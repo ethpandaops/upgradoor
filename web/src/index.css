@@ -1,0 +1,137 @@
+/*
+ * Two tiers of colour:
+ *   1. primitive values per theme (plain CSS variables on :root / .dark);
+ *   2. semantic tokens (@theme), named for intent. Application code uses only
+ *      the semantic tokens, so it never needs dark: variants for colour.
+ */
+
+@import 'tailwindcss';
+
+/* Class-based dark mode: the theme toggle sets .dark on <html>. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+@theme {
+  --font-sans: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, 'SF Mono', SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+
+  /* Surfaces */
+  --color-background: var(--background-value);
+  --color-surface: var(--surface-value);
+  --color-surface-raised: var(--surface-raised-value);
+  --color-surface-hover: var(--surface-hover-value);
+  --color-surface-selected: var(--surface-selected-value);
+  --color-scrim: var(--scrim-value);
+
+  /* Lines */
+  --color-border: var(--border-value);
+  --color-border-strong: var(--border-strong-value);
+
+  /* Text */
+  --color-foreground: var(--foreground-value);
+  --color-muted: var(--muted-value);
+  --color-faint: var(--faint-value);
+
+  /* Accent: links, focus, primary buttons, active tab */
+  --color-accent: var(--accent-value);
+  --color-accent-hover: var(--accent-hover-value);
+  --color-on-accent: var(--on-accent-value);
+
+  /* State: text / icon colour plus a subtle fill for badges and banners */
+  --color-success: var(--success-value);
+  --color-success-subtle: var(--success-subtle-value);
+  --color-warning: var(--warning-value);
+  --color-warning-subtle: var(--warning-subtle-value);
+  --color-danger: var(--danger-value);
+  --color-danger-subtle: var(--danger-subtle-value);
+  --color-danger-solid: var(--danger-solid-value);
+  --color-info: var(--info-value);
+  --color-info-subtle: var(--info-subtle-value);
+}
+
+:root {
+  color-scheme: light;
+
+  --background-value: oklch(0.975 0.003 250);
+  --surface-value: oklch(1 0 0);
+  --surface-raised-value: oklch(0.965 0.004 250);
+  --surface-hover-value: oklch(0.95 0.006 250);
+  --surface-selected-value: oklch(0.94 0.03 195);
+  --scrim-value: oklch(0.2 0.01 250 / 0.5);
+
+  --border-value: oklch(0.9 0.006 250);
+  --border-strong-value: oklch(0.8 0.01 250);
+
+  --foreground-value: oklch(0.24 0.015 250);
+  --muted-value: oklch(0.47 0.015 250);
+  --faint-value: oklch(0.62 0.012 250);
+
+  --accent-value: oklch(0.5 0.1 195);
+  --accent-hover-value: oklch(0.43 0.09 195);
+  --on-accent-value: oklch(1 0 0);
+
+  --success-value: oklch(0.47 0.13 150);
+  --success-subtle-value: oklch(0.95 0.045 150);
+  --warning-value: oklch(0.5 0.12 70);
+  --warning-subtle-value: oklch(0.95 0.06 85);
+  --danger-value: oklch(0.5 0.19 27);
+  --danger-subtle-value: oklch(0.95 0.035 20);
+  --danger-solid-value: oklch(0.53 0.21 27);
+  --info-value: oklch(0.48 0.14 255);
+  --info-subtle-value: oklch(0.95 0.03 255);
+}
+
+.dark {
+  color-scheme: dark;
+
+  --background-value: oklch(0.17 0.008 250);
+  --surface-value: oklch(0.205 0.009 250);
+  --surface-raised-value: oklch(0.24 0.01 250);
+  --surface-hover-value: oklch(0.27 0.012 250);
+  --surface-selected-value: oklch(0.29 0.04 195);
+  --scrim-value: oklch(0.1 0.01 250 / 0.65);
+
+  --border-value: oklch(0.3 0.01 250);
+  --border-strong-value: oklch(0.42 0.012 250);
+
+  --foreground-value: oklch(0.93 0.006 250);
+  --muted-value: oklch(0.72 0.012 250);
+  --faint-value: oklch(0.56 0.012 250);
+
+  --accent-value: oklch(0.78 0.11 195);
+  --accent-hover-value: oklch(0.85 0.1 195);
+  --on-accent-value: oklch(0.17 0.02 195);
+
+  --success-value: oklch(0.8 0.15 150);
+  --success-subtle-value: oklch(0.3 0.06 150);
+  --warning-value: oklch(0.83 0.14 85);
+  --warning-subtle-value: oklch(0.32 0.06 80);
+  --danger-value: oklch(0.76 0.15 22);
+  --danger-subtle-value: oklch(0.3 0.07 22);
+  --danger-solid-value: oklch(0.58 0.2 27);
+  --info-value: oklch(0.78 0.11 250);
+  --info-subtle-value: oklch(0.3 0.06 255);
+}
+
+@layer base {
+  html {
+    background-color: var(--color-background);
+    color: var(--color-foreground);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+  }
+
+  :focus-visible {
+    outline: 2px solid var(--color-accent);
+    outline-offset: 1px;
+  }
+
+  button:not(:disabled),
+  summary,
+  [role='tab'] {
+    cursor: pointer;
+  }
+
+  ::selection {
+    background-color: var(--color-surface-selected);
+  }
+}

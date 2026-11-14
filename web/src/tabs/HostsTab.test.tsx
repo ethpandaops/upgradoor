@@ -1,0 +1,265 @@
+import { screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
+import { describe, expect, it, vi } from 'vitest';
+
+import { shortDigest } from '../lib/format';
+import { LIGHTHOUSE_IMAGE, currentDigest } from '../mock/fixture';
+import { createHarness, renderWithApp } from '../test/harness';
+import { HostsTab } from './HostsTab';
+
+const PUBLIC_COLUMNS = ['Host', 'EL image', 'CL image', 'Update'];
+// The selection checkbox column has no text; the expander column has a screen-reader label.
+const LEADING_COLUMNS = ['Expand'];
+const PRIVATE_COLUMNS = ['KernelOS', 'UptimeReboot', 'Sec.', 'Attesting', 'Seen', 'Slot', 'Actions'];
+
+function columnNames(table: HTMLElement): string[] {
+  return within(table)
+    .getAllByRole('columnheader')
+    .map(th => th.textContent.replace(/[▲▼]/g, '').trim())
+    .filter(Boolean);
+}
+
+function rowOf(table: HTMLElement, host: string): HTMLElement {
+  const cell = within(table).getByText(host, { selector: 'span' });
+  const row = cell.closest('tr');
+  if (!row) throw new Error(`no row for ${host}`);
+  return row;
+}
+
+describe('HostsTab, logged out (public data only)', () => {
+  it('shows only the public columns and requests no authenticated route', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: false });
+    renderWithApp(<HostsTab />, h);
+
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+
+    expect(columnNames(table)).toEqual(PUBLIC_COLUMNS);
+    expect(within(table).getAllByRole('row')).toHaveLength(1 + 24);
+    expect(screen.queryByRole('group', { name: 'Bulk actions' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
+    expect(screen.getByText(/Log in for host details/)).toBeInTheDocument();
+
+    // Nothing that is only served to users may be on the page.
+    expect(table).not.toHaveTextContent('6.12.57+deb13-amd64');
+    expect(table).not.toHaveTextContent('debian');
+
+    expect(h.userCalls()).toEqual([]);
+    expect(h.calls.every(c => c.authorization === null)).toBe(true);
+    expect(new Set(h.calls.map(c => c.path))).toEqual(
+      new Set(['/api/v1/public/hosts', '/api/v1/public/images', '/api/v1/public/network'])
+    );
+  });
+
+  it('renders image, short digest, revision, the custom badge and the update marker', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: false });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+
+    const behind = rowOf(table, 'lighthouse-geth-3');
+    expect(behind).toHaveTextContent(LIGHTHOUSE_IMAGE);
+    expect(within(behind).getByText('pending')).toBeInTheDocument();
+
+    const current = rowOf(table, 'lighthouse-geth-1');
+    const digest = currentDigest(LIGHTHOUSE_IMAGE);
+    const button = within(current).getByRole('button', { name: `digest ${digest}, click to copy` });
+    expect(button).toHaveTextContent(shortDigest(digest));
+    expect(shortDigest(digest)).toHaveLength(12);
+    expect(button).toHaveAttribute('title', expect.stringContaining(digest));
+    expect(within(current).getByText('up to date')).toBeInTheDocument();
+
+    expect(within(rowOf(table, 'grandine-erigon-2')).getByText('custom')).toBeInTheDocument();
+  });
+
+  it('summarises each image and shows the network gate', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: false });
+    renderWithApp(<HostsTab />, h);
+
+    const strip = await screen.findByRole('list', { name: 'Images' });
+    const lighthouse = within(strip).getByText(LIGHTHOUSE_IMAGE).closest('li');
+    expect(lighthouse).toHaveTextContent('on 3 of 7');
+
+    const gate = await screen.findByLabelText('Network gate');
+    expect(within(gate).getByText('ok')).toBeInTheDocument();
+    expect(gate).toHaveTextContent('finality lag2 epochs');
+  });
+
+  it('shows a failing gate with its reasons', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: false });
+    h.controller.setGateFailing(true);
+    renderWithApp(<HostsTab />, h);
+
+    const gate = await screen.findByLabelText('Network gate');
+    expect(within(gate).getByText('failing')).toBeInTheDocument();
+    expect(gate).toHaveTextContent('finality lag 5 epochs > 3');
+    expect(gate).toHaveTextContent(/participation [\d.]+% < 90%/);
+  });
+});
+
+describe('HostsTab, logged in', () => {
+  it('adds the authenticated columns to the same table', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: true });
+    renderWithApp(<HostsTab />, h);
+
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+
+    expect(columnNames(table)).toEqual([...LEADING_COLUMNS, ...PUBLIC_COLUMNS, ...PRIVATE_COLUMNS]);
+    expect(screen.getByRole('group', { name: 'Bulk actions' })).toBeInTheDocument();
+
+    const paths = new Set(h.calls.map(c => c.path));
+    expect(paths).toContain('/api/v1/hosts');
+    expect(paths).toContain('/api/v1/plan');
+    expect(h.userCalls().every(c => c.authorization === 'Bearer mock-token')).toBe(true);
+  });
+
+  it('shows kernel, reboot flag, security updates, attesting share, staleness and the slot', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: true });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+
+    const reboot = rowOf(table, 'teku-besu-1');
+    expect(reboot).toHaveTextContent('6.12.48+deb13-amd64');
+    expect(within(reboot).getByText('reboot')).toBeInTheDocument();
+    expect(within(reboot).getByText('queued')).toBeInTheDocument();
+    expect(reboot).toHaveTextContent('waiting for approval (policy manual)');
+
+    const failed = rowOf(table, 'nimbus-nethermind-1');
+    expect(failed).toHaveTextContent('0%0/128');
+    expect(within(failed).getByText('failed')).toBeInTheDocument();
+
+    const stale = rowOf(table, 'prysm-geth-3');
+    expect(within(stale).getAllByText('stale')).toHaveLength(2);
+
+    expect(within(rowOf(table, 'lighthouse-geth-2')).getByText('verifying')).toBeInTheDocument();
+    expect(within(rowOf(table, 'lodestar-reth-3')).getByText('local hold')).toBeInTheDocument();
+    expect(rowOf(table, 'teku-reth-1')).toHaveTextContent('debian 13');
+    expect(rowOf(table, 'lighthouse-geth-3')).toHaveTextContent(/budget [\d.]+% of 10%/);
+  });
+
+  it('filters by name, image and role, and sorts by a column', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'auth', loggedIn: true });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+
+    const filter = screen.getByRole('searchbox', { name: 'Filter hosts' });
+
+    await user.type(filter, 'bootnode');
+    expect(within(table).getAllByRole('row')).toHaveLength(2);
+    expect(rowOf(table, 'bootnode-1')).toBeInTheDocument();
+
+    await user.clear(filter);
+    await user.type(filter, 'nethermind');
+    expect(within(table).getAllByRole('row')).toHaveLength(1 + 4);
+
+    await user.clear(filter);
+    await user.type(filter, 'teku besu');
+    expect(within(table).getAllByRole('row')).toHaveLength(1 + 3);
+
+    await user.clear(filter);
+    await user.type(filter, 'no-such-host');
+    expect(screen.getByText(/No host matches/)).toBeInTheDocument();
+
+    await user.clear(filter);
+    const firstHost = () => within(table).getAllByRole('row')[1]?.textContent ?? '';
+    expect(firstHost()).toContain('bootnode-1');
+
+    const hostHeader = within(table).getByRole('columnheader', { name: /Host/ });
+    await user.click(within(hostHeader).getByRole('button'));
+    expect(hostHeader).toHaveAttribute('aria-sort', 'descending');
+    expect(firstHost()).toContain('tooling-1');
+
+    const uptime = within(table).getByRole('columnheader', { name: /Uptime/ });
+    await user.click(within(uptime).getByRole('button', { name: 'Uptime' }));
+    await user.click(within(uptime).getByRole('button', { name: 'Uptime' }));
+    expect(uptime).toHaveAttribute('aria-sort', 'descending');
+    expect(firstHost()).toMatch(/lodestar-reth-1|teku-besu-/);
+  });
+
+  it('marks selected hosts the filter hides, in the toolbar and in the confirmation', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'auth', loggedIn: true });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+
+    await user.click(within(table).getByRole('checkbox', { name: 'Select all shown hosts' }));
+    const bulk = screen.getByRole('group', { name: 'Bulk actions' });
+    expect(bulk).toHaveTextContent('24 selected:');
+    expect(bulk).not.toHaveTextContent('hidden by the filter');
+
+    await user.type(screen.getByRole('searchbox', { name: 'Filter hosts' }), 'bootnode');
+    expect(within(table).getAllByRole('row')).toHaveLength(2);
+    expect(bulk).toHaveTextContent('24 selected (23 hidden by the filter):');
+
+    // The confirmation says that the action reaches hosts that are not on screen.
+    await user.click(within(bulk).getByRole('button', { name: 'Reboot…' }));
+    const dialog = screen.getByRole('dialog');
+    const warning = within(dialog).getByRole('alert');
+    expect(warning).toHaveTextContent('Includes 23 selected hosts hidden by the current filter:');
+    expect(warning).not.toHaveTextContent('bootnode-1');
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+
+    await user.click(within(bulk).getByRole('button', { name: 'Forget…' }));
+    expect(within(screen.getByRole('dialog')).getByRole('alert')).toHaveTextContent('Includes 23 selected hosts');
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
+
+    // "Drop hidden" narrows the selection to what is on screen; the request then carries only that.
+    await user.click(within(bulk).getByRole('button', { name: 'Drop hidden' }));
+    expect(bulk).toHaveTextContent('1 selected:');
+    expect(bulk).not.toHaveTextContent('hidden by the filter');
+
+    await user.click(within(bulk).getByRole('button', { name: 'Forget…' }));
+    const confirm = screen.getByRole('dialog');
+    expect(within(confirm).queryByRole('alert')).not.toBeInTheDocument();
+    await user.click(within(confirm).getByRole('button', { name: 'Confirm' }));
+
+    await vi.waitFor(() => {
+      expect(h.calls.filter(c => c.method === 'POST')).toHaveLength(1);
+    });
+    const post = h.calls.find(c => c.method === 'POST');
+    expect(post?.path).toBe('/api/v1/actions/forget');
+    expect(post?.body).toStrictEqual({ hosts: ['bootnode-1'], reason: '' });
+  });
+
+  it('expands a row to containers, needs, packages, leases and history', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'auth', loggedIn: true });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+
+    await user.click(screen.getByRole('button', { name: 'Expand lighthouse-geth-2' }));
+
+    const containers = await screen.findByRole('table', { name: 'Containers' });
+    expect(within(containers).getAllByRole('row')).toHaveLength(1 + 4);
+    expect(within(containers).getByText('lighthouse-validator')).toBeInTheDocument();
+    expect(within(containers).getByText('unmanaged')).toBeInTheDocument();
+
+    expect(screen.getByRole('table', { name: 'Leases of lighthouse-geth-2' })).toHaveTextContent('verifying');
+    expect(screen.getByRole('table', { name: 'History of lighthouse-geth-2' })).toHaveTextContent('lease.granted');
+    expect(screen.getByRole('img', { name: /Attestation liveness/ })).toBeInTheDocument();
+    expect(h.calls.some(c => c.path === '/api/v1/hosts/lighthouse-geth-2')).toBe(true);
+
+    await user.click(screen.getByRole('button', { name: 'Expand prysm-erigon-1' }));
+    const upgradable = await screen.findByRole('table', { name: 'Upgradable packages' });
+    expect(upgradable).toHaveTextContent('openssl');
+    expect(within(upgradable).getAllByText('security')).toHaveLength(3);
+  });
+});
+
+describe('HostsTab, open mode', () => {
+  it('shows everything without a token', async () => {
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<HostsTab />, h);
+
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+
+    expect(columnNames(table)).toEqual([...LEADING_COLUMNS, ...PUBLIC_COLUMNS, ...PRIVATE_COLUMNS]);
+    expect(h.calls.every(c => c.authorization === null)).toBe(true);
+    expect(screen.queryByText(/Log in for host details/)).not.toBeInTheDocument();
+  });
+});
