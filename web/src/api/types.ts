@@ -59,6 +59,7 @@ export interface Container {
   revision?: string;
   version?: string;
   state: string;
+  exitCode?: number;
   health?: string;
   restartCount: number;
   startedAt: string;

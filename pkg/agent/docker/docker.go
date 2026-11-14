@@ -322,6 +322,10 @@ func (r *Runtime) describe(
 		out.State = string(ctr.State.Status)
 		out.StartedAt = parseTime(ctr.State.StartedAt)
 
+		if !ctr.State.Running && !ctr.State.Restarting {
+			out.ExitCode = ctr.State.ExitCode
+		}
+
 		if ctr.State.Health != nil {
 			out.Health = string(ctr.State.Health.Status)
 		}

@@ -24,8 +24,12 @@
 //	rebooting  only with a reboot need: persist the phase, then reboot. After
 //	           the boot the agent finds the phase in its state file, checks
 //	           that the boot id changed and continues with starting
-//	starting   make sure every managed container that was running before the
-//	           operation is running again, EL then CL then VC then other
+//	starting   make sure every managed container that should be running is
+//	           running again, EL then CL then VC then other. That is every
+//	           container that ran before the operation and every one that had
+//	           stopped by itself with an error (protocol.Container.ShouldRun):
+//	           a newer image repairs a container that crashed on a broken one.
+//	           A container somebody stopped stays down, also when it is rolled
 //	verifying  every touched container stays running without a restart for
 //	           verify.window; bounded by verify.timeout
 //	done / failed

@@ -199,7 +199,14 @@ kurtosis run --enclave "$enclave" "$package" --args-file examples/kurtosis/netwo
 }
 pass "devnet started"
 
-beacon=http://$(ip_of "$(container cl-1-lighthouse-geth)"):4000
+# The controller watches the network through the devnet's own beacon nodes.
+# A real controller has the in-cluster node, which upgradoor never touches;
+# here every beacon node is also a managed host and one of them is broken on
+# purpose, so all four are given and the controller fails over.
+beacon_args=()
+for i in $(seq 1 $nodes); do
+    beacon_args+=(--beacon-endpoint "http://$(ip_of "$(container "cl-$i-lighthouse-geth")"):4000")
+done
 
 # --- identities, controller, agents ----------------------------------------
 
@@ -218,7 +225,7 @@ mkdir -p "$work/data"
     --network "$network" --signer-public-key "$signer" \
     --allow-insecure-agent-http \
     --auth-provider-url "$auth" \
-    --beacon-endpoint "$beacon" \
+    "${beacon_args[@]}" \
     --default-setting maxUnavailablePercent=25 \
     --default-setting soakEpochs=1 \
     --default-setting leaseTtl=5m \

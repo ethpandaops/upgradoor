@@ -1108,3 +1108,58 @@ func TestLeaseRunsOutWhileTheHostCannotBeExamined(t *testing.T) {
 	assert.Empty(t, disruptive(e.host.Calls()))
 	assert.Equal(t, gethV1, e.host.Container("geth").Digest)
 }
+
+// A container that crashed on a broken image must come back when a newer
+// image is rolled onto it; one that somebody stopped must stay down.
+func TestRollStartsACrashedContainerButNotAStoppedOne(t *testing.T) {
+	e := newEnv(t, baseScenario())
+
+	// teku died by itself; the validator was stopped by a person.
+	require.NoError(t, e.host.Exit("teku", 1))
+	require.NoError(t, e.host.Exit("validator", 143))
+
+	e.host.SetRegistry(tekuImage, tekuV2, "")
+	e.host.SetRegistry(vcImage, vcV2, "")
+	e.start()
+
+	needs := awaitNeeds(t, e,
+		protocol.ImageNeedID("teku", tekuV2),
+		protocol.ImageNeedID("validator", vcV2),
+	)
+	e.ctrl.grant(e.lease("lease-repair", needs...))
+
+	op := e.ctrl.awaitFinished("lease-repair")
+	require.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+
+	calls := disruptive(e.host.Calls())
+	assert.Contains(t, calls, "recreate teku "+tekuV2+" start=true")
+	assert.Contains(t, calls, "recreate validator "+vcV2+" start=false")
+	assert.NotContains(t, calls, "start validator")
+
+	assert.Equal(t, protocol.StateRunning, e.host.Container("teku").State)
+	assert.Equal(t, "created", e.host.Container("validator").State, "recreated, not started")
+	assert.Equal(t, vcV2, e.host.Container("validator").Digest, "rolled all the same")
+}
+
+func TestContainerShouldRun(t *testing.T) {
+	tests := []struct {
+		state string
+		code  int
+		want  bool
+	}{
+		{protocol.StateRunning, 0, true},
+		{protocol.StateRestarting, 0, true},
+		{protocol.StateExited, 1, true},
+		{protocol.StateDead, 2, true},
+		{protocol.StateExited, 0, false},
+		{protocol.StateExited, 137, false},
+		{protocol.StateExited, 143, false},
+		{"created", 0, false},
+		{"paused", 0, false},
+	}
+
+	for _, tt := range tests {
+		c := protocol.Container{State: tt.state, ExitCode: tt.code}
+		assert.Equal(t, tt.want, c.ShouldRun(), "%s exit %d", tt.state, tt.code)
+	}
+}

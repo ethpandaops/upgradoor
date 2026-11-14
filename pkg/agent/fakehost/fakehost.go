@@ -296,6 +296,8 @@ func (h *Host) Stop(ctx context.Context, name string, _ time.Duration) error {
 
 	if c.State == StateRunning {
 		c.State = StateExited
+		// What "docker stop" leaves behind.
+		c.ExitCode = 143
 	}
 
 	return nil
@@ -317,6 +319,7 @@ func (h *Host) Start(ctx context.Context, name string) error {
 
 	if c.State != StateRunning {
 		c.State = StateRunning
+		c.ExitCode = 0
 		c.StartedAt = h.now()
 	}
 
@@ -584,6 +587,22 @@ func (h *Host) Crash(name string) error {
 
 	c.RestartCount++
 	c.StartedAt = h.now()
+
+	return nil
+}
+
+// Exit makes a running container stop by itself with the given exit code.
+func (h *Host) Exit(name string, code int) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	c := h.find(name)
+	if c == nil {
+		return fmt.Errorf("fakehost: no such container %q", name)
+	}
+
+	c.State = StateExited
+	c.ExitCode = code
 
 	return nil
 }

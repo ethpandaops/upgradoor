@@ -565,7 +565,12 @@ func (o *oracle) checkGrant(
 		return nil
 	}
 
-	if len(gate) > 0 {
+	// A failing gate passes only a host that is already fully down, and
+	// only when the gate fails on data it has (finality, participation).
+	repair := host.weight > 0 && host.live == 0 &&
+		!slices.Contains(gate, "beacon node unreachable") &&
+		!slices.Contains(gate, "liveness data stale")
+	if len(gate) > 0 && !repair {
 		return fmt.Errorf("the network gate fails: %v", gate)
 	}
 

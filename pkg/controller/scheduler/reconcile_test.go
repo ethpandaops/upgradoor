@@ -1440,3 +1440,67 @@ func TestGrantsWithoutLiveness(t *testing.T) {
 		assert.Equal(t, "probes do not report synced", b.lease("a").Readiness)
 	})
 }
+
+// A host that a rollout broke keeps participation below the gate. The gate
+// must not keep its repair away, or nothing would ever recover.
+func TestFailingGatePassesTheRepairOfADownHost(t *testing.T) {
+	setup := func(t *testing.T) *worldBuilder {
+		t.Helper()
+
+		b := newWorldBuilder(t)
+		for _, name := range []string{"a", "b", "c", "d"} {
+			b.host(name, 32)
+			b.wants(name, packagesNeed("2.0"))
+		}
+
+		b.fillLiveness()
+		// d attests with nothing: 96 of 128 live, 75% < 90%.
+		b.live(b.w.Health.LivenessEpoch, "d", 0)
+		b.refreshHealth()
+
+		return b
+	}
+
+	t.Run("participation below the floor", func(t *testing.T) {
+		b := setup(t)
+		out := b.step()
+
+		require.False(t, out.Plan.Gate.OK)
+		require.Equal(t, []string{"d"}, b.leasedHosts(), "the down host is repaired, nobody else moves")
+		assert.Zero(t, b.lease("d").Charged)
+
+		reasons := queueReasons(out.Plan)
+		for _, name := range []string{"a", "b", "c"} {
+			assert.Contains(t, reasons[name], "network gate: participation", name)
+		}
+	})
+
+	t.Run("finality lag too", func(t *testing.T) {
+		b := setup(t)
+		b.w.Health.FinalityLagEpochs = 9
+		b.step()
+
+		require.Equal(t, []string{"d"}, b.leasedHosts())
+	})
+
+	t.Run("not without data to trust", func(t *testing.T) {
+		b := setup(t)
+		b.w.Health.UpdatedAt = b.w.Now.Add(-time.Hour)
+		out := b.step()
+
+		require.Empty(t, b.leasedHosts())
+		assert.Contains(t, queueReasons(out.Plan)["d"], "network gate: "+gateBeacon)
+	})
+
+	t.Run("a host without validators is not a repair", func(t *testing.T) {
+		b := setup(t)
+		b.host("plain", 0)
+		b.wants("plain", packagesNeed("2.0"))
+		// Take the down host out of the picture.
+		b.get("d").HoldWanted = true
+		out := b.step()
+
+		assert.NotContains(t, b.leasedHosts(), "plain")
+		assert.Contains(t, queueReasons(out.Plan)["plain"], "network gate: participation")
+	})
+}

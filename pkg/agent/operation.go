@@ -341,7 +341,7 @@ func (o *operation) plan(ctx context.Context, st *persistedState) (*operationPla
 	enrichContainers(o.cfg, containers, noRegistryCheck)
 
 	for i := range containers {
-		if containers[i].Managed && containers[i].State == containerRunning {
+		if containers[i].Managed && containers[i].ShouldRun() {
 			plan.wasRunning = append(plan.wasRunning, containers[i].Name)
 		}
 	}

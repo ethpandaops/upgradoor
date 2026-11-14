@@ -96,6 +96,14 @@ const (
 	KindOther ContainerKind = "other"
 )
 
+// Docker container states.
+const (
+	StateRunning    = "running"
+	StateRestarting = "restarting"
+	StateExited     = "exited"
+	StateDead       = "dead"
+)
+
 // Container is one Docker container on the host.
 type Container struct {
 	Name string `json:"name"`
@@ -114,7 +122,10 @@ type Container struct {
 	Revision string `json:"revision,omitempty"`
 	Version  string `json:"version,omitempty"`
 
-	State        string    `json:"state"`
+	State string `json:"state"`
+	// ExitCode is the exit code of a container that is not running (exited
+	// or dead); 0 otherwise.
+	ExitCode     int       `json:"exitCode,omitempty"`
 	Health       string    `json:"health,omitempty"`
 	RestartCount int       `json:"restartCount"`
 	StartedAt    time.Time `json:"startedAt"`
@@ -131,6 +142,26 @@ type Container struct {
 	// Registry is the last registry check for Image; nil for unmanaged and
 	// custom containers.
 	Registry *RegistryCheck `json:"registry,omitempty"`
+}
+
+// ShouldRun reports whether the container is meant to be running: it runs,
+// Docker is restarting it, or it stopped by itself with an error. A
+// container that was never started, exited cleanly or was stopped or killed
+// by a person (exit codes 137 and 143, what "docker stop" and "docker kill"
+// leave behind) is meant to be down, and the agent leaves it down.
+//
+// The agent starts exactly these containers again after an operation. That
+// is what lets a newer image repair a container that crashed on a broken
+// one, without ever starting a validator client somebody stopped on purpose.
+func (c *Container) ShouldRun() bool {
+	switch c.State {
+	case StateRunning, StateRestarting:
+		return true
+	case StateExited, StateDead:
+		return c.ExitCode != 0 && c.ExitCode != 137 && c.ExitCode != 143
+	default:
+		return false
+	}
 }
 
 // RegistryCheck is the result of the agent's last look at a tag.

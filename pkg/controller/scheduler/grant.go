@@ -315,7 +315,7 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (verdict, []protocol.
 	switch {
 	case len(needs) == 0:
 		return verdict{rankVerb, reasonVerb}, nil
-	case !r.IgnoreBudget && !g.gate.OK:
+	case !r.IgnoreBudget && !g.gate.OK && !g.repairs(hv):
 		return verdict{rankGate, reasonGatePrefix + g.gate.Reasons[0]}, nil
 	case r.Force && g.forced[r.ID]:
 		return verdict{rankNext, reasonNext}, nil
@@ -328,6 +328,22 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (verdict, []protocol.
 	}
 
 	return verdict{}, needs
+}
+
+// repairs reports whether a grant to the host passes a failing gate: the host
+// has validators and none of them is attesting, so serving it cannot make
+// the network worse and may be what brings it back. Without this a host that
+// a rollout broke would keep participation below the gate and the gate would
+// keep the repair away for ever. It needs data it can trust: a gate that
+// fails because the beacon view or the liveness data is missing passes
+// nobody.
+func (g *granter) repairs(hv *hostView) bool {
+	if hv.weight == 0 || hv.live != 0 {
+		return false
+	}
+
+	return !slices.Contains(g.gate.Reasons, gateBeacon) &&
+		!slices.Contains(g.gate.Reasons, gateLiveness)
 }
 
 // consider grants the host a lease for everything grantable, or says what
