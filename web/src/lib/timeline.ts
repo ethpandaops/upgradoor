@@ -95,7 +95,7 @@ export function typicalLeaseMs(leases: readonly Lease[], epochSeconds: number): 
 
 /**
  * StageOf is a host's stage in a rollout (fleet.Stage, in serving order: 1
- * repair, the members carried over as failed; 2 canary; 3 rest), or undefined
+ * repair, the members whose host is broken; 2 canary; 3 rest), or undefined
  * when unknown. A host waits for its place in the order behind the hosts of
  * an earlier stage.
  */
@@ -105,7 +105,7 @@ export type StageOf = (rollout: string, host: string) => number | undefined;
  * splitQueue separates the queued hosts that start without anybody acting
  * from the rest. A host that waits for its place in a rollout's order is only
  * in the first group if nothing ahead of it in that rollout is stuck: behind
- * a carried host or a canary that waits for the gate or an approval it waits
+ * a broken host or a canary that waits for the gate or an approval it waits
  * as long as that host does. A host that is held, silent or reports a verb
  * its agent does not allow holds nobody back: the scheduler does not make
  * anybody wait for it.
@@ -198,7 +198,7 @@ interface Item {
  * queue in order at every step and starts each host that fits the host limit
  * and the weight budget, skipping the ones that do not. A host that waits for
  * its place in the order ("after x", "after canary x") starts once the hosts
- * of the earlier stages of its rollout (the carried hosts, the canary) are
+ * of the earlier stages of its rollout (the broken hosts, the canary) are
  * done. When the host it waits for is neither in the queue nor holds a lease
  * (it is expected to report its need, and nobody knows when it will), the
  * waiting host gets no slot and is counted as late.
@@ -230,7 +230,10 @@ export function forecast(input: ForecastInput): Forecast {
     a: { host: string; rollouts: readonly string[]; reason: string; active?: boolean; position?: number },
     c: QueueEntry
   ) => {
-    const shared = list(c.rollouts).filter(r => a.rollouts.includes(r));
+    // The rollout the wait is about, as in splitQueue; all of the host's
+    // rollouts only when the plan does not name one.
+    const about = c.rollout ? [c.rollout] : list(c.rollouts);
+    const shared = about.filter(r => a.rollouts.includes(r));
     let known = false;
     for (const r of shared) {
       const mine = stageOf(r, c.host);
@@ -240,10 +243,12 @@ export function forecast(input: ForecastInput): Forecast {
       if (theirs < mine) return true;
     }
     if (known) return false;
-    // Without stages: an active lease is ahead, and so is a host of the same
-    // rollout that is served earlier and waits for something else.
+    // Without stages: a lease that serves the same rollout is ahead, and so
+    // is a host of the same rollout that is served earlier and waits for
+    // something else. A lease of another rollout holds nobody back here.
+    if (shared.length === 0) return false;
     if (a.active === true) return true;
-    return shared.length > 0 && a.reason !== c.reason && (a.position === undefined || a.position < c.position);
+    return a.reason !== c.reason && (a.position === undefined || a.position < c.position);
   };
 
   const slots: ForecastSlot[] = [];

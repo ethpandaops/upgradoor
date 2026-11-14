@@ -33,7 +33,7 @@ import {
 import { HostStateBadge, RolloutStateBadge, stageLabel } from '../components/status';
 import { usePoll } from '../hooks/usePoll';
 import { formatPercent, percentOf, plural, shortRevision } from '../lib/format';
-import { hostsIntent, scopeIntent } from '../lib/intents';
+import { endLeaseIntent, hostsIntent, scopeIntent } from '../lib/intents';
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
@@ -133,7 +133,13 @@ export function RolloutsTab() {
           openLeases.length === 0 ? (
             <Empty>No host holds a lease.</Empty>
           ) : (
-            <LeaseTable leases={openLeases} label="Active leases" />
+            <LeaseTable
+              leases={openLeases}
+              label="Active leases"
+              onEnd={l => {
+                actions.request(endLeaseIntent(l.id, l.host));
+              }}
+            />
           )
         ) : recentLeases.length === 0 ? (
           <Empty>No lease has ended yet.</Empty>
@@ -269,7 +275,17 @@ function HostPips({ hosts }: { hosts: readonly RolloutHost[] }) {
   );
 }
 
+/**
+ * brokenNote is the scheduler's note on a waiting member whose host is
+ * broken ("broken since lease <id> (rollout <id>)"), or undefined.
+ */
+function brokenNote(h: RolloutHost): string | undefined {
+  return h.error?.startsWith('broken since ') ? h.error : undefined;
+}
+
 function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, leases: ReadonlyMap<string, Lease>) {
+  const broken = brokenNote(h);
+
   switch (h.state) {
     case 'pending': {
       const q = queue.get(h.host);
@@ -277,6 +293,7 @@ function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, le
       return (
         <span>
           <span className="text-faint">#{q.position}</span> {q.reason}
+          {broken && <span className="text-muted"> — {broken}</span>}
         </span>
       );
     }
@@ -298,7 +315,7 @@ function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, le
     case 'failed':
       return <span className="text-danger">{h.error || 'failed'}</span>;
     case 'expected':
-      return <span className="text-muted">has not reported the need yet</span>;
+      return <span className="text-muted">has not reported the need yet{broken && ` — ${broken}`}</span>;
     case 'done':
     case 'skipped':
       return <Dash />;

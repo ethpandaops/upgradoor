@@ -234,12 +234,29 @@ export interface Liveness {
 }
 
 /** fleet.NetworkHealth */
+/** fleet.SlotPhase: a stretch of the chain with one slot duration. */
+export interface SlotPhase {
+  /** The first epoch of the phase and its start. */
+  epoch: number;
+  start: string;
+  slotMs: number;
+}
+
 export interface NetworkHealth {
   updatedAt: string;
   error?: string;
   genesisTime: string;
+  /** The current slot duration rounded down to whole seconds, for display. Epoch times come from phases. */
   secondsPerSlot: number;
   slotsPerEpoch: number;
+  /** The chain's slot durations; a fork that changes the duration starts a new phase. */
+  phases?: List<SlotPhase>;
+  /**
+   * Why the current epoch cannot be placed by phases: the beacon node's chain
+   * timing is out of bounds. The network gate is then closed with it as the
+   * reason ("chain timing out of bounds: ...").
+   */
+  timingError?: string;
   headSlot: number;
   currentEpoch: number;
   finalizedEpoch: number;
@@ -266,10 +283,11 @@ export type RolloutState = 'active' | 'halted' | 'completed' | 'superseded' | 'a
 export type HostState = 'expected' | 'pending' | 'leased' | 'done' | 'failed' | 'skipped';
 
 /**
- * fleet.Stage, in serving order: 1 repair (a member carried over as failed
- * from the superseded rollout, served first), 2 the canary (the one host that
- * goes alone until the first success), 3 the rest. It follows from
- * carriedFrom and the rollout's canary.
+ * fleet.Stage, in serving order: 1 repair (a member whose host is broken:
+ * its last lease for the same thing, the image or the packages, failed; it is
+ * served first), 2 the canary (the one host that goes alone until the first
+ * success), 3 the rest. The scheduler derives it from the lease table and
+ * the rollout's canary in every reconcile.
  */
 export type Stage = 1 | 2 | 3;
 
@@ -280,9 +298,12 @@ export interface RolloutHost {
   stage: Stage;
   needId?: string;
   leaseId?: string;
+  /**
+   * The failure reason, the note of a skip, or, on a waiting member in the
+   * repair stage, the lease that broke its host:
+   * "broken since lease <id> (rollout <id>)".
+   */
   error?: string;
-  /** The superseded rollout in which the host had failed; set for a carried member, for good. */
-  carriedFrom?: string;
   updatedAt: string;
 }
 
@@ -393,6 +414,12 @@ export interface HoldRequest {
   reason: string;
 }
 
+/** scheduler.EndLeaseRequest: the body of end-lease. */
+export interface EndLeaseRequest {
+  lease: string;
+  reason: string;
+}
+
 /** scheduler.ScopeRequest: the body of pause, resume and abort. */
 export interface ScopeRequest {
   rollout: string;
@@ -458,7 +485,7 @@ export interface QueueEntry {
   /** Absent in the answer of a controller older than the field. */
   wait?: WaitKind;
   /**
-   * The host an order wait is for: a carried member or the canary. It need
+   * The host an order wait is for: a member whose host is broken, the host of a lease in flight, or the canary. It need
    * not be in the queue: it may hold a lease, or be expected to report.
    */
   after?: string;

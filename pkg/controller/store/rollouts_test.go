@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
@@ -43,12 +44,12 @@ func testRollout(id string, state fleet.RolloutState, sec int, hosts ...string) 
 
 	for i, host := range hosts {
 		r.Hosts = append(r.Hosts, fleet.RolloutHost{
-			Host:        host,
-			State:       fleet.HostPending,
-			Stage:       fleet.Stage(i % 3),
-			CarriedFrom: []string{"", "rollout-0"}[i%2],
-			NeedID:      "need-" + host,
-			UpdatedAt:   at(sec + 1),
+			Host:      host,
+			State:     fleet.HostPending,
+			Stage:     fleet.Stage(i % 3),
+			NeedID:    "need-" + host,
+			Error:     []string{"", "broken since lease l0 (rollout rollout-0)"}[i%2],
+			UpdatedAt: at(sec + 1),
 		})
 	}
 
@@ -707,5 +708,122 @@ func TestCommitAtomicity(t *testing.T) {
 				assert.Equal(t, 2, countRows(t, s, "rollouts"))
 			})
 		}
+	}
+}
+
+// TestRowsOfEarlierBuilds: a database that the builds before this one wrote
+// is read without minding what those builds kept on a rollout and this one
+// does not: the lists a rollout inherited and left (inherited, bequest,
+// bequeathed, in the JSON) and the mark of a member carried over as failed
+// (the column carried_from). The fields are ignored when a row is read and
+// gone when it is next written; the column is dropped by the migration. The
+// leases, from which this build reads who is broken, are untouched.
+func TestRowsOfEarlierBuilds(t *testing.T) {
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "earlier.db")
+
+	migrations, err := loadMigrations(migrationFiles)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(migrations), 3)
+
+	// The database as the build before this one left it: schema version 2.
+	old, err := openPool(ctx, "file:"+escapeURIPath(path)+"?_txlock=immediate", 1)
+	require.NoError(t, err)
+
+	version, err := applyMigrations(ctx, quietLog(), old, migrations[:2])
+	require.NoError(t, err)
+	require.Equal(t, 2, version)
+
+	rows := map[string]string{
+		// The build before this one: bequest and marker.
+		"recorded": `{"id":"recorded","kind":"packages","key":"packages:a","title":"t","state":"superseded",` +
+			`"paused":false,"approved":false,"force":false,"ignoreBudget":false,` +
+			`"inherited":[{"host":"node-1","from":"older","lease":"l-0"}],` +
+			`"bequest":[{"host":"node-1","from":"older"},{"host":"node-2","from":"recorded","lease":"l-1"}],` +
+			`"bequeathed":true,"createdBy":"scheduler","createdAt":"2026-01-01T00:00:00Z",` +
+			`"updatedAt":"2026-01-01T00:10:00Z","endedAt":"2026-01-01T00:10:00Z"}`,
+		// The commit before that: a bequest without the marker.
+		"unmarked": `{"id":"unmarked","kind":"packages","key":"packages:b","title":"t","state":"aborted",` +
+			`"paused":false,"approved":false,"force":false,"ignoreBudget":false,` +
+			`"bequest":[{"host":"node-1","from":"unmarked"}],` +
+			`"createdBy":"scheduler","createdAt":"2026-01-01T00:20:00Z",` +
+			`"updatedAt":"2026-01-01T00:30:00Z","endedAt":"2026-01-01T00:30:00Z"}`,
+		// An open one that had inherited.
+		"open": `{"id":"open","kind":"packages","key":"packages:c","title":"t","state":"active",` +
+			`"paused":false,"approved":false,"force":false,"ignoreBudget":false,` +
+			`"inherited":[{"host":"node-1","from":"unmarked"}],` +
+			`"createdBy":"scheduler","createdAt":"2026-01-01T00:40:00Z","updatedAt":"2026-01-01T00:40:00Z"}`,
+	}
+
+	for _, id := range []string{"recorded", "unmarked", "open"} {
+		var probe fleet.Rollout
+
+		require.NoError(t, json.Unmarshal([]byte(rows[id]), &probe))
+
+		_, err = old.ExecContext(ctx, `INSERT INTO rollouts (id, kind, key, state, created_at, updated_at, ended_at, data)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, id, string(probe.Kind), probe.Key, string(probe.State),
+			millis(probe.CreatedAt), millis(probe.UpdatedAt), nullMillis(probe.EndedAt), rows[id])
+		require.NoError(t, err)
+
+		_, err = old.ExecContext(ctx, `INSERT INTO rollout_hosts
+			(rollout_id, host, state, stage, need_id, lease_id, error, carried_from, updated_at)
+			VALUES (?, 'node-1', 'pending', 1, 'need-1', '', 'failed in rollout older', 'older', ?),
+			       (?, 'node-2', 'leased', 3, 'need-2', 'l-1', '', '', ?)`,
+			id, millis(probe.UpdatedAt), id, millis(probe.UpdatedAt))
+		require.NoError(t, err)
+	}
+
+	lease := testLease("l-0", "node-1", fleet.LeaseFailed, 0)
+	data, err := json.Marshal(lease)
+	require.NoError(t, err)
+
+	_, err = old.ExecContext(ctx, `INSERT INTO leases (id, host, state, granted_at, expires_at, ended_at, data)
+		VALUES (?, ?, ?, ?, ?, ?, ?)`, lease.ID, lease.Host, string(lease.State), millis(lease.GrantedAt),
+		millis(lease.ExpiresAt), nullMillis(lease.EndedAt), string(data))
+	require.NoError(t, err)
+	require.NoError(t, old.Close())
+
+	// This build opens it.
+	s := startStore(t, New(quietLog(), path))
+
+	var columns int
+
+	require.NoError(t, rawDB(t, s).QueryRow(
+		`SELECT COUNT(*) FROM pragma_table_info('rollout_hosts') WHERE name = 'carried_from'`).Scan(&columns))
+	assert.Zero(t, columns, "the migration dropped the column")
+
+	all, err := s.ListRollouts(ctx, RolloutFilter{})
+	require.NoError(t, err)
+	require.Len(t, all, 3)
+
+	for _, r := range all {
+		require.Len(t, r.Hosts, 2, r.ID)
+		assert.Equal(t, fleet.RolloutHost{
+			Host: "node-1", State: fleet.HostPending, Stage: fleet.StageRepair, NeedID: "need-1",
+			Error: "failed in rollout older", UpdatedAt: r.UpdatedAt,
+		}, r.Hosts[0], r.ID)
+		assert.Equal(t, fleet.HostLeased, r.Hosts[1].State, r.ID)
+	}
+
+	leases, err := s.ListLeases(ctx, LeaseFilter{})
+	require.NoError(t, err)
+	require.Len(t, leases, 1)
+	assert.Equal(t, fleet.LeaseFailed, leases[0].State)
+
+	// Written back, the rows no longer carry what this build does not keep.
+	require.NoError(t, s.Commit(ctx, &Changes{Rollouts: all}))
+
+	for _, id := range []string{"recorded", "unmarked", "open"} {
+		var stored string
+
+		require.NoError(t, rawDB(t, s).QueryRow(`SELECT data FROM rollouts WHERE id = ?`, id).Scan(&stored))
+
+		for _, field := range []string{"inherited", "bequest", "bequeathed", "carriedFrom"} {
+			assert.NotContains(t, stored, `"`+field+`"`, id)
+		}
+
+		got, err := s.GetRollout(ctx, id)
+		require.NoError(t, err)
+		assert.Len(t, got.Hosts, 2)
 	}
 }

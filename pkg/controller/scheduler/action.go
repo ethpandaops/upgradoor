@@ -686,6 +686,10 @@ func (s *service) retryAborted(
 		CreatedAt: now,
 	}
 
+	// Nothing is handed to the new rollout: which hosts go first in it and
+	// which leases it waits for is read off the lease table, as for a rollout
+	// that the scheduler opens.
+
 	// The skips that hold for the key move into the new rollout right away:
 	// it may close again before a reconcile has seen it.
 	if err := s.loadHistory(ctx); err != nil {
@@ -695,6 +699,8 @@ func (s *service) retryAborted(
 	if latest := s.hist.closed[r.Key]; latest != nil {
 		for i := range latest.Hosts {
 			if m := latest.Hosts[i]; operatorSkipped(&m) {
+				// The skip moves over, not what the old rollout knew of the
+				// host's past.
 				m.LeaseID = ""
 				m.UpdatedAt = now
 				r.Hosts = append(r.Hosts, m)
@@ -756,6 +762,86 @@ func (s *service) Abort(ctx context.Context, actor string, req ScopeRequest) (*A
 	}
 
 	return &ActionResult{Rollout: r.ID, Message: "rollout aborted"}, nil
+}
+
+// EndLease ends one open lease as failed, with the reason "ended by
+// operator". It is what a person does about a lease that nobody expects to
+// end by itself any more (an agent that reports progress for hours, a host
+// that was taken away by hand): while the lease is open the host counts as
+// unavailable, and a lease of a closed rollout holds back the rollouts that
+// follow it. The end is the end of a failed lease in every respect: the host
+// is failed in the open rollouts the lease served, those halt, and the host
+// is broken for what the lease carried, so it goes first from then on.
+//
+// Only a lease that the agent has started can be ended (it reported an
+// operation: the lease is running or being verified). The agent is not told
+// to stop: it learns that the controller no longer holds the lease from the
+// next sync response, finishes the operation it has started, and takes no
+// other lease before that. A lease that is only granted is refused: the
+// agent may start it at any moment until its deadline without the controller
+// knowing, and a host must not go down under a lease that somebody has
+// declared over. Such a lease ends by itself, and soon: it expires when the
+// agent syncs without having started it, and fails as silent at the latest
+// 2 * leaseTtl + 1 min after the grant.
+func (s *service) EndLease(
+	ctx context.Context, actor string, req EndLeaseRequest,
+) (*ActionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if req.Lease == "" {
+		return nil, fmt.Errorf("%w: no lease named", ErrInvalidAction)
+	}
+
+	w, err := s.loadWorld(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	// The lease ends by the rule every failed lease ends by.
+	p := newPass(w)
+
+	idx := slices.IndexFunc(p.leases, func(l *fleet.Lease) bool { return l.ID == req.Lease })
+	if idx < 0 {
+		l, err := s.opts.Store.GetLease(ctx, req.Lease)
+
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return nil, fmt.Errorf("%w: %s", ErrUnknownLease, req.Lease)
+		case err != nil:
+			return nil, fmt.Errorf("scheduler: get lease %s: %w", req.Lease, err)
+		default:
+			return nil, fmt.Errorf("%w: lease %s is %s", ErrInvalidAction, l.ID, l.State)
+		}
+	}
+
+	l := p.leases[idx]
+	before := l.State
+
+	if l.State == fleet.LeaseGranted {
+		return nil, fmt.Errorf("%w: the agent has not started lease %s; it ends by itself, at the latest %s",
+			ErrInvalidAction, l.ID, l.ExpiresAt.Add(leaseStartGrace+w.Settings.LeaseTTL.Std()).UTC().Format(time.RFC3339))
+	}
+
+	p.failLease(l, reasonEndedByOperator)
+
+	out := p.outcome(nil)
+	changes := out.Changes()
+	changes.Audit = append([]fleet.AuditEntry{s.entry(actor, "action.end-lease", l.Host, map[string]any{
+		keyLease:  l.ID,
+		keyBefore: map[string]any{keyState: before},
+		keyAfter:  map[string]any{keyState: l.State},
+		keyReason: req.Reason,
+	})}, changes.Audit...)
+
+	if err := s.commit(ctx, changes); err != nil {
+		return nil, err
+	}
+
+	return &ActionResult{
+		Message: fmt.Sprintf("lease %s of %s ended as failed", l.ID, l.Host),
+		Hosts:   []string{l.Host},
+	}, nil
 }
 
 // Forget deletes hosts that are gone. A host that holds a lease is refused.

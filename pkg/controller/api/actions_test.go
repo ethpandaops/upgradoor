@@ -58,6 +58,10 @@ func TestActions(t *testing.T) {
 			},
 		},
 		{
+			action: "end-lease", body: `{"lease":"0123456789abcdef","reason":"host taken away"}`,
+			want: scheduler.EndLeaseRequest{Lease: "0123456789abcdef", Reason: "host taken away"},
+		},
+		{
 			action: "pause", body: `{"reason":"incident"}`,
 			want: scheduler.ScopeRequest{Reason: "incident"},
 		},
@@ -158,6 +162,9 @@ func TestActionValidation(t *testing.T) {
 		{action: "unhold", body: `{"hosts":[]}`, contains: "hosts must not be empty"},
 		{action: "forget", body: `{"reason":"x"}`, contains: "hosts must not be empty"},
 		{action: "forget", body: `{"hosts":["a"],"all":true}`, contains: "unknown field"},
+		{action: "end-lease", body: `{"reason":"x"}`, contains: "lease must not be empty"},
+		{action: "end-lease", body: `{"lease":"l","hosts":["a"]}`, contains: "unknown field"},
+		{action: "end-lease", body: `{"lease":"l","reason":"` + longReason + `"}`, contains: "reason is longer"},
 		{
 			action: "pause", body: `{"reason":"` + longReason + `"}`,
 			contains: "reason is longer",
@@ -211,6 +218,11 @@ func TestActionErrorMapping(t *testing.T) {
 			status: http.StatusNotFound, want: "scheduler: unknown rollout: r-404",
 		},
 		{
+			name:   "unknown lease",
+			err:    fmt.Errorf("%w: l-404", scheduler.ErrUnknownLease),
+			status: http.StatusNotFound, want: "scheduler: unknown lease: l-404",
+		},
+		{
 			name:   "invalid action",
 			err:    fmt.Errorf("%w: host holds a lease", scheduler.ErrInvalidAction),
 			status: http.StatusConflict, want: "scheduler: invalid action: host holds a lease",
@@ -231,7 +243,7 @@ func TestActionErrorMapping(t *testing.T) {
 		"roll": `{"all":true}`, "reboot": `{"all":true}`, "hold": `{"hosts":["a"]}`,
 		"unhold": `{"hosts":["a"]}`, "forget": `{"hosts":["a"]}`, "pause": `{}`, "resume": `{}`,
 		"abort": `{"rollout":"r"}`, "skip": `{"rollout":"r","hosts":["a"]}`,
-		"retry": `{"rollout":"r"}`,
+		"retry": `{"rollout":"r"}`, "end-lease": `{"lease":"l"}`,
 	}
 
 	for _, tt := range tests {

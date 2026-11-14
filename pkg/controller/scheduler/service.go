@@ -275,15 +275,18 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 	}
 
 	w.LastLeaseEnd = s.hist.ended
+	w.Ended = s.hist.ledger.leases()
 
 	return w, nil
 }
 
 // history is what the scheduler remembers of the rows that only it writes
 // and that it would otherwise read in full on every tick: the latest closed
-// rollout of every key and the answered directives of the open manual
-// rollouts. It is read from the store once (after a start and after a failed
-// write) and then follows every write. The caller holds service.mu.
+// rollout of every key, the answered directives of the open manual rollouts,
+// and of the lease table the end of every host's last lease and the leases
+// that say which hosts are broken. It is read from the store once (after a
+// start and after a failed write) and then follows every write. The caller
+// holds service.mu.
 type history struct {
 	loaded bool
 	// closed is the latest closed rollout per key. Manual rollouts are left
@@ -294,13 +297,23 @@ type history struct {
 	settled map[string]map[string]*fleet.Directive
 	// ended is, per host, when its most recent terminal lease ended.
 	ended map[string]time.Time
+	// ledger is the digest of the ended leases: per host and group the last
+	// one that broke or repaired the host.
+	ledger ledger
 }
 
-// noteLease takes in a lease that was read or written.
+// noteLease takes in a lease that was read or written. The history keeps
+// the lease itself: nobody changes a lease after it has ended.
 func (h *history) noteLease(l *fleet.Lease) {
-	if l.State.Terminal() && l.EndedAt != nil && l.EndedAt.After(h.ended[l.Host]) {
+	if !l.State.Terminal() {
+		return
+	}
+
+	if l.EndedAt != nil && l.EndedAt.After(h.ended[l.Host]) {
 		h.ended[l.Host] = *l.EndedAt
 	}
+
+	h.ledger.note(l)
 }
 
 // newerRollout orders rollouts by creation, then end, then ID.
@@ -399,8 +412,8 @@ func (s *service) write(ctx context.Context, changes *store.Changes) error {
 	return nil
 }
 
-// loadHistory reads the closed rollouts and the ends of the hosts' last
-// leases once. The caller holds mu.
+// loadHistory reads the closed rollouts and the lease table once. The caller
+// holds mu.
 func (s *service) loadHistory(ctx context.Context) error {
 	if s.hist.loaded {
 		return nil
@@ -421,6 +434,7 @@ func (s *service) loadHistory(ctx context.Context) error {
 		closed:  make(map[string]*fleet.Rollout, len(all)),
 		settled: make(map[string]map[string]*fleet.Directive, 2),
 		ended:   make(map[string]time.Time, len(leases)),
+		ledger:  make(ledger, len(leases)),
 	}
 
 	for _, r := range all {

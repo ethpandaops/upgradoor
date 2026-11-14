@@ -78,6 +78,7 @@ func (h *harness) refreshHealth() {
 	h.health = fleet.NetworkHealth{
 		UpdatedAt: h.now, GenesisTime: testGenesis,
 		SecondsPerSlot: testSecondsPerSlot, SlotsPerEpoch: testSlotsPerEpoch,
+		Phases:       fleet.SinglePhase(testGenesis, testSecondsPerSlot*time.Second),
 		CurrentEpoch: epoch, FinalizedEpoch: epoch - 2, FinalityLagEpochs: 2,
 		LivenessKnown: true, LivenessEpoch: epoch - 1,
 	}
@@ -192,8 +193,13 @@ func (h *harness) finish(name string) {
 	h.tick()
 	h.advance(5 * time.Second)
 	h.tick()
-	h.advance(2 * testEpoch)
-	h.tick()
+
+	// The host keeps syncing: a gap of more than hostStaleAfter would end its
+	// run of healthy syncs.
+	for left := 2 * testEpoch; left > 0; left -= time.Minute {
+		h.advance(min(left, time.Minute))
+		h.tick()
+	}
 }
 
 func TestServiceAssignment(t *testing.T) {
@@ -420,6 +426,7 @@ func TestServiceStartStop(t *testing.T) {
 			return fleet.NetworkHealth{
 				UpdatedAt: time.Now(), GenesisTime: testGenesis,
 				SecondsPerSlot: testSecondsPerSlot, SlotsPerEpoch: testSlotsPerEpoch,
+				Phases: fleet.SinglePhase(testGenesis, testSecondsPerSlot*time.Second),
 			}
 		},
 		Defaults:     fleet.DefaultSettings(),

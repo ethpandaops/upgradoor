@@ -339,13 +339,15 @@ func TestReview2Finding5DeadHostIsNeitherFirstNorCanary(t *testing.T) {
 	assert.False(t, b.lease("dead").Repair)
 }
 
-// Finding 6: a carried member stays carried through pending, expected and
-// pending again. Before, the mark was a prefix of the member's error note,
-// which the change to expected cleared: held and unheld, the host came back
-// as an ordinary member and could become the canary.
-func TestReview2Finding6CarriedMarkSurvivesStateChanges(t *testing.T) {
+// Finding 6: a broken host stays first through pending, expected and pending
+// again. Before, the mark was a prefix of the member's error note, which the
+// change to expected cleared: held and unheld, the host came back as an
+// ordinary member and could become the canary. Now there is no mark: the
+// host's last lease for the image failed, whatever the member's state.
+func TestReview2Finding6BrokenHostStaysFirstThroughStateChanges(t *testing.T) {
 	b := failedOnDigestA(t, "h3", map[string]uint64{"h1": 10, "h2": 10, "h3": 10})
 	first := b.closedOrOpen(imageKey(imgLighthouse, digestA)).ID
+	note := brokenBy(b.lastLease("h3").ID, first)
 	b.advance(time.Minute)
 	seesDigestB(b, "h1", "h2", "h3")
 
@@ -354,7 +356,8 @@ func TestReview2Finding6CarriedMarkSurvivesStateChanges(t *testing.T) {
 	b.step()
 
 	key := imageKey(imgLighthouse, digestB)
-	require.Equal(t, first, b.mustRollout(key).Host("h3").CarriedFrom)
+	require.Equal(t, note, b.mustRollout(key).Host("h3").Error)
+	require.Equal(t, fleet.StageRepair, b.mustRollout(key).Host("h3").Stage)
 	require.Equal(t, fleet.HostPending, b.mustRollout(key).Host("h3").State)
 
 	// The host goes on hold: a held agent reports no need.
@@ -363,7 +366,8 @@ func TestReview2Finding6CarriedMarkSurvivesStateChanges(t *testing.T) {
 	b.get("h3").Status.Needs = nil
 	b.step()
 	require.Equal(t, fleet.HostExpected, b.mustRollout(key).Host("h3").State)
-	assert.Equal(t, first, b.mustRollout(key).Host("h3").CarriedFrom)
+	assert.Equal(t, note, b.mustRollout(key).Host("h3").Error)
+	assert.Equal(t, fleet.StageRepair, b.mustRollout(key).Host("h3").Stage)
 
 	// The hold is lifted: it is still the host that goes first.
 	b.get("h3").HoldWanted = false
@@ -374,16 +378,19 @@ func TestReview2Finding6CarriedMarkSurvivesStateChanges(t *testing.T) {
 	r := b.mustRollout(key)
 
 	assert.Equal(t, []string{"h3"}, b.leasedHosts())
-	assert.Equal(t, first, r.Host("h3").CarriedFrom)
 	assert.Equal(t, fleet.StageRepair, r.Host("h3").Stage)
 	assert.Empty(t, r.Canary)
 	assert.Equal(t, map[string]string{"h1": "after h3", "h2": "after h3"}, queueReasons(out.Plan))
 
-	// Served, it keeps the mark and its stage.
+	// Served, it is in order: the note is gone, and the stage says how it was
+	// served. Its repair was the first success, so nobody waits for a canary.
 	b.serve("h3")
 	r = b.mustRollout(key)
-	assert.Equal(t, first, r.Host("h3").CarriedFrom)
+	assert.Equal(t, fleet.HostDone, r.Host("h3").State)
+	assert.Empty(t, r.Host("h3").Error)
 	assert.Equal(t, fleet.StageRepair, r.Host("h3").Stage)
+	assert.Nil(t, newLedger(b.w.Ended).brokenSince("h3", rolloutGroup(r)))
+	assert.Equal(t, []string{"h1"}, b.leasedHosts())
 }
 
 // Finding 7: the run of healthy syncs must span the window. Before, one

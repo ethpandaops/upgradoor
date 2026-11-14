@@ -21,6 +21,14 @@ var errWrite = errors.New("fakestore: write failed")
 // fakeStore is an in-memory Store. Reads return copies of everything the
 // scheduler may change, like a database would; a host's Status and closed
 // rollouts are shared and must be treated as immutable.
+//
+// Rollouts, leases and directives are kept the way the SQLite store gives
+// them back (storedRollout, storedLease): through their JSON, with times in
+// UTC at millisecond precision and a rollout's members from a table of their
+// own. So what a scheduler reads after a restart is not the object the one
+// before it wrote, and a decision that hangs on a difference between the two
+// (an empty list that comes back as none) shows as a restart that decides
+// differently.
 type fakeStore struct {
 	mu sync.Mutex
 
@@ -59,6 +67,79 @@ func newFakeStore() *fakeStore {
 	}
 }
 
+// storedAt is a time as the store's time columns hold it.
+func storedAt(t time.Time) time.Time { return time.UnixMilli(t.UnixMilli()).UTC() }
+
+func storedAtPtr(t *time.Time) *time.Time {
+	if t == nil {
+		return nil
+	}
+
+	at := storedAt(*t)
+
+	return &at
+}
+
+// viaJSON writes a row as the store's data column holds it and reads it back.
+func viaJSON[T any](row *T) *T {
+	raw, err := json.Marshal(row)
+	if err != nil {
+		panic(fmt.Sprintf("fakestore: encode: %v", err))
+	}
+
+	out := new(T)
+	if err := json.Unmarshal(raw, out); err != nil {
+		panic(fmt.Sprintf("fakestore: decode: %v", err))
+	}
+
+	return out
+}
+
+// storedRollout returns a rollout as store.Commit followed by a read gives it
+// back: everything but the members through JSON, the members from their
+// table, ordered by host and never nil.
+func storedRollout(r *fleet.Rollout) *fleet.Rollout {
+	bare := *r
+	bare.Hosts = nil
+	bare.CreatedAt = storedAt(bare.CreatedAt)
+	bare.UpdatedAt = storedAt(bare.UpdatedAt)
+	bare.EndedAt = storedAtPtr(bare.EndedAt)
+
+	out := viaJSON(&bare)
+	out.Hosts = make([]fleet.RolloutHost, 0, max(len(r.Hosts), 8))
+
+	for i := range r.Hosts {
+		m := r.Hosts[i]
+		m.UpdatedAt = storedAt(m.UpdatedAt)
+		out.Hosts = append(out.Hosts, m)
+	}
+
+	slices.SortStableFunc(out.Hosts, func(a, b fleet.RolloutHost) int { return cmp.Compare(a.Host, b.Host) })
+
+	return out
+}
+
+// storedLease returns a lease as store.Commit followed by a read gives it
+// back.
+func storedLease(l *fleet.Lease) *fleet.Lease {
+	bare := *l
+	bare.GrantedAt = storedAt(bare.GrantedAt)
+	bare.ExpiresAt = storedAt(bare.ExpiresAt)
+	bare.AgentDoneAt = storedAtPtr(bare.AgentDoneAt)
+	bare.SyncedSince = storedAtPtr(bare.SyncedSince)
+	bare.SyncedUntil = storedAtPtr(bare.SyncedUntil)
+	bare.EndedAt = storedAtPtr(bare.EndedAt)
+
+	if l.Operation != nil {
+		op := *l.Operation
+		op.StartedAt = storedAt(op.StartedAt)
+		op.UpdatedAt = storedAt(op.UpdatedAt)
+		bare.Operation = &op
+	}
+
+	return viaJSON(&bare)
+}
+
 // writable reports an injected failure. The caller holds mu.
 func (s *fakeStore) writable() error {
 	if s.failWrites {
@@ -86,6 +167,21 @@ func (s *fakeStore) putHost(h *fleet.Host) {
 
 	c := *h
 	s.hosts[h.Name] = &c
+}
+
+// put stores rollouts directly, whatever failures are injected: rows that
+// somebody else wrote (another build).
+func (s *fakeStore) put(rollouts ...*fleet.Rollout) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for _, r := range rollouts {
+		if _, ok := s.rollouts[r.ID]; !ok {
+			s.rolloutSeq = append(s.rolloutSeq, r.ID)
+		}
+
+		s.rollouts[r.ID] = storedRollout(r)
+	}
 }
 
 // recordSync stores a sync as store.RecordSync does: the host is created or
@@ -388,7 +484,7 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 			s.rolloutSeq = append(s.rolloutSeq, r.ID)
 		}
 
-		s.rollouts[r.ID] = cloneRollout(r)
+		s.rollouts[r.ID] = storedRollout(r)
 	}
 
 	for _, l := range ch.Leases {
@@ -396,7 +492,7 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 			s.leaseSeq = append(s.leaseSeq, l.ID)
 		}
 
-		s.leases[l.ID] = cloneLease(l)
+		s.leases[l.ID] = storedLease(l)
 	}
 
 	for _, d := range ch.Directives {
@@ -405,6 +501,8 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 		}
 
 		c := *d
+		c.CreatedAt = storedAt(c.CreatedAt)
+		c.UpdatedAt = storedAt(c.UpdatedAt)
 		s.directives[d.ID] = &c
 	}
 

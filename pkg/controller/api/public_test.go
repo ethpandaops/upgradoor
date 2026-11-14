@@ -194,6 +194,7 @@ func leakFixture(t *testing.T, h *harness) {
 		UpdatedAt: testEpoch, Error: secretBeaconError,
 		GenesisTime:    testEpoch.Add(-24 * time.Hour),
 		SecondsPerSlot: 12, SlotsPerEpoch: 32, HeadSlot: 7200, CurrentEpoch: 225,
+		Phases:         fleet.SinglePhase(testEpoch.Add(-24*time.Hour), 12*time.Second),
 		FinalizedEpoch: 223, FinalityLagEpochs: 2, LivenessKnown: true, LivenessEpoch: 224,
 		Tracked: 200, Live: 190,
 	}
@@ -240,6 +241,8 @@ func TestPublicEndpointsLeakNothing(t *testing.T) {
 		"updatedAt", "error", "genesisTime", "secondsPerSlot", "slotsPerEpoch", "headSlot",
 		"currentEpoch", "finalizedEpoch", "finalityLagEpochs", "livenessKnown",
 		"livenessEpoch", "livenessUnsupported", "tracked", "live",
+		// The chain's slot phases: public chain data.
+		"phases", "epoch", "start", "slotMs",
 	}
 
 	tests := []struct {
@@ -547,6 +550,40 @@ func TestPublicHistory(t *testing.T) {
 	h.store.liveness = nil
 	assert.JSONEq(t, `[]`, string(decodeJSON[map[string]json.RawMessage](t,
 		h.get("/api/v1/public/history"))["epochs"]))
+}
+
+// TestParticipationTimesAcrossASlotDurationFork: the history stamps every
+// epoch with its real end, also when the slot duration changed inside the
+// window; an epoch that cannot be placed carries no time.
+func TestParticipationTimesAcrossASlotDurationFork(t *testing.T) {
+	genesis := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	fork := genesis.Add(100 * 384 * time.Second)
+	health := &fleet.NetworkHealth{
+		SlotsPerEpoch: 32, CurrentEpoch: 103,
+		Phases: []fleet.SlotPhase{
+			{Epoch: 0, Start: genesis, SlotMs: 12000},
+			{Epoch: 100, Start: fork, SlotMs: 4500},
+		},
+	}
+	rows := []fleet.Liveness{
+		{Host: "a", Epoch: 98, Live: 1, Total: 1},
+		{Host: "a", Epoch: 99, Live: 1, Total: 1},
+		{Host: "a", Epoch: 100, Live: 1, Total: 1},
+		{Host: "a", Epoch: 102, Live: 1, Total: 1},
+	}
+
+	got := participation(rows, health)
+	require.Len(t, got, 4)
+	assert.Equal(t, fork.Add(-384*time.Second), got[0].Time, "the end of epoch 98")
+	assert.Equal(t, fork, got[1].Time, "epoch 99 ends where the fork begins")
+	assert.Equal(t, fork.Add(144*time.Second), got[2].Time, "4.5 s slots: 144 s epochs")
+	assert.Equal(t, fork.Add(3*144*time.Second), got[3].Time)
+	assert.InDelta(t, 144, health.EpochDuration().Seconds(), 0)
+
+	health.Phases = nil
+	for _, point := range participation(rows, health) {
+		assert.True(t, point.Time.IsZero())
+	}
 }
 
 // A scheduler may quote the beacon error in a gate reason. The public view

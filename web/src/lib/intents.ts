@@ -1,7 +1,7 @@
 // The confirm-dialog intents shared by several views.
 
 import type { ActionIntent } from '../components/ActionDialog';
-import { buildHoldRequest, buildRolloutHostsRequest, buildScopeRequest } from './actionRequests';
+import { buildEndLeaseRequest, buildHoldRequest, buildRolloutHostsRequest, buildScopeRequest } from './actionRequests';
 import { plural } from './format';
 
 /** holdIntent builds the confirm dialog of hold / unhold / forget. */
@@ -41,5 +41,15 @@ export function hostsIntent(
     kind: 'call',
     title,
     make: reason => ({ action, body: buildRolloutHostsRequest(rollout, hosts, reason) }),
+  };
+}
+
+/** endLeaseIntent ends one open lease that its agent has started, as failed. */
+export function endLeaseIntent(lease: string, host: string): ActionIntent {
+  return {
+    kind: 'call',
+    title: `End the lease of ${host}`,
+    danger: true,
+    make: reason => ({ action: 'end-lease', body: buildEndLeaseRequest(lease, reason) }),
   };
 }

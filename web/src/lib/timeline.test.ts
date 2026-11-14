@@ -150,6 +150,27 @@ describe('forecast', () => {
   const base = { now: NOW, typicalMs: 10 * MIN, horizonMs: 600 * MIN, active: [] };
   const starts = (f: { slots: { host: string; start: number }[] }) => f.slots.map(s => [s.host, (s.start - NOW) / MIN]);
 
+  it('judges an order wait by the rollout it is about, and lets no lease of another rollout hold a host back', () => {
+    // "b" waits for its place in r1; it is also in r2, where "x" holds a lease.
+    const queue: QueueEntry[] = [
+      { host: 'b', position: 1, reason: 'after canary c', wait: 'order', rollout: 'r1', rollouts: ['r1', 'r2'] },
+    ];
+    const active = [{ host: 'x', start: NOW, weight: 0, rollouts: ['r2'] }];
+    const costs = weights(0, 'b');
+
+    // With stages: x is in an earlier stage of r2, which the wait is not about.
+    const stageOf: StageOf = (rollout, host) => (rollout === 'r2' ? (host === 'x' ? 2 : 3) : undefined);
+    expect(starts(forecast({ ...base, active, queue, budget: budget(), costs, stageOf }))).toEqual([['b', 0]]);
+
+    // Without stages: a lease that shares no rollout with the wait is not ahead.
+    const elsewhere = [{ host: 'x', start: NOW, weight: 0, rollouts: ['r9'] }];
+    expect(starts(forecast({ ...base, active: elsewhere, queue, budget: budget(), costs }))).toEqual([['b', 0]]);
+
+    // A lease of the rollout the wait is about is.
+    const same = [{ host: 'x', start: NOW, weight: 0, rollouts: ['r1'] }];
+    expect(starts(forecast({ ...base, active: same, queue, budget: budget(), costs }))).toEqual([['b', 10]]);
+  });
+
   it('gives no slot to a host that waits for one that is not in the queue and holds no lease', () => {
     // "x" is expected to report its need: nobody knows when it will go.
     const queue = [

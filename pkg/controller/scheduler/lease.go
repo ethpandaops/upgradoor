@@ -4,7 +4,6 @@ import (
 	"fmt"
 	"math"
 	"slices"
-	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -22,6 +21,9 @@ const (
 	// noteAwaitSync is the readiness note until the agent has synced once
 	// after its done report.
 	noteAwaitSync = "waiting for a sync after the operation"
+	// noteAwaitSyncStart is the readiness note after a controller start
+	// until the agent has synced with it.
+	noteAwaitSyncStart = "waiting for a sync after the controller's start"
 )
 
 // advanceLeases moves every open lease along its lifecycle from the host's
@@ -252,17 +254,17 @@ func (p *pass) validatorsReady(l *fleet.Lease, hv *hostView) (ready bool, note s
 		return true, noteAttesting
 	}
 
-	epoch := p.w.Health.EpochDuration()
-	if epoch <= 0 || p.w.Health.GenesisTime.IsZero() {
-		return false, noteEpochTiming
-	}
-
 	want := attestationBar(p.set.MinParticipationPercent, hv.weight)
 	run := uint64(0)
 
 	if p.haveRows {
 		for e := p.newestEpoch; ; e-- {
-			start := p.w.Health.GenesisTime.Add(time.Duration(e) * epoch)
+			// An epoch that cannot be placed in time proves nothing.
+			start, placed := p.w.Health.EpochStart(e)
+			if !placed {
+				return false, noteEpochTiming
+			}
+
 			row, ok := p.rows[l.Host][e]
 
 			if start.Before(*l.AgentDoneAt) || !ok || row.Live < want {
@@ -290,25 +292,49 @@ func attestationBar(percent float64, weight uint64) uint64 {
 }
 
 // nodeReady: the agent's probes reported the node at head with enough peers
-// on every sync of an unbroken run that spans readyEpochs epoch durations:
-// the newest sync of the run, which is the host's last one, came at least
-// that long after the first. Time that passes without a sync proves nothing.
-// A host with no probe configured is ready after such a run of syncs.
+// on every sync of an unbroken run that spans readyEpochs epochs: the newest
+// sync of the run, which is the host's last one, came at least that long
+// after the first. A run is unbroken when every sync in it was healthy, no
+// two consecutive ones lie more than hostStaleAfter apart, and all of it
+// lies after the scheduler's start: a bad sync, silence and a controller
+// restart each end it, and the next healthy sync starts a new one. A host
+// with no probe configured is ready after such a run of syncs. Of a run that
+// began before genesis only the part from genesis on is measured.
 func (p *pass) nodeReady(l *fleet.Lease, hv *hostView) (ready bool, note string) {
 	seen := hv.h.LastSeen
 
-	if hv.h.Status == nil || !seen.After(*l.AgentDoneAt) {
-		l.SyncedSince = nil
+	switch {
+	case hv.h.Status == nil || !seen.After(*l.AgentDoneAt):
+		endRun(l)
 
 		return false, noteAwaitSync
+	case seen.Before(p.w.Since):
+		// What the host said to the controller before its restart is not a
+		// sync of this run.
+		endRun(l)
+
+		return false, noteAwaitSyncStart
 	}
 
 	node := hv.h.Status.Node
 
 	if missing := node.Missing(p.minPeers()); missing != "" {
-		l.SyncedSince = nil
+		endRun(l)
 
 		return false, missing
+	}
+
+	if hv.stale {
+		endRun(l)
+
+		return false, reasonAgentSilent
+	}
+
+	// A run from before the scheduler's start, or with a gap of more than
+	// hostStaleAfter before this sync, is over: this sync starts a new one.
+	if l.SyncedSince != nil && (l.SyncedUntil == nil || l.SyncedSince.Before(p.w.Since) ||
+		seen.Sub(*l.SyncedUntil) > p.set.HostStaleAfter.Std()) {
+		endRun(l)
 	}
 
 	if l.SyncedSince == nil {
@@ -316,9 +342,8 @@ func (p *pass) nodeReady(l *fleet.Lease, hv *hostView) (ready bool, note string)
 		l.SyncedSince = &since
 	}
 
-	if hv.stale {
-		return false, reasonAgentSilent
-	}
+	until := seen
+	l.SyncedUntil = &until
 
 	note, wait := noteNodeReady, "%s, waiting for it to stay so for %s"
 	if node.EL == nil && node.CL == nil {
@@ -329,25 +354,40 @@ func (p *pass) nodeReady(l *fleet.Lease, hv *hostView) (ready bool, note string)
 		return true, note
 	}
 
-	epoch := p.w.Health.EpochDuration()
-	if epoch <= 0 {
+	// A run that began before the chain did (before the first slot phase)
+	// counts from there: no epoch begins earlier, so the readyEpochs epochs are
+	// the chain's first ones.
+	began := *l.SyncedSince
+	if first, known := p.w.Health.TimingStart(); known {
+		began = later(began, first)
+	}
+
+	window, placed := p.w.Health.EpochSpan(began, p.set.ReadyEpochs)
+	if !placed {
 		return false, noteEpochTiming
 	}
 
-	window := time.Duration(p.set.ReadyEpochs) * epoch
-	if seen.Sub(*l.SyncedSince) < window {
+	if seen.Sub(began) < window {
 		return false, fmt.Sprintf(wait, note, window)
 	}
 
 	return true, note
 }
 
-// endLease closes a lease and frees the host's slot.
+// endRun ends the lease's run of healthy syncs.
+func endRun(l *fleet.Lease) {
+	l.SyncedSince = nil
+	l.SyncedUntil = nil
+}
+
+// endLease closes a lease and frees the host's slot. What the end says about
+// the host (broken, repaired, nothing) is on record from here on.
 func (p *pass) endLease(l *fleet.Lease, state fleet.LeaseState) {
 	ended := p.now
 	l.State = state
 	l.EndedAt = &ended
 	p.ended[l.Host] = true
+	p.ledger.note(l)
 
 	if hv := p.hosts[l.Host]; hv != nil && hv.lease == l {
 		hv.lease = nil
@@ -395,6 +435,7 @@ func (p *pass) expireLease(l *fleet.Lease, reason string) {
 		p.setMember(m, fleet.HostPending)
 	}
 
+	p.settleClosed(l)
 	p.record("lease.expired", l.Host, map[string]any{keyLease: l.ID, keyReason: reason})
 }
 
@@ -416,6 +457,7 @@ func (p *pass) releaseLease(l *fleet.Lease) {
 		p.setMember(m, fleet.HostPending)
 	}
 
+	p.settleClosed(l)
 	p.record("lease.released", l.Host, map[string]any{
 		keyLease: l.ID, keyForce: l.Force,
 		// What the controller saw before it gave the slot back.
@@ -461,9 +503,99 @@ func (p *pass) failLease(l *fleet.Lease, reason string) {
 		}
 	}
 
+	p.settleClosed(l)
 	p.record("lease.failed", l.Host, map[string]any{
 		keyLease: l.ID, keyReason: reason, keyRollouts: halted,
 	})
+}
+
+// settleClosed gives the host's member in every closed rollout that the
+// ended lease served the lease's outcome, for whoever looks at the closed
+// rollout: no decision reads it. A rollout that is closed while one of its
+// leases is open (superseded, aborted) leaves the member leased; the lease
+// finishes all the same. Its end halts nothing there: the rollout is closed.
+// What the end means for the rollouts that follow is read off the lease
+// (ledger). Only the latest closed rollout of a key is at hand; an older one
+// keeps its leased member.
+func (p *pass) settleClosed(l *fleet.Lease) {
+	ids := invert(l.Rollouts)
+
+	for _, id := range sortedKeys(ids) {
+		r := p.rolloutByID[id]
+		if r != nil && !r.State.Terminal() {
+			continue
+		}
+
+		if r == nil {
+			r = p.closedCopy(id, l)
+		}
+
+		if r == nil {
+			continue
+		}
+
+		m := r.Host(l.Host)
+		if m == nil || m.State != fleet.HostLeased || m.LeaseID != l.ID {
+			continue
+		}
+
+		done := stepsDone(l, id)
+
+		switch {
+		case l.State == fleet.LeaseReleased && done:
+			p.setMember(m, fleet.HostDone)
+		case l.State == fleet.LeaseFailed && !done:
+			p.setMember(m, fleet.HostFailed)
+			m.Error = l.Error
+		case l.State == fleet.LeaseFailed:
+			m.LeaseID = ""
+			p.setMember(m, fleet.HostDone)
+		default:
+			m.LeaseID = ""
+			p.setMember(m, fleet.HostPending)
+		}
+	}
+}
+
+// invert returns the values of a map as the keys of a set.
+func invert(m map[string]string) map[string]bool {
+	out := make(map[string]bool, len(m))
+	for _, v := range m {
+		out[v] = true
+	}
+
+	return out
+}
+
+// closedCopy returns a copy to change of the closed rollout with the ID, if
+// it is the latest closed one of its key and the lease's end changes
+// anything in it, and queues it for writing.
+func (p *pass) closedCopy(id string, l *fleet.Lease) *fleet.Rollout {
+	for _, r := range p.closedDirty {
+		if r.ID == id {
+			return r
+		}
+	}
+
+	for _, key := range sortedKeys(p.closedLatest) {
+		r := p.closedLatest[key]
+		if r.ID != id {
+			continue
+		}
+
+		m := r.Host(l.Host)
+		if m == nil || m.State != fleet.HostLeased || m.LeaseID != l.ID {
+			return nil
+		}
+
+		c := cloneRollout(r)
+		p.closedLatest[key] = c
+		p.closedDirty = append(p.closedDirty, c)
+
+		return c
+	}
+
+	return nil
 }
 
 // stepsDone reports whether the agent reported done for every need the lease
@@ -549,8 +681,10 @@ func (p *pass) knownLease(id string) bool {
 // reopen takes back the expiry of a lease whose agent started after all:
 // its sync from before the start arrived after the grace period, or the
 // agent ran past its deadline. The host is down, so it holds the lease
-// again; where it still waits in the rollouts the lease served, it is leased
-// again.
+// again; where it still waits in the open rollouts the lease served, it is
+// leased again. Where a rollout it served was closed meanwhile nothing is to
+// be done: the lease is open, so it is in flight for the rollouts that follow
+// (inFlight), and how it ends is on record like the end of any lease.
 func (p *pass) reopen(hv *hostView, closed *fleet.Lease, op *protocol.Operation) {
 	l := cloneLease(closed)
 	l.State = fleet.LeaseRunning
@@ -584,12 +718,16 @@ func (p *pass) reopen(hv *hostView, closed *fleet.Lease, op *protocol.Operation)
 // state and links it to the open rollouts whose needs its steps name.
 func (p *pass) adopt(hv *hostView, op *protocol.Operation) {
 	l := &fleet.Lease{
-		ID:        op.LeaseID,
-		Host:      hv.h.Name,
-		State:     fleet.LeaseRunning,
-		Rollouts:  make(map[string]string, len(op.Steps)),
-		Weight:    hv.weight,
-		Charged:   hv.live,
+		ID:       op.LeaseID,
+		Host:     hv.h.Name,
+		State:    fleet.LeaseRunning,
+		Rollouts: make(map[string]string, len(op.Steps)),
+		Weight:   hv.weight,
+		Charged:  hv.live,
+		// Nobody knows how an adopted lease was granted. While the gate is
+		// closed, the lease of a host with validators counts as a repair for
+		// the one-at-a-time rule: no repair is granted next to it.
+		Repair:    hv.weight > 0 && !p.gate().OK,
 		GrantedBy: grantedByAdoption,
 		GrantedAt: p.now,
 		ExpiresAt: p.now.Add(p.set.LeaseTTL.Std()),

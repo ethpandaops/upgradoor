@@ -103,7 +103,7 @@ func loadRolloutHosts(ctx context.Context, tx *sql.Tx, rollouts []*fleet.Rollout
 	}
 
 	stmt, err := tx.PrepareContext(ctx, `
-		SELECT host, state, stage, need_id, lease_id, error, carried_from, updated_at
+		SELECT host, state, stage, need_id, lease_id, error, updated_at
 		FROM rollout_hosts WHERE rollout_id = ? ORDER BY host`)
 	if err != nil {
 		return err
@@ -128,7 +128,7 @@ func loadRolloutHosts(ctx context.Context, tx *sql.Tx, rollouts []*fleet.Rollout
 			)
 
 			err := rows.Scan(&host.Host, &state, &stage, &host.NeedID, &host.LeaseID,
-				&host.Error, &host.CarriedFrom, &updatedAt)
+				&host.Error, &updatedAt)
 			if err != nil {
 				return errors.Join(err, rows.Close())
 			}
@@ -368,13 +368,13 @@ func upsertRollout(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) erro
 
 	err = insertBatched(ctx, tx, `
 		INSERT INTO rollout_hosts
-			(rollout_id, host, state, stage, need_id, lease_id, error, carried_from, updated_at) VALUES `,
-		9, len(rollout.Hosts),
+			(rollout_id, host, state, stage, need_id, lease_id, error, updated_at) VALUES `,
+		8, len(rollout.Hosts),
 		func(args []any, i int) []any {
 			h := &rollout.Hosts[i]
 
 			return append(args, rollout.ID, h.Host, string(h.State), int(h.Stage), h.NeedID,
-				h.LeaseID, h.Error, h.CarriedFrom, millis(h.UpdatedAt))
+				h.LeaseID, h.Error, millis(h.UpdatedAt))
 		})
 	if err != nil {
 		return fmt.Errorf("store hosts of rollout %s: %w", rollout.ID, err)
@@ -398,6 +398,7 @@ func upsertLease(ctx context.Context, tx *sql.Tx, lease *fleet.Lease) error {
 	stored.ExpiresAt = storedTime(stored.ExpiresAt)
 	stored.AgentDoneAt = storedTimePtr(stored.AgentDoneAt)
 	stored.SyncedSince = storedTimePtr(stored.SyncedSince)
+	stored.SyncedUntil = storedTimePtr(stored.SyncedUntil)
 	stored.EndedAt = storedTimePtr(stored.EndedAt)
 
 	if lease.Operation != nil {

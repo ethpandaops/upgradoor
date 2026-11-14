@@ -128,7 +128,7 @@ describe('MockController, the order inside a rollout', () => {
     expect(rollout.canary).toBe(healthy);
   });
 
-  it('lets one repair at a time pass the closed gate, whatever the order', async () => {
+  it('lets one repair at a time pass the closed gate, whatever the order of its rollout', async () => {
     const mock = await roomy(new MockController());
     mock.setGateFailing(true);
 
@@ -144,11 +144,19 @@ describe('MockController, the order inside a rollout', () => {
     const plan = await call<Plan>(mock, 'plan');
     expect(plan.gate.ok).toBe(false);
 
-    // Everybody the gate concerns waits for it, but one host that is offline.
+    // Everybody the gate concerns waits for it, but the hosts that are
+    // offline: one passes, the others wait for its repair.
     const passing = list(plan.queue).filter(q => clearsByItself(q.wait));
-    expect(passing).toHaveLength(1);
-    expect(plan.hosts?.[passing[0]?.host ?? '']?.live).toBe(0);
-    expect(passing[0]?.wait).not.toBe('order');
+    const first = passing.filter(q => q.wait !== 'order');
+    expect(first).toHaveLength(1);
+    expect(passing.length).toBeGreaterThan(1);
+
+    for (const q of passing) {
+      expect(plan.hosts?.[q.host]?.live).toBe(0);
+      if (q === first[0]) continue;
+      expect(q).toMatchObject({ wait: 'order', reason: `after repair of ${first[0]?.host}`, after: first[0]?.host });
+    }
+
     expect(list(plan.queue).filter(q => q.wait === 'gate').length).toBeGreaterThan(1);
   });
 
@@ -163,6 +171,90 @@ describe('MockController, the order inside a rollout', () => {
     const other = await stagger(await roomy(new MockController()), ['tooling-1', 'rpc-1', 'bootnode-1']);
     expect(other.rollout.canary).toBe('bootnode-1');
     expect(other.reasons.get('rpc-1')?.reason).toBe('after canary bootnode-1');
+  });
+});
+
+describe('MockController, broken hosts and leases that a person ends', () => {
+  const open = async (mock: MockController, title: string) => {
+    const rollouts = await call<Rollouts>(mock, 'rollouts');
+    const rollout = list(rollouts.open).find(r => r.title.includes(title));
+    if (!rollout) throw new Error(`no open rollout ${title}`);
+    return { rollout, leases: list(rollouts.leases), recent: list(rollouts.recentLeases) };
+  };
+  const member = (r: Rollout, host: string) => list(r.hosts).find(m => m.host === host);
+
+  it('puts a host whose last lease for the image failed first, with the lease in its note', async () => {
+    const mock = await roomy(new MockController());
+    const before = await open(mock, 'nethermind');
+    const failed = member(before.rollout, 'nimbus-nethermind-1');
+    expect(failed).toMatchObject({ state: 'failed' });
+
+    await call<ActionResult>(mock, 'actions/retry', { rollout: before.rollout.id, hosts: [], reason: 'again' });
+    const plan = await call<Plan>(mock, 'plan');
+    const { rollout } = await open(mock, 'nethermind');
+
+    expect(member(rollout, 'nimbus-nethermind-1')).toMatchObject({
+      state: 'pending',
+      stage: 1,
+      error: `broken since lease ${failed?.leaseId ?? ''} (rollout ${rollout.id})`,
+    });
+    expect(rollout.canary).toBeUndefined();
+
+    const waits = new Map(list(plan.queue).map(q => [q.host, q]));
+    expect(waits.get('nimbus-nethermind-2')).toMatchObject({
+      reason: 'after nimbus-nethermind-1',
+      wait: 'order',
+      after: 'nimbus-nethermind-1',
+    });
+    expect(waits.get('nimbus-nethermind-1')?.wait).not.toBe('order');
+  });
+
+  it('ends a lease that the agent has started as failed: its rollout halts and the host is broken', async () => {
+    const mock = await roomy(new MockController());
+    const before = await open(mock, 'lighthouse');
+    const lease = before.leases.find(l => l.host === 'lighthouse-geth-2');
+    expect(lease?.state).toBe('verifying');
+
+    const res = await call<ActionResult>(mock, 'actions/end-lease', { lease: lease?.id, reason: 'host taken away' });
+    expect(res.hosts).toStrictEqual(['lighthouse-geth-2']);
+
+    const { rollout, leases, recent } = await open(mock, 'lighthouse');
+    expect(leases.some(l => l.id === lease?.id)).toBe(false);
+    expect(recent.find(l => l.id === lease?.id)).toMatchObject({ state: 'failed', error: 'ended by operator' });
+    expect(rollout).toMatchObject({ state: 'halted', reason: 'lighthouse-geth-2: ended by operator' });
+    expect(member(rollout, 'lighthouse-geth-2')).toMatchObject({ state: 'failed', error: 'ended by operator' });
+
+    const audit = await call<{ entries: { action: string; target?: string; detail?: Record<string, unknown> }[] }>(
+      mock,
+      'audit?limit=5'
+    );
+    expect(audit.entries.find(e => e.action === 'action.end-lease')).toMatchObject({
+      target: 'lighthouse-geth-2',
+      detail: { lease: lease?.id, reason: 'host taken away' },
+    });
+
+    // Retried, it goes first.
+    await call<ActionResult>(mock, 'actions/retry', { rollout: rollout.id, hosts: [], reason: 'again' });
+    await call<Plan>(mock, 'plan');
+    const after = await open(mock, 'lighthouse');
+    expect(member(after.rollout, 'lighthouse-geth-2')).toMatchObject({
+      stage: 1,
+      error: `broken since lease ${lease?.id ?? ''} (rollout ${rollout.id})`,
+    });
+  });
+
+  it('refuses to end a lease that is unknown or over', async () => {
+    const mock = new MockController();
+    const end = async (lease: string) =>
+      mock.fetch('/api/v1/actions/end-lease', { method: 'POST', body: JSON.stringify({ lease, reason: '' }) });
+
+    expect((await end('nosuchlease')).status).toBe(404);
+
+    const { recent } = await open(mock, 'lighthouse');
+    const over = recent.find(l => l.state === 'released');
+    const res = await end(over?.id ?? '');
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: expect.stringContaining('is released') as unknown });
   });
 });
 

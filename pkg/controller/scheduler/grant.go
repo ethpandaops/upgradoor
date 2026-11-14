@@ -6,7 +6,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
-	"time"
+	"strings"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -27,6 +27,7 @@ const (
 	reasonGatePrefix    = "network gate: "
 	reasonAfter         = "after "
 	reasonAfterCanary   = "after canary "
+	reasonAfterRepair   = "after repair of "
 	reasonNext          = "next"
 )
 
@@ -34,6 +35,10 @@ const (
 const (
 	gateBeacon   = "beacon node unreachable"
 	gateLiveness = "liveness data stale"
+	// gateTimingPrefix starts the reason of a gate that is closed because the
+	// beacon node's chain timing cannot place the current epoch; the beacon
+	// service's reason follows.
+	gateTimingPrefix = "chain timing out of bounds: "
 )
 
 // Ranks of the waiting reasons. A higher rank is closer to being granted.
@@ -158,7 +163,12 @@ func (p *pass) gate() Gate {
 	n := &p.w.Health
 	epoch := n.EpochDuration()
 
-	if n.UpdatedAt.IsZero() || epoch <= 0 || p.now.Sub(n.UpdatedAt) > 2*epoch {
+	switch {
+	case n.TimingError != "":
+		// The node answers, but what it says about slots and epochs cannot be
+		// worked with: that is not a node that is unreachable.
+		g.Reasons = append(g.Reasons, gateTimingPrefix+n.TimingError)
+	case n.UpdatedAt.IsZero() || epoch <= 0 || p.now.Sub(n.UpdatedAt) > 2*epoch:
 		g.Reasons = append(g.Reasons, gateBeacon)
 	}
 
@@ -172,11 +182,16 @@ func (p *pass) gate() Gate {
 	for _, hv := range p.hosts {
 		tracked += hv.weight
 
-		// Validators of hosts holding a lease are left out on both sides:
-		// a rollout must not close the gate on itself.
+		// A lease takes out of the gate what it took offline: the validators
+		// that were live when it was granted are left out on both sides, so a
+		// rollout does not close the gate on itself. Those that were offline
+		// already stay in, as not live: a lease must not hide them, least of
+		// all a repair, which would open the gate for everybody else.
 		if hv.lease == nil {
 			total += hv.weight
 			live += hv.live
+		} else {
+			total += hv.weight - min(hv.lease.Charged, hv.weight)
 		}
 	}
 
@@ -229,20 +244,27 @@ func (p *pass) policyVerdict(r *fleet.Rollout) verdict {
 	}
 }
 
-// orderVerdict applies the order inside one rollout to one host. A carried
-// host waits for nobody. Every other host waits for each carried member that
-// is still to be served, and, until the rollout has its first success, for
-// the canary.
+// orderVerdict applies the order inside one rollout to one host. A host that
+// is broken for the rollout's group waits for nobody. Every other host waits
+// for each member whose host is broken and that is still to be served, for a
+// lease that is in flight for the rollout, and, until the rollout has its
+// first success, for the canary.
 func (p *pass) orderVerdict(r *fleet.Rollout, hv *hostView) verdict {
-	if m := r.Host(hv.h.Name); m == nil || m.CarriedFrom != "" {
+	if m := r.Host(hv.h.Name); m == nil || p.broken(r, m.Host) {
 		return verdict{}
 	}
 
-	if m := p.carriedAwaited(r); m != nil {
+	if m := p.brokenAwaited(r); m != nil {
 		return verdict{rank: rankOrder, reason: reasonAfter + m.Host, after: m.Host}
 	}
 
-	if r.Canary == "" || r.Canary == hv.h.Name || succeeded(r) {
+	// A lease of a closed rollout of the group that is still open is the
+	// canary in flight: no second host goes down before it has ended.
+	if host := p.inFlight(r); host != "" {
+		return verdict{rank: rankOrder, reason: reasonAfter + host, after: host}
+	}
+
+	if r.Canary == "" || r.Canary == hv.h.Name || p.succeeded(r) {
 		return verdict{}
 	}
 
@@ -263,9 +285,11 @@ type granter struct {
 	// forced names the force rollouts that were granted a host in this
 	// pass; they get one host per reconcile.
 	forced map[string]bool
-	// repairOpen: a lease that was granted through the repair exception of
-	// the gate is open, from an earlier pass or this one.
-	repairOpen bool
+	// repairHost is the host of a lease that was granted through the repair
+	// exception of the gate and was open when the pass began, or was granted
+	// in it. While it is set no further repair is granted: each repair has
+	// ended, however it ended, a reconcile before the next begins.
+	repairHost string
 }
 
 // evaluate decides whether the host's needs in one rollout are grantable
@@ -290,8 +314,12 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 	}
 
 	if !r.IgnoreBudget && !g.gate.OK {
-		if !g.repairs(hv) {
+		switch {
+		case !g.repairable(hv):
 			return verdict{rank: rankGate, reason: reasonGatePrefix + g.gate.Reasons[0]}, nil, false
+		case g.repairHost != "":
+			// Its repair would pass the gate, but one repair at a time.
+			return verdict{rank: rankOrder, reason: reasonAfterRepair + g.repairHost, after: g.repairHost}, nil, false
 		}
 
 		repair = true
@@ -313,20 +341,22 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 	return verdict{}, needs, false
 }
 
-// repairs reports whether a grant to the host passes a closed gate: the
-// repair exception. The host has validators and none of them attests, so
+// repairable reports whether the repair exception of a closed gate applies
+// to the host, the one-at-a-time rule aside. The host has validators and none of them attests, so
 // serving it cannot make the network worse and may be what brings it back;
 // without the exception a host that keeps participation below the gate would
 // keep its own repair away for ever. The exception is bounded:
 //
 //   - it needs data it can trust: a gate that is closed because the beacon
-//     view or the liveness data is missing passes nobody;
+//     view, its chain timing or the liveness data is missing passes nobody;
 //   - one at a time: nobody passes while a lease that was granted through the
-//     exception is still open, in whatever rollout;
+//     exception is open, in whatever rollout, nor in the pass in which such a
+//     lease ended (repairHost; the caller checks it);
 //   - the host must be established as offline (see offline).
-func (g *granter) repairs(hv *hostView) bool {
-	if g.repairOpen || slices.Contains(g.gate.Reasons, gateBeacon) ||
-		slices.Contains(g.gate.Reasons, gateLiveness) {
+func (g *granter) repairable(hv *hostView) bool {
+	if slices.ContainsFunc(g.gate.Reasons, func(reason string) bool {
+		return reason == gateBeacon || reason == gateLiveness || strings.HasPrefix(reason, gateTimingPrefix)
+	}) {
 		return false
 	}
 
@@ -335,8 +365,8 @@ func (g *granter) repairs(hv *hostView) bool {
 
 // offline reports whether the host is established as offline: it has
 // validators, holds no lease, and none of its validators attested in the two
-// newest stored liveness epochs, both of which began after the host's last
-// lease ended and after this database first saw the host. One epoch without
+// newest stored liveness epochs, both of which began (strictly) after the
+// host's last lease ended and after this database first saw the host. One epoch without
 // attestations can be a glitch of the whole network, and a host that has just
 // been rolled or rebooted (by any rollout, successfully or not) is still on
 // its way back: neither is a host to repair.
@@ -345,8 +375,9 @@ func (p *pass) offline(hv *hostView) bool {
 		return false
 	}
 
-	epoch := p.w.Health.EpochDuration()
-	if epoch <= 0 || p.w.Health.GenesisTime.IsZero() {
+	// An epoch that cannot be placed in time establishes nothing.
+	began, placed := p.w.Health.EpochStart(p.newestEpoch - 1)
+	if !placed {
 		return false
 	}
 
@@ -358,9 +389,7 @@ func (p *pass) offline(hv *hostView) bool {
 		}
 	}
 
-	began := p.w.Health.GenesisTime.Add(time.Duration(p.newestEpoch-1) * epoch)
-
-	return !began.Before(later(p.lastLeaseEnd(hv.h.Name), hv.h.FirstSeen))
+	return began.After(later(p.lastLeaseEnd(hv.h.Name), hv.h.FirstSeen))
 }
 
 // consider grants the host a lease for everything grantable, or says what
@@ -465,7 +494,10 @@ func (g *granter) lease(hv *hostView, parts []part, repair bool) {
 	}
 
 	g.budget.take(hv.live)
-	g.repairOpen = g.repairOpen || repair
+
+	if repair {
+		g.repairHost = host
+	}
 
 	hv.lease = l
 	p.leases = append(p.leases, l)
@@ -489,7 +521,7 @@ type waiting struct {
 }
 
 // servingOrder lists the hosts that wait in an open rollout and hold no
-// lease: oldest rollout first, inside a rollout by stage (carried members,
+// lease: oldest rollout first, inside a rollout by stage (broken hosts,
 // the canary, the rest), then ascending weight and name.
 func (p *pass) servingOrder() []*waiting {
 	var (
@@ -545,9 +577,15 @@ func (p *pass) grant() *Plan {
 		gate:   p.gate(),
 		budget: p.budget(),
 		forced: make(map[string]bool, 2),
-		repairOpen: slices.ContainsFunc(p.leases, func(l *fleet.Lease) bool {
-			return l.Repair && !l.State.Terminal()
-		}),
+	}
+
+	// Every lease the pass knows was open when it began.
+	for _, l := range p.leases {
+		if l.Repair {
+			g.repairHost = l.Host
+
+			break
+		}
 	}
 
 	plan := &Plan{

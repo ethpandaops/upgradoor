@@ -9,6 +9,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 )
 
 const (
@@ -305,4 +307,19 @@ func wholeSeconds(slot time.Duration) uint64 {
 	}
 
 	return seconds
+}
+
+// published returns the phases as fleet.NetworkHealth carries them.
+func (c *chainTiming) published() []fleet.SlotPhase {
+	out := make([]fleet.SlotPhase, 0, len(c.phases))
+
+	for _, phase := range c.phases {
+		out = append(out, fleet.SlotPhase{
+			Epoch:  phase.epoch,
+			Start:  phase.start,
+			SlotMs: uint64(phase.slot / time.Millisecond),
+		})
+	}
+
+	return out
 }

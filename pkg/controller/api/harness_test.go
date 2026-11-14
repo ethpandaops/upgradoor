@@ -528,6 +528,12 @@ func (f *fakeScheduler) Forget(_ context.Context, actor string, req scheduler.Ho
 	return f.record("forget", actor, req)
 }
 
+func (f *fakeScheduler) EndLease(_ context.Context, actor string, req scheduler.EndLeaseRequest) (
+	*scheduler.ActionResult, error,
+) {
+	return f.record("end-lease", actor, req)
+}
+
 func (f *fakeScheduler) recorded() []schedulerCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()

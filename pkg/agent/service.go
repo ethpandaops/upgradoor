@@ -432,6 +432,14 @@ func (s *service) handleLease(
 		}
 
 		if !cur.Operation.Phase.Terminal() {
+			// The controller no longer holds the lease, and nothing was
+			// touched for it yet: it must not be started any more.
+			if !cur.Started {
+				s.withdrawLease(cur.Lease.ID)
+
+				return false
+			}
+
 			// Once started, finish; a new lease has to wait.
 			if lease != nil && s.ignoredLease != lease.ID {
 				s.ignoredLease = lease.ID
@@ -466,6 +474,34 @@ func (s *service) handleLease(
 	}
 
 	return s.acceptLease(ctx, lease)
+}
+
+// withdrawLease marks the persisted lease as one the controller no longer
+// holds, unless the operation has started in the meantime. The operation
+// declines a withdrawn lease instead of starting it; the refusal is reported,
+// forgotten, and only then is another lease taken.
+func (s *service) withdrawLease(id string) {
+	withdrawn := false
+
+	err := s.store.Update(func(st *persistedState) {
+		cur := st.Current
+		if cur == nil || cur.Lease.ID != id || cur.Started || cur.Withdrawn {
+			return
+		}
+
+		cur.Withdrawn = true
+		withdrawn = true
+	})
+	if err != nil {
+		s.log.WithError(err).WithField("lease", id).Error("cannot persist that the lease was withdrawn")
+
+		return
+	}
+
+	if withdrawn {
+		s.log.WithField("lease", id).
+			Warn("the controller no longer offers the lease; it will not be started")
+	}
 }
 
 // acceptLease persists a new lease with its deadline and only then starts

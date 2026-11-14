@@ -29,11 +29,13 @@ func (s *Server) actions() map[string]userHandler {
 		"hold":   action(s, validateHostsRequest, sched.Hold),
 		"unhold": action(s, validateHostsRequest, sched.Unhold),
 		"forget": action(s, validateHostsRequest, sched.Forget),
-		"pause":  action(s, validateScope(false), sched.Pause),
-		"resume": action(s, validateScope(false), sched.Resume),
-		"abort":  action(s, validateScope(true), sched.Abort),
-		"skip":   action(s, validateRolloutHosts(true), sched.Skip),
-		"retry":  action(s, validateRolloutHosts(false), sched.Retry),
+		// End one open lease that its agent has started, as failed.
+		"end-lease": action(s, validateEndLease, sched.EndLease),
+		"pause":     action(s, validateScope(false), sched.Pause),
+		"resume":    action(s, validateScope(false), sched.Resume),
+		"abort":     action(s, validateScope(true), sched.Abort),
+		"skip":      action(s, validateRolloutHosts(true), sched.Skip),
+		"retry":     action(s, validateRolloutHosts(false), sched.Retry),
 	}
 }
 
@@ -72,12 +74,13 @@ func action[T any](
 	}
 }
 
-// writeSchedulerError maps a scheduler error to its status: an unknown host
-// or rollout is 404, an action that cannot apply now is 409. Those messages
+// writeSchedulerError maps a scheduler error to its status: an unknown host,
+// rollout or lease is 404, an action that cannot apply now is 409. Those messages
 // are written by the scheduler for people; anything else stays internal.
 func (s *Server) writeSchedulerError(w http.ResponseWriter, r *http.Request, err error) {
 	switch {
-	case errors.Is(err, scheduler.ErrUnknownHost), errors.Is(err, scheduler.ErrUnknownRollout):
+	case errors.Is(err, scheduler.ErrUnknownHost), errors.Is(err, scheduler.ErrUnknownRollout),
+		errors.Is(err, scheduler.ErrUnknownLease):
 		s.writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, scheduler.ErrInvalidAction):
 		s.writeError(w, http.StatusConflict, err.Error())
@@ -163,6 +166,19 @@ func validateReboot(req *scheduler.RebootRequest) error {
 func validateHostsRequest(req *scheduler.HoldRequest) error {
 	if err := validateHosts(req.Hosts, true); err != nil {
 		return err
+	}
+
+	return validateReason(req.Reason)
+}
+
+// validateEndLease checks the end-lease action: one lease, by its ID.
+func validateEndLease(req *scheduler.EndLeaseRequest) error {
+	if req.Lease == "" {
+		return badRequestf("lease must not be empty")
+	}
+
+	if len(req.Lease) > maxNameLength {
+		return badRequestf("invalid lease id")
 	}
 
 	return validateReason(req.Reason)

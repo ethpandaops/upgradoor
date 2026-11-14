@@ -104,8 +104,9 @@ func (s *Server) handlePublicHistory(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// participation sums liveness rows per epoch, oldest epoch first. Without a
-// known genesis the points carry the zero time.
+// participation sums liveness rows per epoch, oldest epoch first. Each point
+// carries the time its epoch ended, placed by the chain's slot phases; a
+// point whose epoch cannot be placed carries the zero time.
 func participation(rows []fleet.Liveness, health *fleet.NetworkHealth) []ParticipationPoint {
 	byEpoch := make(map[uint64]*ParticipationPoint, 64)
 
@@ -125,8 +126,9 @@ func participation(rows []fleet.Liveness, health *fleet.NetworkHealth) []Partici
 	out := make([]ParticipationPoint, 0, len(byEpoch))
 
 	for _, point := range byEpoch {
-		if duration := health.EpochDuration(); duration > 0 && !health.GenesisTime.IsZero() {
-			point.Time = health.GenesisTime.Add(time.Duration(point.Epoch+1) * duration).UTC()
+		// The point stands at the end of its epoch.
+		if end, ok := health.EpochStart(point.Epoch + 1); ok {
+			point.Time = end.UTC()
 		}
 
 		out = append(out, *point)

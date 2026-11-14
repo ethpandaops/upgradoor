@@ -183,8 +183,9 @@ func (p *pass) skipNote(key, host string) string {
 // liftSkips ends the skips that outlived their need. A skip holds for the
 // key of its rollout for as long as the host keeps reporting the need: once
 // a host that is neither held nor silent syncs without it, a later need of
-// the same key (the reboot key never changes) is a new one. While a rollout
-// of the key is open the skip lives on in its member list instead.
+// the same key (the reboot key never changes) is a new one. The sync must be
+// newer than the skip. While a rollout of the key is open the skip lives on
+// in its member list instead.
 func (p *pass) liftSkips() {
 	open := p.openKeys()
 
@@ -202,6 +203,13 @@ func (p *pass) liftSkips() {
 			hv := p.hosts[m.Host]
 			if !operatorSkipped(m) || hv == nil || hv.h.Status == nil || hv.held || hv.stale ||
 				p.hostKeys[m.Host][key] {
+				continue
+			}
+
+			// Only a sync from after the skip says that the need is gone. After
+			// a controller restart a host that has been silent for long is not
+			// stale yet, and its old sync may predate the need.
+			if !hv.h.LastSeen.After(m.UpdatedAt) {
 				continue
 			}
 
@@ -317,86 +325,14 @@ func (p *pass) supersede(rep *reportedNeeds) {
 		switch r.Kind {
 		case fleet.RolloutImage:
 			if t := rep.images[r.Image]; t != nil && t.digest != r.Digest {
-				p.carry(prefixImageKey+r.Image, r)
 				p.closeRollout(r, fleet.RolloutSuperseded, "the tag moved to "+shortDigest(t.digest))
 			}
 		case fleet.RolloutPackages:
 			if _, ok := rep.packages[strings.TrimPrefix(r.Key, prefixPackages)]; !ok && len(rep.packages) > 0 {
-				p.carry(groupPackages, r)
 				p.closeRollout(r, fleet.RolloutSuperseded, "newer package versions appeared")
 			}
 		default:
 		}
-	}
-}
-
-// carry remembers the hosts that had failed in a superseded rollout for the
-// rollouts that follow it.
-func (p *pass) carry(group string, r *fleet.Rollout) {
-	set := p.carried[group]
-	if set == nil {
-		set = make(map[string]string, len(r.Hosts))
-		p.carried[group] = set
-	}
-
-	for _, h := range carriedHosts(r) {
-		set[h] = r.ID
-	}
-}
-
-// carriedHosts lists the members that failed in the rollout, or that it had
-// itself taken over as failed and not served yet.
-func carriedHosts(r *fleet.Rollout) []string {
-	out := make([]string, 0, len(r.Hosts))
-
-	for i := range r.Hosts {
-		m := &r.Hosts[i]
-
-		waiting := m.State == fleet.HostPending || m.State == fleet.HostExpected
-		if m.State == fleet.HostFailed || (waiting && m.CarriedFrom != "") {
-			out = append(out, m.Host)
-		}
-	}
-
-	return out
-}
-
-// carriedFor returns the hosts a new rollout of the group serves first.
-func (p *pass) carriedFor(group string) map[string]string {
-	if set, ok := p.carried[group]; ok {
-		return set
-	}
-
-	for _, r := range p.w.Closed {
-		if rolloutGroup(r) != group {
-			continue
-		}
-
-		if r.State != fleet.RolloutSuperseded {
-			return nil
-		}
-
-		set := make(map[string]string, len(r.Hosts))
-		for _, h := range carriedHosts(r) {
-			set[h] = r.ID
-		}
-
-		return set
-	}
-
-	return nil
-}
-
-// rolloutGroup names what a superseded rollout is followed by: rollouts of
-// the same image reference, or of the packages kind.
-func rolloutGroup(r *fleet.Rollout) string {
-	switch r.Kind {
-	case fleet.RolloutImage:
-		return prefixImageKey + r.Image
-	case fleet.RolloutPackages:
-		return groupPackages
-	default:
-		return ""
 	}
 }
 
@@ -418,10 +354,10 @@ func (p *pass) closeRollout(r *fleet.Rollout, state fleet.RolloutState, reason s
 }
 
 // open creates a rollout for every reported cause that has none, unless the
-// latest closed rollout of its key was aborted. It returns the new rollouts
-// with the hosts each serves first.
-func (p *pass) open(rep *reportedNeeds) map[string]map[string]string {
-	created := make(map[string]map[string]string, 2)
+// latest closed rollout of its key was aborted. It returns the IDs of the
+// new rollouts.
+func (p *pass) open(rep *reportedNeeds) map[string]bool {
+	created := make(map[string]bool, 2)
 	openKeys := p.openKeys()
 
 	add := func(r *fleet.Rollout) {
@@ -439,12 +375,7 @@ func (p *pass) open(rep *reportedNeeds) map[string]map[string]string {
 		p.rolloutByID[r.ID] = r
 		openKeys[r.Key] = true
 
-		carried := p.carriedFor(rolloutGroup(r))
-		if carried == nil {
-			carried = map[string]string{}
-		}
-
-		created[r.ID] = carried
+		created[r.ID] = true
 
 		p.record("rollout.created", r.ID, map[string]any{keyKey: r.Key, "title": r.Title})
 	}
@@ -533,9 +464,9 @@ func (p *pass) assignNeeds() {
 	}
 }
 
-// syncMembers updates the members of one open rollout. carried is non-nil
-// for a rollout created in this pass.
-func (p *pass) syncMembers(r *fleet.Rollout, carried map[string]string) {
+// syncMembers updates the members of one open rollout. created says that
+// the rollout was created in this pass.
+func (p *pass) syncMembers(r *fleet.Rollout, created bool) {
 	needs := p.needs[r.ID]
 
 	for i := range r.Hosts {
@@ -570,24 +501,22 @@ func (p *pass) syncMembers(r *fleet.Rollout, carried map[string]string) {
 			continue
 		}
 
-		if prev, ok := carried[name]; ok && skip == "" {
-			m.Error = carriedPrefix + prev
-			m.CarriedFrom = prev
-		}
-
 		r.Hosts = append(r.Hosts, m)
 	}
 
+	p.markBroken(r)
 	p.stages(r)
 
-	if carried != nil && r.Kind == fleet.RolloutImage {
+	if created && r.Kind == fleet.RolloutImage {
 		p.recheckExpected(r)
 	}
 }
 
-// stages settles the canary and gives every member its stage: a carried
-// member is in the repair stage, the canary in its own, everybody else in
-// the rest.
+// stages settles the canary and gives every member its stage: the canary is
+// in its own, a member whose host is broken for the rollout's group in the
+// repair stage, everybody else in the rest. A member that is done through the
+// lease that repaired it keeps the repair stage: its host is in order now,
+// and the stage says how it was served.
 func (p *pass) stages(r *fleet.Rollout) {
 	p.pickCanary(r)
 
@@ -595,10 +524,11 @@ func (p *pass) stages(r *fleet.Rollout) {
 		m := &r.Hosts[i]
 
 		switch {
-		case m.CarriedFrom != "":
-			m.Stage = fleet.StageRepair
 		case r.Canary == m.Host:
 			m.Stage = fleet.StageCanary
+		case p.broken(r, m.Host):
+			m.Stage = fleet.StageRepair
+		case m.Stage == fleet.StageRepair && m.State == fleet.HostDone && m.LeaseID != "":
 		default:
 			m.Stage = fleet.StageRest
 		}
@@ -612,16 +542,17 @@ func (p *pass) stages(r *fleet.Rollout) {
 // canary that left without having been served (skipped, held, silent,
 // forgotten, its need gone by itself) is replaced by the next candidate.
 // There is no new canary in a forced rollout, in a rollout with a single
-// member, after the first success, and while a carried member is still to be
-// served.
+// member, after the first success, while a member whose host is broken is
+// still to be served, and while a lease is in flight for the rollout. A host
+// that is broken is never chosen.
 func (p *pass) pickCanary(r *fleet.Rollout) {
-	if c := r.Host(r.Canary); c != nil && !r.Force && c.CarriedFrom == "" && keepsCanary(r, c) {
+	if c := r.Host(r.Canary); c != nil && !r.Force && p.keepsCanary(r, c) {
 		return
 	}
 
 	r.Canary = ""
 
-	if r.Force || succeeded(r) || p.carriedAwaited(r) != nil {
+	if r.Force || p.succeeded(r) || p.brokenAwaited(r) != nil || p.inFlight(r) != "" {
 		return
 	}
 
@@ -637,7 +568,8 @@ func (p *pass) pickCanary(r *fleet.Rollout) {
 			members++
 		}
 
-		if m.CarriedFrom != "" || p.repairLeased(m) || (m.State != fleet.HostLeased && !p.servable(r, m)) {
+		if p.broken(r, m.Host) || p.repairLeased(m) ||
+			(m.State != fleet.HostLeased && !p.servable(r, m)) {
 			continue
 		}
 
@@ -662,13 +594,14 @@ func (p *pass) repairLeased(m *fleet.RolloutHost) bool {
 }
 
 // keepsCanary reports whether the canary was served: it holds a lease, is
-// done by one, or failed with one and the rollout is still halted by it.
-func keepsCanary(r *fleet.Rollout, c *fleet.RolloutHost) bool {
+// done through one that was released, or failed with one and the rollout is
+// still halted by it.
+func (p *pass) keepsCanary(r *fleet.Rollout, c *fleet.RolloutHost) bool {
 	switch c.State {
 	case fleet.HostLeased:
 		return true
 	case fleet.HostDone:
-		return c.LeaseID != ""
+		return p.doneByRelease(c)
 	case fleet.HostFailed:
 		return r.State == fleet.RolloutHalted
 	default:
@@ -676,17 +609,48 @@ func keepsCanary(r *fleet.Rollout, c *fleet.RolloutHost) bool {
 	}
 }
 
+// leaseByID returns a lease that was open when the pass began, or a closed
+// one the world holds, or nil.
+func (p *pass) leaseByID(id string) *fleet.Lease {
+	for _, l := range p.leases {
+		if l.ID == id {
+			return l
+		}
+	}
+
+	return p.w.ClosedLeases[id]
+}
+
+// doneByRelease reports whether the member is done through a lease that was
+// released. Where the lease is still known (it ended in this pass, or the
+// host still reports its operation) its state is looked at, so a row of an
+// older build that kept the ID of a failed lease does not count; a lease
+// that is no longer known is taken at the member's word.
+func (p *pass) doneByRelease(m *fleet.RolloutHost) bool {
+	if m.State != fleet.HostDone || m.LeaseID == "" {
+		return false
+	}
+
+	l := p.leaseByID(m.LeaseID)
+
+	return l == nil || l.State == fleet.LeaseReleased
+}
+
 // succeeded reports whether the rollout has had its first success: a member
 // is done through a lease that was released, which a lease is only after the
 // host passed the readiness check (a forced lease is released without it, but
 // serves forced rollouts only, which have no canary). A member that is done
 // because its need went away, or whose step was done in a lease that failed,
-// carries no lease ID and is no success. From then on nobody waits for a
-// canary.
-func succeeded(r *fleet.Rollout) bool {
-	return slices.ContainsFunc(r.Hosts, func(m fleet.RolloutHost) bool {
-		return m.State == fleet.HostDone && m.LeaseID != ""
-	})
+// carries no lease ID and is no success (see doneByRelease for rows of older
+// builds). From the first success on nobody waits for a canary.
+func (p *pass) succeeded(r *fleet.Rollout) bool {
+	for i := range r.Hosts {
+		if p.doneByRelease(&r.Hosts[i]) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // servable reports whether a member that waits can be served as far as the
@@ -714,18 +678,6 @@ func (p *pass) servable(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 // members behind it: it holds a lease or is servable.
 func (p *pass) awaited(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 	return m.State == fleet.HostLeased || p.servable(r, m)
-}
-
-// carriedAwaited returns the first carried member that is still to be
-// served, or nil.
-func (p *pass) carriedAwaited(r *fleet.Rollout) *fleet.RolloutHost {
-	for i := range r.Hosts {
-		if m := &r.Hosts[i]; m.CarriedFrom != "" && p.awaited(r, m) {
-			return m
-		}
-	}
-
-	return nil
 }
 
 // canaryBefore orders the members that can be the canary: a member that
@@ -937,8 +889,8 @@ func hasContainer(r *fleet.Rollout, hv *hostView, onTarget bool) bool {
 }
 
 // blockingExpected reports whether an expected member is still waited for:
-// it is served in its turn (a carried one first, another one can be the
-// canary), and it keeps the rollout open.
+// it is served in its turn (one whose host is broken first, another one can
+// be the canary), and it keeps the rollout open.
 func (p *pass) blockingExpected(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 	hv := p.hosts[m.Host]
 	if hv == nil || hv.held || hv.stale {

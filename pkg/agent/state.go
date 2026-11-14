@@ -61,6 +61,11 @@ type operationRecord struct {
 
 	// Started is true once the agent decided to act on the lease.
 	Started bool `json:"started"`
+	// Withdrawn is true when a sync response no longer offered the lease
+	// before the agent had started it: the controller does not hold the lease
+	// any more (it expired it, a person ended it, its database is gone). Such
+	// a lease is never started.
+	Withdrawn bool `json:"withdrawn,omitempty"`
 	// BootID is the boot id when the operation started.
 	BootID string `json:"bootId,omitempty"`
 	// WasRunning are the managed containers that were running when the

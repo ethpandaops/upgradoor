@@ -75,6 +75,7 @@ func (b *worldBuilder) refreshHealth() {
 		UpdatedAt:         b.w.Now,
 		GenesisTime:       testGenesis,
 		SecondsPerSlot:    testSecondsPerSlot,
+		Phases:            fleet.SinglePhase(testGenesis, testSecondsPerSlot*time.Second),
 		SlotsPerEpoch:     testSlotsPerEpoch,
 		CurrentEpoch:      epoch,
 		FinalizedEpoch:    epoch - 2,
@@ -141,13 +142,22 @@ func (b *worldBuilder) down(name string) {
 }
 
 // advance moves the clock; every host that is not in silent syncs at the new
-// time.
+// time, and has kept syncing with the same status in between: a run of
+// healthy syncs that the scheduler has on record for its lease has no gap. (A
+// host in silent sends nothing, and its run has the gap.)
 func (b *worldBuilder) advance(d time.Duration, silent ...string) {
 	b.w.Now = b.w.Now.Add(d)
 
 	for _, h := range b.w.Hosts {
 		if !slices.Contains(silent, h.Name) {
 			h.LastSeen = b.w.Now
+		}
+	}
+
+	for _, l := range b.w.Leases {
+		if l.SyncedUntil != nil && !slices.Contains(silent, l.Host) {
+			until := b.w.Now
+			l.SyncedUntil = &until
 		}
 	}
 
@@ -208,8 +218,13 @@ func applyOutcome(w *World, out *Outcome) {
 
 	for _, l := range out.Leases {
 		w.Leases = slices.DeleteFunc(w.Leases, func(x *fleet.Lease) bool { return x.ID == l.ID })
+		// The lease table, as far as it has ended: a lease that is taken up
+		// again leaves it.
+		w.Ended = slices.DeleteFunc(slices.Clone(w.Ended), func(x *fleet.Lease) bool { return x.ID == l.ID })
 
 		if l.State.Terminal() {
+			w.Ended = append(w.Ended, l)
+
 			if w.ClosedLeases == nil {
 				w.ClosedLeases = map[string]*fleet.Lease{}
 			}
@@ -342,7 +357,8 @@ func (b *worldBuilder) finish(host string) {
 }
 
 // serve walks the host's lease to released: done, a first sync after it,
-// then one full epoch (live, or synced for hosts without validators).
+// then syncs every minute until two epochs have passed (the validators live,
+// the node synced throughout).
 func (b *worldBuilder) serve(host string) {
 	b.t.Helper()
 	b.finish(host)
@@ -352,6 +368,49 @@ func (b *worldBuilder) serve(host string) {
 	b.advance(2 * testEpoch)
 	b.step()
 	require.Nil(b.t, b.lease(host), "lease of %s was not released", host)
+}
+
+// brokenBy returns the note of a waiting member whose host the lease broke
+// for the rollout with the ID.
+func brokenBy(lease, rollout string) string {
+	return brokenPrefix + lease + " (rollout " + rollout + ")"
+}
+
+// lastLease returns the lease of the host that ended last, by the order the
+// ledger uses.
+func (b *worldBuilder) lastLease(host string) *fleet.Lease {
+	b.t.Helper()
+
+	var last *fleet.Lease
+
+	for _, l := range b.w.Ended {
+		if l.Host == host && (last == nil || endedAfter(l, last)) {
+			last = l
+		}
+	}
+
+	require.NotNil(b.t, last, "no lease of %s has ended", host)
+
+	return last
+}
+
+// broke puts a failed lease of the host for the need on record, granted for
+// a rollout that is long closed: the host is broken for the need's group.
+func (b *worldBuilder) broke(host string, need protocol.Need) *fleet.Lease {
+	ended := b.w.Now.Add(-time.Hour)
+	l := &fleet.Lease{
+		ID: "broke-" + host, Host: host, State: fleet.LeaseFailed, Error: "container did not start",
+		Needs: []protocol.Need{need}, Rollouts: map[string]string{need.ID: "id000"},
+		GrantedAt: ended.Add(-time.Minute), ExpiresAt: ended.Add(time.Hour), EndedAt: &ended,
+		Operation: &protocol.Operation{
+			LeaseID: "broke-" + host, Phase: protocol.PhaseFailed, Disrupted: true,
+			Steps: []protocol.Step{{NeedID: need.ID, Status: protocol.StepFailed}},
+		},
+	}
+
+	b.w.Ended = append(slices.Clone(b.w.Ended), l)
+
+	return l
 }
 
 // queue returns the waiting reason per host of a plan.

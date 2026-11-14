@@ -31,7 +31,13 @@ import (
 // syncing, without their EL or slow to find peers, lose peers they had, and
 // agents go silent while their host is checked for readiness. In every fifth
 // seed the beacon node does not serve the liveness endpoint for the whole
-// run. After
+// run; every fourth run begins before the chain's genesis, and in every
+// seventh the beacon node announces a slot phase far in the future that is
+// out of bounds. Now and then the controller restarts on closed rollouts as
+// the builds before this one wrote them, with the fields those builds kept.
+// A person ends a lease now and then.
+// The store gives every row back as the SQLite store does (fakestore_test.go).
+// After
 // every step the oracle (sim_oracle_test.go) asserts the invariants of
 // docs/scheduler.md from the world's own state; at the end of a run the world
 // is healed and everything must converge.
@@ -105,11 +111,37 @@ type simStats struct {
 	// controller without a record of them first saw them.
 	HoldsAdopted                     int
 	Skips, SkipsLifted, SkipsCarried int
-	// Repairs are the leases granted through the closed gate, Carried the
-	// members carried over as failed, MixedLeases the failed leases in which
+	// Repairs are the leases granted through the closed gate, BrokenMembers
+	// the members in the repair stage, MixedLeases the failed leases in which
 	// a step was done.
-	Repairs, Carried, MixedLeases   int
-	ConvergeTicks, MaxConvergeTicks int
+	Repairs, BrokenMembers, MixedLeases int
+	// Forks are the changes of the slot duration and SettledClosed the
+	// members of closed rollouts that got the outcome of a lease that ended
+	// after the rollout had closed.
+	Forks, SettledClosed int
+	// Reopened are the expired leases that were taken up again.
+	Reopened int
+	// BeforeGenesis are the runs that began before the chain did,
+	// FuturePhases those in which the beacon node announced a slot phase out
+	// of bounds for the far future, PreviousBuilds the restarts on rows of
+	// the builds before this one. The others count what the oracle saw by its
+	// own record of the leases: broken hosts that were granted first
+	// (BrokenFirst) and repaired (Repaired); hosts held back by a lease in
+	// flight (FlightHeld), of those the ones behind a lease of an aborted
+	// rollout (FlightAborted), behind a lease that was taken up again
+	// (FlightReopened), in a rollout that a person's retry opened
+	// (FlightRetried) and in a rollout that was open before the lease's
+	// rollout was closed (FlightNextToOpen); the leases a person ended
+	// (EndedByOperator) and the hosts those broke (BrokenByOperator); and the
+	// hosts broken by a lease of a rollout that had been aborted
+	// (BrokenAfterAbort).
+	BeforeGenesis, FuturePhases, PreviousBuilds int
+	BrokenFirst, Repaired                       int
+	FlightHeld, FlightAborted, FlightReopened   int
+	FlightRetried, FlightNextToOpen             int
+	EndedByOperator, BrokenByOperator           int
+	BrokenAfterAbort                            int
+	ConvergeTicks, MaxConvergeTicks             int
 	// Waits counts the waiting reasons seen in plans, by their first word.
 	Waits map[string]int
 }
@@ -142,8 +174,24 @@ func (a *simStats) add(b *simStats) {
 	a.SkipsLifted += b.SkipsLifted
 	a.SkipsCarried += b.SkipsCarried
 	a.Repairs += b.Repairs
-	a.Carried += b.Carried
+	a.BrokenMembers += b.BrokenMembers
 	a.MixedLeases += b.MixedLeases
+	a.Forks += b.Forks
+	a.Reopened += b.Reopened
+	a.BeforeGenesis += b.BeforeGenesis
+	a.FuturePhases += b.FuturePhases
+	a.PreviousBuilds += b.PreviousBuilds
+	a.BrokenFirst += b.BrokenFirst
+	a.Repaired += b.Repaired
+	a.FlightHeld += b.FlightHeld
+	a.FlightAborted += b.FlightAborted
+	a.FlightReopened += b.FlightReopened
+	a.FlightRetried += b.FlightRetried
+	a.FlightNextToOpen += b.FlightNextToOpen
+	a.EndedByOperator += b.EndedByOperator
+	a.BrokenByOperator += b.BrokenByOperator
+	a.BrokenAfterAbort += b.BrokenAfterAbort
+	a.SettledClosed += b.SettledClosed
 	a.ConvergeTicks += b.ConvergeTicks
 	a.MaxConvergeTicks = max(a.MaxConvergeTicks, b.MaxConvergeTicks)
 
@@ -153,6 +201,22 @@ func (a *simStats) add(b *simStats) {
 
 	for k, v := range b.Waits {
 		a.Waits[k] += v
+	}
+}
+
+// countRollout counts the members in the repair stage and those that were
+// settled after their rollout had closed.
+func (s *sim) countRollout(r *fleet.Rollout) {
+	for i := range r.Hosts {
+		m := &r.Hosts[i]
+		if r.State.Terminal() && r.EndedAt != nil && m.UpdatedAt.After(*r.EndedAt) &&
+			(m.State == fleet.HostFailed || m.State == fleet.HostDone) {
+			s.stats.SettledClosed++
+		}
+
+		if m.Stage == fleet.StageRepair {
+			s.stats.BrokenMembers++
+		}
 	}
 }
 
@@ -169,8 +233,27 @@ func (s *sim) countLease(l *fleet.Lease) {
 	}
 }
 
+// countLedger takes over what the oracle counted. The oracle starts over
+// when the database is lost.
+func (s *sim) countLedger() {
+	c := &s.oracle.counts
+
+	s.stats.BrokenFirst += c.brokenFirst
+	s.stats.Repaired += c.repaired
+	s.stats.FlightHeld += c.flightHeld
+	s.stats.FlightAborted += c.flightAborted
+	s.stats.FlightReopened += c.flightReopened
+	s.stats.FlightRetried += c.flightRetried
+	s.stats.FlightNextToOpen += c.flightNextToOpen
+	s.stats.EndedByOperator += c.endedByOperator
+	s.stats.BrokenByOperator += c.brokenByOperator
+	s.stats.BrokenAfterAbort += c.brokenAfterAbort
+}
+
 // count reads the run's totals off the audit trail and the store.
 func (s *sim) count() {
+	s.countLedger()
+
 	for _, action := range s.store.auditActions() {
 		switch action {
 		case "lease.granted":
@@ -183,6 +266,8 @@ func (s *sim) count() {
 			s.stats.Expired++
 		case "lease.adopted":
 			s.stats.Adopted++
+		case "lease.reopened":
+			s.stats.Reopened++
 		case "rollout.completed":
 			s.stats.Completed++
 		case "rollout.superseded":
@@ -199,12 +284,12 @@ func (s *sim) count() {
 	seen := make(map[string]bool, 8)
 	all, _, _ := s.store.view()
 
-	for _, r := range all {
-		for i := range r.Hosts {
-			if r.Hosts[i].CarriedFrom != "" {
-				s.stats.Carried++
-			}
+	s.stats.Forks = len(s.world.phases) - 1
 
+	for _, r := range all {
+		s.countRollout(r)
+
+		for i := range r.Hosts {
 			if !operatorSkipped(&r.Hosts[i]) && !strings.HasPrefix(r.Hosts[i].Error, skipLiftedPrefix) {
 				continue
 			}
@@ -252,8 +337,21 @@ func (s *sim) count() {
 		}
 	}
 
+	s.countWorld()
+}
+
+// countWorld counts what kind of world the run was in.
+func (s *sim) countWorld() {
 	s.stats.Hosts = len(s.world.agents)
 	s.stats.Seeds = 1
+
+	if s.world.start.Before(testGenesis) {
+		s.stats.BeforeGenesis = 1
+	}
+
+	if s.world.bogus != nil {
+		s.stats.FuturePhases = 1
+	}
 
 	if s.world.livenessUnsupported {
 		s.stats.Unsupported = 1
@@ -264,11 +362,19 @@ func newSim(seed uint64) (*sim, error) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 
+	// Taken from the seed, not from the random stream, so that the other
+	// seeds keep their histories: every fourth run begins 4 to 16 minutes
+	// before the chain's genesis.
+	start := simStart
+	if seed%4 == 3 {
+		start = testGenesis.Add(-time.Duration(4+seed%13) * time.Minute)
+	}
+
 	rng := rand.New(rand.NewPCG(seed, 0x5eed))
 	s := &sim{
 		seed:    seed,
 		rng:     rng,
-		world:   newSimWorld(rng),
+		world:   newSimWorld(rng, start),
 		store:   newFakeStore(),
 		oracle:  newOracle(),
 		log:     log,
@@ -281,6 +387,22 @@ func newSim(seed uint64) (*sim, error) {
 	// Taken from the seed, not from the random stream, so that the other
 	// seeds keep their histories.
 	s.world.livenessUnsupported = seed%5 == 4
+
+	// Every seventh run the beacon node announces a slot phase that is out of
+	// bounds, for an epoch far beyond the run: slots of two hours, or a start
+	// that does not follow from the phase before it. What is invalid in the
+	// future invalidates nothing now.
+	if seed%7 == 5 {
+		at := 1_000_000 + seed%1000
+		bogus := fleet.SlotPhase{Epoch: at, Start: s.world.epochStart(at), SlotMs: 2 * fleet.MaxSlotMs}
+
+		if seed%2 == 0 {
+			bogus.SlotMs = simSecondsPerSlot * 1000
+			bogus.Start = bogus.Start.Add(time.Second)
+		}
+
+		s.world.bogus = &bogus
+	}
 
 	pick := func(values ...float64) float64 { return values[rng.IntN(len(values))] }
 	policy := func() fleet.Policy {
@@ -357,7 +479,7 @@ func (s *sim) boot(st *fakeStore) error {
 }
 
 func (s *sim) note(format string, args ...any) {
-	at := s.world.now.Sub(testGenesis.Add(50 * simEpoch)).Truncate(time.Second)
+	at := s.world.now.Sub(s.world.start).Truncate(time.Second)
 	s.trail = append(s.trail, fmt.Sprintf("%4d +%-8s %s", s.step, at, fmt.Sprintf(format, args...)))
 }
 
@@ -392,7 +514,7 @@ func (s *sim) tick(d time.Duration) error {
 }
 
 // checkStarts: an agent stops containers only under a lease that is open at
-// that moment. A lease the store has never seen (the database was lost) is
+// that moment, unless its clock is slow and the lease expired on it. A lease the store has never seen (the database was lost) is
 // adopted at the agent's next sync.
 func (s *sim) checkStarts() error {
 	for _, a := range s.world.agents {
@@ -406,6 +528,10 @@ func (s *sim) checkStarts() error {
 		case errors.Is(err, store.ErrNotFound):
 		case err != nil:
 			return err
+		case (a.overrun || len(a.late) > 0) && l.State == fleet.LeaseExpired && l.Host == a.name:
+			// Its clock is slow: it starts a lease the controller has expired,
+			// or one the controller expired in favour of the lease it ran
+			// late. The controller takes the lease up again.
 		case l.State.Terminal() || l.Host != a.name:
 			return fmt.Errorf("%s started to stop containers for lease %s, which is %s (host %s)",
 				a.name, l.ID, l.State, l.Host)
@@ -569,6 +695,8 @@ func (s *sim) facts(fresh bool) *simFacts {
 		skipped:        s.skipped,
 		holds:          s.holds,
 		registered:     s.registered,
+		epochStart:     w.epochStart,
+		epochOf:        w.epochOf,
 		fresh:          fresh,
 	}
 
@@ -598,6 +726,7 @@ func (s *sim) facts(fresh bool) *simFacts {
 			lastSync:   a.lastSync,
 			status:     a.lastSent,
 			disrupted:  a.disrupted,
+			late:       a.late,
 			doneAt:     a.doneAt,
 		}
 	}
@@ -672,7 +801,7 @@ func (s *sim) act(what string, res *ActionResult, err error) error {
 	case err == nil:
 		s.note("%s: %s", what, res.Message)
 	case errors.Is(err, ErrInvalidAction), errors.Is(err, ErrUnknownHost),
-		errors.Is(err, ErrUnknownRollout), errors.Is(err, errWrite):
+		errors.Is(err, ErrUnknownRollout), errors.Is(err, ErrUnknownLease), errors.Is(err, errWrite):
 		s.note("%s: %v", what, err)
 	default:
 		return fmt.Errorf("%s: %w", what, err)
@@ -743,6 +872,13 @@ func (s *sim) randomStep() error {
 		return s.tick(d)
 	case n < 520:
 		image := w.images[s.rng.IntN(len(w.images))]
+
+		// Every other time the tag that moves is one that a host is rolling
+		// right now: the rollout is superseded while its lease is open.
+		if running := s.rollingImages(); len(running) > 0 && s.rng.IntN(2) == 0 {
+			image = running[s.rng.IntN(len(running))]
+		}
+
 		kind := digestGood
 
 		switch s.rng.IntN(10) {
@@ -791,6 +927,8 @@ func (s *sim) randomStep() error {
 		s.note("store: failing=%v", s.store.failing())
 	case n < 726:
 		return s.loseDatabase()
+	case n < 729:
+		return s.previousBuild()
 	default:
 		return s.operatorAction()
 	}
@@ -874,6 +1012,8 @@ func (s *sim) loseDatabase() error {
 	s.note("database lost")
 	s.stats.LostDatabases++
 
+	s.countLedger()
+
 	s.store = newFakeStore()
 	s.oracle = newOracle()
 	s.observed = 0
@@ -888,11 +1028,139 @@ func (s *sim) loseDatabase() error {
 	return s.boot(s.store)
 }
 
+// previousBuild restarts the controller on closed rollouts as the builds
+// before this one wrote them. Those builds kept on a rollout what it took
+// over from the rollouts before it and what it left to those after it
+// (inherited, bequest, bequeathed, and carriedFrom on a member); this build
+// keeps none of it and must read such rows without minding. The oldest of
+// them never gave a member of a closed rollout the outcome of a lease that
+// ended after the rollout was closed: such a member is still leased, by a
+// lease that is long over. Who is broken is read off the lease table, which
+// every build wrote alike, so none of this may change a decision.
+func (s *sim) previousBuild() error {
+	if s.store.failing() {
+		return nil
+	}
+
+	rollouts, leases, _ := s.store.snapshot()
+	rewritten := make([]*fleet.Rollout, 0, len(rollouts))
+
+	for _, r := range rollouts {
+		if !r.State.Terminal() || r.EndedAt == nil {
+			continue
+		}
+
+		for _, l := range leases {
+			m := r.Host(l.Host)
+			served := slices.ContainsFunc(sortedKeys(l.Rollouts), func(need string) bool { return l.Rollouts[need] == r.ID })
+
+			// A lease that ended after the rollout was closed was never
+			// settled in it.
+			if m == nil || !served || l.EndedAt == nil || !l.EndedAt.After(*r.EndedAt) || operatorSkipped(m) {
+				continue
+			}
+
+			m.State, m.LeaseID, m.Error = fleet.HostLeased, l.ID, ""
+		}
+
+		legacy, err := s.legacyRow(r)
+		if err != nil {
+			return err
+		}
+
+		rewritten = append(rewritten, legacy)
+	}
+
+	s.note("the closed rollouts are rows of an earlier build (%d), controller restart", len(rewritten))
+	s.stats.PreviousBuilds++
+
+	s.store.put(rewritten...)
+
+	return s.boot(s.store)
+}
+
+// legacyRow gives a rollout the fields that the builds before this one
+// stored with it, at random, and reads it the way the store reads a row.
+func (s *sim) legacyRow(r *fleet.Rollout) (*fleet.Rollout, error) {
+	raw, err := json.Marshal(r)
+	if err != nil {
+		return nil, fmt.Errorf("legacy row: %w", err)
+	}
+
+	row := make(map[string]any, 24)
+	if err = json.Unmarshal(raw, &row); err != nil {
+		return nil, fmt.Errorf("legacy row: %w", err)
+	}
+
+	entry := func() map[string]any {
+		e := map[string]any{"host": s.agent().name, "from": fmt.Sprintf("x%05d", s.rng.IntN(s.ids+1))}
+		if s.rng.IntN(2) == 0 {
+			e["lease"] = fmt.Sprintf("x%05d", s.rng.IntN(s.ids+1))
+		}
+
+		return e
+	}
+
+	if s.rng.IntN(2) == 0 {
+		row["inherited"] = []any{entry()}
+	}
+
+	// The build before this one recorded the bequest with a marker; the one
+	// before that without.
+	switch s.rng.IntN(3) {
+	case 0:
+		row["bequest"] = []any{entry(), entry()}
+		row["bequeathed"] = true
+	case 1:
+		row["bequest"] = []any{entry()}
+	}
+
+	if members, ok := row["hosts"].([]any); ok {
+		for _, m := range members {
+			if member, ok := m.(map[string]any); ok && s.rng.IntN(3) == 0 {
+				member["carriedFrom"] = fmt.Sprintf("x%05d", s.rng.IntN(s.ids+1))
+			}
+		}
+	}
+
+	if raw, err = json.Marshal(row); err != nil {
+		return nil, fmt.Errorf("legacy row: %w", err)
+	}
+
+	out := &fleet.Rollout{}
+	if err = json.Unmarshal(raw, out); err != nil {
+		return nil, fmt.Errorf("a row of an earlier build cannot be read: %w", err)
+	}
+
+	return out, nil
+}
+
+// rollingImages lists the images that some agent is rolling right now.
+func (s *sim) rollingImages() []string {
+	var images []string
+
+	for _, a := range s.world.agents {
+		if a.op == nil || a.op.Phase.Terminal() || a.lease == nil {
+			continue
+		}
+
+		for i := range a.lease.Needs {
+			if n := &a.lease.Needs[i]; n.Kind == protocol.NeedImage && !slices.Contains(images, n.Image.Image) {
+				images = append(images, n.Image.Image)
+			}
+		}
+	}
+
+	slices.Sort(images)
+
+	return images
+}
+
 // worldEvent starts or ends trouble that has nothing to do with rollouts.
 func (s *sim) worldEvent() {
 	w := s.world
 
-	switch s.rng.IntN(12) {
+	switch s.rng.IntN(13) {
 	case 0, 1, 2, 3:
 		a := s.agent()
 		if w.now.Before(a.outageUntil) {
@@ -913,6 +1181,12 @@ func (s *sim) worldEvent() {
 	case 8:
 		w.beaconDownUntil = w.now.Add(s.duration(30, 300))
 		s.note("beacon node down for %s", w.beaconDownUntil.Sub(w.now))
+	case 11:
+		// A fork changes the slot duration, in one to three epochs.
+		slot := []time.Duration{3 * time.Second, 12 * time.Second, 4500 * time.Millisecond, 6 * time.Second}[s.rng.IntN(4)]
+		if at := w.epochOf(w.now) + 1 + uint64(s.rng.IntN(3)); w.fork(at, slot) {
+			s.note("fork at epoch %d: slots of %s", at, slot)
+		}
 	case 9:
 		// One epoch or several in which nobody is seen attesting.
 		w.blackoutUntil = w.now.Add(s.duration(20, 220))
@@ -1093,8 +1367,10 @@ func (s *sim) operatorAction() error {
 		return s.act(fmt.Sprintf("unhold %v", hosts), res, err)
 	case n < 80:
 		return s.manualAction()
-	case n < 97:
+	case n < 94:
 		return s.settingsAction()
+	case n < 97:
+		return s.endLease()
 	default:
 		hosts := s.someHosts()[:1]
 		res, err := s.svc.Forget(ctx, simActor, HoldRequest{Hosts: hosts})
@@ -1111,6 +1387,28 @@ func (s *sim) operatorAction() error {
 
 		return s.act(fmt.Sprintf("forget %v", hosts), res, err)
 	}
+}
+
+// endLease is the person who ends an open lease: any one, whatever it does.
+// The agent finishes what it has started; the host is broken from then on. A
+// lease that the agent has not started as far as the controller knows is
+// refused.
+func (s *sim) endLease() error {
+	ctx := context.Background()
+
+	open, err := s.store.ListLeases(ctx, store.LeaseFilter{OpenOnly: true})
+	if err != nil {
+		return err
+	}
+
+	id := "nosuchlease"
+	if len(open) > 0 {
+		id = open[s.rng.IntN(len(open))].ID
+	}
+
+	res, err := s.svc.EndLease(ctx, simActor, EndLeaseRequest{Lease: id, Reason: "sim"})
+
+	return s.act("end lease "+id, res, err)
 }
 
 // rolloutAction pauses, resumes (approves), aborts or skips in one rollout.
@@ -1657,11 +1955,37 @@ func TestSimulation(t *testing.T) {
 			"skips taken back":                           total.SkipsLifted,
 			"skips carried over":                         total.SkipsCarried,
 			"repairs through the closed gate":            total.Repairs,
-			"members carried over as failed":             total.Carried,
+			"members in the repair stage":                total.BrokenMembers,
+			"broken hosts granted first":                 total.BrokenFirst,
+			"broken hosts repaired":                      total.Repaired,
+			"hosts held back by a lease in flight":       total.FlightHeld,
+			"leases ended by a person":                   total.EndedByOperator,
+			"runs with a slot phase out of bounds":       total.FuturePhases,
 			"failed leases with a step done":             total.MixedLeases,
+			"slot-duration forks":                        total.Forks,
+			"expired leases taken up again":              total.Reopened,
+			"leases that ended after their rollout":      total.SettledClosed,
 			"waits for a verb the agent lacks":           total.Waits["verb"],
 			"waits for the budget":                       total.Waits["budget"], "waits for the host limit": total.Waits["host"],
 			"waits for the gate": total.Waits["network"], "waits for the order": total.Waits["after"],
+		} {
+			if count == 0 {
+				t.Errorf("the simulation never produced any %s", what)
+			}
+		}
+	}
+
+	// What is rare shows in a long run only.
+	if len(failed) == 0 && n >= 1000 {
+		for what, count := range map[string]int{
+			"runs that begin before genesis":                                   total.BeforeGenesis,
+			"restarts on rows of an earlier build":                             total.PreviousBuilds,
+			"hosts held back by the lease of an aborted rollout":               total.FlightAborted,
+			"hosts held back by a lease that was taken up again":               total.FlightReopened,
+			"hosts held back in a rollout that a retry opened":                 total.FlightRetried,
+			"hosts held back in a rollout that was open when the other closed": total.FlightNextToOpen,
+			"hosts broken by a lease that a person ended":                      total.BrokenByOperator,
+			"hosts broken by a lease of a rollout that had been aborted":       total.BrokenAfterAbort,
 		} {
 			if count == 0 {
 				t.Errorf("the simulation never produced any %s", what)

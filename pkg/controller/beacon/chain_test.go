@@ -7,6 +7,8 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 )
 
 // rawSpec builds spec values the way a node sends them: decimal strings.
@@ -232,5 +234,36 @@ func TestWholeSeconds(t *testing.T) {
 
 	for _, tt := range tests {
 		assert.Equal(t, tt.want, wholeSeconds(tt.slot), tt.slot.String())
+	}
+}
+
+// TestPublishedPhasesPlaceEpochsLikeTheService: what the service publishes
+// for the scheduler and the API places every epoch where the service's own
+// timing does, across forks that change the slot duration, one of them to a
+// slot that is not a whole number of seconds.
+func TestPublishedPhasesPlaceEpochsLikeTheService(t *testing.T) {
+	timing, err := newChainTiming(testGenesis, rawSpec(t, map[string]any{
+		"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "8",
+		"SLOT_DURATION_MS_AAA": "6000", "AAA_FORK_EPOCH": "3",
+		"SLOT_DURATION_MS_BBB": "4500", "BBB_FORK_EPOCH": "7",
+	}))
+	require.NoError(t, err)
+
+	health := fleet.NetworkHealth{SlotsPerEpoch: timing.slotsPerEpoch, Phases: timing.published()}
+	require.Len(t, health.Phases, 3)
+
+	start := testGenesis
+
+	for epoch := range uint64(12) {
+		got, ok := health.EpochStart(epoch)
+		require.True(t, ok)
+		assert.Equal(t, start, got, "start of epoch %d", epoch)
+		assert.Equal(t, epoch, timing.epochAt(start), "the service's epoch at that time")
+
+		at, ok := health.EpochAt(start.Add(time.Millisecond))
+		require.True(t, ok)
+		assert.Equal(t, epoch, at)
+
+		start = start.Add(8 * timing.slotDuration(epoch))
 	}
 }

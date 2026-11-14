@@ -1109,6 +1109,55 @@ func TestLeaseRunsOutWhileTheHostCannotBeExamined(t *testing.T) {
 	assert.Equal(t, gethV1, e.host.Container("geth").Digest)
 }
 
+// A lease that the controller stops offering before the agent has started it
+// is not started any more: the controller has expired it, or a person has
+// ended it, and a host must not go down under a lease that is over. Once
+// started, an operation is finished whatever the controller offers
+// (TestAnotherLeaseWaitsForTheCurrentOperation).
+func TestLeaseWithdrawnBeforeItStartedIsNotStarted(t *testing.T) {
+	e := newEnv(t, baseScenario())
+	e.ctrl.set(func(c *controller) { c.autoRelease = false })
+	e.host.SetRegistry(gethImage, gethV2, "")
+	e.host.SetRegistry(tekuImage, tekuV2, "")
+	e.start()
+
+	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2), protocol.ImageNeedID("teku", tekuV2))
+
+	// The host cannot be examined: the agent holds the lease and has not
+	// started it.
+	e.host.Fail("observe", errors.New("docker daemon is restarting"))
+	e.ctrl.grant(e.lease("lease-gone", needs[0]))
+	awaitLeaseOnDisk(t, e, "lease-gone")
+
+	// The controller no longer offers it.
+	e.ctrl.set(func(c *controller) { c.lease = nil })
+	e.ctrl.awaitSyncs(e.ctrl.syncCount() + 3)
+
+	// The host can be examined again, well before the lease's deadline.
+	e.host.Fail("observe", nil)
+
+	req := e.ctrl.await("the refusal", func(req *protocol.SyncRequest) bool {
+		return req.Operation != nil && req.Operation.LeaseID == "lease-gone" && req.Operation.Phase.Terminal()
+	})
+	op := req.Operation
+
+	assert.Equal(t, protocol.PhaseDone, op.Phase)
+	assert.False(t, op.Disrupted)
+	assert.Equal(t, protocol.StepRefused, stepOf(t, *op, needs[0].ID).Status)
+	assert.Contains(t, stepOf(t, *op, needs[0].ID).Error, "no longer offered the lease")
+	assert.Empty(t, disruptive(e.host.Calls()), "nothing was touched")
+	assert.Equal(t, gethV1, e.host.Container("geth").Digest)
+
+	// The refusal reported, the agent is free for the lease that follows.
+	e.ctrl.set(func(c *controller) { c.autoRelease = true })
+	e.ctrl.grant(e.lease("lease-next", needs[1]))
+
+	next := e.ctrl.awaitFinished("lease-next")
+	assert.Equal(t, protocol.PhaseDone, next.Phase, next.Error)
+	assert.Equal(t, tekuV2, e.host.Container("teku").Digest)
+	assert.Equal(t, gethV1, e.host.Container("geth").Digest, "the withdrawn lease was never run")
+}
+
 // A container that crashed on a broken image must come back when a newer
 // image is rolled onto it; one that somebody stopped must stay down.
 func TestRollStartsACrashedContainerButNotAStoppedOne(t *testing.T) {

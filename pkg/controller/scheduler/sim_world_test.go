@@ -120,6 +120,9 @@ type simAgent struct {
 	// blind: the agent's registry polls see nothing new, so it never reports
 	// the need the controller expects of it.
 	blind bool
+	// overrun: the agent's clock is slow, so that it may start its lease
+	// after the controller has expired it.
+	overrun bool
 	// stepFail is the index of the step of the running operation that fails
 	// while the others succeed; -1 for none.
 	stepFail int
@@ -136,6 +139,9 @@ type simAgent struct {
 	// anything, and when it finished successfully.
 	disrupted map[string]bool
 	doneAt    map[string]time.Time
+	// late names the leases the agent started with a slow clock: possibly
+	// after the controller had expired them.
+	late map[string]bool
 
 	lastSync time.Time
 	lastSent *protocol.SyncRequest
@@ -158,8 +164,10 @@ func (a *simAgent) container(name string) *simContainer {
 // simWorld is the simulated fleet, registry and network. Nothing in it comes
 // from the scheduler.
 type simWorld struct {
-	rng    *rand.Rand
-	now    time.Time
+	rng *rand.Rand
+	now time.Time
+	// start is when the world began.
+	start  time.Time
 	agents []*simAgent
 	byName map[string]*simAgent
 
@@ -186,6 +194,14 @@ type simWorld struct {
 	dropPercent          uint64
 	healthAt             time.Time
 
+	// phases are the chain's slot durations: the first from genesis on, one
+	// more for every fork that changes the duration.
+	phases []simPhase
+	// bogus is a slot phase that the beacon node announces for an epoch far
+	// beyond the run and that is out of bounds, or nil. The chain itself knows
+	// nothing of it: every epoch of the run is placed as without it.
+	bogus *fleet.SlotPhase
+
 	// epoch is the epoch of now; epochMin the fewest validators each host
 	// attested with at any moment of it.
 	epoch    uint64
@@ -200,11 +216,17 @@ type simWorld struct {
 
 func simDigest(n int) string { return fmt.Sprintf("sha256:%064x", n) }
 
-// newSimWorld builds a random fleet.
-func newSimWorld(rng *rand.Rand) *simWorld {
+// simStart is when a simulated world begins, unless its chain has not begun
+// yet (newSim).
+var simStart = testGenesis.Add(50*simEpoch + 7*time.Second)
+
+// newSimWorld builds a random fleet at a time, which may lie before the
+// chain's genesis.
+func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 	w := &simWorld{
 		rng:        rng,
-		now:        testGenesis.Add(50*simEpoch + 7*time.Second),
+		now:        start,
+		start:      start,
 		byName:     make(map[string]*simAgent, 32),
 		registry:   make(map[string]string, 4),
 		digestKind: make(map[string]int, 16),
@@ -212,6 +234,7 @@ func newSimWorld(rng *rand.Rand) *simWorld {
 		published:  make(map[uint64]map[string]uint64, 64),
 		dropped:    make(map[string]bool, 2),
 		pkgVersion: 1,
+		phases:     []simPhase{{start: testGenesis, slot: simSecondsPerSlot * time.Second}},
 	}
 	w.healthAt = w.now
 	w.epoch = w.epochOf(w.now)
@@ -240,6 +263,7 @@ func newSimWorld(rng *rand.Rand) *simWorld {
 			pkgSeen:      1,
 			handled:      make(map[string]protocol.DirectiveAck, 8),
 			disrupted:    make(map[string]bool, 8),
+			late:         make(map[string]bool, 2),
 			doneAt:       make(map[string]time.Time, 8),
 			localHold:    rng.IntN(25) == 0,
 			dead:         rng.IntN(20) == 0,
@@ -303,10 +327,62 @@ func (w *simWorld) newDigest(kind int) string {
 	return d
 }
 
-func (w *simWorld) epochOf(t time.Time) uint64 { return uint64(t.Sub(testGenesis) / simEpoch) }
+// simPhase is a stretch of the simulated chain with one slot duration.
+type simPhase struct {
+	epoch uint64
+	start time.Time
+	slot  time.Duration
+}
 
+// phaseOf returns the phase an epoch is in.
+func (w *simWorld) phaseOf(e uint64) simPhase {
+	phase := w.phases[0]
+
+	for _, next := range w.phases[1:] {
+		if next.epoch <= e {
+			phase = next
+		}
+	}
+
+	return phase
+}
+
+// epochOf is the epoch a time is in. This is the world's own clock: it does
+// not share code with the scheduler's. Before genesis no epoch has begun:
+// the time counts to the first one, which is not complete before it has run.
+func (w *simWorld) epochOf(t time.Time) uint64 {
+	phase := w.phases[0]
+	if t.Before(phase.start) {
+		return phase.epoch
+	}
+
+	for _, next := range w.phases[1:] {
+		if !t.Before(next.start) {
+			phase = next
+		}
+	}
+
+	return phase.epoch + uint64(t.Sub(phase.start)/(simSlotsPerEpoch*phase.slot))
+}
+
+// epochStart is when an epoch begins.
 func (w *simWorld) epochStart(e uint64) time.Time {
-	return testGenesis.Add(time.Duration(e) * simEpoch)
+	phase := w.phaseOf(e)
+
+	return phase.start.Add(time.Duration(e-phase.epoch) * simSlotsPerEpoch * phase.slot)
+}
+
+// fork schedules a change of the slot duration at an epoch that has not
+// begun. The chain has at most two of them.
+func (w *simWorld) fork(at uint64, slot time.Duration) bool {
+	last := w.phases[len(w.phases)-1]
+	if len(w.phases) > 2 || at <= w.epochOf(w.now) || at <= last.epoch || slot == last.slot {
+		return false
+	}
+
+	w.phases = append(w.phases, simPhase{epoch: at, start: w.epochStart(at), slot: slot})
+
+	return true
 }
 
 // describe renders the fleet for a failure report.
@@ -560,12 +636,34 @@ func (w *simWorld) health() fleet.NetworkHealth {
 	}
 
 	epoch := w.epochOf(w.healthAt)
+	phase := w.phaseOf(epoch)
+
+	// A chain that has just begun (or has not yet) has finalized nothing, and
+	// lags by no more than it is old.
+	lag = min(lag, epoch)
+
+	slot := uint64(0)
+	if since := w.healthAt.Sub(w.epochStart(epoch)); since > 0 {
+		slot = uint64(since / phase.slot)
+	}
+	phases := make([]fleet.SlotPhase, 0, len(w.phases))
+
+	// The beacon service publishes the whole schedule, forks to come too.
+	for _, p := range w.phases {
+		phases = append(phases, fleet.SlotPhase{Epoch: p.epoch, Start: p.start, SlotMs: uint64(p.slot / time.Millisecond)})
+	}
+
+	if w.bogus != nil {
+		phases = append(phases, *w.bogus)
+	}
+
 	n := fleet.NetworkHealth{
 		UpdatedAt:         w.healthAt,
 		GenesisTime:       testGenesis,
-		SecondsPerSlot:    simSecondsPerSlot,
+		SecondsPerSlot:    uint64(phase.slot / time.Second),
+		Phases:            phases,
 		SlotsPerEpoch:     simSlotsPerEpoch,
-		HeadSlot:          uint64(w.healthAt.Sub(testGenesis) / (simSecondsPerSlot * time.Second)),
+		HeadSlot:          epoch*simSlotsPerEpoch + slot,
 		CurrentEpoch:      epoch,
 		FinalizedEpoch:    epoch - lag,
 		FinalityLagEpochs: lag,
@@ -729,6 +827,10 @@ func (w *simWorld) startOperation(a *simAgent) {
 
 	a.down = true
 	a.disrupted[op.LeaseID] = true
+
+	if a.overrun {
+		a.late[op.LeaseID] = true
+	}
 	a.opEnd = w.now.Add(time.Duration(4+w.rng.IntN(80)) * time.Second)
 	a.opFail = !w.calm && w.rng.IntN(25) == 0
 
@@ -988,15 +1090,32 @@ func (w *simWorld) respond(a *simAgent, resp *Assignment) {
 
 		delay := time.Duration(w.rng.IntN(8)) * time.Second
 
+		// A host whose validators are down is one that gets a repair lease;
+		// its agent is late more often, so that such leases expire and are
+		// taken up again too.
+		late := 6
+		if a.dead || w.now.Before(a.outageUntil) {
+			late = 14
+		}
+
 		switch n := w.rng.IntN(20); {
 		case w.calm:
 		case n == 0:
 			delay = time.Hour
 		case n < 4:
 			delay = time.Duration(10+w.rng.IntN(60)) * time.Second
-		case n < 6:
+		case n < late:
 			// Start in the last moments before the deadline.
 			delay = max(a.deadline.Sub(w.now)-time.Duration(1+w.rng.IntN(25))*time.Second, 0)
+		}
+
+		// Now and then the agent's clock is slow by more than the grace the
+		// controller gives: it starts a lease that the controller has just
+		// expired. The controller takes such a lease up again.
+		a.overrun = !w.calm && w.rng.IntN(20) < late-4
+		if a.overrun {
+			a.deadline = a.deadline.Add(time.Duration(61+w.rng.IntN(90)) * time.Second)
+			delay = max(a.deadline.Sub(w.now)-time.Duration(1+w.rng.IntN(40))*time.Second, 0)
 		}
 
 		a.startAt = w.now.Add(delay)

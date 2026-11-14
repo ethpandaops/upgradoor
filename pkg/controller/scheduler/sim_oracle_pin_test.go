@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 	"testing"
@@ -54,10 +55,13 @@ func newPinned(t *testing.T) *pinned {
 			health: fleet.NetworkHealth{
 				UpdatedAt: now, GenesisTime: testGenesis,
 				SecondsPerSlot: simSecondsPerSlot, SlotsPerEpoch: simSlotsPerEpoch,
+				Phases:       fleet.SinglePhase(testGenesis, simSecondsPerSlot*time.Second),
 				CurrentEpoch: pinEpoch + 1, FinalizedEpoch: pinEpoch - 1, FinalityLagEpochs: 2,
 				LivenessKnown: true, LivenessEpoch: pinEpoch,
 			},
 			hosts:          make(map[string]*simHostFact, 6),
+			epochStart:     func(e uint64) time.Time { return testGenesis.Add(time.Duration(e) * simEpoch) },
+			epochOf:        func(t time.Time) uint64 { return uint64(t.Sub(testGenesis) / simEpoch) },
 			rows:           map[uint64]map[string]uint64{pinEpoch - 1: {}, pinEpoch: {}},
 			publishedEpoch: pinEpoch,
 			havePublished:  true,
@@ -115,17 +119,94 @@ func (p *pinned) offline(host string) {
 	p.f.rows[pinEpoch][host] = 0
 }
 
+// breakIn lets the named hosts fail in the open rollout, one lease after the
+// other, each as the canary of the hosts that are left: everybody else is
+// skipped first, and a person reopens the rollout after every failure but
+// the last without retrying the host.
+func (p *pinned) breakIn(hosts ...string) {
+	p.t.Helper()
+
+	r := p.rollout()
+
+	for i := range r.Hosts {
+		if m := &r.Hosts[i]; !slices.Contains(hosts, m.Host) && m.State == fleet.HostPending {
+			m.State = fleet.HostSkipped
+		}
+	}
+
+	// The canary is a host with validators before one without.
+	order := slices.Clone(hosts)
+	slices.SortStableFunc(order, func(a, b string) int {
+		return cmp.Compare(min(p.f.hosts[b].weight, 1), min(p.f.hosts[a].weight, 1))
+	})
+
+	for i, host := range order {
+		if i > 0 {
+			r.State = fleet.RolloutActive
+			p.f.retried = []string{r.ID}
+			p.ok()
+		}
+
+		p.grant(host)
+		p.ok()
+		p.fail(host, true)
+		p.ok()
+	}
+}
+
+// broken gives a waiting member the stage and the note of a host that is
+// broken, as the scheduler does: by the last lease of the host that failed.
+func (p *pinned) broken(r *fleet.Rollout, host string) {
+	p.t.Helper()
+
+	for _, l := range slices.Backward(p.snap.leases) {
+		if l.Host != host || l.State != fleet.LeaseFailed {
+			continue
+		}
+
+		m := r.Host(host)
+		m.Stage = fleet.StageRepair
+		m.Error = oracleBrokenNote + l.ID + " (rollout " + l.Rollouts[l.Needs[0].ID] + ")"
+
+		return
+	}
+
+	p.t.Fatalf("no lease of %s has failed", host)
+}
+
 // successor moves the tag to digest B: the rollout so far is superseded with
-// the named hosts failed in it, and the scheduler opens the next one, in
-// which it marks them as carried.
+// the named hosts failed in it (by a lease each), and the scheduler opens the
+// next one, in which they are in the repair stage.
 func (p *pinned) successor(failed ...string) *fleet.Rollout {
 	p.t.Helper()
 
+	next := p.follow(failed...)
+	p.reconciled()
+
+	return next
+}
+
+// follow is successor without the look at the result: the reconcile that
+// opens the next rollout has written its rows. A rollout that a person closed
+// before stays as it is.
+func (p *pinned) follow(failed ...string) *fleet.Rollout {
+	p.t.Helper()
+
 	old := p.rollout()
-	old.State = fleet.RolloutSuperseded
+
+	unbroken := slices.DeleteFunc(slices.Clone(failed), func(host string) bool {
+		return old.Host(host).State == fleet.HostFailed
+	})
+	if len(unbroken) > 0 {
+		p.breakIn(unbroken...)
+	}
+
+	if !old.State.Terminal() {
+		old.State = fleet.RolloutSuperseded
+	}
 
 	next := &fleet.Rollout{
-		ID: "r2", Kind: fleet.RolloutImage, Key: imageKey(imgGeth, digestB),
+		ID: fmt.Sprintf("r%d", len(p.snap.rollouts)+1), Kind: fleet.RolloutImage, Key: imageKey(imgGeth, digestB),
 		Image: imgGeth, Digest: digestB, State: fleet.RolloutActive,
 		CreatedAt: p.f.now.Add(-time.Minute),
 	}
@@ -133,11 +214,6 @@ func (p *pinned) successor(failed ...string) *fleet.Rollout {
 	for i := range old.Hosts {
 		m := &old.Hosts[i]
 		member := fleet.RolloutHost{Host: m.Host, State: fleet.HostPending, Stage: fleet.StageRest}
-
-		if slices.Contains(failed, m.Host) {
-			m.State = fleet.HostFailed
-			member.CarriedFrom = old.ID
-		}
 
 		next.Hosts = append(next.Hosts, member)
 
@@ -148,7 +224,37 @@ func (p *pinned) successor(failed ...string) *fleet.Rollout {
 
 	p.snap.rollouts = append(p.snap.rollouts, next)
 	p.digest = digestB
-	p.reconciled()
+
+	for _, host := range failed {
+		p.broken(next, host)
+	}
+
+	return next
+}
+
+// abortAndRetry lets a person abort the open rollout and retry it at once:
+// the rollout is aborted, and the action opens a new one for the same cause.
+func (p *pinned) abortAndRetry() *fleet.Rollout {
+	p.t.Helper()
+
+	old := p.rollout()
+	old.State = fleet.RolloutAborted
+	p.ok()
+
+	next := &fleet.Rollout{
+		ID: fmt.Sprintf("r%d", len(p.snap.rollouts)+1), Kind: old.Kind, Key: old.Key,
+		Image: old.Image, Digest: old.Digest, State: fleet.RolloutActive,
+		CreatedBy: simActor, CreatedAt: p.f.now.Add(-time.Second),
+	}
+
+	for i := range old.Hosts {
+		next.Hosts = append(next.Hosts, fleet.RolloutHost{
+			Host: old.Hosts[i].Host, State: fleet.HostPending, Stage: fleet.StageRest,
+		})
+	}
+
+	p.snap.rollouts = append(p.snap.rollouts, next)
+	p.ok()
 
 	return next
 }
@@ -206,6 +312,15 @@ func (p *pinned) grant(host string) *fleet.Lease {
 	return l
 }
 
+// repair grants the host a lease through the closed gate, marked as the
+// scheduler marks it.
+func (p *pinned) repair(host string) *fleet.Lease {
+	l := p.grant(host)
+	l.Repair = true
+
+	return l
+}
+
 // done lets the agent finish the host's lease one second before the newest
 // liveness epoch began, and sync once right after.
 func (p *pinned) done(host string) *fleet.Lease {
@@ -216,6 +331,13 @@ func (p *pinned) done(host string) *fleet.Lease {
 	h.lastSync = h.doneAt[l.ID].Add(time.Second)
 	h.status.Needs = nil
 	h.status.Containers = []protocol.Container{container("c", imgGeth, p.digest, p.digest, p.f.now)}
+
+	if l.Operation == nil {
+		l.Operation = &protocol.Operation{
+			LeaseID: l.ID, Phase: protocol.PhaseDone, Disrupted: true,
+			Steps: []protocol.Step{{NeedID: l.Needs[0].ID, Status: protocol.StepDone}},
+		}
+	}
 
 	return l
 }
@@ -340,7 +462,7 @@ func TestOracleAcceptsASingleMemberWithoutCanary(t *testing.T) {
 	p.ok()
 }
 
-func TestOracleAcceptsCarriedHostsFirst(t *testing.T) {
+func TestOracleAcceptsBrokenHostsFirst(t *testing.T) {
 	// n1 and v2 failed in the rollout that the new one supersedes: both are
 	// granted before anybody else and without a canary. Their repair is the
 	// first success, so the rest follows without one too.
@@ -356,6 +478,15 @@ func TestOracleAcceptsCarriedHostsFirst(t *testing.T) {
 	p.grant("v3")
 	p.grant("b1")
 	p.ok()
+
+	// Repaired, they are in order: for the next digest nobody goes first, and
+	// the canary is the one it would be anyway.
+	p.release("v3")
+	p.release("b1")
+	p.ok()
+	p.successor()
+	p.grant("v1")
+	p.ok()
 }
 
 func TestOracleAcceptsARepairThroughTheClosedGate(t *testing.T) {
@@ -366,7 +497,7 @@ func TestOracleAcceptsARepairThroughTheClosedGate(t *testing.T) {
 	p.grant("v1")
 	p.ok()
 	p.offline("v2")
-	p.grant("v2")
+	p.repair("v2")
 	p.ok()
 
 	// Nobody else is stuck meanwhile: they wait for the gate.
@@ -385,7 +516,7 @@ func TestOracleAcceptsHostsThatWaitForTheOrder(t *testing.T) {
 		p.reconciled()
 	}
 
-	// A carried host that is out holds the others back as well.
+	// A broken host that is out holds the others back as well.
 	q := newPinned(t)
 	q.successor("v2")
 	q.grant("v2")
@@ -394,6 +525,265 @@ func TestOracleAcceptsHostsThatWaitForTheOrder(t *testing.T) {
 	for range 2 * simStuckPasses {
 		q.reconciled()
 	}
+}
+
+func TestOracleAcceptsASuccessorOfARolloutWithAnOpenLease(t *testing.T) {
+	// v1 is out for the rollout of digest A when the tag moves. The successor
+	// grants nobody while that lease is open. It fails: v1 is broken and
+	// goes first.
+	p := newPinned(t)
+	l := p.grant("v1")
+	p.ok()
+	next := p.successor()
+
+	for range 2 * simStuckPasses {
+		p.reconciled()
+	}
+
+	l.State = fleet.LeaseFailed
+	p.f.hosts["v1"].disrupted[l.ID] = true
+	p.snap.rollouts[0].Host("v1").State = fleet.HostFailed
+	p.broken(next, "v1")
+	p.reconciled()
+
+	p.grant("v1")
+	p.ok()
+
+	// Released ready instead, the host is in order and nobody goes first.
+	q := newPinned(t)
+	q.grant("v1")
+	q.ok()
+	q.successor()
+	q.snap.leases[0].State = fleet.LeaseReleased
+	q.snap.leases[0].Operation = &protocol.Operation{
+		LeaseID: "l1", Phase: protocol.PhaseDone, Disrupted: true,
+		Steps: []protocol.Step{{NeedID: q.snap.leases[0].Needs[0].ID, Status: protocol.StepDone}},
+	}
+	q.f.hosts["v1"].disrupted["l1"] = true
+	q.f.hosts["v1"].doneAt["l1"] = q.f.now.Add(-2 * time.Minute)
+	q.snap.rollouts[0].Host("v1").State = fleet.HostDone
+	q.o.runs["l1"] = oracleRun{
+		first: q.f.now.Add(-time.Minute), newest: q.f.now,
+		syncs: []time.Time{q.f.now.Add(-time.Minute), q.f.now},
+	}
+	q.reconciled()
+	q.grant("v1")
+	q.ok()
+}
+
+func TestOracleAcceptsARetryNextToALeaseInFlight(t *testing.T) {
+	// v1 is out for the rollout of digest A when the tag moves. A person
+	// aborts the successor and retries it: the rollout that the retry opens
+	// waits for the lease like the one before it, and has v1 first when the
+	// lease fails.
+	p := newPinned(t)
+	l := p.grant("v1")
+	p.ok()
+	p.successor()
+
+	next := p.abortAndRetry()
+
+	for range 2 * simStuckPasses {
+		p.reconciled()
+	}
+
+	l.State = fleet.LeaseFailed
+	p.f.hosts["v1"].disrupted[l.ID] = true
+	p.snap.rollouts[0].Host("v1").State = fleet.HostFailed
+	p.broken(next, "v1")
+	p.reconciled()
+
+	p.grant("v1")
+	p.ok()
+
+	// A host that failed in the aborted rollout itself goes first as well,
+	// in the rollout of the retry.
+	q := newPinned(t)
+	q.grant("v1")
+	q.ok()
+	q.fail("v1", true)
+	q.ok()
+
+	reopened := q.abortAndRetry()
+	q.broken(reopened, "v1")
+	q.reconciled()
+	q.grant("v1")
+	q.ok()
+
+	// And into the rollout of the next digest.
+	r := newPinned(t)
+	r.grant("v1")
+	r.ok()
+	r.fail("v1", true)
+	r.ok()
+	r.rollout().State = fleet.RolloutAborted
+	r.ok()
+	r.successor("v1")
+	r.grant("v1")
+	r.ok()
+}
+
+func TestOracleAcceptsALeaseReopenedAfterItsRolloutWasSuperseded(t *testing.T) {
+	// The lease of v1 expires, the tag moves, and then the agent turns out to
+	// have started: the successor grants nobody while that lease is open
+	// again, and has v1 first when it fails.
+	p := newPinned(t)
+	l := p.grant("v1")
+	p.ok()
+
+	l.State = fleet.LeaseExpired
+	p.rollout().Host("v1").State = fleet.HostPending
+	p.rollout().Host("v1").LeaseID = ""
+	p.ok()
+
+	next := p.successor()
+
+	p.f.hosts["v1"].disrupted[l.ID] = true
+	l.State = fleet.LeaseRunning
+	p.snap.rollouts[0].Host("v1").State = fleet.HostLeased
+	p.snap.rollouts[0].Host("v1").LeaseID = l.ID
+
+	for range 2 * simStuckPasses {
+		p.reconciled()
+	}
+
+	l.State = fleet.LeaseFailed
+	p.snap.rollouts[0].Host("v1").State = fleet.HostFailed
+	p.broken(next, "v1")
+	p.reconciled()
+
+	p.grant("v1")
+	p.ok()
+}
+
+func TestOracleAcceptsRowsOfAnEarlierBuild(t *testing.T) {
+	// The rollout of digest A was aborted with v1 out; its lease failed after
+	// that. In rows of an earlier build v1 is still leased there, by a lease
+	// that is over. The row says nothing either way: the lease failed, so v1
+	// goes first in the next rollout.
+	p := newPinned(t)
+	l := p.grant("v1")
+	p.ok()
+	p.rollout().State = fleet.RolloutAborted
+	p.ok()
+
+	l.State = fleet.LeaseFailed
+	p.f.hosts["v1"].disrupted[l.ID] = true
+	p.ok()
+
+	next := p.follow()
+	p.broken(next, "v1")
+	p.reconciled()
+	p.grant("v1")
+	p.ok()
+}
+
+func TestOracleAcceptsALeaseEndedByAPerson(t *testing.T) {
+	// v1 is out for the rollout of digest A, which a person aborts. The next
+	// rollout waits for that lease, for as long as the agent takes. A person
+	// ends the lease: v1 is broken and goes first, and nobody waits for a
+	// lease any more.
+	p := newPinned(t)
+	l := p.grant("v1")
+	p.ok()
+	p.rollout().State = fleet.RolloutAborted
+	p.ok()
+
+	next := p.successor()
+
+	for range 2 * simStuckPasses {
+		p.reconciled()
+	}
+
+	l.State, l.Error = fleet.LeaseFailed, oracleEndedByOperator
+	p.f.hosts["v1"].disrupted[l.ID] = true
+	p.ok()
+
+	p.broken(next, "v1")
+	p.reconciled()
+	p.grant("v1")
+	p.ok()
+	p.release("v1")
+	p.ok()
+	p.grant("v2")
+	p.grant("v3")
+	p.ok()
+}
+
+func TestOracleAcceptsLeasesThatSayNothing(t *testing.T) {
+	// A lease that expired stopped nothing: its host is an ordinary member
+	// of the next rollout, and the canary is chosen as ever.
+	p := newPinned(t)
+	l := p.grant("v1")
+	p.ok()
+
+	l.State = fleet.LeaseExpired
+	p.rollout().Host("v1").State = fleet.HostPending
+	p.rollout().Host("v1").LeaseID = ""
+	p.ok()
+	p.successor()
+	p.grant("v1")
+	p.ok()
+
+	// A lease that failed on another step, with the step for the image done,
+	// does not break the host for the image either.
+	q := newPinned(t)
+	// (Adopted, so that the lease may carry a step for something that is not
+	// a rollout of this history.)
+	l = q.grant("v1")
+	other := rebootNeed()
+	l.Needs = append(l.Needs, other)
+	l.GrantedBy = grantedByAdoption
+	q.ok()
+
+	l.State = fleet.LeaseFailed
+	l.Operation = &protocol.Operation{
+		LeaseID: l.ID, Phase: protocol.PhaseFailed, Disrupted: true,
+		Steps: []protocol.Step{
+			{NeedID: l.Needs[0].ID, Status: protocol.StepDone},
+			{NeedID: other.ID, Status: protocol.StepFailed},
+		},
+	}
+	q.f.hosts["v1"].disrupted[l.ID] = true
+	q.rollout().Host("v1").State = fleet.HostDone
+	q.rollout().Host("v1").LeaseID = ""
+	q.ok()
+	q.successor()
+	q.grant("v1")
+	q.ok()
+}
+
+// genesis moves the start of the pinned chain.
+func (p *pinned) genesis(at time.Time) {
+	p.f.epochStart = func(e uint64) time.Time { return at.Add(time.Duration(e) * simEpoch) }
+	p.f.epochOf = func(t time.Time) uint64 {
+		if t.Before(at) {
+			return 0
+		}
+
+		return uint64(t.Sub(at) / simEpoch)
+	}
+}
+
+func TestOracleAcceptsARunFromBeforeGenesis(t *testing.T) {
+	// The node came back a minute ago, ten seconds before the chain began:
+	// 50 seconds of its first epoch are enough.
+	p := newPinned(t)
+	p.serve("v1")
+	p.ok()
+	p.grant("n1")
+	p.ok()
+	p.genesis(p.f.now.Add(-50 * time.Second))
+
+	l := p.done("n1")
+	p.f.hosts["n1"].doneAt[l.ID] = p.f.now.Add(-61 * time.Second)
+	p.f.hosts["n1"].lastSync = p.f.now.Add(-time.Minute)
+	l.State = fleet.LeaseVerifying
+	p.reconciled()
+	p.f.hosts["n1"].lastSync = p.f.now
+	l.State = fleet.LeaseReleased
+	p.rollout().Host("n1").State = fleet.HostDone
+	p.ok()
 }
 
 func TestOracleAcceptsAReadinessFailureAfterTheTimeout(t *testing.T) {
@@ -582,15 +972,15 @@ func TestOracleRejectsBadHistories(t *testing.T) {
 			want: "canary v1 although n1 comes first",
 		},
 		{
-			name: "ordering violation: a host while a carried host waits",
+			name: "ordering violation: a host while a broken host waits",
 			bad: func(p *pinned) {
 				p.successor("n1")
 				p.grant("v1")
 			},
-			want: "granted although the carried host n1 (pending) is still to be served",
+			want: "granted although the broken host n1 (pending) is still to be served",
 		},
 		{
-			name: "ordering violation: a host while a carried host is expected to report",
+			name: "ordering violation: a host while a broken host is expected to report",
 			bad: func(p *pinned) {
 				r := p.successor("n1")
 				r.CreatedAt = p.f.now
@@ -598,30 +988,113 @@ func TestOracleRejectsBadHistories(t *testing.T) {
 				p.f.hosts["n1"].status.Needs = nil
 				p.grant("v1")
 			},
-			want: "granted although the carried host n1 (expected) is still to be served",
+			want: "granted although the broken host n1 (expected) is still to be served",
 		},
 		{
-			name: "ordering violation: a host while a carried host is being repaired",
+			name: "ordering violation: a host while a broken host is being repaired",
 			bad: func(p *pinned) {
 				p.successor("v2")
 				p.grant("v2")
 				p.ok()
 				p.grant("v1")
 			},
-			want: "granted although the carried host v2 (leased) is still to be served",
+			want: "granted although the broken host v2 (leased) is still to be served",
 		},
 		{
-			name: "a carried mark that is lost",
+			name: "broken: a host whose last lease failed is not in the repair stage",
 			bad: func(p *pinned) {
 				r := p.successor("n1")
-				r.Host("n1").CarriedFrom = ""
+				r.Host("n1").Stage, r.Host("n1").Error = fleet.StageRest, ""
+				p.f.fresh = true
 			},
-			want: "member n1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is marked carried: false",
+			want: "member n1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is in stage 3",
 		},
 		{
-			name: "a carried mark that nothing in the history of the rollouts gives",
-			bad:  func(p *pinned) { p.rollout().Host("v2").CarriedFrom = "r0" },
-			want: "is marked carried: true",
+			name: "broken: a repair stage that no lease gives",
+			bad: func(p *pinned) {
+				p.rollout().Host("v2").Stage = fleet.StageRepair
+				p.f.fresh = true
+			},
+			want: "is in stage 1 with the note \"\", but by the leases the oracle saw end its host is broken: false",
+		},
+		{
+			name: "broken: a note that names another lease",
+			bad: func(p *pinned) {
+				r := p.successor("n1")
+				r.Host("n1").Error = oracleBrokenNote + "l99"
+				p.f.fresh = true
+			},
+			want: "carries the note \"broken since lease l99\"",
+		},
+		{
+			name: "broken: a host that was repaired since is still in the repair stage",
+			bad: func(p *pinned) {
+				p.successor("v2")
+				p.grant("v2")
+				p.ok()
+				p.release("v2")
+				p.ok()
+
+				// The tag moves again. The lease that broke v2 is still in the
+				// table, and so is the one that repaired it.
+				r := p.follow()
+				p.broken(r, "v2")
+				p.f.fresh = true
+			},
+			want: "member v2 of rollout r3 (image:" + imgGeth + "@" + digestB + ") is in stage 1",
+		},
+		{
+			name: "broken: a host that was repaired since is granted before the canary",
+			bad: func(p *pinned) {
+				p.successor("v2")
+				p.grant("v2")
+				p.ok()
+				p.release("v2")
+				p.ok()
+				p.successor()
+				p.grant("v2")
+			},
+			want: "canary v2 although v1 comes first",
+		},
+		{
+			name: "broken: a host whose lease expired goes first",
+			bad: func(p *pinned) {
+				l := p.grant("v2")
+				l.State = fleet.LeaseExpired
+				p.rollout().Host("v2").State = fleet.HostPending
+				p.rollout().Host("v2").LeaseID = ""
+				p.rollout().Host("v2").Stage = fleet.StageRepair
+				p.f.fresh = true
+			},
+			want: "member v2 of rollout r1 (image:" + imgGeth + "@" + digestA + ") is in stage 1",
+		},
+		{
+			name: "ended by a person: the host is not first afterwards",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				p.rollout().State = fleet.RolloutAborted
+				p.ok()
+				p.successor()
+
+				l.State, l.Error = fleet.LeaseFailed, oracleEndedByOperator
+				p.f.hosts["v1"].disrupted[l.ID] = true
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is in stage 3",
+		},
+		{
+			name: "in flight: a canary is chosen while a lease of the closed rollout is still open",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+
+				r := p.follow()
+				r.Canary = "v2"
+				r.Host("v2").Stage = fleet.StageCanary
+				p.f.fresh = true
+			},
+			want: "rollout r2 chose the canary v2 while lease l1 of a closed rollout is still open on v1",
 		},
 		{
 			name: "first success: the rest after a canary whose lease failed on another step",
@@ -665,9 +1138,9 @@ func TestOracleRejectsBadHistories(t *testing.T) {
 				p.ok()
 				p.offline("v2")
 				p.offline("v3")
-				p.grant("v2")
+				p.repair("v2")
 				p.ok()
-				p.grant("v3")
+				p.repair("v3")
 			},
 			want: "and another repair is open",
 		},
@@ -676,8 +1149,8 @@ func TestOracleRejectsBadHistories(t *testing.T) {
 			bad: func(p *pinned) {
 				p.offline("v2")
 				p.offline("v3")
-				p.grant("v2")
-				p.grant("v3")
+				p.repair("v2")
+				p.repair("v3")
 			},
 			want: "and another repair is open",
 		},
@@ -745,6 +1218,262 @@ func TestOracleRejectsBadHistories(t *testing.T) {
 				l.Error = "not ready after 30m0s: waiting for attestation data from the beacon node"
 			},
 			want: "1m0s after the later of the end of its operation and the controller's start",
+		},
+		{
+			name: "gate: an ordinary grant next to a repair, as if the repaired host were not there",
+			bad: func(p *pinned) {
+				// 80 of 100 attest: closed at 85%. With the repaired host left
+				// out it would read 80 of 90 and be open.
+				p.f.settings.MinParticipationPercent = 85
+				p.offline("v2")
+				p.offline("v3")
+				p.repair("v2")
+				p.ok()
+				p.grant("v1")
+			},
+			want: "the network gate fails ([participation])",
+		},
+		{
+			name: "repair: a lease through the closed gate that is not marked",
+			bad: func(p *pinned) {
+				p.offline("v2")
+				p.offline("v3")
+				p.grant("v2")
+			},
+			want: "lease l1 of v2 is marked repair: false, but the oracle saw: true",
+		},
+		{
+			name: "repair: a mark on a lease that passed no closed gate",
+			bad:  func(p *pinned) { p.repair("v1") },
+			want: "lease l1 of v1 is marked repair: true, but the oracle saw: false",
+		},
+		{
+			name: "books: a member that waits and carries a lease ID",
+			bad: func(p *pinned) {
+				p.rollout().Host("v2").LeaseID = "l9"
+				p.f.fresh = true
+			},
+			want: "member v2 of rollout r1 is pending and carries lease l9",
+		},
+		{
+			name: "books: a member done through a lease whose step for the rollout was not done",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				l.Operation = &protocol.Operation{
+					LeaseID: l.ID, Phase: protocol.PhaseDone, Disrupted: true,
+					Steps: []protocol.Step{{NeedID: l.Needs[0].ID, Status: protocol.StepSuperseded}},
+				}
+				p.release("v1")
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r1 is done through lease l1, which is released and did not finish every step",
+		},
+		{
+			name: "books: a failed canary that is replaced while the rollout is halted",
+			bad: func(p *pinned) {
+				p.rollout().Canary = "v1"
+				p.grant("v1")
+				p.reconciled()
+				p.fail("v1", true)
+				p.rollout().Canary = "v2"
+				p.f.fresh = true
+			},
+			want: "rollout r1 is halted by its canary v1, which is no longer its canary",
+		},
+		{
+			name: "books: a host that becomes the canary while it holds a repair lease",
+			bad: func(p *pinned) {
+				p.rollout().Canary = "v1"
+				p.grant("v1")
+				p.reconciled()
+				p.offline("v2")
+				p.repair("v2")
+				p.reconciled()
+				p.rollout().Canary = "v2"
+				p.f.fresh = true
+			},
+			want: "host v2 became the canary of rollout r1 while it holds the repair lease l2",
+		},
+		{
+			name: "books: a lease that is still being checked after the readiness timeout",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+				p.verifying("v1")
+				p.f.now = p.f.now.Add(31 * time.Minute)
+				p.f.health.UpdatedAt = p.f.now
+				p.f.hosts["v1"].lastSync = p.f.now
+				p.f.fresh = true
+			},
+			want: "lease l1 of v1 is still being checked for readiness 31m0s after the later of its first check",
+		},
+		{
+			name: "supersede: a grant while a lease of the superseded rollout is still open",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+				p.successor()
+				p.grant("v2")
+			},
+			want: "granted although lease l1 of a closed rollout is still open on v1",
+		},
+		{
+			name: "supersede: a host whose lease of the superseded rollout failed does not go first",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				p.successor()
+
+				// The lease fails: by the oracle's record v1 is broken now.
+				l.State = fleet.LeaseFailed
+				p.f.hosts["v1"].disrupted[l.ID] = true
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is in stage 3",
+		},
+		{
+			name: "retry: a grant in the reopened rollout while a lease of the superseded rollout is still open",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+				p.successor()
+				p.abortAndRetry()
+				p.grant("v2")
+			},
+			want: "rollout r3 (image:" + imgGeth + "@" + digestB + "): granted although lease l1 of a closed " +
+				"rollout is still open on v1",
+		},
+		{
+			name: "retry: a broken host that does not go first in the reopened rollout",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+				p.fail("v1", true)
+				p.ok()
+				p.successor("v1")
+				p.abortAndRetry()
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r3 (image:" + imgGeth + "@" + digestB + ") is in stage 3",
+		},
+		{
+			name: "abort: a host that failed in the aborted rollout does not go first after the retry",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+				p.fail("v1", true)
+				p.ok()
+				p.abortAndRetry()
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r2 (image:" + imgGeth + "@" + digestA + ") is in stage 3",
+		},
+		{
+			name: "abort: a host that failed in the aborted rollout does not go first for the next digest",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+				p.fail("v1", true)
+				p.ok()
+				p.rollout().State = fleet.RolloutAborted
+				p.ok()
+				p.follow()
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is in stage 3",
+		},
+		{
+			name: "abort: a grant for the next digest while a lease of the aborted rollout is still open",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+				p.rollout().State = fleet.RolloutAborted
+				p.ok()
+				p.successor()
+				p.grant("v2")
+			},
+			want: "granted although lease l1 of a closed rollout is still open on v1",
+		},
+		{
+			name: "reopen: a grant next to a lease that was taken up again after its rollout was superseded",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+
+				l.State = fleet.LeaseExpired
+				p.rollout().Host("v1").State = fleet.HostPending
+				p.rollout().Host("v1").LeaseID = ""
+				p.ok()
+				p.successor()
+
+				// The agent did start: the lease runs again, and the
+				// successor leases its canary next to it.
+				p.f.hosts["v1"].disrupted[l.ID] = true
+				l.State = fleet.LeaseRunning
+				p.grant("v2")
+			},
+			want: "granted although lease l1 of a closed rollout is still open on v1",
+		},
+		{
+			name: "reopen: a lease taken up again after its rollout was superseded fails and its host does not go first",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+
+				l.State = fleet.LeaseExpired
+				p.rollout().Host("v1").State = fleet.HostPending
+				p.rollout().Host("v1").LeaseID = ""
+				p.ok()
+				p.successor()
+
+				p.f.hosts["v1"].disrupted[l.ID] = true
+				l.State = fleet.LeaseFailed
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is in stage 3",
+		},
+		{
+			name: "rows of an earlier build: a lease that failed after its rollout was closed, the row still says leased",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				p.rollout().State = fleet.RolloutAborted
+				p.ok()
+
+				l.State = fleet.LeaseFailed
+				p.f.hosts["v1"].disrupted[l.ID] = true
+				p.ok()
+
+				// The member of the aborted rollout is still leased. What counts
+				// is how the lease ended.
+				p.follow()
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is in stage 3",
+		},
+		{
+			name: "readiness: a lease whose epochs were not placed although the timing is known",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+				p.verifying("v1").Readiness = "epoch timing unknown"
+			},
+			want: `is verifying with "epoch timing unknown" "", but the chain's timing is known`,
+		},
+		{
+			name: "readiness: a lease failed for epochs that were not placed",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+
+				l := p.done("v1")
+				p.f.hosts["v1"].doneAt[l.ID] = p.f.now.Add(-31 * time.Minute)
+				p.f.since = p.f.now.Add(-2 * time.Hour)
+				p.fail("v1", true)
+				l.Error = "not ready after 30m0s: epoch timing unknown"
+			},
+			want: "but the chain's timing is known",
 		},
 		{
 			name: "no progress: nobody is granted although nothing holds the canary back",
@@ -1084,6 +1813,28 @@ func TestOracleRejectsBadHistories(t *testing.T) {
 				p.rollout().Host("n1").State = fleet.HostDone
 			},
 			want: "that spans 10s, it must span 48s",
+		},
+		{
+			name: "release on a run that began before genesis and has not lasted an epoch of the chain",
+			bad: func(p *pinned) {
+				canaryDone(p)
+				p.grant("n1")
+				p.ok()
+
+				// The chain began 20 seconds ago; the first sync after the
+				// operation came a minute ago.
+				p.genesis(p.f.now.Add(-20 * time.Second))
+
+				l := p.done("n1")
+				p.f.hosts["n1"].doneAt[l.ID] = p.f.now.Add(-61 * time.Second)
+				p.f.hosts["n1"].lastSync = p.f.now.Add(-time.Minute)
+				l.State = fleet.LeaseVerifying
+				p.reconciled()
+				p.f.hosts["n1"].lastSync = p.f.now
+				l.State = fleet.LeaseReleased
+				p.rollout().Host("n1").State = fleet.HostDone
+			},
+			want: "that spans 1m0s, it must span 48s",
 		},
 		{
 			name: "release although a sync in between showed the node without its peers",

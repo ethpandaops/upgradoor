@@ -85,8 +85,8 @@ type Rollout struct {
 	IgnoreBudget bool `json:"ignoreBudget"`
 	// Canary is the host that goes alone until the rollout has its first
 	// success. Empty for a forced rollout, for a rollout with a single member
-	// and for a rollout whose first success came without one (a carried
-	// member, or a repair through the closed gate).
+	// and for a rollout whose first success came without one (a broken host
+	// that was repaired, or a repair through the closed gate).
 	Canary string `json:"canary,omitempty"`
 
 	CreatedBy string     `json:"createdBy"`
@@ -136,15 +136,17 @@ func (s HostState) Settled() bool {
 }
 
 // Stage is the place of a host inside a rollout: hosts the change already
-// broke go first, then one canary alone, then the rest. It follows from
-// RolloutHost.CarriedFrom and Rollout.Canary and is set anew in every
-// reconcile of an open rollout.
+// broke go first, then one canary alone, then the rest. It is set anew in
+// every reconcile of an open rollout for the members that wait, from the
+// lease table (which hosts are broken) and Rollout.Canary; a member that was
+// served keeps the stage it was served in.
 type Stage int
 
 // Stages, in serving order. The zero value is no stage.
 const (
-	// StageRepair: a member carried over as failed from the rollout this one
-	// supersedes. It waits for no canary, and the other members wait for it.
+	// StageRepair: a member whose host is broken for the rollout's group: its
+	// last lease for the same thing (the image reference, the packages)
+	// failed. It waits for no canary, and the other members wait for it.
 	StageRepair Stage = iota + 1
 	// StageCanary: the one host that goes first of the others, alone.
 	StageCanary
@@ -160,13 +162,11 @@ type RolloutHost struct {
 	// NeedID is the host's need served by this rollout, once reported.
 	NeedID  string `json:"needId,omitempty"`
 	LeaseID string `json:"leaseId,omitempty"`
-	// Error is the failure reason for HostFailed.
-	Error string `json:"error,omitempty"`
-	// CarriedFrom is the ID of the superseded rollout in which the host had
-	// failed, for a member that was carried over from it. It is set when the
-	// member joins and never changes.
-	CarriedFrom string    `json:"carriedFrom,omitempty"`
-	UpdatedAt   time.Time `json:"updatedAt"`
+	// Error is the failure reason for HostFailed, the note of a skip, or, on
+	// a member that waits in the repair stage, the lease in which its host
+	// last failed ("broken since lease <id> (rollout <id>)").
+	Error     string    `json:"error,omitempty"`
+	UpdatedAt time.Time `json:"updatedAt"`
 }
 
 // LeaseState is the lifecycle state of a lease.
@@ -231,6 +231,9 @@ type Lease struct {
 	// node at head with enough peers. It is what the node part of the
 	// readiness check measures; nil while there is no such run.
 	SyncedSince *time.Time `json:"syncedSince,omitempty"`
+	// SyncedUntil is the newest sync of that run. A sync that comes more than
+	// hostStaleAfter after it starts a new run.
+	SyncedUntil *time.Time `json:"syncedUntil,omitempty"`
 	EndedAt     *time.Time `json:"endedAt,omitempty"`
 
 	// Operation is the agent's last report for this lease.

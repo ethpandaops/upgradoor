@@ -29,6 +29,7 @@
 //	POST /api/v1/actions/retry         user     scheduler.RolloutHostsRequest -> scheduler.ActionResult
 //	POST /api/v1/actions/abort         user     scheduler.ScopeRequest        -> scheduler.ActionResult
 //	POST /api/v1/actions/forget        user     scheduler.HoldRequest         -> scheduler.ActionResult
+//	POST /api/v1/actions/end-lease     user     scheduler.EndLeaseRequest     -> scheduler.ActionResult
 //
 //	GET  /metrics                      Prometheus
 //	GET  /healthz

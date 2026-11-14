@@ -325,14 +325,37 @@ func TestGate(t *testing.T) {
 			want: []string{},
 		},
 		{
-			name: "validators of a leased host are left out on both sides",
+			name: "the validators a lease took offline are left out on both sides",
 			setup: func(b *worldBuilder) {
-				// "a" is down under a lease: 50 of 50 remaining attest.
+				// "a" is down under a lease that found all 50 attesting: 50 of
+				// the 50 remaining attest.
 				b.live(b.w.Health.LivenessEpoch, "a", 0)
-				b.w.Leases = []*fleet.Lease{{ID: "l1", Host: "a", State: fleet.LeaseRunning}}
+				b.w.Leases = []*fleet.Lease{{ID: "l1", Host: "a", State: fleet.LeaseRunning, Weight: 50, Charged: 50}}
 				b.get("a").Status.Operation = &protocol.Operation{LeaseID: "l1", Phase: protocol.PhaseApplying}
 			},
 			want: []string{},
+		},
+		{
+			name: "validators that were offline before the lease stay in, as not live",
+			setup: func(b *worldBuilder) {
+				// The lease found 30 of "a"'s 50 attesting: the other 20 were
+				// down already and still count. 50 of 70 attest.
+				b.live(b.w.Health.LivenessEpoch, "a", 0)
+				b.w.Leases = []*fleet.Lease{{ID: "l1", Host: "a", State: fleet.LeaseRunning, Weight: 50, Charged: 30}}
+				b.get("a").Status.Operation = &protocol.Operation{LeaseID: "l1", Phase: protocol.PhaseApplying}
+			},
+			want: []string{"participation 71.4% < 90%"},
+		},
+		{
+			name: "a repair lease leaves the gate as closed as it was",
+			setup: func(b *worldBuilder) {
+				b.live(b.w.Health.LivenessEpoch, "a", 0)
+				b.w.Leases = []*fleet.Lease{{
+					ID: "l1", Host: "a", State: fleet.LeaseRunning, Weight: 50, Charged: 0, Repair: true,
+				}}
+				b.get("a").Status.Operation = &protocol.Operation{LeaseID: "l1", Phase: protocol.PhaseApplying}
+			},
+			want: []string{"participation 50% < 90%"},
 		},
 		{
 			name: "liveness unknown with tracked validators",
@@ -779,8 +802,8 @@ func TestImageSupersedeCarriesFailedHostsFirst(t *testing.T) {
 	second := b.mustRollout(imageKey(imgLighthouse, digestB))
 	assert.Equal(t, map[string]fleet.HostState{
 		"h1": fleet.HostPending, "h2": fleet.HostExpected, "h3": fleet.HostExpected,
-	}, memberStates(second), "nothing is granted before the hosts carried over had their turn")
-	assert.Equal(t, carriedPrefix+first.ID, second.Host("h3").Error)
+	}, memberStates(second), "nothing is granted before the host the change broke had its turn")
+	assert.Equal(t, brokenBy(b.lastLease("h3").ID, first.ID), second.Host("h3").Error)
 	assert.Equal(t, map[string]string{"h1": "after h3"}, queueReasons(out.Plan))
 
 	// The expected hosts are told to look at the registry now.
@@ -811,7 +834,7 @@ func TestImageSupersedeCarriesFailedHostsFirst(t *testing.T) {
 	second = b.mustRollout(second.Key)
 	assert.Equal(t, []string{"h3"}, b.leasedHosts())
 	assert.Equal(t, fleet.StageRepair, second.Host("h3").Stage)
-	assert.Empty(t, second.Canary, "no canary while a carried host is being repaired")
+	assert.Empty(t, second.Canary, "no canary while a broken host is being repaired")
 	assert.Equal(t, map[string]string{"h1": "after h3", "h2": "after h3"}, queueReasons(out.Plan))
 
 	// The repair is the first success: nobody waits for a canary after it.
@@ -1029,7 +1052,7 @@ func TestMembership(t *testing.T) {
 	})
 }
 
-// TestCanaryThenTheRest: with no carried host, the canary alone, then
+// TestCanaryThenTheRest: with no broken host, the canary alone, then
 // everybody else at once. A bootnode is a host like any other.
 func TestCanaryThenTheRest(t *testing.T) {
 	b := newWorldBuilder(t)
@@ -1250,27 +1273,24 @@ func TestCanaryCandidates(t *testing.T) {
 		assert.Equal(t, []string{"tool"}, b.leasedHosts())
 	})
 
-	t.Run("a carried host that waits for a person holds nobody back", func(t *testing.T) {
+	t.Run("a broken host that waits for a person holds nobody back", func(t *testing.T) {
 		for name, setup := range map[string]func(b *worldBuilder){
-			"silent":  func(b *worldBuilder) { b.get("carried").LastSeen = b.w.Now.Add(-time.Hour) },
-			"held":    func(b *worldBuilder) { b.get("carried").HoldWanted = true },
-			"no verb": func(b *worldBuilder) { b.get("carried").Status.Verbs = []protocol.Verb{protocol.VerbRoll} },
+			"silent":  func(b *worldBuilder) { b.get("broken").LastSeen = b.w.Now.Add(-time.Hour) },
+			"held":    func(b *worldBuilder) { b.get("broken").HoldWanted = true },
+			"no verb": func(b *worldBuilder) { b.get("broken").Status.Verbs = []protocol.Verb{protocol.VerbRoll} },
 		} {
 			t.Run(name, func(t *testing.T) {
 				b := newWorldBuilder(t)
 				b.w.Settings.MaxUnavailablePercent = 100
 				b.host("light", 5)
 				b.host("mid", 8)
-				b.host("carried", 30)
+				b.host("broken", 30)
 
 				for _, h := range b.w.Hosts {
 					b.wants(h.Name, packagesNeed("2.0"))
 				}
 
-				b.w.Settings.Paused = true
-				b.step()
-				b.mustRollout(packagesKey("2.0")).Host("carried").CarriedFrom = "id000"
-				b.w.Settings.Paused = false
+				b.broke("broken", packagesNeed("1.5"))
 				setup(b)
 
 				out := b.step()
@@ -1278,13 +1298,13 @@ func TestCanaryCandidates(t *testing.T) {
 
 				assert.Equal(t, []string{"light"}, b.leasedHosts())
 				assert.Equal(t, "light", r.Canary)
-				assert.Equal(t, fleet.StageRepair, r.Host("carried").Stage)
+				assert.Equal(t, fleet.StageRepair, r.Host("broken").Stage)
 				assert.Equal(t, "after canary light", queueReasons(out.Plan)["mid"])
 			})
 		}
 	})
 
-	t.Run("a carried host that waits for the budget holds the others back", func(t *testing.T) {
+	t.Run("a broken host that waits for the budget holds the others back", func(t *testing.T) {
 		b := newWorldBuilder(t)
 		b.w.Settings.MaxUnavailablePercent = 100
 		b.host("a", 10)
@@ -1295,11 +1315,8 @@ func TestCanaryCandidates(t *testing.T) {
 			b.wants(h.Name, packagesNeed("2.0"))
 		}
 
-		// "a" attests, but was carried over as failed; the budget is zero.
-		b.w.Settings.Paused = true
-		b.step()
-		b.mustRollout(packagesKey("2.0")).Host("a").CarriedFrom = "id000"
-		b.w.Settings.Paused = false
+		// "a" attests, but its last packages lease failed; the budget is zero.
+		b.broke("a", packagesNeed("1.5"))
 		b.w.Settings.MaxUnavailablePercent = 0
 
 		out := b.step()

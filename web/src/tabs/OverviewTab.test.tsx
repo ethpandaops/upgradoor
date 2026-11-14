@@ -139,10 +139,10 @@ describe('OverviewTab, logged in', () => {
 
     // A closed gate lets one repair at a time pass, of a host whose validators
     // have all been offline for two epochs: that host starts by itself, the
-    // next one that is down does not, and nobody else does.
+    // next one that is down follows it, and nobody else does.
     const next = screen.getByRole('region', { name: 'Up next' });
     expect(next).toHaveTextContent('lighthouse-geth-3');
-    expect(next).not.toHaveTextContent('lighthouse-geth-4');
+    expect(next).toHaveTextContent('after repair of lighthouse-geth-3');
     expect(next).not.toHaveTextContent('lighthouse-nethermind-1');
     expect(next).not.toHaveTextContent('bootnode-1');
   });

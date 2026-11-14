@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -108,6 +109,9 @@ type service struct {
 	prunedBefore uint64
 	// warned remembers warnings that are logged once.
 	warned map[string]struct{}
+	// timingWarned is the last warning about the chain timing that was
+	// logged: it is logged again when what it says changes.
+	timingWarned string
 }
 
 var _ Service = (*service)(nil)
@@ -384,6 +388,53 @@ func (s *service) loadTiming(ctx context.Context) error {
 	return nil
 }
 
+// timingWarning is logged when the timing read from the node is out of
+// bounds.
+const timingWarning = "The chain timing of the beacon node is out of bounds"
+
+// checkTiming validates the timing as it is published, on every poll: what
+// was read once is good or bad for the epoch the clock is in now. It returns
+// why the current epoch cannot be placed, or "" when it can.
+//
+// A phase that is out of bounds (fleet.ValidateTiming) is logged once, with
+// the reason and with what follows from it, and again when either changes:
+// while the phase lies in the future nothing is closed, the epochs before it
+// are placed as ever; once the clock is in it (or it is the first phase) no
+// epoch of now can be placed, and the scheduler closes the network gate with
+// the reason.
+func (s *service) checkTiming(current uint64, phases []fleet.SlotPhase) string {
+	err := fleet.ValidateTiming(s.timing.slotsPerEpoch, phases)
+	if err == nil {
+		s.timingWarned = ""
+
+		return ""
+	}
+
+	reason := strings.TrimPrefix(err.Error(), fleet.ErrInvalidTiming.Error()+": ")
+	usable := fleet.TimingUsable(s.timing.slotsPerEpoch, phases, current)
+
+	effect := "the current epoch cannot be placed in time: the network gate is closed and no host is found ready"
+	if usable {
+		effect = "nothing is closed yet: the epochs before that phase are placed, the ones from it on are not"
+	}
+
+	if key := effect + "|" + reason; key != s.timingWarned {
+		s.timingWarned = key
+
+		s.log.WithFields(logrus.Fields{
+			"reason":        reason,
+			"effect":        effect,
+			"current_epoch": current,
+		}).Warn(timingWarning)
+	}
+
+	if usable {
+		return ""
+	}
+
+	return reason
+}
+
 // refreshChain reads head and finality and publishes the chain part of the
 // view.
 func (s *service) refreshChain(ctx context.Context, now time.Time) error {
@@ -405,11 +456,16 @@ func (s *service) refreshChain(ctx context.Context, now time.Time) error {
 			"seconds per slot (and the epoch duration derived from it) is rounded")
 	}
 
+	phases := s.timing.published()
+	timingError := s.checkTiming(current, phases)
+
 	// Timing is known from here on, even when the node stops answering.
 	s.setHealth(func(h *fleet.NetworkHealth) {
 		h.GenesisTime = s.timing.genesis
 		h.SecondsPerSlot = slotSeconds
 		h.SlotsPerEpoch = s.timing.slotsPerEpoch
+		h.Phases = phases
+		h.TimingError = timingError
 	})
 
 	var head headResponse

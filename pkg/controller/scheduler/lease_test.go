@@ -1094,7 +1094,8 @@ func TestReadinessEpochCounting(t *testing.T) {
 			// configured and the run of syncs started with the done report.
 			doneAt := b.w.Now
 			lease := &fleet.Lease{
-				ID: "l1", Host: "a", State: fleet.LeaseVerifying, AgentDoneAt: &doneAt, SyncedSince: &doneAt,
+				ID: "l1", Host: "a", State: fleet.LeaseVerifying, AgentDoneAt: &doneAt,
+				SyncedSince: &doneAt, SyncedUntil: &doneAt, Weight: weight, Charged: weight,
 				GrantedAt: doneAt, ExpiresAt: doneAt.Add(time.Hour),
 			}
 			b.w.Leases = []*fleet.Lease{lease}

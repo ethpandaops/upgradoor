@@ -23,10 +23,6 @@ const (
 	// reported for a lease the controller did not know. It is a reserved
 	// name, so no manual lease can carry it.
 	grantedByAdoption = reservedActorPrefix + "adopted"
-	// carriedPrefix starts the note on a waiting member that had failed in
-	// the rollout this one supersedes. The note is for people; what makes
-	// the member go first is RolloutHost.CarriedFrom.
-	carriedPrefix = "failed in superseded rollout "
 	// skippedPrefix starts the note on a member a person skipped. The skip
 	// holds for the rollout's key while the note stands.
 	skippedPrefix = "skipped:"
@@ -86,10 +82,9 @@ type World struct {
 	// Rollouts are the non-terminal rollouts.
 	Rollouts []*fleet.Rollout
 	// Closed are terminal rollouts, newest first. It must hold at least the
-	// latest closed rollout of every key that hosts still report and of
-	// every image reference and the packages kind. The latest one of a key
-	// decides whether the cause stays closed (aborted) and which hosts stay
-	// skipped for it.
+	// latest closed rollout of every key that hosts still report. The latest
+	// one of a key decides whether the cause stays closed (aborted) and which
+	// hosts stay skipped for it. Nothing else is read off a closed rollout.
 	Closed []*fleet.Rollout
 	// Leases are the non-terminal leases.
 	Leases []*fleet.Lease
@@ -101,6 +96,12 @@ type World struct {
 	// open nor listed here is adopted; one for an expired lease reopens it
 	// when the agent did start after all.
 	ClosedLeases map[string]*fleet.Lease
+	// Ended are terminal leases. It must hold at least, for every host and
+	// every group (an image reference, the packages), the most recent lease
+	// that failed the host for the group or repaired it (verdictOf); the whole
+	// lease table is right too. Which hosts are broken is derived from it and
+	// from the leases that end in the reconcile.
+	Ended []*fleet.Lease
 	// LastLeaseEnd is, per host, when its most recent terminal lease ended.
 	// A host without an entry never held a lease this database knows of.
 	LastLeaseEnd map[string]time.Time
@@ -213,10 +214,9 @@ type pass struct {
 
 	// needs holds the reported needs per rollout ID and host.
 	needs map[string]map[string][]protocol.Need
-	// carried maps hosts that had failed in a rollout superseded in this
-	// pass to that rollout's ID, per successor group (image reference or
-	// packages kind).
-	carried map[string]map[string]string
+	// ledger says which hosts are broken for which group: the digest of
+	// World.Ended, plus the leases that ended in this pass.
+	ledger ledger
 	// closedLatest is the latest closed rollout per key; closedDirty are the
 	// copies of those in which a skip was lifted in this pass.
 	closedLatest map[string]*fleet.Rollout
@@ -266,7 +266,7 @@ func newPass(w *World) *pass {
 		origDirectives: make(map[string]*fleet.Directive, len(w.Directives)),
 		rows:           make(map[string]map[uint64]fleet.Liveness, len(w.Hosts)),
 		needs:          make(map[string]map[string][]protocol.Need, len(w.Rollouts)+2),
-		carried:        make(map[string]map[string]string, 2),
+		ledger:         newLedger(w.Ended),
 		closedLatest:   make(map[string]*fleet.Rollout, len(w.Closed)),
 		hostKeys:       make(map[string]map[string]bool, len(w.Hosts)),
 		ended:          make(map[string]bool, 2),
@@ -500,6 +500,7 @@ func cloneLease(l *fleet.Lease) *fleet.Lease {
 	c.Needs = slices.Clone(l.Needs)
 	c.AgentDoneAt = cloneTime(l.AgentDoneAt)
 	c.SyncedSince = cloneTime(l.SyncedSince)
+	c.SyncedUntil = cloneTime(l.SyncedUntil)
 	c.EndedAt = cloneTime(l.EndedAt)
 	c.Operation = cloneOperation(l.Operation)
 

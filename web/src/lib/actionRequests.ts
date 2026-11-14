@@ -2,7 +2,14 @@
 // sentences that tell an operator exactly what an action will do.
 
 import type { ActionCall } from '../api/client';
-import type { HoldRequest, RebootRequest, RollRequest, RolloutHostsRequest, ScopeRequest } from '../api/types';
+import type {
+  EndLeaseRequest,
+  HoldRequest,
+  RebootRequest,
+  RollRequest,
+  RolloutHostsRequest,
+  ScopeRequest,
+} from '../api/types';
 import { hostList, plural } from './format';
 
 /** "now": granted as fast as budget and gate allow; "staggered": a manual rollout through the normal rules. */
@@ -60,6 +67,11 @@ export function buildRebootRequest(o: DisruptiveOptions): RebootRequest {
 /** buildHoldRequest builds the body of the hold, unhold and forget actions. */
 export function buildHoldRequest(hosts: readonly string[], reason: string): HoldRequest {
   return { hosts: [...new Set(hosts)].sort(), reason: reason.trim() };
+}
+
+/** buildEndLeaseRequest builds the body of end-lease. */
+export function buildEndLeaseRequest(lease: string, reason: string): EndLeaseRequest {
+  return { lease, reason: reason.trim() };
 }
 
 /** buildScopeRequest builds the body of pause, resume and abort; an empty rollout is the global scope. */
@@ -162,6 +174,15 @@ export function describeCall(call: ActionCall): string[] {
         `Forget ${selectionText({ hosts: call.body.hosts, all: false })}: delete the host with its inventory, ` +
           'packages, needs and liveness. Rollout, lease and audit history is kept. ' +
           'A host whose agent still runs registers again on its next sync. Refused while the host holds a lease.',
+      ];
+    case 'end-lease':
+      return [
+        `End lease ${call.body.lease} as failed ("ended by operator"). The host no longer counts as holding a ` +
+          'lease, the rollouts the lease served halt, and rollouts that waited for it go on.',
+        'The host is broken from then on: it goes first in every rollout of the same image or the packages ' +
+          'until a lease succeeds on it. Hold the host to take it out of the way.',
+        'The agent is not stopped: it finishes the operation it has started. ' +
+          'Refused for a lease the agent has not started; that one ends by itself.',
       ];
     case 'pause':
       return call.body.rollout === ''

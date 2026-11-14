@@ -141,10 +141,18 @@ func (o *operation) run(ctx context.Context) {
 	}
 }
 
+// reasonWithdrawn is why a lease is not started that the controller stopped
+// offering before the agent had begun.
+const reasonWithdrawn = "the controller no longer offered the lease before the operation started"
+
 // begin decides whether to act on a freshly persisted lease and, if so,
 // executes it.
 func (o *operation) begin(ctx context.Context, st *persistedState) error {
 	rec := st.Current
+
+	if rec.Withdrawn {
+		return o.decline(protocol.PhaseDone, protocol.StepRefused, reasonWithdrawn)
+	}
 
 	if !o.now().Before(rec.Deadline) {
 		return o.decline(protocol.PhaseDone, protocol.StepRefused, fmt.Sprintf(
@@ -194,9 +202,19 @@ func (o *operation) begin(ctx context.Context, st *persistedState) error {
 		first = protocol.PhaseDraining
 	}
 
+	// The start and the withdrawal of a lease exclude each other: whichever
+	// is written first stands.
+	withdrawn := false
+
 	err = o.store.Update(func(st *persistedState) {
 		cur := st.Current
 		if cur == nil {
+			return
+		}
+
+		if cur.Withdrawn {
+			withdrawn = true
+
 			return
 		}
 
@@ -222,6 +240,10 @@ func (o *operation) begin(ctx context.Context, st *persistedState) error {
 		o.log.WithError(err).Error("cannot persist the start of the operation; not acting")
 
 		return nil
+	}
+
+	if withdrawn {
+		return o.decline(protocol.PhaseDone, protocol.StepRefused, reasonWithdrawn)
 	}
 
 	o.notify()

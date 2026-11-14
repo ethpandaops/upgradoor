@@ -4,6 +4,7 @@ import type {
   Config,
   ErrorBody,
   Gate,
+  EndLeaseRequest,
   HoldRequest,
   HostDetail,
   Hosts,
@@ -69,6 +70,7 @@ export interface ActionBodies {
   hold: HoldRequest;
   unhold: HoldRequest;
   forget: HoldRequest;
+  'end-lease': EndLeaseRequest;
   pause: ScopeRequest;
   resume: ScopeRequest;
   abort: ScopeRequest;

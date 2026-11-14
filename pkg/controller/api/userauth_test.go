@@ -169,6 +169,7 @@ func userRoutes() []userRoute {
 		{method: http.MethodPost, path: "/api/v1/actions/retry", body: `{"rollout":"r"}`},
 		{method: http.MethodPost, path: "/api/v1/actions/abort", body: `{"rollout":"r"}`},
 		{method: http.MethodPost, path: "/api/v1/actions/forget", body: `{"hosts":["a"]}`},
+		{method: http.MethodPost, path: "/api/v1/actions/end-lease", body: `{"lease":"l"}`},
 	}
 }
 

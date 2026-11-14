@@ -34,6 +34,7 @@ func TestPollPublishesChainView(t *testing.T) {
 		GenesisTime:       testGenesis,
 		SecondsPerSlot:    12,
 		SlotsPerEpoch:     8,
+		Phases:            fleet.SinglePhase(testGenesis, 12*time.Second),
 		HeadSlot:          82,
 		CurrentEpoch:      10,
 		FinalizedEpoch:    8,
@@ -180,6 +181,182 @@ func TestPollUnusableSpec(t *testing.T) {
 	got := h.svc.Health()
 	assert.Contains(t, got.Error, "SLOTS_PER_EPOCH")
 	assert.True(t, got.UpdatedAt.IsZero())
+}
+
+// TestPollTimingOutOfBounds: a chain timing that is out of bounds is said so,
+// once, in the log and in the published view. Only what the clock has reached
+// counts: a slot phase out of bounds that is scheduled for the future is
+// logged and closes nothing, and the epochs before it are placed as ever.
+// Before, nothing validated the timing where it was read: the service logged
+// "Loaded chain timing" for a spec that the scheduler then rejected whole,
+// and the operator saw "beacon node unreachable" for a node that answered.
+func TestPollTimingOutOfBounds(t *testing.T) {
+	const twoHours = "7200000"
+
+	for _, tt := range []struct {
+		name string
+		spec map[string]any
+		// timingError is what the view carries, as a part of it; empty when
+		// the current epoch can be placed. warned says whether the warning
+		// is logged at all.
+		timingError string
+		warned      bool
+	}{
+		{
+			name: "mainnet", spec: map[string]any{"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32"},
+		},
+		{
+			name: "minimal", spec: map[string]any{"SECONDS_PER_SLOT": "6", "SLOTS_PER_EPOCH": "8"},
+		},
+		{
+			name: "gnosis", spec: map[string]any{"SECONDS_PER_SLOT": "5", "SLOTS_PER_EPOCH": "16"},
+		},
+		{
+			name: "a fork to 6 s slots that has passed",
+			spec: map[string]any{
+				"SECONDS_PER_SLOT": "12", "SLOT_DURATION_MS": "12000", "SLOTS_PER_EPOCH": "32",
+				"SLOT_DURATION_MS_GLOAS": "6000", "GLOAS_FORK_EPOCH": "7",
+			},
+		},
+		{
+			name: "forks to 4.5 s and then 3 s slots",
+			spec: map[string]any{
+				"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32", "SLOT_DURATION_MS_GLOAS": "4500",
+				"GLOAS_FORK_EPOCH": "7", "SLOT_DURATION_MS_HEZE": "3000", "HEZE_FORK_EPOCH": "13",
+			},
+		},
+		{
+			name: "a fork that is not scheduled",
+			spec: map[string]any{
+				"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32",
+				"SLOT_DURATION_MS_GLOAS": "6000", "GLOAS_FORK_EPOCH": "18446744073709551615",
+			},
+		},
+		{
+			name: "a valid fork 190 years out",
+			spec: map[string]any{
+				"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32",
+				"SLOT_DURATION_MS_GLOAS": "6000", "GLOAS_FORK_EPOCH": "15600000",
+			},
+		},
+		{
+			// The finding: one phase out of bounds, far in the future,
+			// invalidated the timing now.
+			name: "slots of two hours from epoch 1000000 on",
+			spec: map[string]any{
+				"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32",
+				"SLOT_DURATION_MS_GLOAS": twoHours, "GLOAS_FORK_EPOCH": "1000000",
+			},
+			warned: true,
+		},
+		{
+			name:        "epochs of more than a day from genesis on",
+			spec:        map[string]any{"SECONDS_PER_SLOT": "3600", "SLOTS_PER_EPOCH": "32"},
+			timingError: "phase 0 (from epoch 0) has slots of 3600000 ms and epochs of 32 slots",
+			warned:      true,
+		},
+		{
+			name: "slots of two hours from a fork that has passed",
+			spec: map[string]any{
+				"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32",
+				"SLOT_DURATION_MS_GLOAS": twoHours, "GLOAS_FORK_EPOCH": "2",
+			},
+			timingError: "phase 1 (from epoch 2) has slots of 7200000 ms",
+			warned:      true,
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, 1, newFakeStore(host("a", 0, 4)), nil)
+			h.node.set(func(n *fakeNode) {
+				n.spec = tt.spec
+				n.headSlot = 0
+				n.finalized = 0
+			})
+
+			h.svc.poll(t.Context())
+			h.clock.Advance(testSlot)
+			h.svc.poll(t.Context())
+
+			got := h.svc.Health()
+			assert.Empty(t, got.Error, "the node answered")
+			assert.False(t, got.UpdatedAt.IsZero())
+
+			warnings := 0
+			if tt.warned {
+				warnings = 1
+			}
+
+			assert.Equal(t, warnings, h.warnings(timingWarning), "logged once, not on every poll")
+			assert.Equal(t, tt.warned, fleet.ValidateTiming(got.SlotsPerEpoch, got.Phases) != nil)
+
+			_, placed := got.EpochStart(got.CurrentEpoch)
+
+			if tt.timingError == "" {
+				assert.Empty(t, got.TimingError)
+				assert.True(t, placed, "the current epoch is placed")
+				assert.Positive(t, got.EpochDuration())
+
+				// What the view places, it places where the service does.
+				for epoch := range got.CurrentEpoch + 3 {
+					start, ok := got.EpochStart(epoch)
+					require.True(t, ok, "epoch %d", epoch)
+					assert.Equal(t, h.svc.timing.epochStart(epoch), start, "epoch %d", epoch)
+				}
+
+				return
+			}
+
+			assert.Contains(t, got.TimingError, tt.timingError)
+			assert.NotContains(t, got.TimingError, "invalid chain timing", "the reason, without the error's class")
+			assert.False(t, placed)
+			assert.Zero(t, got.EpochDuration())
+
+			for _, entry := range h.logs.AllEntries() {
+				if entry.Message == timingWarning {
+					assert.Equal(t, got.TimingError, entry.Data["reason"])
+					assert.Contains(t, entry.Data["effect"], "the network gate is closed")
+				}
+			}
+		})
+	}
+
+	// The warning comes again when what it says changes: the clock reaches
+	// the phase that is out of bounds.
+	t.Run("the clock reaches the phase", func(t *testing.T) {
+		h := newHarness(t, 1, newFakeStore(host("a", 0, 4)), nil)
+		h.node.set(func(n *fakeNode) {
+			n.spec = map[string]any{
+				"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "8",
+				"SLOT_DURATION_MS_GLOAS": twoHours, "GLOAS_FORK_EPOCH": "12",
+			}
+		})
+
+		h.svc.poll(t.Context())
+
+		got := h.svc.Health()
+		require.Equal(t, uint64(10), got.CurrentEpoch)
+		assert.Empty(t, got.TimingError, "two epochs before the phase")
+		assert.Equal(t, testEpoch, got.EpochDuration())
+		assert.Equal(t, 1, h.warnings(timingWarning))
+
+		_, placed := got.EpochStart(11)
+		assert.True(t, placed, "the last epoch before the phase")
+
+		_, placed = got.EpochStart(12)
+		assert.False(t, placed, "the first epoch of the phase")
+
+		_, placed = got.EpochSpan(h.clock.Now(), 2)
+		assert.False(t, placed, "a span that reaches into the phase")
+
+		h.clock.Set(at(12, time.Second))
+		h.svc.poll(t.Context())
+		h.svc.poll(t.Context())
+
+		got = h.svc.Health()
+		assert.Contains(t, got.TimingError, "phase 1 (from epoch 12) has slots of 7200000 ms")
+		assert.Zero(t, got.EpochDuration())
+		assert.Equal(t, 2, h.warnings(timingWarning), "said again, once, with what it means now")
+	})
 }
 
 func TestPollFailureKeepsLastView(t *testing.T) {

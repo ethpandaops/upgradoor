@@ -2,7 +2,7 @@ import { list, type Lease, type Need } from '../api/types';
 import { formatDuration, secondsBetween } from '../lib/format';
 import { ShortId } from './Digest';
 import { RelTime } from './RelTime';
-import { Badge, Dash, Table, Td, Th } from './primitives';
+import { Badge, Button, Dash, Table, Td, Th } from './primitives';
 import { LeaseStateBadge, StepBadge, needSummary } from './status';
 
 function stepLabel(needs: readonly Need[], needId: string): string {
@@ -15,18 +15,22 @@ function stepLabel(needs: readonly Need[], needId: string): string {
 /**
  * LeaseTable lists leases with the agent's phase, the per-need steps and the
  * controller's readiness note. `closed` switches the time columns to the
- * history form (ended, duration).
+ * history form (ended, duration). With `onEnd` every open lease that its
+ * agent has started gets a button to end it; a lease that is only granted
+ * ends by itself and cannot be ended.
  */
 export function LeaseTable({
   leases,
   label,
   showHost = true,
   closed = false,
+  onEnd,
 }: {
   leases: readonly Lease[];
   label: string;
   showHost?: boolean;
   closed?: boolean;
+  onEnd?: (lease: Lease) => void;
 }) {
   return (
     <Table label={label}>
@@ -45,6 +49,7 @@ export function LeaseTable({
           <Th>Granted</Th>
           <Th>{closed ? 'Ended' : 'Expires'}</Th>
           {closed && <Th>Took</Th>}
+          {onEnd && <Th>Actions</Th>}
         </tr>
       </thead>
       <tbody>
@@ -110,6 +115,25 @@ export function LeaseTable({
                 <RelTime value={closed ? l.endedAt : l.expiresAt} />
               </Td>
               {closed && <Td>{took === null ? <Dash /> : formatDuration(took)}</Td>}
+              {onEnd && (
+                <Td>
+                  <Button
+                    dense
+                    variant="danger"
+                    disabled={l.state !== 'running' && l.state !== 'verifying'}
+                    title={
+                      l.state === 'granted'
+                        ? 'The agent has not started this lease; it ends by itself.'
+                        : 'End this lease as failed'
+                    }
+                    onClick={() => {
+                      onEnd(l);
+                    }}
+                  >
+                    End…
+                  </Button>
+                </Td>
+              )}
             </tr>
           );
         })}

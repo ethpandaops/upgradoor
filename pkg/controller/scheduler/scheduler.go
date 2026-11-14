@@ -21,6 +21,9 @@ var (
 	// ErrUnknownRollout is returned when an action names a rollout that does
 	// not exist.
 	ErrUnknownRollout = errors.New("scheduler: unknown rollout")
+	// ErrUnknownLease is returned when an action names a lease that does not
+	// exist.
+	ErrUnknownLease = errors.New("scheduler: unknown lease")
 	// ErrInvalidAction is returned when an action cannot apply in the
 	// current state; the message says why.
 	ErrInvalidAction = errors.New("scheduler: invalid action")
@@ -65,6 +68,10 @@ type Service interface {
 	Retry(ctx context.Context, actor string, req RolloutHostsRequest) (*ActionResult, error)
 	// Abort closes a rollout. Open leases finish.
 	Abort(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
+	// EndLease ends one open lease that the agent has started as failed
+	// ("ended by operator"). The host is broken from then on and goes first;
+	// a lease that held back the rollouts of its group no longer does.
+	EndLease(ctx context.Context, actor string, req EndLeaseRequest) (*ActionResult, error)
 	// Forget deletes hosts that are gone. Refused while a host holds a lease.
 	Forget(ctx context.Context, actor string, req HoldRequest) (*ActionResult, error)
 }
@@ -124,6 +131,13 @@ type RolloutHostsRequest struct {
 	Rollout string   `json:"rollout"`
 	Hosts   []string `json:"hosts"`
 	Reason  string   `json:"reason"`
+}
+
+// EndLeaseRequest is the body of POST /api/v1/actions/end-lease.
+type EndLeaseRequest struct {
+	// Lease is the ID of an open lease.
+	Lease  string `json:"lease"`
+	Reason string `json:"reason"`
 }
 
 // ActionResult is the answer to every action.
@@ -188,9 +202,9 @@ type QueueEntry struct {
 	// by itself from one that waits for a person.
 	Wait WaitKind `json:"wait"`
 	// After names the host that a host waiting for its place in the order
-	// of a rollout waits for: a carried member, or the canary. That host may
-	// not be in the queue itself: it holds a lease, or it is expected to
-	// report its need.
+	// of a rollout waits for: a member whose host is broken, the host of a
+	// lease in flight, or the canary. That host may not be in the queue
+	// itself: it holds a lease, or it is expected to report its need.
 	After string `json:"after,omitempty"`
 	// Rollout is the ID of the rollout the reason is about: the one that is
 	// paused, halted, unapproved or whose order the host waits in. Empty when
