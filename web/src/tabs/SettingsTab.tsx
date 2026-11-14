@@ -265,7 +265,7 @@ function FieldInput({
             className={cx(INPUT_CLASS, 'w-24 font-mono', invalid && 'border-danger')}
           />
           {spec.kind === 'percent' && <span className="text-muted">%</span>}
-          {spec.key === 'maxFinalityLagEpochs' || spec.key === 'soakEpochs' ? (
+          {spec.key === 'maxFinalityLagEpochs' || spec.key === 'readyEpochs' ? (
             <span className="text-muted">epochs</span>
           ) : null}
         </span>

@@ -226,14 +226,14 @@ func TestProbeBoth(t *testing.T) {
 	got := New(testLog(), el.URL, cl.URL).Probe(context.Background())
 	require.NotNil(t, got.EL)
 	require.NotNil(t, got.CL)
-	assert.True(t, got.Synced())
+	assert.True(t, got.Synced(1))
 }
 
 func TestProbeNothingConfigured(t *testing.T) {
 	got := New(testLog(), "", "").Probe(context.Background())
 	assert.Nil(t, got.EL)
 	assert.Nil(t, got.CL)
-	assert.True(t, got.Synced(), "no probe configured counts as synced")
+	assert.True(t, got.Synced(1), "no probe configured counts as synced")
 }
 
 func TestProbeUnreachable(t *testing.T) {
@@ -249,7 +249,7 @@ func TestProbeUnreachable(t *testing.T) {
 	assert.False(t, got.CL.Reachable)
 	assert.NotEmpty(t, got.EL.Error)
 	assert.NotEmpty(t, got.CL.Error)
-	assert.False(t, got.Synced())
+	assert.False(t, got.Synced(1))
 }
 
 func TestProbeTimeout(t *testing.T) {

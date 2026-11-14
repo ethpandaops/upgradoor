@@ -178,7 +178,7 @@ export function ActionDialog({
               setTiming('now');
             }}
             label="Now"
-            hint="as fast as budget and gate allow; no ordering, no soak between hosts"
+            hint="as fast as budget and gate allow; no canary, no ready check between hosts"
           />
           <Choice
             type="radio"
@@ -188,7 +188,7 @@ export function ActionDialog({
               setTiming('staggered');
             }}
             label="Staggered"
-            hint="a manual rollout: canary, batches, soak, bootnodes last"
+            hint="a manual rollout: one canary, then everybody else, each with a ready check"
           />
           <Choice
             type="checkbox"
@@ -198,7 +198,7 @@ export function ActionDialog({
               setForce(f => !f);
             }}
             label="Force"
-            hint="skip stage ordering and the readiness soak (never the budget)"
+            hint="skip the order and the ready check (never the budget)"
           />
         </fieldset>
       )}

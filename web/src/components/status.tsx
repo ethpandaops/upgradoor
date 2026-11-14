@@ -85,10 +85,9 @@ export function StepBadge({ status, title }: { status: StepStatus; title?: strin
 }
 
 const STAGE_LABEL: Record<Stage, string> = {
-  0: 'no validators',
-  1: 'canary',
-  2: 'batch',
-  3: 'bootnode',
+  1: 'repair',
+  2: 'canary',
+  3: 'rest',
 };
 
 /** stageLabel names a fleet.Stage. */

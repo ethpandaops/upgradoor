@@ -43,11 +43,12 @@ func testRollout(id string, state fleet.RolloutState, sec int, hosts ...string) 
 
 	for i, host := range hosts {
 		r.Hosts = append(r.Hosts, fleet.RolloutHost{
-			Host:      host,
-			State:     fleet.HostPending,
-			Stage:     fleet.Stage(i % 4),
-			NeedID:    "need-" + host,
-			UpdatedAt: at(sec + 1),
+			Host:        host,
+			State:       fleet.HostPending,
+			Stage:       fleet.Stage(i % 3),
+			CarriedFrom: []string{"", "rollout-0"}[i%2],
+			NeedID:      "need-" + host,
+			UpdatedAt:   at(sec + 1),
 		})
 	}
 
@@ -144,7 +145,7 @@ func TestRollouts(t *testing.T) {
 			packages.Hosts[1].State = fleet.HostFailed
 			packages.Hosts[1].LeaseID = "l9"
 			packages.Hosts[1].Error = "exit 1"
-			packages.Hosts[1].Stage = fleet.StageBootnodes
+			packages.Hosts[1].Stage = fleet.StageCanary
 
 			all := []*fleet.Rollout{
 				testRollout("r-old-done", fleet.RolloutCompleted, 0, "node-1"),

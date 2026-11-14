@@ -27,8 +27,11 @@ import (
 // The simulation drives the real Service over an in-memory store with a
 // random fleet, simulated agents, a simulated registry and network, random
 // operator actions, controller restarts (some after an outage longer than
-// leaseTtl) and store write failures. In every fifth seed the beacon node
-// does not serve the liveness endpoint for the whole run. After
+// leaseTtl) and store write failures. Nodes come back from an operation
+// syncing, without their EL or slow to find peers, lose peers they had, and
+// agents go silent while their host is checked for readiness. In every fifth
+// seed the beacon node does not serve the liveness endpoint for the whole
+// run. After
 // every step the oracle (sim_oracle_test.go) asserts the invariants of
 // docs/scheduler.md from the world's own state; at the end of a run the world
 // is healed and everything must converge.
@@ -78,7 +81,9 @@ type sim struct {
 	// holds is the person's own record of the hosts on controller hold. It
 	// outlives the controller's database.
 	holds map[string]bool
-	stats simStats
+	// registered is when the current database first saw each host.
+	registered map[string]time.Time
+	stats      simStats
 }
 
 // simStats counts what happened, so that the test can tell a simulation that
@@ -100,7 +105,11 @@ type simStats struct {
 	// controller without a record of them first saw them.
 	HoldsAdopted                     int
 	Skips, SkipsLifted, SkipsCarried int
-	ConvergeTicks, MaxConvergeTicks  int
+	// Repairs are the leases granted through the closed gate, Carried the
+	// members carried over as failed, MixedLeases the failed leases in which
+	// a step was done.
+	Repairs, Carried, MixedLeases   int
+	ConvergeTicks, MaxConvergeTicks int
 	// Waits counts the waiting reasons seen in plans, by their first word.
 	Waits map[string]int
 }
@@ -132,6 +141,9 @@ func (a *simStats) add(b *simStats) {
 	a.Skips += b.Skips
 	a.SkipsLifted += b.SkipsLifted
 	a.SkipsCarried += b.SkipsCarried
+	a.Repairs += b.Repairs
+	a.Carried += b.Carried
+	a.MixedLeases += b.MixedLeases
 	a.ConvergeTicks += b.ConvergeTicks
 	a.MaxConvergeTicks = max(a.MaxConvergeTicks, b.MaxConvergeTicks)
 
@@ -141,6 +153,19 @@ func (a *simStats) add(b *simStats) {
 
 	for k, v := range b.Waits {
 		a.Waits[k] += v
+	}
+}
+
+// countLease counts the repairs and the failed leases in which a step was
+// done.
+func (s *sim) countLease(l *fleet.Lease) {
+	if l.Repair {
+		s.stats.Repairs++
+	}
+
+	if l.State == fleet.LeaseFailed && l.Operation != nil &&
+		slices.ContainsFunc(l.Operation.Steps, func(st protocol.Step) bool { return st.Status == protocol.StepDone }) {
+		s.stats.MixedLeases++
 	}
 }
 
@@ -176,6 +201,10 @@ func (s *sim) count() {
 
 	for _, r := range all {
 		for i := range r.Hosts {
+			if r.Hosts[i].CarriedFrom != "" {
+				s.stats.Carried++
+			}
+
 			if !operatorSkipped(&r.Hosts[i]) && !strings.HasPrefix(r.Hosts[i].Error, skipLiftedPrefix) {
 				continue
 			}
@@ -207,6 +236,8 @@ func (s *sim) count() {
 		if l.Force {
 			s.stats.ForcedGrants++
 		}
+
+		s.countLease(l)
 
 		if exempt {
 			s.stats.ExemptGrants++
@@ -243,6 +274,8 @@ func newSim(seed uint64) (*sim, error) {
 		log:     log,
 		skipped: make(map[string]map[string]bool, 4),
 		holds:   make(map[string]bool, 4),
+
+		registered: make(map[string]time.Time, 16),
 	}
 
 	// Taken from the seed, not from the random stream, so that the other
@@ -265,7 +298,8 @@ func newSim(seed uint64) (*sim, error) {
 		MaxUnavailablePercent:   pick(0, 5, 10, 10, 20, 34, 50, 100),
 		MinParticipationPercent: pick(66, 80, 90),
 		MaxFinalityLagEpochs:    uint64(pick(2, 3, 5)),
-		SoakEpochs:              uint64(pick(0, 1, 1, 2)),
+		ReadyEpochs:             uint64(pick(0, 1, 1, 2)),
+		MinPeers:                int(pick(1, 3, 3, 5)),
 		LeaseTTL:                fleet.Duration(time.Duration(pick(60, 120, 300)) * time.Second),
 		HostStaleAfter:          fleet.Duration(time.Duration(pick(30, 60, 120)) * time.Second),
 		ReadinessTimeout:        fleet.Duration(time.Duration(pick(120, 300, 600)) * time.Second),
@@ -307,11 +341,17 @@ func (s *sim) service(st *fakeStore, newID func() string) (*service, error) {
 	return svc, nil
 }
 
-// boot (re)starts the controller on the store.
+// boot (re)starts the controller on the store. Its beacon service knows the
+// epoch timing at once and what it has stored about liveness a little later.
 func (s *sim) boot(st *fakeStore) error {
 	svc, err := s.service(st, s.newID)
 	s.svc = svc
 	s.since = s.world.now
+
+	if !s.world.calm {
+		s.world.livenessUnknownUntil = later(s.world.livenessUnknownUntil,
+			s.world.now.Add(time.Duration(s.rng.IntN(30))*time.Second))
+	}
 
 	return err
 }
@@ -391,6 +431,10 @@ func (s *sim) syncAgents() error {
 
 		if a.bootnode {
 			host.Roles = []string{fleet.RoleBootnode}
+		}
+
+		if s.store.host(a.name) == nil {
+			s.registered[a.name] = w.now
 		}
 
 		if s.store.recordSync(host) {
@@ -520,10 +564,11 @@ func (s *sim) facts(fresh bool) *simFacts {
 		hosts:          make(map[string]*simHostFact, len(w.agents)),
 		rows:           w.published,
 		publishedEpoch: w.publishedEpoch,
-		havePublished:  w.havePublished,
+		havePublished:  w.storedLiveness(),
 		retried:        s.retried,
 		skipped:        s.skipped,
 		holds:          s.holds,
+		registered:     s.registered,
 		fresh:          fresh,
 	}
 
@@ -541,14 +586,13 @@ func (s *sim) facts(fresh bool) *simFacts {
 			live = a.weight
 
 			silent := w.now.Sub(later(a.lastSync, s.since)) > settings.HostStaleAfter.Std()
-			if silent || (a.lastSent != nil && !a.lastSent.Node.Synced()) {
+			if silent || (a.lastSent != nil && !oracleNodeBack(a.lastSent.Node, 1)) {
 				live = 0
 			}
 		}
 
 		f.hosts[a.name] = &simHostFact{
 			weight:     a.weight,
-			bootnode:   a.bootnode,
 			live:       live,
 			holdWanted: registered.HoldWanted,
 			lastSync:   a.lastSync,
@@ -561,11 +605,13 @@ func (s *sim) facts(fresh bool) *simFacts {
 	return f
 }
 
-// observe hands the committed state to the oracle, unless nothing was
-// written since the last observation.
+// observe hands the committed state to the oracle. It does so after every
+// reconcile, also one that wrote nothing: a host that is stuck shows in
+// reconciles that change nothing. An action that wrote nothing is not looked
+// at again.
 func (s *sim) observe(fresh bool) error {
 	writes := s.store.writeCount()
-	if writes == s.observed && len(s.retried) == 0 {
+	if !fresh && writes == s.observed && len(s.retried) == 0 {
 		return nil
 	}
 
@@ -716,10 +762,12 @@ func (s *sim) randomStep() error {
 		a.rebootRequired = true
 		a.rebootSticks = s.rng.IntN(8) == 0
 		s.note("%s: reboot required (sticks: %v)", a.name, a.rebootSticks)
-	case n < 600:
+	case n < 595:
 		s.worldEvent()
-	case n < 650:
+	case n < 640:
 		s.agentEvent()
+	case n < 665:
+		s.nodeEvent()
 	case n < 690:
 		s.stats.Restarts++
 
@@ -766,7 +814,13 @@ func (s *sim) outage() error {
 		return err
 	}
 
+	// Longer than leaseTtl, and every other time longer than readinessTimeout
+	// too: a host that was being checked must not fail for it.
 	down := settings.LeaseTTL.Std() + s.duration(1, 240)
+	if s.rng.IntN(2) == 0 {
+		down = max(down, settings.ReadinessTimeout.Std()+s.duration(1, 120))
+	}
+
 	s.note("controller down for %s, then restart", down)
 
 	w.beaconDownUntil = later(w.beaconDownUntil, w.now.Add(down))
@@ -825,6 +879,7 @@ func (s *sim) loseDatabase() error {
 	s.observed = 0
 	s.retried = nil
 	s.skipped = make(map[string]map[string]bool, 4)
+	s.registered = make(map[string]time.Time, 16)
 
 	for _, a := range s.world.agents {
 		s.world.dropped[a.name] = true
@@ -837,7 +892,7 @@ func (s *sim) loseDatabase() error {
 func (s *sim) worldEvent() {
 	w := s.world
 
-	switch s.rng.IntN(10) {
+	switch s.rng.IntN(12) {
 	case 0, 1, 2, 3:
 		a := s.agent()
 		if w.now.Before(a.outageUntil) {
@@ -858,6 +913,10 @@ func (s *sim) worldEvent() {
 	case 8:
 		w.beaconDownUntil = w.now.Add(s.duration(30, 300))
 		s.note("beacon node down for %s", w.beaconDownUntil.Sub(w.now))
+	case 9:
+		// One epoch or several in which nobody is seen attesting.
+		w.blackoutUntil = w.now.Add(s.duration(20, 220))
+		s.note("no attestations seen for %s", w.blackoutUntil.Sub(w.now))
 	default:
 		if s.rng.IntN(2) == 0 {
 			w.livenessStallUntil = w.now.Add(s.duration(60, 400))
@@ -869,12 +928,74 @@ func (s *sim) worldEvent() {
 	}
 }
 
+// recovering picks a host whose agent has finished an operation and waits
+// for the controller to find it ready, when there is one; else any host.
+func (s *sim) recovering() *simAgent {
+	var done []*simAgent
+
+	for _, a := range s.world.agents {
+		if a.op != nil && a.op.Phase == protocol.PhaseDone && a.op.Disrupted {
+			done = append(done, a)
+		}
+	}
+
+	if len(done) == 0 {
+		return s.agent()
+	}
+
+	return done[s.rng.IntN(len(done))]
+}
+
+// nodeEvent gives one node trouble that the readiness check must notice,
+// most often a node that has just come back from an operation: it falls
+// behind, loses peers it had, loses its execution client, or its agent goes
+// silent.
+func (s *sim) nodeEvent() {
+	w := s.world
+
+	a := s.agent()
+	if s.rng.IntN(4) != 0 {
+		a = s.recovering()
+	}
+
+	switch s.rng.IntN(6) {
+	case 0:
+		a.syncingUntil = w.now.Add(s.duration(5, 120))
+		a.syncingEL = s.rng.IntN(2) == 0
+		s.note("%s: node syncing for %s (EL: %v)", a.name, a.syncingUntil.Sub(w.now), a.syncingEL)
+	case 1, 2:
+		a.peerCap = s.rng.IntN(4)
+		a.peerCapUntil = w.now.Add(s.duration(5, 200))
+		s.note("%s: at most %d peers for %s", a.name, a.peerCap, a.peerCapUntil.Sub(w.now))
+	case 3:
+		if s.rng.IntN(2) == 0 {
+			a.elDownUntil = w.now.Add(s.duration(5, 120))
+			s.note("%s: EL down for %s", a.name, a.elDownUntil.Sub(w.now))
+		} else {
+			a.elOfflineUntil = w.now.Add(s.duration(5, 120))
+			s.note("%s: CL reports its EL offline for %s", a.name, a.elOfflineUntil.Sub(w.now))
+		}
+	default:
+		a.silentUntil = w.now.Add(s.duration(20, 400))
+		s.note("%s: silent for %s", a.name, a.silentUntil.Sub(w.now))
+	}
+}
+
 // agentEvent changes something on one host.
 func (s *sim) agentEvent() {
 	w := s.world
 	a := s.agent()
 
-	switch s.rng.IntN(10) {
+	switch s.rng.IntN(13) {
+	case 10:
+		a.dead = !a.dead
+		s.note("%s: validators dead: %v", a.name, a.dead)
+	case 11:
+		a.sloppy = !a.sloppy
+		s.note("%s: reports needs it may not serve: %v", a.name, a.sloppy)
+	case 12:
+		a.blind = !a.blind
+		s.note("%s: registry polls see nothing: %v", a.name, a.blind)
 	case 0, 1, 2, 3:
 		a.silentUntil = w.now.Add(s.duration(10, 400))
 		s.note("%s: silent for %s", a.name, a.silentUntil.Sub(w.now))
@@ -1084,8 +1205,15 @@ func (s *sim) settingsAction() error {
 		set.MinParticipationPercent = []float64{50, 66, 80, 90, 95}[s.rng.IntN(5)]
 		what = fmt.Sprintf("minParticipationPercent=%v", set.MinParticipationPercent)
 	case 4:
-		set.SoakEpochs = uint64(s.rng.IntN(3))
-		what = fmt.Sprintf("soakEpochs=%d", set.SoakEpochs)
+		if s.rng.IntN(2) == 0 {
+			set.MinPeers = []int{1, 2, 3, 5}[s.rng.IntN(4)]
+			what = fmt.Sprintf("minPeers=%d", set.MinPeers)
+
+			break
+		}
+
+		set.ReadyEpochs = uint64(s.rng.IntN(3))
+		what = fmt.Sprintf("readyEpochs=%d", set.ReadyEpochs)
 	case 5:
 		set.PolicyImage = policies[s.rng.IntN(len(policies))]
 		what = "policyImage=" + string(set.PolicyImage)
@@ -1113,6 +1241,7 @@ func (s *sim) converge() error {
 
 	w.calm = true
 	w.beaconDownUntil, w.finalityStallUntil, w.dropUntil = time.Time{}, time.Time{}, time.Time{}
+	w.blackoutUntil = time.Time{}
 	w.livenessStallUntil, w.livenessUnknownUntil = time.Time{}, time.Time{}
 	s.store.setFailing(false, 0)
 
@@ -1122,6 +1251,9 @@ func (s *sim) converge() error {
 
 	for _, a := range w.agents {
 		a.silentUntil, a.outageUntil, a.localHold, a.rebootSticks = time.Time{}, time.Time{}, false, false
+		a.syncingUntil, a.elOfflineUntil, a.elDownUntil = time.Time{}, time.Time{}, time.Time{}
+		a.peerCapUntil, a.elLag = time.Time{}, 0
+		a.dead, a.sloppy, a.blind = false, false, false
 	}
 
 	set, err := s.svc.Settings(ctx)
@@ -1524,6 +1656,10 @@ func TestSimulation(t *testing.T) {
 			"skipped hosts":                              total.Skips,
 			"skips taken back":                           total.SkipsLifted,
 			"skips carried over":                         total.SkipsCarried,
+			"repairs through the closed gate":            total.Repairs,
+			"members carried over as failed":             total.Carried,
+			"failed leases with a step done":             total.MixedLeases,
+			"waits for a verb the agent lacks":           total.Waits["verb"],
 			"waits for the budget":                       total.Waits["budget"], "waits for the host limit": total.Waits["host"],
 			"waits for the gate": total.Waits["network"], "waits for the order": total.Waits["after"],
 		} {

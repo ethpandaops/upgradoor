@@ -73,6 +73,37 @@ function waitKind(reason: string): WaitKind {
   return 'next';
 }
 
+/** The stages of fleet.Stage. */
+const STAGE_REPAIR = 1;
+const STAGE_CANARY = 2;
+const STAGE_REST = 3;
+
+/** carried: the member failed in the rollout this one supersedes. */
+function carried(m: RolloutHost): boolean {
+  return Boolean(m.carriedFrom);
+}
+
+/** succeeded: the rollout has served a member successfully (one is done through a lease). */
+function succeeded(r: Rollout): boolean {
+  return list(r.hosts).some(m => m.state === 'done' && Boolean(m.leaseId));
+}
+
+/** keepsCanary: the canary holds a lease, is done by one, or failed and the rollout is still halted by it. */
+function keepsCanary(r: Rollout, m: RolloutHost): boolean {
+  if (m.state === 'leased') return true;
+  if (m.state === 'done') return Boolean(m.leaseId);
+  return m.state === 'failed' && r.state === 'halted';
+}
+
+/** fits: the three grant conditions of the availability budget for a host that costs cost. */
+function fits(cost: number, budget: Budget): boolean {
+  return (
+    cost === 0 ||
+    budget.unavailableWeight + cost <= budget.allowedWeight + 1e-9 ||
+    (budget.unavailableWeight === 0 && budget.allowedWeight > 0 && budget.leasedHosts === 0)
+  );
+}
+
 class HttpError extends Error {
   readonly status: number;
 
@@ -194,7 +225,7 @@ export class MockController {
 
     const body: unknown = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
 
-    if (method === 'PUT' && route === 'settings') return this.putSettings(body as Settings);
+    if (method === 'PUT' && route === 'settings') return this.putSettings(body);
 
     if (method === 'POST' && route.startsWith('actions/')) {
       const result = this.action(route.slice('actions/'.length), body);
@@ -388,8 +419,127 @@ export class MockController {
     };
   }
 
+  /** live is the number of the host's validators that attested in the newest epoch. */
+  private live(name: string): number {
+    const host = this.data.hosts.get(name);
+    return host ? this.liveAt(host, 0, this.currentEpoch() - 1) : 0;
+  }
+
+  /** lastLeaseEnd is when the host's most recent lease ended, or 0. */
+  private lastLeaseEnd(name: string): number {
+    return this.data.leases
+      .filter(l => l.host === name && l.endedAt)
+      .reduce((latest, l) => Math.max(latest, Date.parse(l.endedAt as string)), 0);
+  }
+
+  /**
+   * offline: the host is established as offline. It has validators, holds no
+   * lease, and none of them attested in the two newest epochs, both of which
+   * began after its last lease ended.
+   */
+  private offline(host: HostDetail): boolean {
+    if (host.validators === 0 || this.openLease(host.name)) return false;
+
+    const newest = this.currentEpoch() - 1;
+    if (this.liveAt(host, 0, newest) !== 0 || this.liveAt(host, 1, newest) !== 0) return false;
+
+    return this.data.genesis + (newest - 1) * EPOCH_MS >= this.lastLeaseEnd(host.name);
+  }
+
+  /**
+   * repairHost is the one host that the closed gate lets pass: the first in
+   * serving order that is established as offline, while the gate fails on
+   * data it has and no lease that was granted this way is open.
+   */
+  private repairHost(order: readonly string[], open: readonly Rollout[], gate: Gate): string | undefined {
+    const reasons = list(gate.reasons);
+    if (gate.ok || reasons.includes('beacon node unreachable') || reasons.includes('liveness data stale')) {
+      return undefined;
+    }
+    if (this.data.leases.some(l => l.repair && !['released', 'failed', 'expired'].includes(l.state))) {
+      return undefined;
+    }
+
+    if (this.data.settings.paused) return undefined;
+
+    // Only a host that one of its rollouts would grant but for the gate.
+    const grants = (r: Rollout, host: HostDetail) =>
+      r.state === 'active' &&
+      !r.paused &&
+      !r.ignoreBudget &&
+      this.policy(r) !== 'paused' &&
+      (this.policy(r) !== 'manual' || r.approved) &&
+      list(r.hosts).some(m => m.host === host.name && m.state === 'pending') &&
+      this.hasVerb(r, host);
+
+    return order.find(name => {
+      const host = this.data.hosts.get(name);
+      const held = !host || host.holdWanted || host.hold.local || host.hold.controller;
+      return (
+        host !== undefined && !held && !this.isStale(name) && this.offline(host) && open.some(r => grants(r, host))
+      );
+    });
+  }
+
+  /** hasVerb: the agent allows the verb of a need it reports for the rollout. */
+  private hasVerb(r: Rollout, host: HostDetail): boolean {
+    const kinds = r.kind === 'manual' ? list(host.needs).map(n => n.kind) : [r.kind];
+    return kinds.some(kind => list(host.verbs).includes(kind === 'image' ? 'roll' : kind));
+  }
+
+  /**
+   * servable: the member can be served as far as its host goes. It waits
+   * with a need whose verb the agent allows and is neither held nor silent;
+   * or it is expected and still waited for: neither held nor silent, the
+   * rollout no older than hostStaleAfter, and, in an image rollout, the host
+   * allows the roll verb and still runs the image at another digest.
+   */
+  private servable(r: Rollout, m: RolloutHost): boolean {
+    const host = this.data.hosts.get(m.host);
+    if (!host || host.holdWanted || host.hold.local || host.hold.controller || this.isStale(m.host)) return false;
+
+    if (m.state === 'pending') return this.hasVerb(r, host);
+    if (m.state !== 'expected') return false;
+
+    const staleAfter = parseGoDuration(this.data.settings.hostStaleAfter) ?? 120_000;
+    if (this.now() - Date.parse(r.createdAt) > staleAfter) return false;
+    if (r.kind !== 'image') return r.kind === 'manual';
+
+    return (
+      list(host.verbs).includes('roll') &&
+      list(host.containers).some(c => c.managed && !c.custom && c.image === r.image && c.digest !== r.digest)
+    );
+  }
+
+  /** awaited: the member holds a lease or is servable; the members behind it wait for it. */
+  private awaited(r: Rollout, m: RolloutHost): boolean {
+    return m.state === 'leased' || this.servable(r, m);
+  }
+
+  /** carriedAwaited is the first carried member that is still to be served. */
+  private carriedAwaited(r: Rollout): RolloutHost | undefined {
+    return list(r.hosts).find(m => carried(m) && this.awaited(r, m));
+  }
+
+  /**
+   * orderWait names the host that the order inside the rollout makes the
+   * host wait for, or undefined: every carried member that is still to be
+   * served and, until the rollout has its first success, the canary. A
+   * carried host waits for nobody.
+   */
+  private orderWait(r: Rollout, host: string): { reason: string; after: string } | undefined {
+    const me = list(r.hosts).find(m => m.host === host);
+    if (r.force || !me || carried(me)) return undefined;
+
+    const first = this.carriedAwaited(r);
+    if (first) return { reason: `after ${first.host}`, after: first.host };
+
+    if (!r.canary || r.canary === host || succeeded(r)) return undefined;
+    return { reason: `after canary ${r.canary}`, after: r.canary };
+  }
+
   /** waitingReason follows the order of docs/scheduler.md, "Waiting reasons". */
-  private waitingReason(host: HostDetail, memberOf: Rollout[], gate: Gate, budget: Budget): string {
+  private waitingReason(host: HostDetail, memberOf: Rollout[], gate: Gate, budget: Budget, repair: boolean): string {
     if (host.holdWanted || host.hold.local || host.hold.controller) return 'held';
     if (this.isStale(host.name)) return 'agent silent';
     if (this.data.settings.paused) return 'paused';
@@ -409,21 +559,21 @@ export class MockController {
       return halted ? `rollout halted: ${halted.reason ?? 'a host failed'}` : 'next';
     }
 
-    const ignoresBudget = allowed.some(r => r.ignoreBudget);
-    if (!gate.ok && !ignoresBudget) return `network gate: ${list(gate.reasons)[0] ?? 'failing'}`;
+    const able = allowed.filter(r => this.hasVerb(r, host));
+    if (able.length === 0) return 'verb not allowed by the agent';
 
-    for (const r of allowed) {
-      if (r.force) continue;
-      const me = list(r.hosts).find(h => h.host === host.name);
-      const blocker = list(r.hosts).find(
-        h => me && h.stage < me.stage && h.state !== 'done' && h.state !== 'skipped' && h.state !== 'expected'
-      );
-      if (blocker) return `after ${blocker.host}`;
-    }
+    const ignoresBudget = able.some(r => r.ignoreBudget);
+    const throughGate = !gate.ok && !ignoresBudget;
+    if (throughGate && !repair) return `network gate: ${list(gate.reasons)[0] ?? 'failing'}`;
+
+    // The host is served for every rollout whose order lets it go: it waits
+    // for the order only when the order of each of them holds it back. A
+    // repair through the closed gate does not wait for its place.
+    const waits = able.map(r => this.orderWait(r, host.name));
+    if (!throughGate && waits.every(w => w !== undefined)) return waits[0]?.reason ?? 'next';
 
     if (!ignoresBudget) {
-      const cost = this.liveAt(host, 0, this.currentEpoch() - 1);
-      if (cost > 0 && budget.unavailableWeight + cost > budget.allowedWeight && budget.unavailableWeight > 0) {
+      if (!fits(this.live(host.name), budget)) {
         const pct = (w: number) => formatPercent(budget.totalWeight > 0 ? (w / budget.totalWeight) * 100 : 0);
         return `budget ${pct(budget.unavailableWeight)} of ${pct(budget.allowedWeight)}`;
       }
@@ -433,6 +583,16 @@ export class MockController {
     }
 
     return 'next';
+  }
+
+  /** orderAfter names the host that a host waiting for its place in the order waits for. */
+  private orderAfter(host: string, memberOf: Rollout[]): string | undefined {
+    for (const r of memberOf) {
+      const wait = r.state === 'active' ? this.orderWait(r, host) : undefined;
+      if (wait) return wait.after;
+    }
+
+    return undefined;
   }
 
   /** aboutRollout is the rollout a waiting reason is about, as the scheduler names it in the plan. */
@@ -449,12 +609,7 @@ export class MockController {
       case 'halted':
         return memberOf.find(r => r.state === 'halted')?.id;
       case 'order':
-        return active.find(r => {
-          const me = list(r.hosts).find(h => h.host === host);
-          return list(r.hosts).some(
-            h => me && h.stage < me.stage && h.state !== 'done' && h.state !== 'skipped' && h.state !== 'expected'
-          );
-        })?.id;
+        return active.find(r => this.orderWait(r, host) !== undefined)?.id;
       case 'gate':
       case 'verb':
         return active[0]?.id;
@@ -463,22 +618,73 @@ export class MockController {
     }
   }
 
+  /**
+   * settleStages mirrors the scheduler's order inside a rollout
+   * (docs/scheduler.md, Ordering): the canary is settled and every member
+   * gets its stage: a carried member is in the repair stage, the canary in
+   * its own, everybody else in the rest. The canary is the first member that
+   * is not carried and can go, in this order: it fits the budget, it has
+   * live validators, it reports the need, it is the lightest, by name. There
+   * is none in a forced rollout, for a single member, after the first
+   * success and while a carried member is still to be served.
+   */
+  private settleStages(r: Rollout, budget: Budget): void {
+    const members = list(r.hosts);
+    const current = members.find(m => m.host === r.canary);
+
+    if (r.force || !current || !keepsCanary(r, current)) {
+      r.canary = undefined;
+
+      if (!r.force && !succeeded(r) && !this.carriedAwaited(r)) {
+        const weight = (m: RolloutHost) => this.data.hosts.get(m.host)?.validators ?? 0;
+        const best = members
+          .filter(m => !carried(m) && this.awaited(r, m) && !this.openLease(m.host)?.repair)
+          .sort(
+            (a, b) =>
+              Number(a.state !== 'leased') - Number(b.state !== 'leased') ||
+              Number(!fits(this.live(a.host), budget)) - Number(!fits(this.live(b.host), budget)) ||
+              Number(this.live(a.host) === 0) - Number(this.live(b.host) === 0) ||
+              Number(a.state === 'expected') - Number(b.state === 'expected') ||
+              weight(a) - weight(b) ||
+              a.host.localeCompare(b.host)
+          )[0];
+        const counted = members.filter(
+          m => m.state === 'pending' || m.state === 'leased' || m.state === 'failed' || this.servable(r, m)
+        ).length;
+
+        if (best && counted > 1) r.canary = best.host;
+      }
+    }
+
+    for (const m of members) {
+      m.stage = carried(m) ? STAGE_REPAIR : m.host === r.canary ? STAGE_CANARY : STAGE_REST;
+    }
+  }
+
   private plan(): Plan {
     const gate = this.gate();
     const budget = this.budget();
     const open = this.openRollouts();
+    for (const r of open) this.settleStages(r, budget);
     const epoch = this.currentEpoch() - 1;
 
     const hosts: Record<string, HostPlan> = {};
     const queue: QueueEntry[] = [];
 
-    // Queue order: oldest rollout first, members in stage order.
+    // Queue order: oldest rollout first, inside a rollout by stage (carried
+    // members, the canary, the rest), then ascending weight and name.
+    const weight = (m: RolloutHost) => this.data.hosts.get(m.host)?.validators ?? 0;
     const order: string[] = [];
     for (const r of open) {
-      for (const m of [...list(r.hosts)].sort((a, b) => a.stage - b.stage)) {
+      const members = [...list(r.hosts)].sort(
+        (a, b) => a.stage - b.stage || weight(a) - weight(b) || a.host.localeCompare(b.host)
+      );
+      for (const m of members) {
         if (m.state === 'pending' && !order.includes(m.host)) order.push(m.host);
       }
     }
+
+    const repair = this.repairHost(order, open, gate);
 
     for (const host of this.data.hosts.values()) {
       const lease = this.openLease(host.name);
@@ -507,7 +713,7 @@ export class MockController {
       }
 
       if (!lease && memberOf.length > 0) {
-        plan.reason = this.waitingReason(host, memberOf, gate, budget);
+        plan.reason = this.waitingReason(host, memberOf, gate, budget, host.name === repair);
       }
 
       hosts[host.name] = plan;
@@ -524,6 +730,7 @@ export class MockController {
         position: queue.length + 1,
         reason: plan.reason ?? 'next',
         wait,
+        after: wait === 'order' ? this.orderAfter(name, memberOf) : undefined,
         rollout: this.aboutRollout(name, memberOf, wait),
         rollouts: memberOf.map(r => r.id),
       });
@@ -653,6 +860,8 @@ export class MockController {
   }
 
   private rollouts(limit: number): Rollouts {
+    const budget = this.budget();
+    for (const r of this.openRollouts()) this.settleStages(r, budget);
     const terminal = (l: Lease) => ['released', 'failed', 'expired'].includes(l.state);
     const newest = <T extends { createdAt?: string; grantedAt?: string }>(a: T, b: T) =>
       (b.createdAt ?? b.grantedAt ?? '').localeCompare(a.createdAt ?? a.grantedAt ?? '');
@@ -675,7 +884,27 @@ export class MockController {
     return { settings: { ...this.data.settings }, defaults: { ...this.data.defaults } };
   }
 
-  private putSettings(next: Settings): SettingsBody {
+  /** putSettings answers like the controller: 400 for an unknown key, a missing one or a value out of range. */
+  private putSettings(body: unknown): SettingsBody {
+    if (typeof body !== 'object' || body === null || Array.isArray(body)) {
+      throw new HttpError(400, 'settings must be a JSON object');
+    }
+
+    const given = body as Record<string, unknown>;
+    const known = new Set<string>(FIELDS.map(f => f.key));
+
+    for (const key of Object.keys(given)) {
+      if (!known.has(key)) throw new HttpError(400, `unknown field "${key}"`);
+    }
+
+    for (const spec of FIELDS) {
+      const value = given[spec.key];
+      const wanted =
+        spec.kind === 'switch' ? 'boolean' : spec.kind === 'percent' || spec.kind === 'count' ? 'number' : 'string';
+      if (typeof value !== wanted) throw new HttpError(400, `${spec.key} must be a ${wanted}`);
+    }
+
+    const next = body as Settings;
     const form = toForm(next);
     for (const spec of FIELDS) {
       const problem = validateField(spec, form[spec.key]);
@@ -802,14 +1031,7 @@ export class MockController {
       }
 
       host.needs = [...list(host.needs), ...needs];
-      const bootnode = list(host.roles).includes('bootnode');
-      members.push({
-        host: host.name,
-        state: 'pending',
-        stage: bootnode ? 3 : host.validators === 0 ? 0 : 2,
-        needId: needs[0]?.id,
-        updatedAt: now,
-      });
+      members.push({ host: host.name, state: 'pending', stage: STAGE_REST, needId: needs[0]?.id, updatedAt: now });
     }
 
     if (members.length === 0) {

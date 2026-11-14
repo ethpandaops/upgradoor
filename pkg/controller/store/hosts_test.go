@@ -76,7 +76,7 @@ func TestRecordSync(t *testing.T) {
 			}
 			assert.Equal(t, want, res.Host)
 			assert.Equal(t, uint64(100), res.Host.Weight())
-			assert.True(t, res.Host.IsBootnode())
+			assert.Contains(t, res.Host.Roles, fleet.RoleBootnode)
 
 			got, err := s.GetHost(ctx, "node-1")
 			require.NoError(t, err)

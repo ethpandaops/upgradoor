@@ -265,8 +265,13 @@ export type RolloutState = 'active' | 'halted' | 'completed' | 'superseded' | 'a
 /** fleet.HostState */
 export type HostState = 'expected' | 'pending' | 'leased' | 'done' | 'failed' | 'skipped';
 
-/** fleet.Stage: 0 no validators, 1 canary, 2 batches, 3 bootnodes. */
-export type Stage = 0 | 1 | 2 | 3;
+/**
+ * fleet.Stage, in serving order: 1 repair (a member carried over as failed
+ * from the superseded rollout, served first), 2 the canary (the one host that
+ * goes alone until the first success), 3 the rest. It follows from
+ * carriedFrom and the rollout's canary.
+ */
+export type Stage = 1 | 2 | 3;
 
 /** fleet.RolloutHost */
 export interface RolloutHost {
@@ -276,6 +281,8 @@ export interface RolloutHost {
   needId?: string;
   leaseId?: string;
   error?: string;
+  /** The superseded rollout in which the host had failed; set for a carried member, for good. */
+  carriedFrom?: string;
   updatedAt: string;
 }
 
@@ -316,6 +323,8 @@ export interface Lease {
   weight: number;
   charged: number;
   force: boolean;
+  /** Granted through the repair exception of a closed gate; one such lease is open at most. */
+  repair?: boolean;
   grantedBy: string;
   grantedAt: string;
   expiresAt: string;
@@ -344,7 +353,8 @@ export interface Settings {
   maxUnavailablePercent: number;
   minParticipationPercent: number;
   maxFinalityLagEpochs: number;
-  soakEpochs: number;
+  readyEpochs: number;
+  minPeers: number;
   leaseTtl: string;
   hostStaleAfter: string;
   readinessTimeout: string;
@@ -447,6 +457,11 @@ export interface QueueEntry {
   reason: string;
   /** Absent in the answer of a controller older than the field. */
   wait?: WaitKind;
+  /**
+   * The host an order wait is for: a carried member or the canary. It need
+   * not be in the queue: it may hold a lease, or be expected to report.
+   */
+  after?: string;
   /**
    * The rollout the reason is about (the paused, halted or unapproved one, or
    * the one whose order the host waits in); absent when the reason is about

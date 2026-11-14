@@ -6,7 +6,7 @@ import (
 	"math"
 	"slices"
 	"strconv"
-	"strings"
+	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -26,10 +26,7 @@ const (
 	reasonVerb          = "verb not allowed by the agent"
 	reasonGatePrefix    = "network gate: "
 	reasonAfter         = "after "
-	reasonAfterNoVals   = "after hosts without validators"
-	reasonAfterVals     = "after validator hosts"
 	reasonAfterCanary   = "after canary "
-	reasonAfterBootnode = "after bootnode "
 	reasonNext          = "next"
 )
 
@@ -78,6 +75,8 @@ var waitKinds = map[int]WaitKind{
 type verdict struct {
 	rank   int
 	reason string
+	// after names the host an order wait is for.
+	after string
 }
 
 // budgetState is the availability budget while grants are being made.
@@ -115,24 +114,28 @@ func (p *pass) budget() *budgetState {
 	return b
 }
 
+// fits checks the three grant conditions for a host that costs cost: it
+// costs nothing, it stays inside the budget, or it goes alone.
+func (b *budgetState) fits(cost uint64) bool {
+	return cost == 0 ||
+		float64(b.unavailable+cost) <= b.allowed+budgetEpsilon ||
+		(b.unavailable == 0 && b.allowed > 0 && b.leased == 0)
+}
+
 // admit checks the three grant conditions and the host-count limit for a
 // host that costs cost.
 func (b *budgetState) admit(cost uint64) verdict {
-	fits := cost == 0 ||
-		float64(b.unavailable+cost) <= b.allowed+budgetEpsilon ||
-		(b.unavailable == 0 && b.allowed > 0 && b.leased == 0)
-
-	if !fits {
+	if !b.fits(cost) {
 		used := 0.0
 		if b.total > 0 {
 			used = float64(b.unavailable) * 100 / float64(b.total)
 		}
 
-		return verdict{rankBudget, "budget " + percent(used) + " of " + percent(b.percent)}
+		return verdict{rank: rankBudget, reason: "budget " + percent(used) + " of " + percent(b.percent)}
 	}
 
 	if b.leased >= b.maxLeased {
-		return verdict{rankHostLimit, fmt.Sprintf("host limit %d of %d", b.leased, b.maxLeased)}
+		return verdict{rank: rankHostLimit, reason: fmt.Sprintf("host limit %d of %d", b.leased, b.maxLeased)}
 	}
 
 	return verdict{}
@@ -214,87 +217,36 @@ func (p *pass) policyVerdict(r *fleet.Rollout) verdict {
 
 	switch {
 	case r.Paused:
-		return verdict{rankRolloutPaused, reasonRolloutPaused}
+		return verdict{rank: rankRolloutPaused, reason: reasonRolloutPaused}
 	case policy == fleet.PolicyManual && !r.Approved:
-		return verdict{rankApproval, reasonApproval}
+		return verdict{rank: rankApproval, reason: reasonApproval}
 	case policy == fleet.PolicyPaused:
-		return verdict{rankPolicyPaused, reasonPolicyPaused}
+		return verdict{rank: rankPolicyPaused, reason: reasonPolicyPaused}
 	case r.State != fleet.RolloutActive:
-		return verdict{rankHalted, reasonHaltedPrefix + r.Reason}
+		return verdict{rank: rankHalted, reason: reasonHaltedPrefix + r.Reason}
 	default:
 		return verdict{}
 	}
 }
 
-// memberClass is the ordering class of a member; for a forgotten host it
-// comes from the stored stage.
-func (p *pass) memberClass(m *fleet.RolloutHost) fleet.Stage {
-	if hv := p.hosts[m.Host]; hv != nil {
-		return hv.class()
-	}
-
-	if m.Stage == fleet.StageCanary {
-		return fleet.StageBatches
-	}
-
-	return m.Stage
-}
-
-// orderVerdict applies the stage ordering of one rollout to one host.
+// orderVerdict applies the order inside one rollout to one host. A carried
+// host waits for nobody. Every other host waits for each carried member that
+// is still to be served, and, until the rollout has its first success, for
+// the canary.
 func (p *pass) orderVerdict(r *fleet.Rollout, hv *hostView) verdict {
-	var (
-		class        = hv.class()
-		noVals, vals bool
-		bootnode     string
-	)
-
-	for i := range r.Hosts {
-		m := &r.Hosts[i]
-		if m.Host == hv.h.Name || !p.blocks(r, m) {
-			continue
-		}
-
-		// A host carried over as failed that is still expected to report is
-		// served before the hosts of its own and of later stages.
-		if m.State == fleet.HostExpected && strings.HasPrefix(m.Error, carriedPrefix) &&
-			p.memberClass(m) <= class {
-			return verdict{rankOrder, reasonAfter + m.Host}
-		}
-
-		switch p.memberClass(m) {
-		case fleet.StageNoValidators:
-			noVals = true
-		case fleet.StageBootnodes:
-			if m.State == fleet.HostLeased {
-				bootnode = m.Host
-			}
-		default:
-			vals = true
-		}
-	}
-
-	switch {
-	case class == fleet.StageNoValidators:
-		return verdict{}
-	case noVals:
-		return verdict{rankOrder, reasonAfterNoVals}
-	case class == fleet.StageBatches:
-		if r.Canary == "" || r.Canary == hv.h.Name {
-			return verdict{}
-		}
-
-		if c := r.Host(r.Canary); c != nil && c.State == fleet.HostDone {
-			return verdict{}
-		}
-
-		return verdict{rankOrder, reasonAfterCanary + r.Canary}
-	case vals:
-		return verdict{rankOrder, reasonAfterVals}
-	case bootnode != "":
-		return verdict{rankOrder, reasonAfterBootnode + bootnode}
-	default:
+	if m := r.Host(hv.h.Name); m == nil || m.CarriedFrom != "" {
 		return verdict{}
 	}
+
+	if m := p.carriedAwaited(r); m != nil {
+		return verdict{rank: rankOrder, reason: reasonAfter + m.Host, after: m.Host}
+	}
+
+	if r.Canary == "" || r.Canary == hv.h.Name || succeeded(r) {
+		return verdict{}
+	}
+
+	return verdict{rank: rankOrder, reason: reasonAfterCanary + r.Canary, after: r.Canary}
 }
 
 // part is the share of one rollout in a lease.
@@ -311,13 +263,17 @@ type granter struct {
 	// forced names the force rollouts that were granted a host in this
 	// pass; they get one host per reconcile.
 	forced map[string]bool
+	// repairOpen: a lease that was granted through the repair exception of
+	// the gate is open, from an earlier pass or this one.
+	repairOpen bool
 }
 
 // evaluate decides whether the host's needs in one rollout are grantable
-// now, the budget aside.
-func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (verdict, []protocol.Need) {
-	if v := g.p.policyVerdict(r); v.rank != rankGrantable {
-		return v, nil
+// now, the budget aside. repair says that they are only because the closed
+// gate lets the repair of this host pass.
+func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted []protocol.Need, repair bool) {
+	if v = g.p.policyVerdict(r); v.rank != rankGrantable {
+		return v, nil, false
 	}
 
 	reported := g.p.needs[r.ID][hv.h.Name]
@@ -329,38 +285,82 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (verdict, []protocol.
 		}
 	}
 
+	if len(needs) == 0 {
+		return verdict{rank: rankVerb, reason: reasonVerb}, nil, false
+	}
+
+	if !r.IgnoreBudget && !g.gate.OK {
+		if !g.repairs(hv) {
+			return verdict{rank: rankGate, reason: reasonGatePrefix + g.gate.Reasons[0]}, nil, false
+		}
+
+		repair = true
+	}
+
 	switch {
-	case len(needs) == 0:
-		return verdict{rankVerb, reasonVerb}, nil
-	case !r.IgnoreBudget && !g.gate.OK && !g.repairs(hv):
-		return verdict{rankGate, reasonGatePrefix + g.gate.Reasons[0]}, nil
 	case r.Force && g.forced[r.ID]:
-		return verdict{rankNext, reasonNext}, nil
-	case r.Force:
-		return verdict{}, needs
+		return verdict{rank: rankNext, reason: reasonNext}, nil, false
+	case r.Force, repair:
+		// A forced rollout has no order, and a repair does not wait for its
+		// place in one.
+		return verdict{}, needs, repair
 	}
 
-	if v := g.p.orderVerdict(r, hv); v.rank != rankGrantable {
-		return v, nil
+	if v = g.p.orderVerdict(r, hv); v.rank != rankGrantable {
+		return v, nil, false
 	}
 
-	return verdict{}, needs
+	return verdict{}, needs, false
 }
 
-// repairs reports whether a grant to the host passes a failing gate: the host
-// has validators and none of them is attesting, so serving it cannot make
-// the network worse and may be what brings it back. Without this a host that
-// a rollout broke would keep participation below the gate and the gate would
-// keep the repair away for ever. It needs data it can trust: a gate that
-// fails because the beacon view or the liveness data is missing passes
-// nobody.
+// repairs reports whether a grant to the host passes a closed gate: the
+// repair exception. The host has validators and none of them attests, so
+// serving it cannot make the network worse and may be what brings it back;
+// without the exception a host that keeps participation below the gate would
+// keep its own repair away for ever. The exception is bounded:
+//
+//   - it needs data it can trust: a gate that is closed because the beacon
+//     view or the liveness data is missing passes nobody;
+//   - one at a time: nobody passes while a lease that was granted through the
+//     exception is still open, in whatever rollout;
+//   - the host must be established as offline (see offline).
 func (g *granter) repairs(hv *hostView) bool {
-	if hv.weight == 0 || hv.live != 0 {
+	if g.repairOpen || slices.Contains(g.gate.Reasons, gateBeacon) ||
+		slices.Contains(g.gate.Reasons, gateLiveness) {
 		return false
 	}
 
-	return !slices.Contains(g.gate.Reasons, gateBeacon) &&
-		!slices.Contains(g.gate.Reasons, gateLiveness)
+	return g.p.offline(hv)
+}
+
+// offline reports whether the host is established as offline: it has
+// validators, holds no lease, and none of its validators attested in the two
+// newest stored liveness epochs, both of which began after the host's last
+// lease ended and after this database first saw the host. One epoch without
+// attestations can be a glitch of the whole network, and a host that has just
+// been rolled or rebooted (by any rollout, successfully or not) is still on
+// its way back: neither is a host to repair.
+func (p *pass) offline(hv *hostView) bool {
+	if hv.weight == 0 || hv.lease != nil || p.w.Health.LivenessUnsupported || !p.haveRows || p.newestEpoch == 0 {
+		return false
+	}
+
+	epoch := p.w.Health.EpochDuration()
+	if epoch <= 0 || p.w.Health.GenesisTime.IsZero() {
+		return false
+	}
+
+	byEpoch := p.rows[hv.h.Name]
+
+	for _, e := range []uint64{p.newestEpoch, p.newestEpoch - 1} {
+		if row, ok := byEpoch[e]; !ok || row.Live != 0 {
+			return false
+		}
+	}
+
+	began := p.w.Health.GenesisTime.Add(time.Duration(p.newestEpoch-1) * epoch)
+
+	return !began.Before(later(p.lastLeaseEnd(hv.h.Name), hv.h.FirstSeen))
 }
 
 // consider grants the host a lease for everything grantable, or says what
@@ -370,20 +370,22 @@ func (g *granter) repairs(hv *hostView) bool {
 func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, about string) {
 	switch {
 	case hv.held:
-		return verdict{rankHeld, reasonHeld}, ""
+		return verdict{rank: rankHeld, reason: reasonHeld}, ""
 	case hv.stale:
-		return verdict{rankSilent, reasonAgentSilent}, ""
+		return verdict{rank: rankSilent, reason: reasonAgentSilent}, ""
 	case g.p.set.Paused:
-		return verdict{rankPaused, reasonPaused}, ""
+		return verdict{rank: rankPaused, reason: reasonPaused}, ""
 	}
 
 	var (
 		best           verdict
 		normal, exempt []part
+		repair         bool
 	)
 
 	for _, r := range rollouts {
-		rv, needs := g.evaluate(r, hv)
+		rv, needs, viaRepair := g.evaluate(r, hv)
+		repair = repair || viaRepair
 
 		switch {
 		case rv.rank != rankGrantable:
@@ -399,7 +401,7 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 
 	if len(normal) > 0 {
 		if bv := g.budget.admit(hv.live); bv.rank != rankGrantable {
-			best, about, normal = bv, "", nil
+			best, about, normal, repair = bv, "", nil, false
 		}
 	}
 
@@ -408,13 +410,14 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 		return best, about
 	}
 
-	g.lease(hv, parts)
+	g.lease(hv, parts, repair)
 
 	return verdict{}, ""
 }
 
-// lease creates the lease for one host and books it.
-func (g *granter) lease(hv *hostView, parts []part) {
+// lease creates the lease for one host and books it. repair: the grant
+// passed a closed gate through the repair exception.
+func (g *granter) lease(hv *hostView, parts []part, repair bool) {
 	p := g.p
 	host := hv.h.Name
 
@@ -426,6 +429,7 @@ func (g *granter) lease(hv *hostView, parts []part) {
 		Weight:    hv.weight,
 		Charged:   hv.live,
 		Force:     true,
+		Repair:    repair,
 		GrantedBy: parts[0].r.CreatedBy,
 		GrantedAt: p.now,
 		ExpiresAt: p.now.Add(p.set.LeaseTTL.Std()),
@@ -447,12 +451,8 @@ func (g *granter) lease(hv *hostView, parts []part) {
 		m.NeedID = pt.needs[0].ID
 		p.setMember(m, fleet.HostLeased)
 
-		switch {
-		case r.Force:
+		if r.Force {
 			g.forced[r.ID] = true
-		case hv.class() == fleet.StageBatches && r.Canary == "":
-			r.Canary = host
-			m.Stage = fleet.StageCanary
 		}
 
 		l.Force = l.Force && r.Force
@@ -465,6 +465,7 @@ func (g *granter) lease(hv *hostView, parts []part) {
 	}
 
 	g.budget.take(hv.live)
+	g.repairOpen = g.repairOpen || repair
 
 	hv.lease = l
 	p.leases = append(p.leases, l)
@@ -477,6 +478,7 @@ func (g *granter) lease(hv *hostView, parts []part) {
 		"allowed":      g.budget.allowed,
 		keyForce:       l.Force,
 		"ignoreBudget": ignoreBudget,
+		"repair":       l.Repair,
 	})
 }
 
@@ -487,8 +489,8 @@ type waiting struct {
 }
 
 // servingOrder lists the hosts that wait in an open rollout and hold no
-// lease: oldest rollout first, inside a rollout by stage, then hosts carried
-// over as failed, hosts that are fully down, ascending weight and name.
+// lease: oldest rollout first, inside a rollout by stage (carried members,
+// the canary, the rest), then ascending weight and name.
 func (p *pass) servingOrder() []*waiting {
 	var (
 		order  []*waiting
@@ -515,8 +517,7 @@ func (p *pass) servingOrder() []*waiting {
 			ha, hb := p.hosts[a.Host], p.hosts[b.Host]
 
 			return cmp.Or(
-				cmp.Compare(serveStage(r, ha), serveStage(r, hb)),
-				cmp.Compare(serveLate(a, ha), serveLate(b, hb)),
+				cmp.Compare(a.Stage, b.Stage),
 				cmp.Compare(ha.weight, hb.weight),
 				cmp.Compare(a.Host, b.Host),
 			)
@@ -537,28 +538,6 @@ func (p *pass) servingOrder() []*waiting {
 	return order
 }
 
-func serveStage(r *fleet.Rollout, hv *hostView) fleet.Stage {
-	class := hv.class()
-	if class == fleet.StageBatches && r.Canary == hv.h.Name {
-		return fleet.StageCanary
-	}
-
-	return class
-}
-
-// serveLate ranks hosts inside a stage: 0 for hosts carried over as failed,
-// 1 for hosts whose validators are all down, 2 for the rest.
-func serveLate(m *fleet.RolloutHost, hv *hostView) int {
-	switch {
-	case strings.HasPrefix(m.Error, carriedPrefix):
-		return 0
-	case hv.weight > 0 && hv.live == 0:
-		return 1
-	default:
-		return 2
-	}
-}
-
 // grant makes the grants of this pass and builds the plan.
 func (p *pass) grant() *Plan {
 	g := &granter{
@@ -566,6 +545,9 @@ func (p *pass) grant() *Plan {
 		gate:   p.gate(),
 		budget: p.budget(),
 		forced: make(map[string]bool, 2),
+		repairOpen: slices.ContainsFunc(p.leases, func(l *fleet.Lease) bool {
+			return l.Repair && !l.State.Terminal()
+		}),
 	}
 
 	plan := &Plan{
@@ -595,6 +577,7 @@ func (p *pass) grant() *Plan {
 			Position: len(plan.Queue) + 1,
 			Reason:   v.reason,
 			Wait:     waitKinds[v.rank],
+			After:    v.after,
 			Rollout:  about,
 			Rollouts: ids,
 		})

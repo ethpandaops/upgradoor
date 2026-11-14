@@ -7,6 +7,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"sync"
@@ -248,7 +249,7 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 		return nil, fmt.Errorf("scheduler: list hosts: %w", err)
 	}
 
-	epochs := max(int(settings.SoakEpochs)+3, minLivenessEpochs)
+	epochs := max(int(settings.ReadyEpochs)+3, minLivenessEpochs)
 	if w.Liveness, err = st.ListLiveness(ctx, epochs); err != nil {
 		return nil, fmt.Errorf("scheduler: list liveness: %w", err)
 	}
@@ -273,6 +274,8 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 		return nil, err
 	}
 
+	w.LastLeaseEnd = s.hist.ended
+
 	return w, nil
 }
 
@@ -289,6 +292,15 @@ type history struct {
 	// settled holds, per open manual rollout, its directives that are no
 	// longer pending, by ID. They never change again.
 	settled map[string]map[string]*fleet.Directive
+	// ended is, per host, when its most recent terminal lease ended.
+	ended map[string]time.Time
+}
+
+// noteLease takes in a lease that was read or written.
+func (h *history) noteLease(l *fleet.Lease) {
+	if l.State.Terminal() && l.EndedAt != nil && l.EndedAt.After(h.ended[l.Host]) {
+		h.ended[l.Host] = *l.EndedAt
+	}
 }
 
 // newerRollout orders rollouts by creation, then end, then ID.
@@ -364,6 +376,13 @@ func (h *history) follow(changes *store.Changes) {
 	for _, d := range changes.Directives {
 		h.noteDirective(d)
 	}
+
+	// A fresh map: the last world may still be read.
+	h.ended = maps.Clone(h.ended)
+
+	for _, l := range changes.Leases {
+		h.noteLease(l)
+	}
 }
 
 // write commits changes and keeps the history in step. After a failed write
@@ -380,7 +399,8 @@ func (s *service) write(ctx context.Context, changes *store.Changes) error {
 	return nil
 }
 
-// loadHistory reads the closed rollouts once. The caller holds mu.
+// loadHistory reads the closed rollouts and the ends of the hosts' last
+// leases once. The caller holds mu.
 func (s *service) loadHistory(ctx context.Context) error {
 	if s.hist.loaded {
 		return nil
@@ -391,14 +411,24 @@ func (s *service) loadHistory(ctx context.Context) error {
 		return fmt.Errorf("scheduler: list rollouts: %w", err)
 	}
 
+	leases, err := s.opts.Store.ListLeases(ctx, store.LeaseFilter{})
+	if err != nil {
+		return fmt.Errorf("scheduler: list leases: %w", err)
+	}
+
 	s.hist = history{
 		loaded:  true,
 		closed:  make(map[string]*fleet.Rollout, len(all)),
 		settled: make(map[string]map[string]*fleet.Directive, 2),
+		ended:   make(map[string]time.Time, len(leases)),
 	}
 
 	for _, r := range all {
 		s.hist.noteRollout(r)
+	}
+
+	for _, l := range leases {
+		s.hist.noteLease(l)
 	}
 
 	return nil

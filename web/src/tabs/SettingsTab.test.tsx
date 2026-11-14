@@ -25,7 +25,8 @@ describe('SettingsTab', () => {
     expect(within(form).getByLabelText('Max unavailable')).toHaveValue('10');
     expect(within(form).getByLabelText('Min participation')).toHaveValue('90');
     expect(within(form).getByLabelText('Max finality lag')).toHaveValue('3');
-    expect(within(form).getByLabelText('Soak epochs')).toHaveValue('1');
+    expect(within(form).getByLabelText('Ready epochs')).toHaveValue('1');
+    expect(within(form).getByLabelText('Min peers')).toHaveValue('3');
     expect(within(form).getByLabelText('Lease TTL')).toHaveValue('30m');
     expect(within(form).getByLabelText('Host stale after')).toHaveValue('2m');
     expect(within(form).getByLabelText('Readiness timeout')).toHaveValue('30m');
@@ -57,7 +58,7 @@ describe('SettingsTab', () => {
 
     expect(within(rowOf(form, 'Max unavailable')).getByText('changed')).toBeInTheDocument();
     expect(within(rowOf(form, 'Lease TTL')).getByText('changed')).toBeInTheDocument();
-    expect(within(rowOf(form, 'Soak epochs')).queryByText('changed')).not.toBeInTheDocument();
+    expect(within(rowOf(form, 'Ready epochs')).queryByText('changed')).not.toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('4 unsaved changes');
 
     await user.click(screen.getByRole('button', { name: 'Save' }));
@@ -72,7 +73,8 @@ describe('SettingsTab', () => {
       maxUnavailablePercent: 12.5,
       minParticipationPercent: 90,
       maxFinalityLagEpochs: 3,
-      soakEpochs: 1,
+      readyEpochs: 1,
+      minPeers: 3,
       leaseTtl: '45m',
       hostStaleAfter: '2m',
       readinessTimeout: '30m',
@@ -117,7 +119,8 @@ describe('SettingsTab', () => {
       ['Max unavailable', '150', 'must be between 0 and 100'],
       ['Min participation', 'abc', 'must be a number between 0 and 100'],
       ['Max finality lag', '1', 'must be at least 2'],
-      ['Soak epochs', '1.5', 'must be a whole number'],
+      ['Ready epochs', '1.5', 'must be a whole number'],
+      ['Min peers', '0', 'must be at least 1'],
       ['Lease TTL', '30', 'must be a duration like 30m, 90s or 1h30m'],
       ['Host stale after', '10s', 'must be at least 30s'],
       ['Readiness timeout', '30s', 'must be at least 1m'],
@@ -153,7 +156,7 @@ describe('SettingsTab', () => {
   it('shows a failed save and keeps the edit', async () => {
     const { form, h, user } = await openSettings();
 
-    const input = within(form).getByLabelText('Soak epochs');
+    const input = within(form).getByLabelText('Ready epochs');
     await user.clear(input);
     await user.type(input, '2');
 
@@ -165,7 +168,7 @@ describe('SettingsTab', () => {
 
     const alerts = await screen.findAllByRole('alert');
     expect(alerts.some(a => /Could not save the settings: .*HTTP 401/.test(a.textContent))).toBe(true);
-    expect(within(form).getByLabelText('Soak epochs')).toHaveValue('2');
+    expect(within(form).getByLabelText('Ready epochs')).toHaveValue('2');
     expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
   });
 });

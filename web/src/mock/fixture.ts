@@ -1,7 +1,7 @@
 // The mock fleet: a devnet with 24 hosts in the states an operator meets.
 //
-//   - an image rollout in progress (lighthouse): hosts without validators and
-//     the canary are done, one host is verifying, the rest waits;
+//   - an image rollout in progress (lighthouse): the canary and a host
+//     without validators are done, one host is verifying, the rest waits;
 //   - a halted image rollout (nethermind) with a failed host;
 //   - a reboot rollout that waits for approval (policy manual);
 //   - a stale host, a host on local hold and a host with a custom image.
@@ -221,7 +221,8 @@ export function defaultSettings(): Settings {
     maxUnavailablePercent: 10,
     minParticipationPercent: 90,
     maxFinalityLagEpochs: 3,
-    soakEpochs: 1,
+    readyEpochs: 1,
+    minPeers: 3,
     leaseTtl: '30m0s',
     hostStaleAfter: '2m0s',
     readinessTimeout: '30m0s',
@@ -593,12 +594,12 @@ export function buildMockData(now: number = Date.now()): MockData {
       createdAt: at(47 * 60),
       updatedAt: at(4 * 60),
       hosts: [
-        withLease(member('rpc-1', 'done', 0, at(38 * 60)), leaseRpc, 'image/lighthouse/' + lhDigest),
-        withLease(member('lighthouse-geth-1', 'done', 1, at(21 * 60)), leaseCanary, 'image/lighthouse/' + lhDigest),
-        withLease(member('lighthouse-geth-2', 'leased', 2, at(9 * 60)), leaseVerifying, 'image/lighthouse/' + lhDigest),
-        pending('lighthouse-geth-3', 2, 'image/lighthouse/', 46 * 60),
-        pending('lighthouse-geth-4', 2, 'image/lighthouse/', 46 * 60),
-        pending('lighthouse-nethermind-1', 2, 'image/lighthouse/', 46 * 60),
+        withLease(member('lighthouse-geth-1', 'done', 2, at(38 * 60)), leaseCanary, 'image/lighthouse/' + lhDigest),
+        withLease(member('rpc-1', 'done', 3, at(21 * 60)), leaseRpc, 'image/lighthouse/' + lhDigest),
+        withLease(member('lighthouse-geth-2', 'leased', 3, at(9 * 60)), leaseVerifying, 'image/lighthouse/' + lhDigest),
+        pending('lighthouse-geth-3', 3, 'image/lighthouse/', 46 * 60),
+        pending('lighthouse-geth-4', 3, 'image/lighthouse/', 46 * 60),
+        pending('lighthouse-nethermind-1', 3, 'image/lighthouse/', 46 * 60),
         pending('bootnode-1', 3, 'image/lighthouse/', 46 * 60),
       ],
     },
@@ -622,14 +623,14 @@ export function buildMockData(now: number = Date.now()): MockData {
       updatedAt: at(2 * 3600 + 50 * 60),
       hosts: [
         {
-          ...member('nimbus-nethermind-1', 'failed', 1, at(2 * 3600 + 50 * 60)),
+          ...member('nimbus-nethermind-1', 'failed', 2, at(2 * 3600 + 50 * 60)),
           leaseId: leaseFailed,
           needId: nmNeed.id,
           error: 'container nethermind restarted 14 times while verifying',
         },
-        pending('lighthouse-nethermind-1', 2, 'image/nethermind/', 3 * 3600 + 11 * 60),
-        pending('nimbus-nethermind-2', 2, 'image/nethermind/', 3 * 3600 + 11 * 60),
-        pending('nimbus-nethermind-3', 2, 'image/nethermind/', 3 * 3600 + 11 * 60),
+        pending('lighthouse-nethermind-1', 3, 'image/nethermind/', 3 * 3600 + 11 * 60),
+        pending('nimbus-nethermind-2', 3, 'image/nethermind/', 3 * 3600 + 11 * 60),
+        pending('nimbus-nethermind-3', 3, 'image/nethermind/', 3 * 3600 + 11 * 60),
       ],
     },
     {
@@ -642,14 +643,15 @@ export function buildMockData(now: number = Date.now()): MockData {
       approved: false,
       force: false,
       ignoreBudget: false,
+      canary: 'lodestar-reth-1',
       createdBy: 'scheduler',
       createdAt: at(26 * 3600),
       updatedAt: at(26 * 3600),
       hosts: [
-        pending('lodestar-reth-1', 1, 'reboot', 26 * 3600),
-        pending('teku-besu-1', 2, 'reboot', 26 * 3600),
-        pending('teku-besu-2', 2, 'reboot', 25 * 3600),
-        pending('teku-besu-3', 2, 'reboot', 25 * 3600),
+        pending('lodestar-reth-1', 2, 'reboot', 26 * 3600),
+        pending('teku-besu-1', 3, 'reboot', 26 * 3600),
+        pending('teku-besu-2', 3, 'reboot', 25 * 3600),
+        pending('teku-besu-3', 3, 'reboot', 25 * 3600),
       ],
     },
     {
@@ -673,7 +675,10 @@ export function buildMockData(now: number = Date.now()): MockData {
       endedAt: at(2 * 86400 + 2 * 3600),
       hosts: [...hosts.keys()]
         .filter(h => h !== 'lodestar-reth-3' && h !== 'prysm-geth-3')
-        .map(h => member(h, 'done', hosts.get(h)?.validators ? 2 : 0, at(2 * 86400 + 3 * 3600))),
+        .map(h => ({
+          ...member(h, 'done', h === 'grandine-erigon-1' ? 2 : 3, at(2 * 86400 + 3 * 3600)),
+          leaseId: `ls-${hex(`lease/docker/${h}`, 16)}`,
+        })),
     },
     {
       id: oldLighthouseRollout,
@@ -694,10 +699,13 @@ export function buildMockData(now: number = Date.now()): MockData {
       updatedAt: at(4 * 86400 - 3000),
       endedAt: at(4 * 86400 - 3000),
       hosts: [
-        member('rpc-1', 'done', 0, at(4 * 86400 - 600)),
-        member('lighthouse-geth-1', 'done', 1, at(4 * 86400 - 1800)),
-        member('lighthouse-geth-2', 'pending', 2, at(4 * 86400)),
-        member('lighthouse-geth-3', 'pending', 2, at(4 * 86400)),
+        {
+          ...member('lighthouse-geth-1', 'done', 2, at(4 * 86400 - 1800)),
+          leaseId: `ls-${hex('lease/lighthouse-old/lighthouse-geth-1', 16)}`,
+        },
+        { ...member('rpc-1', 'done', 3, at(4 * 86400 - 600)), leaseId: `ls-${hex('lease/lighthouse-old/rpc-1', 16)}` },
+        member('lighthouse-geth-2', 'pending', 3, at(4 * 86400)),
+        member('lighthouse-geth-3', 'pending', 3, at(4 * 86400)),
       ],
     },
     {
@@ -716,9 +724,9 @@ export function buildMockData(now: number = Date.now()): MockData {
       updatedAt: at(5 * 86400 - 240),
       endedAt: at(5 * 86400 - 240),
       hosts: [
-        member('prysm-geth-1', 'skipped', 1, at(5 * 86400 - 240)),
-        member('prysm-geth-2', 'skipped', 2, at(5 * 86400 - 240)),
-        member('prysm-erigon-1', 'skipped', 2, at(5 * 86400 - 240)),
+        member('prysm-geth-1', 'skipped', 3, at(5 * 86400 - 240)),
+        member('prysm-geth-2', 'skipped', 3, at(5 * 86400 - 240)),
+        member('prysm-erigon-1', 'skipped', 3, at(5 * 86400 - 240)),
       ],
     },
   ];
@@ -739,19 +747,21 @@ export function buildMockData(now: number = Date.now()): MockData {
       grantedBy: 'scheduler',
       grantedAt: at(9 * 60),
       expiresAt: at(9 * 60 - 30 * 60),
-      agentDoneAt: at(6 * 60),
+      // Done for longer than one epoch (384 s): the node part of the readiness
+      // check has passed, the validators are still missing.
+      agentDoneAt: at(7 * 60 + 30),
       operation: {
         leaseId: leaseVerifying,
         phase: 'done',
         startedAt: at(9 * 60 - 8),
-        updatedAt: at(6 * 60),
+        updatedAt: at(7 * 60 + 30),
         steps: [
           { needId: lhNeed('lighthouse').id, status: 'done' },
           { needId: lhNeed('lighthouse-validator').id, status: 'done' },
         ],
         disrupted: true,
       },
-      readiness: 'validators attesting again; 0 of 1 complete soak epochs',
+      readiness: 'validators attesting: 0 of 1 epochs with at least 115 of 128',
     },
     {
       id: leaseCanary,
@@ -766,22 +776,23 @@ export function buildMockData(now: number = Date.now()): MockData {
       charged: VALIDATORS_PER_HOST,
       force: false,
       grantedBy: 'scheduler',
-      grantedAt: at(36 * 60),
-      expiresAt: at(6 * 60),
-      agentDoneAt: at(33 * 60),
-      endedAt: at(21 * 60),
+      grantedAt: at(46 * 60),
+      expiresAt: at(16 * 60),
+      // Released 7 minutes after done: not before one epoch (384 s) at head.
+      agentDoneAt: at(45 * 60),
+      endedAt: at(38 * 60),
       operation: {
         leaseId: leaseCanary,
         phase: 'done',
-        startedAt: at(36 * 60 - 6),
-        updatedAt: at(33 * 60),
+        startedAt: at(46 * 60 - 6),
+        updatedAt: at(45 * 60),
         steps: [
           { needId: lhNeed('lighthouse').id, status: 'done' },
           { needId: lhNeed('lighthouse-validator').id, status: 'done' },
         ],
         disrupted: true,
       },
-      readiness: 'ready: validators live for 1 complete epoch',
+      readiness: 'ready: node at head with peers, validators attesting',
     },
     {
       id: leaseRpc,
@@ -793,19 +804,19 @@ export function buildMockData(now: number = Date.now()): MockData {
       charged: 0,
       force: false,
       grantedBy: 'scheduler',
-      grantedAt: at(46 * 60),
-      expiresAt: at(16 * 60),
-      agentDoneAt: at(44 * 60),
-      endedAt: at(38 * 60),
+      grantedAt: at(36 * 60),
+      expiresAt: at(6 * 60),
+      agentDoneAt: at(33 * 60),
+      endedAt: at(21 * 60),
       operation: {
         leaseId: leaseRpc,
         phase: 'done',
-        startedAt: at(46 * 60 - 5),
-        updatedAt: at(44 * 60),
+        startedAt: at(36 * 60 - 5),
+        updatedAt: at(33 * 60),
         steps: [{ needId: lhNeed('lighthouse').id, status: 'done' }],
         disrupted: true,
       },
-      readiness: 'ready: probes synced for 1 epoch',
+      readiness: 'ready: node at head with peers',
     },
     {
       id: leaseFailed,
@@ -856,7 +867,7 @@ export function buildMockData(now: number = Date.now()): MockData {
     after: { certHash: hex('cert/prysm-geth-2'), generation: 1 },
   });
   log(6 * 86400, 'bob@example.org', 'settings.update', 'settings', {
-    before: { ...defaults, maxUnavailablePercent: 5, soakEpochs: 2 },
+    before: { ...defaults, maxUnavailablePercent: 5, readyEpochs: 2 },
     after: { ...defaults },
   });
   log(5 * 86400, 'alice@example.org', 'action.reboot', abortedRollout, {
@@ -890,14 +901,20 @@ export function buildMockData(now: number = Date.now()): MockData {
     reason: 'nimbus-nethermind-1: container nethermind restarted 14 times while verifying',
   });
   log(47 * 60, 'scheduler', 'rollout.created', lighthouseRollout, { image: LIGHTHOUSE_IMAGE, digest: lhDigest });
-  log(46 * 60, 'scheduler', 'lease.granted', 'rpc-1', { lease: leaseRpc, rollout: lighthouseRollout });
-  log(38 * 60, 'scheduler', 'lease.released', 'rpc-1', { lease: leaseRpc });
-  log(36 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-1', {
+  log(46 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-1', {
     lease: leaseCanary,
     rollout: lighthouseRollout,
     canary: true,
   });
-  log(21 * 60, 'scheduler', 'lease.released', 'lighthouse-geth-1', { lease: leaseCanary });
+  log(38 * 60, 'scheduler', 'lease.released', 'lighthouse-geth-1', {
+    lease: leaseCanary,
+    readiness: 'ready: node at head with peers, validators attesting',
+  });
+  log(36 * 60, 'scheduler', 'lease.granted', 'rpc-1', { lease: leaseRpc, rollout: lighthouseRollout });
+  log(21 * 60, 'scheduler', 'lease.released', 'rpc-1', {
+    lease: leaseRpc,
+    readiness: 'ready: node at head with peers',
+  });
   log(9 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-2', { lease: leaseVerifying, rollout: lighthouseRollout });
 
   return {

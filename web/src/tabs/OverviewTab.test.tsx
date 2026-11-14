@@ -69,8 +69,8 @@ describe('OverviewTab, logged in', () => {
     const progress = await screen.findByRole('region', { name: 'In progress' });
     const lease = (await within(progress).findByText('lighthouse-geth-2')).closest('li');
     expect(lease).toHaveTextContent('Image roll');
-    expect(within(lease as HTMLElement).getByRole('list', { name: 'Step 5 of 5: Soak' })).toBeInTheDocument();
-    expect(lease).toHaveTextContent('0 of 1 complete soak epochs');
+    expect(within(lease as HTMLElement).getByRole('list', { name: 'Step 5 of 5: Ready check' })).toBeInTheDocument();
+    expect(lease).toHaveTextContent('validators attesting: 0 of 1 epochs with at least 115 of 128');
 
     expect(screen.getByRole('region', { name: 'Outage budget' })).toHaveTextContent(
       /[\d.]+% of 10% validators offline/
@@ -84,7 +84,9 @@ describe('OverviewTab, logged in', () => {
       .map(li => li.textContent);
     expect(hosts).toHaveLength(4);
     expect(hosts[0]).toMatch(/^1lighthouse-nethermind-1Image rollwaits: budget [\d.]+% of 10%(~\d+m|<1m)$/);
-    expect(hosts[3]).toMatch(/^4bootnode-1Image rollwaits: after lighthouse-geth-2/);
+    // A bootnode is a host like any other: the canary is done, and without
+    // validators it costs the budget nothing.
+    expect(hosts[1]).toMatch(/^2bootnode-1Image rollstarts with the next plan/);
     expect(next).not.toHaveTextContent('teku-besu-1');
     // Every lane bar has a name of its own, not only a colour.
     expect(document.querySelectorAll('svg[role="img"] rect > title').length).toBeGreaterThanOrEqual(5);
@@ -134,7 +136,15 @@ describe('OverviewTab, logged in', () => {
     const attention = await screen.findByRole('region', { name: 'Needs attention' });
     const first = (await within(attention).findAllByRole('listitem'))[0];
     expect(first).toHaveTextContent('The network gate is closed');
-    expect(screen.getByRole('region', { name: 'Up next' })).toHaveTextContent('Nothing will start by itself');
+
+    // A closed gate lets one repair at a time pass, of a host whose validators
+    // have all been offline for two epochs: that host starts by itself, the
+    // next one that is down does not, and nobody else does.
+    const next = screen.getByRole('region', { name: 'Up next' });
+    expect(next).toHaveTextContent('lighthouse-geth-3');
+    expect(next).not.toHaveTextContent('lighthouse-geth-4');
+    expect(next).not.toHaveTextContent('lighthouse-nethermind-1');
+    expect(next).not.toHaveTextContent('bootnode-1');
   });
 
   it('speaks of hosts, not validators, on a fleet without validators', async () => {

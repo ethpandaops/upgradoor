@@ -23,8 +23,9 @@ const (
 	// reported for a lease the controller did not know. It is a reserved
 	// name, so no manual lease can carry it.
 	grantedByAdoption = reservedActorPrefix + "adopted"
-	// carriedPrefix starts the note on a pending member that had failed in
-	// the rollout this one supersedes. Such members are served first.
+	// carriedPrefix starts the note on a waiting member that had failed in
+	// the rollout this one supersedes. The note is for people; what makes
+	// the member go first is RolloutHost.CarriedFrom.
 	carriedPrefix = "failed in superseded rollout "
 	// skippedPrefix starts the note on a member a person skipped. The skip
 	// holds for the rollout's key while the note stands.
@@ -78,7 +79,7 @@ type World struct {
 	Settings fleet.Settings
 	Health   fleet.NetworkHealth
 	// Liveness holds the rows of the newest stored epochs (at least
-	// soakEpochs + 2 of them when available).
+	// readyEpochs + 2 of them when available).
 	Liveness []fleet.Liveness
 	// Hosts are all known hosts with their last sync.
 	Hosts []*fleet.Host
@@ -100,6 +101,9 @@ type World struct {
 	// open nor listed here is adopted; one for an expired lease reopens it
 	// when the agent did start after all.
 	ClosedLeases map[string]*fleet.Lease
+	// LastLeaseEnd is, per host, when its most recent terminal lease ended.
+	// A host without an entry never held a lease this database knows of.
+	LastLeaseEnd map[string]time.Time
 	// NewID returns a new unique ID.
 	NewID func() string
 }
@@ -178,19 +182,6 @@ func (hv *hostView) operation() *protocol.Operation {
 	return hv.h.Status.Operation
 }
 
-// class is the ordering class of the host: StageNoValidators,
-// StageBatches (any validator host) or StageBootnodes.
-func (hv *hostView) class() fleet.Stage {
-	switch {
-	case hv.h.IsBootnode():
-		return fleet.StageBootnodes
-	case hv.weight == 0:
-		return fleet.StageNoValidators
-	default:
-		return fleet.StageBatches
-	}
-}
-
 // pass is the working state of one reconcile.
 type pass struct {
 	w   *World
@@ -232,6 +223,31 @@ type pass struct {
 	closedDirty  []*fleet.Rollout
 	// hostKeys are the rollout keys of the observed needs each host reports.
 	hostKeys map[string]map[string]bool
+	// before is the budget before this pass grants anything; see
+	// budgetBefore.
+	before *budgetState
+	// ended names the hosts whose lease ended in this pass.
+	ended map[string]bool
+}
+
+// lastLeaseEnd is when the host's most recent lease ended, this pass
+// included; the zero time when it never held one.
+func (p *pass) lastLeaseEnd(host string) time.Time {
+	if p.ended[host] {
+		return p.now
+	}
+
+	return p.w.LastLeaseEnd[host]
+}
+
+// budgetBefore is the budget as the leases and the liveness stand before
+// this pass grants anything. The canary is chosen against it.
+func (p *pass) budgetBefore() *budgetState {
+	if p.before == nil {
+		p.before = p.budget()
+	}
+
+	return p.before
 }
 
 func newPass(w *World) *pass {
@@ -253,6 +269,7 @@ func newPass(w *World) *pass {
 		carried:        make(map[string]map[string]string, 2),
 		closedLatest:   make(map[string]*fleet.Rollout, len(w.Closed)),
 		hostKeys:       make(map[string]map[string]bool, len(w.Hosts)),
+		ended:          make(map[string]bool, 2),
 	}
 
 	for _, r := range w.Closed {
@@ -367,11 +384,16 @@ func (p *pass) liveOf(host string, weight uint64) (live uint64, known bool) {
 	return min(row.Live, weight), true
 }
 
+// probeLivePeers is the number of peers a node needs to count as attesting
+// by its probes. One is enough to attest; the readiness check after an
+// operation asks for more (minPeers).
+const probeLivePeers = 1
+
 // probeLive is how many of the host's validators count as attesting when the
 // beacon node does not serve liveness: none when the host is stale or its
 // last sync's probes are configured and not synced, else all of them.
 func probeLive(hv *hostView) uint64 {
-	if hv.stale || (hv.h.Status != nil && !hv.h.Status.Node.Synced()) {
+	if hv.stale || (hv.h.Status != nil && !hv.h.Status.Node.Synced(probeLivePeers)) {
 		return 0
 	}
 

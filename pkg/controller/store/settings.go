@@ -11,8 +11,14 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 )
 
-// LoadSettings returns defaults with every stored override applied. A stored
-// key that is not a field of fleet.Settings, or whose value no longer
+// renamedSettings maps the stored key of a setting that was renamed to the
+// key it has now. The value means the same under both names.
+var renamedSettings = map[string]string{"soakEpochs": "readyEpochs"}
+
+// LoadSettings returns defaults with every stored override applied. A value
+// stored under the former name of a setting is read under its new name,
+// unless one is stored there too; the next save writes only the new name. A
+// stored key that is not a field of fleet.Settings, or whose value no longer
 // decodes into its field, is skipped with a warning and the default stays.
 //
 //nolint:gocritic // hugeParam: the by-value signature is fixed by the Store interface.
@@ -41,6 +47,19 @@ func (s *sqliteStore) LoadSettings(
 	})
 	if err != nil {
 		return defaults, fmt.Errorf("store: load settings: %w", err)
+	}
+
+	for old, key := range renamedSettings {
+		value, ok := overrides[old]
+		if !ok {
+			continue
+		}
+
+		if _, stored := overrides[key]; !stored {
+			overrides[key] = value
+		}
+
+		delete(overrides, old)
 	}
 
 	settings := defaults

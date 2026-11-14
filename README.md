@@ -227,8 +227,11 @@ curl -s -X POST -d '{"required":true}' http://127.0.0.1:7771/reboot-required > /
 
 What to expect in the Rollouts tab within about a minute:
 
-- An image rollout opens. `node-1` and `node-2` are rolled one after the other
-  (the host limit is 1 for three hosts), `bootnode-1` last.
+- An image rollout opens. One host goes first as the canary (none of the
+  fake hosts has validators, so it is the first host that reports the new
+  digest, or the first of those by name); when
+  it is ready the other two follow one after the other (the host limit is 1
+  for three hosts).
 - A reboot rollout opens for `node-1` and waits: `waiting for approval (policy
   manual)`. Approve it on the rollout card to see a (simulated) reboot.
 

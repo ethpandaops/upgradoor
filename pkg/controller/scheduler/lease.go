@@ -157,7 +157,10 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 		return
 	}
 
-	if timeout := p.set.ReadinessTimeout.Std(); p.now.Sub(*l.AgentDoneAt) > timeout {
+	// Counted from the scheduler's start at the earliest: while the controller
+	// was down nobody looked, and a host with validators cannot be ready
+	// before the beacon service has liveness again.
+	if timeout := p.set.ReadinessTimeout.Std(); p.now.Sub(later(*l.AgentDoneAt, p.w.Since)) > timeout {
 		p.failLease(l, fmt.Sprintf("not ready after %s: %s", timeout, note))
 	}
 }
@@ -189,30 +192,72 @@ func (p *pass) stillReported(l *fleet.Lease, hv *hostView) string {
 	return ""
 }
 
-// ready evaluates the readiness rule for a verifying lease and returns a
-// one-line progress note.
+// Readiness notes.
+const (
+	noteEpochTiming = "epoch timing unknown"
+	noteNodeReady   = "node at head with peers"
+	noteNoProbe     = "no node probe configured"
+	noteAttesting   = "validators attesting"
+	// noteAwaitLiveness is the readiness note of a host with validators
+	// while the beacon node has not said yet whether they attest.
+	noteAwaitLiveness = "waiting for attestation data from the beacon node"
+	noteReadyPrefix   = "ready: "
+)
+
+// ready evaluates the readiness check for a verifying lease and returns a
+// one-line note saying what is still missing. The node must be back at head
+// with peers; a host with validators must also attest again. Only a beacon
+// node that is known not to serve liveness takes the attestation check away;
+// while liveness is merely not known yet, the host is not ready.
 func (p *pass) ready(l *fleet.Lease, hv *hostView) (ready bool, note string) {
-	if hv.weight > 0 && p.w.Health.LivenessKnown && !p.w.Health.LivenessUnsupported {
-		return p.readyByLiveness(l, hv)
+	// Always evaluated: it keeps the run of healthy syncs.
+	nodeOK, nodeNote := p.nodeReady(l, hv)
+	if !nodeOK {
+		return false, nodeNote
 	}
 
-	return p.readyByProbe(l, hv)
+	switch {
+	case hv.weight == 0 || p.w.Health.LivenessUnsupported:
+		return true, noteReadyPrefix + nodeNote
+	case !p.w.Health.LivenessKnown:
+		return false, noteAwaitLiveness
+	}
+
+	if attesting, attestNote := p.validatorsReady(l, hv); !attesting {
+		return false, attestNote
+	}
+
+	return true, noteReadyPrefix + nodeNote + ", " + noteAttesting
 }
 
-// readyByLiveness: for soakEpochs consecutive complete epochs that started
+// minPeers is the number of peers each of EL and CL must have for a node to
+// count as back, in this fleet.
+func (p *pass) minPeers() int {
+	nodes := 0
+
+	for _, hv := range p.hosts {
+		if st := hv.h.Status; st != nil && (st.Node.EL != nil || st.Node.CL != nil) {
+			nodes++
+		}
+	}
+
+	return p.set.EffectiveMinPeers(nodes)
+}
+
+// validatorsReady: for readyEpochs consecutive complete epochs that started
 // after the agent's done time, enough of the host's validators attested.
-func (p *pass) readyByLiveness(l *fleet.Lease, hv *hostView) (ready bool, note string) {
-	soak := p.set.SoakEpochs
-	if soak == 0 {
-		return true, "no soak configured"
+func (p *pass) validatorsReady(l *fleet.Lease, hv *hostView) (ready bool, note string) {
+	epochs := p.set.ReadyEpochs
+	if epochs == 0 {
+		return true, noteAttesting
 	}
 
 	epoch := p.w.Health.EpochDuration()
 	if epoch <= 0 || p.w.Health.GenesisTime.IsZero() {
-		return false, "epoch timing unknown"
+		return false, noteEpochTiming
 	}
 
-	want := max(uint64(math.Floor(p.set.MinParticipationPercent*float64(hv.weight)/100+budgetEpsilon)), 1)
+	want := attestationBar(p.set.MinParticipationPercent, hv.weight)
 	run := uint64(0)
 
 	if p.haveRows {
@@ -232,16 +277,24 @@ func (p *pass) readyByLiveness(l *fleet.Lease, hv *hostView) (ready bool, note s
 		}
 	}
 
-	note = fmt.Sprintf("%d of %d epochs with at least %d of %d validators attesting",
-		min(run, soak), soak, want, hv.weight)
+	note = fmt.Sprintf("%s: %d of %d epochs with at least %d of %d",
+		noteAttesting, min(run, epochs), epochs, want, hv.weight)
 
-	return run >= soak, note
+	return run >= epochs, note
 }
 
-// readyByProbe: the agent's probes reported synced on every sync of an
-// unbroken run that has lasted soakEpochs epoch durations, with at least one
-// sync after the done report.
-func (p *pass) readyByProbe(l *fleet.Lease, hv *hostView) (ready bool, note string) {
+// attestationBar is the smallest number of validators that is at least
+// percent of weight, and at least 1.
+func attestationBar(percent float64, weight uint64) uint64 {
+	return max(uint64(math.Ceil(percent*float64(weight)/100-budgetEpsilon)), 1)
+}
+
+// nodeReady: the agent's probes reported the node at head with enough peers
+// on every sync of an unbroken run that spans readyEpochs epoch durations:
+// the newest sync of the run, which is the host's last one, came at least
+// that long after the first. Time that passes without a sync proves nothing.
+// A host with no probe configured is ready after such a run of syncs.
+func (p *pass) nodeReady(l *fleet.Lease, hv *hostView) (ready bool, note string) {
 	seen := hv.h.LastSeen
 
 	if hv.h.Status == nil || !seen.After(*l.AgentDoneAt) {
@@ -250,10 +303,12 @@ func (p *pass) readyByProbe(l *fleet.Lease, hv *hostView) (ready bool, note stri
 		return false, noteAwaitSync
 	}
 
-	if !hv.h.Status.Node.Synced() {
+	node := hv.h.Status.Node
+
+	if missing := node.Missing(p.minPeers()); missing != "" {
 		l.SyncedSince = nil
 
-		return false, "probes do not report synced"
+		return false, missing
 	}
 
 	if l.SyncedSince == nil {
@@ -265,22 +320,26 @@ func (p *pass) readyByProbe(l *fleet.Lease, hv *hostView) (ready bool, note stri
 		return false, reasonAgentSilent
 	}
 
-	soak := p.set.SoakEpochs
-	if soak == 0 {
-		return true, "probes synced"
+	note, wait := noteNodeReady, "%s, waiting for it to stay so for %s"
+	if node.EL == nil && node.CL == nil {
+		note, wait = noteNoProbe, "%s, waiting %s"
+	}
+
+	if p.set.ReadyEpochs == 0 {
+		return true, note
 	}
 
 	epoch := p.w.Health.EpochDuration()
 	if epoch <= 0 {
-		return false, "epoch timing unknown"
+		return false, noteEpochTiming
 	}
 
-	window := time.Duration(soak) * epoch
-	if p.now.Sub(*l.SyncedSince) < window {
-		return false, fmt.Sprintf("probes synced, soaking for %s", window)
+	window := time.Duration(p.set.ReadyEpochs) * epoch
+	if seen.Sub(*l.SyncedSince) < window {
+		return false, fmt.Sprintf(wait, note, window)
 	}
 
-	return true, "probes synced"
+	return true, note
 }
 
 // endLease closes a lease and frees the host's slot.
@@ -288,6 +347,7 @@ func (p *pass) endLease(l *fleet.Lease, state fleet.LeaseState) {
 	ended := p.now
 	l.State = state
 	l.EndedAt = &ended
+	p.ended[l.Host] = true
 
 	if hv := p.hosts[l.Host]; hv != nil && hv.lease == l {
 		hv.lease = nil
@@ -378,6 +438,9 @@ func (p *pass) failLease(l *fleet.Lease, reason string) {
 		m := r.Host(l.Host)
 
 		if otherFailed && stepsDone(l, r.ID) {
+			// Done, but not through a lease that passed readiness: it is no
+			// success of the rollout.
+			m.LeaseID = ""
 			p.setMember(m, fleet.HostDone)
 
 			continue
@@ -507,7 +570,6 @@ func (p *pass) reopen(hv *hostView, closed *fleet.Lease, op *protocol.Operation)
 
 		m.LeaseID = l.ID
 		p.setMember(m, fleet.HostLeased)
-		p.claimCanary(r, m, hv)
 	}
 
 	p.leases = append(p.leases, l)
@@ -569,18 +631,7 @@ func (p *pass) adoptStep(l *fleet.Lease, hv *hostView, needID string) {
 		m.LeaseID = l.ID
 		p.setMember(m, fleet.HostLeased)
 
-		p.claimCanary(r, m, hv)
-
 		return
-	}
-}
-
-// claimCanary makes a validator host that holds a lease outside of a grant
-// (adopted or reopened) the canary of a rollout that has none yet.
-func (p *pass) claimCanary(r *fleet.Rollout, m *fleet.RolloutHost, hv *hostView) {
-	if !r.Force && r.Canary == "" && hv.class() == fleet.StageBatches {
-		r.Canary = m.Host
-		m.Stage = fleet.StageCanary
 	}
 }
 

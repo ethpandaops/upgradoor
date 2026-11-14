@@ -1,5 +1,6 @@
 // Package scheduler plans rollouts and grants leases under the availability
-// budget, the network gate and the stage ordering. docs/scheduler.md states
+// budget, the network gate and the order inside a rollout (hosts the change
+// already broke first, then a canary, then the rest). docs/scheduler.md states
 // the rules; the simulation tests assert them after every step.
 package scheduler
 
@@ -84,9 +85,9 @@ type RollRequest struct {
 	// every managed, non-custom container of each host.
 	Containers []string `json:"containers"`
 	// Staggered runs the selection as a manual rollout through the normal
-	// ordering, budget, gate and soak. Not staggered means "now": each host
-	// is granted as soon as the budget and gate allow, without ordering
-	// and without soak between hosts.
+	// order, budget, gate and readiness check. Not staggered means "now":
+	// each host is granted as soon as the budget and gate allow, in no order
+	// and without waiting for readiness between hosts.
 	Staggered bool `json:"staggered"`
 	// Force skips ordering and readiness for a staggered rollout as well.
 	Force bool `json:"force"`
@@ -186,6 +187,11 @@ type QueueEntry struct {
 	// Wait classifies Reason, so a client can tell a host that will be served
 	// by itself from one that waits for a person.
 	Wait WaitKind `json:"wait"`
+	// After names the host that a host waiting for its place in the order
+	// of a rollout waits for: a carried member, or the canary. That host may
+	// not be in the queue itself: it holds a lease, or it is expected to
+	// report its need.
+	After string `json:"after,omitempty"`
 	// Rollout is the ID of the rollout the reason is about: the one that is
 	// paused, halted, unapproved or whose order the host waits in. Empty when
 	// the reason is about the host or the fleet (hold, global pause, budget).

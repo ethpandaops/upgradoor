@@ -77,12 +77,16 @@ type Rollout struct {
 	Paused bool `json:"paused"`
 	// Approved is set by a person for a rollout whose policy is manual.
 	Approved bool `json:"approved"`
-	// Force skips ordering and soak for this rollout (never the budget).
+	// Force skips the order inside the rollout and the readiness check (never
+	// the budget).
 	Force bool `json:"force"`
 	// IgnoreBudget additionally skips the budget and the network gate. It
 	// can only be set explicitly by a person and is audited.
 	IgnoreBudget bool `json:"ignoreBudget"`
-	// Canary is the first validator host granted in this rollout.
+	// Canary is the host that goes alone until the rollout has its first
+	// success. Empty for a forced rollout, for a rollout with a single member
+	// and for a rollout whose first success came without one (a carried
+	// member, or a repair through the closed gate).
 	Canary string `json:"canary,omitempty"`
 
 	CreatedBy string     `json:"createdBy"`
@@ -116,7 +120,9 @@ const (
 	HostPending HostState = "pending"
 	// HostLeased: a lease that includes this rollout's need is open.
 	HostLeased HostState = "leased"
-	// HostDone: served and ready, or the need disappeared by itself.
+	// HostDone: served and ready (LeaseID names the released lease), or the
+	// need disappeared by itself, or its step was done in a lease that failed
+	// on another step (both without LeaseID).
 	HostDone HostState = "done"
 	// HostFailed: the lease failed.
 	HostFailed HostState = "failed"
@@ -124,25 +130,26 @@ const (
 	HostSkipped HostState = "skipped"
 )
 
-// Settled reports whether the host no longer blocks later stages.
+// Settled reports whether the host is no longer waited for.
 func (s HostState) Settled() bool {
 	return s == HostDone || s == HostSkipped
 }
 
-// Stage is the ordering class of a host inside a rollout. Stages run
-// strictly in order.
+// Stage is the place of a host inside a rollout: hosts the change already
+// broke go first, then one canary alone, then the rest. It follows from
+// RolloutHost.CarriedFrom and Rollout.Canary and is set anew in every
+// reconcile of an open rollout.
 type Stage int
 
-// Stages.
+// Stages, in serving order. The zero value is no stage.
 const (
-	// StageNoValidators: hosts without validators that are not bootnodes.
-	StageNoValidators Stage = iota
-	// StageCanary: the first validator host, alone.
+	// StageRepair: a member carried over as failed from the rollout this one
+	// supersedes. It waits for no canary, and the other members wait for it.
+	StageRepair Stage = iota + 1
+	// StageCanary: the one host that goes first of the others, alone.
 	StageCanary
-	// StageBatches: the remaining validator hosts, as the budget allows.
-	StageBatches
-	// StageBootnodes: bootnodes, last and one at a time.
-	StageBootnodes
+	// StageRest: every other member, as the budget and the host limit allow.
+	StageRest
 )
 
 // RolloutHost is one member host of a rollout.
@@ -154,8 +161,12 @@ type RolloutHost struct {
 	NeedID  string `json:"needId,omitempty"`
 	LeaseID string `json:"leaseId,omitempty"`
 	// Error is the failure reason for HostFailed.
-	Error     string    `json:"error,omitempty"`
-	UpdatedAt time.Time `json:"updatedAt"`
+	Error string `json:"error,omitempty"`
+	// CarriedFrom is the ID of the superseded rollout in which the host had
+	// failed, for a member that was carried over from it. It is set when the
+	// member joins and never changes.
+	CarriedFrom string    `json:"carriedFrom,omitempty"`
+	UpdatedAt   time.Time `json:"updatedAt"`
 }
 
 // LeaseState is the lifecycle state of a lease.
@@ -169,8 +180,8 @@ const (
 	// LeaseRunning: the agent reports a non-terminal phase.
 	LeaseRunning LeaseState = "running"
 	// LeaseVerifying: the agent reported done; the controller is waiting
-	// for its own readiness check (validators live for soakEpochs, or
-	// probes synced for hosts without validators).
+	// for its own readiness check (the node back at head with peers and
+	// the host's validators attesting again).
 	LeaseVerifying LeaseState = "verifying"
 	// LeaseReleased: ready; the slot is free again.
 	LeaseReleased LeaseState = "released"
@@ -205,6 +216,9 @@ type Lease struct {
 	// Force: readiness is not awaited; the lease is released as soon as the
 	// agent reports done.
 	Force bool `json:"force"`
+	// Repair: the lease was granted through the repair exception of a closed
+	// network gate. At most one such lease is open at a time.
+	Repair bool `json:"repair,omitempty"`
 	// GrantedBy is "scheduler" or the person behind a manual action.
 	GrantedBy string `json:"grantedBy"`
 
@@ -213,9 +227,9 @@ type Lease struct {
 	// AgentDoneAt is when the agent first reported a terminal phase.
 	AgentDoneAt *time.Time `json:"agentDoneAt,omitempty"`
 	// SyncedSince is the start of the current unbroken run of syncs, after
-	// the agent's done report, in which the host's probes reported synced.
-	// It is what the probe readiness rule measures; nil while there is no
-	// such run.
+	// the agent's done report, in which the host's node probes reported the
+	// node at head with enough peers. It is what the node part of the
+	// readiness check measures; nil while there is no such run.
 	SyncedSince *time.Time `json:"syncedSince,omitempty"`
 	EndedAt     *time.Time `json:"endedAt,omitempty"`
 

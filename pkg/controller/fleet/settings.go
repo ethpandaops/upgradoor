@@ -61,9 +61,16 @@ type Settings struct {
 	MinParticipationPercent float64 `json:"minParticipationPercent"`
 	// MaxFinalityLagEpochs is the network gate's finality lag ceiling.
 	MaxFinalityLagEpochs uint64 `json:"maxFinalityLagEpochs"`
-	// SoakEpochs is how many consecutive complete epochs a host's validators
-	// must be live after its slot before the slot is released.
-	SoakEpochs uint64 `json:"soakEpochs"`
+	// ReadyEpochs is how long a host must look healthy after its operation
+	// before its slot is released: the node at head with peers for this many
+	// epoch durations, and its validators attesting in this many consecutive
+	// complete epochs. 0 releases at the first healthy sync after the
+	// operation.
+	ReadyEpochs uint64 `json:"readyEpochs"`
+	// MinPeers is how many peers each of the execution and the consensus
+	// client must have for the node to count as back, at most. See
+	// EffectiveMinPeers.
+	MinPeers int `json:"minPeers"`
 	// LeaseTTL is how long an agent has to start a granted lease, and the
 	// silence after which a started lease is declared failed.
 	LeaseTTL Duration `json:"leaseTtl"`
@@ -87,7 +94,8 @@ func DefaultSettings() Settings {
 		MaxUnavailablePercent:   10,
 		MinParticipationPercent: 90,
 		MaxFinalityLagEpochs:    3,
-		SoakEpochs:              1,
+		ReadyEpochs:             1,
+		MinPeers:                3,
 		LeaseTTL:                Duration(30 * time.Minute),
 		HostStaleAfter:          Duration(2 * time.Minute),
 		ReadinessTimeout:        Duration(30 * time.Minute),
@@ -111,6 +119,16 @@ func (s *Settings) PolicyFor(kind protocol.NeedKind) Policy {
 	}
 }
 
+// EffectiveMinPeers is the number of peers a node must have in a fleet in
+// which nodes hosts run a node: MinPeers, but never more than half of the
+// other nodes (rounded up, at least 1). Two or three nodes need 1 peer, four
+// or five need 2, six and more need 3 with the default. A node that has
+// found half of the others is back; waiting for all of them would make every
+// short peer loss on a small devnet restart the check.
+func (s *Settings) EffectiveMinPeers(nodes int) int {
+	return max(1, min(s.MinPeers, nodes/2))
+}
+
 // Validate checks value ranges.
 func (s *Settings) Validate() error {
 	if s.MaxUnavailablePercent < 0 || s.MaxUnavailablePercent > 100 {
@@ -123,6 +141,10 @@ func (s *Settings) Validate() error {
 
 	if s.MaxFinalityLagEpochs < 2 {
 		return errors.New("maxFinalityLagEpochs must be at least 2 (a healthy network lags 2)")
+	}
+
+	if s.MinPeers < 1 {
+		return errors.New("minPeers must be at least 1")
 	}
 
 	if s.LeaseTTL.Std() < time.Minute {

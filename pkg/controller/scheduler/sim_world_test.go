@@ -100,6 +100,37 @@ type simAgent struct {
 	opFail bool
 	reboot bool
 	down   bool
+	// upAt is when the last operation ended: the node finds its peers again
+	// from then on.
+	upAt time.Time
+
+	// What the node goes through besides being up or down. syncingUntil: a
+	// client reports syncing (the execution client when syncingEL, else the
+	// consensus client). elOfflineUntil: the consensus client reports its
+	// execution client offline. elDownUntil: the execution client does not
+	// answer. peerCapUntil: the node has at most peerCap peers. elLag: the
+	// execution client finds its peers that much later than the consensus
+	// client.
+	// dead: the host's validators never attest, while its node and its agent
+	// are fine (a broken validator client, missing keys).
+	dead bool
+	// sloppy: the agent reports its needs also while it is held and for verbs
+	// its configuration does not allow. It refuses the steps all the same.
+	sloppy bool
+	// blind: the agent's registry polls see nothing new, so it never reports
+	// the need the controller expects of it.
+	blind bool
+	// stepFail is the index of the step of the running operation that fails
+	// while the others succeed; -1 for none.
+	stepFail int
+
+	syncingUntil   time.Time
+	syncingEL      bool
+	elOfflineUntil time.Time
+	elDownUntil    time.Time
+	peerCapUntil   time.Time
+	peerCap        int
+	elLag          time.Duration
 
 	// World truth per lease ID, for the oracle: whether the agent stopped
 	// anything, and when it finished successfully.
@@ -144,9 +175,11 @@ type simWorld struct {
 	// endpoint, for the whole run. Nothing is ever published.
 	livenessUnsupported bool
 
-	beaconDownUntil      time.Time
-	finalityStallUntil   time.Time
-	finalityStallSince   time.Time
+	beaconDownUntil    time.Time
+	finalityStallUntil time.Time
+	finalityStallSince time.Time
+	// blackoutUntil: no validator of any host is seen attesting.
+	blackoutUntil        time.Time
 	livenessStallUntil   time.Time
 	livenessUnknownUntil time.Time
 	dropUntil            time.Time
@@ -209,6 +242,10 @@ func newSimWorld(rng *rand.Rand) *simWorld {
 			disrupted:    make(map[string]bool, 8),
 			doneAt:       make(map[string]time.Time, 8),
 			localHold:    rng.IntN(25) == 0,
+			dead:         rng.IntN(20) == 0,
+			sloppy:       rng.IntN(5) == 0,
+			blind:        rng.IntN(12) == 0,
+			stepFail:     -1,
 		}
 
 		if rng.IntN(7) == 0 {
@@ -277,8 +314,8 @@ func (w *simWorld) describe() string {
 	var b strings.Builder
 
 	for _, a := range w.agents {
-		fmt.Fprintf(&b, "  %s weight=%d bootnode=%v probes=%v verbs=%v localHold=%v:",
-			a.name, a.weight, a.bootnode, a.probes, a.verbs, a.localHold)
+		fmt.Fprintf(&b, "  %s weight=%d bootnode=%v probes=%v verbs=%v localHold=%v dead=%v sloppy=%v blind=%v:",
+			a.name, a.weight, a.bootnode, a.probes, a.verbs, a.localHold, a.dead, a.sloppy, a.blind)
 
 		for _, c := range a.containers {
 			fmt.Fprintf(&b, " %s=%s(managed=%v custom=%v)", c.name, c.image, c.managed, c.custom)
@@ -290,16 +327,13 @@ func (w *simWorld) describe() string {
 	return b.String()
 }
 
-// attesting is how many of the host's validators attest right now.
+// attesting is how many of the host's validators attest right now. A node
+// that is syncing, has lost its execution client or has no peer attests with
+// none.
 func (w *simWorld) attesting(a *simAgent) uint64 {
-	if a.weight == 0 || a.down || w.now.Before(a.outageUntil) {
+	if a.weight == 0 || a.dead || w.now.Before(w.blackoutUntil) || !w.synced(a) || w.behind(a) ||
+		w.clPeers(a) == 0 {
 		return 0
-	}
-
-	for _, c := range a.containers {
-		if c.managed && !c.custom && w.digestKind[c.running] != digestGood {
-			return 0
-		}
 	}
 
 	if w.now.Before(w.dropUntil) {
@@ -309,7 +343,46 @@ func (w *simWorld) attesting(a *simAgent) uint64 {
 	return a.weight
 }
 
-// synced is what the host's probes say.
+// simPeers is how many peers a node has once it found them all again;
+// simPeerEvery is how long each of them takes after the node came back.
+const (
+	simPeers     = 12
+	simPeerEvery = 3 * time.Second
+)
+
+// clPeers is how many peers the consensus client has: none while the node is
+// down, then one more every simPeerEvery since it came back from its last
+// operation or outage, and no more than peerCap while the node has trouble
+// keeping them.
+func (w *simWorld) clPeers(a *simAgent) int {
+	return w.peersAfter(a, 0)
+}
+
+// elPeers is the same for the execution client, which finds its peers elLag
+// later and has none while it does not answer.
+func (w *simWorld) elPeers(a *simAgent) int {
+	if w.now.Before(a.elDownUntil) {
+		return 0
+	}
+
+	return w.peersAfter(a, a.elLag)
+}
+
+func (w *simWorld) peersAfter(a *simAgent, lag time.Duration) int {
+	if !w.synced(a) {
+		return 0
+	}
+
+	peers := int(min(simPeers, max(0, w.now.Sub(later(a.upAt, a.outageUntil))-lag)/simPeerEvery))
+	if w.now.Before(a.peerCapUntil) {
+		peers = min(peers, a.peerCap)
+	}
+
+	return peers
+}
+
+// synced reports whether the host's node is up: no operation has it stopped,
+// it is in no outage and its containers run.
 func (w *simWorld) synced(a *simAgent) bool {
 	if a.down || w.now.Before(a.outageUntil) {
 		return false
@@ -322,6 +395,56 @@ func (w *simWorld) synced(a *simAgent) bool {
 	}
 
 	return true
+}
+
+// behind reports whether a node that is up is not at head: a client is
+// syncing, or the consensus client has lost its execution client.
+func (w *simWorld) behind(a *simAgent) bool {
+	return w.now.Before(a.syncingUntil) || w.now.Before(a.elOfflineUntil) || w.now.Before(a.elDownUntil)
+}
+
+// node is what the host's probes say.
+func (w *simWorld) node(a *simAgent) protocol.NodeHealth {
+	var (
+		up      = w.synced(a)
+		syncing = up && w.now.Before(a.syncingUntil)
+		elUp    = up && !w.now.Before(a.elDownUntil)
+	)
+
+	return protocol.NodeHealth{
+		EL: &protocol.ELHealth{Reachable: elUp, Syncing: syncing && a.syncingEL && elUp, Peers: w.elPeers(a)},
+		CL: &protocol.CLHealth{
+			Reachable: up,
+			Syncing:   syncing && !a.syncingEL,
+			ELOffline: up && (!elUp || w.now.Before(a.elOfflineUntil)),
+			Peers:     w.clPeers(a),
+		},
+	}
+}
+
+// comeBack decides what the node goes through after an operation: now and
+// then it has to catch up first, its execution client takes longer than its
+// consensus client, or it keeps losing its peers.
+func (w *simWorld) comeBack(a *simAgent) {
+	a.upAt = w.now
+	a.elLag = 0
+
+	if w.calm {
+		return
+	}
+
+	if w.rng.IntN(3) == 0 {
+		a.syncingUntil = w.now.Add(time.Duration(2+w.rng.IntN(40)) * time.Second)
+		a.syncingEL = w.rng.IntN(2) == 0
+	}
+
+	if w.rng.IntN(5) == 0 {
+		a.elOfflineUntil = w.now.Add(time.Duration(2+w.rng.IntN(30)) * time.Second)
+	}
+
+	if w.rng.IntN(3) == 0 {
+		a.elLag = time.Duration(3+w.rng.IntN(40)) * time.Second
+	}
 }
 
 // advance moves the clock, publishes the liveness of the epochs that ended
@@ -410,6 +533,23 @@ func (w *simWorld) publishedLive(a *simAgent) uint64 {
 	}
 
 	return min(live, a.weight)
+}
+
+// storedLiveness reports whether the store still holds a row of the newest
+// published epoch: the rows of a forgotten host and of a lost database are
+// gone until the next epoch is published.
+func (w *simWorld) storedLiveness() bool {
+	if !w.havePublished {
+		return false
+	}
+
+	for name := range w.published[w.publishedEpoch] {
+		if !w.dropped[name] {
+			return true
+		}
+	}
+
+	return false
 }
 
 // health is the beacon service's view.
@@ -501,7 +641,7 @@ func (w *simWorld) work(a *simAgent) {
 // poll looks at the registries and the package candidates.
 func (w *simWorld) poll(a *simAgent) {
 	for _, c := range a.containers {
-		if c.managed && !c.custom {
+		if c.managed && !c.custom && !a.blind {
 			c.seen = w.registry[c.image]
 			c.checkedAt = w.now
 		}
@@ -561,6 +701,7 @@ func (w *simWorld) startOperation(a *simAgent) {
 	}
 
 	a.reboot = false
+	a.stepFail = -1
 
 	for i := range a.lease.Needs {
 		n := &a.lease.Needs[i]
@@ -590,6 +731,13 @@ func (w *simWorld) startOperation(a *simAgent) {
 	a.disrupted[op.LeaseID] = true
 	a.opEnd = w.now.Add(time.Duration(4+w.rng.IntN(80)) * time.Second)
 	a.opFail = !w.calm && w.rng.IntN(25) == 0
+
+	// Now and then one step of several fails while the others succeed.
+	if !w.calm && len(op.Steps) > 1 && w.rng.IntN(6) == 0 {
+		if i := w.rng.IntN(len(op.Steps)); op.Steps[i].Status == protocol.StepRunning {
+			a.stepFail = i
+		}
+	}
 }
 
 // finishOperation ends the running operation and applies what it did.
@@ -597,6 +745,7 @@ func (w *simWorld) finishOperation(a *simAgent) {
 	op := a.op
 	op.UpdatedAt = w.now
 	a.down = false
+	w.comeBack(a)
 
 	if a.opFail {
 		// Nothing was changed; the containers are back on what they ran.
@@ -619,6 +768,15 @@ func (w *simWorld) finishOperation(a *simAgent) {
 	for i := range op.Steps {
 		step := &op.Steps[i]
 		if step.Status != protocol.StepRunning {
+			continue
+		}
+
+		if i == a.stepFail {
+			step.Status = protocol.StepFailed
+			step.Error = "step exited with status 1"
+			op.Phase = protocol.PhaseFailed
+			op.Error = step.Error
+
 			continue
 		}
 
@@ -670,15 +828,16 @@ func simPackages(from, to int) []protocol.PackageChange {
 }
 
 // needs lists the agent's open needs. A held agent reports none, and a need
-// is reported only for a verb the local configuration allows.
+// is reported only for a verb the local configuration allows; a sloppy agent
+// reports its observed needs regardless.
 func (w *simWorld) needs(a *simAgent) []protocol.Need {
-	if a.held() {
+	if a.held() && !a.sloppy {
 		return nil
 	}
 
 	needs := make([]protocol.Need, 0, 4)
 
-	if a.allows(protocol.VerbRoll) {
+	if a.allows(protocol.VerbRoll) || a.sloppy {
 		for _, c := range a.containers {
 			if !c.managed || c.custom || c.seen == c.running {
 				continue
@@ -694,7 +853,7 @@ func (w *simWorld) needs(a *simAgent) []protocol.Need {
 		}
 	}
 
-	if a.allows(protocol.VerbPackages) && a.pkgSeen > a.pkgInstalled {
+	if (a.allows(protocol.VerbPackages) || a.sloppy) && a.pkgSeen > a.pkgInstalled {
 		pkgs := simPackages(a.pkgInstalled, a.pkgSeen)
 		needs = append(needs, protocol.Need{
 			ID:       protocol.PackagesNeedID(pkgs),
@@ -703,8 +862,13 @@ func (w *simWorld) needs(a *simAgent) []protocol.Need {
 		})
 	}
 
-	if a.allows(protocol.VerbReboot) && a.rebootRequired {
+	if (a.allows(protocol.VerbReboot) || a.sloppy) && a.rebootRequired {
 		needs = append(needs, rebootNeed())
+	}
+
+	if a.held() {
+		// Held: the observed needs at most, no manual ones.
+		return needs
 	}
 
 	// A manual need that local policy no longer permits is dropped.
@@ -774,17 +938,7 @@ func (w *simWorld) request(a *simAgent) *protocol.SyncRequest {
 	}
 
 	if a.probes {
-		ok := w.synced(a)
-		peers := 0
-
-		if ok {
-			peers = 12
-		}
-
-		req.Node = protocol.NodeHealth{
-			EL: &protocol.ELHealth{Reachable: ok, Peers: peers},
-			CL: &protocol.CLHealth{Reachable: ok, Peers: peers},
-		}
+		req.Node = w.node(a)
 	}
 
 	return req

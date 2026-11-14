@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
@@ -14,12 +15,12 @@ import (
 // simHostFact is what the simulated world knows about one registered host.
 // None of it comes from the scheduler.
 type simHostFact struct {
-	weight   uint64
-	bootnode bool
+	weight uint64
 	// live is how many validators attested in the newest liveness epoch the
 	// beacon service stored (the full weight without a row). When the beacon
 	// node does not serve liveness it is the probe rule instead: none when
-	// the host is stale or its last sync's probes are not synced, else all.
+	// the host is stale or its last sync's probes do not show the node at head
+	// with a peer, else all.
 	live uint64
 	// holdWanted is the operator's hold switch.
 	holdWanted bool
@@ -30,17 +31,6 @@ type simHostFact struct {
 	// it stopped anything, and when it finished successfully.
 	disrupted map[string]bool
 	doneAt    map[string]time.Time
-}
-
-func (h *simHostFact) class() fleet.Stage {
-	switch {
-	case h.bootnode:
-		return fleet.StageBootnodes
-	case h.weight == 0:
-		return fleet.StageNoValidators
-	default:
-		return fleet.StageBatches
-	}
 }
 
 func (h *simHostFact) held() bool {
@@ -72,6 +62,10 @@ type simFacts struct {
 	// hold, cleared by unhold, and kept when the controller loses its
 	// database or forgets the host.
 	holds map[string]bool
+	// registered is when this database first saw each host: the time of the
+	// sync that created its row. A lost database and a forgotten host start
+	// over.
+	registered map[string]time.Time
 	// fresh is true when a reconcile has just been committed against
 	// exactly these facts.
 	fresh bool
@@ -101,9 +95,19 @@ func (s *simSnapshot) rollout(id string) *fleet.Rollout {
 	return nil
 }
 
+// oracleRun is the oracle's record of the readiness run of one lease: the
+// first and the newest sync of the unbroken run of syncs, after the
+// operation, that showed the node at head with peers.
+type oracleRun struct {
+	first, newest time.Time
+}
+
 // oracle checks the invariants of docs/scheduler.md on a history of
-// observations. It keeps its own books: which leases and rollouts it has
-// seen in which state, and which rollouts a failed lease halted.
+// observations. It keeps its own books and takes none of its definitions
+// from the scheduler: which leases and rollouts it has seen in which state,
+// which rollouts a failed lease halted, which members a rollout inherited as
+// failed from the one it supersedes, which rollouts have had a success, which
+// leases passed a closed gate, and when each host's last lease ended.
 type oracle struct {
 	rollouts map[string]fleet.RolloutState
 	leases   map[string]fleet.LeaseState
@@ -111,6 +115,43 @@ type oracle struct {
 	halted map[string]string
 	// directives are the directives seen so far.
 	directives map[string]bool
+	// runs holds the readiness run per lease whose agent is done. The oracle
+	// keeps it from the syncs it sees, not from the lease.
+	runs map[string]oracleRun
+	// carried is the supersede ledger: per rollout, the members it inherited
+	// as failed from the rollout it supersedes.
+	carried map[string]map[string]bool
+	// succeeded names the rollouts in which a member is done through a lease
+	// that the oracle saw released and judged ready itself.
+	succeeded map[string]bool
+	// grants are the leases the oracle saw granted; repairs those of them
+	// that passed a closed gate.
+	grants  map[string]bool
+	repairs map[string]bool
+	// leaseEnd is when the oracle saw the last lease of each host end.
+	leaseEnd map[string]time.Time
+	// stuck counts, per rollout and host, the committed reconciles in a row
+	// that left the host waiting although nothing held it back.
+	stuck map[string]int
+}
+
+// simStuckPasses is how many committed reconciles in a row may leave a host
+// waiting that nothing holds back. One can: the canary is chosen against the
+// budget before the grants of the pass, and an older rollout may take that
+// budget in the same pass.
+const simStuckPasses = 5
+
+// oracleView is what the oracle looks at while it checks the grants of one
+// reconcile.
+type oracleView struct {
+	f    *simFacts
+	snap *simSnapshot
+	// before are the hosts that held a lease before the reconcile granted
+	// anything; leased are those that hold one now.
+	before map[string]bool
+	leased map[string]bool
+	// gate are the gate's failures at that reconcile.
+	gate []string
 }
 
 func newOracle() *oracle {
@@ -120,6 +161,13 @@ func newOracle() *oracle {
 		halted:   make(map[string]string, 4),
 
 		directives: make(map[string]bool, 64),
+		runs:       make(map[string]oracleRun, 8),
+		carried:    make(map[string]map[string]bool, 8),
+		succeeded:  make(map[string]bool, 8),
+		grants:     make(map[string]bool, 64),
+		repairs:    make(map[string]bool, 8),
+		leaseEnd:   make(map[string]time.Time, 16),
+		stuck:      make(map[string]int, 8),
 	}
 }
 
@@ -132,6 +180,12 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 
 	for _, id := range f.retried {
 		delete(o.halted, id)
+	}
+
+	o.trackRuns(f, snap)
+
+	if err := o.checkCarried(f, snap); err != nil {
+		return err
 	}
 
 	var (
@@ -153,6 +207,11 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 			leased[l.Host] = true
 		}
 
+		// A lease that is taken up again is not the grant the oracle saw.
+		if known && was.Terminal() && !l.State.Terminal() {
+			delete(o.grants, l.ID)
+		}
+
 		if l.State != was {
 			if err := o.checkLeaseEnd(f, snap, l); err != nil {
 				return err
@@ -168,11 +227,16 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 		return err
 	}
 
+	view := &oracleView{f: f, snap: snap, before: make(map[string]bool, len(leased)), leased: leased}
+	for name := range leased {
+		view.before[name] = true
+	}
+
 	// The gate is evaluated once per reconcile, before the first grant.
-	gate := oracleGate(f, leased)
+	view.gate = oracleGate(f, leased)
 
 	for _, l := range granted {
-		if err := o.checkGrant(f, snap, l, leased, gate); err != nil {
+		if err := o.checkGrant(view, l); err != nil {
 			return fmt.Errorf("grant of lease %s to %s: %w", l.ID, l.Host, err)
 		}
 
@@ -181,6 +245,10 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 
 	for _, l := range snap.leases {
 		o.leases[l.ID] = l.State
+
+		if l.State.Terminal() {
+			delete(o.runs, l.ID)
+		}
 	}
 
 	for _, r := range snap.rollouts {
@@ -188,7 +256,173 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 	}
 
 	if f.fresh {
+		if err := o.checkProgress(view); err != nil {
+			return err
+		}
+
 		return checkMembership(f, snap)
+	}
+
+	return nil
+}
+
+// trackRuns keeps the oracle's own record of the readiness run of every open
+// lease whose agent is done: the run starts with the first sync after the
+// operation that shows the node at head with peers, grows with every further
+// one and ends with the first that does not. A sync the scheduler could not
+// judge, because its reconcile was not committed, can start a run but not
+// end one: the scheduler cannot know of it either.
+func (o *oracle) trackRuns(f *simFacts, snap *simSnapshot) {
+	peers := oracleMinPeers(f)
+
+	for _, l := range snap.leases {
+		if was, known := o.leases[l.ID]; known && was.Terminal() {
+			continue
+		}
+
+		host := f.hosts[l.Host]
+		if host == nil {
+			delete(o.runs, l.ID)
+
+			continue
+		}
+
+		doneAt, done := host.doneAt[l.ID]
+		back := done && host.status != nil && host.lastSync.After(doneAt) &&
+			oracleNodeBack(host.status.Node, peers)
+
+		switch run, running := o.runs[l.ID]; {
+		case back && !running:
+			o.runs[l.ID] = oracleRun{first: host.lastSync, newest: host.lastSync}
+		case back:
+			run.newest = host.lastSync
+			o.runs[l.ID] = run
+		case f.fresh:
+			delete(o.runs, l.ID)
+		}
+	}
+}
+
+// oracleGroup names what a superseded rollout is followed by: rollouts of
+// the same image reference, or of the packages kind. Reboot and manual
+// rollouts are followed by nothing.
+func oracleGroup(r *fleet.Rollout) string {
+	switch r.Kind {
+	case fleet.RolloutImage:
+		return "image " + r.Image
+	case fleet.RolloutPackages:
+		return "packages"
+	default:
+		return ""
+	}
+}
+
+// oracleNewer orders rollouts by creation, then end, then ID.
+func oracleNewer(a, b *fleet.Rollout) bool {
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.After(b.CreatedAt)
+	}
+
+	var endA, endB time.Time
+	if a.EndedAt != nil {
+		endA = *a.EndedAt
+	}
+
+	if b.EndedAt != nil {
+		endB = *b.EndedAt
+	}
+
+	if !endA.Equal(endB) {
+		return endA.After(endB)
+	}
+
+	return a.ID > b.ID
+}
+
+// bequeathed lists the members a superseded rollout leaves to the one that
+// follows it as carried: those that failed in it, and those it had itself
+// inherited and not served yet.
+func (o *oracle) bequeathed(r *fleet.Rollout) []string {
+	var hosts []string
+
+	for i := range r.Hosts {
+		m := &r.Hosts[i]
+
+		waiting := m.State == fleet.HostPending || m.State == fleet.HostExpected
+		if m.State == fleet.HostFailed || (waiting && o.carried[r.ID][m.Host]) {
+			hosts = append(hosts, m.Host)
+		}
+	}
+
+	return hosts
+}
+
+// checkCarried keeps the supersede ledger and holds the scheduler's carried
+// marks against it. A rollout that the scheduler opens inherits the failed
+// members of the rollouts of its group that it supersedes in the same
+// reconcile, or, when there is none, of the newest rollout of its group that
+// was closed before, if that one was superseded. A member is carried when it
+// is inherited and in the rollout from the start, unless a person skipped it.
+// The mark never changes afterwards.
+func (o *oracle) checkCarried(f *simFacts, snap *simSnapshot) error {
+	for _, r := range snap.rollouts {
+		if _, known := o.rollouts[r.ID]; known {
+			continue
+		}
+
+		ledger := make(map[string]bool, 2)
+		o.carried[r.ID] = ledger
+
+		group := oracleGroup(r)
+		if !f.fresh || group == "" {
+			// Opened by a person, or of a kind that nothing is carried into.
+			continue
+		}
+
+		var (
+			inherited []string
+			now       bool
+			latest    *fleet.Rollout
+		)
+
+		for _, old := range snap.rollouts {
+			was, known := o.rollouts[old.ID]
+			if !known || oracleGroup(old) != group {
+				continue
+			}
+
+			switch {
+			case !was.Terminal() && old.State == fleet.RolloutSuperseded:
+				now = true
+				inherited = append(inherited, o.bequeathed(old)...)
+			case was.Terminal() && (latest == nil || oracleNewer(old, latest)):
+				latest = old
+			}
+		}
+
+		if !now && latest != nil && latest.State == fleet.RolloutSuperseded {
+			inherited = o.bequeathed(latest)
+		}
+
+		for _, name := range inherited {
+			if m := r.Host(name); m != nil && m.State != fleet.HostSkipped {
+				ledger[name] = true
+			}
+		}
+	}
+
+	for _, r := range snap.rollouts {
+		if r.State.Terminal() {
+			continue
+		}
+
+		for i := range r.Hosts {
+			m := &r.Hosts[i]
+			if marked := m.CarriedFrom != ""; marked != o.carried[r.ID][m.Host] {
+				return fmt.Errorf("member %s of rollout %s (%s) is marked carried: %v, but by the history of "+
+					"superseded rollouts it is: %v", m.Host, r.ID, r.Key, marked, o.carried[r.ID][m.Host])
+			}
+		}
 	}
 
 	return nil
@@ -264,6 +498,10 @@ func (o *oracle) checkStates(f *simFacts, snap *simSnapshot) error {
 func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) error {
 	host := f.hosts[l.Host]
 
+	if l.State.Terminal() {
+		o.leaseEnd[l.Host] = f.now
+	}
+
 	switch l.State {
 	case fleet.LeaseFailed:
 		// A controller outage is not the agent's silence: the agent has
@@ -281,6 +519,19 @@ func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) e
 			}
 		}
 
+		// A controller outage is no time in which the host could have been
+		// found ready either: the readiness timeout runs from the later of the
+		// end of the operation and the controller's start.
+		if strings.HasPrefix(l.Error, "not ready after") && host != nil {
+			if doneAt, ok := host.doneAt[l.ID]; ok {
+				waited := f.now.Sub(later(doneAt, f.since))
+				if timeout := f.settings.ReadinessTimeout.Std(); waited <= timeout {
+					return fmt.Errorf("lease %s of %s failed as %q %s after the later of the end of its operation "+
+						"and the controller's start, readinessTimeout is %s", l.ID, l.Host, l.Error, waited, timeout)
+				}
+			}
+		}
+
 		o.haltedBy(snap, l)
 	case fleet.LeaseExpired:
 		if host != nil && host.disrupted[l.ID] {
@@ -292,7 +543,22 @@ func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) e
 			return fmt.Errorf("lease %s released for unknown host %s", l.ID, l.Host)
 		}
 
-		return checkRelease(f, l, host)
+		if err := o.checkRelease(f, l, host); err != nil {
+			return err
+		}
+
+		// A lease that the oracle found ready is a success of every rollout
+		// in which it left the host done.
+		for _, id := range l.Rollouts {
+			r := snap.rollout(id)
+			if l.Force || r == nil {
+				continue
+			}
+
+			if m := r.Host(l.Host); m != nil && m.State == fleet.HostDone && m.LeaseID == l.ID {
+				o.succeeded[id] = true
+			}
+		}
 	default:
 	}
 
@@ -362,8 +628,12 @@ func (o *oracle) checkHolds(f *simFacts, snap *simSnapshot) error {
 }
 
 // checkRelease: a lease is released only after the agent finished an
-// operation that the world has seen recover.
-func checkRelease(f *simFacts, l *fleet.Lease, host *simHostFact) error {
+// operation that the world has seen recover: the node back at head with
+// peers on every sync of readyEpochs epoch durations and, for a host with
+// validators, the validators attesting again for readyEpochs complete
+// epochs. Only a beacon node that does not serve liveness takes the second
+// part away.
+func (o *oracle) checkRelease(f *simFacts, l *fleet.Lease, host *simHostFact) error {
 	doneAt, ok := host.doneAt[l.ID]
 	if !ok {
 		return fmt.Errorf("lease %s of %s released although the agent never finished it", l.ID, l.Host)
@@ -390,40 +660,131 @@ func checkRelease(f *simFacts, l *fleet.Lease, host *simHostFact) error {
 		}
 	}
 
-	soak := f.settings.SoakEpochs
+	epochs := f.settings.ReadyEpochs
 	epoch := f.health.EpochDuration()
 
-	if host.weight == 0 || !f.health.LivenessKnown || f.health.LivenessUnsupported {
-		if host.status == nil || !host.lastSync.After(doneAt) || !host.status.Node.Synced() {
-			return fmt.Errorf("lease %s of %s released although its probes do not report synced after the operation "+
-				"(done at %s, last sync %s, synced %v)", l.ID, l.Host, doneAt.Format(time.TimeOnly),
-				host.lastSync.Format(time.TimeOnly), host.status != nil && host.status.Node.Synced())
+	// The validators attest again. Not knowing whether they do is not enough.
+	if host.weight > 0 && !f.health.LivenessUnsupported {
+		if !f.health.LivenessKnown {
+			return fmt.Errorf("lease %s of %s released although the beacon node has not said whether its %d "+
+				"validators attest", l.ID, l.Host, host.weight)
 		}
 
-		return nil
+		// The smallest count that is at least minParticipationPercent of them.
+		want := uint64(1)
+		for float64(want)*100 < f.settings.MinParticipationPercent*float64(host.weight)-1e-6 {
+			want++
+		}
+
+		for i := range epochs {
+			if !f.havePublished || f.publishedEpoch < i {
+				return fmt.Errorf("lease %s of %s released with fewer than %d liveness epochs", l.ID, l.Host, epochs)
+			}
+
+			e := f.publishedEpoch - i
+			live, ok := f.rows[e][l.Host]
+
+			switch {
+			case f.health.GenesisTime.Add(time.Duration(e) * epoch).Before(doneAt):
+				return fmt.Errorf("lease %s of %s released after %d of %d complete epochs since the agent was done",
+					l.ID, l.Host, i, epochs)
+			case !ok || live < want:
+				return fmt.Errorf("lease %s of %s released although %d of %d validators attested in epoch %d (need %d)",
+					l.ID, l.Host, live, host.weight, e, want)
+			}
+		}
 	}
 
-	want := max(uint64(math.Floor(f.settings.MinParticipationPercent*float64(host.weight)/100+budgetEpsilon)), 1)
+	// The node is back at head with peers: for every host, whatever the
+	// beacon node says about its validators.
+	peers := oracleMinPeers(f)
 
-	for i := range soak {
-		if !f.havePublished || f.publishedEpoch < i {
-			return fmt.Errorf("lease %s of %s released with fewer than %d liveness epochs", l.ID, l.Host, soak)
-		}
+	if host.status == nil || !host.lastSync.After(doneAt) || !oracleNodeBack(host.status.Node, peers) {
+		return fmt.Errorf("lease %s of %s released although its node is not seen at head with %d peers after the "+
+			"operation (done at %s, last sync %s, node %s)", l.ID, l.Host, peers, doneAt.Format(time.TimeOnly),
+			host.lastSync.Format(time.TimeOnly), oracleNode(host.status))
+	}
 
-		e := f.publishedEpoch - i
-		live, ok := f.rows[e][l.Host]
+	// The agent is still heard: an old sync says nothing about now.
+	if f.stale(host) {
+		return fmt.Errorf("lease %s of %s released although its agent is silent: last sync %s ago, controller "+
+			"started %s ago", l.ID, l.Host, f.now.Sub(host.lastSync), f.now.Sub(f.since))
+	}
 
-		switch {
-		case f.health.GenesisTime.Add(time.Duration(e) * epoch).Before(doneAt):
-			return fmt.Errorf("lease %s of %s released after %d of %d complete epochs since the agent was done",
-				l.ID, l.Host, i, soak)
-		case !ok || live < want:
-			return fmt.Errorf("lease %s of %s released although %d of %d validators attested in epoch %d (need %d)",
-				l.ID, l.Host, live, host.weight, e, want)
-		}
+	// It was seen so on every sync of readyEpochs epoch durations: the run
+	// the oracle recorded spans that long, from its first sync to its newest.
+	// Time without a sync counts for nothing.
+	window := time.Duration(epochs) * epoch
+
+	run, running := o.runs[l.ID]
+	if !running {
+		return fmt.Errorf("lease %s of %s released although no run of syncs with the node at head with %d peers "+
+			"is on record", l.ID, l.Host, peers)
+	}
+
+	if span := run.newest.Sub(run.first); span < window {
+		return fmt.Errorf("lease %s of %s released on a run of syncs with the node at head with %d peers that "+
+			"spans %s, it must span %s", l.ID, l.Host, peers, span, window)
 	}
 
 	return nil
+}
+
+// oracleMinPeers is the number of peers each client of a node must have:
+// minPeers, but no more than half of the other hosts that run a node (rounded
+// up, at least 1).
+func oracleMinPeers(f *simFacts) int {
+	nodes := 0
+
+	for _, h := range f.hosts {
+		if h.status != nil && (h.status.Node.EL != nil || h.status.Node.CL != nil) {
+			nodes++
+		}
+	}
+
+	// Half of the nodes-1 others, rounded up.
+	half := nodes / 2
+
+	switch {
+	case half < 1:
+		return 1
+	case f.settings.MinPeers > half:
+		return half
+	default:
+		return f.settings.MinPeers
+	}
+}
+
+// oracleNodeBack reports whether the probes of one sync show the node at
+// head with peers. A probe that is not configured says nothing.
+func oracleNodeBack(n protocol.NodeHealth, peers int) bool {
+	elOK := n.EL == nil || (n.EL.Reachable && !n.EL.Syncing && n.EL.Peers >= peers)
+	clOK := n.CL == nil || (n.CL.Reachable && !n.CL.Syncing && !n.CL.ELOffline && n.CL.Peers >= peers)
+
+	return elOK && clOK
+}
+
+// oracleNode renders the probes of a sync for a failure report.
+func oracleNode(req *protocol.SyncRequest) string {
+	if req == nil {
+		return "unknown"
+	}
+
+	out := ""
+
+	if el := req.Node.EL; el != nil {
+		out += fmt.Sprintf("EL reachable=%v syncing=%v peers=%d ", el.Reachable, el.Syncing, el.Peers)
+	}
+
+	if cl := req.Node.CL; cl != nil {
+		out += fmt.Sprintf("CL reachable=%v syncing=%v elOffline=%v peers=%d", cl.Reachable, cl.Syncing, cl.ELOffline, cl.Peers)
+	}
+
+	if out == "" {
+		return "has no probe"
+	}
+
+	return out
 }
 
 // oracleGate evaluates the network gate from the world. leased are the hosts
@@ -466,9 +827,10 @@ func oracleGate(f *simFacts, leased map[string]bool) []string {
 	return reasons
 }
 
-// oracleBudget checks the three grant conditions and the host-count limit
-// for one host against the world's own count of unavailable weight.
-func oracleBudget(f *simFacts, leased map[string]bool, host string) error {
+// oracleFits checks the three grant conditions for one host against the
+// world's own count of unavailable weight: it costs nothing, it stays inside
+// the budget, or it goes alone.
+func oracleFits(f *simFacts, leased map[string]bool, host string) error {
 	var total, unavailable uint64
 
 	for name, h := range f.hosts {
@@ -481,8 +843,7 @@ func oracleBudget(f *simFacts, leased map[string]bool, host string) error {
 		}
 	}
 
-	percent := f.settings.MaxUnavailablePercent
-	allowed := percent * float64(total) / 100
+	allowed := f.settings.MaxUnavailablePercent * float64(total) / 100
 	cost := f.hosts[host].live
 
 	fits := cost == 0 ||
@@ -493,7 +854,17 @@ func oracleBudget(f *simFacts, leased map[string]bool, host string) error {
 			cost, unavailable, total, allowed, len(leased))
 	}
 
-	limit := max(1, int(math.Floor(percent*float64(len(f.hosts))/100+budgetEpsilon)))
+	return nil
+}
+
+// oracleBudget checks the three grant conditions and the host-count limit
+// for one host.
+func oracleBudget(f *simFacts, leased map[string]bool, host string) error {
+	if err := oracleFits(f, leased, host); err != nil {
+		return err
+	}
+
+	limit := max(1, int(math.Floor(f.settings.MaxUnavailablePercent*float64(len(f.hosts))/100+budgetEpsilon)))
 	if len(leased) >= limit {
 		return fmt.Errorf("host limit: %d hosts already hold a lease, at most %d of %d may", len(leased), limit, len(f.hosts))
 	}
@@ -501,11 +872,54 @@ func oracleBudget(f *simFacts, leased map[string]bool, host string) error {
 	return nil
 }
 
-// checkGrant checks one new lease. leased are the hosts that held a lease
-// when it was granted; gate are the gate's failures at that reconcile.
-func (o *oracle) checkGrant(
-	f *simFacts, snap *simSnapshot, l *fleet.Lease, leased map[string]bool, gate []string,
-) error {
+// oracleOffline reports whether the host is established as offline: it has
+// validators and none of them attested in the two newest published epochs,
+// both of which began after the oracle saw the host's last lease end and
+// after the database first saw the host.
+func (o *oracle) oracleOffline(f *simFacts, name string) bool {
+	host := f.hosts[name]
+	if host == nil || host.weight == 0 || f.health.LivenessUnsupported || !f.havePublished || f.publishedEpoch == 0 {
+		return false
+	}
+
+	for _, e := range []uint64{f.publishedEpoch, f.publishedEpoch - 1} {
+		if live, ok := f.rows[e][name]; !ok || live != 0 {
+			return false
+		}
+	}
+
+	began := f.health.GenesisTime.Add(time.Duration(f.publishedEpoch-1) * f.health.EpochDuration())
+
+	return !began.Before(later(o.leaseEnd[name], f.registered[name]))
+}
+
+// repairOpen reports whether a lease that passed a closed gate is open.
+func (o *oracle) repairOpen(snap *simSnapshot) bool {
+	return slices.ContainsFunc(snap.leases, func(l *fleet.Lease) bool {
+		return o.repairs[l.ID] && !l.State.Terminal()
+	})
+}
+
+// oracleRepairs reports whether a closed gate lets the repair of the host
+// pass: the gate is closed on data it has (finality, participation), no
+// other repair is open, and the host is established as offline.
+func (o *oracle) oracleRepairs(v *oracleView, name string) error {
+	switch {
+	case slices.Contains(v.gate, "beacon node unreachable"), slices.Contains(v.gate, "liveness data stale"):
+		return fmt.Errorf("the network gate fails for want of data: %v", v.gate)
+	case o.repairOpen(v.snap):
+		return fmt.Errorf("the network gate fails (%v) and another repair is open", v.gate)
+	case !o.oracleOffline(v.f, name):
+		return fmt.Errorf("the network gate fails (%v) and the host is not established as offline: none of its "+
+			"validators attesting in the two newest epochs, both begun after its last lease ended", v.gate)
+	default:
+		return nil
+	}
+}
+
+// checkGrant checks one new lease.
+func (o *oracle) checkGrant(v *oracleView, l *fleet.Lease) error {
+	f, snap := v.f, v.snap
 	host := f.hosts[l.Host]
 
 	switch {
@@ -513,7 +927,7 @@ func (o *oracle) checkGrant(
 		return fmt.Errorf("new lease is %s, not granted", l.State)
 	case host == nil || host.status == nil:
 		return errors.New("the host is unknown or has never synced")
-	case leased[l.Host]:
+	case v.leased[l.Host]:
 		return errors.New("the host already holds a lease")
 	case host.held():
 		return errors.New("the host is held")
@@ -549,39 +963,44 @@ func (o *oracle) checkGrant(
 			return fmt.Errorf("need %s is served for no rollout", n.ID)
 		}
 
-		if slices.Contains(rollouts, r) {
-			continue
+		if !slices.Contains(rollouts, r) {
+			rollouts = append(rollouts, r)
+			exempt = exempt && r.IgnoreBudget
 		}
+	}
 
-		rollouts = append(rollouts, r)
-		exempt = exempt && r.IgnoreBudget
+	// A closed gate lets nothing pass but one repair at a time, of a host
+	// that is established as offline. A repair does not wait for its place in
+	// the order of a rollout.
+	repair := !exempt && len(v.gate) > 0
+	if repair {
+		if err := o.oracleRepairs(v, l.Host); err != nil {
+			return err
+		}
+	}
 
-		if err := o.checkRolloutGrant(f, snap, r, l, host); err != nil {
+	o.grants[l.ID] = true
+
+	for _, r := range rollouts {
+		if err := o.checkRolloutGrant(v, r, l, host, repair); err != nil {
 			return fmt.Errorf("rollout %s (%s): %w", r.ID, r.Key, err)
 		}
+	}
+
+	if repair {
+		o.repairs[l.ID] = true
 	}
 
 	if exempt {
 		return nil
 	}
 
-	// A failing gate passes only a host that is already fully down, and
-	// only when the gate fails on data it has (finality, participation).
-	repair := host.weight > 0 && host.live == 0 &&
-		!slices.Contains(gate, "beacon node unreachable") &&
-		!slices.Contains(gate, "liveness data stale")
-	if len(gate) > 0 && !repair {
-		return fmt.Errorf("the network gate fails: %v", gate)
-	}
-
-	return oracleBudget(f, leased, l.Host)
+	return oracleBudget(f, v.leased, l.Host)
 }
 
-// checkRolloutGrant checks that a rollout may be granted to a host: state,
-// pause, policy, halt and ordering.
-func (o *oracle) checkRolloutGrant(
-	f *simFacts, snap *simSnapshot, r *fleet.Rollout, l *fleet.Lease, host *simHostFact,
-) error {
+// oraclePolicy says why the policy of a rollout's kind lets nothing be
+// granted in it, or "".
+func oraclePolicy(f *simFacts, r *fleet.Rollout) string {
 	policy := fleet.PolicyAuto
 
 	switch r.Kind {
@@ -594,6 +1013,21 @@ func (o *oracle) checkRolloutGrant(
 	default:
 	}
 
+	switch {
+	case policy == fleet.PolicyPaused:
+		return "the policy is paused"
+	case policy == fleet.PolicyManual && !r.Approved:
+		return "the policy is manual and nobody approved the rollout"
+	default:
+		return ""
+	}
+}
+
+// checkRolloutGrant checks that a rollout may be granted to a host: state,
+// pause, policy, halt and ordering. repair: the grant passed a closed gate.
+func (o *oracle) checkRolloutGrant(
+	v *oracleView, r *fleet.Rollout, l *fleet.Lease, host *simHostFact, repair bool,
+) error {
 	m := r.Host(l.Host)
 
 	switch {
@@ -603,64 +1037,277 @@ func (o *oracle) checkRolloutGrant(
 		return fmt.Errorf("lease %s failed in it and nobody retried it", o.halted[r.ID])
 	case r.Paused:
 		return errors.New("the rollout is paused")
-	case policy == fleet.PolicyPaused:
-		return errors.New("the policy is paused")
-	case policy == fleet.PolicyManual && !r.Approved:
-		return errors.New("the policy is manual and nobody approved the rollout")
+	case oraclePolicy(v.f, r) != "":
+		return errors.New(oraclePolicy(v.f, r))
 	case m == nil || m.State != fleet.HostLeased || m.LeaseID != l.ID:
 		return errors.New("the host is not a member leased by this lease")
-	case r.Force:
+	case r.Force, repair, o.carried[r.ID][l.Host]:
+		// A forced rollout has no order, a repair does not wait for its place
+		// in one, and a carried host waits for nobody.
 		return nil
 	}
 
-	return checkOrdering(f, snap, r, l.Host, host)
+	return o.checkOrdering(v, r, m, host)
 }
 
-// checkOrdering: every member of an earlier stage is settled or a
-// non-blocking expected host; the canary and bootnode stages hold one lease
-// at a time; the canary goes before every other validator host.
-func checkOrdering(f *simFacts, snap *simSnapshot, r *fleet.Rollout, name string, host *simHostFact) error {
-	class := host.class()
+// carriedAhead reports whether a member other than the granted one is
+// carried and still to be served: it holds a lease, or it waits and its host
+// could be granted (or is expected to report).
+func (o *oracle) carriedAhead(v *oracleView, r *fleet.Rollout, m *fleet.RolloutHost) bool {
+	other := v.f.hosts[m.Host]
+	if other == nil || !o.carried[r.ID][m.Host] {
+		return false
+	}
+
+	return m.State == fleet.HostLeased || oracleServable(v.f, v.snap, r, m, other)
+}
+
+// oracleRank is the place of a member among the candidates for the canary.
+type oracleRank struct {
+	overBudget, notLive, expected int
+	weight                        uint64
+	name                          string
+}
+
+// before reports whether a comes before b: hosts that fit the budget, hosts
+// with live validators, hosts that report the need, ascending weight, name.
+func (a oracleRank) before(b oracleRank) bool {
+	switch {
+	case a.overBudget != b.overBudget:
+		return a.overBudget < b.overBudget
+	case a.notLive != b.notLive:
+		return a.notLive < b.notLive
+	case a.expected != b.expected:
+		return a.expected < b.expected
+	case a.weight != b.weight:
+		return a.weight < b.weight
+	default:
+		return a.name < b.name
+	}
+}
+
+// rankOf ranks a member against the budget as it was before the reconcile
+// granted anything.
+func oracleRankOf(v *oracleView, m *fleet.RolloutHost, h *simHostFact) oracleRank {
+	k := oracleRank{weight: h.weight, name: m.Host}
+
+	if oracleFits(v.f, v.before, m.Host) != nil {
+		k.overBudget = 1
+	}
+
+	if h.live == 0 {
+		k.notLive = 1
+	}
+
+	if m.State == fleet.HostExpected {
+		k.expected = 1
+	}
+
+	return k
+}
+
+// checkOrdering checks the grant, under an open gate, of a host that is not
+// carried, in a rollout that is not forced. Carried members go first: nobody
+// else is granted while one is still to be served. Until the rollout has its
+// first success, one member goes alone, the canary: nobody is granted while
+// another member holds a lease, except next to a repair that passed the
+// closed gate. The canary is the first of the members that can be served, in
+// this order: those that fit the budget as it was before the reconcile
+// granted anything, those with live validators, those that report the need
+// before those only expected to, ascending weight, name.
+func (o *oracle) checkOrdering(v *oracleView, r *fleet.Rollout, granted *fleet.RolloutHost, host *simHostFact) error {
+	for i := range r.Hosts {
+		if m := &r.Hosts[i]; m.Host != granted.Host && o.carriedAhead(v, r, m) {
+			return fmt.Errorf("granted although the carried host %s (%s) is still to be served", m.Host, m.State)
+		}
+	}
+
+	if o.succeeded[r.ID] {
+		return nil
+	}
+
+	mine := oracleRankOf(v, granted, host)
+	mine.expected = 0
 
 	for i := range r.Hosts {
 		m := &r.Hosts[i]
 
-		other := f.hosts[m.Host]
-		if m.Host == name || other == nil {
+		other := v.f.hosts[m.Host]
+		if m.Host == granted.Host || other == nil {
 			continue
 		}
 
-		switch {
-		case other.class() < class:
-			if m.State.Settled() || (m.State == fleet.HostExpected && !oracleBlocks(f, snap, r, m, other)) {
+		if m.State == fleet.HostLeased {
+			if o.repairs[m.LeaseID] {
 				continue
 			}
 
-			return fmt.Errorf("stage %d host granted while %s of stage %d is %s", class, m.Host, other.class(), m.State)
-		case other.class() != class || m.State != fleet.HostLeased:
-		case class == fleet.StageBootnodes:
-			return fmt.Errorf("bootnode granted while bootnode %s holds a lease", m.Host)
-		case class == fleet.StageBatches && r.Canary == name:
-			return fmt.Errorf("canary granted while validator host %s holds a lease", m.Host)
+			return fmt.Errorf("granted before the first success of the rollout while %s holds a lease", m.Host)
 		}
-	}
 
-	if class != fleet.StageBatches || r.Canary == name {
-		return nil
-	}
+		if o.carried[r.ID][m.Host] || !oracleServable(v.f, v.snap, r, m, other) {
+			continue
+		}
 
-	if r.Canary == "" {
-		return errors.New("validator host granted without a canary on record")
-	}
-
-	if c := r.Host(r.Canary); c == nil || c.State != fleet.HostDone {
-		return fmt.Errorf("validator host granted before canary %s is done", r.Canary)
+		if theirs := oracleRankOf(v, m, other); theirs.before(mine) {
+			return fmt.Errorf("canary %s although %s comes first (%+v before %+v)", granted.Host, m.Host, theirs, mine)
+		}
 	}
 
 	return nil
 }
 
-// oracleBlocks reports whether an expected member holds back later stages.
+// checkProgress: a host that nothing holds back is granted. After a committed
+// reconcile, a member that waits with a need it may be granted, in a rollout
+// that grants (active, not paused, approved, not halted, not forced), with
+// the scheduler unpaused, the gate letting it pass (open, or its repair) and
+// the budget and the host limit admitting it, can only be waiting for the
+// order of its rollout. The order holds nobody back who passes the closed
+// gate as a repair, and no carried host. It holds another host back for a
+// carried member that is still to be served and, before the first success,
+// for a member that holds a lease, for a member that is busy with a lease of
+// another rollout, and for an expected member that comes before it as the
+// canary. It never holds anybody back for a member that is held, silent or
+// without the verb. A host left waiting without such a reason for
+// simStuckPasses reconciles in a row is stuck.
+func (o *oracle) checkProgress(v *oracleView) error {
+	f := v.f
+	seen := make(map[string]bool, len(o.stuck))
+
+	for _, r := range v.snap.rollouts {
+		if f.settings.Paused || r.State != fleet.RolloutActive || r.Paused || r.Force ||
+			o.halted[r.ID] != "" || oraclePolicy(f, r) != "" {
+			continue
+		}
+
+		for i := range r.Hosts {
+			m := &r.Hosts[i]
+
+			host := f.hosts[m.Host]
+			if m.State != fleet.HostPending || host == nil || v.leased[m.Host] ||
+				!oracleServable(f, v.snap, r, m, host) {
+				continue
+			}
+
+			repair := false
+
+			if !r.IgnoreBudget {
+				if len(v.gate) > 0 {
+					if o.oracleRepairs(v, m.Host) != nil {
+						continue
+					}
+
+					repair = true
+				}
+
+				if oracleBudget(f, v.leased, m.Host) != nil {
+					continue
+				}
+			}
+
+			if !repair && o.orderHolds(v, r, m, host) {
+				continue
+			}
+
+			key := r.ID + "/" + m.Host
+			seen[key] = true
+			o.stuck[key]++
+
+			if o.stuck[key] >= simStuckPasses {
+				return fmt.Errorf("host %s is stuck in rollout %s (%s): %d reconciles in a row left it waiting although "+
+					"the gate, the budget and the host limit let it pass and the order of the rollout does not hold "+
+					"it back", m.Host, r.ID, r.Key, o.stuck[key])
+			}
+		}
+	}
+
+	for key := range o.stuck {
+		if !seen[key] {
+			delete(o.stuck, key)
+		}
+	}
+
+	return nil
+}
+
+// orderHolds reports whether the order of the rollout holds the waiting
+// member back.
+func (o *oracle) orderHolds(v *oracleView, r *fleet.Rollout, waiting *fleet.RolloutHost, host *simHostFact) bool {
+	if o.carried[r.ID][waiting.Host] {
+		return false
+	}
+
+	first := !o.succeeded[r.ID]
+	mine := oracleRankOf(v, waiting, host)
+
+	for i := range r.Hosts {
+		m := &r.Hosts[i]
+
+		other := v.f.hosts[m.Host]
+		if m.Host == waiting.Host || other == nil {
+			continue
+		}
+
+		if m.State == fleet.HostLeased {
+			// Before the first success every lease is waited for; after it, the
+			// lease of a carried host.
+			if first || o.carried[r.ID][m.Host] {
+				return true
+			}
+
+			continue
+		}
+
+		if !oracleServable(v.f, v.snap, r, m, other) {
+			continue
+		}
+
+		if o.carried[r.ID][m.Host] {
+			return true
+		}
+
+		// The canary may be a host that is busy with another lease, or one
+		// that is not here yet and comes first all the same.
+		if first && (v.leased[m.Host] || (m.State == fleet.HostExpected && oracleRankOf(v, m, other).before(mine))) {
+			return true
+		}
+	}
+
+	return false
+}
+
+// oracleServable reports whether a member could be granted as far as the
+// host itself goes: it waits with a need of the rollout that its agent
+// allows and is neither held nor stale, or it is expected to report.
+func oracleServable(f *simFacts, snap *simSnapshot, r *fleet.Rollout, m *fleet.RolloutHost, host *simHostFact) bool {
+	switch m.State {
+	case fleet.HostExpected:
+		return oracleBlocks(f, snap, r, m, host)
+	case fleet.HostPending:
+	default:
+		return false
+	}
+
+	if host.held() || host.status == nil || f.stale(host) {
+		return false
+	}
+
+	return slices.ContainsFunc(host.status.Needs, func(n protocol.Need) bool {
+		if !slices.Contains(host.status.Verbs, n.Kind.Verb()) {
+			return false
+		}
+
+		if n.DirectiveID == "" {
+			return needKey(&n) == r.Key
+		}
+
+		return slices.ContainsFunc(snap.directives, func(d *fleet.Directive) bool {
+			return d.ID == n.DirectiveID && d.RolloutID == r.ID
+		})
+	})
+}
+
+// oracleBlocks reports whether an expected member is still waited for.
 func oracleBlocks(f *simFacts, snap *simSnapshot, r *fleet.Rollout, m *fleet.RolloutHost, host *simHostFact) bool {
 	if host.held() || host.status == nil || f.stale(host) ||
 		f.now.Sub(later(r.CreatedAt, f.since)) > f.settings.HostStaleAfter.Std() {

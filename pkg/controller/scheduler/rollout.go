@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"cmp"
 	"fmt"
 	"slices"
 	"strings"
@@ -352,7 +353,7 @@ func carriedHosts(r *fleet.Rollout) []string {
 		m := &r.Hosts[i]
 
 		waiting := m.State == fleet.HostPending || m.State == fleet.HostExpected
-		if m.State == fleet.HostFailed || (waiting && strings.HasPrefix(m.Error, carriedPrefix)) {
+		if m.State == fleet.HostFailed || (waiting && m.CarriedFrom != "") {
 			out = append(out, m.Host)
 		}
 	}
@@ -555,7 +556,6 @@ func (p *pass) syncMembers(r *fleet.Rollout, carried map[string]string) {
 		case skip != "":
 			// A skip for the key outlives the rollout it was given in.
 			m.State = fleet.HostSkipped
-			m.Stage = hv.class()
 			m.Error = skip
 
 			if len(needs[name]) > 0 {
@@ -572,40 +572,213 @@ func (p *pass) syncMembers(r *fleet.Rollout, carried map[string]string) {
 
 		if prev, ok := carried[name]; ok && skip == "" {
 			m.Error = carriedPrefix + prev
+			m.CarriedFrom = prev
 		}
 
 		r.Hosts = append(r.Hosts, m)
 	}
 
-	// A canary that left without having been served (skipped, back to
-	// expected, or done because its need went away by itself) proved
-	// nothing: the next validator host granted takes its place.
-	if c := r.Host(r.Canary); r.Canary != "" && (c == nil || c.State == fleet.HostSkipped ||
-		c.State == fleet.HostExpected || (c.State == fleet.HostDone && c.LeaseID == "")) {
-		r.Canary = ""
-
-		if c != nil && c.Stage == fleet.StageCanary {
-			c.Stage = fleet.StageBatches
-		}
-	}
-
-	for i := range r.Hosts {
-		m := &r.Hosts[i]
-
-		hv := p.hosts[m.Host]
-		if hv == nil || m.State.Settled() {
-			continue
-		}
-
-		m.Stage = hv.class()
-		if m.Stage == fleet.StageBatches && r.Canary == m.Host {
-			m.Stage = fleet.StageCanary
-		}
-	}
+	p.stages(r)
 
 	if carried != nil && r.Kind == fleet.RolloutImage {
 		p.recheckExpected(r)
 	}
+}
+
+// stages settles the canary and gives every member its stage: a carried
+// member is in the repair stage, the canary in its own, everybody else in
+// the rest.
+func (p *pass) stages(r *fleet.Rollout) {
+	p.pickCanary(r)
+
+	for i := range r.Hosts {
+		m := &r.Hosts[i]
+
+		switch {
+		case m.CarriedFrom != "":
+			m.Stage = fleet.StageRepair
+		case r.Canary == m.Host:
+			m.Stage = fleet.StageCanary
+		default:
+			m.Stage = fleet.StageRest
+		}
+	}
+}
+
+// pickCanary settles which member is the canary of the rollout: the one host
+// that goes alone until the rollout has its first success. A canary that
+// holds a lease, is done by one that was released, or failed and halted the
+// rollout stays. Until then the choice is made anew in every pass, so a
+// canary that left without having been served (skipped, held, silent,
+// forgotten, its need gone by itself) is replaced by the next candidate.
+// There is no new canary in a forced rollout, in a rollout with a single
+// member, after the first success, and while a carried member is still to be
+// served.
+func (p *pass) pickCanary(r *fleet.Rollout) {
+	if c := r.Host(r.Canary); c != nil && !r.Force && c.CarriedFrom == "" && keepsCanary(r, c) {
+		return
+	}
+
+	r.Canary = ""
+
+	if r.Force || succeeded(r) || p.carriedAwaited(r) != nil {
+		return
+	}
+
+	var (
+		best    *fleet.RolloutHost
+		members int
+	)
+
+	for i := range r.Hosts {
+		m := &r.Hosts[i]
+
+		if p.blocks(r, m) {
+			members++
+		}
+
+		if m.CarriedFrom != "" || p.repairLeased(m) || (m.State != fleet.HostLeased && !p.servable(r, m)) {
+			continue
+		}
+
+		if best == nil || p.canaryBefore(m, best) {
+			best = m
+		}
+	}
+
+	if best != nil && members > 1 {
+		r.Canary = best.Host
+	}
+}
+
+// repairLeased reports whether the member holds a lease that was granted
+// through the repair exception of the gate. Such a host is not the canary:
+// it was offline before, so its return proves less than a canary must.
+func (p *pass) repairLeased(m *fleet.RolloutHost) bool {
+	hv := p.hosts[m.Host]
+
+	return m.State == fleet.HostLeased && hv != nil && hv.lease != nil &&
+		hv.lease.ID == m.LeaseID && hv.lease.Repair
+}
+
+// keepsCanary reports whether the canary was served: it holds a lease, is
+// done by one, or failed with one and the rollout is still halted by it.
+func keepsCanary(r *fleet.Rollout, c *fleet.RolloutHost) bool {
+	switch c.State {
+	case fleet.HostLeased:
+		return true
+	case fleet.HostDone:
+		return c.LeaseID != ""
+	case fleet.HostFailed:
+		return r.State == fleet.RolloutHalted
+	default:
+		return false
+	}
+}
+
+// succeeded reports whether the rollout has had its first success: a member
+// is done through a lease that was released, which a lease is only after the
+// host passed the readiness check (a forced lease is released without it, but
+// serves forced rollouts only, which have no canary). A member that is done
+// because its need went away, or whose step was done in a lease that failed,
+// carries no lease ID and is no success. From then on nobody waits for a
+// canary.
+func succeeded(r *fleet.Rollout) bool {
+	return slices.ContainsFunc(r.Hosts, func(m fleet.RolloutHost) bool {
+		return m.State == fleet.HostDone && m.LeaseID != ""
+	})
+}
+
+// servable reports whether a member that waits can be served as far as the
+// host itself goes: it reports a need its agent allows and is neither held
+// nor silent, or it is expected to report within hostStaleAfter. A member
+// that is not servable waits for a person and holds nobody back.
+func (p *pass) servable(r *fleet.Rollout, m *fleet.RolloutHost) bool {
+	hv := p.hosts[m.Host]
+	if hv == nil {
+		return false
+	}
+
+	switch m.State {
+	case fleet.HostPending:
+		return !hv.held && !hv.stale && slices.ContainsFunc(p.needs[r.ID][m.Host],
+			func(n protocol.Need) bool { return hv.allows(n.Kind.Verb()) })
+	case fleet.HostExpected:
+		return p.blockingExpected(r, m)
+	default:
+		return false
+	}
+}
+
+// awaited reports whether a member is unsettled in a way that holds back the
+// members behind it: it holds a lease or is servable.
+func (p *pass) awaited(r *fleet.Rollout, m *fleet.RolloutHost) bool {
+	return m.State == fleet.HostLeased || p.servable(r, m)
+}
+
+// carriedAwaited returns the first carried member that is still to be
+// served, or nil.
+func (p *pass) carriedAwaited(r *fleet.Rollout) *fleet.RolloutHost {
+	for i := range r.Hosts {
+		if m := &r.Hosts[i]; m.CarriedFrom != "" && p.awaited(r, m) {
+			return m
+		}
+	}
+
+	return nil
+}
+
+// canaryBefore orders the members that can be the canary: a member that
+// holds a lease first, then hosts that fit the budget as it is before this
+// pass grants anything, hosts with live validators (only they prove that
+// attesting still works after the change; a host whose validators are all
+// offline proves as little as a host without any), hosts that report the
+// need before hosts that are only expected to, ascending weight and name.
+func (p *pass) canaryBefore(a, b *fleet.RolloutHost) bool {
+	type rank struct {
+		waiting, overBudget, notLive, expected int
+		weight                                 uint64
+	}
+
+	of := func(m *fleet.RolloutHost) rank {
+		k := rank{notLive: 1}
+
+		if m.State != fleet.HostLeased {
+			k.waiting = 1
+		}
+
+		if m.State == fleet.HostExpected {
+			k.expected = 1
+		}
+
+		hv := p.hosts[m.Host]
+		if hv == nil {
+			return k
+		}
+
+		if !p.budgetBefore().fits(hv.live) {
+			k.overBudget = 1
+		}
+
+		k.weight = hv.weight
+
+		if hv.live > 0 {
+			k.notLive = 0
+		}
+
+		return k
+	}
+
+	ka, kb := of(a), of(b)
+
+	return cmp.Or(
+		cmp.Compare(ka.waiting, kb.waiting),
+		cmp.Compare(ka.overBudget, kb.overBudget),
+		cmp.Compare(ka.notLive, kb.notLive),
+		cmp.Compare(ka.expected, kb.expected),
+		cmp.Compare(ka.weight, kb.weight),
+		cmp.Compare(a.Host, b.Host),
+	) < 0
 }
 
 // recheckExpected queues a recheck directive for every expected host of a
@@ -763,8 +936,9 @@ func hasContainer(r *fleet.Rollout, hv *hostView, onTarget bool) bool {
 	return false
 }
 
-// blockingExpected reports whether an expected member still holds back
-// later stages and the completion of the rollout.
+// blockingExpected reports whether an expected member is still waited for:
+// it is served in its turn (a carried one first, another one can be the
+// canary), and it keeps the rollout open.
 func (p *pass) blockingExpected(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 	hv := p.hosts[m.Host]
 	if hv == nil || hv.held || hv.stale {
@@ -789,8 +963,8 @@ func (p *pass) blockingExpected(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 	}
 }
 
-// blocks reports whether a member is unsettled in a way that holds back
-// later stages.
+// blocks reports whether a member is unsettled in a way that keeps the
+// rollout open.
 func (p *pass) blocks(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 	switch m.State {
 	case fleet.HostDone, fleet.HostSkipped:

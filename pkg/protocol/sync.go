@@ -10,7 +10,10 @@
 // request proof (pkg/identity) covers the body bytes as sent on the wire.
 package protocol
 
-import "time"
+import (
+	"fmt"
+	"time"
+)
 
 const (
 	// Version is the protocol version spoken by this build.
@@ -184,19 +187,36 @@ type NodeHealth struct {
 	CL *CLHealth `json:"cl,omitempty"`
 }
 
-// Synced reports whether every configured probe is reachable, in sync and
-// has at least one peer. With no probe configured it reports true.
-func (n NodeHealth) Synced() bool {
-	if n.EL != nil && (!n.EL.Reachable || n.EL.Syncing || n.EL.Peers == 0) {
-		return false
-	}
+// Synced reports whether the node is at head with peers: every configured
+// probe is reachable, not syncing (the consensus client also: its execution
+// client is not offline) and has at least minPeers peers. With no probe
+// configured it reports true.
+func (n NodeHealth) Synced(minPeers int) bool {
+	return n.Missing(minPeers) == ""
+}
 
-	if n.CL != nil &&
-		(!n.CL.Reachable || n.CL.Syncing || n.CL.ELOffline || n.CL.Peers == 0) {
-		return false
-	}
+// Missing says in plain words what keeps the node from being at head with
+// minPeers peers; empty when nothing does. Reachability is named first, then
+// syncing, then peers.
+func (n NodeHealth) Missing(minPeers int) string {
+	el, cl := n.EL, n.CL
 
-	return true
+	switch {
+	case el != nil && !el.Reachable:
+		return "EL is not reachable"
+	case cl != nil && !cl.Reachable:
+		return "CL is not reachable"
+	case el != nil && el.Syncing, cl != nil && cl.Syncing:
+		return "node is syncing"
+	case cl != nil && cl.ELOffline:
+		return "CL reports its EL offline"
+	case el != nil && el.Peers < minPeers:
+		return fmt.Sprintf("waiting for peers: EL has %d of %d", el.Peers, minPeers)
+	case cl != nil && cl.Peers < minPeers:
+		return fmt.Sprintf("waiting for peers: CL has %d of %d", cl.Peers, minPeers)
+	default:
+		return ""
+	}
 }
 
 // ELHealth is the execution client probe (eth_syncing, net_peerCount,

@@ -52,7 +52,7 @@ func TestSettings(t *testing.T) {
 
 			changed := defaults
 			changed.MaxUnavailablePercent = 12.5
-			changed.SoakEpochs = 3
+			changed.ReadyEpochs = 3
 			changed.LeaseTTL = fleet.Duration(45 * time.Minute)
 			changed.PolicyReboot = fleet.PolicyAuto
 			changed.Paused = true
@@ -60,7 +60,7 @@ func TestSettings(t *testing.T) {
 			require.NoError(t, s.SaveSettings(ctx, defaults, changed))
 			assert.Equal(t, map[string]string{
 				"maxUnavailablePercent": "12.5",
-				"soakEpochs":            "3",
+				"readyEpochs":           "3",
 				"leaseTtl":              `"45m0s"`,
 				"policyReboot":          `"auto"`,
 				"paused":                "true",
@@ -74,16 +74,16 @@ func TestSettings(t *testing.T) {
 			// changed flag default shows through for fields not overridden.
 			other := defaults
 			other.MinParticipationPercent = 80
-			other.SoakEpochs = 9
+			other.ReadyEpochs = 9
 
 			got, err = s.LoadSettings(ctx, other)
 			require.NoError(t, err)
 			assert.InDelta(t, 80.0, got.MinParticipationPercent, 0, "not overridden: the new default")
-			assert.Equal(t, uint64(3), got.SoakEpochs, "overridden: the stored value")
+			assert.Equal(t, uint64(3), got.ReadyEpochs, "overridden: the stored value")
 
 			// Setting fields back to their defaults removes their rows.
 			partly := changed
-			partly.SoakEpochs = defaults.SoakEpochs
+			partly.ReadyEpochs = defaults.ReadyEpochs
 			partly.Paused = false
 			partly.HostStaleAfter = fleet.Duration(5 * time.Minute)
 
@@ -135,7 +135,7 @@ func TestLoadSettingsIgnoresBadRows(t *testing.T) {
 
 	_, err := rawDB(t, s).Exec(`
 		INSERT INTO settings (key, value) VALUES
-			('soakEpochs', '4'),
+			('readyEpochs', '4'),
 			('removedInV2', '"whatever"'),
 			('leaseTtl', '"not a duration"'),
 			('maxFinalityLagEpochs', '"three"'),
@@ -147,7 +147,7 @@ func TestLoadSettingsIgnoresBadRows(t *testing.T) {
 	require.NoError(t, err)
 
 	want := defaults
-	want.SoakEpochs = 4
+	want.ReadyEpochs = 4
 	want.PolicyImage = fleet.PolicyManual
 	assert.Equal(t, want, got, "good rows apply; unknown and undecodable ones leave the default")
 
@@ -172,7 +172,51 @@ func TestLoadSettingsIgnoresBadRows(t *testing.T) {
 
 	// Saving cleans the table up: only real differences remain.
 	require.NoError(t, s.SaveSettings(ctx, defaults, got))
-	assert.Equal(t, map[string]string{"soakEpochs": "4", "policyImage": `"manual"`}, storedSettings(t, s))
+	assert.Equal(t, map[string]string{"readyEpochs": "4", "policyImage": `"manual"`}, storedSettings(t, s))
+}
+
+// A value stored as soakEpochs, the former name of readyEpochs, is read as
+// readyEpochs without a warning; a stored readyEpochs wins over it; the next
+// save leaves only the new key.
+func TestLoadSettingsReadsTheFormerSoakEpochs(t *testing.T) {
+	ctx := context.Background()
+	defaults := fleet.DefaultSettings()
+
+	tests := []struct {
+		name   string
+		rows   string
+		want   uint64
+		stored map[string]string
+	}{
+		{"only the former key", `('soakEpochs', '3')`, 3, map[string]string{"readyEpochs": "3"}},
+		{"both keys", `('soakEpochs', '3'), ('readyEpochs', '2')`, 2, map[string]string{"readyEpochs": "2"}},
+		{"the former key at the default", `('soakEpochs', '1')`, 1, map[string]string{}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			log, hook := logrustest.NewNullLogger()
+			s := startStore(t, New(log, filepath.Join(t.TempDir(), "upgradoor.db")))
+
+			_, err := rawDB(t, s).Exec(`INSERT INTO settings (key, value) VALUES ` + tt.rows)
+			require.NoError(t, err)
+
+			for range 2 {
+				got, loadErr := s.LoadSettings(ctx, defaults)
+				require.NoError(t, loadErr)
+				assert.Equal(t, tt.want, got.ReadyEpochs)
+			}
+
+			for _, entry := range hook.AllEntries() {
+				assert.NotEqual(t, logrus.WarnLevel, entry.Level, entry.Message)
+			}
+
+			got, err := s.LoadSettings(ctx, defaults)
+			require.NoError(t, err)
+			require.NoError(t, s.SaveSettings(ctx, defaults, got))
+			assert.Equal(t, tt.stored, storedSettings(t, s))
+		})
+	}
 }
 
 func TestSettingsFieldsCoverEveryField(t *testing.T) {
@@ -184,7 +228,7 @@ func TestSettingsFieldsCoverEveryField(t *testing.T) {
 	// Every field of fleet.Settings must have its own key: a field with
 	// `json:"-"` or omitempty would silently never be stored.
 	assert.ElementsMatch(t, []string{
-		"maxUnavailablePercent", "minParticipationPercent", "maxFinalityLagEpochs", "soakEpochs",
+		"maxUnavailablePercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyEpochs", "minPeers",
 		"leaseTtl", "hostStaleAfter", "readinessTimeout",
 		"policyImage", "policyPackages", "policyReboot", "paused",
 	}, keysOf(fields))

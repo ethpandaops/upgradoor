@@ -78,12 +78,13 @@ func TestLeaseLifecycle(t *testing.T) {
 	assert.Equal(t, doneAt, *l.AgentDoneAt)
 	assert.Equal(t, SlotVerifying, out.Plan.Hosts["a"].Slot)
 	assert.Equal(t, uint64(10), out.Plan.Budget.UnavailableWeight, "still unavailable while verifying")
-	assert.Equal(t, "0 of 1 epochs with at least 9 of 10 validators attesting", l.Readiness)
+	assert.Equal(t, noteAwaitSync, l.Readiness)
 
 	// The epoch the operation ended in does not count.
 	b.advance(testEpoch)
 	b.step()
 	assert.Equal(t, fleet.LeaseVerifying, b.lease("a").State)
+	assert.Equal(t, "no node probe configured, waiting 6m24s", b.lease("a").Readiness)
 
 	b.advance(testEpoch)
 
@@ -608,10 +609,10 @@ func TestNeedStillReportedAfterTheOperationFails(t *testing.T) {
 }
 
 func TestDoneReportAloneDoesNotReleaseWithoutALaterSync(t *testing.T) {
-	// Without soak the readiness rule of a validator host holds at once, but
+	// With readyEpochs 0 the readiness check of a validator host holds at once, but
 	// the needs of the sync that reported done may predate the operation.
 	b := newWorldBuilder(t)
-	b.w.Settings.SoakEpochs = 0
+	b.w.Settings.ReadyEpochs = 0
 	b.host("a", 10)
 	b.wants("a", rebootNeed())
 	b.step()
@@ -773,7 +774,7 @@ func TestForceRollout(t *testing.T) {
 	b.host("tool", 0)
 	b.manualRollout("m1", true, false, "boot", "val", "tool")
 
-	// No stages, no canary; one host per reconcile.
+	// No canary; one host per reconcile.
 	out := b.step()
 	assert.Equal(t, []string{"tool"}, b.leasedHosts())
 	assert.Equal(t, map[string]string{"val": "next", "boot": "next"}, queueReasons(out.Plan))
@@ -787,7 +788,7 @@ func TestForceRollout(t *testing.T) {
 	b.step()
 	assert.Equal(t, []string{"boot", "tool", "val"}, b.leasedHosts())
 
-	// Released as soon as the agent reports done: no soak.
+	// Released as soon as the agent reports done: no readiness check.
 	b.finish("val")
 
 	out = b.step()
@@ -846,7 +847,7 @@ func TestIgnoreBudget(t *testing.T) {
 	})
 }
 
-func TestStaggeredManualRolloutFollowsTheStages(t *testing.T) {
+func TestStaggeredManualRolloutHasACanary(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 100
 	b.w.Settings.PolicyReboot = fleet.PolicyPaused // manual rollouts answer to no policy
@@ -856,13 +857,13 @@ func TestStaggeredManualRolloutFollowsTheStages(t *testing.T) {
 	b.manualRollout("m1", false, false, "v1", "v2", "tool")
 
 	out := b.step()
-	assert.Equal(t, []string{"tool"}, b.leasedHosts())
-	assert.Equal(t, "after hosts without validators", queueReasons(out.Plan)["v1"])
-	assert.False(t, b.lease("tool").Force)
-
-	b.serve("tool")
 	assert.Equal(t, []string{"v1"}, b.leasedHosts())
 	assert.Equal(t, "v1", b.mustRollout("manual:m1").Canary)
+	assert.Equal(t, map[string]string{"tool": "after canary v1", "v2": "after canary v1"}, queueReasons(out.Plan))
+	assert.False(t, b.lease("v1").Force)
+
+	b.serve("v1")
+	assert.Equal(t, []string{"tool", "v2"}, b.leasedHosts())
 }
 
 func TestManualDirectives(t *testing.T) {
@@ -1044,42 +1045,42 @@ func TestReadinessEpochCounting(t *testing.T) {
 	tests := []struct {
 		name   string
 		weight uint64
-		soak   uint64
+		epochs uint64
 		// rows maps epochs to how many of the host's validators attested.
 		rows map[uint64]uint64
 		want bool
 		note string
 	}{
 		{
-			name: "the epoch the operation ended in does not count",
-			soak: 1, rows: map[uint64]uint64{100: 10},
-			note: "0 of 1 epochs with at least 9 of 10 validators attesting",
+			name:   "the epoch the operation ended in does not count",
+			epochs: 1, rows: map[uint64]uint64{100: 10},
+			note: "validators attesting: 0 of 1 epochs with at least 9 of 10",
 		},
 		{
-			name: "one complete epoch after done",
-			soak: 1, rows: map[uint64]uint64{100: 0, 101: 10},
+			name:   "one complete epoch after done",
+			epochs: 1, rows: map[uint64]uint64{100: 0, 101: 10},
 			want: true,
-			note: "1 of 1 epochs with at least 9 of 10 validators attesting",
+			note: "ready: no node probe configured, validators attesting",
 		},
-		{name: "minParticipation of the host's weight is enough", soak: 1, rows: map[uint64]uint64{101: 9}, want: true},
-		{name: "one validator short", soak: 1, rows: map[uint64]uint64{101: 8}},
-		{name: "two epochs wanted, one seen", soak: 2, rows: map[uint64]uint64{101: 10}, note: "1 of 2 epochs with at least 9 of 10 validators attesting"},
-		{name: "two consecutive epochs", soak: 2, rows: map[uint64]uint64{101: 10, 102: 10}, want: true},
-		{name: "the run must be unbroken", soak: 2, rows: map[uint64]uint64{101: 10, 102: 3}},
-		{name: "a new run after a bad epoch", soak: 2, rows: map[uint64]uint64{101: 3, 102: 10, 103: 10}, want: true},
-		{name: "a missing epoch breaks the run", soak: 2, rows: map[uint64]uint64{101: 10, 103: 10}},
-		{name: "three epochs", soak: 3, rows: map[uint64]uint64{101: 10, 102: 9, 103: 10}, want: true},
-		{name: "a single validator must attest", weight: 1, soak: 1, rows: map[uint64]uint64{101: 0}, note: "0 of 1 epochs with at least 1 of 1 validators attesting"},
-		{name: "a single validator attests", weight: 1, soak: 1, rows: map[uint64]uint64{101: 1}, want: true},
-		{name: "no soak configured", soak: 0, rows: map[uint64]uint64{100: 0}, want: true},
-		{name: "no rows after done at all", soak: 1, rows: map[uint64]uint64{}},
+		{name: "minParticipation of the host's weight is enough", epochs: 1, rows: map[uint64]uint64{101: 9}, want: true},
+		{name: "one validator short", epochs: 1, rows: map[uint64]uint64{101: 8}},
+		{name: "two epochs wanted, one seen", epochs: 2, rows: map[uint64]uint64{101: 10}, note: "validators attesting: 1 of 2 epochs with at least 9 of 10"},
+		{name: "two consecutive epochs", epochs: 2, rows: map[uint64]uint64{101: 10, 102: 10}, want: true},
+		{name: "the run must be unbroken", epochs: 2, rows: map[uint64]uint64{101: 10, 102: 3}},
+		{name: "a new run after a bad epoch", epochs: 2, rows: map[uint64]uint64{101: 3, 102: 10, 103: 10}, want: true},
+		{name: "a missing epoch breaks the run", epochs: 2, rows: map[uint64]uint64{101: 10, 103: 10}},
+		{name: "three epochs", epochs: 3, rows: map[uint64]uint64{101: 10, 102: 9, 103: 10}, want: true},
+		{name: "a single validator must attest", weight: 1, epochs: 1, rows: map[uint64]uint64{101: 0}, note: "validators attesting: 0 of 1 epochs with at least 1 of 1"},
+		{name: "a single validator attests", weight: 1, epochs: 1, rows: map[uint64]uint64{101: 1}, want: true},
+		{name: "readyEpochs 0", epochs: 0, rows: map[uint64]uint64{100: 0}, want: true},
+		{name: "no rows after done at all", epochs: 1, rows: map[uint64]uint64{}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := newWorldBuilder(t)
 			b.autoLive = false
-			b.w.Settings.SoakEpochs = tt.soak
+			b.w.Settings.ReadyEpochs = tt.epochs
 
 			weight := tt.weight
 			if weight == 0 {
@@ -1089,9 +1090,11 @@ func TestReadinessEpochCounting(t *testing.T) {
 			b.host("a", weight)
 			b.host("other", 10)
 
+			// The node part of the check holds throughout: no probe is
+			// configured and the run of syncs started with the done report.
 			doneAt := b.w.Now
 			lease := &fleet.Lease{
-				ID: "l1", Host: "a", State: fleet.LeaseVerifying, AgentDoneAt: &doneAt,
+				ID: "l1", Host: "a", State: fleet.LeaseVerifying, AgentDoneAt: &doneAt, SyncedSince: &doneAt,
 				GrantedAt: doneAt, ExpiresAt: doneAt.Add(time.Hour),
 			}
 			b.w.Leases = []*fleet.Lease{lease}
@@ -1151,7 +1154,7 @@ func TestProbeReadiness(t *testing.T) {
 
 		b.advance(5 * time.Second)
 		b.step()
-		assert.Equal(t, "probes do not report synced", b.lease("a").Readiness)
+		assert.Equal(t, "node is syncing", b.lease("a").Readiness)
 		assert.Nil(t, b.lease("a").SyncedSince)
 
 		b.advance(5 * time.Second)
@@ -1160,7 +1163,7 @@ func TestProbeReadiness(t *testing.T) {
 		b.step()
 		require.NotNil(t, b.lease("a").SyncedSince)
 		assert.Equal(t, since, *b.lease("a").SyncedSince)
-		assert.Equal(t, "probes synced, soaking for 6m24s", b.lease("a").Readiness)
+		assert.Equal(t, "node at head with peers, waiting for it to stay so for 6m24s", b.lease("a").Readiness)
 
 		// A sync that is not synced starts the run over.
 		b.advance(testEpoch / 2)
@@ -1173,7 +1176,7 @@ func TestProbeReadiness(t *testing.T) {
 		b.step()
 		b.advance(testEpoch - time.Second)
 		b.step()
-		require.NotNil(t, b.lease("a"), "one second short of soakEpochs epoch durations")
+		require.NotNil(t, b.lease("a"), "one second short of readyEpochs epoch durations")
 
 		b.advance(time.Second)
 		b.step()
@@ -1197,7 +1200,7 @@ func TestProbeReadiness(t *testing.T) {
 		assert.Nil(t, b.lease("a"))
 	})
 
-	t.Run("validator host falls back to the probes when liveness is unknown", func(t *testing.T) {
+	t.Run("validator host waits for liveness while it is unknown", func(t *testing.T) {
 		b := start(t, 10)
 		b.healthMod = func(n *fleet.NetworkHealth) { n.LivenessKnown = false }
 		b.refreshHealth()
@@ -1206,13 +1209,14 @@ func TestProbeReadiness(t *testing.T) {
 		b.step()
 		b.advance(5 * time.Second)
 		b.step()
-		assert.Equal(t, "probes synced, soaking for 6m24s", b.lease("a").Readiness)
+		assert.Equal(t, "node at head with peers, waiting for it to stay so for 6m24s", b.lease("a").Readiness)
 
 		b.advance(testEpoch)
 
 		out := b.step()
-		assert.Nil(t, b.lease("a"))
-		assert.False(t, out.Plan.Gate.OK, "the gate fails, the open lease still finishes")
+		require.NotNil(t, b.lease("a"), "the probes alone do not release a host with validators")
+		assert.Equal(t, "waiting for attestation data from the beacon node", b.lease("a").Readiness)
+		assert.False(t, out.Plan.Gate.OK)
 	})
 
 	t.Run("a host that went silent is not ready", func(t *testing.T) {
@@ -1244,8 +1248,10 @@ func TestReadinessTimeout(t *testing.T) {
 	b.finish("a")
 	b.liveOverride["a"] = 0
 	b.step()
+	b.advance(5 * time.Second)
+	b.step()
 
-	b.advance(30 * time.Minute)
+	b.advance(30*time.Minute - 5*time.Second)
 	b.step()
 	require.NotNil(t, b.lease("a"), "exactly readinessTimeout is not yet over it")
 	assert.Equal(t, fleet.LeaseVerifying, b.lease("a").State)
@@ -1255,7 +1261,7 @@ func TestReadinessTimeout(t *testing.T) {
 	out := b.step()
 	require.Nil(t, b.lease("a"))
 	assert.Equal(t, fleet.LeaseFailed, out.Leases[0].State)
-	assert.Equal(t, "not ready after 30m0s: 0 of 1 epochs with at least 2 of 10 validators attesting",
+	assert.Equal(t, "not ready after 30m0s: validators attesting: 0 of 1 epochs with at least 2 of 10",
 		out.Leases[0].Error)
 
 	r := b.mustRollout(packagesKey("2.0"))
@@ -1451,34 +1457,34 @@ func TestControllerOutageDoesNotMakeHostsStale(t *testing.T) {
 		assert.Equal(t, SlotIdle, b.step().Plan.Hosts["a"].Slot)
 	})
 
-	t.Run("an expected host keeps blocking later stages", func(t *testing.T) {
+	t.Run("an expected host keeps being waited for", func(t *testing.T) {
 		b := newWorldBuilder(t)
 		b.host("tool", 0)
 		b.host("val", 10)
-		b.wantsImage("val", imgLighthouse, digestA)
-		b.get("tool").Status.Containers = []protocol.Container{
+		b.wantsImage("tool", imgLighthouse, digestA)
+		b.get("val").Status.Containers = []protocol.Container{
 			container("c", imgLighthouse, digestOld, digestOld, b.w.Now),
 		}
 
 		out := b.step()
-		require.Equal(t, "after hosts without validators", queueReasons(out.Plan)["val"])
+		require.Equal(t, "after canary val", queueReasons(out.Plan)["tool"])
 
-		// Neither the silence of "tool" nor the age of the rollout is news:
+		// Neither the silence of "val" nor the age of the rollout is news:
 		// nobody could report to a controller that was down.
 		b.restartAfter(time.Hour)
 
 		out = b.step()
 		assert.Empty(t, b.leasedHosts())
-		assert.Equal(t, "after hosts without validators", queueReasons(out.Plan)["val"])
+		assert.Equal(t, "after canary val", queueReasons(out.Plan)["tool"])
 
-		// The hosts sync again; "tool" has hostStaleAfter from the start.
+		// The hosts sync again; "val" has hostStaleAfter from the start.
 		b.advance(stale)
 
 		out = b.step()
-		assert.Equal(t, "after hosts without validators", queueReasons(out.Plan)["val"])
+		assert.Equal(t, "after canary val", queueReasons(out.Plan)["tool"])
 
 		b.advance(time.Second)
 		b.step()
-		assert.Equal(t, []string{"val"}, b.leasedHosts())
+		assert.Equal(t, []string{"tool"}, b.leasedHosts())
 	})
 }

@@ -1,7 +1,7 @@
 import { list, type Lease } from '../api/types';
 import { cx } from './primitives';
 
-const STEPS = ['Drain', 'Apply', 'Reboot', 'Start', 'Verify', 'Soak'] as const;
+const STEPS = ['Drain', 'Apply', 'Reboot', 'Start', 'Verify', 'Ready check'] as const;
 type StepName = (typeof STEPS)[number];
 
 /** leaseStep says which step a lease is in, or -1 before the agent picked it up. */
@@ -11,7 +11,7 @@ function leaseStep(lease: Lease): { steps: StepName[]; current: number; failed: 
   const at = (name: StepName) => steps.indexOf(name);
   const failed = lease.state === 'failed' || lease.operation?.phase === 'failed';
 
-  if (lease.state === 'verifying') return { steps, current: at('Soak'), failed };
+  if (lease.state === 'verifying') return { steps, current: at('Ready check'), failed };
 
   switch (lease.operation?.phase) {
     case 'draining':
@@ -25,7 +25,7 @@ function leaseStep(lease: Lease): { steps: StepName[]; current: number; failed: 
     case 'verifying':
       return { steps, current: at('Verify'), failed };
     case 'done':
-      return { steps, current: at('Soak'), failed };
+      return { steps, current: at('Ready check'), failed };
     case 'failed':
       // The agent does not say in which phase it failed.
       return { steps, current: -1, failed: true };
@@ -36,8 +36,9 @@ function leaseStep(lease: Lease): { steps: StepName[]; current: number; failed: 
 
 /**
  * LeaseProgress shows where a host is in its lease: the agent drains, applies
- * (and reboots), starts and verifies; then the controller waits for the
- * validators to attest again (the soak) before it releases the lease.
+ * (and reboots), starts and verifies; then the controller checks that the
+ * node is back at head with peers and its validators attest again (the ready
+ * check) before it releases the lease.
  */
 export function LeaseProgress({ lease }: { lease: Lease }) {
   const { steps, current, failed } = leaseStep(lease);

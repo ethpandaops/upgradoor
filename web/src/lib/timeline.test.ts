@@ -83,24 +83,48 @@ function stages(byHost: Record<string, number>): StageOf {
 }
 
 describe('splitQueue', () => {
-  it('keeps a host out of "next" while a host of an earlier stage is stuck', () => {
+  it('keeps a host out of "next" while the canary of its rollout is stuck', () => {
     const queue = [
-      entry('rpc', 1, 'held'),
-      entry('val-1', 2, 'order', 'after hosts without validators'),
-      entry('val-2', 3, 'order', 'after hosts without validators'),
-      entry('boot', 4, 'order', 'after validator hosts'),
+      entry('rpc', 1, 'gate'),
+      entry('val-1', 2, 'order', 'after canary rpc'),
+      entry('val-2', 3, 'order', 'after canary rpc'),
+      entry('boot', 4, 'order', 'after canary rpc'),
       entry('other', 5, 'budget'),
     ];
-    const { next, behind } = splitQueue(queue, stages({ rpc: 0, 'val-1': 2, 'val-2': 2, boot: 3 }));
+    const { next, behind } = splitQueue(queue, stages({ rpc: 2, 'val-1': 3, 'val-2': 3, boot: 3 }));
 
     expect(next.map(q => q.host)).toEqual(['other']);
-    // boot waits behind val-1 and val-2, which wait behind rpc.
+    // All three wait behind the canary, which waits for the gate.
     expect(behind.map(q => q.host)).toEqual(['val-1', 'val-2', 'boot']);
+  });
+
+  it('keeps the canary and the rest out of "next" while a broken host of the rollout is stuck', () => {
+    const queue = [
+      entry('broken', 1, 'gate'),
+      entry('canary', 2, 'order', 'after broken'),
+      entry('rest', 3, 'order', 'after broken'),
+    ];
+    const { next, behind } = splitQueue(queue, stages({ broken: 1, canary: 2, rest: 3 }));
+
+    expect(next).toEqual([]);
+    expect(behind.map(q => q.host)).toEqual(['canary', 'rest']);
+  });
+
+  it('lets nobody wait for a host that is held, silent or reports a verb it does not allow', () => {
+    // The scheduler serves such a host when a person has acted; meanwhile the
+    // hosts behind it wait for somebody else, who is on the way.
+    for (const wait of ['held', 'silent', 'verb'] as const) {
+      const queue = [entry('broken', 1, wait), entry('rest', 2, 'order', 'after other')];
+      const { next, behind } = splitQueue(queue, stages({ broken: 1, rest: 3 }));
+
+      expect(next.map(q => q.host)).toEqual(['rest']);
+      expect(behind).toEqual([]);
+    }
   });
 
   it('does not hold a host back for a stuck host of its own stage', () => {
     const queue = [entry('held', 1, 'held'), entry('b', 2, 'order', 'after canary c')];
-    const { next, behind } = splitQueue(queue, stages({ held: 2, b: 2 }));
+    const { next, behind } = splitQueue(queue, stages({ held: 3, b: 3 }));
 
     expect(next.map(q => q.host)).toEqual(['b']);
     expect(behind).toEqual([]);
@@ -108,10 +132,10 @@ describe('splitQueue', () => {
 
   it('judges by the rollout the reason is about', () => {
     const queue: QueueEntry[] = [
-      { host: 'stuck', position: 1, reason: 'held', wait: 'held', rollouts: ['r2'] },
+      { host: 'stuck', position: 1, reason: 'policy paused', wait: 'policy-paused', rollouts: ['r2'] },
       { host: 'b', position: 2, reason: 'after canary c', wait: 'order', rollout: 'r1', rollouts: ['r1', 'r2'] },
     ];
-    const stageOf: StageOf = (_rollout, host) => (host === 'stuck' ? 0 : 2);
+    const stageOf: StageOf = (_rollout, host) => (host === 'stuck' ? 2 : 3);
 
     expect(splitQueue(queue, stageOf).next.map(q => q.host)).toEqual(['b']);
   });
@@ -125,6 +149,32 @@ describe('splitQueue', () => {
 describe('forecast', () => {
   const base = { now: NOW, typicalMs: 10 * MIN, horizonMs: 600 * MIN, active: [] };
   const starts = (f: { slots: { host: string; start: number }[] }) => f.slots.map(s => [s.host, (s.start - NOW) / MIN]);
+
+  it('gives no slot to a host that waits for one that is not in the queue and holds no lease', () => {
+    // "x" is expected to report its need: nobody knows when it will go.
+    const queue = [
+      { ...entry('a', 1, 'order', 'after x'), after: 'x' },
+      { ...entry('b', 2, 'order', 'after canary x'), after: 'x' },
+      entry('c', 3, 'budget'),
+    ];
+    const costs = weights(0, 'a', 'b', 'c');
+    const stageOf = stages({ x: 1, a: 3, b: 3, c: 3 });
+
+    const f = forecast({ ...base, queue, budget: budget(), costs, stageOf });
+    expect(starts(f)).toEqual([['c', 0]]);
+    expect(f.late).toBe(2);
+    expect(f.unplaced).toBe(0);
+
+    // Once it holds a lease, the others follow it.
+    const active = [{ host: 'x', start: NOW, weight: 0, rollouts: ['r1'] }];
+    const g = forecast({ ...base, active, queue, budget: budget({ maxLeasedHosts: 5 }), costs, stageOf });
+    expect(starts(g)).toEqual([
+      ['c', 0],
+      ['a', 10],
+      ['b', 10],
+    ]);
+    expect(g.late).toBe(0);
+  });
 
   it('serves in order, one after the other when the weight budget fits one host', () => {
     const f = forecast({
@@ -187,13 +237,13 @@ describe('forecast', () => {
     entry('canary', 1, 'next'),
     entry('b1', 2, 'order', 'after canary canary'),
     entry('b2', 3, 'order', 'after canary canary'),
-    entry('boot', 4, 'order', 'after validator hosts'),
+    entry('boot', 4, 'order', 'after canary canary'),
   ];
 
   it.each([
-    ['with stages', stages({ canary: 1, b1: 2, b2: 2, boot: 3 })],
+    ['with stages', stages({ canary: 2, b1: 3, b2: 3, boot: 3 })],
     ['without stages', undefined],
-  ])('starts the batch after the canary and the bootnode after the batch (%s)', (_name, stageOf) => {
+  ])('starts the rest after the canary, the bootnode with it (%s)', (_name, stageOf) => {
     const f = forecast({
       ...base,
       queue: staged,
@@ -206,7 +256,7 @@ describe('forecast', () => {
       ['canary', 0],
       ['b1', 10],
       ['b2', 10],
-      ['boot', 20],
+      ['boot', 10],
     ]);
   });
 
@@ -217,7 +267,7 @@ describe('forecast', () => {
       active: [{ host: 'same-stage', start: NOW, weight: 0, rollouts: ['r1'] }],
       budget: budget({ allowedWeight: 1000, maxLeasedHosts: 3 }),
       costs: weights(100, 'b1'),
-      stageOf: stages({ 'same-stage': 2, b1: 2 }),
+      stageOf: stages({ 'same-stage': 3, b1: 3 }),
     });
 
     expect(starts(f)).toEqual([['b1', 0]]);

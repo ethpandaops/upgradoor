@@ -11,8 +11,8 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// RoleBootnode is the certificate role that marks a bootnode. Bootnodes are
-// rolled last and one at a time.
+// RoleBootnode is the certificate role that marks a bootnode. It is shown
+// with the host; the scheduler treats a bootnode like any other host.
 const RoleBootnode = "bootnode"
 
 // Host is one host known to the controller. A host exists once a valid
@@ -45,17 +45,6 @@ type Host struct {
 
 // Weight is the number of validators the host operates.
 func (h *Host) Weight() uint64 { return h.Validators.Count() }
-
-// IsBootnode reports whether the host carries the bootnode role.
-func (h *Host) IsBootnode() bool {
-	for _, r := range h.Roles {
-		if r == RoleBootnode {
-			return true
-		}
-	}
-
-	return false
-}
 
 // Stale reports whether the host's agent has been silent for longer than
 // staleAfter.

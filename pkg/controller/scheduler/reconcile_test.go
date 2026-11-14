@@ -173,7 +173,8 @@ func TestBudgetAlreadyDownHostIsFree(t *testing.T) {
 	assert.Equal(t, uint64(0), b.lease("down").Charged)
 	assert.Equal(t, uint64(20), b.lease("down").Weight)
 	assert.Equal(t, uint64(20), out.Plan.Budget.UnavailableWeight)
-	assert.Equal(t, "after canary down", queueReasons(out.Plan)["up"])
+	assert.Equal(t, "after canary down", queueReasons(out.Plan)["up"],
+		"the only host that fits the budget is the canary")
 
 	// A second cause shows the budget for the host that is up.
 	b.wants("up", rebootNeed())
@@ -193,16 +194,48 @@ func TestBudgetZeroMaxUnavailable(t *testing.T) {
 		b.wants(h, packagesNeed("2.0"))
 	}
 
+	// No validator may go down: the canary is a host that costs nothing, the
+	// hosts without validators roll one at a time, the host with validators
+	// waits for the budget.
 	out := b.step()
 	assert.Equal(t, []string{"tool1"}, b.leasedHosts())
-	assert.Equal(t, "host limit 1 of 1", queueReasons(out.Plan)["tool2"])
+	assert.Equal(t, "tool1", b.mustRollout(packagesKey("2.0")).Canary)
+	assert.Equal(t, map[string]string{
+		"val": "after canary tool1", "tool2": "after canary tool1",
+	}, queueReasons(out.Plan))
 
 	b.serve("tool1")
+	assert.Equal(t, []string{"tool2"}, b.leasedHosts())
+
 	b.serve("tool2")
 
 	out = b.step()
 	assert.Empty(t, b.leasedHosts())
 	assert.Equal(t, map[string]string{"val": "budget 0% of 0%"}, queueReasons(out.Plan))
+}
+
+// TestHostsThatCostNothingPassAFullBudget: in the rest, a host without
+// validators is served while a host with validators waits for the budget.
+func TestHostsThatCostNothingPassAFullBudget(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.w.Settings.MaxUnavailablePercent = 50
+	b.w.Settings.MinParticipationPercent = 50
+	b.host("sick", 100)
+	b.live(b.w.Health.LivenessEpoch, "sick", 60) // 40 of 200 down by themselves
+	b.liveOverride["sick"] = 60
+
+	for name, weight := range map[string]uint64{"canary": 10, "heavy": 90, "tool1": 0, "tool2": 0} {
+		b.host(name, weight)
+		b.wants(name, packagesNeed("2.0"))
+	}
+
+	b.step()
+	require.Equal(t, []string{"canary"}, b.leasedHosts())
+	b.serve("canary")
+
+	out := b.step()
+	assert.Equal(t, []string{"tool1", "tool2"}, b.leasedHosts())
+	assert.Equal(t, map[string]string{"heavy": "budget 20% of 50%"}, queueReasons(out.Plan))
 }
 
 func TestHostLimitBoundsHostsWithoutValidators(t *testing.T) {
@@ -214,12 +247,16 @@ func TestHostLimitBoundsHostsWithoutValidators(t *testing.T) {
 		b.wants(h, packagesNeed("2.0"))
 	}
 
+	b.step()
+	require.Equal(t, []string{"t1"}, b.leasedHosts(), "the canary")
+	b.serve("t1")
+
 	out := b.step()
-	assert.Equal(t, []string{"t1", "t2"}, b.leasedHosts())
+	assert.Equal(t, []string{"t2", "t3"}, b.leasedHosts())
 	assert.Equal(t, 2, out.Plan.Budget.MaxLeasedHosts)
-	assert.Equal(t, "host limit 2 of 2", queueReasons(out.Plan)["t3"])
+	assert.Equal(t, "host limit 2 of 2", queueReasons(out.Plan)["t4"])
 	assert.Equal(t, 1, out.Plan.Queue[0].Position)
-	assert.Equal(t, "t3", out.Plan.Queue[0].Host)
+	assert.Equal(t, "t4", out.Plan.Queue[0].Host)
 	assert.Equal(t, WaitHostLimit, out.Plan.Queue[0].Wait)
 }
 
@@ -450,7 +487,7 @@ func TestWaitingReasons(t *testing.T) {
 		{
 			name: "rollout halted",
 			setup: func(b *worldBuilder) {
-				b.host("first", 0)
+				b.host("first", 5)
 				b.wants("first", packagesNeed("2.0"))
 				b.step()
 				b.report("first", protocol.PhaseFailed, true)
@@ -461,14 +498,6 @@ func TestWaitingReasons(t *testing.T) {
 			name:  "network gate",
 			setup: func(b *worldBuilder) { b.w.Health.FinalityLagEpochs = 5 },
 			want:  "network gate: finality lag 5 epochs > 3",
-		},
-		{
-			name: "after hosts without validators",
-			setup: func(b *worldBuilder) {
-				b.host("tool", 0)
-				b.wants("tool", packagesNeed("2.0"))
-			},
-			want: "after hosts without validators",
 		},
 		{
 			name: "after canary",
@@ -535,7 +564,7 @@ func TestWaitingReasons(t *testing.T) {
 		{
 			name: "policy paused wins over halted",
 			setup: func(b *worldBuilder) {
-				b.host("first", 0)
+				b.host("first", 5)
 				b.wants("first", packagesNeed("2.0"))
 				b.step()
 				b.report("first", protocol.PhaseFailed, true)
@@ -546,7 +575,7 @@ func TestWaitingReasons(t *testing.T) {
 		{
 			name: "halted wins over the gate",
 			setup: func(b *worldBuilder) {
-				b.host("first", 0)
+				b.host("first", 5)
 				b.wants("first", packagesNeed("2.0"))
 				b.step()
 				b.report("first", protocol.PhaseFailed, true)
@@ -557,8 +586,8 @@ func TestWaitingReasons(t *testing.T) {
 		{
 			name: "gate wins over ordering",
 			setup: func(b *worldBuilder) {
-				b.host("tool", 0)
-				b.wants("tool", packagesNeed("2.0"))
+				b.host("a", 5)
+				b.wants("a", packagesNeed("2.0"))
 				b.w.Health.FinalityLagEpochs = 5
 			},
 			want: "network gate: finality lag 5 epochs > 3",
@@ -778,10 +807,19 @@ func TestImageSupersedeCarriesFailedHostsFirst(t *testing.T) {
 		h.Status.Needs = []protocol.Need{imageNeed("c", imgLighthouse, digestB)}
 	}
 
-	b.step()
+	out = b.step()
 	second = b.mustRollout(second.Key)
 	assert.Equal(t, []string{"h3"}, b.leasedHosts())
-	assert.Equal(t, "h3", second.Canary)
+	assert.Equal(t, fleet.StageRepair, second.Host("h3").Stage)
+	assert.Empty(t, second.Canary, "no canary while a carried host is being repaired")
+	assert.Equal(t, map[string]string{"h1": "after h3", "h2": "after h3"}, queueReasons(out.Plan))
+
+	// The repair is the first success: nobody waits for a canary after it.
+	b.serve("h3")
+	second = b.mustRollout(second.Key)
+	assert.Equal(t, []string{"h1", "h2"}, b.leasedHosts())
+	assert.Empty(t, second.Canary)
+	assert.Equal(t, fleet.StageRepair, second.Host("h3").Stage, "a served member keeps its stage")
 }
 
 func TestImageTargetIsTheFreshestRegistryCheck(t *testing.T) {
@@ -893,27 +931,30 @@ func TestMembership(t *testing.T) {
 		assert.Equal(t, fleet.HostDone, r.Host("fixed").State)
 	})
 
-	t.Run("an expected host blocks later stages only for hostStaleAfter", func(t *testing.T) {
+	t.Run("an expected host with validators is waited for as the canary only for hostStaleAfter", func(t *testing.T) {
 		b := newWorldBuilder(t)
 		b.host("tool", 0)
 		b.host("val", 10)
-		b.wantsImage("val", imgLighthouse, digestA)
-		b.get("tool").Status.Containers = []protocol.Container{container("c", imgLighthouse, digestOld, digestOld, b.w.Now)}
+		b.wantsImage("tool", imgLighthouse, digestA)
+		b.get("val").Status.Containers = []protocol.Container{container("c", imgLighthouse, digestOld, digestOld, b.w.Now)}
 
+		// The host with validators is the canary as soon as it reports.
 		out := b.step()
-		assert.Equal(t, "after hosts without validators", queueReasons(out.Plan)["val"])
+		assert.Equal(t, "val", b.mustRollout(key).Canary)
+		assert.Equal(t, "after canary val", queueReasons(out.Plan)["tool"])
 
 		b.advance(b.w.Settings.HostStaleAfter.Std() + time.Second)
 		b.step()
-		assert.Equal(t, []string{"val"}, b.leasedHosts())
-		assert.Equal(t, fleet.HostExpected, b.mustRollout(key).Host("tool").State, "it is still shown as expected")
+		assert.Equal(t, []string{"tool"}, b.leasedHosts())
+		assert.Equal(t, fleet.HostExpected, b.mustRollout(key).Host("val").State, "it is still shown as expected")
+		assert.Empty(t, b.mustRollout(key).Canary, "one member left to serve: no canary")
 
 		// The rollout completes without it.
-		b.serve("val")
+		b.serve("tool")
 		assert.Equal(t, fleet.RolloutCompleted, b.closed(key).State)
 	})
 
-	t.Run("an expected host that is held, stale or lacks the verb does not block", func(t *testing.T) {
+	t.Run("an expected host that is held, stale or lacks the verb is not waited for", func(t *testing.T) {
 		for _, tt := range []struct {
 			name  string
 			setup func(h *fleet.Host, now time.Time)
@@ -926,13 +967,13 @@ func TestMembership(t *testing.T) {
 				b := newWorldBuilder(t)
 				b.host("tool", 0)
 				b.host("val", 10)
-				b.wantsImage("val", imgLighthouse, digestA)
-				b.get("tool").Status.Containers = []protocol.Container{container("c", imgLighthouse, digestOld, digestOld, b.w.Now)}
-				tt.setup(b.get("tool"), b.w.Now)
+				b.wantsImage("tool", imgLighthouse, digestA)
+				b.get("val").Status.Containers = []protocol.Container{container("c", imgLighthouse, digestOld, digestOld, b.w.Now)}
+				tt.setup(b.get("val"), b.w.Now)
 
 				b.step()
 
-				assert.Equal(t, []string{"val"}, b.leasedHosts())
+				assert.Equal(t, []string{"tool"}, b.leasedHosts())
 			})
 		}
 	})
@@ -988,7 +1029,9 @@ func TestMembership(t *testing.T) {
 	})
 }
 
-func TestStageOrdering(t *testing.T) {
+// TestCanaryThenTheRest: with no carried host, the canary alone, then
+// everybody else at once. A bootnode is a host like any other.
+func TestCanaryThenTheRest(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 100
 
@@ -1006,77 +1049,264 @@ func TestStageOrdering(t *testing.T) {
 
 	key := packagesKey("2.0")
 
-	// Stage 0: hosts without validators, several at once.
+	// The canary is the lightest host with validators, alone.
 	out := b.step()
-	assert.Equal(t, []string{"tool1", "tool2"}, b.leasedHosts())
-	assert.Equal(t, map[string]string{
-		"val-light": "after hosts without validators",
-		"val-mid":   "after hosts without validators",
-		"val-heavy": "after hosts without validators",
-		"boot1":     "after hosts without validators",
-		"boot2":     "after hosts without validators",
-	}, queueReasons(out.Plan))
-
-	order := make([]string, 0, len(out.Plan.Queue))
-	for _, q := range out.Plan.Queue {
-		order = append(order, q.Host)
-	}
-
-	assert.Equal(t, []string{"val-light", "val-mid", "val-heavy", "boot1", "boot2"}, order,
-		"validator hosts by ascending weight, bootnodes last")
-
-	b.serve("tool1")
-	assert.Equal(t, []string{"tool2"}, b.leasedHosts(), "stage 0 is not settled yet")
-	b.serve("tool2")
-
-	// Stage 1: the canary is the lightest validator host, alone.
-	out = b.step()
 	assert.Equal(t, []string{"val-light"}, b.leasedHosts())
 	assert.Equal(t, "val-light", b.mustRollout(key).Canary)
 	assert.Equal(t, fleet.StageCanary, b.mustRollout(key).Host("val-light").Stage)
 	assert.Equal(t, map[string]string{
+		"tool1":     "after canary val-light",
+		"tool2":     "after canary val-light",
+		"boot1":     "after canary val-light",
+		"boot2":     "after canary val-light",
 		"val-mid":   "after canary val-light",
 		"val-heavy": "after canary val-light",
-		"boot1":     "after validator hosts",
-		"boot2":     "after validator hosts",
 	}, queueReasons(out.Plan))
 
-	// Stage 2: the rest of the validator hosts together.
-	b.serve("val-light")
-	assert.Equal(t, []string{"val-heavy", "val-mid"}, b.leasedHosts())
-	assert.Equal(t, fleet.StageBatches, b.mustRollout(key).Host("val-mid").Stage)
+	order := make([]string, 0, len(out.Plan.Queue))
+	for _, q := range out.Plan.Queue {
+		assert.Equal(t, WaitOrder, q.Wait)
+		assert.Equal(t, "val-light", q.After, "the host it waits for")
 
-	b.serve("val-mid")
-	assert.Equal(t, []string{"val-heavy"}, b.leasedHosts())
+		order = append(order, q.Host)
+	}
 
-	// Stage 3: bootnodes, one at a time, also the one with validators.
-	b.serve("val-heavy")
+	assert.Equal(t, []string{"boot1", "tool1", "tool2", "boot2", "val-mid", "val-heavy"}, order,
+		"by ascending weight and name, whatever the role")
 
+	// Not before the canary is done: a done report alone is not enough.
+	b.finish("val-light")
+	b.step()
+	assert.Equal(t, []string{"val-light"}, b.leasedHosts(), "the canary is still being verified")
+
+	b.advance(5 * time.Second)
+	b.step()
+	b.advance(2 * testEpoch)
+
+	// The rest: every other member at once, bootnodes among them.
 	out = b.step()
-	assert.Equal(t, []string{"boot1"}, b.leasedHosts())
-	assert.Equal(t, map[string]string{"boot2": "after bootnode boot1"}, queueReasons(out.Plan))
-	assert.Equal(t, fleet.StageBootnodes, b.mustRollout(key).Host("boot2").Stage)
+	assert.Equal(t, []string{"boot1", "boot2", "tool1", "tool2", "val-heavy", "val-mid"}, b.leasedHosts())
+	assert.Empty(t, out.Plan.Queue)
 
-	b.serve("boot1")
-	assert.Equal(t, []string{"boot2"}, b.leasedHosts())
-	b.serve("boot2")
+	r := b.mustRollout(key)
+	assert.Equal(t, fleet.HostDone, r.Host("val-light").State)
+	assert.Equal(t, fleet.StageCanary, r.Host("val-light").Stage)
+
+	for _, name := range b.leasedHosts() {
+		assert.Equal(t, fleet.StageRest, r.Host(name).Stage, name)
+		b.report(name, protocol.PhaseApplying, true)
+	}
+
+	for _, name := range b.leasedHosts() {
+		b.serve(name)
+	}
+
 	assert.Equal(t, fleet.RolloutCompleted, b.closed(key).State)
 }
 
-func TestCanaryCandidates(t *testing.T) {
-	t.Run("a host that is fully down goes first", func(t *testing.T) {
+func TestCanaryChoice(t *testing.T) {
+	key := packagesKey("2.0")
+
+	start := func(t *testing.T, hosts map[string]uint64) *worldBuilder {
+		t.Helper()
+
 		b := newWorldBuilder(t)
-		b.w.Settings.MinParticipationPercent = 10
-		b.host("light", 5)
-		b.host("down", 30)
-		b.wants("light", packagesNeed("2.0"))
-		b.wants("down", packagesNeed("2.0"))
-		b.live(b.w.Health.LivenessEpoch, "down", 0)
+		b.w.Settings.MaxUnavailablePercent = 100
+
+		for _, name := range sortedKeys(hosts) {
+			b.host(name, hosts[name])
+			b.wants(name, packagesNeed("2.0"))
+		}
+
+		return b
+	}
+
+	t.Run("a host with validators when the rollout has one", func(t *testing.T) {
+		b := start(t, map[string]uint64{"a-tool": 0, "b-tool": 0, "val": 40})
+
+		out := b.step()
+		assert.Equal(t, []string{"val"}, b.leasedHosts())
+		assert.Equal(t, "val", b.mustRollout(key).Canary)
+		assert.Equal(t, map[string]string{"a-tool": "after canary val", "b-tool": "after canary val"},
+			queueReasons(out.Plan))
+	})
+
+	t.Run("the first member when no member has validators", func(t *testing.T) {
+		b := start(t, map[string]uint64{"b": 0, "a": 0, "c": 0})
+
+		out := b.step()
+		assert.Equal(t, []string{"a"}, b.leasedHosts())
+		assert.Equal(t, "a", b.mustRollout(key).Canary)
+		assert.Equal(t, map[string]string{"b": "after canary a", "c": "after canary a"}, queueReasons(out.Plan))
+
+		b.serve("a")
+		assert.Equal(t, []string{"b", "c"}, b.leasedHosts())
+	})
+
+	t.Run("a bootnode is chosen like any host", func(t *testing.T) {
+		b := start(t, map[string]uint64{"val": 10})
+		b.host("boot", 3, fleet.RoleBootnode)
+		b.wants("boot", packagesNeed("2.0"))
 
 		b.step()
+		assert.Equal(t, []string{"boot"}, b.leasedHosts(), "the lightest host with validators")
+		assert.Equal(t, "boot", b.mustRollout(key).Canary)
+	})
 
-		assert.Equal(t, []string{"down"}, b.leasedHosts())
-		assert.Equal(t, "down", b.mustRollout(packagesKey("2.0")).Canary)
+	t.Run("a single member needs no canary", func(t *testing.T) {
+		b := start(t, map[string]uint64{"only": 10})
+
+		b.step()
+		assert.Equal(t, []string{"only"}, b.leasedHosts())
+		assert.Empty(t, b.mustRollout(key).Canary)
+		assert.Equal(t, fleet.StageRest, b.mustRollout(key).Host("only").Stage)
+	})
+
+	t.Run("a member that joins while the first host is out waits for it", func(t *testing.T) {
+		b := start(t, map[string]uint64{"only": 0})
+		b.step()
+		require.Equal(t, []string{"only"}, b.leasedHosts())
+
+		b.host("late", 10)
+		b.wants("late", packagesNeed("2.0"))
+
+		out := b.step()
+		assert.Equal(t, []string{"only"}, b.leasedHosts())
+		assert.Equal(t, "only", b.mustRollout(key).Canary, "the host that went first is the canary")
+		assert.Equal(t, "after canary only", queueReasons(out.Plan)["late"])
+	})
+
+	t.Run("a validator host that cannot be served is not waited for", func(t *testing.T) {
+		for name, setup := range map[string]func(b *worldBuilder){
+			"silent":  func(b *worldBuilder) { b.get("val").LastSeen = b.w.Now.Add(-time.Hour) },
+			"held":    func(b *worldBuilder) { b.get("val").HoldWanted = true },
+			"no verb": func(b *worldBuilder) { b.get("val").Status.Verbs = []protocol.Verb{protocol.VerbRoll} },
+		} {
+			t.Run(name, func(t *testing.T) {
+				b := start(t, map[string]uint64{"tool": 0, "val": 10})
+				setup(b)
+
+				b.step()
+				assert.Equal(t, []string{"tool"}, b.leasedHosts())
+				assert.Equal(t, "tool", b.mustRollout(key).Canary)
+			})
+		}
+	})
+
+	t.Run("a silent canary that was not served is replaced", func(t *testing.T) {
+		b := start(t, map[string]uint64{"a": 5, "b": 6})
+		b.w.Settings.Paused = true
+		b.step()
+		require.Equal(t, "a", b.mustRollout(key).Canary)
+
+		b.w.Settings.Paused = false
+		b.advance(b.w.Settings.HostStaleAfter.Std()+time.Second, "a")
+		b.step()
+		assert.Equal(t, "b", b.mustRollout(key).Canary)
+		assert.Equal(t, []string{"b"}, b.leasedHosts())
+	})
+}
+
+func TestCanaryCandidates(t *testing.T) {
+	t.Run("a host whose validators are all offline is not preferred", func(t *testing.T) {
+		// It proves nothing about attesting; with room in the budget the
+		// canary is a host with live validators, however heavy.
+		b := newWorldBuilder(t)
+		b.w.Settings.MinParticipationPercent = 10
+		b.w.Settings.MaxUnavailablePercent = 100
+		b.host("down", 5)
+		b.host("live", 30)
+		b.host("tool", 0)
+
+		for _, h := range b.w.Hosts {
+			b.wants(h.Name, packagesNeed("2.0"))
+		}
+
+		b.down("down")
+
+		out := b.step()
+		r := b.mustRollout(packagesKey("2.0"))
+
+		require.True(t, out.Plan.Gate.OK)
+		assert.Equal(t, []string{"live"}, b.leasedHosts())
+		assert.Equal(t, "live", r.Canary)
+		assert.Equal(t, fleet.StageRest, r.Host("down").Stage, "an ordinary member")
+		assert.Equal(t, map[string]string{
+			"down": "after canary live", "tool": "after canary live",
+		}, queueReasons(out.Plan))
+
+		// Without a host with live validators it ranks with the hosts that
+		// have none: the lightest of them, then by name.
+		b = newWorldBuilder(t)
+		b.w.Settings.MinParticipationPercent = 10
+		b.host("down", 5)
+		b.host("idle", 95)
+		b.host("tool", 0)
+		b.wants("down", packagesNeed("2.0"))
+		b.wants("tool", packagesNeed("2.0"))
+		b.down("down")
+
+		b.step()
+		assert.Equal(t, []string{"tool"}, b.leasedHosts())
+	})
+
+	t.Run("a carried host that waits for a person holds nobody back", func(t *testing.T) {
+		for name, setup := range map[string]func(b *worldBuilder){
+			"silent":  func(b *worldBuilder) { b.get("carried").LastSeen = b.w.Now.Add(-time.Hour) },
+			"held":    func(b *worldBuilder) { b.get("carried").HoldWanted = true },
+			"no verb": func(b *worldBuilder) { b.get("carried").Status.Verbs = []protocol.Verb{protocol.VerbRoll} },
+		} {
+			t.Run(name, func(t *testing.T) {
+				b := newWorldBuilder(t)
+				b.w.Settings.MaxUnavailablePercent = 100
+				b.host("light", 5)
+				b.host("mid", 8)
+				b.host("carried", 30)
+
+				for _, h := range b.w.Hosts {
+					b.wants(h.Name, packagesNeed("2.0"))
+				}
+
+				b.w.Settings.Paused = true
+				b.step()
+				b.mustRollout(packagesKey("2.0")).Host("carried").CarriedFrom = "id000"
+				b.w.Settings.Paused = false
+				setup(b)
+
+				out := b.step()
+				r := b.mustRollout(packagesKey("2.0"))
+
+				assert.Equal(t, []string{"light"}, b.leasedHosts())
+				assert.Equal(t, "light", r.Canary)
+				assert.Equal(t, fleet.StageRepair, r.Host("carried").Stage)
+				assert.Equal(t, "after canary light", queueReasons(out.Plan)["mid"])
+			})
+		}
+	})
+
+	t.Run("a carried host that waits for the budget holds the others back", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.w.Settings.MaxUnavailablePercent = 100
+		b.host("a", 10)
+		b.host("b", 10)
+		b.host("tool", 0)
+
+		for _, h := range b.w.Hosts {
+			b.wants(h.Name, packagesNeed("2.0"))
+		}
+
+		// "a" attests, but was carried over as failed; the budget is zero.
+		b.w.Settings.Paused = true
+		b.step()
+		b.mustRollout(packagesKey("2.0")).Host("a").CarriedFrom = "id000"
+		b.w.Settings.Paused = false
+		b.w.Settings.MaxUnavailablePercent = 0
+
+		out := b.step()
+		assert.Empty(t, b.leasedHosts())
+		assert.Equal(t, map[string]string{
+			"a": "budget 0% of 0%", "b": "after a", "tool": "after a",
+		}, queueReasons(out.Plan))
 	})
 
 	t.Run("a skipped canary is replaced", func(t *testing.T) {
@@ -1132,31 +1362,72 @@ func TestCanaryCandidates(t *testing.T) {
 		assert.Equal(t, []string{"b"}, b.leasedHosts(), "one new canary, alone")
 
 		// The hold is lifted: the old canary rejoins and waits for the new
-		// one like every other validator host.
+		// one like every other host.
 		b.wants("a", packagesNeed("2.0"))
 
 		out := b.step()
 
 		assert.Equal(t, []string{"b"}, b.leasedHosts())
 		assert.Equal(t, "after canary b", queueReasons(out.Plan)["a"])
-		assert.Equal(t, fleet.StageBatches, b.mustRollout(packagesKey("2.0")).Host("a").Stage)
+		assert.Equal(t, fleet.StageRest, b.mustRollout(packagesKey("2.0")).Host("a").Stage)
 	})
 
 	t.Run("a failed canary halts and nobody follows", func(t *testing.T) {
 		b := newWorldBuilder(t)
 		b.w.Settings.MaxUnavailablePercent = 100
+		b.w.Settings.MinParticipationPercent = 10
 		b.host("a", 5)
 		b.host("b", 6)
-		b.wants("a", packagesNeed("2.0"))
-		b.wants("b", packagesNeed("2.0"))
+		b.host("c", 7)
+		b.host("down", 9)
+
+		for _, h := range []string{"a", "b", "c"} {
+			b.wants(h, packagesNeed("2.0"))
+		}
+
 		b.step()
+		require.Equal(t, []string{"a"}, b.leasedHosts())
 		b.report("a", protocol.PhaseFailed, true)
 
 		out := b.step()
+		key := packagesKey("2.0")
 
 		assert.Empty(t, b.leasedHosts())
-		assert.Equal(t, "rollout halted: a: container did not start", queueReasons(out.Plan)["b"])
+		assert.Equal(t, fleet.RolloutHalted, b.mustRollout(key).State)
+		assert.Equal(t, "a", b.mustRollout(key).Canary)
+		assert.Equal(t, map[string]string{
+			"b": "rollout halted: a: container did not start",
+			"c": "rollout halted: a: container did not start",
+		}, queueReasons(out.Plan))
 		assert.Equal(t, SlotFailed, out.Plan.Hosts["a"].Slot)
+
+		// It stays so, pass after pass, and an offline host that joins does not
+		// move either.
+		b.wants("down", packagesNeed("2.0"))
+		b.liveOverride["down"] = 0
+		b.advance(testEpoch)
+
+		out = b.step()
+		assert.Empty(t, b.leasedHosts())
+		assert.Equal(t, "rollout halted: a: container did not start", queueReasons(out.Plan)["down"])
+		delete(b.liveOverride, "down")
+		b.get("down").Status.Needs = nil
+		b.advance(testEpoch)
+		b.step()
+
+		// A person reopens the rollout without retrying the canary. A failure
+		// is not a success: one new canary goes alone, not everybody at once.
+		b.mustRollout(key).State = fleet.RolloutActive
+		b.mustRollout(key).Reason = ""
+
+		out = b.step()
+		assert.Equal(t, []string{"b"}, b.leasedHosts())
+		assert.Equal(t, "b", b.mustRollout(key).Canary)
+		assert.Equal(t, fleet.HostFailed, b.mustRollout(key).Host("a").State)
+		assert.Equal(t, map[string]string{"c": "after canary b"}, queueReasons(out.Plan))
+
+		b.serve("b")
+		assert.Equal(t, []string{"c"}, b.leasedHosts())
 	})
 }
 
@@ -1430,7 +1701,7 @@ func TestGrantsWithoutLiveness(t *testing.T) {
 		b.step()
 		b.advance(5 * time.Second)
 		b.step()
-		assert.Equal(t, "probes synced, soaking for 6m24s", b.lease("a").Readiness)
+		assert.Equal(t, "node at head with peers, waiting for it to stay so for 6m24s", b.lease("a").Readiness)
 
 		b.advance(testEpoch)
 		b.step()
@@ -1490,7 +1761,7 @@ func TestGrantsWithoutLiveness(t *testing.T) {
 		b.advance(5 * time.Second)
 		b.step()
 
-		assert.Equal(t, "probes do not report synced", b.lease("a").Readiness)
+		assert.Equal(t, "CL is not reachable", b.lease("a").Readiness)
 	})
 }
 
@@ -1507,8 +1778,8 @@ func TestFailingGatePassesTheRepairOfADownHost(t *testing.T) {
 		}
 
 		b.fillLiveness()
-		// d attests with nothing: 96 of 128 live, 75% < 90%.
-		b.live(b.w.Health.LivenessEpoch, "d", 0)
+		// d has attested with nothing for two epochs: 96 of 128 live, 75% < 90%.
+		b.down("d")
 		b.refreshHealth()
 
 		return b
@@ -1521,6 +1792,11 @@ func TestFailingGatePassesTheRepairOfADownHost(t *testing.T) {
 		require.False(t, out.Plan.Gate.OK)
 		require.Equal(t, []string{"d"}, b.leasedHosts(), "the down host is repaired, nobody else moves")
 		assert.Zero(t, b.lease("d").Charged)
+		assert.True(t, b.lease("d").Repair)
+		// It was the canary already: with a quarter of the weight down it is
+		// the only member that fits the budget.
+		assert.Equal(t, "d", b.mustRollout(packagesKey("2.0")).Canary)
+		assert.Equal(t, fleet.StageCanary, b.mustRollout(packagesKey("2.0")).Host("d").Stage)
 
 		reasons := queueReasons(out.Plan)
 		for _, name := range []string{"a", "b", "c"} {

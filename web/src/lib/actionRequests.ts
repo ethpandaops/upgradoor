@@ -92,18 +92,18 @@ function timingText(o: DisruptiveOptions): string[] {
     lines.push(
       `Now: each host is granted a slot ${
         budget ? 'as soon as the availability budget and the network gate allow' : 'at once'
-      }, without stage ordering and without waiting for readiness between hosts.`
+      }, without a canary and without waiting for readiness between hosts.`
     );
   } else if (o.force) {
     lines.push(
-      'Staggered, forced: a manual rollout that skips stage ordering and the readiness soak.' +
+      'Staggered, forced: a manual rollout that skips the order and the ready check.' +
         (budget ? ' Hosts are still granted under the availability budget and the network gate.' : '')
     );
   } else {
     lines.push(
-      'Staggered: a manual rollout in stage order: hosts without validators first, then a canary, ' +
-        `then the remaining hosts${budget ? ' as the availability budget allows' : ''}, bootnodes last; ` +
-        'a stage starts once the stage before it is ready.'
+      'Staggered: a manual rollout: one host first as the canary, ' +
+        `then all the others${budget ? ' as the availability budget allows' : ''}; ` +
+        'the others start once the canary is back at head with peers and its validators attest again.'
     );
   }
 
@@ -182,7 +182,7 @@ export function describeCall(call: ActionCall): string[] {
     case 'skip':
       return [
         `Skip ${selectionText({ hosts: call.body.hosts, all: false })} in rollout ${call.body.rollout}: ` +
-          'the host is not served for this rollout and no longer blocks later stages.',
+          'the host is not served for this rollout and nobody waits for it any more.',
       ];
     case 'retry':
       return [

@@ -45,6 +45,13 @@ export function clearsByItself(wait: WaitKind | undefined): boolean {
   return wait === undefined || AUTO_WAITS.has(wait);
 }
 
+const NOBODY_WAITS: ReadonlySet<WaitKind> = new Set(['held', 'silent', 'verb']);
+
+/** holdsBack: hosts behind this one in the order of a rollout wait for it. */
+function holdsBack(wait: WaitKind | undefined): boolean {
+  return wait === undefined || !NOBODY_WAITS.has(wait);
+}
+
 /** needsSomebody: the host waits until a person acts (approve, resume, retry, unhold, fix the agent). */
 export function needsSomebody(wait: WaitKind | undefined): boolean {
   return wait !== undefined && wait !== 'gate' && !AUTO_WAITS.has(wait);
@@ -74,8 +81,8 @@ function median(values: number[]): number | undefined {
 
 /**
  * typicalLeaseMs is the median duration of the leases that were released; with
- * none to learn from, two epochs plus three minutes (a restart and one soak
- * epoch), or 15 minutes without a known epoch length.
+ * none to learn from, two epochs plus three minutes (a restart and one epoch
+ * of ready check), or 15 minutes without a known epoch length.
  */
 export function typicalLeaseMs(leases: readonly Lease[], epochSeconds: number): number {
   const took = leases
@@ -86,15 +93,22 @@ export function typicalLeaseMs(leases: readonly Lease[], epochSeconds: number): 
   return median(took) ?? (epochSeconds > 0 ? (2 * epochSeconds + 180) * 1000 : 15 * 60 * 1000);
 }
 
-/** StageOf is a host's stage in a rollout (fleet.Stage), or undefined when unknown. */
+/**
+ * StageOf is a host's stage in a rollout (fleet.Stage, in serving order: 1
+ * repair, the members carried over as failed; 2 canary; 3 rest), or undefined
+ * when unknown. A host waits for its place in the order behind the hosts of
+ * an earlier stage.
+ */
 export type StageOf = (rollout: string, host: string) => number | undefined;
 
 /**
  * splitQueue separates the queued hosts that start without anybody acting
  * from the rest. A host that waits for its place in a rollout's order is only
  * in the first group if nothing ahead of it in that rollout is stuck: behind
- * a held, silent or unapproved host of an earlier stage it waits as long as
- * that host does.
+ * a carried host or a canary that waits for the gate or an approval it waits
+ * as long as that host does. A host that is held, silent or reports a verb
+ * its agent does not allow holds nobody back: the scheduler does not make
+ * anybody wait for it.
  */
 export function splitQueue(
   queue: readonly QueueEntry[],
@@ -113,12 +127,14 @@ export function splitQueue(
     const rollouts = q.rollout ? [q.rollout] : list(q.rollouts);
     const blocked =
       q.wait === 'order' &&
-      stuck.some(s =>
-        rollouts.some(r => {
-          const mine = stageOf(r, q.host);
-          const theirs = list(s.rollouts).includes(r) ? stageOf(r, s.host) : undefined;
-          return mine !== undefined && theirs !== undefined && theirs < mine;
-        })
+      stuck.some(
+        s =>
+          holdsBack(s.wait) &&
+          rollouts.some(r => {
+            const mine = stageOf(r, q.host);
+            const theirs = list(s.rollouts).includes(r) ? stageOf(r, s.host) : undefined;
+            return mine !== undefined && theirs !== undefined && theirs < mine;
+          })
       );
 
     if (blocked) {
@@ -181,15 +197,21 @@ interface Item {
  * assumption: every lease takes typicalMs. Like the scheduler it walks the
  * queue in order at every step and starts each host that fits the host limit
  * and the weight budget, skipping the ones that do not. A host that waits for
- * its place in the order ("after canary x") starts once the hosts of earlier
- * stages in its rollout are done.
+ * its place in the order ("after x", "after canary x") starts once the hosts
+ * of the earlier stages of its rollout (the carried hosts, the canary) are
+ * done. When the host it waits for is neither in the queue nor holds a lease
+ * (it is expected to report its need, and nobody knows when it will), the
+ * waiting host gets no slot and is counted as late.
  */
 export function forecast(input: ForecastInput): Forecast {
   const { now, typicalMs, budget } = input;
   const stageOf: StageOf = input.stageOf ?? (() => undefined);
-  const ordered = [...input.queue].filter(q => clearsByItself(q.wait)).sort((a, b) => a.position - b.position);
+  const queued = [...input.queue].filter(q => clearsByItself(q.wait)).sort((a, b) => a.position - b.position);
+  // A host that waits for one that is not here yet starts nobody knows when.
+  const here = new Set([...input.active.map(a => a.host), ...queued.map(q => q.host)]);
+  const ordered = queued.filter(q => q.wait !== 'order' || q.after === undefined || here.has(q.after));
   let pending = ordered.slice(0, MAX_CANDIDATES);
-  let late = ordered.length - pending.length;
+  let late = queued.length - pending.length;
 
   const items: Item[] = input.active.map(a => ({
     host: a.host,

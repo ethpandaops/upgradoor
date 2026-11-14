@@ -96,9 +96,8 @@ func (s *service) manual(ctx context.Context, actor string, req *manualRequest) 
 		}
 
 		res.Hosts = append(res.Hosts, h.Name)
-		hv := hostView{h: h, weight: h.Weight()}
 		r.Hosts = append(r.Hosts, fleet.RolloutHost{
-			Host: h.Name, State: fleet.HostExpected, Stage: hv.class(), UpdatedAt: now,
+			Host: h.Name, State: fleet.HostExpected, Stage: fleet.StageRest, UpdatedAt: now,
 		})
 
 		for _, c := range containers {

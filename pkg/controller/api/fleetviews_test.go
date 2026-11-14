@@ -332,7 +332,7 @@ func TestPlan(t *testing.T) {
 
 func TestSettings(t *testing.T) {
 	defaults := fleet.DefaultSettings()
-	defaults.SoakEpochs = 2
+	defaults.ReadyEpochs = 2
 
 	h := newHarness(t, func(o *Options) { o.DefaultSettings = defaults })
 

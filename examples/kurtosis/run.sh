@@ -227,7 +227,7 @@ mkdir -p "$work/data"
     --auth-provider-url "$auth" \
     "${beacon_args[@]}" \
     --default-setting maxUnavailablePercent=25 \
-    --default-setting soakEpochs=1 \
+    --default-setting readyEpochs=1 \
     --default-setting leaseTtl=5m \
     --default-setting readinessTimeout=6m \
     --default-setting hostStaleAfter=1m \
@@ -359,8 +359,9 @@ api /api/v1/rollouts | jq --arg id "$rb" '.recent[] | select(.id == $id)' >"$wor
 jq -e '.canary != "" and ([.hosts[] | select(.state == "done")] | length) == 4' \
     "$work/rollout-b.json" >/dev/null || die "rollout B: not four done hosts with a canary"
 
-# Leases for B, oldest first: one host at a time, the canary first, each
-# released (validators attesting again) before the next was granted.
+# Leases for B, oldest first: one host at a time (the host limit is 1 for
+# four hosts), the canary first, each released (node at head with peers,
+# validators attesting again) before the next was granted.
 api "/api/v1/audit?limit=1000" | jq '[.entries[] | select(.action | startswith("lease."))] | reverse' \
     >"$work/audit-leases.json"
 jq -e --arg c "$(jq -r .canary "$work/rollout-b.json")" '
@@ -374,10 +375,10 @@ jq -e --arg c "$(jq -r .canary "$work/rollout-b.json")" '
 pass "B rolled host by host: canary first, never more than one lease, each released before the next"
 
 jq -e '[.[] | select(.action == "lease.released") | .detail.readiness
-        | test("^1 of 1 epochs with at least [0-9]+ of 32 validators attesting$")] | length == 4 and all' \
+        | . == "ready: node at head with peers, validators attesting"] | length == 4 and all' \
     "$work/audit-leases.json" >/dev/null ||
-    die "a lease was released without attestation-based readiness: $(jq -c '[.[] | select(.action == "lease.released") | .detail]' "$work/audit-leases.json")"
-pass "every slot was released on attestation-based readiness"
+    die "a lease was released without the node and attestation readiness check: $(jq -c '[.[] | select(.action == "lease.released") | .detail]' "$work/audit-leases.json")"
+pass "every slot was released with the node at head with peers and the validators attesting"
 
 # --- C: a broken build -------------------------------------------------------
 
@@ -452,9 +453,9 @@ wait_until "node-4 hold lifted" 60 jq_true /api/v1/hosts/node-4 '.hold.controlle
 [ "$(cat "$work/max-open-leases" 2>/dev/null || echo 0)" -le 1 ] || die "more than one lease was open at once"
 pass "roll now, hold, pause/resume and a staggered roll all worked, still one lease at a time"
 
-api /api/v1/settings | jq '.settings | .soakEpochs = 2 | .policyReboot = "auto"' >"$work/settings.json"
+api /api/v1/settings | jq '.settings | .readyEpochs = 2 | .minPeers = 2 | .policyReboot = "auto"' >"$work/settings.json"
 post /api/v1/settings "$(cat "$work/settings.json")" PUT >/dev/null
-jq_true /api/v1/settings '.settings.soakEpochs == 2 and .defaults.soakEpochs == 1' || die "settings change not stored"
+jq_true /api/v1/settings '.settings.readyEpochs == 2 and .defaults.readyEpochs == 1 and .settings.minPeers == 2 and .defaults.minPeers == 3' || die "settings change not stored"
 
 api "/api/v1/audit?limit=1000" >"$work/audit.json"
 for action in settings.update action.roll action.hold action.unhold action.pause action.resume; do
@@ -462,7 +463,8 @@ for action in settings.update action.roll action.hold action.unhold action.pause
         "$work/audit.json" >/dev/null || die "audit log has no $action by e2e@example.com"
 done
 jq -e 'any(.entries[]; .action == "settings.update"
-        and .detail.before.soakEpochs == 1 and .detail.after.soakEpochs == 2)' \
+        and .detail.before.readyEpochs == 1 and .detail.after.readyEpochs == 2
+        and .detail.before.minPeers == 3 and .detail.after.minPeers == 2)' \
     "$work/audit.json" >/dev/null || die "settings change is not audited with before and after"
 for action in host.registered rollout.created rollout.halted rollout.completed lease.granted lease.released lease.failed; do
     jq -e --arg a "$action" 'any(.entries[]; .action == $a)' "$work/audit.json" >/dev/null ||

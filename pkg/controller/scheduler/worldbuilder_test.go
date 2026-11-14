@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"maps"
 	"slices"
 	"testing"
 	"time"
@@ -92,7 +93,7 @@ func (b *worldBuilder) host(name string, weight uint64, roles ...string) *fleet.
 	h := &fleet.Host{
 		Name:      name,
 		Roles:     roles,
-		FirstSeen: b.w.Now,
+		FirstSeen: b.w.Now.Add(-24 * time.Hour),
 		LastSeen:  b.w.Now,
 		Status:    &protocol.SyncRequest{Verbs: slices.Clone(allVerbs)},
 	}
@@ -128,6 +129,15 @@ func (b *worldBuilder) live(epoch uint64, name string, live uint64) {
 	b.w.Liveness = append(b.w.Liveness, fleet.Liveness{
 		Host: name, Epoch: epoch, Live: live, Total: h.Weight(),
 	})
+}
+
+// down makes the host established as offline: none of its validators
+// attested in the two newest complete epochs, nor will they in the ones that
+// autoLive fills in.
+func (b *worldBuilder) down(name string) {
+	b.liveOverride[name] = 0
+	b.live(b.w.Health.LivenessEpoch, name, 0)
+	b.live(b.w.Health.LivenessEpoch-1, name, 0)
 }
 
 // advance moves the clock; every host that is not in silent syncs at the new
@@ -205,6 +215,17 @@ func applyOutcome(w *World, out *Outcome) {
 			}
 
 			w.ClosedLeases[l.ID] = l
+
+			// As the service does: remember when the host's last lease ended.
+			if l.EndedAt != nil && l.EndedAt.After(w.LastLeaseEnd[l.Host]) {
+				ended := maps.Clone(w.LastLeaseEnd)
+				if ended == nil {
+					ended = map[string]time.Time{}
+				}
+
+				ended[l.Host] = *l.EndedAt
+				w.LastLeaseEnd = ended
+			}
 		} else {
 			delete(w.ClosedLeases, l.ID)
 			w.Leases = append(w.Leases, l)
@@ -417,4 +438,18 @@ func auditActions(out *Outcome) []string {
 	}
 
 	return actions
+}
+
+// closedOrOpen returns the rollout with the key, open or closed.
+func (b *worldBuilder) closedOrOpen(key string) *fleet.Rollout {
+	b.t.Helper()
+
+	if r := b.rollout(key); r != nil {
+		return r
+	}
+
+	r := b.closed(key)
+	require.NotNil(b.t, r, "no rollout %s", key)
+
+	return r
 }

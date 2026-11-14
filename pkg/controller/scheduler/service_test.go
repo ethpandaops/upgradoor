@@ -217,7 +217,7 @@ func TestServiceAssignment(t *testing.T) {
 
 	b := h.assignment("b")
 	assert.Nil(t, b.Lease)
-	assert.Equal(t, &protocol.Queue{Position: 1, Reason: "host limit 1 of 1"}, b.Queue)
+	assert.Equal(t, &protocol.Queue{Position: 1, Reason: "after canary a"}, b.Queue)
 
 	idle := h.assignment("idle")
 	assert.Nil(t, idle.Lease)
@@ -310,6 +310,39 @@ func TestServiceRestartChangesNothing(t *testing.T) {
 	h.tick()
 	assert.Equal(t, dump, h.store.dump(), "a rebuilt scheduler decides nothing new")
 	assert.Equal(t, plan, h.svc.Plan())
+}
+
+// TestServiceKnowsWhenAHostsLastLeaseEnded: the repair exception of the gate
+// asks when a host's last lease ended. The service follows its own writes and
+// reads the leases once after a start and after a failed write.
+func TestServiceKnowsWhenAHostsLastLeaseEnded(t *testing.T) {
+	ctx := context.Background()
+	h := newHarness(t)
+	h.addHost("a", 10, packagesNeed("2.0"))
+	h.addHost("b", 10, packagesNeed("2.0"))
+	h.advance(0)
+	h.tick()
+	require.NotNil(t, h.assignment("a").Lease)
+
+	w, err := h.svc.loadWorld(ctx)
+	require.NoError(t, err)
+	assert.Empty(t, w.LastLeaseEnd, "nobody has had a lease that ended")
+
+	h.failLease("a")
+	ended := h.now
+
+	for _, how := range []string{"follows its write", "after a restart", "after a failed write"} {
+		switch how {
+		case "after a restart":
+			h.restart()
+		case "after a failed write":
+			h.svc.hist = history{}
+		}
+
+		w, err = h.svc.loadWorld(ctx)
+		require.NoError(t, err, how)
+		assert.Equal(t, map[string]time.Time{"a": ended}, w.LastLeaseEnd, how)
+	}
 }
 
 // TestServiceRestartAfterAnOutage: a controller that was down for longer
@@ -677,9 +710,10 @@ func TestRebootAction(t *testing.T) {
 
 	r := h.rollout(res.Rollout)
 	assert.False(t, r.Force)
-	assert.Equal(t, fleet.StageBootnodes, r.Host("boot").Stage)
-	assert.Equal(t, fleet.StageNoValidators, r.Host("tool").Stage)
-	assert.Equal(t, fleet.StageBatches, r.Host("v1").Stage)
+
+	for i := range r.Hosts {
+		assert.Equal(t, fleet.StageRest, r.Hosts[i].Stage, "the canary is chosen by the scheduler")
+	}
 
 	// Every agent accepts and reports the manual need.
 	for _, name := range res.Hosts {
@@ -696,27 +730,32 @@ func TestRebootAction(t *testing.T) {
 		})
 	}
 
-	// The staggered rollout runs through the normal stages.
-	order := make([]string, 0, 4)
-
-	for range 4 {
-		h.tick()
-
-		leased := ""
+	// The staggered rollout runs its two stages: the canary alone, then the
+	// rest at once, the bootnode among them.
+	leased := func() []string {
+		out := make([]string, 0, len(res.Hosts))
 
 		for _, name := range res.Hosts {
 			if h.assignment(name).Lease != nil {
-				require.Empty(t, leased, "one host at a time here")
-				leased = name
+				out = append(out, name)
 			}
 		}
 
-		require.NotEmpty(t, leased)
-		order = append(order, leased)
-		h.finish(leased)
+		return out
 	}
 
-	assert.Equal(t, []string{"tool", "v1", "v2", "boot"}, order)
+	h.tick()
+	require.Equal(t, []string{"v1"}, leased())
+	assert.Equal(t, "v1", h.rollout(res.Rollout).Canary)
+	assert.Equal(t, fleet.StageCanary, h.rollout(res.Rollout).Host("v1").Stage)
+
+	h.finish("v1")
+	require.Equal(t, []string{"boot", "tool", "v2"}, leased())
+
+	for _, name := range leased() {
+		h.finish(name)
+	}
+
 	assert.Equal(t, fleet.RolloutCompleted, h.rollout(res.Rollout).State)
 	assert.Empty(t, h.openRollouts(), "manual needs open no observed-cause rollout")
 }

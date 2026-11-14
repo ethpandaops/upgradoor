@@ -17,19 +17,20 @@ func TestParseDefaultSettings(t *testing.T) {
 
 	s, err = ParseDefaultSettings([]string{
 		"maxUnavailablePercent=25", "leaseTtl=10m", "policyReboot=auto",
-		"soakEpochs=2", "paused=true", `policyImage="manual"`,
+		"readyEpochs=2", "minPeers=5", "paused=true", `policyImage="manual"`,
 	})
 	require.NoError(t, err)
 	assert.InDelta(t, 25.0, s.MaxUnavailablePercent, 0)
 	assert.Equal(t, 10*time.Minute, s.LeaseTTL.Std())
 	assert.Equal(t, fleet.PolicyAuto, s.PolicyReboot)
 	assert.Equal(t, fleet.PolicyManual, s.PolicyImage)
-	assert.Equal(t, uint64(2), s.SoakEpochs)
+	assert.Equal(t, uint64(2), s.ReadyEpochs)
+	assert.Equal(t, 5, s.MinPeers)
 	assert.True(t, s.Paused)
 
 	for _, bad := range []string{
 		"nokey", "=1", "unknown=1", "leaseTtl=30", "maxUnavailablePercent=200",
-		"policyImage=sometimes", "soakEpochs=many",
+		"policyImage=sometimes", "readyEpochs=many", "minPeers=0",
 	} {
 		_, err := ParseDefaultSettings([]string{bad})
 		require.Error(t, err, bad)
