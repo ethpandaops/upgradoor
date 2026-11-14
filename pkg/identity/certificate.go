@@ -1,7 +1,7 @@
 package identity
 
 import (
-	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
@@ -17,12 +17,12 @@ const (
 	Issuer = "upgradoor-signer"
 
 	// certHeader is the fixed JOSE header of a host certificate.
-	certHeader = `{"alg":"EdDSA","typ":"JWT"}`
+	certHeader = `{"alg":"` + Algorithm + `","typ":"JWT"}`
 	// proofHeader is the fixed JOSE header of a request proof.
-	proofHeader = `{"alg":"EdDSA","typ":"upgradoor-proof+jwt"}`
+	proofHeader = `{"alg":"` + Algorithm + `","typ":"upgradoor-proof+jwt"}`
 
-	jwkKeyType = "OKP"
-	jwkCurve   = "Ed25519"
+	// jwkKeyType is the JWK key type of ML-DSA keys ("algorithm key pair").
+	jwkKeyType = "AKP"
 )
 
 var (
@@ -50,11 +50,11 @@ func (r *ValidatorRange) Count() uint64 {
 	return r.End - r.Start
 }
 
-// JWK is the Ed25519 public key in JWK form.
+// JWK is the ML-DSA public key in JWK form.
 type JWK struct {
 	Kty string `json:"kty"`
-	Crv string `json:"crv"`
-	X   string `json:"x"`
+	Alg string `json:"alg"`
+	Pub string `json:"pub"`
 }
 
 // Confirmation is the "cnf" claim binding the certificate to the host key.
@@ -75,12 +75,12 @@ type Claims struct {
 }
 
 // HostKey returns the host public key the certificate is bound to.
-func (c *Claims) HostKey() (ed25519.PublicKey, error) {
-	if c.Cnf.JWK.Kty != jwkKeyType || c.Cnf.JWK.Crv != jwkCurve {
+func (c *Claims) HostKey() (*mldsa.PublicKey, error) {
+	if c.Cnf.JWK.Kty != jwkKeyType || c.Cnf.JWK.Alg != Algorithm {
 		return nil, fmt.Errorf("%w: unsupported cnf key type", ErrBadCertificate)
 	}
 
-	pub, err := DecodePublicKey(c.Cnf.JWK.X)
+	pub, err := DecodePublicKey(c.Cnf.JWK.Pub)
 	if err != nil {
 		return nil, fmt.Errorf("%w: cnf key: %w", ErrBadCertificate, err)
 	}
@@ -123,7 +123,7 @@ func IssueCertificate(seed []byte, spec CertificateSpec) (string, error) {
 
 // SignCertificate signs a certificate for hostKey with the signer key.
 func SignCertificate(
-	signer ed25519.PrivateKey, hostKey ed25519.PublicKey, spec CertificateSpec,
+	signer *mldsa.PrivateKey, hostKey *mldsa.PublicKey, spec CertificateSpec,
 ) (string, error) {
 	if err := ValidateName(spec.Network); err != nil {
 		return "", err
@@ -156,8 +156,8 @@ func SignCertificate(
 		Subject: spec.Hostname,
 		Cnf: Confirmation{JWK: JWK{
 			Kty: jwkKeyType,
-			Crv: jwkCurve,
-			X:   EncodePublicKey(hostKey),
+			Alg: Algorithm,
+			Pub: EncodePublicKey(hostKey),
 		}},
 		Generation: spec.Generation,
 		Validators: spec.Validators,
@@ -172,7 +172,7 @@ func SignCertificate(
 		return "", fmt.Errorf("identity: encode claims: %w", err)
 	}
 
-	return signCompact(signer, certHeader, payload), nil
+	return signCompact(signer, certHeader, payload)
 }
 
 // Certificate is a verified host certificate.
@@ -187,7 +187,7 @@ type Certificate struct {
 // VerifyCertificate checks the signer signature and the claims of raw and
 // that it was issued for network.
 func VerifyCertificate(
-	signer ed25519.PublicKey, network, raw string,
+	signer *mldsa.PublicKey, network, raw string,
 ) (*Certificate, error) {
 	payload, err := verifyCompact(signer, certHeader, raw)
 	if err != nil {
@@ -233,20 +233,26 @@ func CertificateHash(raw string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// signCompact returns header.payload.signature in JWS compact form.
-func signCompact(key ed25519.PrivateKey, header string, payload []byte) string {
+// signCompact returns header.payload.signature in JWS compact form. The
+// signature is the deterministic ML-DSA variant, so the same input always
+// yields the same token.
+func signCompact(key *mldsa.PrivateKey, header string, payload []byte) (string, error) {
 	enc := base64.RawURLEncoding
 	signingInput := enc.EncodeToString([]byte(header)) + "." + enc.EncodeToString(payload)
-	sig := ed25519.Sign(key, []byte(signingInput))
 
-	return signingInput + "." + enc.EncodeToString(sig)
+	sig, err := key.SignDeterministic([]byte(signingInput), nil)
+	if err != nil {
+		return "", fmt.Errorf("identity: sign: %w", err)
+	}
+
+	return signingInput + "." + enc.EncodeToString(sig), nil
 }
 
 // verifyCompact verifies a JWS in compact form against key and returns the
 // decoded payload. The header must equal wantHeader byte for byte: there is
 // exactly one algorithm and one type per token kind, so nothing is negotiated.
-func verifyCompact(key ed25519.PublicKey, wantHeader, raw string) ([]byte, error) {
-	if len(key) != ed25519.PublicKeySize {
+func verifyCompact(key *mldsa.PublicKey, wantHeader, raw string) ([]byte, error) {
+	if key == nil {
 		return nil, errors.New("invalid verification key")
 	}
 
@@ -276,7 +282,7 @@ func verifyCompact(key ed25519.PublicKey, wantHeader, raw string) ([]byte, error
 		return nil, errors.New("malformed signature")
 	}
 
-	if !ed25519.Verify(key, []byte(parts[0]+"."+parts[1]), sig) {
+	if mldsa.Verify(key, []byte(parts[0]+"."+parts[1]), sig, nil) != nil {
 		return nil, errors.New("signature mismatch")
 	}
 

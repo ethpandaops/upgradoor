@@ -60,6 +60,14 @@ one place to see which host runs what.
 - **One seed per devnet**, `secret_upgradoor_seed` in the devnet's sops file.
   Ansible derives the signer key and one key per host from it. The seed never
   reaches a host or the cluster. A host holds only its own key.
+- **Post-quantum host identity.** Signer and host keys are ML-DSA-44
+  (FIPS 204, Go `crypto/mldsa`), and nothing else: no hybrid with a classical
+  signature. Host certificates and request proofs are ML-DSA-44 signatures,
+  because signatures of the elliptic-curve class are not safe against a
+  quantum attacker. The derivation from the seed (HKDF-SHA256) is symmetric
+  and not affected. Two things are outside upgradoor's control and are not
+  post-quantum: the user-login tokens, which the authenticatoor issues and
+  signs (RS256), and TLS, which is the ingress's.
 - **Closed verb set.** An agent can do three things, each only under a lease
   and only if its local configuration allows the verb: `roll` a managed
   container, upgrade the configured blocked `packages`, `reboot`. The
@@ -94,7 +102,7 @@ Known limits of the model are listed in [docs/protocol.md](docs/protocol.md#limi
 
 ## Build, test, lint
 
-Needs Go 1.26.10 or newer. The web UI needs Node 24.
+Needs Go 1.27 or newer (`crypto/mldsa`). The web UI needs Node 24.
 
 ```sh
 make build        # bin/upgradoor with the web UI embedded (builds web/dist if missing)

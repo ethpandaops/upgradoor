@@ -1,7 +1,7 @@
 package identity
 
 import (
-	"crypto/ed25519"
+	"crypto/mldsa"
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
@@ -60,24 +60,24 @@ func BodyHash(body []byte) string {
 
 // SignProof signs claims with the host key. It is deterministic; use
 // Credentials.Proof for real requests.
-func SignProof(key ed25519.PrivateKey, claims *ProofClaims) (string, error) {
+func SignProof(key *mldsa.PrivateKey, claims *ProofClaims) (string, error) {
 	payload, err := json.Marshal(claims)
 	if err != nil {
 		return "", fmt.Errorf("identity: encode proof: %w", err)
 	}
 
-	return signCompact(key, proofHeader, payload), nil
+	return signCompact(key, proofHeader, payload)
 }
 
 // Credentials are an agent's key and certificate.
 type Credentials struct {
-	key  ed25519.PrivateKey
+	key  *mldsa.PrivateKey
 	cert string
 }
 
 // NewCredentials pairs a host key with its certificate. It checks that the
 // certificate is bound to the key; it cannot check the signer signature.
-func NewCredentials(key ed25519.PrivateKey, cert string) (*Credentials, error) {
+func NewCredentials(key *mldsa.PrivateKey, cert string) (*Credentials, error) {
 	claims, err := UnverifiedClaims(cert)
 	if err != nil {
 		return nil, err
@@ -151,7 +151,7 @@ type Request struct {
 
 // Verifier authenticates agent requests for one network.
 type Verifier struct {
-	signer  ed25519.PublicKey
+	signer  *mldsa.PublicKey
 	network string
 	skew    time.Duration
 	now     func() time.Time
@@ -175,7 +175,7 @@ func WithClockSkew(skew time.Duration) VerifierOption {
 
 // NewVerifier returns a verifier that accepts certificates signed by signer
 // for network.
-func NewVerifier(signer ed25519.PublicKey, network string, opts ...VerifierOption) *Verifier {
+func NewVerifier(signer *mldsa.PublicKey, network string, opts ...VerifierOption) *Verifier {
 	v := &Verifier{
 		signer:  signer,
 		network: network,
@@ -240,7 +240,7 @@ func (v *Verifier) Verify(cert, proof string, req Request) (*Certificate, error)
 		return nil, fmt.Errorf("%w: body hash", ErrProofMismatch)
 	}
 
-	if !v.remember(c.Cnf.JWK.X+"/"+claims.ID, claims.ExpiresAt+skew, now.Unix()) {
+	if !v.remember(c.Hash+"/"+claims.ID, claims.ExpiresAt+skew, now.Unix()) {
 		return nil, ErrProofReplayed
 	}
 

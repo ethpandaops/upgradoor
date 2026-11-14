@@ -2,7 +2,7 @@ package identity
 
 import (
 	"bytes"
-	"crypto/ed25519"
+	"crypto/mldsa"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -62,7 +62,7 @@ func TestVectors(t *testing.T) {
 			assert.Equal(t, v.Hostname, cert.Subject)
 			assert.Equal(t, v.Generation, cert.Generation)
 			assert.Equal(t, v.Validators, cert.Validators)
-			assert.Equal(t, v.HostPublicKey, cert.Cnf.JWK.X)
+			assert.Equal(t, v.HostPublicKey, cert.Cnf.JWK.Pub)
 			assert.Equal(t, v.CertificateHash, cert.Hash)
 
 			key, err := DecodePrivateKey(v.HostKey)
@@ -95,7 +95,7 @@ func TestCertificateEncoding(t *testing.T) {
 
 	header, err := base64.RawURLEncoding.DecodeString(parts[0])
 	require.NoError(t, err)
-	assert.Equal(t, `{"alg":"EdDSA","typ":"JWT"}`, string(header))
+	assert.Equal(t, `{"alg":"ML-DSA-44","typ":"JWT"}`, string(header))
 
 	host, err := DeriveHostKey([]byte(testSeed), "net", "host-1", 0)
 	require.NoError(t, err)
@@ -103,7 +103,7 @@ func TestCertificateEncoding(t *testing.T) {
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	require.NoError(t, err)
 	assert.Equal(t, `{"iss":"upgradoor-signer","net":"net","sub":"host-1",`+
-		`"cnf":{"jwk":{"kty":"OKP","crv":"Ed25519","x":"`+EncodePublicKey(PublicKey(host))+`"}},`+
+		`"cnf":{"jwk":{"kty":"AKP","alg":"ML-DSA-44","pub":"`+EncodePublicKey(PublicKey(host))+`"}},`+
 		`"gen":0,"val":{"start":0,"end":100},"roles":["a","b"]}`, string(payload))
 
 	noVal, err := IssueCertificate([]byte(testSeed), CertificateSpec{
@@ -131,7 +131,7 @@ func TestDerivationIsolation(t *testing.T) {
 	signer, err := DeriveSignerKey(seed, "net")
 	require.NoError(t, err)
 
-	keys := []ed25519.PrivateKey{a, b, a1, other, signer}
+	keys := []*mldsa.PrivateKey{a, b, a1, other, signer}
 	for i := range keys {
 		for j := i + 1; j < len(keys); j++ {
 			assert.False(t, keys[i].Equal(keys[j]))
@@ -150,7 +150,7 @@ func TestDerivationIsolation(t *testing.T) {
 }
 
 type fixture struct {
-	signer   ed25519.PublicKey
+	signer   *mldsa.PublicKey
 	creds    *Credentials
 	verifier *Verifier
 	now      time.Time

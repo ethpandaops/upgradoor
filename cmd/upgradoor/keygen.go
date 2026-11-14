@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 
@@ -166,7 +167,44 @@ func newKeygenCmd() *cobra.Command {
 		},
 	}
 
-	cmd.AddCommand(signer, hostKey, hostCert, vectors)
+	var signerKey string
+
+	verify := &cobra.Command{
+		Use:   "verify-cert",
+		Short: "Verify a host certificate read from standard input and print its claims (no seed needed)",
+		Long: "Verify a host certificate read from standard input against a signer public key\n" +
+			"and print its claims as JSON. Needs no seed. Certificates issued by the Ansible\n" +
+			"filter plugin carry a randomized signature, so they are compared by verifying\n" +
+			"them, not byte for byte.",
+		RunE: func(c *cobra.Command, _ []string) error {
+			if network == "" {
+				return errors.New("--network is required")
+			}
+
+			pub, err := identity.DecodePublicKey(signerKey)
+			if err != nil {
+				return fmt.Errorf("--signer-public-key: %w", err)
+			}
+
+			raw, err := io.ReadAll(io.LimitReader(c.InOrStdin(), 64<<10))
+			if err != nil {
+				return fmt.Errorf("read certificate: %w", err)
+			}
+
+			cert, err := identity.VerifyCertificate(pub, network, strings.TrimSpace(string(raw)))
+			if err != nil {
+				return err
+			}
+
+			enc := json.NewEncoder(c.OutOrStdout())
+			enc.SetEscapeHTML(false)
+
+			return enc.Encode(cert.Claims)
+		},
+	}
+	verify.Flags().StringVar(&signerKey, "signer-public-key", "", "signer public key (required)")
+
+	cmd.AddCommand(signer, hostKey, hostCert, verify, vectors)
 
 	return cmd
 }

@@ -40,7 +40,7 @@ type Config struct {
 	DataDir string
 	// Network is the network name certificates must be issued for.
 	Network string
-	// SignerPublicKey is the unpadded base64url Ed25519 signer public key.
+	// SignerPublicKey is the unpadded base64url ML-DSA-44 signer public key.
 	SignerPublicKey string
 	// PublicURLs are the base URLs agents reach the controller under.
 	PublicURLs []string
