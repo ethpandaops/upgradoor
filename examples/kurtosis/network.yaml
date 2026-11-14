@@ -1,0 +1,32 @@
+# ethereum-package arguments for the end-to-end devnet: four nodes, each a
+# geth execution client, a lighthouse beacon node and a separate lighthouse
+# validator client. Lighthouse comes from the example's own registry so the
+# run can publish new builds of it under one tag.
+participants:
+  - el_type: geth
+    # A fixed release, so no geth rollout starts during the run.
+    el_image: ethereum/client-go:v1.17.6
+    cl_type: lighthouse
+    # The tag upgradoor follows. run.sh pushes builds A, B, C and D to it.
+    cl_image: localhost:5055/lighthouse:example
+    # The validator client runs the same image, so every host has two
+    # containers in each lighthouse rollout.
+    vc_image: localhost:5055/lighthouse:example
+    count: 4
+    # Validators per node: each host's weight. Keys are assigned in order,
+    # so node i holds indices [32*(i-1), 32*i).
+    validator_count: 32
+    supernode: true
+
+network_params:
+  # Short slots and epochs so readiness (one full epoch of attestations
+  # after a roll) takes about a minute.
+  preset: minimal
+  seconds_per_slot: 6
+
+# Keep each client's data in a volume: upgradoor recreates containers, and a
+# recreated node must keep its database and identity. Real devnet hosts keep
+# data on the host.
+persistent: true
+
+additional_services: []

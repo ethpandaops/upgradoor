@@ -1,0 +1,9 @@
+# One "host" of the end-to-end devnet: a Debian system with the upgradoor
+# binary. The agent in it manages three containers of the Kurtosis enclave
+# through the Docker socket. Its package inventory is this image's, and it
+# has no systemd, so nothing on the real machine can be upgraded or rebooted.
+FROM debian:13-slim
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl && \
+    rm -rf /var/lib/apt/lists/*
+COPY upgradoor /usr/local/bin/upgradoor
+ENTRYPOINT ["/usr/local/bin/upgradoor"]

@@ -397,6 +397,7 @@ func upsertLease(ctx context.Context, tx *sql.Tx, lease *fleet.Lease) error {
 	stored.GrantedAt = storedTime(stored.GrantedAt)
 	stored.ExpiresAt = storedTime(stored.ExpiresAt)
 	stored.AgentDoneAt = storedTimePtr(stored.AgentDoneAt)
+	stored.SyncedSince = storedTimePtr(stored.SyncedSince)
 	stored.EndedAt = storedTimePtr(stored.EndedAt)
 
 	if lease.Operation != nil {

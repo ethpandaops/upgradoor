@@ -212,6 +212,11 @@ type Lease struct {
 	ExpiresAt time.Time `json:"expiresAt"`
 	// AgentDoneAt is when the agent first reported a terminal phase.
 	AgentDoneAt *time.Time `json:"agentDoneAt,omitempty"`
+	// SyncedSince is the start of the current unbroken run of syncs, after
+	// the agent's done report, in which the host's probes reported synced.
+	// It is what the probe readiness rule measures; nil while there is no
+	// such run.
+	SyncedSince *time.Time `json:"syncedSince,omitempty"`
 	EndedAt     *time.Time `json:"endedAt,omitempty"`
 
 	// Operation is the agent's last report for this lease.
