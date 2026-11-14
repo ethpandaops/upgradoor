@@ -13,8 +13,17 @@ build: ensure-web
 build-web:
 	cd web && npm ci && npm run build
 
-ensure-web:
-	@if [ ! -f web/dist/index.html ]; then $(MAKE) build-web; fi
+# The built UI is rebuilt whenever one of its sources is newer than it, so
+# the binary never embeds a stale page.
+WEB_SOURCES := $(shell find web/src web/public -type f 2>/dev/null) \
+	web/index.html web/package.json web/package-lock.json web/vite.config.ts \
+	web/tsconfig.json web/tsconfig.node.json
+
+web/dist/index.html: $(WEB_SOURCES)
+	$(MAKE) build-web
+	@touch $@
+
+ensure-web: web/dist/index.html
 
 test: test-go test-web
 

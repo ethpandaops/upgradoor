@@ -106,8 +106,31 @@ const CUSTOM_BADGE = (
  * ImageCell shows an image as tag + short digest + revision, with a "custom"
  * badge. stacked puts the digest below the tag to keep wide tables narrow.
  */
-export function ImageCell({ image, stacked = false }: { image: PublicImageRef | undefined; stacked?: boolean }) {
+export function ImageCell({
+  image,
+  stacked = false,
+  compact = false,
+}: {
+  image: PublicImageRef | undefined;
+  stacked?: boolean;
+  /** compact is one line: the tag without its registry path and the digest. */
+  compact?: boolean;
+}) {
   if (!image) return <Dash />;
+
+  if (compact) {
+    return (
+      <span className="inline-flex items-center gap-2">
+        <span className="max-w-32 truncate font-mono text-xs/5 2xl:max-w-56" title={image.image}>
+          {displayImage(image.image)}
+        </span>
+        <span className="text-xs/5">
+          <Digest value={image.digest} />
+        </span>
+        {image.custom && CUSTOM_BADGE}
+      </span>
+    );
+  }
 
   const ids = (
     <>
@@ -179,6 +202,19 @@ export function NeedLine({ need }: { need: Need }) {
         ))}
       {need.kind === 'reboot' && <span>{list(need.reboot?.reasons).join(', ')}</span>}
       {need.directiveId && <Badge title={`directive ${need.directiveId}`}>manual</Badge>}
+    </span>
+  );
+}
+
+const WORK_LABEL = { image: 'Image roll', packages: 'Package upgrade', reboot: 'Reboot' } as const;
+const WORK_DOT = { image: 'bg-series-image', packages: 'bg-series-packages', reboot: 'bg-series-reboot' } as const;
+
+/** WorkTag names what is done to a host, keyed with the timeline's colour. */
+export function WorkTag({ kind }: { kind: keyof typeof WORK_LABEL }) {
+  return (
+    <span className="inline-flex items-center gap-1.5 text-xs/5 whitespace-nowrap text-muted">
+      <span aria-hidden="true" className={`size-2 rounded-xs ${WORK_DOT[kind]}`} />
+      {WORK_LABEL[kind]}
     </span>
   );
 }

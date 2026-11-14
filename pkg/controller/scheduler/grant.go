@@ -57,6 +57,23 @@ const (
 	rankNext
 )
 
+// waitKinds maps a verdict's rank to the wait kind served in the plan.
+var waitKinds = map[int]WaitKind{
+	rankHeld:          WaitHeld,
+	rankSilent:        WaitSilent,
+	rankPaused:        WaitPaused,
+	rankRolloutPaused: WaitRolloutPaused,
+	rankApproval:      WaitApproval,
+	rankPolicyPaused:  WaitPolicyPaused,
+	rankHalted:        WaitHalted,
+	rankVerb:          WaitVerb,
+	rankGate:          WaitGate,
+	rankOrder:         WaitOrder,
+	rankBudget:        WaitBudget,
+	rankHostLimit:     WaitHostLimit,
+	rankNext:          WaitNext,
+}
+
 // verdict is why one host waits (rankGrantable: it does not).
 type verdict struct {
 	rank   int
@@ -347,15 +364,17 @@ func (g *granter) repairs(hv *hostView) bool {
 }
 
 // consider grants the host a lease for everything grantable, or says what
-// it waits for.
-func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) verdict {
+// it waits for. When the wait is about one rollout (its pause, approval,
+// policy, halt, order, gate or verb), that rollout's ID is returned too; a
+// hold, the global pause and the budget are about none.
+func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, about string) {
 	switch {
 	case hv.held:
-		return verdict{rankHeld, reasonHeld}
+		return verdict{rankHeld, reasonHeld}, ""
 	case hv.stale:
-		return verdict{rankSilent, reasonAgentSilent}
+		return verdict{rankSilent, reasonAgentSilent}, ""
 	case g.p.set.Paused:
-		return verdict{rankPaused, reasonPaused}
+		return verdict{rankPaused, reasonPaused}, ""
 	}
 
 	var (
@@ -364,12 +383,12 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) verdict {
 	)
 
 	for _, r := range rollouts {
-		v, needs := g.evaluate(r, hv)
+		rv, needs := g.evaluate(r, hv)
 
 		switch {
-		case v.rank != rankGrantable:
-			if v.rank > best.rank {
-				best = v
+		case rv.rank != rankGrantable:
+			if rv.rank > best.rank {
+				best, about = rv, r.ID
 			}
 		case r.IgnoreBudget:
 			exempt = append(exempt, part{r, needs})
@@ -379,19 +398,19 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) verdict {
 	}
 
 	if len(normal) > 0 {
-		if v := g.budget.admit(hv.live); v.rank != rankGrantable {
-			best, normal = v, nil
+		if bv := g.budget.admit(hv.live); bv.rank != rankGrantable {
+			best, about, normal = bv, "", nil
 		}
 	}
 
 	parts := slices.Concat(exempt, normal)
 	if len(parts) == 0 {
-		return best
+		return best, about
 	}
 
 	g.lease(hv, parts)
 
-	return verdict{}
+	return verdict{}, ""
 }
 
 // lease creates the lease for one host and books it.
@@ -560,7 +579,7 @@ func (p *pass) grant() *Plan {
 	reasons := make(map[string]string, len(p.hosts))
 
 	for _, w := range p.servingOrder() {
-		v := g.consider(w.hv, w.rollouts)
+		v, about := g.consider(w.hv, w.rollouts)
 		if v.rank == rankGrantable {
 			continue
 		}
@@ -575,6 +594,8 @@ func (p *pass) grant() *Plan {
 			Host:     w.hv.h.Name,
 			Position: len(plan.Queue) + 1,
 			Reason:   v.reason,
+			Wait:     waitKinds[v.rank],
+			Rollout:  about,
 			Rollouts: ids,
 		})
 	}

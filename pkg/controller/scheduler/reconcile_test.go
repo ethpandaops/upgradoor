@@ -220,6 +220,24 @@ func TestHostLimitBoundsHostsWithoutValidators(t *testing.T) {
 	assert.Equal(t, "host limit 2 of 2", queueReasons(out.Plan)["t3"])
 	assert.Equal(t, 1, out.Plan.Queue[0].Position)
 	assert.Equal(t, "t3", out.Plan.Queue[0].Host)
+	assert.Equal(t, WaitHostLimit, out.Plan.Queue[0].Wait)
+}
+
+// Every reason a host can wait for has a wait kind: a client that sorts the
+// queue into "starts by itself" and "needs somebody" must never see a blank.
+func TestEveryWaitingRankHasAKind(t *testing.T) {
+	seen := make(map[WaitKind]bool, len(waitKinds))
+
+	for rank := rankHeld; rank <= rankNext; rank++ {
+		kind, ok := waitKinds[rank]
+		require.True(t, ok, "rank %d has no wait kind", rank)
+		assert.NotEmpty(t, kind)
+		assert.False(t, seen[kind], "wait kind %q is used twice", kind)
+
+		seen[kind] = true
+	}
+
+	assert.NotContains(t, waitKinds, rankGrantable)
 }
 
 func TestGate(t *testing.T) {
@@ -585,6 +603,41 @@ func TestWaitingReasonShowsTheNeedClosestToAGrant(t *testing.T) {
 	// is told about the budget.
 	assert.Equal(t, "budget 8% of 10%", queueReasons(out.Plan)["h"])
 	assert.Len(t, out.Plan.Queue[0].Rollouts, 2)
+	assert.Empty(t, out.Plan.Queue[0].Rollout, "the budget is about no rollout")
+}
+
+// A host in two rollouts waits for one thing; the plan names the rollout
+// that thing is about, so "approve" in a client cannot hit the other one.
+func TestQueueEntryNamesTheRolloutItsReasonIsAbout(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.w.Settings.PolicyReboot = fleet.PolicyManual
+	b.w.Settings.Paused = true
+	b.host("h", 0)
+	b.wants("h", packagesNeed("2.0"), rebootNeed())
+	b.step()
+
+	packages := b.mustRollout(packagesKey("2.0"))
+	packages.Paused = true
+	b.w.Settings.Paused = false
+
+	var reboot *fleet.Rollout
+
+	for _, r := range b.w.Rollouts {
+		if r.Kind == fleet.RolloutReboot {
+			reboot = r
+		}
+	}
+
+	require.NotNil(t, reboot)
+
+	out := b.step()
+
+	require.Len(t, out.Plan.Queue, 1)
+
+	entry := out.Plan.Queue[0]
+	assert.Equal(t, WaitApproval, entry.Wait)
+	assert.Equal(t, reboot.ID, entry.Rollout)
+	assert.ElementsMatch(t, []string{packages.ID, reboot.ID}, entry.Rollouts)
 }
 
 func TestRolloutOpensPerCause(t *testing.T) {

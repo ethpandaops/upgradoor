@@ -62,6 +62,81 @@ func (s *Server) handlePublicNetwork(w http.ResponseWriter, _ *http.Request) {
 	s.writeJSON(w, http.StatusOK, gate)
 }
 
+// History window of GET /api/v1/public/history, in epochs.
+const (
+	defaultHistoryEpochs = 128
+	maxHistoryEpochs     = 512
+)
+
+// handlePublicHistory serves GET /api/v1/public/history?limit=<epochs>. It
+// sums the per-host liveness rows per epoch: which host attested is not
+// public, how much of the network did is.
+func (s *Server) handlePublicHistory(w http.ResponseWriter, r *http.Request) {
+	ctx := r.Context()
+
+	limit, err := queryLimit(r, defaultHistoryEpochs, maxHistoryEpochs)
+	if err != nil {
+		s.writeBadRequest(w, err)
+
+		return
+	}
+
+	rows, err := s.opts.Store.ListLiveness(ctx, limit)
+	if err != nil {
+		s.internalError(w, r, err)
+
+		return
+	}
+
+	settings, err := s.opts.Scheduler.Settings(ctx)
+	if err != nil {
+		s.internalError(w, r, err)
+
+		return
+	}
+
+	health := s.opts.Beacon.Health()
+
+	s.writeJSON(w, http.StatusOK, PublicHistory{
+		Epochs:                  participation(rows, &health),
+		MinParticipationPercent: settings.MinParticipationPercent,
+		EpochSeconds:            health.EpochDuration().Seconds(),
+	})
+}
+
+// participation sums liveness rows per epoch, oldest epoch first. Without a
+// known genesis the points carry the zero time.
+func participation(rows []fleet.Liveness, health *fleet.NetworkHealth) []ParticipationPoint {
+	byEpoch := make(map[uint64]*ParticipationPoint, 64)
+
+	for i := range rows {
+		row := &rows[i]
+
+		point, ok := byEpoch[row.Epoch]
+		if !ok {
+			point = &ParticipationPoint{Epoch: row.Epoch}
+			byEpoch[row.Epoch] = point
+		}
+
+		point.Live += row.Live
+		point.Total += row.Total
+	}
+
+	out := make([]ParticipationPoint, 0, len(byEpoch))
+
+	for _, point := range byEpoch {
+		if duration := health.EpochDuration(); duration > 0 && !health.GenesisTime.IsZero() {
+			point.Time = health.GenesisTime.Add(time.Duration(point.Epoch+1) * duration).UTC()
+		}
+
+		out = append(out, *point)
+	}
+
+	slices.SortFunc(out, func(a, b ParticipationPoint) int { return cmp.Compare(a.Epoch, b.Epoch) })
+
+	return out
+}
+
 // scrubGate removes the beacon service's error text from a gate, both from
 // the network view and from every reason that quotes it.
 func scrubGate(gate *scheduler.Gate) {

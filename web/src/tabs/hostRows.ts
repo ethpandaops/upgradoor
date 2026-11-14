@@ -10,7 +10,7 @@ import {
   type PublicImageRef,
   type QueueEntry,
 } from '../api/types';
-import type { SortDirection } from '../components/primitives';
+import type { SortDirection, Tone } from '../components/primitives';
 
 export interface HostRow {
   name: string;
@@ -64,7 +64,38 @@ export function mergeHostRows(
   return [...rows.values()];
 }
 
-/** matchesFilter reports whether every word of the filter occurs in the row's name, images, roles or slot. */
+/** hostState is the one state a host is in, as the State column shows it. */
+export function hostState(row: HostRow): { tone: Tone; label: string; detail?: string } | undefined {
+  const s = row.summary;
+  if (!s) return undefined;
+
+  switch (s.plan.slot) {
+    case 'leased':
+      return { tone: 'accent', label: 'updating' };
+    case 'verifying':
+      return { tone: 'accent', label: 'verifying' };
+    case 'failed':
+      return { tone: 'danger', label: 'failed', detail: s.plan.reason };
+    case 'held':
+      return { tone: 'warning', label: 'held', detail: s.plan.reason === 'held' ? undefined : s.plan.reason };
+    case 'stale':
+      return { tone: 'warning', label: 'silent', detail: 'the agent stopped syncing' };
+    case 'queued':
+      return {
+        tone: 'info',
+        label: row.queuePosition === undefined ? 'queued' : `queued #${row.queuePosition}`,
+        detail: s.plan.reason,
+      };
+    case 'idle':
+      return list(s.needs).length > 0 ? { tone: 'neutral', label: 'pending' } : undefined;
+  }
+}
+
+/**
+ * matchesFilter reports whether every word of the filter occurs in the row's
+ * name, images, roles or state: the state as the table shows it ("updating",
+ * "silent", "up to date") and the waiting reason.
+ */
 export function matchesFilter(row: HostRow, filter: string): boolean {
   const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
   if (words.length === 0) return true;
@@ -76,7 +107,9 @@ export function matchesFilter(row: HostRow, filter: string): boolean {
     row.cl?.image,
     row.cl?.digest,
     ...list(row.summary?.roles),
-    row.summary?.plan.slot,
+    row.summary ? (hostState(row)?.label ?? 'up to date') : undefined,
+    row.summary?.plan.reason,
+    row.summary?.hold.local ? 'local hold' : undefined,
     row.el?.custom || row.cl?.custom ? 'custom' : undefined,
     row.updatePending ? 'pending' : undefined,
   ]

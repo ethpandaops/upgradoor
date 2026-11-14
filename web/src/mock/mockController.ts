@@ -20,8 +20,10 @@ import {
   type Liveness,
   type Need,
   type PackageMatch,
+  type ParticipationPoint,
   type Packages,
   type Plan,
+  type PublicHistory,
   type PublicHost,
   type PublicHosts,
   type PublicImage,
@@ -37,6 +39,7 @@ import {
   type ScopeRequest,
   type Settings,
   type SettingsBody,
+  type WaitKind,
 } from '../api/types';
 import { formatPercent } from '../lib/format';
 import { parseGoDuration } from '../lib/goDuration';
@@ -49,6 +52,26 @@ export const MOCK_TOKEN = 'mock-token';
 export const MOCK_AUTH_URL = 'https://auth.mock.invalid';
 
 const LIVENESS_EPOCHS = 16;
+/** The controller's default and maximum history window, in epochs. */
+const HISTORY_DEFAULT = 128;
+const HISTORY_MAX = 512;
+
+/** waitKind classifies a waiting reason the way the scheduler does. */
+function waitKind(reason: string): WaitKind {
+  if (reason === 'held') return 'held';
+  if (reason === 'agent silent') return 'silent';
+  if (reason === 'paused') return 'paused';
+  if (reason === 'rollout paused') return 'rollout-paused';
+  if (reason.startsWith('waiting for approval')) return 'approval';
+  if (reason === 'policy paused') return 'policy-paused';
+  if (reason.startsWith('rollout halted')) return 'halted';
+  if (reason.startsWith('network gate')) return 'gate';
+  if (reason.startsWith('verb not allowed')) return 'verb';
+  if (reason.startsWith('after ')) return 'order';
+  if (reason.startsWith('budget ')) return 'budget';
+  if (reason.startsWith('host limit')) return 'host-limit';
+  return 'next';
+}
 
 class HttpError extends Error {
   readonly status: number;
@@ -141,6 +164,8 @@ export class MockController {
           return this.publicImages();
         case 'public/network':
           return this.gate();
+        case 'public/history':
+          return this.history(q.get('limit'));
       }
     }
 
@@ -198,7 +223,7 @@ export class MockController {
     const weight = host.validators;
     if (weight === 0) return 0;
 
-    if (list(host.containers).some(c => c.kind === 'el' && c.state !== 'running')) return back < 14 ? 0 : weight;
+    if (list(host.containers).some(c => c.kind === 'el' && c.state !== 'running')) return back < 27 ? 0 : weight;
     if (host.name === 'lighthouse-geth-2' && this.openLease(host.name))
       return back === 1 || back === 2 ? 0 : weight - 2;
     if (this.data.gateFailing && back < 2 && hash(`gate/${host.name}`) % 4 === 0) return 0;
@@ -215,6 +240,43 @@ export class MockController {
       live: this.liveAt(host, back, newest - back),
       total: host.validators,
     }));
+  }
+
+  /** history sums the hosts' liveness per epoch; a host is dark while it holds (or held) a lease. */
+  private history(raw: string | null): PublicHistory {
+    const limit = raw === null ? HISTORY_DEFAULT : Number(raw);
+    if (!Number.isInteger(limit) || limit < 1) throw new HttpError(400, 'limit must be a positive integer');
+
+    // No rows before genesis.
+    const newest = this.currentEpoch() - 1;
+    const epochs: ParticipationPoint[] = [];
+
+    for (let back = Math.min(limit, HISTORY_MAX, newest + 1) - 1; back >= 0; back--) {
+      const epoch = newest - back;
+      const start = this.data.genesis + epoch * EPOCH_MS;
+      const end = start + EPOCH_MS;
+      let live = 0;
+      let total = 0;
+
+      for (const host of this.data.hosts.values()) {
+        total += host.validators;
+        const dark = this.data.leases.some(l => {
+          if (l.host !== host.name || !l.endedAt) return false;
+          const from = Date.parse(l.grantedAt);
+          const to = Date.parse(l.agentDoneAt ?? l.endedAt);
+          return from < end && to > start;
+        });
+        if (!dark) live += this.liveAt(host, back, epoch);
+      }
+
+      epochs.push({ epoch, time: this.iso(end), live, total });
+    }
+
+    return {
+      epochs,
+      minParticipationPercent: this.data.settings.minParticipationPercent,
+      epochSeconds: EPOCH_MS / 1000,
+    };
   }
 
   private gate(): Gate {
@@ -373,6 +435,34 @@ export class MockController {
     return 'next';
   }
 
+  /** aboutRollout is the rollout a waiting reason is about, as the scheduler names it in the plan. */
+  private aboutRollout(host: string, memberOf: Rollout[], wait: WaitKind): string | undefined {
+    const active = memberOf.filter(r => r.state === 'active');
+
+    switch (wait) {
+      case 'rollout-paused':
+        return active.find(r => r.paused)?.id;
+      case 'approval':
+        return active.find(r => !r.paused && this.policy(r) === 'manual' && !r.approved)?.id;
+      case 'policy-paused':
+        return active.find(r => this.policy(r) === 'paused')?.id;
+      case 'halted':
+        return memberOf.find(r => r.state === 'halted')?.id;
+      case 'order':
+        return active.find(r => {
+          const me = list(r.hosts).find(h => h.host === host);
+          return list(r.hosts).some(
+            h => me && h.stage < me.stage && h.state !== 'done' && h.state !== 'skipped' && h.state !== 'expected'
+          );
+        })?.id;
+      case 'gate':
+      case 'verb':
+        return active[0]?.id;
+      default:
+        return undefined;
+    }
+  }
+
   private plan(): Plan {
     const gate = this.gate();
     const budget = this.budget();
@@ -427,11 +517,15 @@ export class MockController {
       const host = this.data.hosts.get(name);
       const plan = hosts[name];
       if (!host || !plan || plan.leaseId) continue;
+      const memberOf = open.filter(r => list(r.hosts).some(m => m.host === name && m.state === 'pending'));
+      const wait = waitKind(plan.reason ?? 'next');
       queue.push({
         host: name,
         position: queue.length + 1,
         reason: plan.reason ?? 'next',
-        rollouts: open.filter(r => list(r.hosts).some(m => m.host === name && m.state === 'pending')).map(r => r.id),
+        wait,
+        rollout: this.aboutRollout(name, memberOf, wait),
+        rollouts: memberOf.map(r => r.id),
       });
     }
 

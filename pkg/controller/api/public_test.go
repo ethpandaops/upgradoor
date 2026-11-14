@@ -179,6 +179,12 @@ func leakFixture(t *testing.T, h *harness) {
 		ID: "lease-zz", Host: "lighthouse-geth-1", State: fleet.LeaseFailed,
 		Needs: needs, Error: secretLeaseError,
 	}}
+	// Per-host liveness: the public history may only show its sum.
+	h.store.liveness = []fleet.Liveness{
+		{Host: "lighthouse-geth-1", Epoch: 224, Live: 61, Total: 64},
+		{Host: "lighthouse-geth-2", Epoch: 224, Live: 13, Total: 64},
+		{Host: "lighthouse-geth-1", Epoch: 223, Live: 64, Total: 64},
+	}
 	h.store.audit = []fleet.AuditEntry{{
 		ID: 1, Time: testEpoch, Actor: secretAuditActor, Action: "action.hold",
 		Target: "lighthouse-geth-1", Detail: map[string]any{"reason": secretHoldReason},
@@ -254,6 +260,13 @@ func TestPublicEndpointsLeakNothing(t *testing.T) {
 			},
 		},
 		{path: "/api/v1/public/network", allowed: networkKeys},
+		{
+			path: "/api/v1/public/history",
+			allowed: []string{
+				"epochs", "epoch", "time", "live", "total",
+				"minParticipationPercent", "epochSeconds",
+			},
+		},
 		{path: "/api/v1/config", allowed: []string{"network", "version", "authProviderUrl"}},
 	}
 
@@ -485,6 +498,55 @@ func TestPublicNetwork(t *testing.T) {
 	assert.Equal(t, []string{"the scheduler has not planned yet"}, gate.Reasons)
 	assert.Equal(t, uint64(225), gate.Network.CurrentEpoch)
 	assert.Equal(t, beaconErrorPublic, gate.Network.Error)
+}
+
+func TestPublicHistory(t *testing.T) {
+	h := newHarness(t, nil)
+	leakFixture(t, h)
+
+	h.store.liveness = []fleet.Liveness{
+		{Host: "b", Epoch: 224, Live: 60, Total: 64},
+		{Host: "a", Epoch: 224, Live: 100, Total: 128},
+		{Host: "a", Epoch: 223, Live: 128, Total: 128},
+	}
+
+	rec := h.get("/api/v1/public/history")
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	got := decodeJSON[PublicHistory](t, rec)
+	genesis := testEpoch.Add(-24 * time.Hour)
+
+	assert.Equal(t, []ParticipationPoint{
+		{Epoch: 223, Time: genesis.Add(224 * 384 * time.Second), Live: 128, Total: 128},
+		{Epoch: 224, Time: genesis.Add(225 * 384 * time.Second), Live: 160, Total: 192},
+	}, got.Epochs, "summed per epoch, oldest first, stamped with the end of the epoch")
+	assert.InDelta(t, fleet.DefaultSettings().MinParticipationPercent, got.MinParticipationPercent, 0)
+	assert.InDelta(t, 384, got.EpochSeconds, 0)
+	assert.NotContains(t, rec.Body.String(), `"host"`, "which host attested is not public")
+
+	// A point is the sum and nothing else.
+	var raw struct {
+		Epochs []map[string]json.RawMessage `json:"epochs"`
+	}
+
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &raw))
+	require.Len(t, raw.Epochs, 2)
+
+	for _, point := range raw.Epochs {
+		keys := make([]string, 0, len(point))
+		for key := range point {
+			keys = append(keys, key)
+		}
+
+		assert.ElementsMatch(t, []string{"epoch", "time", "live", "total"}, keys)
+	}
+
+	assert.Equal(t, http.StatusBadRequest, h.get("/api/v1/public/history?limit=0").Code)
+
+	// No liveness yet: an empty list, not null.
+	h.store.liveness = nil
+	assert.JSONEq(t, `[]`, string(decodeJSON[map[string]json.RawMessage](t,
+		h.get("/api/v1/public/history"))["epochs"]))
 }
 
 // A scheduler may quote the beacon error in a gate reason. The public view

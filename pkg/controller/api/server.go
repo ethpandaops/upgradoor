@@ -329,6 +329,7 @@ func (s *Server) routes(ui http.Handler) http.Handler {
 	handle(http.MethodGet, "/api/v1/public/hosts", http.HandlerFunc(s.handlePublicHosts))
 	handle(http.MethodGet, "/api/v1/public/images", http.HandlerFunc(s.handlePublicImages))
 	handle(http.MethodGet, "/api/v1/public/network", http.HandlerFunc(s.handlePublicNetwork))
+	handle(http.MethodGet, "/api/v1/public/history", http.HandlerFunc(s.handlePublicHistory))
 
 	handle(http.MethodGet, "/api/v1/hosts", s.user(s.handleHosts))
 	handle(http.MethodGet, "/api/v1/hosts/{name}", s.user(s.handleHost))

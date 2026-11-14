@@ -7,10 +7,10 @@ import { LIGHTHOUSE_IMAGE, currentDigest } from '../mock/fixture';
 import { createHarness, renderWithApp } from '../test/harness';
 import { HostsTab } from './HostsTab';
 
-const PUBLIC_COLUMNS = ['Host', 'EL image', 'CL image', 'Update'];
+const PUBLIC_COLUMNS = ['Host', 'Execution', 'Consensus', 'State'];
 // The selection checkbox column has no text; the expander column has a screen-reader label.
 const LEADING_COLUMNS = ['Expand'];
-const PRIVATE_COLUMNS = ['KernelOS', 'UptimeReboot', 'Sec.', 'Attesting', 'Seen', 'Slot', 'Actions'];
+const PRIVATE_COLUMNS = ['Attesting', 'Kernel', 'Uptime', 'Updates', 'Seen'];
 
 function columnNames(table: HTMLElement): string[] {
   return within(table)
@@ -45,18 +45,17 @@ describe('HostsTab, logged out (public data only)', () => {
 
     expect(h.userCalls()).toEqual([]);
     expect(h.calls.every(c => c.authorization === null)).toBe(true);
-    expect(new Set(h.calls.map(c => c.path))).toEqual(
-      new Set(['/api/v1/public/hosts', '/api/v1/public/images', '/api/v1/public/network'])
-    );
+    expect(new Set(h.calls.map(c => c.path))).toEqual(new Set(['/api/v1/public/hosts']));
   });
 
-  it('renders image, short digest, revision, the custom badge and the update marker', async () => {
+  it('renders image, short digest, the custom badge and the update marker', async () => {
     const h = await createHarness({ mode: 'auth', loggedIn: false });
     renderWithApp(<HostsTab />, h);
     const table = await screen.findByRole('table', { name: 'Hosts' });
 
     const behind = rowOf(table, 'lighthouse-geth-3');
-    expect(behind).toHaveTextContent(LIGHTHOUSE_IMAGE);
+    expect(behind).toHaveTextContent('lighthouse:unstable');
+    expect(within(behind).getByTitle(LIGHTHOUSE_IMAGE)).toBeInTheDocument();
     expect(within(behind).getByText('pending')).toBeInTheDocument();
 
     const current = rowOf(table, 'lighthouse-geth-1');
@@ -68,51 +67,6 @@ describe('HostsTab, logged out (public data only)', () => {
     expect(within(current).getByText('up to date')).toBeInTheDocument();
 
     expect(within(rowOf(table, 'grandine-erigon-2')).getByText('custom')).toBeInTheDocument();
-  });
-
-  it('summarises each image and shows the network gate', async () => {
-    const h = await createHarness({ mode: 'auth', loggedIn: false });
-    renderWithApp(<HostsTab />, h);
-
-    const strip = await screen.findByRole('list', { name: 'Images' });
-    const lighthouse = within(strip).getByText(LIGHTHOUSE_IMAGE).closest('li');
-    expect(lighthouse).toHaveTextContent('on 3 of 7');
-
-    const gate = await screen.findByLabelText('Network gate');
-    expect(within(gate).getByText('ok')).toBeInTheDocument();
-    expect(gate).toHaveTextContent('finality lag2 epochs');
-  });
-
-  it('shows a failing gate with its reasons', async () => {
-    const h = await createHarness({ mode: 'auth', loggedIn: false });
-    h.controller.setGateFailing(true);
-    renderWithApp(<HostsTab />, h);
-
-    const gate = await screen.findByLabelText('Network gate');
-    expect(within(gate).getByText('failing')).toBeInTheDocument();
-    expect(gate).toHaveTextContent('finality lag 5 epochs > 3');
-    expect(gate).toHaveTextContent(/participation [\d.]+% < 90%/);
-  });
-});
-
-describe('HostsTab, beacon node without the liveness endpoint', () => {
-  it('says what the gate and the budget use instead', async () => {
-    const h = await createHarness({ mode: 'auth', loggedIn: false });
-    h.controller.setLivenessUnsupported(true);
-    renderWithApp(<HostsTab />, h);
-
-    const gate = await screen.findByLabelText('Network gate');
-    expect(within(gate).getByText('ok')).toBeInTheDocument();
-    expect(gate).toHaveTextContent('participationnot served');
-    expect(gate).toHaveTextContent('liveness not served by the beacon node: readiness and budget use agent probes');
-  });
-
-  it('shows no such note when liveness is served', async () => {
-    const h = await createHarness({ mode: 'auth', loggedIn: false });
-    renderWithApp(<HostsTab />, h);
-
-    const gate = await screen.findByLabelText('Network gate');
-    expect(gate).not.toHaveTextContent('liveness not served');
   });
 });
 
@@ -133,7 +87,7 @@ describe('HostsTab, logged in', () => {
     expect(h.userCalls().every(c => c.authorization === 'Bearer mock-token')).toBe(true);
   });
 
-  it('shows kernel, reboot flag, security updates, attesting share, staleness and the slot', async () => {
+  it('shows kernel, reboot flag, security updates, attesting share, staleness and the state', async () => {
     const h = await createHarness({ mode: 'auth', loggedIn: true });
     renderWithApp(<HostsTab />, h);
     const table = await screen.findByRole('table', { name: 'Hosts' });
@@ -142,18 +96,22 @@ describe('HostsTab, logged in', () => {
     const reboot = rowOf(table, 'teku-besu-1');
     expect(reboot).toHaveTextContent('6.12.48+deb13-amd64');
     expect(within(reboot).getByText('reboot')).toBeInTheDocument();
-    expect(within(reboot).getByText('queued')).toBeInTheDocument();
+    expect(within(reboot).getByText(/^queued #\d+$/)).toBeInTheDocument();
     expect(reboot).toHaveTextContent('waiting for approval (policy manual)');
 
     const failed = rowOf(table, 'nimbus-nethermind-1');
     expect(failed).toHaveTextContent('0%0/128');
+    expect(rowOf(table, 'prysm-erigon-1')).toHaveTextContent('3 security');
     expect(within(failed).getByText('failed')).toBeInTheDocument();
 
     const stale = rowOf(table, 'prysm-geth-3');
-    expect(within(stale).getAllByText('stale')).toHaveLength(2);
+    expect(within(stale).getByText('silent')).toBeInTheDocument();
+    expect(stale).toHaveTextContent('the agent stopped syncing');
 
     expect(within(rowOf(table, 'lighthouse-geth-2')).getByText('verifying')).toBeInTheDocument();
+    expect(within(rowOf(table, 'lodestar-reth-3')).getByText('held')).toBeInTheDocument();
     expect(within(rowOf(table, 'lodestar-reth-3')).getByText('local hold')).toBeInTheDocument();
+    expect(within(rowOf(table, 'prysm-geth-1')).getByText('up to date')).toBeInTheDocument();
     expect(rowOf(table, 'teku-reth-1')).toHaveTextContent('debian 13');
     expect(rowOf(table, 'lighthouse-geth-3')).toHaveTextContent(/budget [\d.]+% of 10%/);
   });
@@ -282,5 +240,54 @@ describe('HostsTab, open mode', () => {
     expect(columnNames(table)).toEqual([...LEADING_COLUMNS, ...PUBLIC_COLUMNS, ...PRIVATE_COLUMNS]);
     expect(h.calls.every(c => c.authorization === null)).toBe(true);
     expect(screen.queryByText(/Log in for host details/)).not.toBeInTheDocument();
+  });
+});
+
+describe('HostsTab rows', () => {
+  it('opens a host by a click anywhere on its row, but not on its checkbox', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+
+    await user.click(within(table).getByRole('checkbox', { name: 'Select rpc-1' }));
+    expect(screen.queryByRole('group', { name: 'Actions for rpc-1' })).not.toBeInTheDocument();
+
+    await user.click(within(table).getByText('rpc-1'));
+    const actions = await screen.findByRole('group', { name: 'Actions for rpc-1' });
+    expect(within(actions).getByRole('button', { name: 'Roll…' })).toBeInTheDocument();
+    expect(within(table).getByRole('button', { name: 'Collapse rpc-1' })).toHaveAttribute('aria-expanded', 'true');
+  });
+
+  it('filters by the state the table shows', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+    const filter = screen.getByRole('searchbox', { name: 'Filter hosts' });
+    const hosts = () =>
+      within(table)
+        .getAllByRole('row')
+        .slice(1)
+        .map(r => r.querySelector('td:nth-child(3)')?.textContent);
+
+    await user.type(filter, 'silent');
+    expect(hosts()).toEqual(['prysm-geth-3']);
+
+    await user.clear(filter);
+    await user.type(filter, 'verifying');
+    // The state, and the waiting reasons that mention it.
+    expect(hosts()).toEqual(['lighthouse-geth-2', 'nimbus-nethermind-2', 'nimbus-nethermind-3']);
+
+    await user.clear(filter);
+    await user.type(filter, 'approval');
+    expect(hosts()).toHaveLength(4);
+
+    // The raw slot names of the API are not what the table says.
+    await user.clear(filter);
+    await user.type(filter, 'stale');
+    expect(screen.getByText(/No host matches/)).toBeInTheDocument();
   });
 });

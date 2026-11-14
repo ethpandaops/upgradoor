@@ -68,11 +68,21 @@ export function Button({ variant = 'default', dense = false, className, type, ..
   );
 }
 
-/** Table is the dense table shell; it scrolls horizontally on narrow screens. */
-export function Table({ children, label }: { children: ReactNode; label: string }) {
+/**
+ * Table is the table shell; it scrolls horizontally on narrow screens. roomy
+ * is the main table of a view: taller rows, cells centred on the row.
+ */
+export function Table({ children, label, roomy = false }: { children: ReactNode; label: string; roomy?: boolean }) {
   return (
-    <div className="overflow-x-auto rounded-sm border border-border bg-surface">
-      <table aria-label={label} className="w-full border-collapse text-left text-xs/5">
+    <div className="overflow-x-auto rounded-lg border border-border bg-surface">
+      <table
+        aria-label={label}
+        className={cx(
+          'w-full border-collapse text-left',
+          'text-xs/5',
+          roomy && '[&_td]:py-2 [&_td]:align-middle [&_th]:py-2'
+        )}
+      >
         {children}
       </table>
     </div>
@@ -89,8 +99,8 @@ export function Th({ className, tight = false, ...rest }: ThHTMLAttributes<HTMLT
     <th
       scope="col"
       className={cx(
-        'border-b border-border bg-surface-raised py-1 font-medium whitespace-nowrap text-muted',
-        tight ? 'px-0.5' : 'px-1.5',
+        'border-b border-border bg-surface-raised py-1.5 font-medium whitespace-nowrap text-muted',
+        tight ? 'px-0.5' : 'px-2.5',
         className
       )}
       {...rest}
@@ -101,7 +111,11 @@ export function Th({ className, tight = false, ...rest }: ThHTMLAttributes<HTMLT
 export function Td({ className, tight = false, ...rest }: TdHTMLAttributes<HTMLTableCellElement> & CellProps) {
   return (
     <td
-      className={cx('border-b border-border py-1 align-top whitespace-nowrap', tight ? 'px-0.5' : 'px-1.5', className)}
+      className={cx(
+        'border-b border-border py-1.5 align-top whitespace-nowrap',
+        tight ? 'px-0.5' : 'px-2.5',
+        className
+      )}
       {...rest}
     />
   );
@@ -121,11 +135,11 @@ export interface SortColumn {
  * SortTh is a column header that sorts when activated. A cell that stacks two
  * values takes two sort columns, stacked the same way.
  */
-export function SortTh({ columns }: { columns: readonly SortColumn[] }) {
+export function SortTh({ columns, className }: { columns: readonly SortColumn[]; className?: string }) {
   const active = columns.find(c => c.active);
 
   return (
-    <Th aria-sort={active ? (active.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
+    <Th className={className} aria-sort={active ? (active.direction === 'asc' ? 'ascending' : 'descending') : 'none'}>
       <span className="flex flex-col items-start">
         {columns.map(c => (
           <button
@@ -194,9 +208,9 @@ export function Empty({ children }: { children: ReactNode }) {
 /** Section is a titled block inside a tab. */
 export function Section({ title, aside, children }: { title: ReactNode; aside?: ReactNode; children: ReactNode }) {
   return (
-    <section className="flex flex-col gap-1.5">
-      <div className="flex flex-wrap items-center gap-2">
-        <h2 className="text-xs/5 font-semibold tracking-wide text-muted uppercase">{title}</h2>
+    <section className="flex flex-col gap-2">
+      <div className="flex flex-wrap items-center gap-3">
+        <h2 className="text-sm/6 font-semibold">{title}</h2>
         {aside}
       </div>
       {children}
@@ -221,3 +235,108 @@ export function Dash() {
 /** TextInput is the one text field style. */
 export const INPUT_CLASS =
   'h-7 rounded-sm border border-border-strong bg-surface px-2 text-xs/5 text-foreground placeholder:text-faint disabled:opacity-50';
+
+/** Card is a titled panel on the page background. */
+export function Card({
+  title,
+  count,
+  aside,
+  label,
+  className,
+  children,
+}: {
+  title: ReactNode;
+  /** count is shown muted after the title. */
+  count?: number;
+  aside?: ReactNode;
+  /** label names the region for assistive tech when the title is not plain text. */
+  label?: string;
+  className?: string;
+  children: ReactNode;
+}) {
+  return (
+    <section
+      aria-label={label ?? (typeof title === 'string' ? title : undefined)}
+      className={cx('flex min-w-0 flex-col gap-3 rounded-lg border border-border bg-surface p-4', className)}
+    >
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <h2 className="text-sm/6 font-semibold">
+          {title}
+          {count !== undefined && <span className="font-normal text-faint"> {count}</span>}
+        </h2>
+        {aside && <div className="ml-auto flex flex-wrap items-center gap-2">{aside}</div>}
+      </div>
+      {children}
+    </section>
+  );
+}
+
+/** Segmented is a small one-of-n switch. */
+export function Segmented<T extends string>({
+  label,
+  options,
+  value,
+  onChange,
+}: {
+  label: string;
+  options: readonly { value: T; label: string }[];
+  value: T;
+  onChange: (value: T) => void;
+}) {
+  return (
+    <div role="group" aria-label={label} className="inline-flex rounded-sm border border-border-strong">
+      {options.map(o => (
+        <button
+          key={o.value}
+          type="button"
+          aria-pressed={o.value === value}
+          onClick={() => {
+            onChange(o.value);
+          }}
+          className={cx(
+            'h-6 px-2 text-xs/5 font-medium first:rounded-l-xs last:rounded-r-xs',
+            o.value === value ? 'bg-surface-selected text-foreground' : 'text-muted hover:bg-surface-hover'
+          )}
+        >
+          {o.label}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+/** Meter is a thin bar: how much of an allowance is used. Past the allowance it turns red. */
+export function Meter({
+  value,
+  max,
+  label,
+  progress = false,
+}: {
+  value: number;
+  max: number;
+  label: string;
+  /** progress: the bar fills towards a goal instead of using up an allowance. */
+  progress?: boolean;
+}) {
+  const over = !progress && value > max + 1e-9;
+  const share = max > 0 ? Math.min(1, value / max) : value > 0 ? 1 : 0;
+
+  return (
+    <span
+      role="meter"
+      aria-label={label}
+      aria-valuemin={0}
+      aria-valuemax={Math.round(max * 10) / 10}
+      aria-valuenow={Math.round(value * 10) / 10}
+      className="block h-1.5 w-full overflow-hidden rounded-full bg-surface-raised"
+    >
+      <span
+        className={cx(
+          'block h-full rounded-full',
+          over ? 'bg-danger-solid' : !progress && share > 0.85 ? 'bg-warning' : 'bg-accent'
+        )}
+        style={{ width: `${share * 100}%` }}
+      />
+    </span>
+  );
+}

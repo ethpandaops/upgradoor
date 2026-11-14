@@ -420,11 +420,39 @@ export interface Budget {
   maxLeasedHosts: number;
 }
 
+/**
+ * scheduler.WaitKind: the class of a waiting reason. next, budget, host-limit
+ * and order clear by themselves; gate clears when the network recovers; the
+ * rest needs somebody to act.
+ */
+export type WaitKind =
+  | 'next'
+  | 'budget'
+  | 'host-limit'
+  | 'order'
+  | 'gate'
+  | 'verb'
+  | 'halted'
+  | 'policy-paused'
+  | 'approval'
+  | 'rollout-paused'
+  | 'paused'
+  | 'silent'
+  | 'held';
+
 /** scheduler.QueueEntry */
 export interface QueueEntry {
   host: string;
   position: number;
   reason: string;
+  /** Absent in the answer of a controller older than the field. */
+  wait?: WaitKind;
+  /**
+   * The rollout the reason is about (the paused, halted or unapproved one, or
+   * the one whose order the host waits in); absent when the reason is about
+   * the host or the fleet.
+   */
+  rollout?: string;
   rollouts: List<string>;
 }
 
@@ -513,6 +541,22 @@ export interface PublicImage {
 /** api.PublicImages */
 export interface PublicImages {
   images: List<PublicImage>;
+}
+
+/** api.ParticipationPoint: the network's attestation participation in one epoch. */
+export interface ParticipationPoint {
+  epoch: number;
+  /** The end of the epoch. */
+  time: string;
+  live: number;
+  total: number;
+}
+
+/** api.PublicHistory */
+export interface PublicHistory {
+  epochs: List<ParticipationPoint>;
+  minParticipationPercent: number;
+  epochSeconds: number;
 }
 
 /** api.HostSummary */

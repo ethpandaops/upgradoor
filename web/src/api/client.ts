@@ -9,6 +9,7 @@ import type {
   Hosts,
   Packages,
   Plan,
+  PublicHistory,
   PublicHosts,
   PublicImages,
   RebootRequest,
@@ -134,6 +135,10 @@ export class ApiClient {
 
   publicNetwork(signal?: AbortSignal): Promise<Gate> {
     return this.request('/api/v1/public/network', { user: false, signal });
+  }
+
+  publicHistory(limit?: number, signal?: AbortSignal): Promise<PublicHistory> {
+    return this.request(`/api/v1/public/history${query({ limit })}`, { user: false, signal });
   }
 
   // -------------------------------------------------------------- user

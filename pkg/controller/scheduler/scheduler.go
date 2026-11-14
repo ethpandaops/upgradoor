@@ -183,9 +183,38 @@ type QueueEntry struct {
 	// "network gate: participation 88% < 90%", "paused",
 	// "waiting for approval (policy manual)", "after canary lighthouse-geth-1".
 	Reason string `json:"reason"`
+	// Wait classifies Reason, so a client can tell a host that will be served
+	// by itself from one that waits for a person.
+	Wait WaitKind `json:"wait"`
+	// Rollout is the ID of the rollout the reason is about: the one that is
+	// paused, halted, unapproved or whose order the host waits in. Empty when
+	// the reason is about the host or the fleet (hold, global pause, budget).
+	Rollout string `json:"rollout,omitempty"`
 	// Rollouts are the IDs of the rollouts the host is a pending member of.
 	Rollouts []string `json:"rollouts"`
 }
+
+// WaitKind is the class of a queued host's waiting reason.
+type WaitKind string
+
+// Wait kinds. Budget, host limit, order and next clear by themselves as the
+// rollout proceeds; gate clears when the network recovers; the others need
+// somebody to act.
+const (
+	WaitNext          WaitKind = "next"
+	WaitBudget        WaitKind = "budget"
+	WaitHostLimit     WaitKind = "host-limit"
+	WaitOrder         WaitKind = "order"
+	WaitGate          WaitKind = "gate"
+	WaitVerb          WaitKind = "verb"
+	WaitHalted        WaitKind = "halted"
+	WaitPolicyPaused  WaitKind = "policy-paused"
+	WaitApproval      WaitKind = "approval"
+	WaitRolloutPaused WaitKind = "rollout-paused"
+	WaitPaused        WaitKind = "paused"
+	WaitSilent        WaitKind = "silent"
+	WaitHeld          WaitKind = "held"
+)
 
 // SlotState is a host's state in the availability view.
 type SlotState string

@@ -31,7 +31,7 @@ describe('App in public mode (auth configured, logged out)', () => {
   it('never calls an authenticated endpoint, whatever tab is opened', async () => {
     const { calls, userCalls, user } = boot({ auth: true, loggedIn: false });
 
-    await screen.findByRole('table', { name: 'Hosts' });
+    await screen.findByRole('region', { name: 'Network gate' });
     expect(screen.getByRole('button', { name: 'Login' })).toBeInTheDocument();
 
     for (const name of TABS) {
@@ -49,11 +49,14 @@ describe('App in public mode (auth configured, logged out)', () => {
 
   it('shows the private views after a login and hides them again after logout', async () => {
     const { userCalls, user } = boot({ auth: true, loggedIn: false });
-    await screen.findByRole('table', { name: 'Hosts' });
+    await screen.findByRole('region', { name: 'Network gate' });
+    expect(screen.queryByRole('region', { name: 'In progress' })).not.toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'Login' }));
 
     expect(await screen.findByText('mock-user@example.org')).toBeInTheDocument();
+    await screen.findByRole('region', { name: 'In progress' });
+    await user.click(screen.getByRole('tab', { name: 'Hosts' }));
     await screen.findByRole('columnheader', { name: /Kernel/ });
     expect(userCalls().length).toBeGreaterThan(0);
     expect(userCalls().every(c => c.authorization === 'Bearer mock-token')).toBe(true);
@@ -72,7 +75,7 @@ describe('App in public mode (auth configured, logged out)', () => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
     const { userCalls, user } = boot({ auth: true, unreachable: true });
 
-    await screen.findByRole('table', { name: 'Hosts' });
+    await screen.findByRole('region', { name: 'Network gate' });
 
     expect(screen.getByText('auth provider unreachable')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Login' })).not.toBeInTheDocument();
@@ -87,7 +90,7 @@ describe('App in open mode (no auth provider)', () => {
   it('shows everything without a login button', async () => {
     const { calls, user } = boot({ auth: false });
 
-    await screen.findByRole('columnheader', { name: /Kernel/ });
+    await screen.findByRole('region', { name: 'In progress' });
 
     expect(screen.getByText('open access')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Login' })).not.toBeInTheDocument();
@@ -101,12 +104,15 @@ describe('App in open mode (no auth provider)', () => {
 
   it('keeps the tab in the URL hash and moves between tabs with the arrow keys', async () => {
     const { user } = boot({ auth: false });
+    await screen.findByRole('region', { name: 'Network gate' });
+
+    const overview = screen.getByRole('tab', { name: 'Overview' });
+    expect(overview).toHaveAttribute('aria-selected', 'true');
+
+    overview.focus();
+    await user.keyboard('{ArrowRight}');
+    expect(window.location.hash).toBe('#hosts');
     await screen.findByRole('table', { name: 'Hosts' });
-
-    const hosts = screen.getByRole('tab', { name: 'Hosts' });
-    expect(hosts).toHaveAttribute('aria-selected', 'true');
-
-    hosts.focus();
     await user.keyboard('{ArrowRight}');
 
     const rollouts = screen.getByRole('tab', { name: 'Rollouts' });
@@ -120,7 +126,7 @@ describe('App in open mode (no auth provider)', () => {
 
   it('switches and persists the theme', async () => {
     const { user } = boot({ auth: false });
-    await screen.findByRole('table', { name: 'Hosts' });
+    await screen.findByRole('region', { name: 'Network gate' });
 
     await user.click(screen.getByRole('button', { name: /Theme: system/ }));
     expect(localStorage.getItem('upgradoor.theme')).toBe('light');
@@ -132,6 +138,35 @@ describe('App in open mode (no auth provider)', () => {
 
     await user.click(screen.getByRole('button', { name: /Theme: dark/ }));
     expect(localStorage.getItem('upgradoor.theme')).toBeNull();
+  });
+});
+
+describe('Header', () => {
+  it('holds the views and keeps its corner free once the panda menu is on the page', async () => {
+    boot({ auth: false });
+    await screen.findByRole('region', { name: 'Network gate' });
+
+    const banner = screen.getByRole('banner');
+    expect(within(banner).getByRole('tablist', { name: 'Views' })).toBeInTheDocument();
+    // Dark in both themes.
+    expect(banner).toHaveClass('dark');
+    expect(banner).toHaveClass('pl-4');
+
+    const menu = document.createElement('div');
+    menu.id = 'panda-menu-root';
+    document.body.appendChild(menu);
+    try {
+      await waitFor(() => {
+        expect(banner).toHaveClass('pl-18');
+      });
+      expect(banner).not.toHaveClass('pl-4');
+    } finally {
+      menu.remove();
+    }
+
+    await waitFor(() => {
+      expect(banner).toHaveClass('pl-4');
+    });
   });
 });
 

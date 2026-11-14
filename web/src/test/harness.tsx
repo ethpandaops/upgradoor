@@ -34,6 +34,7 @@ export const PUBLIC_PATHS = [
   '/api/v1/public/hosts',
   '/api/v1/public/images',
   '/api/v1/public/network',
+  '/api/v1/public/history',
 ];
 
 /** recordingFetch wraps a fetch and notes every call. */

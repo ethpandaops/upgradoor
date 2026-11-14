@@ -20,7 +20,7 @@ const (
 	// known; after that an unset PollInterval means one slot.
 	DefaultPollInterval = 12 * time.Second
 	// DefaultRetention is how many epochs of liveness rows are kept.
-	DefaultRetention uint64 = 64
+	DefaultRetention uint64 = 256
 	// DefaultLivenessChunkSize is the number of validator indices per
 	// liveness request.
 	DefaultLivenessChunkSize = 5000

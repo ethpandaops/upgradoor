@@ -1,8 +1,7 @@
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 
 import {
   list,
-  type Budget,
   type Lease,
   type Plan,
   type Policy,
@@ -14,14 +13,27 @@ import {
 import { useApp } from '../appContext';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { Digest, ShortId } from '../components/Digest';
-import { GateIndicator } from '../components/GateIndicator';
 import { LeaseTable } from '../components/LeaseTable';
 import { RelTime } from '../components/RelTime';
-import { Badge, Button, Dash, Empty, ErrorBanner, Loading, Section, Table, Td, Th, cx } from '../components/primitives';
+import {
+  Badge,
+  Button,
+  Dash,
+  Empty,
+  ErrorBanner,
+  Loading,
+  Meter,
+  Section,
+  Segmented,
+  Table,
+  Td,
+  Th,
+  cx,
+} from '../components/primitives';
 import { HostStateBadge, RolloutStateBadge, stageLabel } from '../components/status';
 import { usePoll } from '../hooks/usePoll';
-import { buildRolloutHostsRequest, buildScopeRequest } from '../lib/actionRequests';
-import { formatPercent, percentOf, shortRevision } from '../lib/format';
+import { formatPercent, percentOf, plural, shortRevision } from '../lib/format';
+import { hostsIntent, scopeIntent } from '../lib/intents';
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
@@ -40,30 +52,14 @@ function policyFor(settings: Settings | undefined, rollout: Rollout): Policy | u
   }
 }
 
-function scopeIntent(action: 'pause' | 'resume' | 'abort', title: string, rollout: string): ActionIntent {
-  return {
-    kind: 'call',
-    title,
-    danger: action === 'abort',
-    make: reason => ({ action, body: buildScopeRequest(rollout, reason) }),
-  };
-}
-
-function hostsIntent(action: 'skip' | 'retry', title: string, rollout: string, hosts: readonly string[]): ActionIntent {
-  return {
-    kind: 'call',
-    title,
-    make: reason => ({ action, body: buildRolloutHostsRequest(rollout, hosts, reason) }),
-  };
-}
-
 /**
- * RolloutsTab shows the plan: the global pause, the budget, every open
- * rollout as a queue with the waiting reason per host, the active leases and
- * the recent history.
+ * RolloutsTab shows the work in detail: every open rollout with the state and
+ * waiting reason of each of its hosts, the leases, and what has finished.
+ * The Overview tab has the summary: timeline, in progress, up next.
  */
 export function RolloutsTab() {
   const { api } = useApp();
+  const [leaseView, setLeaseView] = useState<'active' | 'recent'>('active');
 
   const rollouts = usePoll(s => api.rollouts(50, s), { key: 'rollouts' });
   const plan = usePoll(s => api.plan(s), { key: 'plan' });
@@ -88,7 +84,7 @@ export function RolloutsTab() {
   const recentLeases = list(rollouts.data?.recentLeases);
 
   return (
-    <div className="flex flex-col gap-3">
+    <div className="mx-auto flex w-full max-w-screen-2xl flex-col gap-6">
       {rollouts.error !== undefined && (
         <ErrorBanner error={rollouts.error} what="the rollouts" onRetry={rollouts.refresh} />
       )}
@@ -99,13 +95,12 @@ export function RolloutsTab() {
       {actions.notice}
 
       {plan.data && <PlanBar plan={plan.data} onAction={actions.request} />}
-      {plan.data && <GateIndicator gate={plan.data.gate} />}
 
       <Section title={`Open rollouts (${open.length})`}>
         {open.length === 0 ? (
           <Empty>Nothing is rolling out. A rollout opens when a host reports a need.</Empty>
         ) : (
-          <div className="flex flex-col gap-2">
+          <div className="flex flex-col gap-3">
             {open.map(r => (
               <RolloutCard
                 key={r.id}
@@ -120,35 +115,38 @@ export function RolloutsTab() {
         )}
       </Section>
 
-      <Section title={`Active leases (${openLeases.length})`}>
-        {openLeases.length === 0 ? (
-          <Empty>No host holds a lease.</Empty>
+      <Section
+        title="Leases"
+        aside={
+          <Segmented
+            label="Leases shown"
+            value={leaseView}
+            onChange={setLeaseView}
+            options={[
+              { value: 'active', label: `Active (${openLeases.length})` },
+              { value: 'recent', label: `Recent (${recentLeases.length})` },
+            ]}
+          />
+        }
+      >
+        {leaseView === 'active' ? (
+          openLeases.length === 0 ? (
+            <Empty>No host holds a lease.</Empty>
+          ) : (
+            <LeaseTable leases={openLeases} label="Active leases" />
+          )
+        ) : recentLeases.length === 0 ? (
+          <Empty>No lease has ended yet.</Empty>
         ) : (
-          <LeaseTable leases={openLeases} label="Active leases" />
+          <LeaseTable leases={recentLeases} label="Recent leases" closed />
         )}
       </Section>
 
-      <Section title={`Queue (${list(plan.data?.queue).length})`}>
-        {list(plan.data?.queue).length === 0 ? (
-          <Empty>No host is waiting for a slot.</Empty>
-        ) : (
-          <QueueTable queue={list(plan.data?.queue)} rollouts={open} />
-        )}
-      </Section>
-
-      <Section title="Recent rollouts">
+      <Section title="Finished rollouts">
         {recent.length === 0 ? (
           <Empty>No rollout has finished yet.</Empty>
         ) : (
           <RecentRollouts rollouts={recent} onAction={actions.request} />
-        )}
-      </Section>
-
-      <Section title="Recent leases">
-        {recentLeases.length === 0 ? (
-          <Empty>No lease has ended yet.</Empty>
-        ) : (
-          <LeaseTable leases={recentLeases} label="Recent leases" closed />
         )}
       </Section>
 
@@ -157,56 +155,61 @@ export function RolloutsTab() {
   );
 }
 
-function BudgetMeter({ budget }: { budget: Budget }) {
-  const used = budget.totalWeight > 0 ? (budget.unavailableWeight / budget.totalWeight) * 100 : 0;
-  const allowed = budget.totalWeight > 0 ? (budget.allowedWeight / budget.totalWeight) * 100 : 0;
-  const over = budget.unavailableWeight > budget.allowedWeight;
-  // The bar spans twice the allowance, so the limit sits in the middle.
-  const scale = allowed > 0 ? Math.min(100, (used / (allowed * 2)) * 100) : used > 0 ? 100 : 0;
-
-  return (
-    <span className="inline-flex items-center gap-2">
-      <span className="text-muted">unavailable</span>
-      <span className={cx('font-mono font-medium', over ? 'text-danger' : 'text-foreground')}>
-        {budget.unavailableWeight}
-      </span>
-      <span className="text-muted">of allowed</span>
-      <span className="font-mono font-medium">{Math.round(budget.allowedWeight * 10) / 10}</span>
-      <span className="text-muted">
-        weight ({formatPercent(used)} of {formatPercent(allowed)}; total {budget.totalWeight})
-      </span>
-      <span
-        role="meter"
-        aria-label="Unavailable weight against the allowance"
-        aria-valuemin={0}
-        aria-valuemax={Math.round(budget.allowedWeight)}
-        aria-valuenow={budget.unavailableWeight}
-        className="relative h-2 w-24 overflow-hidden rounded-xs bg-surface-raised"
-      >
-        <span
-          className={cx('absolute inset-y-0 left-0', over ? 'bg-danger' : 'bg-accent')}
-          style={{ width: `${scale}%` }}
-        />
-        <span className="absolute inset-y-0 left-1/2 w-px bg-border-strong" />
-      </span>
-    </span>
-  );
-}
-
+/** PlanBar is the scheduler in one line: running or paused, the gate, and the budget in use. */
 function PlanBar({ plan, onAction }: { plan: Plan; onAction: (intent: ActionIntent) => void }) {
   const b = plan.budget;
+  const pct = (w: number) => formatPercent(b.totalWeight > 0 ? (w / b.totalWeight) * 100 : 0);
 
   return (
     <div
+      role="group"
       aria-label="Scheduler"
       className={cx(
-        'flex flex-wrap items-center gap-x-4 gap-y-1 rounded-sm border bg-surface px-2 py-1 text-xs/5',
-        plan.paused ? 'border-warning' : 'border-border'
+        'flex flex-wrap items-center gap-x-6 gap-y-2 rounded-lg border bg-surface px-4 py-2.5 text-xs/5',
+        plan.paused || !plan.gate.ok ? 'border-warning' : 'border-border'
       )}
     >
-      <span className="inline-flex items-center gap-1.5">
-        <span className="font-semibold text-muted uppercase">Scheduler</span>
+      <span className="inline-flex items-center gap-2">
+        <span className="text-sm/6 font-semibold">Scheduler</span>
         {plan.paused ? <Badge tone="warning">paused</Badge> : <Badge tone="success">running</Badge>}
+      </span>
+
+      <span role="group" aria-label="Network gate" className="inline-flex items-center gap-2">
+        <span className="text-muted">Network gate</span>
+        {plan.gate.ok ? <Badge tone="success">open</Badge> : <Badge tone="danger">closed</Badge>}
+        {!plan.gate.ok && (
+          <span className="font-medium whitespace-normal text-danger">
+            {list(plan.gate.reasons).join(' · ') || 'no reason given'}
+          </span>
+        )}
+      </span>
+
+      {b.totalWeight > 0 && (
+        <span
+          className="inline-flex items-center gap-2"
+          title={`${b.unavailableWeight} of ${b.totalWeight} validators are offline or on a host being updated; ${Math.round(b.allowedWeight * 10) / 10} may be`}
+        >
+          <span className="text-muted">Outage budget</span>
+          <span className="w-20">
+            <Meter value={b.unavailableWeight} max={b.allowedWeight} label="Validators offline against the allowance" />
+          </span>
+          <span className="tabular-nums">
+            {pct(b.unavailableWeight)} of {pct(b.allowedWeight)}
+          </span>
+        </span>
+      )}
+
+      <span className="inline-flex items-baseline gap-1.5">
+        <span className="text-muted">Hosts down</span>
+        <span className={cx('tabular-nums', b.leasedHosts >= b.maxLeasedHosts && 'font-medium text-warning')}>
+          {b.leasedHosts} of {b.maxLeasedHosts}
+        </span>
+      </span>
+
+      <span className="ml-auto inline-flex items-center gap-3">
+        <span className="text-faint">
+          planned <RelTime value={plan.computedAt} />
+        </span>
         {plan.paused ? (
           <Button
             dense
@@ -228,22 +231,41 @@ function PlanBar({ plan, onAction }: { plan: Plan; onAction: (intent: ActionInte
           </Button>
         )}
       </span>
-
-      <BudgetMeter budget={b} />
-
-      <span className="inline-flex items-baseline gap-1">
-        <span className="text-muted">leased hosts</span>
-        <span className={cx('font-mono font-medium', b.leasedHosts >= b.maxLeasedHosts && 'text-warning')}>
-          {b.leasedHosts}
-        </span>
-        <span className="text-muted">of limit</span>
-        <span className="font-mono font-medium">{b.maxLeasedHosts}</span>
-      </span>
-
-      <span className="inline-flex items-baseline gap-1 text-muted">
-        planned <RelTime value={plan.computedAt} />
-      </span>
     </div>
+  );
+}
+
+const PIP: Record<RolloutHost['state'], string> = {
+  done: 'bg-success',
+  leased: 'animate-pulse bg-accent',
+  failed: 'bg-danger-solid',
+  pending: 'bg-border-strong',
+  expected: 'bg-border',
+  skipped: 'bg-border',
+};
+
+/** HostPips draws one mark per host of a rollout, in serving order, coloured by its state. */
+function HostPips({ hosts }: { hosts: readonly RolloutHost[] }) {
+  const count = (state: RolloutHost['state']) => hosts.filter(h => h.state === state).length;
+  const summary = [
+    `${count('done')} done`,
+    count('leased') > 0 && `${count('leased')} in progress`,
+    count('pending') + count('expected') > 0 && `${count('pending') + count('expected')} waiting`,
+    count('failed') > 0 && `${count('failed')} failed`,
+    count('skipped') > 0 && `${count('skipped')} skipped`,
+  ]
+    .filter(Boolean)
+    .join(', ');
+
+  return (
+    <span className="inline-flex items-center gap-2 text-xs/5 text-muted">
+      <span role="img" aria-label={`${plural(hosts.length, 'host')}: ${summary}`} className="inline-flex gap-0.5">
+        {hosts.map(h => (
+          <span key={h.host} title={`${h.host}: ${h.state}`} className={cx('h-3 w-1.5 rounded-xs', PIP[h.state])} />
+        ))}
+      </span>
+      {summary}
+    </span>
   );
 }
 
@@ -300,7 +322,6 @@ function RolloutCard({
     () => [...list(r.hosts)].sort((a, b) => a.stage - b.stage || collator.compare(a.host, b.host)),
     [r.hosts]
   );
-  const settled = hosts.filter(h => h.state === 'done' || h.state === 'skipped').length;
   const failed = hosts.filter(h => h.state === 'failed');
   const waitsForApproval = policy === 'manual' && !r.approved;
 
@@ -308,7 +329,7 @@ function RolloutCard({
     <article
       aria-label={r.title}
       className={cx(
-        'flex flex-col gap-1.5 rounded-sm border bg-surface p-2',
+        'flex flex-col gap-2 rounded-lg border bg-surface p-4',
         r.state === 'halted' ? 'border-danger' : 'border-border'
       )}
     >
@@ -321,9 +342,7 @@ function RolloutCard({
         {policy === 'paused' && <Badge tone="warning">policy paused</Badge>}
         {r.force && <Badge tone="warning">force</Badge>}
         {r.ignoreBudget && <Badge tone="danger">ignores budget</Badge>}
-        <span className="text-muted">
-          {settled}/{hosts.length} hosts settled
-        </span>
+        <HostPips hosts={hosts} />
 
         <span className="ml-auto inline-flex flex-wrap gap-1">
           {waitsForApproval && !r.paused && (
@@ -433,7 +452,7 @@ function RolloutCard({
             <Th>Host</Th>
             <Th>Stage</Th>
             <Th>State</Th>
-            <Th className="w-full">Waiting for / progress</Th>
+            <Th className="w-full">Waiting for / doing</Th>
             <Th>Updated</Th>
             <Th>Actions</Th>
           </tr>
@@ -489,39 +508,6 @@ function RolloutCard({
         </tbody>
       </Table>
     </article>
-  );
-}
-
-function QueueTable({ queue, rollouts }: { queue: readonly QueueEntry[]; rollouts: readonly Rollout[] }) {
-  const titles = new Map(rollouts.map(r => [r.id, r.title]));
-
-  return (
-    <Table label="Queue">
-      <thead>
-        <tr>
-          <Th>#</Th>
-          <Th>Host</Th>
-          <Th>Waiting for</Th>
-          <Th className="w-full">Rollouts</Th>
-        </tr>
-      </thead>
-      <tbody>
-        {[...queue]
-          .sort((a, b) => a.position - b.position)
-          .map(q => (
-            <tr key={q.host} className="hover:bg-surface-hover">
-              <Td className="text-faint">{q.position}</Td>
-              <Td className="font-medium">{q.host}</Td>
-              <Td>{q.reason}</Td>
-              <Td className="whitespace-normal text-muted">
-                {list(q.rollouts)
-                  .map(id => titles.get(id) ?? id)
-                  .join(' · ')}
-              </Td>
-            </tr>
-          ))}
-      </tbody>
-    </Table>
   );
 }
 

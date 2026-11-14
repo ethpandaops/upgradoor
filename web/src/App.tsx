@@ -11,14 +11,16 @@ import { useHashTab } from './hooks/useHashTab';
 import { useTheme } from './hooks/useTheme';
 import { AuditTab } from './tabs/AuditTab';
 import { HostsTab } from './tabs/HostsTab';
+import { OverviewTab } from './tabs/OverviewTab';
 import { PackagesTab } from './tabs/PackagesTab';
 import { RolloutsTab } from './tabs/RolloutsTab';
 import { SettingsTab } from './tabs/SettingsTab';
 
-const TABS = ['hosts', 'rollouts', 'packages', 'settings', 'audit'] as const;
+const TABS = ['overview', 'hosts', 'rollouts', 'packages', 'settings', 'audit'] as const;
 type TabId = (typeof TABS)[number];
 
 const TAB_LABEL: Record<TabId, string> = {
+  overview: 'Overview',
   hosts: 'Hosts',
   rollouts: 'Rollouts',
   packages: 'Packages',
@@ -26,7 +28,7 @@ const TAB_LABEL: Record<TabId, string> = {
   audit: 'Audit',
 };
 
-/** Only the Hosts tab has a public view. */
+/** Overview and Hosts have a public view; the rest needs a login. */
 const PRIVATE_TABS: ReadonlySet<TabId> = new Set(['rollouts', 'packages', 'settings', 'audit']);
 
 /** MockControls lets the mock mode flip the network gate from the UI. */
@@ -98,7 +100,7 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
   const services = useMemo<AppServices>(() => ({ api, auth, config }), [api, auth, config]);
   const authState = useAuthState(auth);
   const { preference, setPreference } = useTheme();
-  const [tab, setTab] = useHashTab<TabId>(TABS, 'hosts');
+  const [tab, setTab] = useHashTab<TabId>(TABS, 'overview');
   const [gateFailing, setGateFailing] = useState(() => mock?.gateFailing() ?? false);
   const tabRefs = useRef(new Map<TabId, HTMLButtonElement>());
 
@@ -129,6 +131,9 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
     panel = <LoginPrompt tab={TAB_LABEL[tab]} auth={auth} authState={authState} />;
   } else {
     switch (tab) {
+      case 'overview':
+        panel = <OverviewTab onOpenTab={setTab} />;
+        break;
       case 'hosts':
         panel = <HostsTab />;
         break;
@@ -158,66 +163,71 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
             theme={preference}
             onTheme={setPreference}
             mockLabel={mock?.label}
+            extra={
+              mock && (
+                <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
+                  <input
+                    type="checkbox"
+                    checked={gateFailing}
+                    onChange={e => {
+                      mock.setGateFailing(e.target.checked);
+                      setGateFailing(e.target.checked);
+                    }}
+                    className="accent-accent"
+                  />
+                  failing gate
+                </label>
+              )
+            }
+            nav={
+              <div
+                role="tablist"
+                aria-label="Views"
+                onKeyDown={onTabKey}
+                className="flex h-full min-h-10 items-stretch"
+              >
+                {TABS.map(id => {
+                  const locked = PRIVATE_TABS.has(id) && !priv;
+                  return (
+                    <button
+                      key={id}
+                      ref={el => {
+                        if (el) tabRefs.current.set(id, el);
+                        else tabRefs.current.delete(id);
+                      }}
+                      type="button"
+                      role="tab"
+                      id={`tab-${id}`}
+                      aria-selected={tab === id}
+                      aria-controls="tab-panel"
+                      tabIndex={tab === id ? 0 : -1}
+                      title={locked ? 'Needs a login' : undefined}
+                      onClick={() => {
+                        setTab(id);
+                      }}
+                      className={cx(
+                        'border-y-2 border-t-transparent px-3 text-sm/6 font-medium whitespace-nowrap',
+                        tab === id
+                          ? 'border-b-accent text-foreground'
+                          : 'border-b-transparent text-muted hover:text-foreground',
+                        locked && tab !== id && 'text-faint'
+                      )}
+                    >
+                      {TAB_LABEL[id]}
+                      {locked && (
+                        <span aria-hidden="true" className="text-faint">
+                          {' '}
+                          (login)
+                        </span>
+                      )}
+                    </button>
+                  );
+                })}
+              </div>
+            }
           />
 
-          <div className="flex flex-wrap items-end gap-x-3 border-b border-border bg-surface px-3">
-            <div role="tablist" aria-label="Views" onKeyDown={onTabKey} className="flex gap-1">
-              {TABS.map(id => {
-                const locked = PRIVATE_TABS.has(id) && !priv;
-                return (
-                  <button
-                    key={id}
-                    ref={el => {
-                      if (el) tabRefs.current.set(id, el);
-                      else tabRefs.current.delete(id);
-                    }}
-                    type="button"
-                    role="tab"
-                    id={`tab-${id}`}
-                    aria-selected={tab === id}
-                    aria-controls="tab-panel"
-                    tabIndex={tab === id ? 0 : -1}
-                    title={locked ? 'Needs a login' : undefined}
-                    onClick={() => {
-                      setTab(id);
-                    }}
-                    className={cx(
-                      '-mb-px border-b-2 px-3 py-1.5 text-sm/6 font-medium',
-                      tab === id
-                        ? 'border-accent text-foreground'
-                        : 'border-transparent text-muted hover:border-border-strong hover:text-foreground',
-                      locked && tab !== id && 'text-faint'
-                    )}
-                  >
-                    {TAB_LABEL[id]}
-                    {locked && (
-                      <span aria-hidden="true" className="text-faint">
-                        {' '}
-                        (login)
-                      </span>
-                    )}
-                  </button>
-                );
-              })}
-            </div>
-
-            {mock && (
-              <label className="ml-auto flex items-center gap-1.5 py-1.5 text-xs/5 text-muted">
-                <input
-                  type="checkbox"
-                  checked={gateFailing}
-                  onChange={e => {
-                    mock.setGateFailing(e.target.checked);
-                    setGateFailing(e.target.checked);
-                  }}
-                  className="accent-accent"
-                />
-                mock: failing network gate
-              </label>
-            )}
-          </div>
-
-          <main id="tab-panel" role="tabpanel" aria-labelledby={`tab-${tab}`} className="grow p-2">
+          <main id="tab-panel" role="tabpanel" aria-labelledby={`tab-${tab}`} className="grow p-4">
             {panel}
           </main>
         </div>

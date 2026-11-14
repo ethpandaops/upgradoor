@@ -105,6 +105,24 @@ type PublicImages struct {
 	Images []PublicImage `json:"images"`
 }
 
+// ParticipationPoint is the attestation participation of one epoch across
+// every tracked validator. Only the sum over all hosts is public.
+type ParticipationPoint struct {
+	Epoch uint64 `json:"epoch"`
+	// Time is the end of the epoch.
+	Time  time.Time `json:"time"`
+	Live  uint64    `json:"live"`
+	Total uint64    `json:"total"`
+}
+
+// PublicHistory is the body of GET /api/v1/public/history: the recent
+// participation, oldest epoch first, and the threshold the gate holds it to.
+type PublicHistory struct {
+	Epochs                  []ParticipationPoint `json:"epochs"`
+	MinParticipationPercent float64              `json:"minParticipationPercent"`
+	EpochSeconds            float64              `json:"epochSeconds"`
+}
+
 // HostSummary is one row of the authenticated host table.
 type HostSummary struct {
 	Name         string    `json:"name"`

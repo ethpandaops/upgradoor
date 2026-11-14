@@ -2,9 +2,7 @@ import { Fragment, useMemo, useState } from 'react';
 
 import { list, type HostSummary } from '../api/types';
 import { useApp, useAuthState, usePrivateAccess } from '../appContext';
-import { useActions, type ActionIntent } from '../components/ActionDialog';
-import { GateIndicator } from '../components/GateIndicator';
-import { ImageStrip } from '../components/ImageStrip';
+import { useActions } from '../components/ActionDialog';
 import { RelTime } from '../components/RelTime';
 import {
   Badge,
@@ -22,13 +20,14 @@ import {
   type SortColumn,
   type SortDirection,
 } from '../components/primitives';
-import { ImageCell, SlotBadge } from '../components/status';
+import { ImageCell, needSummary } from '../components/status';
 import { usePoll } from '../hooks/usePoll';
-import { buildHoldRequest } from '../lib/actionRequests';
 import { formatDuration, formatPercent, plural } from '../lib/format';
+import { holdIntent } from '../lib/intents';
 import { HostDetailPanel } from './HostDetailPanel';
 import {
   attestingShare,
+  hostState,
   matchesFilter,
   mergeHostRows,
   rollableContainers,
@@ -37,26 +36,11 @@ import {
   type SortKey,
 } from './hostRows';
 
-/** holdIntent builds the confirm dialog of hold / unhold / forget. */
-function holdIntent(
-  action: 'hold' | 'unhold' | 'forget',
-  hosts: readonly string[],
-  hiddenHosts: readonly string[] = []
-): ActionIntent {
-  const verb = action === 'hold' ? 'Hold' : action === 'unhold' ? 'Unhold' : 'Forget';
-  return {
-    kind: 'call',
-    title: `${verb} ${plural(hosts.length, 'host')}`,
-    danger: action === 'forget',
-    hiddenHosts,
-    make: reason => ({ action, body: buildHoldRequest(hosts, reason) }),
-  };
-}
-
 /**
- * HostsTab is the default view. Logged out it shows only the public data
+ * HostsTab is the fleet table. Logged out it shows only the public data
  * (name, EL / CL image, update marker); logged in the same table gains the
- * host details, the expandable rows and the actions.
+ * host's state, and a row opens to the host's details and actions. Actions on
+ * several hosts go through the selection.
  */
 export function HostsTab() {
   const { api, auth } = useApp();
@@ -64,8 +48,6 @@ export function HostsTab() {
   const authEnabled = useAuthState(auth).enabled;
 
   const publicHosts = usePoll(s => api.publicHosts(s), { key: 'public-hosts' });
-  const images = usePoll(s => api.publicImages(s), { key: 'public-images' });
-  const gate = usePoll(s => api.publicNetwork(s), { key: 'public-network' });
   const hosts = usePoll(s => api.hosts(s), { key: 'hosts', enabled: priv });
   const plan = usePoll(s => api.plan(s), { key: 'plan', enabled: priv });
 
@@ -76,7 +58,6 @@ export function HostsTab() {
 
   const refreshAll = () => {
     publicHosts.refresh();
-    images.refresh();
     hosts.refresh();
     plan.refresh();
   };
@@ -132,30 +113,22 @@ export function HostsTab() {
     return selection.filter(n => !visible.has(n));
   }, [rows, selection]);
   const allVisibleSelected = visibleNames.length > 0 && visibleNames.every(n => selected.has(n));
-  const columnCount = priv ? 13 : 4;
+  const columnCount = priv ? 11 : 4;
 
   const loading = publicHosts.loading || (priv && hosts.loading);
 
   return (
-    <div className="flex flex-col gap-2">
-      {gate.data && <GateIndicator gate={gate.data} />}
-      {gate.error !== undefined && <ErrorBanner error={gate.error} what="the network gate" onRetry={gate.refresh} />}
-
-      <ImageStrip images={list(images.data?.images)} />
-      {images.error !== undefined && (
-        <ErrorBanner error={images.error} what="the image summary" onRetry={images.refresh} />
-      )}
-
-      <div className="flex flex-wrap items-center gap-2">
+    <div className="flex flex-col gap-3">
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
         <input
           type="search"
           aria-label="Filter hosts"
-          placeholder={priv ? 'Filter: name, image, role, slot…' : 'Filter: name, image…'}
+          placeholder={priv ? 'Filter by name, image, role, state…' : 'Filter by name or image…'}
           value={filter}
           onChange={e => {
             setFilter(e.target.value);
           }}
-          className={cx(INPUT_CLASS, 'w-64')}
+          className={cx(INPUT_CLASS, 'w-72')}
         />
         <span className="text-xs/5 text-muted">
           {rows.length === allRows.length
@@ -164,7 +137,7 @@ export function HostsTab() {
         </span>
 
         {priv && (
-          <div role="group" aria-label="Bulk actions" className="flex flex-wrap items-center gap-1.5">
+          <div role="group" aria-label="Bulk actions" className="ml-auto flex flex-wrap items-center gap-1.5">
             {selection.length > 0 ? (
               <>
                 <span className="text-xs/5 font-medium">
@@ -249,9 +222,9 @@ export function HostsTab() {
               </>
             ) : (
               <>
-                <span className="text-xs/5 text-muted">Whole fleet:</span>
                 <Button
                   dense
+                  variant="ghost"
                   onClick={() => {
                     actions.request({
                       kind: 'roll',
@@ -261,15 +234,16 @@ export function HostsTab() {
                     });
                   }}
                 >
-                  Roll all…
+                  Roll all hosts…
                 </Button>
                 <Button
                   dense
+                  variant="ghost"
                   onClick={() => {
                     actions.request({ kind: 'reboot', hosts: [], all: true });
                   }}
                 >
-                  Reboot all…
+                  Reboot all hosts…
                 </Button>
               </>
             )}
@@ -295,7 +269,7 @@ export function HostsTab() {
           <Empty>No host has talked to this controller yet. A host appears once its agent has synced.</Empty>
         )
       ) : (
-        <Table label="Hosts">
+        <Table label="Hosts" roomy>
           <thead>
             <tr>
               {priv && (
@@ -317,26 +291,24 @@ export function HostsTab() {
                 </>
               )}
               <SortTh columns={[sortColumn('name', 'Host')]} />
-              <SortTh columns={[sortColumn('el', 'EL image')]} />
-              <SortTh columns={[sortColumn('cl', 'CL image')]} />
-              <SortTh columns={[sortColumn('pending', 'Update', 'The host has an open need')]} />
-              {priv && (
+              <SortTh columns={[sortColumn('el', 'Execution')]} />
+              <SortTh columns={[sortColumn('cl', 'Consensus')]} />
+              {priv ? (
                 <>
-                  <SortTh columns={[sortColumn('kernel', 'Kernel'), sortColumn('os', 'OS')]} />
-                  <SortTh
-                    columns={[
-                      sortColumn('uptime', 'Uptime'),
-                      sortColumn('reboot', 'Reboot', '/var/run/reboot-required exists'),
-                    ]}
-                  />
-                  <SortTh columns={[sortColumn('security', 'Sec.', 'Pending security updates')]} />
+                  <SortTh columns={[sortColumn('slot', 'State', 'What the scheduler does with the host')]} />
                   <SortTh
                     columns={[sortColumn('attesting', 'Attesting', 'Validators live in the last complete epoch')]}
                   />
-                  <SortTh columns={[sortColumn('lastSeen', 'Seen', 'When the agent last synced')]} />
-                  <SortTh columns={[sortColumn('slot', 'Slot')]} />
-                  <Th>Actions</Th>
+                  <SortTh columns={[sortColumn('kernel', 'Kernel')]} />
+                  <SortTh className="hidden xl:table-cell" columns={[sortColumn('uptime', 'Uptime')]} />
+                  <SortTh columns={[sortColumn('security', 'Updates', 'Pending package updates')]} />
+                  <SortTh
+                    className="hidden 2xl:table-cell"
+                    columns={[sortColumn('lastSeen', 'Seen', 'When the agent last synced')]}
+                  />
                 </>
+              ) : (
+                <SortTh columns={[sortColumn('pending', 'State', 'The host has an update waiting')]} />
               )}
             </tr>
           </thead>
@@ -363,11 +335,10 @@ export function HostsTab() {
                     onExpand={() => {
                       setExpanded(prev => toggle(prev, row.name));
                     }}
-                    onAction={actions.request}
                   />
                   {priv && isOpen && (
                     <tr>
-                      <td colSpan={columnCount} className="border-b border-border-strong bg-background p-2">
+                      <td colSpan={columnCount} className="border-b border-border-strong bg-background p-4">
                         <HostDetailPanel name={row.name} onAction={actions.request} />
                       </td>
                     </tr>
@@ -391,7 +362,6 @@ function HostTableRow({
   expanded,
   onSelect,
   onExpand,
-  onAction,
 }: {
   row: HostRow;
   priv: boolean;
@@ -399,15 +369,24 @@ function HostTableRow({
   expanded: boolean;
   onSelect: () => void;
   onExpand: () => void;
-  onAction: (intent: ActionIntent) => void;
 }) {
   const s = row.summary;
 
   return (
-    <tr className={cx('hover:bg-surface-hover', selected && 'bg-surface-selected')}>
+    <tr
+      className={cx('hover:bg-surface-hover', selected && 'bg-surface-selected', priv && 'cursor-pointer')}
+      onClick={
+        priv
+          ? e => {
+              // A click on a control inside the row is that control's.
+              if (!(e.target as HTMLElement).closest('button, input, a')) onExpand();
+            }
+          : undefined
+      }
+    >
       {priv && (
         <>
-          <Td tight className="text-center">
+          <Td tight className="pl-3 text-center">
             <input
               type="checkbox"
               aria-label={`Select ${row.name}`}
@@ -422,7 +401,7 @@ function HostTableRow({
               aria-expanded={expanded}
               aria-label={`${expanded ? 'Collapse' : 'Expand'} ${row.name}`}
               onClick={onExpand}
-              className="rounded-xs px-1 text-muted hover:bg-surface-hover hover:text-foreground"
+              className="rounded-xs px-1 text-muted hover:text-foreground"
             >
               {expanded ? '▾' : '▸'}
             </button>
@@ -430,102 +409,70 @@ function HostTableRow({
         </>
       )}
       <Td>
-        <span className={cx('flex gap-x-1.5', priv ? 'flex-col' : 'items-center')}>
-          <span className="font-medium">{row.name}</span>
-          {s && (
-            <span className="flex items-center gap-1.5">
-              {list(s.roles).map(role => (
+        <span className="flex items-center gap-2">
+          <span className="text-sm/6 font-medium">{row.name}</span>
+          {s &&
+            list(s.roles)
+              .filter(role => role !== 'ethereum_node')
+              .map(role => (
                 <Badge key={role} tone={role === 'bootnode' ? 'info' : 'neutral'}>
                   {role}
                 </Badge>
               ))}
-              {s.validators > 0 && (
-                <span className="text-faint" title={`${s.validators} validators`}>
-                  {s.validators}v
-                </span>
-              )}
-            </span>
-          )}
         </span>
       </Td>
       <Td>
-        <ImageCell image={row.el} stacked={priv} />
+        <ImageCell image={row.el} compact />
       </Td>
       <Td>
-        <ImageCell image={row.cl} stacked={priv} />
+        <ImageCell image={row.cl} compact />
       </Td>
-      <Td>
-        {row.updatePending ? (
-          <Badge tone="warning" title="The host has an open need (image, packages or reboot)">
-            pending
-          </Badge>
-        ) : (
-          <span className="text-faint">up to date</span>
-        )}
-      </Td>
-      {priv &&
-        (s ? <PrivateCells summary={s} queuePosition={row.queuePosition} onAction={onAction} /> : <MissingCells />)}
+      {!priv && (
+        <Td>
+          {row.updatePending ? (
+            <Badge tone="warning" title="The host has an update waiting (image, packages or reboot)">
+              pending
+            </Badge>
+          ) : (
+            <span className="text-faint">up to date</span>
+          )}
+        </Td>
+      )}
+      {priv && (s ? <PrivateCells row={row} summary={s} /> : <MissingCells />)}
     </tr>
   );
 }
 
 function MissingCells() {
   return (
-    <Td colSpan={7} className="text-faint">
+    <Td colSpan={6} className="text-faint">
       no details yet
     </Td>
   );
 }
 
-function PrivateCells({
-  summary: s,
-  queuePosition,
-  onAction,
-}: {
-  summary: HostSummary;
-  queuePosition: number | undefined;
-  onAction: (intent: ActionIntent) => void;
-}) {
+function PrivateCells({ row, summary: s }: { row: HostRow; summary: HostSummary }) {
   const share = attestingShare(s);
-  const verbs = list(s.verbs);
-  const held = s.holdWanted || s.hold.controller;
+  const state = hostState(row);
+  const needs = list(s.needs);
   const kernelBehind = s.os.newestKernel !== '' && s.os.newestKernel !== s.os.runningKernel;
 
   return (
     <>
       <Td>
-        <span className="flex flex-col">
-          <span>
-            <span className="font-mono">{s.os.runningKernel || <Dash />}</span>
-            {kernelBehind && (
-              <span className="text-warning" title={`A newer kernel is installed: ${s.os.newestKernel}`}>
-                {' '}
-                ↑
-              </span>
-            )}
-          </span>
-          <span className="text-muted" title={`${s.os.prettyName} (${s.os.arch})`}>
-            {s.os.id} {s.os.versionId}
-          </span>
-        </span>
-      </Td>
-      <Td>
-        <span className="flex flex-col items-start">
-          <span title={`${s.uptimeSeconds} s`}>{formatDuration(s.uptimeSeconds)}</span>
-          {s.os.rebootRequired && (
-            <Badge tone="warning" title={`Reboot required by: ${list(s.os.rebootPackages).join(', ') || 'unknown'}`}>
-              reboot
+        <span className="flex items-center gap-2" title={needs.map(needSummary).join('\n') || undefined}>
+          {state ? <Badge tone={state.tone}>{state.label}</Badge> : <span className="text-faint">up to date</span>}
+          {s.hold.local && (
+            <Badge tone="warning" title={`Local hold file${s.hold.localReason ? `: ${s.hold.localReason}` : ''}`}>
+              local hold
             </Badge>
           )}
+          {state?.detail && (
+            <span className="max-w-36 truncate text-muted 2xl:max-w-80" title={state.detail}>
+              {state.detail}
+            </span>
+          )}
         </span>
-      </Td>
-      <Td title={`${s.pending.upgradable} upgradable, ${s.pending.security} security, ${s.pending.blocked} blocked`}>
-        {s.pending.security > 0 ? (
-          <span className="font-medium text-danger">{s.pending.security}</span>
-        ) : (
-          <span className="text-faint">0</span>
-        )}
-        {s.pending.blocked > 0 && <span className="text-warning"> +{s.pending.blocked}b</span>}
       </Td>
       <Td>
         {s.plan.weight === 0 ? (
@@ -534,91 +481,67 @@ function PrivateCells({
           </span>
         ) : share === undefined ? (
           <span className="text-muted" title="No liveness data yet">
-            ? <span className="text-faint">(?/{s.plan.weight})</span>
+            ? <span className="text-faint">of {s.plan.weight}</span>
           </span>
         ) : (
           <span
-            className={cx(
-              'flex flex-col font-mono',
-              share >= 0.9 ? 'text-success' : share > 0 ? 'text-warning' : 'text-danger'
-            )}
+            className="flex items-center gap-2 tabular-nums"
             title={`${s.plan.live} of ${s.plan.weight} validators attested in the last complete epoch`}
           >
-            <span>{formatPercent(share * 100)}</span>
-            <span className="text-faint">
+            <span
+              aria-hidden="true"
+              className={cx(
+                'size-2 rounded-full',
+                share >= 0.9 ? 'bg-success' : share > 0 ? 'bg-warning' : 'bg-danger-solid'
+              )}
+            />
+            <span className={cx(share < 0.9 && 'font-medium', share === 0 && 'text-danger')}>
+              {formatPercent(share * 100)}
+            </span>
+            <span className="hidden text-faint 2xl:inline">
               {s.plan.live}/{s.plan.weight}
             </span>
           </span>
         )}
       </Td>
       <Td>
-        <span className={cx('flex flex-col items-start', s.stale && 'font-medium text-warning')}>
-          <RelTime value={s.lastSeen} />
-          {s.stale && <Badge tone="warning">stale</Badge>}
+        <span className="flex items-baseline gap-2" title={`${s.os.prettyName} (${s.os.arch})`}>
+          <span className="font-mono">{s.os.runningKernel || <Dash />}</span>
+          {kernelBehind && (
+            <span className="text-warning" title={`A newer kernel is installed: ${s.os.newestKernel}`}>
+              ↑
+            </span>
+          )}
+          <span className="hidden text-faint 2xl:inline">
+            {s.os.id} {s.os.versionId}
+          </span>
         </span>
       </Td>
-      <Td>
-        <span className="flex flex-col">
-          <span className="flex items-center gap-1.5">
-            <SlotBadge slot={s.plan.slot} />
-            {queuePosition !== undefined && <span className="text-faint">#{queuePosition}</span>}
-            {s.hold.local && (
-              <Badge tone="warning" title={`Local hold file${s.hold.localReason ? `: ${s.hold.localReason}` : ''}`}>
-                local hold
-              </Badge>
-            )}
-          </span>
-          {s.plan.reason && (
-            <span className="max-w-32 truncate text-muted" title={`Waiting reason: ${s.plan.reason}`}>
-              {s.plan.reason}
-            </span>
+      <Td className="hidden xl:table-cell">
+        <span className="tabular-nums" title={`${s.uptimeSeconds} s`}>
+          {formatDuration(s.uptimeSeconds)}
+        </span>
+      </Td>
+      <Td title={`${s.pending.upgradable} upgradable, ${s.pending.security} security, ${s.pending.blocked} blocked`}>
+        <span className="flex items-center gap-2">
+          {s.pending.security > 0 ? (
+            <span className="font-medium text-danger">{s.pending.security} security</span>
+          ) : s.pending.upgradable > 0 ? (
+            <span className="text-muted">{s.pending.upgradable}</span>
+          ) : (
+            <span className="text-faint">–</span>
+          )}
+          {s.pending.blocked > 0 && <span className="text-warning">{s.pending.blocked} blocked</span>}
+          {s.os.rebootRequired && (
+            <Badge tone="warning" title={`Reboot required by: ${list(s.os.rebootPackages).join(', ') || 'unknown'}`}>
+              reboot
+            </Badge>
           )}
         </span>
       </Td>
-      <Td>
-        <span className="grid min-w-max grid-cols-2 gap-0.5">
-          <Button
-            dense
-            disabled={!verbs.includes('roll')}
-            title={verbs.includes('roll') ? undefined : 'The agent does not allow the roll verb'}
-            aria-label={`Roll ${s.name}`}
-            onClick={() => {
-              onAction({ kind: 'roll', hosts: [s.name], all: false, containerChoices: rollableContainers([s]) });
-            }}
-          >
-            Roll
-          </Button>
-          <Button
-            dense
-            disabled={!verbs.includes('reboot')}
-            title={verbs.includes('reboot') ? undefined : 'The agent does not allow the reboot verb'}
-            aria-label={`Reboot ${s.name}`}
-            onClick={() => {
-              onAction({ kind: 'reboot', hosts: [s.name], all: false });
-            }}
-          >
-            Reboot
-          </Button>
-          <Button
-            dense
-            aria-label={`${held ? 'Unhold' : 'Hold'} ${s.name}`}
-            onClick={() => {
-              onAction(holdIntent(held ? 'unhold' : 'hold', [s.name]));
-            }}
-          >
-            {held ? 'Unhold' : 'Hold'}
-          </Button>
-          <Button
-            dense
-            variant="ghost"
-            aria-label={`Forget ${s.name}`}
-            title="Delete this host from the controller"
-            onClick={() => {
-              onAction(holdIntent('forget', [s.name]));
-            }}
-          >
-            Forget
-          </Button>
+      <Td className="hidden 2xl:table-cell">
+        <span className={cx(s.stale ? 'font-medium text-warning' : 'text-muted')}>
+          <RelTime value={s.lastSeen} />
         </span>
       </Td>
     </>
