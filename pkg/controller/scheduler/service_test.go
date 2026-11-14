@@ -825,10 +825,16 @@ func TestSkipAction(t *testing.T) {
 	assert.Equal(t, "action.skip", h.store.lastAudit().Action)
 
 	// The skipped host is settled: it keeps reporting the need, is never
-	// granted and does not keep the rollout open.
+	// granted and does not keep the rollout open. TestSkipOutlivesTheRollout
+	// follows it past the completion.
 	h.finish("leased")
 	assert.Nil(t, h.assignment("waiting").Lease)
 	assert.Equal(t, fleet.RolloutCompleted, h.rollout(id).State)
+
+	h.advance(2 * time.Second)
+	h.tick()
+	assert.Empty(t, h.openRollouts())
+	assert.Nil(t, h.assignment("waiting").Lease)
 
 	_, err = h.svc.Skip(h.ctx, "alice", RolloutHostsRequest{Rollout: id, Hosts: []string{"waiting"}})
 	require.ErrorIs(t, err, ErrInvalidAction, "the rollout is closed")
@@ -892,7 +898,7 @@ func TestRetryAction(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a"}, res.Hosts)
-	assert.Equal(t, map[string]string{"b": "has not failed in the rollout"}, res.Rejected)
+	assert.Equal(t, map[string]string{"b": "has neither failed nor been skipped in the rollout"}, res.Rejected)
 
 	r := h.rollout(id)
 	assert.Equal(t, fleet.RolloutActive, r.State)
@@ -929,8 +935,19 @@ func TestRetryAction(t *testing.T) {
 		h2.tick()
 		assert.Equal(t, fleet.RolloutCompleted, h2.rollout(id).State)
 
+		// The skipped host still reports the need and is not served again.
+		h2.advance(time.Hour)
+		h2.tick()
+		assert.Empty(t, h2.openRollouts())
+		assert.Nil(t, h2.assignment("a").Lease)
+
+		// Retry of the completed rollout lifts the skip, once.
 		_, err = h2.svc.Retry(h2.ctx, "alice", RolloutHostsRequest{Rollout: id})
-		require.ErrorIs(t, err, ErrInvalidAction, "completed is terminal")
+		require.NoError(t, err)
+		assert.Equal(t, fleet.RolloutCompleted, h2.rollout(id).State, "completed is terminal")
+
+		_, err = h2.svc.Retry(h2.ctx, "alice", RolloutHostsRequest{Rollout: id})
+		require.ErrorIs(t, err, ErrInvalidAction, "nothing left to retry")
 	})
 
 	t.Run("unknown rollout", func(t *testing.T) {
@@ -1095,4 +1112,453 @@ func TestServiceAdoptsOnlyUnknownLeases(t *testing.T) {
 	require.Len(t, leases, 2)
 	assert.Equal(t, []protocol.Need{need}, leases[1].Needs)
 	assert.Empty(t, a.Lease.Needs)
+}
+
+// reportsNeed tells whether the host's last sync lists the need.
+func (h *harness) reportsNeed(name, needID string) bool {
+	return slices.ContainsFunc(h.store.host(name).Status.Needs, func(n protocol.Need) bool { return n.ID == needID })
+}
+
+func TestSkipOutlivesTheRollout(t *testing.T) {
+	needs := []struct {
+		name string
+		need protocol.Need
+	}{
+		{"packages", packagesNeed("2.0")},
+		{"reboot", rebootNeed()},
+		{"image", imageNeed("c", imgLighthouse, digestA)},
+	}
+
+	// start skips "waiting" and serves "leased", so the rollout completes
+	// with a skipped host that still reports the need.
+	start := func(t *testing.T, need protocol.Need) (h *harness, id string) {
+		t.Helper()
+
+		h = newHarness(t)
+		h.addHost("leased", 0, need)
+		h.addHost("waiting", 0, need)
+		h.tick()
+
+		id = h.openRollouts()[0].ID
+
+		_, err := h.svc.Skip(h.ctx, "alice", RolloutHostsRequest{
+			Rollout: id, Hosts: []string{"waiting"}, Reason: "broken disk",
+		})
+		require.NoError(t, err)
+
+		h.finish("leased")
+		require.Equal(t, fleet.RolloutCompleted, h.rollout(id).State)
+		require.True(t, h.reportsNeed("waiting", need.ID))
+
+		return h, id
+	}
+
+	for _, tt := range needs {
+		t.Run(tt.name+": the skipped host is not rolled once the rollout completes", func(t *testing.T) {
+			h, id := start(t, tt.need)
+
+			for range 5 {
+				h.advance(2 * time.Second)
+				h.tick()
+				assert.Empty(t, h.openRollouts(), "the skipped host's need opens no rollout")
+				assert.Nil(t, h.assignment("waiting").Lease)
+			}
+
+			// A restart remembers the skip as well.
+			h.restart()
+			h.advance(time.Hour)
+			h.tick()
+			assert.Empty(t, h.openRollouts())
+			assert.Equal(t, "skipped: broken disk", h.rollout(id).Host("waiting").Error)
+			assert.NotContains(t, h.store.auditActions(), "rollout.skip-lifted")
+		})
+	}
+
+	t.Run("another host with the same need opens a rollout; the skipped host joins it as skipped", func(t *testing.T) {
+		h, _ := start(t, packagesNeed("2.0"))
+		h.addHost("late", 0, packagesNeed("2.0"))
+		h.advance(2 * time.Second)
+		h.tick()
+
+		open := h.openRollouts()
+		require.Len(t, open, 1)
+		assert.Equal(t, fleet.HostSkipped, open[0].Host("waiting").State)
+		assert.Equal(t, "skipped: broken disk", open[0].Host("waiting").Error)
+		assert.Equal(t, fleet.HostLeased, open[0].Host("late").State)
+		assert.Nil(t, h.assignment("waiting").Lease)
+
+		h.finish("late")
+		assert.Equal(t, fleet.RolloutCompleted, h.rollout(open[0].ID).State)
+
+		h.advance(2 * time.Second)
+		h.tick()
+		assert.Empty(t, h.openRollouts(), "the skip moved on to the newer closed rollout")
+		assert.Nil(t, h.assignment("waiting").Lease)
+	})
+
+	t.Run("a changed key is a new cause", func(t *testing.T) {
+		h, _ := start(t, packagesNeed("2.0"))
+		h.sync("waiting", func(st *protocol.SyncRequest) { st.Needs = []protocol.Need{packagesNeed("3.0")} })
+		h.tick()
+
+		require.Len(t, h.openRollouts(), 1)
+		assert.NotNil(t, h.assignment("waiting").Lease)
+	})
+
+	t.Run("retry of the closed rollout lifts the skip", func(t *testing.T) {
+		h, id := start(t, packagesNeed("2.0"))
+
+		res, err := h.svc.Retry(h.ctx, "bob", RolloutHostsRequest{
+			Rollout: id, Hosts: []string{"waiting", "leased"}, Reason: "disk replaced",
+		})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"waiting"}, res.Hosts)
+		assert.Equal(t, map[string]string{"leased": "is not skipped in the rollout"}, res.Rejected)
+		assert.Equal(t, fleet.RolloutCompleted, h.rollout(id).State, "the closed rollout stays closed")
+		assert.Equal(t, "skip lifted: disk replaced", h.rollout(id).Host("waiting").Error)
+
+		entry := h.store.lastAudit()
+		assert.Equal(t, "action.retry", entry.Action)
+		assert.Equal(t, "bob", entry.Actor)
+
+		h.tick()
+		require.Len(t, h.openRollouts(), 1)
+		assert.NotNil(t, h.assignment("waiting").Lease)
+
+		_, err = h.svc.Retry(h.ctx, "bob", RolloutHostsRequest{Rollout: id})
+		require.ErrorIs(t, err, ErrInvalidAction, "no skip left to lift")
+	})
+
+	t.Run("the skip survives an aborted cause that is reopened and aborted again at once", func(t *testing.T) {
+		h := newHarness(t)
+		h.addHost("leased", 0, packagesNeed("2.0"))
+		h.addHost("waiting", 0, packagesNeed("2.0"))
+		h.tick()
+
+		id := h.openRollouts()[0].ID
+
+		_, err := h.svc.Skip(h.ctx, "alice", RolloutHostsRequest{Rollout: id, Hosts: []string{"waiting"}})
+		require.NoError(t, err)
+		_, err = h.svc.Abort(h.ctx, "alice", ScopeRequest{Rollout: id})
+		require.NoError(t, err)
+		h.finish("leased")
+
+		// Reopened and aborted before any reconcile has seen the new rollout.
+		res, err := h.svc.Retry(h.ctx, "alice", RolloutHostsRequest{Rollout: id})
+		require.NoError(t, err)
+		assert.Equal(t, fleet.HostSkipped, h.rollout(res.Rollout).Host("waiting").State)
+
+		_, err = h.svc.Abort(h.ctx, "alice", ScopeRequest{Rollout: res.Rollout})
+		require.NoError(t, err)
+
+		res, err = h.svc.Retry(h.ctx, "alice", RolloutHostsRequest{Rollout: id})
+		require.NoError(t, err)
+
+		for range 3 {
+			h.advance(2 * time.Second)
+			h.tick()
+			assert.Nil(t, h.assignment("waiting").Lease)
+		}
+
+		assert.Equal(t, fleet.HostSkipped, h.rollout(res.Rollout).Host("waiting").State)
+		assert.Equal(t, fleet.RolloutCompleted, h.rollout(res.Rollout).State)
+	})
+
+	t.Run("retry of an open rollout takes a skip back only for a named host", func(t *testing.T) {
+		h := newHarness(t)
+		h.addHost("leased", 0, packagesNeed("2.0"))
+		h.addHost("waiting", 0, packagesNeed("2.0"))
+		h.tick()
+
+		id := h.openRollouts()[0].ID
+
+		_, err := h.svc.Skip(h.ctx, "alice", RolloutHostsRequest{Rollout: id, Hosts: []string{"waiting"}})
+		require.NoError(t, err)
+
+		_, err = h.svc.Retry(h.ctx, "alice", RolloutHostsRequest{Rollout: id})
+		require.ErrorIs(t, err, ErrInvalidAction, "nothing failed, and no host is named")
+		assert.Equal(t, fleet.HostSkipped, h.rollout(id).Host("waiting").State)
+
+		res, err := h.svc.Retry(h.ctx, "alice", RolloutHostsRequest{Rollout: id, Hosts: []string{"waiting"}})
+		require.NoError(t, err)
+		assert.Equal(t, []string{"waiting"}, res.Hosts)
+		assert.Equal(t, fleet.HostPending, h.rollout(id).Host("waiting").State)
+	})
+
+	t.Run("the skip ends when the host stops reporting the need", func(t *testing.T) {
+		h, id := start(t, rebootNeed())
+
+		// Someone rebooted the host by hand.
+		h.sync("waiting", func(st *protocol.SyncRequest) { st.Needs = nil })
+		h.tick()
+		assert.Equal(t, "skip lifted: the host stopped reporting the need", h.rollout(id).Host("waiting").Error)
+		assert.Contains(t, h.store.auditActions(), "rollout.skip-lifted")
+
+		// A later reboot need is a new one.
+		h.advance(time.Hour)
+		h.sync("waiting", func(st *protocol.SyncRequest) { st.Needs = []protocol.Need{rebootNeed()} })
+		h.tick()
+		assert.NotNil(t, h.assignment("waiting").Lease)
+	})
+
+	t.Run("a held host reports nothing and keeps its skip", func(t *testing.T) {
+		h, id := start(t, rebootNeed())
+
+		h.sync("waiting", func(st *protocol.SyncRequest) {
+			st.Needs = nil
+			st.Hold = protocol.Hold{Local: true}
+		})
+		h.tick()
+		assert.Equal(t, "skipped: broken disk", h.rollout(id).Host("waiting").Error)
+
+		h.sync("waiting", func(st *protocol.SyncRequest) {
+			st.Needs = []protocol.Need{rebootNeed()}
+			st.Hold = protocol.Hold{}
+		})
+		h.tick()
+		assert.Empty(t, h.openRollouts())
+		assert.Nil(t, h.assignment("waiting").Lease)
+	})
+}
+
+func TestForgetIsAuditedBeforeTheHostIsDeleted(t *testing.T) {
+	t.Run("no audit entry, no delete", func(t *testing.T) {
+		h := newHarness(t)
+		h.addHost("gone", 0)
+		h.store.setFailing(false, 1)
+
+		res, err := h.svc.Forget(h.ctx, "alice", HoldRequest{Hosts: []string{"gone"}})
+		require.ErrorIs(t, err, errWrite)
+		require.NotNil(t, res)
+		assert.Empty(t, res.Hosts)
+		assert.NotNil(t, h.store.host("gone"), "a host is never deleted without an audit entry")
+		assert.Empty(t, h.store.auditActions())
+	})
+
+	t.Run("a delete that fails after the audit entry is audited as failed", func(t *testing.T) {
+		h := newHarness(t)
+		h.addHost("gone", 0)
+		h.store.failSkip, h.store.failNext = 1, 1
+
+		_, err := h.svc.Forget(h.ctx, "alice", HoldRequest{Hosts: []string{"gone"}})
+		require.ErrorIs(t, err, errWrite)
+		assert.NotNil(t, h.store.host("gone"))
+		assert.Equal(t, []string{"action.forget", "action.forget.failed"}, h.store.auditActions())
+	})
+
+	t.Run("a failure names the hosts that are already gone", func(t *testing.T) {
+		h := newHarness(t)
+		h.addHost("a", 0)
+		h.addHost("b", 0)
+		// Audit and delete of "a" pass, the audit entry of "b" fails.
+		h.store.failSkip, h.store.failNext = 2, 1
+
+		res, err := h.svc.Forget(h.ctx, "alice", HoldRequest{Hosts: []string{"a", "b"}})
+		require.ErrorIs(t, err, errWrite)
+		require.NotNil(t, res)
+		assert.Equal(t, []string{"a"}, res.Hosts)
+		assert.Nil(t, h.store.host("a"))
+		assert.NotNil(t, h.store.host("b"))
+		assert.Equal(t, []string{"action.forget"}, h.store.auditActions())
+	})
+
+	t.Run("directives that could not be cancelled are cancelled by the next reconcile", func(t *testing.T) {
+		h := newHarness(t)
+		h.addHost("gone", 0)
+
+		_, err := h.svc.Hold(h.ctx, "alice", HoldRequest{Hosts: []string{"gone"}})
+		require.NoError(t, err)
+		h.tick()
+		require.Len(t, h.assignment("gone").Directives, 1)
+
+		// Audit and delete pass, the cancellation fails.
+		h.store.failSkip, h.store.failNext = 2, 1
+
+		res, err := h.svc.Forget(h.ctx, "alice", HoldRequest{Hosts: []string{"gone"}})
+		require.NoError(t, err, "the host is gone and audited")
+		assert.Equal(t, []string{"gone"}, res.Hosts)
+		assert.Len(t, h.assignment("gone").Directives, 1)
+
+		h.tick()
+		assert.Empty(t, h.assignment("gone").Directives)
+	})
+}
+
+func TestHoldOfSeveralHostsReportsThePartialResult(t *testing.T) {
+	h := newHarness(t)
+	h.addHost("a", 0)
+	h.addHost("b", 0)
+	h.addHost("c", 0)
+	// Hold and audit of "a" pass, the hold of "b" fails.
+	h.store.failSkip, h.store.failNext = 2, 1
+
+	res, err := h.svc.Hold(h.ctx, "alice", HoldRequest{Hosts: []string{"a", "b", "c"}, Reason: "debugging"})
+	require.ErrorIs(t, err, errWrite)
+	require.NotNil(t, res, "the caller learns what was changed")
+	assert.Equal(t, []string{"a"}, res.Hosts)
+	assert.Contains(t, res.Message, "stopped at b")
+	assert.True(t, h.store.host("a").HoldWanted)
+	assert.False(t, h.store.host("b").HoldWanted)
+	assert.False(t, h.store.host("c").HoldWanted)
+	assert.Equal(t, []string{"action.hold"}, h.store.auditActions())
+}
+
+func TestReservedActorNames(t *testing.T) {
+	tests := []struct{ actor, want string }{
+		{"", "anonymous"},
+		{"alice", "alice"},
+		{"adopted", "adopted"},
+		{"scheduler", "user:scheduler"},
+		{"scheduler:adopted", "user:scheduler:adopted"},
+		{"scheduler:x", "user:scheduler:x"},
+		{"schedulers", "schedulers"},
+	}
+
+	for _, tt := range tests {
+		assert.Equal(t, tt.want, actorName(tt.actor), "actor %q", tt.actor)
+	}
+
+	// A person who carries the adoption marker, or the name the marker had
+	// before it was reserved, still gets a lease with its needs.
+	for _, actor := range []string{grantedByAdoption, "adopted", actorScheduler} {
+		t.Run(actor, func(t *testing.T) {
+			h := newHarness(t)
+			h.addHost("a", 0)
+
+			res, err := h.svc.Reboot(h.ctx, actor, RebootRequest{All: true})
+			require.NoError(t, err)
+
+			dir := h.assignment("a").Directives[0]
+			need := protocol.Need{
+				ID: protocol.ManualNeedID(dir.ID), Kind: protocol.NeedReboot, DirectiveID: dir.ID,
+				Reboot: &protocol.RebootNeed{Reasons: []string{protocol.RebootReasonManual}},
+			}
+
+			h.sync("a", func(st *protocol.SyncRequest) {
+				st.Needs = []protocol.Need{need}
+				st.DirectiveAcks = []protocol.DirectiveAck{{ID: dir.ID, Status: protocol.DirectiveAccepted}}
+			})
+			h.tick()
+
+			lease := h.assignment("a").Lease
+			require.NotNil(t, lease)
+			assert.Equal(t, []protocol.Need{need}, lease.Needs, "a manual lease is restated with its needs")
+
+			_, leases, _ := h.store.snapshot()
+			require.Len(t, leases, 1)
+			assert.Equal(t, actorName(actor), leases[0].GrantedBy)
+			assert.NotEqual(t, grantedByAdoption, leases[0].GrantedBy)
+			assert.Equal(t, actorName(actor), h.rollout(res.Rollout).CreatedBy)
+			assert.Equal(t, actorName(actor), h.store.lastAuditOf("action.reboot").Actor)
+		})
+	}
+}
+
+func TestTickReadsOnlyWhatIsOpen(t *testing.T) {
+	h := newHarness(t)
+	h.addHost("a", 0, packagesNeed("2.0"))
+	h.addHost("b", 0)
+	h.tick()
+	require.NotNil(t, h.assignment("a").Lease)
+
+	// A manual rollout whose directive "b" answers; it waits for the one
+	// slot that "a" holds.
+	res, err := h.svc.Reboot(h.ctx, "alice", RebootRequest{Hosts: []string{"b"}, Staggered: true})
+	require.NoError(t, err)
+
+	dir := h.assignment("b").Directives[0]
+	need := protocol.Need{
+		ID: protocol.ManualNeedID(dir.ID), Kind: protocol.NeedReboot, DirectiveID: dir.ID,
+		Reboot: &protocol.RebootNeed{Reasons: []string{protocol.RebootReasonManual}},
+	}
+
+	h.sync("b", func(st *protocol.SyncRequest) {
+		st.Needs = []protocol.Need{need}
+		st.DirectiveAcks = []protocol.DirectiveAck{{ID: dir.ID, Status: protocol.DirectiveAccepted}}
+	})
+	h.tick()
+	h.sync("b", func(st *protocol.SyncRequest) { st.DirectiveAcks = nil })
+	require.Empty(t, h.assignment("b").Directives, "the directive is answered")
+
+	steady := []string{"rollouts:open", "directives:pending"}
+	h.store.reads = nil
+
+	for range 5 {
+		h.advance(2 * time.Second)
+		h.tick()
+	}
+
+	assert.Equal(t, steady, h.store.readKinds(), "a tick reads neither closed rollouts nor answered directives")
+	assert.Equal(t, fleet.HostPending, h.rollout(res.Rollout).Host("b").State,
+		"the answered directive of the open manual rollout is still known")
+	assert.Equal(t, "host limit 1 of 1", h.assignment("b").Queue.Reason)
+
+	// A restarted scheduler reads the history once and decides the same.
+	h.restart()
+	h.store.reads = nil
+	h.advance(2 * time.Second)
+	h.tick()
+	assert.Equal(t, []string{"rollouts:open", "rollouts:all", "directives:all"}, h.store.readKinds())
+	assert.Equal(t, fleet.HostPending, h.rollout(res.Rollout).Host("b").State)
+
+	h.store.reads = nil
+	h.advance(2 * time.Second)
+	h.tick()
+	assert.Equal(t, steady, h.store.readKinds())
+
+	// The rollout runs to its end on what the scheduler remembers.
+	h.finish("a")
+	require.NotNil(t, h.assignment("b").Lease)
+	assert.Equal(t, []protocol.Need{need}, h.assignment("b").Lease.Needs)
+
+	h.finish("b")
+	assert.Equal(t, fleet.RolloutCompleted, h.rollout(res.Rollout).State)
+
+	h.store.reads = nil
+	h.advance(2 * time.Second)
+	h.tick()
+	assert.Equal(t, steady, h.store.readKinds())
+}
+
+func TestAbortedCauseStaysClosedHoweverManyRolloutsFollow(t *testing.T) {
+	h := newHarness(t)
+	h.addHost("a", 0, packagesNeed("2.0"))
+	h.tick()
+
+	id := h.openRollouts()[0].ID
+
+	_, err := h.svc.Abort(h.ctx, "alice", ScopeRequest{Rollout: id})
+	require.NoError(t, err)
+	h.finish("a")
+	h.sync("a", func(st *protocol.SyncRequest) { st.Needs = []protocol.Need{packagesNeed("2.0")} })
+
+	// Many rollouts of other causes come and go.
+	ended := h.now
+	changes := &store.Changes{}
+
+	for i := range 700 {
+		changes.Rollouts = append(changes.Rollouts, &fleet.Rollout{
+			ID: fmt.Sprintf("old%04d", i), Kind: fleet.RolloutPackages, Key: fmt.Sprintf("packages:old%04d", i),
+			State: fleet.RolloutCompleted, CreatedAt: h.now.Add(time.Duration(i) * time.Second), EndedAt: &ended,
+		})
+	}
+
+	require.NoError(t, h.store.Commit(h.ctx, changes))
+
+	h.restart()
+	h.advance(time.Hour)
+	h.tick()
+	assert.Empty(t, h.openRollouts(), "the aborted cause stays closed")
+	assert.Nil(t, h.assignment("a").Lease)
+
+	// After a failed write the history is read again, with the same result.
+	h.addHost("b", 0, rebootNeed())
+	h.store.setFailing(false, 1)
+	require.ErrorIs(t, h.svc.reconcile(h.ctx), errWrite)
+	h.store.reads = nil
+	h.tick()
+	assert.Contains(t, h.store.readKinds(), "rollouts:all")
+	require.Len(t, h.openRollouts(), 1)
+	assert.Equal(t, keyReboot, h.openRollouts()[0].Key, "the aborted cause is still closed")
+	assert.Nil(t, h.assignment("a").Lease)
 }

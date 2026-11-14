@@ -131,6 +131,8 @@ func (p *pass) syncHold(hv *hostView) {
 // syncRollouts supersedes, opens, updates membership of and completes
 // rollouts from the needs the hosts report.
 func (p *pass) syncRollouts() {
+	p.liftSkips()
+
 	rep := p.reported()
 
 	p.supersede(rep)
@@ -149,7 +151,80 @@ func (p *pass) syncRollouts() {
 	}
 }
 
-// reported collects the observed needs of all hosts.
+// openKeys are the keys of the non-terminal rollouts.
+func (p *pass) openKeys() map[string]bool {
+	keys := make(map[string]bool, len(p.rollouts))
+
+	for _, r := range p.rollouts {
+		if !r.State.Terminal() {
+			keys[r.Key] = true
+		}
+	}
+
+	return keys
+}
+
+// skipNote returns the note of the skip that holds for the host in the
+// latest closed rollout of the key, or "".
+func (p *pass) skipNote(key, host string) string {
+	r := p.closedLatest[key]
+	if r == nil {
+		return ""
+	}
+
+	if m := r.Host(host); m != nil && operatorSkipped(m) {
+		return m.Error
+	}
+
+	return ""
+}
+
+// liftSkips ends the skips that outlived their need. A skip holds for the
+// key of its rollout for as long as the host keeps reporting the need: once
+// a host that is neither held nor silent syncs without it, a later need of
+// the same key (the reboot key never changes) is a new one. While a rollout
+// of the key is open the skip lives on in its member list instead.
+func (p *pass) liftSkips() {
+	open := p.openKeys()
+
+	for _, key := range sortedKeys(p.closedLatest) {
+		r := p.closedLatest[key]
+		if open[key] || r.Kind == fleet.RolloutManual {
+			continue
+		}
+
+		copied := false
+
+		for i := range r.Hosts {
+			m := &r.Hosts[i]
+
+			hv := p.hosts[m.Host]
+			if !operatorSkipped(m) || hv == nil || hv.h.Status == nil || hv.held || hv.stale ||
+				p.hostKeys[m.Host][key] {
+				continue
+			}
+
+			if !copied {
+				r = cloneRollout(r)
+				m = &r.Hosts[i]
+				p.closedLatest[key] = r
+				p.closedDirty = append(p.closedDirty, r)
+				copied = true
+			}
+
+			m.Error = skipLiftedPrefix + reasonNeedGone
+			m.UpdatedAt = p.now
+
+			p.record("rollout.skip-lifted", r.ID, map[string]any{
+				"host": m.Host, keyKey: key, keyReason: reasonNeedGone,
+			})
+		}
+	}
+}
+
+// reported collects the observed needs of all hosts. The need of a host
+// that a person skipped for the same key in its latest closed rollout is
+// left out: it opens nothing.
 func (p *pass) reported() *reportedNeeds {
 	rep := &reportedNeeds{
 		images:   make(map[string]*imageTarget, 4),
@@ -164,11 +239,14 @@ func (p *pass) reported() *reportedNeeds {
 		}
 	}
 
+	open := p.openKeys()
+
 	for _, name := range p.names {
 		hv := p.hosts[name]
 
 		for _, n := range hv.needs() {
-			if n.DirectiveID != "" {
+			key := needKey(&n)
+			if key == "" || (!open[key] && p.skipNote(key, name) != "") {
 				continue
 			}
 
@@ -343,13 +421,7 @@ func (p *pass) closeRollout(r *fleet.Rollout, state fleet.RolloutState, reason s
 // with the hosts each serves first.
 func (p *pass) open(rep *reportedNeeds) map[string]map[string]string {
 	created := make(map[string]map[string]string, 2)
-	openKeys := make(map[string]bool, len(p.rollouts))
-
-	for _, r := range p.rollouts {
-		if !r.State.Terminal() {
-			openKeys[r.Key] = true
-		}
-	}
+	openKeys := p.openKeys()
 
 	add := func(r *fleet.Rollout) {
 		if openKeys[r.Key] || p.abortedLatest(r.Key) {
@@ -407,13 +479,9 @@ func (p *pass) open(rep *reportedNeeds) map[string]map[string]string {
 // abortedLatest reports whether the latest closed rollout of the key was
 // aborted.
 func (p *pass) abortedLatest(key string) bool {
-	for _, r := range p.w.Closed {
-		if r.Key == key {
-			return r.State == fleet.RolloutAborted
-		}
-	}
+	r := p.closedLatest[key]
 
-	return false
+	return r != nil && r.State == fleet.RolloutAborted
 }
 
 // assignNeeds sorts every reported need to the open rollout it belongs to.
@@ -481,8 +549,18 @@ func (p *pass) syncMembers(r *fleet.Rollout, carried map[string]string) {
 
 		hv := p.hosts[name]
 		m := fleet.RolloutHost{Host: name, UpdatedAt: p.now}
+		skip := p.skipNote(r.Key, name)
 
 		switch {
+		case skip != "":
+			// A skip for the key outlives the rollout it was given in.
+			m.State = fleet.HostSkipped
+			m.Stage = hv.class()
+			m.Error = skip
+
+			if len(needs[name]) > 0 {
+				m.NeedID = needs[name][0].ID
+			}
 		case len(needs[name]) > 0:
 			m.State = fleet.HostPending
 			m.NeedID = needs[name][0].ID
@@ -492,7 +570,7 @@ func (p *pass) syncMembers(r *fleet.Rollout, carried map[string]string) {
 			continue
 		}
 
-		if prev, ok := carried[name]; ok {
+		if prev, ok := carried[name]; ok && skip == "" {
 			m.Error = carriedPrefix + prev
 		}
 

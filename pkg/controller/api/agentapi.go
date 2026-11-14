@@ -548,6 +548,12 @@ func (s *Server) inventory(r *http.Request, cert *identity.Certificate, body []b
 	}
 
 	if err := s.opts.Store.SaveInventory(ctx, cert.Subject, &inv); err != nil {
+		// The agent's fault, not the controller's: say so instead of a 500
+		// the agent would retry unchanged.
+		if errors.Is(err, store.ErrInventoryInvalid) || errors.Is(err, store.ErrInventoryHash) {
+			return nil, agentErrorf(http.StatusBadRequest, "invalid inventory: %s", err.Error())
+		}
+
 		return nil, fmt.Errorf("save inventory of %s: %w", cert.Subject, err)
 	}
 

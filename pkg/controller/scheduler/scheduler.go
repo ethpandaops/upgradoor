@@ -59,7 +59,8 @@ type Service interface {
 	// Skip marks hosts as skipped in a rollout.
 	Skip(ctx context.Context, actor string, req RolloutHostsRequest) (*ActionResult, error)
 	// Retry reopens a halted or aborted rollout (all failed hosts, or the
-	// listed ones) and so lifts the digest block.
+	// listed ones) and so lifts the digest block. It also takes back skips
+	// of the hosts it applies to.
 	Retry(ctx context.Context, actor string, req RolloutHostsRequest) (*ActionResult, error)
 	// Abort closes a rollout. Open leases finish.
 	Abort(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)

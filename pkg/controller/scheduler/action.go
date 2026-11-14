@@ -80,7 +80,7 @@ func (s *service) manual(ctx context.Context, actor string, req *manualRequest) 
 		Approved:     true,
 		Force:        !req.staggered || req.force,
 		IgnoreBudget: req.ignoreBudget,
-		CreatedBy:    s.entry(actor, "", "", nil).Actor,
+		CreatedBy:    actorName(actor),
 		CreatedAt:    now,
 		UpdatedAt:    now,
 	}
@@ -224,8 +224,8 @@ func (s *service) selectHosts(ctx context.Context, names []string, all bool) ([]
 
 // commit writes an action's changes and asks for a reconcile.
 func (s *service) commit(ctx context.Context, changes *store.Changes) error {
-	if err := s.opts.Store.Commit(ctx, changes); err != nil {
-		return fmt.Errorf("scheduler: commit: %w", err)
+	if err := s.write(ctx, changes); err != nil {
+		return err
 	}
 
 	s.Nudge()
@@ -261,22 +261,17 @@ func (s *service) setHold(
 
 	res := &ActionResult{}
 
+	// The store has no transaction over several hosts: when one fails, the
+	// earlier ones stay changed and audited, and the result names them.
 	for _, h := range hosts {
-		if err := s.opts.Store.SetHostHold(ctx, h.Name, wanted, reason); err != nil {
-			return nil, fmt.Errorf("scheduler: set hold of %s: %w", h.Name, err)
-		}
+		if err := s.setHostHold(ctx, actor, action, h, wanted, reason, req.Reason); err != nil {
+			res.Message = fmt.Sprintf("stopped at %s; changed before it: %d host(s)", h.Name, len(res.Hosts))
 
-		if err := s.appendAudit(ctx, s.entry(actor, action, h.Name, map[string]any{
-			keyBefore: map[string]any{"holdWanted": h.HoldWanted, "holdReason": h.HoldReason},
-			keyAfter:  map[string]any{"holdWanted": wanted, "holdReason": reason},
-			keyReason: req.Reason,
-		})); err != nil {
-			// A hold change that could not be audited is taken back.
-			if undo := s.opts.Store.SetHostHold(ctx, h.Name, h.HoldWanted, h.HoldReason); undo != nil {
-				return nil, errors.Join(err, fmt.Errorf("scheduler: restore hold of %s: %w", h.Name, undo))
+			if len(res.Hosts) > 0 {
+				s.Nudge()
 			}
 
-			return nil, err
+			return res, err
 		}
 
 		res.Hosts = append(res.Hosts, h.Name)
@@ -290,6 +285,31 @@ func (s *service) setHold(
 	s.Nudge()
 
 	return res, nil
+}
+
+// setHostHold changes the hold switch of one host and audits it. A change
+// that could not be audited is taken back.
+func (s *service) setHostHold(
+	ctx context.Context, actor, action string, h *fleet.Host, wanted bool, reason, given string,
+) error {
+	if err := s.opts.Store.SetHostHold(ctx, h.Name, wanted, reason); err != nil {
+		return fmt.Errorf("scheduler: set hold of %s: %w", h.Name, err)
+	}
+
+	err := s.appendAudit(ctx, s.entry(actor, action, h.Name, map[string]any{
+		keyBefore: map[string]any{"holdWanted": h.HoldWanted, "holdReason": h.HoldReason},
+		keyAfter:  map[string]any{"holdWanted": wanted, "holdReason": reason},
+		keyReason: given,
+	}))
+	if err == nil {
+		return nil
+	}
+
+	if undo := s.opts.Store.SetHostHold(ctx, h.Name, h.HoldWanted, h.HoldReason); undo != nil {
+		return errors.Join(err, fmt.Errorf("scheduler: restore hold of %s: %w", h.Name, undo))
+	}
+
+	return err
 }
 
 // Pause pauses everything (no Rollout) or one rollout.
@@ -478,7 +498,7 @@ func (s *service) Skip(
 			res.Rejected[name] = "already " + string(m.State)
 		default:
 			m.State = fleet.HostSkipped
-			m.Error = strings.TrimSpace("skipped: " + req.Reason)
+			m.Error = strings.TrimSpace(skippedPrefix + " " + req.Reason)
 			m.UpdatedAt = now
 
 			res.Hosts = append(res.Hosts, name)
@@ -499,9 +519,11 @@ func (s *service) Skip(
 }
 
 // Retry reopens a halted rollout: the failed hosts (all, or the listed
-// ones) return to pending. For an aborted rollout it lifts the block on the
-// cause by opening a new rollout for the same key; the aborted one stays
-// closed.
+// ones) return to pending. A listed host that a person skipped returns to
+// pending as well. For an aborted rollout it lifts the block on the cause by
+// opening a new rollout for the same key; the aborted one stays closed. For
+// any other closed rollout it lifts the skips (all, or the listed hosts)
+// that still keep hosts from being served for its key.
 func (s *service) Retry(
 	ctx context.Context, actor string, req RolloutHostsRequest,
 ) (*ActionResult, error) {
@@ -518,25 +540,20 @@ func (s *service) Retry(
 	}
 
 	if r.State.Terminal() {
-		return nil, fmt.Errorf("%w: rollout %s is %s", ErrInvalidAction, r.ID, r.State)
+		return s.retrySkipped(ctx, actor, r, &req)
 	}
 
 	now := s.opts.Now()
 	res := &ActionResult{Rollout: r.ID, Rejected: make(map[string]string, len(req.Hosts))}
 
-	for _, name := range req.Hosts {
-		if m := r.Host(name); m == nil || m.State != fleet.HostFailed {
-			res.Rejected[name] = "has not failed in the rollout"
-		}
-	}
-
 	for i := range r.Hosts {
 		m := &r.Hosts[i]
-		if m.State != fleet.HostFailed {
-			continue
-		}
+		listed := slices.Contains(req.Hosts, m.Host)
 
-		if len(req.Hosts) > 0 && !slices.Contains(req.Hosts, m.Host) {
+		// Failed hosts are retried unless others are listed; a skip is only
+		// taken back for a host that is named.
+		if (m.State != fleet.HostFailed || (len(req.Hosts) > 0 && !listed)) &&
+			(!operatorSkipped(m) || !listed) {
 			continue
 		}
 
@@ -545,6 +562,12 @@ func (s *service) Retry(
 		m.LeaseID = ""
 		m.UpdatedAt = now
 		res.Hosts = append(res.Hosts, m.Host)
+	}
+
+	for _, name := range req.Hosts {
+		if !slices.Contains(res.Hosts, name) {
+			res.Rejected[name] = "has neither failed nor been skipped in the rollout"
+		}
 	}
 
 	if len(res.Hosts) == 0 && r.State != fleet.RolloutHalted {
@@ -565,8 +588,70 @@ func (s *service) Retry(
 	})
 }
 
+// retrySkipped lifts the skips a closed rollout still holds for its key.
+// The rollout stays closed; the hosts open a new one with their next sync.
+func (s *service) retrySkipped(
+	ctx context.Context, actor string, r *fleet.Rollout, req *RolloutHostsRequest,
+) (*ActionResult, error) {
+	now := s.opts.Now()
+	res := &ActionResult{Rollout: r.ID, Rejected: make(map[string]string, len(req.Hosts))}
+
+	for i := range r.Hosts {
+		m := &r.Hosts[i]
+		if !operatorSkipped(m) || (len(req.Hosts) > 0 && !slices.Contains(req.Hosts, m.Host)) {
+			continue
+		}
+
+		m.Error = strings.TrimSpace(skipLiftedPrefix + req.Reason)
+		m.UpdatedAt = now
+		res.Hosts = append(res.Hosts, m.Host)
+	}
+
+	for _, name := range req.Hosts {
+		if !slices.Contains(res.Hosts, name) {
+			res.Rejected[name] = "is not skipped in the rollout"
+		}
+	}
+
+	if len(res.Hosts) == 0 || r.Kind == fleet.RolloutManual {
+		res.Message = "nothing to retry"
+
+		return res, fmt.Errorf("%w: rollout %s is %s and holds no skip to lift",
+			ErrInvalidAction, r.ID, r.State)
+	}
+
+	// Only the latest rollout of the key carries the skips that hold.
+	if err := s.loadHistory(ctx); err != nil {
+		return nil, err
+	}
+
+	if latest := s.hist.closed[r.Key]; latest != nil && latest.ID != r.ID {
+		return nil, fmt.Errorf("%w: rollout %s followed for the same cause, retry the hosts there",
+			ErrInvalidAction, latest.ID)
+	}
+
+	open, err := s.opts.Store.ListRollouts(ctx, store.RolloutFilter{OpenOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: list open rollouts: %w", err)
+	}
+
+	for _, o := range open {
+		if o.Key == r.Key && !o.State.Terminal() {
+			return nil, fmt.Errorf("%w: rollout %s is open for the same cause, retry the hosts there",
+				ErrInvalidAction, o.ID)
+		}
+	}
+
+	res.Message = fmt.Sprintf("skip lifted for %d host(s)", len(res.Hosts))
+
+	return res, s.commitRollout(ctx, actor, "action.retry", r, map[string]any{
+		keyHosts: res.Hosts, keyKey: r.Key, "skipLifted": true, keyReason: req.Reason,
+	})
+}
+
 // retryAborted opens a new rollout for the key of an aborted one. Hosts
-// join it as they report the need.
+// join it as they report the need; hosts that a person skipped for the key
+// stay skipped in it.
 func (s *service) retryAborted(
 	ctx context.Context, actor string, aborted *fleet.Rollout, reason string,
 ) (*ActionResult, error) {
@@ -598,8 +683,24 @@ func (s *service) retryAborted(
 		Revision:  aborted.Revision,
 		Packages:  slices.Clone(aborted.Packages),
 		State:     fleet.RolloutActive,
-		CreatedBy: s.entry(actor, "", "", nil).Actor,
+		CreatedBy: actorName(actor),
 		CreatedAt: now,
+	}
+
+	// The skips that hold for the key move into the new rollout right away:
+	// it may close again before a reconcile has seen it.
+	if err := s.loadHistory(ctx); err != nil {
+		return nil, err
+	}
+
+	if latest := s.hist.closed[r.Key]; latest != nil {
+		for i := range latest.Hosts {
+			if m := latest.Hosts[i]; operatorSkipped(&m) {
+				m.LeaseID = ""
+				m.UpdatedAt = now
+				r.Hosts = append(r.Hosts, m)
+			}
+		}
 	}
 
 	res := &ActionResult{Rollout: r.ID, Message: "cause reopened as rollout " + r.ID}
@@ -678,9 +779,10 @@ func (s *service) Forget(ctx context.Context, actor string, req HoldRequest) (*A
 		return nil, fmt.Errorf("scheduler: list directives: %w", err)
 	}
 
-	now := s.opts.Now()
 	res := &ActionResult{Rejected: make(map[string]string, len(hosts))}
 
+	// The store has no transaction over several hosts: when one fails, the
+	// result names the hosts that are already gone.
 	for _, h := range hosts {
 		if slices.ContainsFunc(leases, func(l *fleet.Lease) bool {
 			return l.Host == h.Name && !l.State.Terminal()
@@ -690,25 +792,10 @@ func (s *service) Forget(ctx context.Context, actor string, req HoldRequest) (*A
 			continue
 		}
 
-		if err := s.opts.Store.DeleteHost(ctx, h.Name); err != nil {
-			return nil, fmt.Errorf("scheduler: delete host %s: %w", h.Name, err)
-		}
+		if err := s.forgetHost(ctx, actor, h.Name, req.Reason, pending); err != nil {
+			res.Message = fmt.Sprintf("stopped at %s; forgotten before it: %d host(s)", h.Name, len(res.Hosts))
 
-		changes := &store.Changes{Audit: []fleet.AuditEntry{
-			s.entry(actor, "action.forget", h.Name, map[string]any{keyReason: req.Reason}),
-		}}
-
-		for _, d := range pending {
-			if d.Host == h.Name && d.State == fleet.DirectivePending {
-				d.State = fleet.DirectiveCancelled
-				d.Error = reasonHostForgotten
-				d.UpdatedAt = now
-				changes.Directives = append(changes.Directives, d)
-			}
-		}
-
-		if err := s.commit(ctx, changes); err != nil {
-			return nil, err
+			return res, err
 		}
 
 		res.Hosts = append(res.Hosts, h.Name)
@@ -723,4 +810,53 @@ func (s *service) Forget(ctx context.Context, actor string, req HoldRequest) (*A
 	res.Message = fmt.Sprintf("%d host(s) forgotten", len(res.Hosts))
 
 	return res, nil
+}
+
+// forgetHost deletes one host. The audit entry is written first, so a host
+// never disappears without one; a delete that then fails is audited as
+// failed. The host's pending directives are cancelled last: the reconcile
+// cancels them as well, so a failure there is only logged.
+func (s *service) forgetHost(
+	ctx context.Context, actor, name, reason string, pending []*fleet.Directive,
+) error {
+	if err := s.appendAudit(ctx, s.entry(actor, "action.forget", name, map[string]any{
+		keyReason: reason,
+	})); err != nil {
+		return err
+	}
+
+	if err := s.opts.Store.DeleteHost(ctx, name); err != nil {
+		err = fmt.Errorf("scheduler: delete host %s: %w", name, err)
+
+		if auditErr := s.appendAudit(ctx, s.entry(actor, "action.forget.failed", name, map[string]any{
+			"error": err.Error(),
+		})); auditErr != nil {
+			return errors.Join(err, auditErr)
+		}
+
+		return err
+	}
+
+	now := s.opts.Now()
+	changes := &store.Changes{}
+
+	for _, d := range pending {
+		if d.Host == name && d.State == fleet.DirectivePending {
+			d.State = fleet.DirectiveCancelled
+			d.Error = reasonHostForgotten
+			d.UpdatedAt = now
+			changes.Directives = append(changes.Directives, d)
+		}
+	}
+
+	if !changes.Empty() {
+		if err := s.write(ctx, changes); err != nil {
+			s.log.WithError(err).WithField("host", name).
+				Warn("Could not cancel the directives of a forgotten host; the next reconcile does")
+		}
+	}
+
+	s.Nudge()
+
+	return nil
 }

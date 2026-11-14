@@ -1,11 +1,14 @@
 package scheduler
 
 import (
+	"cmp"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"slices"
+	"strings"
 	"sync"
 	"time"
 
@@ -19,9 +22,6 @@ import (
 const (
 	// defaultTickInterval is the reconcile period.
 	defaultTickInterval = 2 * time.Second
-	// closedRolloutHistory is how many of the newest rollouts are looked at
-	// for the "aborted stays closed" rule and the failed-host carry-over.
-	closedRolloutHistory = 500
 	// minLivenessEpochs is the least number of liveness epochs loaded.
 	minLivenessEpochs = 6
 )
@@ -66,8 +66,9 @@ type service struct {
 	log  logrus.FieldLogger
 	opts Options
 
-	// mu serialises reconciles and actions.
-	mu sync.Mutex
+	// mu serialises reconciles and actions and guards hist.
+	mu   sync.Mutex
+	hist history
 
 	planMu sync.RWMutex
 	plan   *Plan
@@ -204,8 +205,8 @@ func (s *service) reconcile(ctx context.Context) error {
 	out := Reconcile(w)
 
 	if changes := out.Changes(); !changes.Empty() {
-		if err := s.opts.Store.Commit(ctx, changes); err != nil {
-			return fmt.Errorf("scheduler: commit: %w", err)
+		if err := s.write(ctx, changes); err != nil {
+			return err
 		}
 
 		s.log.WithFields(logrus.Fields{
@@ -251,15 +252,8 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 		return nil, fmt.Errorf("scheduler: list open rollouts: %w", err)
 	}
 
-	recent, err := st.ListRollouts(ctx, store.RolloutFilter{Limit: closedRolloutHistory})
-	if err != nil {
-		return nil, fmt.Errorf("scheduler: list recent rollouts: %w", err)
-	}
-
-	for _, r := range recent {
-		if r.State.Terminal() {
-			w.Closed = append(w.Closed, r)
-		}
+	if w.Closed, err = s.closedRollouts(ctx); err != nil {
+		return nil, err
 	}
 
 	if w.Leases, err = st.ListLeases(ctx, store.LeaseFilter{OpenOnly: true}); err != nil {
@@ -277,29 +271,195 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 	return w, nil
 }
 
-// loadDirectives keeps the pending directives and those of open rollouts.
-func (s *service) loadDirectives(ctx context.Context, w *World) error {
-	all, err := s.opts.Store.ListDirectives(ctx, store.DirectiveFilter{})
+// history is what the scheduler remembers of the rows that only it writes
+// and that it would otherwise read in full on every tick: the latest closed
+// rollout of every key and the answered directives of the open manual
+// rollouts. It is read from the store once (after a start and after a failed
+// write) and then follows every write. The caller holds service.mu.
+type history struct {
+	loaded bool
+	// closed is the latest closed rollout per key. Manual rollouts are left
+	// out: nothing follows them.
+	closed map[string]*fleet.Rollout
+	// settled holds, per open manual rollout, its directives that are no
+	// longer pending, by ID. They never change again.
+	settled map[string]map[string]*fleet.Directive
+}
+
+// newerRollout orders rollouts by creation, then end, then ID.
+func newerRollout(a, b *fleet.Rollout) int {
+	var endA, endB time.Time
+
+	if a.EndedAt != nil {
+		endA = *a.EndedAt
+	}
+
+	if b.EndedAt != nil {
+		endB = *b.EndedAt
+	}
+
+	return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), endA.Compare(endB), cmp.Compare(a.ID, b.ID))
+}
+
+// closedRollouts returns the latest closed rollout of every key, newest
+// first. The caller holds mu.
+func (s *service) closedRollouts(ctx context.Context) ([]*fleet.Rollout, error) {
+	if err := s.loadHistory(ctx); err != nil {
+		return nil, err
+	}
+
+	out := make([]*fleet.Rollout, 0, len(s.hist.closed))
+	for _, r := range s.hist.closed {
+		out = append(out, r)
+	}
+
+	slices.SortFunc(out, func(a, b *fleet.Rollout) int { return newerRollout(b, a) })
+
+	return out, nil
+}
+
+// noteRollout takes in a rollout that was read or written.
+func (h *history) noteRollout(r *fleet.Rollout) {
+	if !r.State.Terminal() {
+		return
+	}
+
+	delete(h.settled, r.ID)
+
+	if r.Kind == fleet.RolloutManual {
+		return
+	}
+
+	if cur := h.closed[r.Key]; cur == nil || newerRollout(r, cur) >= 0 {
+		h.closed[r.Key] = cloneRollout(r)
+	}
+}
+
+// noteDirective takes in an answered directive of an open manual rollout.
+func (h *history) noteDirective(d *fleet.Directive) {
+	byID, ok := h.settled[d.RolloutID]
+	if !ok || d.State == fleet.DirectivePending {
+		return
+	}
+
+	c := *d
+	byID[d.ID] = &c
+}
+
+// follow takes in a committed write.
+func (h *history) follow(changes *store.Changes) {
+	if !h.loaded {
+		return
+	}
+
+	for _, r := range changes.Rollouts {
+		h.noteRollout(r)
+	}
+
+	for _, d := range changes.Directives {
+		h.noteDirective(d)
+	}
+}
+
+// write commits changes and keeps the history in step. After a failed write
+// the history is read again: the store may or may not have applied it.
+func (s *service) write(ctx context.Context, changes *store.Changes) error {
+	if err := s.opts.Store.Commit(ctx, changes); err != nil {
+		s.hist = history{}
+
+		return fmt.Errorf("scheduler: commit: %w", err)
+	}
+
+	s.hist.follow(changes)
+
+	return nil
+}
+
+// loadHistory reads the closed rollouts once. The caller holds mu.
+func (s *service) loadHistory(ctx context.Context) error {
+	if s.hist.loaded {
+		return nil
+	}
+
+	all, err := s.opts.Store.ListRollouts(ctx, store.RolloutFilter{})
 	if err != nil {
-		return fmt.Errorf("scheduler: list directives: %w", err)
+		return fmt.Errorf("scheduler: list rollouts: %w", err)
 	}
 
-	open := make(map[string]bool, len(w.Rollouts))
-	for _, r := range w.Rollouts {
-		open[r.ID] = true
+	s.hist = history{
+		loaded:  true,
+		closed:  make(map[string]*fleet.Rollout, len(all)),
+		settled: make(map[string]map[string]*fleet.Directive, 2),
 	}
 
-	for _, d := range all {
-		if d.State == fleet.DirectivePending || open[d.RolloutID] {
-			w.Directives = append(w.Directives, d)
-		}
+	for _, r := range all {
+		s.hist.noteRollout(r)
 	}
 
 	return nil
 }
 
-// loadClosedLeases finds out which of the leases that hosts report an
-// operation for are known and closed; the others are adopted.
+// loadDirectives gives the world the pending directives and the answered
+// ones of the open manual rollouts, oldest first. Only the pending ones are
+// read on every tick; the answered ones of a manual rollout are read once,
+// when the rollout is first seen. The caller holds mu and has loaded the
+// history.
+func (s *service) loadDirectives(ctx context.Context, w *World) error {
+	unread := false
+	open := make(map[string]bool, len(w.Rollouts))
+
+	for _, r := range w.Rollouts {
+		if r.Kind != fleet.RolloutManual || r.State.Terminal() {
+			continue
+		}
+
+		open[r.ID] = true
+
+		if _, ok := s.hist.settled[r.ID]; !ok {
+			s.hist.settled[r.ID] = make(map[string]*fleet.Directive, len(r.Hosts))
+			unread = true
+		}
+	}
+
+	for id := range s.hist.settled {
+		if !open[id] {
+			delete(s.hist.settled, id)
+		}
+	}
+
+	found, err := s.opts.Store.ListDirectives(ctx, store.DirectiveFilter{PendingOnly: !unread})
+	if err != nil {
+		s.hist = history{}
+
+		return fmt.Errorf("scheduler: list directives: %w", err)
+	}
+
+	for _, d := range found {
+		if d.State == fleet.DirectivePending {
+			w.Directives = append(w.Directives, d)
+
+			continue
+		}
+
+		s.hist.noteDirective(d)
+	}
+
+	for _, byID := range s.hist.settled {
+		for _, d := range byID {
+			c := *d
+			w.Directives = append(w.Directives, &c)
+		}
+	}
+
+	slices.SortFunc(w.Directives, func(a, b *fleet.Directive) int {
+		return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), cmp.Compare(a.ID, b.ID))
+	})
+
+	return nil
+}
+
+// loadClosedLeases looks up the leases that hosts report an operation for
+// and that are not open: the known ones are closed, the others are adopted.
 func (s *service) loadClosedLeases(ctx context.Context, w *World) error {
 	open := make(map[string]bool, len(w.Leases))
 	for _, l := range w.Leases {
@@ -316,15 +476,15 @@ func (s *service) loadClosedLeases(ctx context.Context, w *World) error {
 			continue
 		}
 
-		_, err := s.opts.Store.GetLease(ctx, id)
+		l, err := s.opts.Store.GetLease(ctx, id)
 
 		switch {
 		case err == nil:
 			if w.ClosedLeases == nil {
-				w.ClosedLeases = make(map[string]bool, 2)
+				w.ClosedLeases = make(map[string]*fleet.Lease, 2)
 			}
 
-			w.ClosedLeases[id] = true
+			w.ClosedLeases[id] = l
 		case errors.Is(err, store.ErrNotFound):
 		default:
 			return fmt.Errorf("scheduler: get lease %s: %w", id, err)
@@ -364,6 +524,7 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 		// works on it knows the lease and ignores the restatement; one that
 		// finished and forgot it (it saw a response without the lease after
 		// the database was lost) must not run the same needs a second time.
+		// The marker is a reserved name that no actor can carry (actorName).
 		if l.GrantedBy != grantedByAdoption {
 			a.Lease.Needs = append(a.Lease.Needs, l.Needs...)
 		}
@@ -455,14 +616,25 @@ func (s *service) saveSettings(
 	return nil
 }
 
+// actorName is the name an actor is recorded under. The scheduler's own
+// names ("scheduler" and everything starting with "scheduler:") are
+// reserved: a person or token that carries one is recorded as "user:<name>",
+// so nothing a person does can pass for a decision of the scheduler.
+func actorName(actor string) string {
+	switch {
+	case actor == "":
+		return "anonymous"
+	case actor == actorScheduler || strings.HasPrefix(actor, reservedActorPrefix):
+		return "user:" + actor
+	default:
+		return actor
+	}
+}
+
 // entry builds an audit entry for an action.
 func (s *service) entry(actor, action, target string, detail map[string]any) fleet.AuditEntry {
-	if actor == "" {
-		actor = "anonymous"
-	}
-
 	return fleet.AuditEntry{
-		Time: s.opts.Now(), Actor: actor, Action: action, Target: target, Detail: detail,
+		Time: s.opts.Now(), Actor: actorName(actor), Action: action, Target: target, Detail: detail,
 	}
 }
 

@@ -55,7 +55,7 @@ func newWorldBuilder(t *testing.T) *worldBuilder {
 	b.w = &World{
 		Now:          testGenesis.Add(100*testEpoch + 10*time.Second),
 		Settings:     settings,
-		ClosedLeases: map[string]bool{},
+		ClosedLeases: map[string]*fleet.Lease{},
 		NewID: func() string {
 			b.ids++
 
@@ -183,6 +183,13 @@ func applyOutcome(w *World, out *Outcome) {
 		w.Rollouts = slices.DeleteFunc(w.Rollouts, func(x *fleet.Rollout) bool { return x.ID == r.ID })
 
 		if r.State.Terminal() {
+			// A closed rollout that changed (a skip was lifted) keeps its place.
+			if i := slices.IndexFunc(w.Closed, func(x *fleet.Rollout) bool { return x.ID == r.ID }); i >= 0 {
+				w.Closed[i] = r
+
+				continue
+			}
+
 			w.Closed = append([]*fleet.Rollout{r}, w.Closed...)
 		} else {
 			w.Rollouts = append(w.Rollouts, r)
@@ -194,11 +201,12 @@ func applyOutcome(w *World, out *Outcome) {
 
 		if l.State.Terminal() {
 			if w.ClosedLeases == nil {
-				w.ClosedLeases = map[string]bool{}
+				w.ClosedLeases = map[string]*fleet.Lease{}
 			}
 
-			w.ClosedLeases[l.ID] = true
+			w.ClosedLeases[l.ID] = l
 		} else {
+			delete(w.ClosedLeases, l.ID)
 			w.Leases = append(w.Leases, l)
 		}
 	}

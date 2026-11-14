@@ -111,8 +111,13 @@ wait_until() {
     pass "$what"
 }
 
-# jq_true PATH FILTER: the authenticated GET of PATH satisfies the jq filter.
-jq_true() { api "$1" | jq -e "$2" >/dev/null; }
+# jq_true PATH [JQ-ARGS...] FILTER: the authenticated GET of PATH satisfies
+# the jq filter.
+jq_true() {
+    local path=$1
+    shift
+    api "$path" | jq -e "$@" >/dev/null
+}
 pub_true() { pub "$1" | jq -e "$2" >/dev/null; }
 
 container() { docker ps -a --format '{{.Names}}' | grep "^$1--" | head -n1; }
@@ -141,6 +146,7 @@ rollout_state() {
         jq -r --arg d "$1" '[.open[], .recent[]] | map(select(.digest == $d)) | .[0].state // "none"'
 }
 rollout_is() { [ "$(rollout_state "$1")" = "$2" ]; }
+rollout_exists() { [ -n "$(rollout_of "$1")" ]; }
 
 # hosts_on DIGEST: how many hosts run the beacon node at that digest.
 hosts_on() { pub /api/v1/public/hosts | jq --arg d "$1" '[.hosts[] | select(.cl.digest == $d)] | length'; }
@@ -322,7 +328,7 @@ say "B: staged roll"
 digest_b=$(publish b 'LABEL upgradoor.e2e.build=b org.opencontainers.image.revision=bbbbbbb')
 pass "build B published: $digest_b"
 
-wait_until "rollout for B opened" 120 test -n "$(sleep 2; rollout_of "$digest_b")"
+wait_until "rollout for B opened" 120 rollout_exists "$digest_b"
 wait_until "rollout for B completed" 1500 rollout_is "$digest_b" completed
 all_on "$digest_b" || die "not every host runs build B"
 pass "every host runs build B"
@@ -346,9 +352,10 @@ jq -e --arg c "$(jq -r .canary "$work/rollout-b.json")" '
 [ "$(cat "$work/max-open-leases" 2>/dev/null || echo 0)" -le 1 ] || die "more than one lease was open at once"
 pass "B rolled host by host: canary first, never more than one lease, each released before the next"
 
-jq -e '[.[] | select(.action == "lease.released") | .detail | tostring | test("epoch|live|attest"; "i")] | all' \
+jq -e '[.[] | select(.action == "lease.released") | .detail.readiness
+        | test("^1 of 1 epochs with at least [0-9]+ of 32 validators attesting$")] | length == 4 and all' \
     "$work/audit-leases.json" >/dev/null ||
-    die "a lease was released without an attestation-based readiness note"
+    die "a lease was released without attestation-based readiness: $(jq -c '[.[] | select(.action == "lease.released") | .detail]' "$work/audit-leases.json")"
 pass "every slot was released on attestation-based readiness"
 
 # --- C: a broken build -------------------------------------------------------

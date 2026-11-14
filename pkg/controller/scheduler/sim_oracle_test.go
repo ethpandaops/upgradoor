@@ -59,6 +59,9 @@ type simFacts struct {
 	// retried names the rollouts a person retried since the last
 	// observation.
 	retried []string
+	// skipped holds, per rollout key, the hosts a person skipped for it and
+	// has not retried, and that have reported the need ever since.
+	skipped map[string]map[string]bool
 	// fresh is true when a reconcile has just been committed against
 	// exactly these facts.
 	fresh bool
@@ -103,7 +106,7 @@ func newOracle() *oracle {
 // observe checks one observation against the history and returns the first
 // violated invariant.
 func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
-	if err := o.checkStates(snap); err != nil {
+	if err := o.checkStates(f, snap); err != nil {
 		return err
 	}
 
@@ -168,8 +171,10 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 }
 
 // checkStates: terminal states are terminal, nothing disappears, one
-// non-terminal rollout per key and one non-terminal lease per host.
-func (o *oracle) checkStates(snap *simSnapshot) error {
+// non-terminal rollout per key and one non-terminal lease per host. The one
+// exception: a lease that expired as not started is reopened when the world
+// says the agent did stop something for it.
+func (o *oracle) checkStates(f *simFacts, snap *simSnapshot) error {
 	keys := make(map[string]string, len(snap.rollouts))
 	seen := make(map[string]bool, len(snap.rollouts)+len(snap.leases))
 
@@ -197,7 +202,10 @@ func (o *oracle) checkStates(snap *simSnapshot) error {
 		seen[l.ID] = true
 
 		if was, ok := o.leases[l.ID]; ok && was.Terminal() && l.State != was {
-			return fmt.Errorf("lease %s left terminal state %s for %s", l.ID, was, l.State)
+			host := f.hosts[l.Host]
+			if was != fleet.LeaseExpired || host == nil || !host.disrupted[l.ID] {
+				return fmt.Errorf("lease %s left terminal state %s for %s", l.ID, was, l.State)
+			}
 		}
 
 		if l.State.Terminal() {
@@ -304,6 +312,23 @@ func checkRelease(f *simFacts, l *fleet.Lease, host *simHostFact) error {
 
 	if l.Force {
 		return nil
+	}
+
+	// A need that the operation served and that the agent still reports was
+	// not served: releasing the lease would serve it again, without end.
+	for i := range l.Needs {
+		n := &l.Needs[i]
+		if n.DirectiveID != "" || l.Operation == nil || stepStatus(l.Operation, n.ID) != protocol.StepDone ||
+			host.status == nil {
+			continue
+		}
+
+		if slices.ContainsFunc(host.status.Needs, func(r protocol.Need) bool {
+			return r.ID == n.ID && r.DirectiveID == ""
+		}) {
+			return fmt.Errorf("lease %s of %s released although the agent still reports need %s, which it served",
+				l.ID, l.Host, n.ID)
+		}
 	}
 
 	soak := f.settings.SoakEpochs
@@ -451,6 +476,10 @@ func (o *oracle) checkGrant(
 
 		if !slices.Contains(host.status.Verbs, n.Kind.Verb()) {
 			return fmt.Errorf("need %s wants verb %s, which the agent does not allow", n.ID, n.Kind.Verb())
+		}
+
+		if key := needKey(n); key != "" && f.skipped[key][l.Host] {
+			return fmt.Errorf("need %s: a person skipped the host for %s and nobody retried it", n.ID, key)
 		}
 
 		r := snap.rollout(l.Rollouts[n.ID])

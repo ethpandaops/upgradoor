@@ -248,6 +248,26 @@ func TestOracleAcceptsAGrantAfterARetry(t *testing.T) {
 	p.ok()
 }
 
+func TestOracleAcceptsAReopenedLease(t *testing.T) {
+	// The agent started a lease after the scheduler had expired it: the
+	// lease is taken up again, and nobody else may be granted on top.
+	p := newPinned(t)
+	l := p.grant("n1")
+	p.ok()
+
+	l.State = fleet.LeaseExpired
+	p.rollout().Host("n1").State = fleet.HostPending
+	p.ok()
+
+	p.f.hosts["n1"].disrupted[l.ID] = true
+	l.State = fleet.LeaseRunning
+	p.rollout().Host("n1").State = fleet.HostLeased
+	p.ok()
+
+	p.release("n1")
+	p.ok()
+}
+
 func TestOracleRejectsBadHistories(t *testing.T) {
 	// canaryDone is a history up to the point where the batches may start.
 	canaryDone := func(p *pinned) {
@@ -465,6 +485,51 @@ func TestOracleRejectsBadHistories(t *testing.T) {
 				p.f.rows[pinEpoch]["v1"] = 3
 			},
 			want: "released although 3 of 10 validators attested in epoch 99 (need 9)",
+		},
+		{
+			name: "expired lease that runs again although the agent never started it",
+			bad: func(p *pinned) {
+				l := p.grant("n1")
+				p.ok()
+				l.State = fleet.LeaseExpired
+				p.rollout().Host("n1").State = fleet.HostPending
+				p.ok()
+				l.State = fleet.LeaseRunning
+				p.rollout().Host("n1").State = fleet.HostLeased
+			},
+			want: "left terminal state expired for running",
+		},
+		{
+			name: "released lease that runs again",
+			bad: func(p *pinned) {
+				p.serve("n1")
+				p.snap.leases[0].State = fleet.LeaseRunning
+			},
+			want: "left terminal state released for running",
+		},
+		{
+			name: "grant to a host a person skipped for the cause",
+			bad: func(p *pinned) {
+				p.f.skipped = map[string]map[string]bool{imageKey(imgGeth, digestA): {"n1": true}}
+				p.grant("n1")
+			},
+			want: "a person skipped the host for image:" + imgGeth + "@" + digestA + " and nobody retried it",
+		},
+		{
+			name: "release although the agent still reports the need it served",
+			bad: func(p *pinned) {
+				l := p.grant("n1")
+				p.ok()
+				p.release("n1")
+
+				need := imageNeed("c", imgGeth, digestA)
+				l.Operation = &protocol.Operation{
+					LeaseID: l.ID, Phase: protocol.PhaseDone, Disrupted: true,
+					Steps: []protocol.Step{{NeedID: need.ID, Status: protocol.StepDone}},
+				}
+				p.f.hosts["n1"].status.Needs = []protocol.Need{need}
+			},
+			want: "released although the agent still reports need " + imageNeed("c", imgGeth, digestA).ID,
 		},
 		{
 			name: "lease expired although the agent stopped containers",

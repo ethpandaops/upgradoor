@@ -19,6 +19,9 @@ const (
 	reasonHostForgotten = "host forgotten"
 	reasonOtherLease    = "the agent works on another lease"
 	reasonAgentFailed   = "the agent reported a failure"
+	// noteAwaitSync is the readiness note until the agent has synced once
+	// after its done report.
+	noteAwaitSync = "waiting for a sync after the operation"
 )
 
 // advanceLeases moves every open lease along its lifecycle from the host's
@@ -49,10 +52,11 @@ func (p *pass) advanceLeases() {
 	}
 }
 
-// advanceGranted handles a lease the agent has not started yet. Once the
-// expiry has passed it expires as soon as a sync from after the expiry shows
-// no operation; an agent that stays silent for another leaseTtl is treated
-// like a silent running one, because it may have started.
+// advanceGranted handles a lease the agent has not started yet. It expires
+// once a sync received leaseStartGrace or more after the expiry shows no
+// operation: an earlier one may have been built before the agent started. An
+// agent that stays silent for another leaseTtl is treated like a silent
+// running one, because it may have started.
 func (p *pass) advanceGranted(l *fleet.Lease, hv *hostView, op *protocol.Operation) {
 	if op != nil {
 		p.applyOperation(l, hv, op)
@@ -60,14 +64,13 @@ func (p *pass) advanceGranted(l *fleet.Lease, hv *hostView, op *protocol.Operati
 		return
 	}
 
-	if p.now.Before(l.ExpiresAt) {
-		return
-	}
+	deadline := l.ExpiresAt.Add(leaseStartGrace)
 
 	switch {
-	case !hv.h.LastSeen.Before(l.ExpiresAt):
+	case p.now.Before(deadline):
+	case !hv.h.LastSeen.Before(deadline):
 		p.expireLease(l, reasonNeverStarted)
-	case !p.now.Before(l.ExpiresAt.Add(p.set.LeaseTTL.Std())):
+	case !p.now.Before(deadline.Add(p.set.LeaseTTL.Std())):
 		p.failLease(l, reasonAgentSilent)
 	}
 }
@@ -129,6 +132,13 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 	}
 
 	ready, note := p.ready(l, hv)
+
+	// The needs of the sync that reported done may predate the operation:
+	// only a later sync says whether it took effect.
+	if ready && !hv.h.LastSeen.After(*l.AgentDoneAt) {
+		ready, note = false, noteAwaitSync
+	}
+
 	l.Readiness = note
 
 	if ready {
@@ -148,26 +158,26 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 	}
 }
 
-// stillReported returns the ID of an observed image or packages need whose
-// step the agent reported done but that a sync from after the done report
-// still lists: the operation did not take effect. Reboot and manual needs
-// are not checked, their IDs do not change when the cause recurs.
+// stillReported returns the ID of an observed need whose step the agent
+// reported done but that a sync from after the done report still lists: the
+// operation did not take effect (the container is still on the old digest,
+// the package was not upgraded, the host booted the old kernel again).
+// Serving it again would repeat the disruption without end, so it fails the
+// lease instead. Manual needs are not checked: the agent drops them itself.
 func (p *pass) stillReported(l *fleet.Lease, hv *hostView) string {
-	if l.Operation == nil || !hv.h.LastSeen.After(*l.AgentDoneAt) {
+	if l.Operation == nil {
 		return ""
 	}
 
 	for i := range l.Needs {
 		n := &l.Needs[i]
-		if n.DirectiveID != "" || n.Kind == protocol.NeedReboot {
+		if n.DirectiveID != "" || stepStatus(l.Operation, n.ID) != protocol.StepDone {
 			continue
 		}
 
-		if stepStatus(l.Operation, n.ID) != protocol.StepDone {
-			continue
-		}
-
-		if slices.ContainsFunc(hv.needs(), func(r protocol.Need) bool { return r.ID == n.ID }) {
+		if slices.ContainsFunc(hv.needs(), func(r protocol.Need) bool {
+			return r.ID == n.ID && r.DirectiveID == ""
+		}) {
 			return n.ID
 		}
 	}
@@ -233,7 +243,7 @@ func (p *pass) readyByProbe(l *fleet.Lease, hv *hostView) (ready bool, note stri
 	if hv.h.Status == nil || !seen.After(*l.AgentDoneAt) {
 		l.SyncedSince = nil
 
-		return false, "waiting for a sync after the operation"
+		return false, noteAwaitSync
 	}
 
 	if !hv.h.Status.Node.Synced() {
@@ -342,7 +352,11 @@ func (p *pass) releaseLease(l *fleet.Lease) {
 		p.setMember(m, fleet.HostPending)
 	}
 
-	p.record("lease.released", l.Host, map[string]any{keyLease: l.ID, keyForce: l.Force})
+	p.record("lease.released", l.Host, map[string]any{
+		keyLease: l.ID, keyForce: l.Force,
+		// What the controller saw before it gave the slot back.
+		"readiness": l.Readiness,
+	})
 }
 
 // failLease ends a lease as failed and halts every rollout it served,
@@ -419,19 +433,27 @@ func stepStatus(op *protocol.Operation, needID string) protocol.StepStatus {
 	return ""
 }
 
-// adoptOperations creates lease rows for operations that hosts report for
-// leases the controller does not know, so the hosts count as holding a
-// lease.
+// adoptOperations makes every host that works on an operation hold a lease
+// for it: an operation for a lease the controller does not know is adopted,
+// and one for a lease that expired as not started is reopened.
 func (p *pass) adoptOperations() {
 	for _, name := range p.names {
 		hv := p.hosts[name]
 		op := hv.operation()
 
-		if op == nil || op.LeaseID == "" || p.w.ClosedLeases[op.LeaseID] || p.knownLease(op.LeaseID) {
+		if op == nil || op.LeaseID == "" || p.knownLease(op.LeaseID) {
 			continue
 		}
 
+		// An operation that ended without stopping anything needs no lease.
 		if op.Phase == protocol.PhaseDone && !op.Disrupted {
+			continue
+		}
+
+		closed := p.w.ClosedLeases[op.LeaseID]
+		if closed != nil && (closed.State != fleet.LeaseExpired || closed.Host != name) {
+			// The lease ended with this operation; the agent repeats it until
+			// it sees a response without the lease.
 			continue
 		}
 
@@ -443,12 +465,53 @@ func (p *pass) adoptOperations() {
 			p.expireLease(hv.lease, reasonOtherLease)
 		}
 
+		if closed != nil {
+			p.reopen(hv, closed, op)
+
+			continue
+		}
+
 		p.adopt(hv, op)
 	}
 }
 
 func (p *pass) knownLease(id string) bool {
 	return slices.ContainsFunc(p.leases, func(l *fleet.Lease) bool { return l.ID == id })
+}
+
+// reopen takes back the expiry of a lease whose agent started after all:
+// its sync from before the start arrived after the grace period, or the
+// agent ran past its deadline. The host is down, so it holds the lease
+// again; where it still waits in the rollouts the lease served, it is leased
+// again.
+func (p *pass) reopen(hv *hostView, closed *fleet.Lease, op *protocol.Operation) {
+	l := cloneLease(closed)
+	l.State = fleet.LeaseRunning
+	l.EndedAt = nil
+	l.Error = ""
+
+	for _, needID := range sortedKeys(l.Rollouts) {
+		r := p.rolloutByID[l.Rollouts[needID]]
+		if r == nil || r.State.Terminal() {
+			continue
+		}
+
+		m := r.Host(l.Host)
+		if m == nil || m.State != fleet.HostPending {
+			continue
+		}
+
+		m.LeaseID = l.ID
+		p.setMember(m, fleet.HostLeased)
+		p.claimCanary(r, m, hv)
+	}
+
+	p.leases = append(p.leases, l)
+	p.origLeases[l.ID] = closed
+	hv.lease = l
+
+	p.record("lease.reopened", l.Host, map[string]any{keyLease: l.ID, "phase": string(op.Phase)})
+	p.applyOperation(l, hv, op)
 }
 
 // adopt creates the lease row for an unknown operation in the reported
@@ -502,12 +565,18 @@ func (p *pass) adoptStep(l *fleet.Lease, hv *hostView, needID string) {
 		m.LeaseID = l.ID
 		p.setMember(m, fleet.HostLeased)
 
-		if !r.Force && r.Canary == "" && hv.class() == fleet.StageBatches {
-			r.Canary = l.Host
-			m.Stage = fleet.StageCanary
-		}
+		p.claimCanary(r, m, hv)
 
 		return
+	}
+}
+
+// claimCanary makes a validator host that holds a lease outside of a grant
+// (adopted or reopened) the canary of a rollout that has none yet.
+func (p *pass) claimCanary(r *fleet.Rollout, m *fleet.RolloutHost, hv *hostView) {
+	if !r.Force && r.Canary == "" && hv.class() == fleet.StageBatches {
+		r.Canary = m.Host
+		m.Stage = fleet.StageCanary
 	}
 }
 

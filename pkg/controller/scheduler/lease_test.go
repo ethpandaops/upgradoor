@@ -115,10 +115,31 @@ func TestGrantedLeaseExpiry(t *testing.T) {
 			want: fleet.LeaseGranted,
 		},
 		{
-			name:      "unused at the expiry: expired, the host waits again and is served again",
-			run:       func(b *worldBuilder) { b.advance(ttl) },
+			name: "a sync without an operation right at the expiry proves nothing yet: the agent may just have started",
+			run:  func(b *worldBuilder) { b.advance(ttl) },
+			want: fleet.LeaseGranted,
+		},
+		{
+			name: "a sync just before the grace period ends: still granted",
+			run:  func(b *worldBuilder) { b.advance(ttl + leaseStartGrace - time.Second) },
+			want: fleet.LeaseGranted,
+		},
+		{
+			name:      "unused after the grace period: expired, the host waits again and is served again",
+			run:       func(b *worldBuilder) { b.advance(ttl + leaseStartGrace) },
 			want:      fleet.LeaseExpired,
 			regranted: true,
+		},
+		{
+			name: "started at the deadline, the report arrives within the grace period: running",
+			run: func(b *worldBuilder) {
+				// The sync at the expiry was built before the start.
+				b.advance(ttl)
+				b.step()
+				b.advance(5 * time.Second)
+				b.report("a", protocol.PhaseApplying, true)
+			},
+			want: fleet.LeaseRunning,
 		},
 		{
 			name: "silent through the expiry: it may have started, the lease stays",
@@ -146,8 +167,13 @@ func TestGrantedLeaseExpiry(t *testing.T) {
 			want: fleet.LeaseRunning,
 		},
 		{
-			name:    "silent for another leaseTtl after the expiry: failed",
-			run:     func(b *worldBuilder) { b.advance(2*ttl, "a") },
+			name: "silent until just before another leaseTtl after the grace period: still granted",
+			run:  func(b *worldBuilder) { b.advance(2*ttl+leaseStartGrace-time.Second, "a") },
+			want: fleet.LeaseGranted,
+		},
+		{
+			name:    "silent for another leaseTtl after the grace period: failed",
+			run:     func(b *worldBuilder) { b.advance(2*ttl+leaseStartGrace, "a") },
 			want:    fleet.LeaseFailed,
 			wantErr: "agent silent",
 		},
@@ -464,7 +490,7 @@ func TestStepOutcomes(t *testing.T) {
 
 			if final == nil {
 				// The lease ended in an earlier step.
-				require.True(t, b.w.ClosedLeases[l.ID])
+				require.NotNil(t, b.w.ClosedLeases[l.ID])
 			} else {
 				assert.Equal(t, tt.wantLease, final.State)
 			}
@@ -530,25 +556,213 @@ func TestSupersededStepStaysPendingWhileTheNeedIsReported(t *testing.T) {
 }
 
 func TestNeedStillReportedAfterTheOperationFails(t *testing.T) {
+	tests := []struct {
+		name string
+		need protocol.Need
+		key  string
+		// weight of the host: validator hosts are verified by liveness.
+		weight uint64
+	}{
+		{name: "image", need: imageNeed("c", imgLighthouse, digestA), key: imageKey(imgLighthouse, digestA)},
+		{name: "packages", need: packagesNeed("2.0"), key: packagesKey("2.0")},
+		{name: "reboot: the host came back still requiring one", need: rebootNeed(), key: keyReboot},
+		{name: "reboot on a validator host", need: rebootNeed(), key: keyReboot, weight: 10},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			b := newWorldBuilder(t)
+			b.host("a", tt.weight)
+			b.wants("a", tt.need)
+			b.step()
+			require.Equal(t, []string{"a"}, b.leasedHosts())
+
+			// The agent says done but keeps reporting the same need.
+			b.report("a", protocol.PhaseDone, true)
+			b.step()
+			b.advance(5 * time.Second)
+			b.step()
+			b.advance(2 * testEpoch)
+
+			out := b.step()
+
+			require.Len(t, out.Leases, 1)
+			assert.Equal(t, fleet.LeaseFailed, out.Leases[0].State)
+			assert.Equal(t, "need "+tt.need.ID+" is still reported after the operation", out.Leases[0].Error)
+
+			r := b.mustRollout(tt.key)
+			assert.Equal(t, fleet.RolloutHalted, r.State)
+			assert.Equal(t, fleet.HostFailed, r.Host("a").State)
+
+			// No loop: nothing is granted, tick after tick, until a person
+			// retries.
+			for range 5 {
+				b.advance(testEpoch)
+				b.step()
+				assert.Empty(t, b.leasedHosts(), "no loop of grants")
+			}
+
+			assert.Empty(t, b.w.Closed, "the cause stays open and halted")
+		})
+	}
+}
+
+func TestDoneReportAloneDoesNotReleaseWithoutALaterSync(t *testing.T) {
+	// Without soak the readiness rule of a validator host holds at once, but
+	// the needs of the sync that reported done may predate the operation.
 	b := newWorldBuilder(t)
-	b.host("a", 0)
-	b.wantsImage("a", imgLighthouse, digestA)
+	b.w.Settings.SoakEpochs = 0
+	b.host("a", 10)
+	b.wants("a", rebootNeed())
 	b.step()
 
-	// The agent says done but keeps reporting the same need.
 	b.report("a", protocol.PhaseDone, true)
 	b.step()
+
+	l := b.lease("a")
+	require.NotNil(t, l)
+	assert.Equal(t, fleet.LeaseVerifying, l.State)
+	assert.Equal(t, noteAwaitSync, l.Readiness)
+
+	// The next sync no longer lists the need: released.
+	b.get("a").Status.Needs = nil
 	b.advance(5 * time.Second)
-	b.step()
-	b.advance(2 * testEpoch)
 
 	out := b.step()
+	require.Len(t, out.Leases, 1)
+	assert.Equal(t, fleet.LeaseReleased, out.Leases[0].State)
+}
 
+func TestRunningLeaseWhoseOperationIsGoneFails(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.host("a", 0)
+	b.host("b", 0)
+	b.wants("a", packagesNeed("2.0"))
+	b.wants("b", packagesNeed("2.0"))
+	b.step()
+	require.Equal(t, []string{"a"}, b.leasedHosts())
+
+	b.report("a", protocol.PhaseApplying, true)
+	b.step()
+	require.Equal(t, fleet.LeaseRunning, b.lease("a").State)
+
+	// The agent lost its state file: it syncs without the operation.
+	b.advance(5 * time.Second)
+
+	st := *b.get("a").Status
+	st.Operation = nil
+	b.get("a").Status = &st
+
+	out := b.step()
 	require.Len(t, out.Leases, 1)
 	assert.Equal(t, fleet.LeaseFailed, out.Leases[0].State)
-	assert.Contains(t, out.Leases[0].Error, "is still reported after the operation")
-	assert.Equal(t, fleet.RolloutHalted, b.mustRollout(imageKey(imgLighthouse, digestA)).State)
-	assert.Empty(t, b.leasedHosts(), "no loop of grants")
+	assert.Equal(t, "the agent no longer reports the operation", out.Leases[0].Error)
+
+	r := b.mustRollout(packagesKey("2.0"))
+	assert.Equal(t, fleet.RolloutHalted, r.State)
+	assert.Equal(t, "a: the agent no longer reports the operation", r.Reason)
+	assert.Empty(t, b.leasedHosts(), "b is not granted in a halted rollout")
+}
+
+func TestExpiredLeaseIsReopenedWhenTheAgentStartedAfterAll(t *testing.T) {
+	ttl := fleet.DefaultSettings().LeaseTTL.Std()
+
+	b := newWorldBuilder(t)
+	b.w.Settings.MaxUnavailablePercent = 34 // 34 of 100 validators, one host at a time
+	b.host("a", 30)
+	b.host("b", 30)
+	b.host("c", 40)
+	b.wants("a", packagesNeed("2.0"))
+	b.wants("b", packagesNeed("2.0"))
+	b.wants("c", packagesNeed("2.0"))
+	key := packagesKey("2.0")
+
+	b.step()
+	require.Equal(t, []string{"a"}, b.leasedHosts())
+
+	first := b.lease("a")
+
+	// The agent of "a" says nothing about an operation until after the grace
+	// period; the pause keeps the scheduler from granting it a new lease.
+	b.w.Settings.Paused = true
+	b.advance(ttl + leaseStartGrace)
+
+	out := b.step()
+	require.Contains(t, auditActions(out), "lease.expired")
+	require.Empty(t, b.leasedHosts())
+	require.Equal(t, fleet.HostPending, b.mustRollout(key).Host("a").State)
+
+	// It had started after all (it ran past its deadline): the expired lease
+	// is taken up again instead of being ignored.
+	b.w.Settings.Paused = false
+	b.advance(5 * time.Second)
+
+	st := *b.get("a").Status
+	st.Operation = &protocol.Operation{
+		LeaseID: first.ID, Phase: protocol.PhaseApplying, Disrupted: true,
+		Steps: []protocol.Step{{NeedID: packagesNeed("2.0").ID, Status: protocol.StepRunning}},
+	}
+	b.get("a").Status = &st
+
+	out = b.step()
+	assert.Contains(t, auditActions(out), "lease.reopened")
+	assert.NotContains(t, auditActions(out), "lease.granted", "the host is down: nobody is granted on top")
+
+	l := b.lease("a")
+	require.NotNil(t, l)
+	assert.Equal(t, first.ID, l.ID)
+	assert.Equal(t, fleet.LeaseRunning, l.State)
+	assert.Nil(t, l.EndedAt)
+	assert.Equal(t, []string{"a"}, b.leasedHosts())
+	assert.Equal(t, uint64(30), out.Plan.Budget.UnavailableWeight)
+
+	m := b.mustRollout(key).Host("a")
+	assert.Equal(t, fleet.HostLeased, m.State)
+	assert.Equal(t, first.ID, m.LeaseID)
+	assert.Equal(t, "after canary a", queueReasons(out.Plan)["b"])
+
+	// From here it is a lease like any other.
+	b.serve("a")
+	assert.Equal(t, fleet.HostDone, b.mustRollout(key).Host("a").State)
+	assert.Equal(t, fleet.LeaseReleased, b.w.ClosedLeases[first.ID].State)
+
+	t.Run("an operation that stopped nothing reopens nothing", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.host("a", 0)
+		b.wants("a", packagesNeed("2.0"))
+		b.step()
+
+		first := b.lease("a")
+		b.w.Settings.Paused = true
+		b.advance(ttl + leaseStartGrace)
+		b.step()
+
+		st := *b.get("a").Status
+		st.Operation = &protocol.Operation{LeaseID: first.ID, Phase: protocol.PhaseDone}
+		b.get("a").Status = &st
+
+		out := b.step()
+		assert.Empty(t, out.Leases)
+		assert.Empty(t, b.leasedHosts())
+	})
+
+	t.Run("a failed lease is never reopened", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.host("a", 0)
+		b.wants("a", packagesNeed("2.0"))
+		b.step()
+		b.report("a", protocol.PhaseFailed, true)
+		b.step()
+		require.Empty(t, b.leasedHosts())
+
+		// The agent keeps repeating the failed operation.
+		for range 3 {
+			b.advance(5 * time.Second)
+
+			out := b.step()
+			assert.Empty(t, out.Leases)
+		}
+	})
 }
 
 func TestForceRollout(t *testing.T) {
@@ -755,7 +969,10 @@ func TestAdoption(t *testing.T) {
 			b.w.Settings.Paused = false
 
 			b.get("a").Status.Operation = tt.op
-			b.w.ClosedLeases["lost-1"] = tt.closed
+
+			if tt.closed {
+				b.w.ClosedLeases["lost-1"] = &fleet.Lease{ID: "lost-1", Host: "a", State: fleet.LeaseFailed}
+			}
 
 			out := b.step()
 
@@ -818,7 +1035,7 @@ func TestAdoption(t *testing.T) {
 		assert.Equal(t, []string{"lease.expired", "lease.adopted"}, auditActions(out))
 		assert.Equal(t, "lost-1", b.lease("a").ID)
 		assert.Len(t, b.w.Leases, 1, "one lease per host")
-		assert.True(t, b.w.ClosedLeases[granted.ID])
+		assert.NotNil(t, b.w.ClosedLeases[granted.ID])
 	})
 }
 

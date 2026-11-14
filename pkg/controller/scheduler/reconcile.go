@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"reflect"
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
@@ -14,13 +15,55 @@ import (
 const (
 	// actorScheduler is the audit actor of the scheduler's own decisions.
 	actorScheduler = "scheduler"
+	// reservedActorPrefix starts every name the scheduler writes into actor
+	// fields for itself. A person can never carry such a name: actorName
+	// rewrites it.
+	reservedActorPrefix = actorScheduler + ":"
 	// grantedByAdoption marks a lease created from an operation the agent
-	// reported for a lease the controller did not know.
-	grantedByAdoption = "adopted"
+	// reported for a lease the controller did not know. It is a reserved
+	// name, so no manual lease can carry it.
+	grantedByAdoption = reservedActorPrefix + "adopted"
 	// carriedPrefix starts the note on a pending member that had failed in
 	// the rollout this one supersedes. Such members are served first.
 	carriedPrefix = "failed in superseded rollout "
+	// skippedPrefix starts the note on a member a person skipped. The skip
+	// holds for the rollout's key while the note stands.
+	skippedPrefix = "skipped:"
+	// skipLiftedPrefix starts the note on a member of a closed rollout whose
+	// skip no longer holds.
+	skipLiftedPrefix = "skip lifted: "
+	// reasonNeedGone is why the scheduler lifts a skip by itself.
+	reasonNeedGone = "the host stopped reporting the need"
+	// leaseStartGrace is how long after a lease's expiry a sync without an
+	// operation is not yet taken as proof that the agent did not start. The
+	// agent may start until its own deadline, which lies up to one response
+	// latency after the controller's, and a sync that was built before the
+	// start can arrive after it.
+	leaseStartGrace = time.Minute
 )
+
+// operatorSkipped reports whether a person skipped the member and the skip
+// still holds.
+func operatorSkipped(m *fleet.RolloutHost) bool {
+	return m.State == fleet.HostSkipped && strings.HasPrefix(m.Error, skippedPrefix)
+}
+
+// needKey is the key of the rollout an observed need belongs to; empty for
+// the need of a manual directive.
+func needKey(n *protocol.Need) string {
+	switch {
+	case n.DirectiveID != "":
+		return ""
+	case n.Kind == protocol.NeedImage && n.Image != nil:
+		return imageKey(n.Image.Image, n.Image.ToDigest)
+	case n.Kind == protocol.NeedPackages && n.Packages != nil:
+		return prefixPackages + protocol.PackagesKey(n.Packages.Packages)
+	case n.Kind == protocol.NeedReboot:
+		return keyReboot
+	default:
+		return ""
+	}
+}
 
 // World is everything one reconcile depends on. Reconcile does not change
 // anything a World points at.
@@ -37,24 +80,28 @@ type World struct {
 	Rollouts []*fleet.Rollout
 	// Closed are terminal rollouts, newest first. It must hold at least the
 	// latest closed rollout of every key that hosts still report and of
-	// every image reference and the packages kind.
+	// every image reference and the packages kind. The latest one of a key
+	// decides whether the cause stays closed (aborted) and which hosts stay
+	// skipped for it.
 	Closed []*fleet.Rollout
 	// Leases are the non-terminal leases.
 	Leases []*fleet.Lease
 	// Directives are the pending directives plus every directive that
 	// belongs to a non-terminal rollout.
 	Directives []*fleet.Directive
-	// ClosedLeases names the terminal leases among the lease IDs that hosts
+	// ClosedLeases holds the terminal leases among the lease IDs that hosts
 	// report an operation for. An operation for a lease that is neither
-	// open nor listed here is adopted.
-	ClosedLeases map[string]bool
+	// open nor listed here is adopted; one for an expired lease reopens it
+	// when the agent did start after all.
+	ClosedLeases map[string]*fleet.Lease
 	// NewID returns a new unique ID.
 	NewID func() string
 }
 
 // Outcome is the result of one reconcile: the rows to write and the plan.
 type Outcome struct {
-	// Rollouts, Leases and Directives are the new and changed rows.
+	// Rollouts, Leases and Directives are the new and changed rows. Rollouts
+	// may include a closed rollout in which a skip was lifted.
 	Rollouts   []*fleet.Rollout
 	Leases     []*fleet.Lease
 	Directives []*fleet.Directive
@@ -171,6 +218,12 @@ type pass struct {
 	// pass to that rollout's ID, per successor group (image reference or
 	// packages kind).
 	carried map[string]map[string]string
+	// closedLatest is the latest closed rollout per key; closedDirty are the
+	// copies of those in which a skip was lifted in this pass.
+	closedLatest map[string]*fleet.Rollout
+	closedDirty  []*fleet.Rollout
+	// hostKeys are the rollout keys of the observed needs each host reports.
+	hostKeys map[string]map[string]bool
 }
 
 func newPass(w *World) *pass {
@@ -190,6 +243,14 @@ func newPass(w *World) *pass {
 		rows:           make(map[string]map[uint64]fleet.Liveness, len(w.Hosts)),
 		needs:          make(map[string]map[string][]protocol.Need, len(w.Rollouts)+2),
 		carried:        make(map[string]map[string]string, 2),
+		closedLatest:   make(map[string]*fleet.Rollout, len(w.Closed)),
+		hostKeys:       make(map[string]map[string]bool, len(w.Hosts)),
+	}
+
+	for _, r := range w.Closed {
+		if _, ok := p.closedLatest[r.Key]; !ok && r.State.Terminal() {
+			p.closedLatest[r.Key] = r
+		}
 	}
 
 	p.indexLiveness()
@@ -205,6 +266,16 @@ func newPass(w *World) *pass {
 
 		p.hosts[h.Name] = hv
 		p.names = append(p.names, h.Name)
+
+		keys := make(map[string]bool, len(hv.needs()))
+
+		for i := range hv.needs() {
+			if key := needKey(&hv.needs()[i]); key != "" {
+				keys[key] = true
+			}
+		}
+
+		p.hostKeys[h.Name] = keys
 	}
 
 	slices.Sort(p.names)
@@ -325,6 +396,11 @@ func (p *pass) outcome(plan *Plan) *Outcome {
 			continue
 		}
 
+		r.UpdatedAt = p.now
+		out.Rollouts = append(out.Rollouts, r)
+	}
+
+	for _, r := range p.closedDirty {
 		r.UpdatedAt = p.now
 		out.Rollouts = append(out.Rollouts, r)
 	}

@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-web ensure-web test test-go test-web test-docker test-system lint lint-go lint-web e2e clean
+.PHONY: all build build-web ensure-web test test-go test-web test-docker test-system test-reboot lint lint-go lint-web e2e clean
 
 all: build
 
@@ -40,6 +40,11 @@ lint-go:
 
 lint-web:
 	cd web && npm ci && npm run lint
+
+# Needs Docker: the full agent under systemd in throwaway hosts, with leases
+# that survive real reboots of those hosts.
+test-reboot:
+	./test/e2e/reboot.sh
 
 # End-to-end run on a local Kurtosis devnet.
 e2e:

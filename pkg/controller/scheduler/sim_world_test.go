@@ -32,6 +32,10 @@ const (
 
 const simPackage = "docker-ce"
 
+// simLatencySeconds bounds how far an agent's start deadline lies after the
+// lease's expiry. It must stay below leaseStartGrace.
+const simLatencySeconds = 20
+
 // simContainer is one container of a simulated host.
 type simContainer struct {
 	name    string
@@ -67,7 +71,10 @@ type simAgent struct {
 	pkgInstalled   int
 	pkgSeen        int
 	rebootRequired bool
-	boot           int
+	// rebootSticks: the host comes back from a reboot still requiring one
+	// (its boot configuration picks the old kernel).
+	rebootSticks bool
+	boot         int
 
 	localHold bool
 	ctrlHold  bool
@@ -598,6 +605,7 @@ func (w *simWorld) finishOperation(a *simAgent) {
 	}
 
 	op.Phase = protocol.PhaseDone
+	rebooted := false
 
 	for i := range op.Steps {
 		step := &op.Steps[i]
@@ -624,7 +632,7 @@ func (w *simWorld) finishOperation(a *simAgent) {
 			a.pkgSeen = w.pkgVersion
 			a.rebootRequired = a.rebootRequired || w.rng.IntN(4) == 0
 		case protocol.NeedReboot:
-			a.rebootRequired = false
+			rebooted = true
 			a.boot++
 		}
 
@@ -633,6 +641,12 @@ func (w *simWorld) finishOperation(a *simAgent) {
 				return m.directive == n.DirectiveID
 			})
 		}
+	}
+
+	// The reboot is the last thing an operation does, so it also covers
+	// what the package upgrade of the same operation asked for.
+	if rebooted {
+		a.rebootRequired = a.rebootSticks
 	}
 
 	if op.Phase == protocol.PhaseDone {
@@ -805,6 +819,10 @@ func (w *simWorld) respond(a *simAgent, resp *Assignment) {
 			a.deadline = l.ExpiresAt
 		}
 
+		// The response took a while to arrive and the agent's clock is not
+		// the controller's: its deadline lies a little after the lease's.
+		a.deadline = a.deadline.Add(time.Duration(w.rng.IntN(simLatencySeconds+1)) * time.Second)
+
 		delay := time.Duration(w.rng.IntN(8)) * time.Second
 
 		switch n := w.rng.IntN(20); {
@@ -813,6 +831,9 @@ func (w *simWorld) respond(a *simAgent, resp *Assignment) {
 			delay = time.Hour
 		case n < 4:
 			delay = time.Duration(10+w.rng.IntN(60)) * time.Second
+		case n < 6:
+			// Start in the last moments before the deadline.
+			delay = max(a.deadline.Sub(w.now)-time.Duration(1+w.rng.IntN(25))*time.Second, 0)
 		}
 
 		a.startAt = w.now.Add(delay)

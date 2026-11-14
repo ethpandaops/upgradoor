@@ -66,7 +66,12 @@ type sim struct {
 	// is the store's write count at that observation.
 	retried  []string
 	observed int
-	stats    simStats
+	// skipped is the person's own record of the hosts skipped per rollout
+	// key: set by a skip, cleared by a retry that names the host (or lifts
+	// the skips of a closed rollout), by the host syncing without the need
+	// while it is not held, and by forgetting the host.
+	skipped map[string]map[string]bool
+	stats   simStats
 }
 
 // simStats counts what happened, so that the test can tell a simulation that
@@ -78,6 +83,7 @@ type simStats struct {
 	ForcedGrants, ExemptGrants, Bundled   int
 	Restarts, WriteFailures, Shadows      int
 	LostDatabases, Adopted                int
+	Skips, SkipsLifted, SkipsCarried      int
 	ConvergeTicks, MaxConvergeTicks       int
 	// Waits counts the waiting reasons seen in plans, by their first word.
 	Waits map[string]int
@@ -102,6 +108,9 @@ func (a *simStats) add(b *simStats) {
 	a.Shadows += b.Shadows
 	a.LostDatabases += b.LostDatabases
 	a.Adopted += b.Adopted
+	a.Skips += b.Skips
+	a.SkipsLifted += b.SkipsLifted
+	a.SkipsCarried += b.SkipsCarried
 	a.ConvergeTicks += b.ConvergeTicks
 	a.MaxConvergeTicks = max(a.MaxConvergeTicks, b.MaxConvergeTicks)
 
@@ -136,6 +145,25 @@ func (s *sim) count() {
 			s.stats.Halts++
 		case "action.abort":
 			s.stats.Aborted++
+		}
+	}
+
+	// A skip that outlived its rollout shows as a member that joined a later
+	// rollout of the same key as skipped.
+	seen := make(map[string]bool, 8)
+	all, _, _ := s.store.view()
+
+	for _, r := range all {
+		for i := range r.Hosts {
+			if !operatorSkipped(&r.Hosts[i]) && !strings.HasPrefix(r.Hosts[i].Error, skipLiftedPrefix) {
+				continue
+			}
+
+			if id := r.Key + " " + r.Hosts[i].Host; seen[id] {
+				s.stats.SkipsCarried++
+			} else {
+				seen[id] = true
+			}
 		}
 	}
 
@@ -178,12 +206,13 @@ func newSim(seed uint64) (*sim, error) {
 
 	rng := rand.New(rand.NewPCG(seed, 0x5eed))
 	s := &sim{
-		seed:   seed,
-		rng:    rng,
-		world:  newSimWorld(rng),
-		store:  newFakeStore(),
-		oracle: newOracle(),
-		log:    log,
+		seed:    seed,
+		rng:     rng,
+		world:   newSimWorld(rng),
+		store:   newFakeStore(),
+		oracle:  newOracle(),
+		log:     log,
+		skipped: make(map[string]map[string]bool, 4),
 	}
 
 	pick := func(values ...float64) float64 { return values[rng.IntN(len(values))] }
@@ -330,6 +359,7 @@ func (s *sim) syncAgents() error {
 		}
 
 		s.store.recordSync(host)
+		s.needsGone(a, req)
 
 		a.lastSync = w.now
 		a.lastSent = req
@@ -447,6 +477,7 @@ func (s *sim) facts(fresh bool) *simFacts {
 		publishedEpoch: w.publishedEpoch,
 		havePublished:  w.havePublished,
 		retried:        s.retried,
+		skipped:        s.skipped,
 		fresh:          fresh,
 	}
 
@@ -624,7 +655,8 @@ func (s *sim) randomStep() error {
 	case n < 560:
 		a := s.agent()
 		a.rebootRequired = true
-		s.note("%s: reboot required", a.name)
+		a.rebootSticks = s.rng.IntN(8) == 0
+		s.note("%s: reboot required (sticks: %v)", a.name, a.rebootSticks)
 	case n < 600:
 		s.worldEvent()
 	case n < 650:
@@ -667,6 +699,7 @@ func (s *sim) loseDatabase() error {
 	s.oracle = newOracle()
 	s.observed = 0
 	s.retried = nil
+	s.skipped = make(map[string]map[string]bool, 4)
 
 	for _, a := range s.world.agents {
 		s.world.dropped[a.name] = true
@@ -783,23 +816,23 @@ func (s *sim) operatorAction() error {
 		return s.rolloutAction(n)
 	case n < 44:
 		r := s.pickRollout(func(r *fleet.Rollout) bool {
-			return r.State == fleet.RolloutHalted || r.State == fleet.RolloutAborted
+			return r.State == fleet.RolloutHalted || r.State == fleet.RolloutAborted ||
+				(s.rng.IntN(4) == 0 && len(skippedMembers(r)) > 0)
 		})
 		if r == nil {
 			return nil
 		}
 
-		req := RolloutHostsRequest{Rollout: r.ID}
-		if s.rng.IntN(5) == 0 {
-			req.Hosts = s.someHosts()
+		var hosts []string
+
+		switch s.rng.IntN(5) {
+		case 0:
+			hosts = s.someHosts()
+		case 1:
+			hosts = skippedMembers(r)
 		}
 
-		res, err := s.svc.Retry(ctx, simActor, req)
-		if err == nil {
-			s.retried = append(s.retried, r.ID)
-		}
-
-		return s.act(fmt.Sprintf("retry %s %v", r.ID, req.Hosts), res, err)
+		return s.retry(r, hosts)
 	case n < 50:
 		hosts := s.someHosts()
 		res, err := s.svc.Hold(ctx, simActor, HoldRequest{Hosts: hosts, Reason: "sim"})
@@ -818,9 +851,14 @@ func (s *sim) operatorAction() error {
 		hosts := s.someHosts()[:1]
 		res, err := s.svc.Forget(ctx, simActor, HoldRequest{Hosts: hosts})
 
-		// The stored liveness rows of a forgotten host are gone.
+		// The stored liveness rows of a forgotten host are gone, and so is
+		// what the person noted about it.
 		if s.store.host(hosts[0]) == nil {
 			s.world.dropped[hosts[0]] = true
+
+			for _, byHost := range s.skipped {
+				delete(byHost, hosts[0])
+			}
 		}
 
 		return s.act(fmt.Sprintf("forget %v", hosts), res, err)
@@ -852,6 +890,16 @@ func (s *sim) rolloutAction(n int) error {
 	default:
 		hosts := s.someHosts()
 		res, err := s.svc.Skip(ctx, simActor, RolloutHostsRequest{Rollout: r.ID, Hosts: hosts})
+		if err == nil && r.Kind != fleet.RolloutManual {
+			for _, name := range res.Hosts {
+				if s.skipped[r.Key] == nil {
+					s.skipped[r.Key] = make(map[string]bool, 2)
+				}
+
+				s.skipped[r.Key][name] = true
+				s.stats.Skips++
+			}
+		}
 
 		return s.act(fmt.Sprintf("skip %s %v", r.ID, hosts), res, err)
 	}
@@ -946,7 +994,7 @@ func (s *sim) converge() error {
 	}
 
 	for _, a := range w.agents {
-		a.silentUntil, a.outageUntil, a.localHold = time.Time{}, time.Time{}, false
+		a.silentUntil, a.outageUntil, a.localHold, a.rebootSticks = time.Time{}, time.Time{}, false, false
 	}
 
 	set, err := s.svc.Settings(ctx)
@@ -1047,7 +1095,14 @@ func (s *sim) operate() error {
 
 		failed := slices.ContainsFunc(r.Hosts, func(m fleet.RolloutHost) bool { return m.State == fleet.HostFailed })
 		if r.State == fleet.RolloutHalted || failed {
-			if err := s.retry(r.ID); err != nil {
+			if err := s.retry(r, nil); err != nil {
+				return err
+			}
+		}
+
+		// A skip is taken back by naming the host.
+		if hosts := skippedMembers(r); len(hosts) > 0 {
+			if err := s.retry(r, hosts); err != nil {
 				return err
 			}
 		}
@@ -1064,8 +1119,11 @@ func (s *sim) operate() error {
 
 		latest[r.Key] = true
 
-		if r.State == fleet.RolloutAborted && !open[r.Key] && reported[r.Key] {
-			if err := s.retry(r.ID); err != nil {
+		// An aborted cause is reopened; the skips of a closed rollout whose
+		// hosts still report the need are lifted.
+		if !open[r.Key] && reported[r.Key] &&
+			(r.State == fleet.RolloutAborted || len(skippedMembers(r)) > 0) {
+			if err := s.retry(r, nil); err != nil {
 				return err
 			}
 		}
@@ -1074,13 +1132,53 @@ func (s *sim) operate() error {
 	return nil
 }
 
-func (s *sim) retry(id string) error {
-	res, err := s.svc.Retry(context.Background(), simActor, RolloutHostsRequest{Rollout: id})
-	if err == nil {
-		s.retried = append(s.retried, id)
+// skippedMembers names the members of a rollout that a person skipped.
+func skippedMembers(r *fleet.Rollout) []string {
+	var hosts []string
+
+	for i := range r.Hosts {
+		if operatorSkipped(&r.Hosts[i]) {
+			hosts = append(hosts, r.Hosts[i].Host)
+		}
 	}
 
-	return s.act("retry "+id, res, err)
+	return hosts
+}
+
+// retry retries a rollout as a person would, for all hosts or the named
+// ones. Every host the action names as retried is no longer skipped for the
+// rollout's key.
+func (s *sim) retry(r *fleet.Rollout, hosts []string) error {
+	res, err := s.svc.Retry(context.Background(), simActor, RolloutHostsRequest{Rollout: r.ID, Hosts: hosts})
+	if err == nil {
+		s.retried = append(s.retried, r.ID)
+
+		for _, name := range res.Hosts {
+			if s.skipped[r.Key][name] {
+				delete(s.skipped[r.Key], name)
+				s.stats.SkipsLifted++
+			}
+		}
+	}
+
+	return s.act(fmt.Sprintf("retry %s %v", r.ID, hosts), res, err)
+}
+
+// needsGone forgets the skips of a host for the needs it no longer reports:
+// a skip holds for as long as the host keeps reporting the need. A held host
+// reports nothing and keeps its skips.
+func (s *sim) needsGone(a *simAgent, req *protocol.SyncRequest) {
+	if h := s.store.host(a.name); h == nil || h.Held() {
+		return
+	}
+
+	for key, byHost := range s.skipped {
+		if byHost[a.name] && !slices.ContainsFunc(req.Needs, func(n protocol.Need) bool {
+			return needKey(&n) == key
+		}) {
+			delete(byHost, a.name)
+		}
+	}
 }
 
 // reportedKeys are the rollout keys of the observed needs the agents report.
@@ -1278,6 +1376,9 @@ func TestSimulation(t *testing.T) {
 			"budget-exempt grants": total.ExemptGrants, "bundled leases": total.Bundled,
 			"restart comparisons": total.Shadows, "write failures": total.WriteFailures,
 			"adopted leases":       total.Adopted,
+			"skipped hosts":        total.Skips,
+			"skips taken back":     total.SkipsLifted,
+			"skips carried over":   total.SkipsCarried,
 			"waits for the budget": total.Waits["budget"], "waits for the host limit": total.Waits["host"],
 			"waits for the gate": total.Waits["network"], "waits for the order": total.Waits["after"],
 		} {

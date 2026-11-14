@@ -41,6 +41,10 @@ type fakeStore struct {
 	failNext   int
 	failSkip   int
 	writes     int
+
+	// reads names the rollout and directive listings since it was last
+	// cleared, e.g. "rollouts:open" or "directives:pending".
+	reads []string
 }
 
 var _ Store = (*fakeStore)(nil)
@@ -261,6 +265,12 @@ func (s *fakeStore) ListRollouts(_ context.Context, f store.RolloutFilter) ([]*f
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	if f.OpenOnly {
+		s.reads = append(s.reads, "rollouts:open")
+	} else {
+		s.reads = append(s.reads, "rollouts:all")
+	}
+
 	var out []*fleet.Rollout
 
 	for i := len(s.rolloutSeq) - 1; i >= 0; i-- {
@@ -332,6 +342,14 @@ func (s *fakeStore) GetLease(_ context.Context, id string) (*fleet.Lease, error)
 func (s *fakeStore) ListDirectives(_ context.Context, f store.DirectiveFilter) ([]*fleet.Directive, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	switch {
+	case f.Host != "":
+	case f.PendingOnly:
+		s.reads = append(s.reads, "directives:pending")
+	default:
+		s.reads = append(s.reads, "directives:all")
+	}
 
 	var out []*fleet.Directive
 
@@ -444,14 +462,39 @@ func (s *fakeStore) auditActions() []string {
 }
 
 func (s *fakeStore) lastAudit() fleet.AuditEntry {
+	return s.lastAuditOf("")
+}
+
+// readKinds returns the distinct listings read since reads was cleared, in
+// the order of their first use.
+func (s *fakeStore) readKinds() []string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if len(s.audit) == 0 {
-		return fleet.AuditEntry{}
+	kinds := make([]string, 0, 4)
+
+	for _, r := range s.reads {
+		if !slices.Contains(kinds, r) {
+			kinds = append(kinds, r)
+		}
 	}
 
-	return s.audit[len(s.audit)-1]
+	return kinds
+}
+
+// lastAuditOf returns the newest audit entry with the action; any action
+// when it is empty.
+func (s *fakeStore) lastAuditOf(action string) fleet.AuditEntry {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	for i := len(s.audit) - 1; i >= 0; i-- {
+		if action == "" || s.audit[i].Action == action {
+			return s.audit[i]
+		}
+	}
+
+	return fleet.AuditEntry{}
 }
 
 // snapshot returns copies of all rollouts and leases in creation order and

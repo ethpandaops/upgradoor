@@ -73,6 +73,8 @@ jobs:
           go-version-file: go.mod
       - name: make test-system
         run: make test-system
+      - name: make test-reboot
+        run: make test-reboot
 
   e2e:
     name: end to end (Kurtosis)

@@ -71,6 +71,13 @@ SYSBOX_REPO=$(cd "$SYSBOX_DIR/../.." && pwd)
 : "${SYSBOX_IMAGE_ID:=}"
 : "${SYSBOX_STATE_DIR:=/var/lib/upgradoor}"
 : "${SYSBOX_BOOT_TIMEOUT:=120}"
+# Optional: the Docker network to attach the host to (default: none) and
+# extra "docker run" arguments, for tests that need more than an isolated
+# host (test/e2e/reboot.sh: a controller to talk to and the Docker socket).
+: "${SYSBOX_NETWORK:=none}"
+if ! declare -p SYSBOX_RUN_ARGS >/dev/null 2>&1; then
+    SYSBOX_RUN_ARGS=()
+fi
 
 sysbox_log() {
     printf '[system-test] %s\n' "$*" >&2
@@ -111,7 +118,8 @@ sysbox_start() {
         --hostname upgradoor-test \
         --label upgradoor.test=system \
         --restart always \
-        --network none \
+        --network "${SYSBOX_NETWORK:-none}" \
+        "${SYSBOX_RUN_ARGS[@]}" \
         --cap-add SYS_ADMIN \
         --cap-add SYS_BOOT \
         --security-opt apparmor=unconfined \
