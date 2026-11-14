@@ -426,6 +426,9 @@ func (s *service) publishLiveness(ctx context.Context, note string) error {
 			h.Error = note
 		}
 
+		// Set and cleared with the detection itself, whatever the store says.
+		h.LivenessUnsupported = unsupported
+
 		if unsupported {
 			h.LivenessKnown = false
 		}

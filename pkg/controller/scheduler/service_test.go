@@ -312,6 +312,68 @@ func TestServiceRestartChangesNothing(t *testing.T) {
 	assert.Equal(t, plan, h.svc.Plan())
 }
 
+// TestServiceRestartAfterAnOutage: a controller that was down for longer
+// than leaseTtl and hostStaleAfter starts again. The agents could not sync
+// meanwhile; their silence counts from the start.
+func TestServiceRestartAfterAnOutage(t *testing.T) {
+	h := newHarness(t)
+	h.addHost("a", 0, packagesNeed("2.0"))
+	h.addHost("b", 0, packagesNeed("2.0"))
+	h.tick()
+
+	lease := h.assignment("a").Lease
+	require.NotNil(t, lease)
+
+	h.sync("a", func(st *protocol.SyncRequest) {
+		st.Operation = &protocol.Operation{
+			LeaseID: lease.ID, Phase: protocol.PhaseApplying, Disrupted: true,
+			Steps: []protocol.Step{{NeedID: lease.Needs[0].ID, Status: protocol.StepRunning}},
+		}
+	})
+	h.tick()
+
+	state := func() fleet.LeaseState {
+		l, err := h.store.GetLease(h.ctx, lease.ID)
+		require.NoError(t, err)
+
+		return l.State
+	}
+
+	require.Equal(t, fleet.LeaseRunning, state())
+
+	ttl := fleet.DefaultSettings().LeaseTTL.Std()
+
+	// Down for three times leaseTtl: no sync, no reconcile.
+	h.now = h.now.Add(3 * ttl)
+	h.refreshHealth()
+	h.restart()
+	h.tick()
+
+	assert.Equal(t, fleet.LeaseRunning, state(), "the outage is not the agent's silence")
+	assert.Equal(t, fleet.RolloutActive, h.openRollouts()[0].State)
+	assert.Equal(t, SlotLeased, h.svc.Plan().Hosts["a"].Slot)
+	assert.Equal(t, SlotQueued, h.svc.Plan().Hosts["b"].Slot, "not stale either")
+
+	// Manual actions judge silence the same way.
+	res, err := h.svc.Reboot(h.ctx, "alice", RebootRequest{Hosts: []string{"b"}, Staggered: true})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"b"}, res.Hosts)
+
+	// "b" syncs again, "a" stays silent for leaseTtl after the start.
+	h.now = h.now.Add(ttl)
+	h.refreshHealth()
+	h.sync("b", nil)
+	h.tick()
+	assert.Equal(t, fleet.LeaseRunning, state())
+
+	h.now = h.now.Add(time.Second)
+	h.refreshHealth()
+	h.sync("b", nil)
+	h.tick()
+	assert.Equal(t, fleet.LeaseFailed, state())
+	assert.Equal(t, SlotQueued, h.svc.Plan().Hosts["b"].Slot)
+}
+
 func TestServiceStartStop(t *testing.T) {
 	h := newHarness(t)
 	h.store.putHost(&fleet.Host{
@@ -483,6 +545,8 @@ func TestRollAction(t *testing.T) {
 	silent := h.addHost("silent", 0)
 	silent.LastSeen = h.now.Add(-time.Hour)
 	h.store.putHost(silent)
+	// The scheduler has been up for as long: the silence is the host's.
+	h.svc.since = silent.LastSeen
 
 	res, err := h.svc.Roll(h.ctx, "alice", RollRequest{All: true, Reason: "new config"})
 	require.NoError(t, err)

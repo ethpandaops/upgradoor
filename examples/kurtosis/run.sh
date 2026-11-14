@@ -123,16 +123,29 @@ pub_true() { pub "$1" | jq -e "$2" >/dev/null; }
 container() { docker ps -a --format '{{.Names}}' | grep "^$1--" | head -n1; }
 ip_of() { docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
 
-# publish NAME DOCKERFILE-BODY: build a lighthouse variant, push it to the tag
-# and print its manifest digest.
+# publish NAME DOCKERFILE-BODY: build a lighthouse variant, move the tag to
+# it and print its manifest digest.
+#
+# The agents share this machine's Docker daemon and pull the followed tag
+# whenever the registry moves it, which re-points the local tag. So the build
+# never uses that tag locally: it is pushed under a tag of its own and the
+# followed tag is moved inside the registry.
 publish() {
-    local name=$1 dir=$work/build-$1
+    local name=$1 dir=$work/build-$1 build=$registry/lighthouse:build-$1
+    local accept='application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json'
+    local type
     mkdir -p "$dir"
     printf 'FROM %s\n%s\n' "$base" "$2" >"$dir/Dockerfile"
-    docker build -q -t "$image" "$dir" >/dev/null
-    docker push -q "$image" >/dev/null
-    curl -fsSI -H 'Accept: application/vnd.oci.image.index.v1+json, application/vnd.docker.distribution.manifest.list.v2+json, application/vnd.oci.image.manifest.v1+json, application/vnd.docker.distribution.manifest.v2+json' \
-        "http://$registry/v2/lighthouse/manifests/example" |
+    docker build -q -t "$build" "$dir" >/dev/null
+    docker push -q "$build" >/dev/null
+    docker image rm "$build" >/dev/null 2>&1 || true
+
+    type=$(curl -fsS -D - -o "$dir/manifest" -H "Accept: $accept" \
+        "http://$registry/v2/lighthouse/manifests/build-$name" |
+        tr -d '\r' | awk 'tolower($1) == "content-type:" {print $2}')
+    curl -fsS -X PUT -H "Content-Type: $type" --data-binary "@$dir/manifest" \
+        "http://$registry/v2/lighthouse/manifests/example" >/dev/null
+    curl -fsSI -H "Accept: $accept" "http://$registry/v2/lighthouse/manifests/example" |
         tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" {print $2}'
 }
 
@@ -173,6 +186,7 @@ wait_until "registry up" 30 curl -fsS "http://$registry/v2/"
 
 digest_a=$(publish a 'LABEL upgradoor.e2e.build=a org.opencontainers.image.revision=aaaaaaa')
 [ -n "$digest_a" ] || die "no digest for build A"
+docker pull -q "$image" >/dev/null
 pass "build A published: $digest_a"
 
 # --- devnet ----------------------------------------------------------------
@@ -387,6 +401,7 @@ pass "digest C is blocked: no lease for 90s, three hosts still on B"
 
 say "D: recovery"
 digest_d=$(publish d 'LABEL upgradoor.e2e.build=d org.opencontainers.image.revision=ddddddd')
+[ "$digest_d" != "$digest_c" ] || die "build D has the digest of build C"
 pass "build D published: $digest_d"
 
 wait_until "rollout C superseded" 180 rollout_is "$digest_c" superseded

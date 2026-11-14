@@ -101,12 +101,20 @@ func (f *fakeStore) RecordSync(_ context.Context, sync *store.HostSync) (*store.
 		host = &fleet.Host{Name: name, FirstSeen: sync.At}
 		f.hosts[name] = host
 		res.Created = true
+
+		// Like the real store: a new host that reports a controller hold
+		// keeps it.
+		if sync.Request != nil && sync.Request.Hold.Controller {
+			res.HoldAdopted = true
+			host.HoldWanted = true
+			host.HoldReason = store.HoldReasonAdopted
+		}
 	} else if host.CertHash != sync.Cert.Hash {
 		res.PreviousCertHash = host.CertHash
 	}
 
 	host.CertHash = sync.Cert.Hash
-	host.Generation = sync.Cert.Generation
+	host.Generation = max(host.Generation, sync.Cert.Generation)
 	host.Validators = sync.Cert.Validators
 	host.Roles = sync.Cert.Roles
 	host.LastSeen = sync.At

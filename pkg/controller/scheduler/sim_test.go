@@ -26,7 +26,9 @@ import (
 
 // The simulation drives the real Service over an in-memory store with a
 // random fleet, simulated agents, a simulated registry and network, random
-// operator actions, controller restarts and store write failures. After
+// operator actions, controller restarts (some after an outage longer than
+// leaseTtl) and store write failures. In every fifth seed the beacon node
+// does not serve the liveness endpoint for the whole run. After
 // every step the oracle (sim_oracle_test.go) asserts the invariants of
 // docs/scheduler.md from the world's own state; at the end of a run the world
 // is healed and everything must converge.
@@ -50,11 +52,13 @@ var simReasons = regexp.MustCompile(`^(held|agent silent|paused|rollout paused|`
 
 // sim is one simulation run.
 type sim struct {
-	seed     uint64
-	rng      *rand.Rand
-	world    *simWorld
-	store    *fakeStore
-	svc      *service
+	seed  uint64
+	rng   *rand.Rand
+	world *simWorld
+	store *fakeStore
+	svc   *service
+	// since is when the controller last started.
+	since    time.Time
 	oracle   *oracle
 	defaults fleet.Settings
 	log      logrus.FieldLogger
@@ -71,7 +75,10 @@ type sim struct {
 	// the skips of a closed rollout), by the host syncing without the need
 	// while it is not held, and by forgetting the host.
 	skipped map[string]map[string]bool
-	stats   simStats
+	// holds is the person's own record of the hosts on controller hold. It
+	// outlives the controller's database.
+	holds map[string]bool
+	stats simStats
 }
 
 // simStats counts what happened, so that the test can tell a simulation that
@@ -83,8 +90,17 @@ type simStats struct {
 	ForcedGrants, ExemptGrants, Bundled   int
 	Restarts, WriteFailures, Shadows      int
 	LostDatabases, Adopted                int
-	Skips, SkipsLifted, SkipsCarried      int
-	ConvergeTicks, MaxConvergeTicks       int
+	// Outages are restarts after more than leaseTtl of downtime and
+	// OutageLeases the open leases they found; Unsupported are the seeds
+	// without liveness and ProbeGrants the budgeted grants to validator
+	// hosts in them.
+	Outages, OutageLeases    int
+	Unsupported, ProbeGrants int
+	// HoldsAdopted counts hosts that were held on the agent when a
+	// controller without a record of them first saw them.
+	HoldsAdopted                     int
+	Skips, SkipsLifted, SkipsCarried int
+	ConvergeTicks, MaxConvergeTicks  int
 	// Waits counts the waiting reasons seen in plans, by their first word.
 	Waits map[string]int
 }
@@ -107,6 +123,11 @@ func (a *simStats) add(b *simStats) {
 	a.WriteFailures += b.WriteFailures
 	a.Shadows += b.Shadows
 	a.LostDatabases += b.LostDatabases
+	a.Outages += b.Outages
+	a.OutageLeases += b.OutageLeases
+	a.Unsupported += b.Unsupported
+	a.ProbeGrants += b.ProbeGrants
+	a.HoldsAdopted += b.HoldsAdopted
 	a.Adopted += b.Adopted
 	a.Skips += b.Skips
 	a.SkipsLifted += b.SkipsLifted
@@ -191,6 +212,10 @@ func (s *sim) count() {
 			s.stats.ExemptGrants++
 		}
 
+		if s.world.livenessUnsupported && !exempt && l.Weight > 0 && l.GrantedBy != grantedByAdoption {
+			s.stats.ProbeGrants++
+		}
+
 		if len(ids) > 1 {
 			s.stats.Bundled++
 		}
@@ -198,6 +223,10 @@ func (s *sim) count() {
 
 	s.stats.Hosts = len(s.world.agents)
 	s.stats.Seeds = 1
+
+	if s.world.livenessUnsupported {
+		s.stats.Unsupported = 1
+	}
 }
 
 func newSim(seed uint64) (*sim, error) {
@@ -213,7 +242,12 @@ func newSim(seed uint64) (*sim, error) {
 		oracle:  newOracle(),
 		log:     log,
 		skipped: make(map[string]map[string]bool, 4),
+		holds:   make(map[string]bool, 4),
 	}
+
+	// Taken from the seed, not from the random stream, so that the other
+	// seeds keep their histories.
+	s.world.livenessUnsupported = seed%5 == 4
 
 	pick := func(values ...float64) float64 { return values[rng.IntN(len(values))] }
 	policy := func() fleet.Policy {
@@ -277,6 +311,7 @@ func (s *sim) service(st *fakeStore, newID func() string) (*service, error) {
 func (s *sim) boot(st *fakeStore) error {
 	svc, err := s.service(st, s.newID)
 	s.svc = svc
+	s.since = s.world.now
 
 	return err
 }
@@ -358,7 +393,11 @@ func (s *sim) syncAgents() error {
 			host.Roles = []string{fleet.RoleBootnode}
 		}
 
-		s.store.recordSync(host)
+		if s.store.recordSync(host) {
+			s.stats.HoldsAdopted++
+			s.note("%s: registered on hold, as its agent reports", a.name)
+		}
+
 		s.needsGone(a, req)
 
 		a.lastSync = w.now
@@ -438,6 +477,11 @@ func (s *sim) reconcile() error {
 			return err
 		}
 
+		// Silence is counted from the scheduler's start, so the comparison is
+		// between two schedulers that started at the same time; what a later
+		// start changes is the outage step's business.
+		fresh.since = s.svc.since
+
 		if err := fresh.reconcile(ctx); err != nil {
 			return fmt.Errorf("reconcile after a restart: %w", err)
 		}
@@ -470,6 +514,7 @@ func (s *sim) facts(fresh bool) *simFacts {
 
 	f := &simFacts{
 		now:            w.now,
+		since:          s.since,
 		settings:       settings,
 		health:         w.health(),
 		hosts:          make(map[string]*simHostFact, len(w.agents)),
@@ -478,6 +523,7 @@ func (s *sim) facts(fresh bool) *simFacts {
 		havePublished:  w.havePublished,
 		retried:        s.retried,
 		skipped:        s.skipped,
+		holds:          s.holds,
 		fresh:          fresh,
 	}
 
@@ -487,10 +533,23 @@ func (s *sim) facts(fresh bool) *simFacts {
 			continue
 		}
 
+		live := w.publishedLive(a)
+
+		if w.livenessUnsupported {
+			// The probe rule: the last sync as the agent sent it, and how long
+			// ago that was as far as this controller can know.
+			live = a.weight
+
+			silent := w.now.Sub(later(a.lastSync, s.since)) > settings.HostStaleAfter.Std()
+			if silent || (a.lastSent != nil && !a.lastSent.Node.Synced()) {
+				live = 0
+			}
+		}
+
 		f.hosts[a.name] = &simHostFact{
 			weight:     a.weight,
 			bootnode:   a.bootnode,
-			live:       w.publishedLive(a),
+			live:       live,
 			holdWanted: registered.HoldWanted,
 			lastSync:   a.lastSync,
 			status:     a.lastSent,
@@ -662,8 +721,13 @@ func (s *sim) randomStep() error {
 	case n < 650:
 		s.agentEvent()
 	case n < 690:
-		s.note("controller restart")
 		s.stats.Restarts++
+
+		if s.rng.IntN(4) == 0 {
+			return s.outage()
+		}
+
+		s.note("controller restart")
 
 		return s.boot(s.store)
 	case n < 720:
@@ -684,6 +748,67 @@ func (s *sim) randomStep() error {
 	}
 
 	w.sample()
+
+	return nil
+}
+
+// outage takes the controller down for longer than leaseTtl and starts it
+// again on the same store. While it is down the world goes on (agents work on
+// what they hold, the beacon service stores nothing) but nobody can sync. The
+// first reconcile after the start runs before any agent has synced again: the
+// outage alone must not fail a lease.
+func (s *sim) outage() error {
+	ctx := context.Background()
+	w := s.world
+
+	settings, err := s.store.LoadSettings(ctx, s.defaults)
+	if err != nil {
+		return err
+	}
+
+	down := settings.LeaseTTL.Std() + s.duration(1, 240)
+	s.note("controller down for %s, then restart", down)
+
+	w.beaconDownUntil = later(w.beaconDownUntil, w.now.Add(down))
+
+	for left := down; left > 0; {
+		step := min(left, 10*time.Second)
+		left -= step
+
+		w.advance(step, s.store)
+
+		if err = s.checkStarts(); err != nil {
+			return err
+		}
+	}
+
+	if err = s.boot(s.store); err != nil {
+		return err
+	}
+
+	carried, err := s.store.ListLeases(ctx, store.LeaseFilter{OpenOnly: true})
+	if err != nil {
+		return err
+	}
+
+	s.stats.Outages++
+	s.stats.OutageLeases += len(carried)
+
+	if err := s.reconcile(); err != nil {
+		return err
+	}
+
+	for _, was := range carried {
+		l, err := s.store.GetLease(ctx, was.ID)
+		if err != nil {
+			return err
+		}
+
+		if l.State == fleet.LeaseFailed && l.Error == reasonAgentSilent {
+			return fmt.Errorf("lease %s of %s (%s) failed as %q on the first reconcile after an outage of %s",
+				l.ID, l.Host, was.State, l.Error, down)
+		}
+	}
 
 	return nil
 }
@@ -836,11 +961,13 @@ func (s *sim) operatorAction() error {
 	case n < 50:
 		hosts := s.someHosts()
 		res, err := s.svc.Hold(ctx, simActor, HoldRequest{Hosts: hosts, Reason: "sim"})
+		s.noteHolds(hosts)
 
 		return s.act(fmt.Sprintf("hold %v", hosts), res, err)
 	case n < 60:
 		hosts := s.someHosts()
 		res, err := s.svc.Unhold(ctx, simActor, HoldRequest{Hosts: hosts})
+		s.noteHolds(hosts)
 
 		return s.act(fmt.Sprintf("unhold %v", hosts), res, err)
 	case n < 80:
@@ -1073,6 +1200,8 @@ func (s *sim) operate() error {
 	for _, a := range s.world.agents {
 		if h := s.store.host(a.name); h != nil && h.HoldWanted {
 			res, err := s.svc.Unhold(ctx, simActor, HoldRequest{Hosts: []string{a.name}})
+			s.noteHolds([]string{a.name})
+
 			if actErr := s.act("unhold "+a.name, res, err); actErr != nil {
 				return actErr
 			}
@@ -1130,6 +1259,17 @@ func (s *sim) operate() error {
 	}
 
 	return nil
+}
+
+// noteHolds takes down what a hold or unhold did to the named hosts, as the
+// person sees it afterwards (an action may fail half way). A host the
+// controller does not know keeps what was noted before.
+func (s *sim) noteHolds(hosts []string) {
+	for _, name := range hosts {
+		if h := s.store.host(name); h != nil {
+			s.holds[name] = h.HoldWanted
+		}
+	}
 }
 
 // skippedMembers names the members of a rollout that a person skipped.
@@ -1375,11 +1515,16 @@ func TestSimulation(t *testing.T) {
 			"superseded rollouts": total.Superseded, "halts": total.Halts, "forced grants": total.ForcedGrants,
 			"budget-exempt grants": total.ExemptGrants, "bundled leases": total.Bundled,
 			"restart comparisons": total.Shadows, "write failures": total.WriteFailures,
-			"adopted leases":       total.Adopted,
-			"skipped hosts":        total.Skips,
-			"skips taken back":     total.SkipsLifted,
-			"skips carried over":   total.SkipsCarried,
-			"waits for the budget": total.Waits["budget"], "waits for the host limit": total.Waits["host"],
+			"adopted leases":                             total.Adopted,
+			"holds adopted from the agents":              total.HoldsAdopted,
+			"outages longer than leaseTtl":               total.Outages,
+			"open leases carried over an outage":         total.OutageLeases,
+			"runs without liveness":                      total.Unsupported,
+			"budgeted validator grants without liveness": total.ProbeGrants,
+			"skipped hosts":                              total.Skips,
+			"skips taken back":                           total.SkipsLifted,
+			"skips carried over":                         total.SkipsCarried,
+			"waits for the budget":                       total.Waits["budget"], "waits for the host limit": total.Waits["host"],
 			"waits for the gate": total.Waits["network"], "waits for the order": total.Waits["after"],
 		} {
 			if count == 0 {

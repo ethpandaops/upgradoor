@@ -225,11 +225,12 @@ What to expect in the Rollouts tab within about a minute:
   manual)`. Approve it on the rollout card to see a (simulated) reboot.
 
 The fake hosts have no validators on purpose. The fake beacon node does not
-serve the liveness endpoint, so a fleet with validator ranges would stay behind
-the network gate (`liveness data stale`), exactly as in production. Add
-`--validator-start 0 --validator-end 32` to a `host-cert` call to see that, and
-use a manual roll with **Ignore budget** to get past it. For validators that
-really attest, use the Kurtosis run (`make e2e`).
+serve the liveness endpoint, so a fleet with validator ranges runs on the
+fallback, exactly as in production: the network gate judges finality only,
+and readiness and the budget use the agents' probes instead of attestations
+(the gate strip says so). Add `--validator-start 0 --validator-end 32` to a
+`host-cert` call to see that. For validators that really attest, use the
+Kurtosis run (`make e2e`).
 
 The scenario file and the control endpoint are described in
 [docs/development.md](docs/development.md#fake-hosts).

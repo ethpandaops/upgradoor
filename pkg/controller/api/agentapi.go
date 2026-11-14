@@ -50,12 +50,19 @@ const (
 	// attempt after a failed write.
 	maxAuditBacklog = 256
 
+	// generationAuditInterval is the least time between two audit entries
+	// for rejected certificates of one host: an agent that keeps trying with
+	// an old key must not flood the audit log.
+	generationAuditInterval = time.Hour
+
 	// agentActorPrefix prefixes the host name in audit entries written on
 	// behalf of an agent.
 	agentActorPrefix = "agent:"
 
-	// detailCertHash is the audit detail key of a certificate hash.
-	detailCertHash = "certHash"
+	// Audit detail keys.
+	detailCertHash   = "certHash"
+	detailGeneration = "generation"
+	detailRemoteAddr = "remoteAddr"
 )
 
 // agentError is an error answer of the agent API.
@@ -111,7 +118,8 @@ type agentEndpoint struct {
 // serveAgent is the frame around both agent endpoints. In this order:
 // checks that need no body (headers, certificate, proof signature and time
 // window), a slot, the bounded read, authentication over the wire bytes,
-// bounded decompression, the call, and the answer with its metric.
+// bounded decompression, the generation floor, the call, and the answer with
+// its metric.
 //
 // Nothing is read and no slot is taken for a sender that cannot show a
 // certificate of this network and a fresh proof signed by its host key.
@@ -136,6 +144,13 @@ func (s *Server) serveAgent(w http.ResponseWriter, r *http.Request, ep *agentEnd
 
 	cert, body, err := s.authenticateAgent(w, r, pre, ep)
 	if err != nil {
+		s.agentFailure(w, r, ep.name, err)
+
+		return
+	}
+
+	// Before anything of the request is parsed or recorded.
+	if err = s.checkGeneration(r, cert); err != nil {
 		s.agentFailure(w, r, ep.name, err)
 
 		return
@@ -267,6 +282,77 @@ func (s *Server) authenticateAgent(
 	}
 
 	return cert, body, nil
+}
+
+// checkGeneration rejects a certificate of a generation lower than the
+// highest one this controller has accepted for the host. That is what makes
+// rotating a host key (issuing the next generation) revoke the old key: once
+// the rotated host has synced, the old certificate is refused although the
+// signer's signature on it is as valid as ever.
+//
+// It is a floor, not a pin: any certificate of the current or a higher
+// generation is accepted. The floor is the host row, so a controller that
+// lost its database knows it again only after the rotated host has synced.
+func (s *Server) checkGeneration(r *http.Request, cert *identity.Certificate) error {
+	host, err := s.opts.Store.GetHost(r.Context(), cert.Subject)
+
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil
+	case err != nil:
+		return fmt.Errorf("get host %s: %w", cert.Subject, err)
+	case cert.Generation >= host.Generation:
+		return nil
+	}
+
+	remote := s.remoteAddr(r)
+
+	s.log.WithFields(logrus.Fields{
+		labelHost:         cert.Subject,
+		"remote":          remote,
+		"generation":      cert.Generation,
+		"seen_generation": host.Generation,
+	}).Warn("Rejected agent request: certificate of an older generation")
+
+	if s.generationAuditDue(cert.Subject) {
+		s.auditIdentity(r.Context(), []fleet.AuditEntry{{
+			Time:   s.now().UTC(),
+			Actor:  agentActorPrefix + cert.Subject,
+			Action: "host.certificate-rejected",
+			Target: cert.Subject,
+			Detail: map[string]any{
+				detailCertHash:   cert.Hash,
+				detailGeneration: cert.Generation,
+				"seenGeneration": host.Generation,
+				detailRemoteAddr: remote,
+			},
+		}})
+	}
+
+	return agentErrorf(http.StatusUnauthorized,
+		"certificate generation %d is older than generation %d already seen for this host",
+		cert.Generation, host.Generation)
+}
+
+// generationAuditDue reports whether a rejected certificate of the host is to
+// be audited now: at most once per generationAuditInterval and host.
+func (s *Server) generationAuditDue(host string) bool {
+	s.generationMu.Lock()
+	defer s.generationMu.Unlock()
+
+	now := s.now()
+
+	if last, ok := s.generationAudited[host]; ok && now.Sub(last) < generationAuditInterval {
+		return false
+	}
+
+	if s.generationAudited == nil {
+		s.generationAudited = make(map[string]time.Time, 4)
+	}
+
+	s.generationAudited[host] = now
+
+	return true
 }
 
 // readAgentBody reads the wire bytes under the endpoint's size limit and
@@ -439,18 +525,26 @@ func (s *Server) identityAudit(
 	actor := agentActorPrefix + cert.Subject
 
 	if result.Created {
+		detail := map[string]any{
+			detailCertHash:   cert.Hash,
+			detailGeneration: cert.Generation,
+			"roles":          cert.Roles,
+			"validators":     cert.Validators.Count(),
+			detailRemoteAddr: remote,
+		}
+
+		// The agent reported a controller hold this controller did not know
+		// of; the host row was created with the hold wanted.
+		if result.HoldAdopted {
+			detail["holdAdopted"] = true
+		}
+
 		entries = append(entries, fleet.AuditEntry{
 			Time:   s.now().UTC(),
 			Actor:  actor,
 			Action: "host.registered",
 			Target: cert.Subject,
-			Detail: map[string]any{
-				detailCertHash: cert.Hash,
-				"generation":   cert.Generation,
-				"roles":        cert.Roles,
-				"validators":   cert.Validators.Count(),
-				"remoteAddr":   remote,
-			},
+			Detail: detail,
 		})
 	}
 
@@ -461,10 +555,10 @@ func (s *Server) identityAudit(
 			Action: "host.certificate-changed",
 			Target: cert.Subject,
 			Detail: map[string]any{
-				"before":     map[string]any{detailCertHash: result.PreviousCertHash},
-				"after":      map[string]any{detailCertHash: cert.Hash},
-				"generation": cert.Generation,
-				"remoteAddr": remote,
+				"before":         map[string]any{detailCertHash: result.PreviousCertHash},
+				"after":          map[string]any{detailCertHash: cert.Hash},
+				detailGeneration: cert.Generation,
+				detailRemoteAddr: remote,
 			},
 		})
 	}

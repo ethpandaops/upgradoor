@@ -2,12 +2,16 @@
 // in-browser MockController instead of a controller.
 //
 //   VITE_MOCK=1 npm run dev        every page load is mocked (open mode)
-//   <any build>/?mock              open mode: no login, everything visible
-//   <any build>/?mock=auth         an auth provider is configured; a fake
+//   VITE_MOCK=1 npm run build      a build that is always mocked
+//   ?mock                          open mode: no login, everything visible
+//   ?mock=auth                     an auth provider is configured; a fake
 //                                  authenticatoor client provides Login / Logout
-//   <any build>/?mock=unreachable  an auth provider is configured but its
+//   ?mock=unreachable              an auth provider is configured but its
 //                                  client script cannot be loaded
 //   &gate=fail                     start with a failing network gate
+//
+// The URL parameters work on the development server and in a VITE_MOCK build
+// only (see mode.ts). A normal build ignores them.
 
 import type { FetchFn } from '../api/client';
 import type { AuthTokenInfo, AuthenticatoorClient } from '../auth/authStore';

@@ -70,14 +70,18 @@ func (p *pass) advanceGranted(l *fleet.Lease, hv *hostView, op *protocol.Operati
 	case p.now.Before(deadline):
 	case !hv.h.LastSeen.Before(deadline):
 		p.expireLease(l, reasonNeverStarted)
-	case !p.now.Before(deadline.Add(p.set.LeaseTTL.Std())):
+	case !p.now.Before(later(deadline, p.w.Since).Add(p.set.LeaseTTL.Std())):
+		// Counted from the scheduler's start at the earliest: after a
+		// controller outage the agent gets leaseTtl to say what it did.
 		p.failLease(l, reasonAgentSilent)
 	}
 }
 
 func (p *pass) advanceRunning(l *fleet.Lease, hv *hostView, op *protocol.Operation) {
 	switch {
-	case p.now.Sub(hv.h.LastSeen) > p.set.LeaseTTL.Std():
+	case p.now.Sub(later(hv.h.LastSeen, p.w.Since)) > p.set.LeaseTTL.Std():
+		// Silence counts from the scheduler's start at the earliest: while the
+		// controller was down the agent could not report.
 		p.failLease(l, reasonAgentSilent)
 	case op != nil:
 		p.applyOperation(l, hv, op)
@@ -188,7 +192,7 @@ func (p *pass) stillReported(l *fleet.Lease, hv *hostView) string {
 // ready evaluates the readiness rule for a verifying lease and returns a
 // one-line progress note.
 func (p *pass) ready(l *fleet.Lease, hv *hostView) (ready bool, note string) {
-	if hv.weight > 0 && p.w.Health.LivenessKnown {
+	if hv.weight > 0 && p.w.Health.LivenessKnown && !p.w.Health.LivenessUnsupported {
 		return p.readyByLiveness(l, hv)
 	}
 

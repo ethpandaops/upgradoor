@@ -90,8 +90,9 @@ func (s *fakeStore) putHost(h *fleet.Host) {
 
 // recordSync stores a sync as store.RecordSync does: the host is created or
 // its certificate data, status and last-seen time replaced; the hold switch
-// stays.
-func (s *fakeStore) recordSync(h *fleet.Host) {
+// stays. A new host that reports a controller hold is created with the hold
+// wanted; adopted says so.
+func (s *fakeStore) recordSync(h *fleet.Host) (adopted bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -103,9 +104,17 @@ func (s *fakeStore) recordSync(h *fleet.Host) {
 		c.HoldReason = old.HoldReason
 	} else {
 		c.FirstSeen = h.LastSeen
+
+		if h.Status != nil && h.Status.Hold.Controller {
+			adopted = true
+			c.HoldWanted = true
+			c.HoldReason = store.HoldReasonAdopted
+		}
 	}
 
 	s.hosts[h.Name] = &c
+
+	return adopted
 }
 
 // setFailing injects write failures: every write while all is set, else the

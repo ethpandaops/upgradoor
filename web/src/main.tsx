@@ -18,7 +18,11 @@ async function start(): Promise<void> {
   let fetchFn: FetchFn | undefined;
   let mock: MockControls | undefined;
 
-  const mode = mockModeFromLocation(window.location.search, import.meta.env.VITE_MOCK as string | undefined);
+  const mode = mockModeFromLocation(
+    window.location.search,
+    import.meta.env.VITE_MOCK as string | undefined,
+    import.meta.env.DEV
+  );
   if (mode) {
     const handle = (await import('./mock/install')).installMock(mode, window.location.search);
     fetchFn = handle.fetch;

@@ -140,6 +140,9 @@ type simWorld struct {
 
 	// calm switches the random failures off (convergence).
 	calm bool
+	// livenessUnsupported: the beacon node does not serve the liveness
+	// endpoint, for the whole run. Nothing is ever published.
+	livenessUnsupported bool
 
 	beaconDownUntil      time.Time
 	finalityStallUntil   time.Time
@@ -358,6 +361,10 @@ func (w *simWorld) sample() {
 // service cannot get them.
 func (w *simWorld) publish(epoch uint64, st *fakeStore) {
 	end := w.epochStart(epoch + 1)
+	if w.livenessUnsupported {
+		return
+	}
+
 	if end.Before(w.beaconDownUntil) || end.Before(w.livenessStallUntil) || end.Before(w.livenessUnknownUntil) {
 		return
 	}
@@ -424,6 +431,8 @@ func (w *simWorld) health() fleet.NetworkHealth {
 		FinalityLagEpochs: lag,
 		LivenessKnown:     w.havePublished && !w.now.Before(w.livenessUnknownUntil),
 		LivenessEpoch:     w.publishedEpoch,
+
+		LivenessUnsupported: w.livenessUnsupported,
 	}
 
 	if w.now.Before(w.beaconDownUntil) {

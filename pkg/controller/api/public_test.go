@@ -233,7 +233,7 @@ func TestPublicEndpointsLeakNothing(t *testing.T) {
 		"ok", "reasons", "network",
 		"updatedAt", "error", "genesisTime", "secondsPerSlot", "slotsPerEpoch", "headSlot",
 		"currentEpoch", "finalizedEpoch", "finalityLagEpochs", "livenessKnown",
-		"livenessEpoch", "tracked", "live",
+		"livenessEpoch", "livenessUnsupported", "tracked", "live",
 	}
 
 	tests := []struct {

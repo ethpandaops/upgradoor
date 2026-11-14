@@ -88,7 +88,7 @@ func (s *service) manual(ctx context.Context, actor string, req *manualRequest) 
 	changes := &store.Changes{Rollouts: []*fleet.Rollout{r}}
 
 	for _, h := range hosts {
-		containers, reason := manualTargets(h, req, now, &settings)
+		containers, reason := manualTargets(h, req, now, s.since, &settings)
 		if reason != "" {
 			res.Rejected[h.Name] = reason
 
@@ -153,14 +153,14 @@ func (s *service) manual(ctx context.Context, actor string, req *manualRequest) 
 // containers of a roll, or one empty entry for a reboot. A non-empty reason
 // rejects the host.
 func manualTargets(
-	h *fleet.Host, req *manualRequest, now time.Time, settings *fleet.Settings,
+	h *fleet.Host, req *manualRequest, now, since time.Time, settings *fleet.Settings,
 ) (targets []string, reason string) {
 	switch {
 	case h.Status == nil:
 		return nil, "no sync yet"
 	case h.Held():
 		return nil, reasonHeld
-	case h.Stale(now, settings.HostStaleAfter.Std()):
+	case hostStale(h, now, since, settings.HostStaleAfter.Std()):
 		return nil, reasonAgentSilent
 	case !slices.Contains(h.Status.Verbs, req.verb):
 		return nil, fmt.Sprintf("verb %s not allowed by the agent", req.verb)

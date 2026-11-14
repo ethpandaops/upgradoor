@@ -73,7 +73,9 @@ type budgetState struct {
 	percent     float64
 }
 
-// budget computes the budget from the hosts' leases and liveness.
+// budget computes the budget from the hosts' leases and liveness (or, when
+// the beacon node does not serve liveness, from the agents' probes: see
+// probeLive).
 func (p *pass) budget() *budgetState {
 	b := &budgetState{percent: p.set.MaxUnavailablePercent}
 
@@ -160,6 +162,10 @@ func (p *pass) gate() Gate {
 
 	switch {
 	case tracked == 0:
+	case n.LivenessUnsupported:
+		// The beacon node does not serve liveness: there is no participation
+		// to judge. Finality and the freshness of the view still gate, and
+		// the budget counts unavailability from the agents' probes.
 	case !n.LivenessKnown || !p.haveRows || n.CurrentEpoch > p.newestEpoch+2:
 		g.Reasons = append(g.Reasons, gateLiveness)
 	case total > 0:

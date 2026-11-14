@@ -24,7 +24,9 @@ type Store interface {
 	Stop() error
 
 	// RecordSync upserts the host from a verified certificate and its sync
-	// request, sets last_seen and replaces the host's rows in needs.
+	// request, sets last_seen and replaces the host's rows in needs. The
+	// stored generation never goes down. A host that is new and reports a
+	// controller hold is created with the hold wanted.
 	RecordSync(ctx context.Context, sync *HostSync) (*SyncResult, error)
 	// GetHost returns one host or ErrNotFound.
 	GetHost(ctx context.Context, name string) (*fleet.Host, error)
@@ -94,7 +96,16 @@ type SyncResult struct {
 	Created bool
 	// PreviousCertHash is set when the certificate hash changed.
 	PreviousCertHash string
+	// HoldAdopted is true when the host was created on hold because its
+	// agent reported a controller hold (see HoldReasonAdopted).
+	HoldAdopted bool
 }
+
+// HoldReasonAdopted is the hold reason of a host that reported a controller
+// hold in the sync that created its row: a controller that does not know the
+// host (a lost database, a forgotten host) keeps the hold instead of lifting
+// it.
+const HoldReasonAdopted = "held on the agent before this controller knew the host"
 
 // PackageMatch is one package name with the versions installed across the
 // fleet.

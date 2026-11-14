@@ -32,6 +32,19 @@ func validatorAgent(t *testing.T) *testAgent {
 	})
 }
 
+// validatorAgentGeneration is validatorAgent with the host key and
+// certificate of the given generation.
+func validatorAgentGeneration(t *testing.T, generation uint64) *testAgent {
+	t.Helper()
+
+	return newAgent(t, identity.CertificateSpec{
+		Hostname:   "lighthouse-geth-1",
+		Generation: generation,
+		Validators: &identity.ValidatorRange{Start: 0, End: 100},
+		Roles:      []string{"ethereum_node"},
+	})
+}
+
 // requireAgentError checks a protocol.ErrorResponse answer.
 func requireAgentError(t *testing.T, rec *httptest.ResponseRecorder, status int, contains string) {
 	t.Helper()
@@ -880,6 +893,225 @@ func TestSyncAuditsIdentity(t *testing.T) {
 	assert.Equal(t, map[string]any{"certHash": secondHash}, changed.Detail["after"])
 	assert.NotEqual(t, firstHash, secondHash)
 	assert.Equal(t, secondHash, h.store.host("lighthouse-geth-1").CertHash)
+}
+
+// Rotating a host key means issuing the next generation. Once the controller
+// has accepted it, the certificates of older generations are refused, on both
+// endpoints, although the signer signed them.
+func TestOlderCertificateGenerationIsRejected(t *testing.T) {
+	const wantErr = "certificate generation 0 is older than generation 1 already seen for this host"
+
+	h := newHarness(t, nil)
+	leaked := validatorAgentGeneration(t, 0)
+	rotated := validatorAgentGeneration(t, 1)
+
+	inv := inventoryFor(t, protocol.Package{Name: "openssl", Version: "3.5.1-1", Arch: "amd64"})
+
+	// Before the rotation the generation 0 key is the host's key.
+	require.Equal(t, http.StatusOK,
+		h.agentPost(leaked, protocol.PathSync, syncRequest(), agentCallOpts{}).Code)
+	require.Equal(t, http.StatusOK,
+		h.agentPost(leaked, protocol.PathInventory, inv, agentCallOpts{}).Code)
+
+	// The rotated host syncs: accepted and audited as a changed certificate.
+	require.Equal(t, http.StatusOK,
+		h.agentPost(rotated, protocol.PathSync, syncRequest(), agentCallOpts{}).Code)
+	require.Equal(t, uint64(1), h.store.host("lighthouse-geth-1").Generation)
+
+	before := *h.store.host("lighthouse-geth-1")
+	auditBefore := len(h.store.auditEntries())
+
+	// Whoever holds the old key is refused, and nothing of the request is
+	// recorded.
+	stolen := syncRequest()
+	stolen.AgentVersion = "evil"
+	stolen.Hold.Controller = true
+
+	h.clock.Advance(time.Minute)
+
+	rec := h.agentPost(leaked, protocol.PathSync, stolen, agentCallOpts{})
+	require.Equal(t, http.StatusUnauthorized, rec.Code, rec.Body.String())
+	assert.Equal(t, wantErr, decodeJSON[protocol.ErrorResponse](t, rec).Error)
+	assert.Equal(t, before, *h.store.host("lighthouse-geth-1"), "the host row is untouched")
+
+	evil := inventoryFor(t, protocol.Package{Name: "evil", Version: "6.6.6", Arch: "amd64"})
+
+	rec = h.agentPost(leaked, protocol.PathInventory, evil, agentCallOpts{Gzip: true})
+	require.Equal(t, http.StatusUnauthorized, rec.Code, rec.Body.String())
+	assert.Equal(t, wantErr, decodeJSON[protocol.ErrorResponse](t, rec).Error)
+
+	stored, err := h.store.GetInventory(t.Context(), "lighthouse-geth-1")
+	require.NoError(t, err)
+	assert.Equal(t, inv.Hash, stored.Hash, "the inventory is untouched")
+
+	// One audit entry for both rejections.
+	audit := h.store.auditEntries()
+	require.Len(t, audit, auditBefore+1)
+
+	rejected := audit[len(audit)-1]
+	assert.Equal(t, "host.certificate-rejected", rejected.Action)
+	assert.Equal(t, "agent:lighthouse-geth-1", rejected.Actor)
+	assert.Equal(t, "lighthouse-geth-1", rejected.Target)
+	assert.Equal(t, uint64(0), rejected.Detail["generation"])
+	assert.Equal(t, uint64(1), rejected.Detail["seenGeneration"])
+	assert.Equal(t, identity.CertificateHash(leaked.creds.Certificate()), rejected.Detail["certHash"])
+
+	// Counted like every other answer.
+	body := h.get("/metrics").Body.String()
+	assert.Contains(t, body, `upgradoor_agent_requests_total{code="401",endpoint="sync"} 1`+"\n")
+	assert.Contains(t, body, `upgradoor_agent_requests_total{code="401",endpoint="inventory"} 1`+"\n")
+
+	// The rotated host is not affected.
+	require.Equal(t, http.StatusOK,
+		h.agentPost(rotated, protocol.PathSync, syncRequest(), agentCallOpts{}).Code)
+	require.Equal(t, http.StatusOK,
+		h.agentPost(rotated, protocol.PathInventory, inv, agentCallOpts{}).Code)
+}
+
+// The floor is not a pin: any certificate of the current or a higher
+// generation that the signer issued is accepted.
+func TestGenerationFloorIsNotAPin(t *testing.T) {
+	h := newHarness(t, nil)
+
+	require.Equal(t, http.StatusOK,
+		h.agentPost(validatorAgentGeneration(t, 1), protocol.PathSync, syncRequest(),
+			agentCallOpts{}).Code)
+
+	first := h.store.host("lighthouse-geth-1").CertHash
+
+	// The same generation, another certificate (the host was reinstalled with
+	// another validator range): accepted, audited as changed.
+	reissued := newAgent(t, identity.CertificateSpec{
+		Hostname:   "lighthouse-geth-1",
+		Generation: 1,
+		Validators: &identity.ValidatorRange{Start: 100, End: 250},
+		Roles:      []string{"ethereum_node"},
+	})
+
+	require.Equal(t, http.StatusOK,
+		h.agentPost(reissued, protocol.PathSync, syncRequest(), agentCallOpts{}).Code)
+
+	host := h.store.host("lighthouse-geth-1")
+	assert.NotEqual(t, first, host.CertHash)
+	assert.Equal(t, uint64(1), host.Generation)
+	assert.Equal(t, uint64(150), host.Weight())
+
+	// A jump over a generation is accepted too, and raises the floor.
+	require.Equal(t, http.StatusOK,
+		h.agentPost(validatorAgentGeneration(t, 4), protocol.PathSync, syncRequest(),
+			agentCallOpts{}).Code)
+	assert.Equal(t, uint64(4), h.store.host("lighthouse-geth-1").Generation)
+
+	rec := h.agentPost(reissued, protocol.PathSync, syncRequest(), agentCallOpts{})
+	requireAgentError(t, rec, http.StatusUnauthorized,
+		"certificate generation 1 is older than generation 4 already seen for this host")
+
+	// Another host is not concerned by this host's generation.
+	other := newAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1"})
+
+	require.Equal(t, http.StatusOK,
+		h.agentPost(other, protocol.PathSync, syncRequest(), agentCallOpts{}).Code)
+
+	actions := make([]string, 0, 5)
+	for _, e := range h.store.auditEntries() {
+		actions = append(actions, e.Action)
+	}
+
+	assert.Equal(t, []string{
+		"host.registered", "host.certificate-changed", "host.certificate-changed",
+		"host.certificate-rejected", "host.registered",
+	}, actions)
+}
+
+// An agent that keeps trying with an old key must not flood the audit log:
+// one entry per host and hour.
+func TestRejectedGenerationAuditIsRateLimited(t *testing.T) {
+	h := newHarness(t, nil)
+	old := validatorAgentGeneration(t, 0)
+	otherOld := newAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1"})
+
+	require.Equal(t, http.StatusOK,
+		h.agentPost(validatorAgentGeneration(t, 2), protocol.PathSync, syncRequest(),
+			agentCallOpts{}).Code)
+	require.Equal(t, http.StatusOK,
+		h.agentPost(newAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1", Generation: 1}),
+			protocol.PathSync, syncRequest(), agentCallOpts{}).Code)
+
+	rejections := func() map[string]int {
+		out := make(map[string]int, 2)
+
+		for _, e := range h.store.auditEntries() {
+			if e.Action == "host.certificate-rejected" {
+				out[e.Target]++
+			}
+		}
+
+		return out
+	}
+
+	attempt := func(agent *testAgent) {
+		t.Helper()
+
+		h.clock.Advance(time.Second)
+		require.Equal(t, http.StatusUnauthorized,
+			h.agentPost(agent, protocol.PathSync, syncRequest(), agentCallOpts{}).Code)
+	}
+
+	for range 20 {
+		attempt(old)
+	}
+
+	assert.Equal(t, map[string]int{"lighthouse-geth-1": 1}, rejections())
+
+	// The limit is per host.
+	attempt(otherOld)
+	attempt(otherOld)
+	assert.Equal(t, map[string]int{"lighthouse-geth-1": 1, "prysm-besu-1": 1}, rejections())
+
+	// Just short of an hour after the first entry: still quiet.
+	h.clock.Advance(generationAuditInterval - 30*time.Second)
+	attempt(old)
+	assert.Equal(t, 1, rejections()["lighthouse-geth-1"])
+
+	h.clock.Advance(time.Minute)
+	attempt(old)
+	attempt(old)
+	assert.Equal(t, 2, rejections()["lighthouse-geth-1"])
+}
+
+// A host that the controller sees for the first time and that reports a
+// controller hold (the database was lost) keeps the hold, and the audit trail
+// says so.
+func TestSyncAdoptsControllerHoldOfANewHost(t *testing.T) {
+	h := newHarness(t, nil)
+	agent := validatorAgent(t)
+
+	req := syncRequest()
+	req.Hold.Controller = true
+
+	require.Equal(t, http.StatusOK, h.agentPost(agent, protocol.PathSync, req, agentCallOpts{}).Code)
+
+	host := h.store.host("lighthouse-geth-1")
+	assert.True(t, host.HoldWanted)
+	assert.Equal(t, "held on the agent before this controller knew the host", host.HoldReason)
+
+	audit := h.store.auditEntries()
+	require.Len(t, audit, 1)
+	assert.Equal(t, "host.registered", audit[0].Action)
+	assert.Equal(t, true, audit[0].Detail["holdAdopted"])
+
+	// A host without a controller hold: no such detail.
+	other := newAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1"})
+	local := syncRequest()
+	local.Hold.Local = true
+
+	require.Equal(t, http.StatusOK, h.agentPost(other, protocol.PathSync, local, agentCallOpts{}).Code)
+
+	audit = h.store.auditEntries()
+	require.Len(t, audit, 2)
+	assert.Equal(t, "host.registered", audit[1].Action)
+	assert.NotContains(t, audit[1].Detail, "holdAdopted")
+	assert.False(t, h.store.host("prysm-besu-1").HoldWanted)
 }
 
 // A failed audit write does not fail the sync, and the entries are not lost:

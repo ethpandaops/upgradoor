@@ -128,6 +128,127 @@ func TestRecordSync(t *testing.T) {
 	}
 }
 
+// The generation is the floor below which the API rejects certificates. A
+// sync with an older certificate that reached the store anyway does not lower
+// it.
+func TestRecordSyncNeverLowersGeneration(t *testing.T) {
+	ctx := context.Background()
+
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			s := backend.open(t)
+
+			cert := func(generation uint64) *identity.Certificate {
+				c := testCert("node-1", nil)
+				c.Generation = generation
+				c.Hash = fmt.Sprintf("hash-gen-%d", generation)
+
+				return c
+			}
+
+			for _, step := range []struct {
+				generation, want uint64
+			}{
+				{generation: 0, want: 0},
+				{generation: 2, want: 2},
+				{generation: 1, want: 2},
+				{generation: 0, want: 2},
+				{generation: 2, want: 2},
+				{generation: 5, want: 5},
+			} {
+				res, err := s.RecordSync(ctx, &HostSync{
+					Cert: cert(step.generation), Request: testRequest(), At: at(0),
+				})
+				require.NoError(t, err)
+				assert.Equal(t, step.want, res.Host.Generation, "after generation %d", step.generation)
+
+				got, err := s.GetHost(ctx, "node-1")
+				require.NoError(t, err)
+				assert.Equal(t, step.want, got.Generation)
+			}
+
+			// Without a request (identity only) the same holds.
+			res, err := s.RecordSync(ctx, &HostSync{Cert: cert(3), At: at(10)})
+			require.NoError(t, err)
+			assert.Equal(t, uint64(5), res.Host.Generation)
+		})
+	}
+}
+
+// A host that reports a controller hold when the controller sees it for the
+// first time keeps the hold: the row is created with the hold wanted.
+func TestRecordSyncAdoptsControllerHold(t *testing.T) {
+	ctx := context.Background()
+
+	held := func(controller, local bool) *protocol.SyncRequest {
+		req := testRequest()
+		req.Hold = protocol.Hold{Controller: controller, Local: local}
+
+		return req
+	}
+
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			s := backend.open(t)
+
+			res, err := s.RecordSync(ctx, &HostSync{
+				Cert: testCert("held", nil), Request: held(true, false), At: at(0),
+			})
+			require.NoError(t, err)
+			assert.True(t, res.Created)
+			assert.True(t, res.HoldAdopted)
+			assert.True(t, res.Host.HoldWanted)
+			assert.Equal(t, HoldReasonAdopted, res.Host.HoldReason)
+			assert.Equal(t, "held on the agent before this controller knew the host", res.Host.HoldReason)
+
+			got, err := s.GetHost(ctx, "held")
+			require.NoError(t, err)
+			assert.True(t, got.HoldWanted)
+			assert.Equal(t, HoldReasonAdopted, got.HoldReason)
+
+			// Only the first sight adopts: a person lifts the hold, the agent
+			// still reports it until it has the release, and the switch stays
+			// off.
+			require.NoError(t, s.SetHostHold(ctx, "held", false, ""))
+
+			res, err = s.RecordSync(ctx, &HostSync{
+				Cert: testCert("held", nil), Request: held(true, false), At: at(10),
+			})
+			require.NoError(t, err)
+			assert.False(t, res.Created)
+			assert.False(t, res.HoldAdopted)
+			assert.False(t, res.Host.HoldWanted)
+			assert.Empty(t, res.Host.HoldReason)
+
+			// A local hold file is not the controller's hold.
+			res, err = s.RecordSync(ctx, &HostSync{
+				Cert: testCert("local", nil), Request: held(false, true), At: at(0),
+			})
+			require.NoError(t, err)
+			assert.True(t, res.Created)
+			assert.False(t, res.HoldAdopted)
+			assert.False(t, res.Host.HoldWanted)
+			assert.Empty(t, res.Host.HoldReason)
+
+			// No request, no report of a hold.
+			res, err = s.RecordSync(ctx, &HostSync{Cert: testCert("bare", nil), At: at(0)})
+			require.NoError(t, err)
+			assert.False(t, res.HoldAdopted)
+			assert.False(t, res.Host.HoldWanted)
+
+			// A forgotten host that comes back held is adopted again.
+			require.NoError(t, s.DeleteHost(ctx, "held"))
+
+			res, err = s.RecordSync(ctx, &HostSync{
+				Cert: testCert("held", nil), Request: held(true, true), At: at(20),
+			})
+			require.NoError(t, err)
+			assert.True(t, res.HoldAdopted)
+			assert.True(t, res.Host.HoldWanted)
+		})
+	}
+}
+
 func TestRecordSyncWithoutValidators(t *testing.T) {
 	ctx := context.Background()
 	s := newFileStore(t)

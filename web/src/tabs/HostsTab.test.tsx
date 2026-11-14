@@ -95,6 +95,27 @@ describe('HostsTab, logged out (public data only)', () => {
   });
 });
 
+describe('HostsTab, beacon node without the liveness endpoint', () => {
+  it('says what the gate and the budget use instead', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: false });
+    h.controller.setLivenessUnsupported(true);
+    renderWithApp(<HostsTab />, h);
+
+    const gate = await screen.findByLabelText('Network gate');
+    expect(within(gate).getByText('ok')).toBeInTheDocument();
+    expect(gate).toHaveTextContent('participationnot served');
+    expect(gate).toHaveTextContent('liveness not served by the beacon node: readiness and budget use agent probes');
+  });
+
+  it('shows no such note when liveness is served', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: false });
+    renderWithApp(<HostsTab />, h);
+
+    const gate = await screen.findByLabelText('Network gate');
+    expect(gate).not.toHaveTextContent('liveness not served');
+  });
+});
+
 describe('HostsTab, logged in', () => {
   it('adds the authenticated columns to the same table', async () => {
     const h = await createHarness({ mode: 'auth', loggedIn: true });

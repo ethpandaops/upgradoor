@@ -19,6 +19,15 @@ const hostColumns = `name, cert_hash, generation, validators_start, validators_e
 // RecordSync upserts the host named by the certificate subject. first_seen
 // is kept for a known host. With a nil Request only the identity, last_seen
 // and remote address are updated; the stored status and needs stay.
+//
+// The generation only ever goes up: it is the floor below which the API
+// rejects certificates, and a sync that slipped past that check must not
+// lower it.
+//
+// A host seen for the first time that reports a controller hold is created
+// with hold_wanted set. The hold was put there by a controller whose database
+// is gone (or that was told to forget the host); without this the scheduler
+// would find the hold unwanted and lift it.
 func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult, error) {
 	if in == nil || in.Cert == nil {
 		return nil, errors.New("store: record sync: certificate is required")
@@ -56,19 +65,26 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 		switch {
 		case errors.Is(txErr, sql.ErrNoRows):
 			result.Created = true
+			result.HoldAdopted = in.Request != nil && in.Request.Hold.Controller
 		case txErr != nil:
 			return txErr
 		case previous != cert.Hash:
 			result.PreviousCertHash = previous
 		}
 
+		holdReason := ""
+		if result.HoldAdopted {
+			holdReason = HoldReasonAdopted
+		}
+
+		// hold_wanted and hold_reason are only written for a new row.
 		_, txErr = tx.ExecContext(ctx, `
 			INSERT INTO hosts (name, cert_hash, generation, validators_start, validators_end,
-				roles, first_seen, last_seen, remote_addr, status)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+				roles, first_seen, last_seen, remote_addr, status, hold_wanted, hold_reason)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(name) DO UPDATE SET
 				cert_hash = excluded.cert_hash,
-				generation = excluded.generation,
+				generation = max(hosts.generation, excluded.generation),
 				validators_start = excluded.validators_start,
 				validators_end = excluded.validators_end,
 				roles = excluded.roles,
@@ -76,7 +92,8 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 				remote_addr = excluded.remote_addr,
 				status = COALESCE(excluded.status, hosts.status)`,
 			cert.Subject, cert.Hash, int64(cert.Generation), valStart, valEnd,
-			rolesJSON, millis(at), millis(at), in.RemoteAddr, status)
+			rolesJSON, millis(at), millis(at), in.RemoteAddr, status,
+			result.HoldAdopted, holdReason)
 		if txErr != nil {
 			return txErr
 		}

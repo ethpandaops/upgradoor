@@ -17,7 +17,9 @@ type simHostFact struct {
 	weight   uint64
 	bootnode bool
 	// live is how many validators attested in the newest liveness epoch the
-	// beacon service stored (the full weight without a row).
+	// beacon service stored (the full weight without a row). When the beacon
+	// node does not serve liveness it is the probe rule instead: none when
+	// the host is stale or its last sync's probes are not synced, else all.
 	live uint64
 	// holdWanted is the operator's hold switch.
 	holdWanted bool
@@ -47,7 +49,11 @@ func (h *simHostFact) held() bool {
 
 // simFacts is the state of the simulated world at one observation.
 type simFacts struct {
-	now      time.Time
+	now time.Time
+	// since is when the controller last started. It cannot have heard from
+	// an agent before that, so silence is counted from the later of the last
+	// sync and since.
+	since    time.Time
 	settings fleet.Settings
 	health   fleet.NetworkHealth
 	hosts    map[string]*simHostFact
@@ -62,9 +68,19 @@ type simFacts struct {
 	// skipped holds, per rollout key, the hosts a person skipped for it and
 	// has not retried, and that have reported the need ever since.
 	skipped map[string]map[string]bool
+	// holds is the person's record of the hosts on controller hold: set by
+	// hold, cleared by unhold, and kept when the controller loses its
+	// database or forgets the host.
+	holds map[string]bool
 	// fresh is true when a reconcile has just been committed against
 	// exactly these facts.
 	fresh bool
+}
+
+// stale: no sync for hostStaleAfter, counted from the controller's start at
+// the earliest.
+func (f *simFacts) stale(h *simHostFact) bool {
+	return f.now.Sub(later(h.lastSync, f.since)) > f.settings.HostStaleAfter.Std()
 }
 
 // simSnapshot is the committed scheduler state at one observation, in
@@ -93,6 +109,8 @@ type oracle struct {
 	leases   map[string]fleet.LeaseState
 	// halted maps a rollout to the lease whose failure halted it.
 	halted map[string]string
+	// directives are the directives seen so far.
+	directives map[string]bool
 }
 
 func newOracle() *oracle {
@@ -100,6 +118,8 @@ func newOracle() *oracle {
 		rollouts: make(map[string]fleet.RolloutState, 16),
 		leases:   make(map[string]fleet.LeaseState, 64),
 		halted:   make(map[string]string, 4),
+
+		directives: make(map[string]bool, 64),
 	}
 }
 
@@ -141,6 +161,10 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 	}
 
 	if err := o.checkHalts(snap); err != nil {
+		return err
+	}
+
+	if err := o.checkHolds(f, snap); err != nil {
 		return err
 	}
 
@@ -242,6 +266,21 @@ func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) e
 
 	switch l.State {
 	case fleet.LeaseFailed:
+		// A controller outage is not the agent's silence: the agent has
+		// leaseTtl from the controller's start to be heard.
+		if l.Error == reasonAgentSilent {
+			heard := f.since
+			if host != nil {
+				heard = later(host.lastSync, f.since)
+			}
+
+			if silent := f.now.Sub(heard); silent < f.settings.LeaseTTL.Std() {
+				return fmt.Errorf("lease %s of %s failed as %q after %s of silence since the later of its last "+
+					"sync and the controller's start, leaseTtl is %s", l.ID, l.Host, l.Error, silent,
+					f.settings.LeaseTTL.Std())
+			}
+		}
+
 		o.haltedBy(snap, l)
 	case fleet.LeaseExpired:
 		if host != nil && host.disrupted[l.ID] {
@@ -302,6 +341,26 @@ func (o *oracle) checkHalts(snap *simSnapshot) error {
 	return nil
 }
 
+// checkHolds: the scheduler lifts a controller hold only when a person asked
+// for it. A controller that does not know a host (lost database, forgotten
+// host) keeps the hold the agent reports.
+func (o *oracle) checkHolds(f *simFacts, snap *simSnapshot) error {
+	for _, d := range snap.directives {
+		if o.directives[d.ID] {
+			continue
+		}
+
+		o.directives[d.ID] = true
+
+		if d.Kind == protocol.DirectiveReleaseHold && f.holds[d.Host] {
+			return fmt.Errorf("directive %s lifts the controller hold of %s, which a person set and nobody lifted",
+				d.ID, d.Host)
+		}
+	}
+
+	return nil
+}
+
 // checkRelease: a lease is released only after the agent finished an
 // operation that the world has seen recover.
 func checkRelease(f *simFacts, l *fleet.Lease, host *simHostFact) error {
@@ -334,7 +393,7 @@ func checkRelease(f *simFacts, l *fleet.Lease, host *simHostFact) error {
 	soak := f.settings.SoakEpochs
 	epoch := f.health.EpochDuration()
 
-	if host.weight == 0 || !f.health.LivenessKnown {
+	if host.weight == 0 || !f.health.LivenessKnown || f.health.LivenessUnsupported {
 		if host.status == nil || !host.lastSync.After(doneAt) || !host.status.Node.Synced() {
 			return fmt.Errorf("lease %s of %s released although its probes do not report synced after the operation "+
 				"(done at %s, last sync %s, synced %v)", l.ID, l.Host, doneAt.Format(time.TimeOnly),
@@ -396,6 +455,8 @@ func oracleGate(f *simFacts, leased map[string]bool) []string {
 
 	switch {
 	case tracked == 0:
+	case n.LivenessUnsupported:
+		// No liveness to be had: finality and freshness alone gate.
 	case !n.LivenessKnown || !f.havePublished || n.CurrentEpoch > f.publishedEpoch+2:
 		reasons = append(reasons, "liveness data stale")
 	case total > 0 && float64(live)*100/float64(total) < f.settings.MinParticipationPercent:
@@ -456,8 +517,9 @@ func (o *oracle) checkGrant(
 		return errors.New("the host already holds a lease")
 	case host.held():
 		return errors.New("the host is held")
-	case f.now.Sub(host.lastSync) > f.settings.HostStaleAfter.Std():
-		return fmt.Errorf("the host is stale: last sync %s ago", f.now.Sub(host.lastSync))
+	case f.stale(host):
+		return fmt.Errorf("the host is stale: last sync %s ago, controller started %s ago",
+			f.now.Sub(host.lastSync), f.now.Sub(f.since))
 	case f.settings.Paused:
 		return errors.New("the global pause is in effect")
 	case len(l.Needs) == 0:
@@ -595,8 +657,8 @@ func checkOrdering(f *simFacts, snap *simSnapshot, r *fleet.Rollout, name string
 
 // oracleBlocks reports whether an expected member holds back later stages.
 func oracleBlocks(f *simFacts, snap *simSnapshot, r *fleet.Rollout, m *fleet.RolloutHost, host *simHostFact) bool {
-	stale := f.settings.HostStaleAfter.Std()
-	if host.held() || host.status == nil || f.now.Sub(host.lastSync) > stale || f.now.Sub(r.CreatedAt) > stale {
+	if host.held() || host.status == nil || f.stale(host) ||
+		f.now.Sub(later(r.CreatedAt, f.since)) > f.settings.HostStaleAfter.Std() {
 		return false
 	}
 

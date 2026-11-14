@@ -101,6 +101,11 @@ type NetworkHealth struct {
 	// serve the liveness endpoint.
 	LivenessKnown bool   `json:"livenessKnown"`
 	LivenessEpoch uint64 `json:"livenessEpoch"`
+	// LivenessUnsupported is true while the beacon node is known not to serve
+	// the liveness endpoint (as opposed to liveness that is merely not there
+	// yet or failed to refresh). The scheduler then judges availability and
+	// readiness from the agents' probes and the gate from finality alone.
+	LivenessUnsupported bool `json:"livenessUnsupported"`
 	// Tracked and Live count the validators of all hosts in LivenessEpoch.
 	Tracked uint64 `json:"tracked"`
 	Live    uint64 `json:"live"`

@@ -268,6 +268,48 @@ func TestOracleAcceptsAReopenedLease(t *testing.T) {
 	p.ok()
 }
 
+// withoutLiveness makes the pinned beacon node one that does not serve the
+// liveness endpoint: nothing was ever published.
+func (p *pinned) withoutLiveness() {
+	p.f.health.LivenessKnown = false
+	p.f.health.LivenessUnsupported = true
+	p.f.rows = map[uint64]map[string]uint64{}
+	p.f.havePublished = false
+}
+
+func TestOracleAcceptsAHistoryWithoutLiveness(t *testing.T) {
+	// No liveness to be had: the gate does not ask for it, and validator
+	// hosts are released on their probes.
+	p := newPinned(t)
+	p.withoutLiveness()
+
+	p.serve("n1")
+	p.serve("v1")
+	p.grant("v2")
+	p.grant("v3")
+	p.ok()
+	p.release("v2")
+	p.release("v3")
+	p.ok()
+}
+
+func TestOracleAcceptsASilentLeaseLongAfterTheStart(t *testing.T) {
+	p := newPinned(t)
+	p.grant("n1")
+	p.ok()
+
+	// The controller started an hour ago and has not heard from the agent
+	// since: longer than leaseTtl.
+	p.f.since = p.f.now.Add(-time.Hour)
+	p.f.hosts["n1"].lastSync = p.f.now.Add(-2 * time.Hour)
+	p.fail("n1", true)
+	p.lease0().Error = reasonAgentSilent
+	p.ok()
+}
+
+// lease0 is the first lease of the history, whatever its state.
+func (p *pinned) lease0() *fleet.Lease { return p.snap.leases[0] }
+
 func TestOracleRejectsBadHistories(t *testing.T) {
 	// canaryDone is a history up to the point where the batches may start.
 	canaryDone := func(p *pinned) {
@@ -530,6 +572,52 @@ func TestOracleRejectsBadHistories(t *testing.T) {
 				p.f.hosts["n1"].status.Needs = []protocol.Need{need}
 			},
 			want: "released although the agent still reports need " + imageNeed("c", imgGeth, digestA).ID,
+		},
+		{
+			name: "lease failed as silent although the controller has just started",
+			bad: func(p *pinned) {
+				p.grant("n1")
+				p.ok()
+
+				// The agent's last sync is old, but the controller was down
+				// until ten minutes ago: less than leaseTtl to be heard.
+				p.f.since = p.f.now.Add(-10 * time.Minute)
+				p.f.hosts["n1"].lastSync = p.f.now.Add(-2 * time.Hour)
+				p.fail("n1", true)
+				p.lease0().Error = reasonAgentSilent
+			},
+			want: `failed as "agent silent" after 10m0s of silence`,
+		},
+		{
+			name: "grant while liveness is merely unknown",
+			bad: func(p *pinned) {
+				p.f.health.LivenessKnown = false
+				p.grant("n1")
+			},
+			want: "liveness data stale",
+		},
+		{
+			name: "release of a validator host on bad probes when liveness is not served",
+			bad: func(p *pinned) {
+				p.withoutLiveness()
+				p.serve("n1")
+				p.grant("v1")
+				p.ok()
+				p.f.hosts["v1"].status.Node = protocol.NodeHealth{CL: &protocol.CLHealth{Reachable: true, Syncing: true}}
+				p.release("v1")
+			},
+			want: "released although its probes do not report synced",
+		},
+		{
+			name: "controller hold lifted although a person holds the host",
+			bad: func(p *pinned) {
+				p.f.holds = map[string]bool{"n1": true}
+				p.snap.directives = append(p.snap.directives, &fleet.Directive{
+					Directive: protocol.Directive{ID: "d1", Kind: protocol.DirectiveReleaseHold},
+					Host:      "n1", State: fleet.DirectivePending,
+				})
+			},
+			want: "lifts the controller hold of n1",
 		},
 		{
 			name: "lease expired although the agent stopped containers",

@@ -68,7 +68,13 @@ func needKey(n *protocol.Need) string {
 // World is everything one reconcile depends on. Reconcile does not change
 // anything a World points at.
 type World struct {
-	Now      time.Time
+	Now time.Time
+	// Since is when this scheduler started. An agent can only have been heard
+	// from then on, so silence (a stale host, a silent lease, an expected host
+	// that never reported) is measured from the later of the last sync and
+	// Since: a controller outage is not the agents' silence. The zero value
+	// measures from the last sync alone.
+	Since    time.Time
 	Settings fleet.Settings
 	Health   fleet.NetworkHealth
 	// Liveness holds the rows of the newest stored epochs (at least
@@ -144,7 +150,9 @@ type hostView struct {
 	live      uint64
 	liveKnown bool
 	held      bool
-	stale     bool
+	// stale: no sync for hostStaleAfter, measured from World.Since at the
+	// earliest.
+	stale bool
 	// lease is the host's non-terminal lease.
 	lease *fleet.Lease
 }
@@ -260,9 +268,14 @@ func newPass(w *World) *pass {
 			h:      h,
 			weight: h.Weight(),
 			held:   h.Held(),
-			stale:  h.Stale(w.Now, w.Settings.HostStaleAfter.Std()),
+			stale:  hostStale(h, w.Now, w.Since, w.Settings.HostStaleAfter.Std()),
 		}
-		hv.live, hv.liveKnown = p.liveOf(h.Name, hv.weight)
+
+		if w.Health.LivenessUnsupported {
+			hv.live = probeLive(hv)
+		} else {
+			hv.live, hv.liveKnown = p.liveOf(h.Name, hv.weight)
+		}
 
 		p.hosts[h.Name] = hv
 		p.names = append(p.names, h.Name)
@@ -352,6 +365,32 @@ func (p *pass) liveOf(host string, weight uint64) (live uint64, known bool) {
 	}
 
 	return min(row.Live, weight), true
+}
+
+// probeLive is how many of the host's validators count as attesting when the
+// beacon node does not serve liveness: none when the host is stale or its
+// last sync's probes are configured and not synced, else all of them.
+func probeLive(hv *hostView) uint64 {
+	if hv.stale || (hv.h.Status != nil && !hv.h.Status.Node.Synced()) {
+		return 0
+	}
+
+	return hv.weight
+}
+
+// later returns the later of two times.
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+
+	return a
+}
+
+// hostStale reports whether the host's agent has been silent for longer than
+// staleAfter, as far as a scheduler that started at since can tell.
+func hostStale(h *fleet.Host, now, since time.Time, staleAfter time.Duration) bool {
+	return now.Sub(later(h.LastSeen, since)) > staleAfter
 }
 
 // sortRollouts orders rollouts oldest first.

@@ -1264,3 +1264,221 @@ func TestReadinessTimeout(t *testing.T) {
 	assert.Empty(t, b.leasedHosts(), "the next host is never granted automatically after a failure")
 	assert.Contains(t, queueReasons(out.Plan)["b"], "rollout halted: a: not ready after 30m0s")
 }
+
+// restartAfter models a controller outage: the clock moves on without any
+// sync, then the scheduler starts.
+func (b *worldBuilder) restartAfter(outage time.Duration) {
+	b.w.Now = b.w.Now.Add(outage)
+	b.w.Since = b.w.Now
+	b.refreshHealth()
+}
+
+// silentStep moves the clock without any sync and reconciles.
+func (b *worldBuilder) silentStep(d time.Duration) *Outcome {
+	b.t.Helper()
+	b.w.Now = b.w.Now.Add(d)
+	b.refreshHealth()
+
+	return b.step()
+}
+
+func TestControllerOutageDoesNotFailRunningLeases(t *testing.T) {
+	ttl := fleet.DefaultSettings().LeaseTTL.Std()
+	key := packagesKey("2.0")
+
+	start := func(t *testing.T) *worldBuilder {
+		t.Helper()
+
+		b := newWorldBuilder(t)
+		b.host("a", 0)
+		b.host("b", 0)
+		b.wants("a", packagesNeed("2.0"))
+		b.wants("b", packagesNeed("2.0"))
+		b.step()
+		require.Equal(t, []string{"a"}, b.leasedHosts())
+		b.report("a", protocol.PhaseApplying, true)
+		b.step()
+		require.Equal(t, fleet.LeaseRunning, b.lease("a").State)
+
+		return b
+	}
+
+	t.Run("the first reconcile after the outage fails nothing", func(t *testing.T) {
+		b := start(t)
+		b.restartAfter(3 * ttl)
+
+		out := b.step()
+
+		require.NotNil(t, b.lease("a"))
+		assert.Equal(t, fleet.LeaseRunning, b.lease("a").State)
+		assert.Equal(t, fleet.RolloutActive, b.mustRollout(key).State)
+		assert.Empty(t, out.Audit)
+		assert.Empty(t, out.Leases)
+	})
+
+	t.Run("an agent that reports again carries on", func(t *testing.T) {
+		b := start(t)
+		b.restartAfter(3 * ttl)
+		b.step()
+
+		b.advance(10 * time.Second)
+		b.serve("a")
+
+		assert.Equal(t, fleet.HostDone, b.mustRollout(key).Host("a").State)
+		assert.Equal(t, []string{"b"}, b.leasedHosts())
+	})
+
+	t.Run("silence for leaseTtl since the start fails the lease", func(t *testing.T) {
+		b := start(t)
+		b.restartAfter(3 * ttl)
+		b.step()
+
+		b.silentStep(ttl)
+		require.NotNil(t, b.lease("a"), "exactly leaseTtl since the start is not yet over it")
+
+		out := b.silentStep(time.Second)
+		require.Nil(t, b.lease("a"))
+		assert.Equal(t, fleet.LeaseFailed, out.Leases[0].State)
+		assert.Equal(t, "agent silent", out.Leases[0].Error)
+		assert.Equal(t, fleet.RolloutHalted, b.mustRollout(key).State)
+	})
+
+	t.Run("a sync after the start counts from the sync", func(t *testing.T) {
+		b := start(t)
+		b.restartAfter(3 * ttl)
+		b.step()
+		b.advance(ttl / 2)
+		b.step()
+
+		b.silentStep(ttl)
+		require.NotNil(t, b.lease("a"))
+
+		b.silentStep(time.Second)
+		assert.Nil(t, b.lease("a"))
+	})
+
+	t.Run("without an outage silence counts from the last sync", func(t *testing.T) {
+		b := start(t)
+		b.w.Since = b.w.Now.Add(-time.Hour)
+
+		b.silentStep(ttl + time.Second)
+		assert.Nil(t, b.lease("a"))
+		assert.Equal(t, fleet.RolloutHalted, b.mustRollout(key).State)
+	})
+}
+
+func TestControllerOutageAndGrantedLeases(t *testing.T) {
+	ttl := fleet.DefaultSettings().LeaseTTL.Std()
+	key := packagesKey("2.0")
+
+	start := func(t *testing.T) *worldBuilder {
+		t.Helper()
+
+		b := newWorldBuilder(t)
+		b.w.Settings.PolicyReboot = fleet.PolicyPaused
+		b.host("a", 0)
+		b.wants("a", packagesNeed("2.0"))
+		b.step()
+		require.Equal(t, fleet.LeaseGranted, b.lease("a").State)
+
+		// Long enough for the old rule: 2 * leaseTtl + grace of silence.
+		b.restartAfter(4 * ttl)
+
+		return b
+	}
+
+	t.Run("not failed as silent on the first reconcile", func(t *testing.T) {
+		b := start(t)
+
+		out := b.step()
+
+		require.NotNil(t, b.lease("a"))
+		assert.Equal(t, fleet.LeaseGranted, b.lease("a").State)
+		assert.Empty(t, out.Audit)
+	})
+
+	t.Run("the agent says it did not start: expired, not a failure", func(t *testing.T) {
+		b := start(t)
+		b.step()
+		b.w.Settings.PolicyPackages = fleet.PolicyPaused
+		b.advance(10 * time.Second)
+
+		out := b.step()
+
+		require.Nil(t, b.lease("a"))
+		assert.Equal(t, []string{"lease.expired"}, auditActions(out))
+		assert.Equal(t, fleet.RolloutActive, b.mustRollout(key).State)
+		assert.Equal(t, fleet.HostPending, b.mustRollout(key).Host("a").State)
+	})
+
+	t.Run("the agent started while the controller was down: running", func(t *testing.T) {
+		b := start(t)
+		b.step()
+		b.advance(10 * time.Second)
+		b.report("a", protocol.PhaseApplying, true)
+		b.step()
+
+		assert.Equal(t, fleet.LeaseRunning, b.lease("a").State)
+	})
+
+	t.Run("still silent leaseTtl after the start: failed", func(t *testing.T) {
+		b := start(t)
+		b.step()
+
+		b.silentStep(ttl - time.Second)
+		require.NotNil(t, b.lease("a"))
+
+		out := b.silentStep(time.Second)
+		require.Nil(t, b.lease("a"))
+		assert.Equal(t, "agent silent", out.Leases[0].Error)
+		assert.Equal(t, fleet.RolloutHalted, b.mustRollout(key).State)
+	})
+}
+
+func TestControllerOutageDoesNotMakeHostsStale(t *testing.T) {
+	stale := fleet.DefaultSettings().HostStaleAfter.Std()
+
+	t.Run("a host is stale only after hostStaleAfter of silence since the start", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.host("a", 0)
+		b.restartAfter(time.Hour)
+
+		assert.Equal(t, SlotIdle, b.step().Plan.Hosts["a"].Slot)
+		assert.Equal(t, SlotIdle, b.silentStep(stale).Plan.Hosts["a"].Slot)
+		assert.Equal(t, SlotStale, b.silentStep(time.Second).Plan.Hosts["a"].Slot)
+
+		b.advance(time.Second)
+		assert.Equal(t, SlotIdle, b.step().Plan.Hosts["a"].Slot)
+	})
+
+	t.Run("an expected host keeps blocking later stages", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.host("tool", 0)
+		b.host("val", 10)
+		b.wantsImage("val", imgLighthouse, digestA)
+		b.get("tool").Status.Containers = []protocol.Container{
+			container("c", imgLighthouse, digestOld, digestOld, b.w.Now),
+		}
+
+		out := b.step()
+		require.Equal(t, "after hosts without validators", queueReasons(out.Plan)["val"])
+
+		// Neither the silence of "tool" nor the age of the rollout is news:
+		// nobody could report to a controller that was down.
+		b.restartAfter(time.Hour)
+
+		out = b.step()
+		assert.Empty(t, b.leasedHosts())
+		assert.Equal(t, "after hosts without validators", queueReasons(out.Plan)["val"])
+
+		// The hosts sync again; "tool" has hostStaleAfter from the start.
+		b.advance(stale)
+
+		out = b.step()
+		assert.Equal(t, "after hosts without validators", queueReasons(out.Plan)["val"])
+
+		b.advance(time.Second)
+		b.step()
+		assert.Equal(t, []string{"val"}, b.leasedHosts())
+	})
+}

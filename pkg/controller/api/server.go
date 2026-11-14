@@ -155,6 +155,11 @@ type Server struct {
 	auditMu      sync.Mutex
 	auditBacklog []fleet.AuditEntry
 
+	// generationAudited remembers, per host, when a certificate that was
+	// rejected for its generation was last audited.
+	generationMu      sync.Mutex
+	generationAudited map[string]time.Time
+
 	mu     sync.Mutex
 	cancel context.CancelFunc
 }

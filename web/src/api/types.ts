@@ -245,6 +245,12 @@ export interface NetworkHealth {
   finalityLagEpochs: number;
   livenessKnown: boolean;
   livenessEpoch: number;
+  /**
+   * True while the beacon node is known not to serve the liveness endpoint.
+   * The gate then judges finality only; readiness and the budget use the
+   * agents' probes.
+   */
+  livenessUnsupported: boolean;
   tracked: number;
   live: number;
 }

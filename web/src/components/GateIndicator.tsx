@@ -5,7 +5,8 @@ import { Badge } from './primitives';
 
 /**
  * GateIndicator shows the network gate: ok or failing with every reason,
- * participation and finality lag. It uses public chain data only.
+ * participation and finality lag. It uses public chain data only. When the
+ * beacon node does not serve liveness it says what the scheduler uses instead.
  */
 export function GateIndicator({ gate }: { gate: Gate }) {
   const n = gate.network;
@@ -36,8 +37,15 @@ export function GateIndicator({ gate }: { gate: Gate }) {
             </span>
           </span>
         ) : (
-          <span className="text-warning" title="The beacon node does not serve liveness data (yet)">
-            unknown
+          <span
+            className="text-warning"
+            title={
+              n.livenessUnsupported
+                ? 'The beacon node does not serve the liveness endpoint'
+                : 'No liveness data (yet): the gate stays closed until there is'
+            }
+          >
+            {n.livenessUnsupported ? 'not served' : 'unknown'}
           </span>
         )}
       </Fact>
@@ -51,6 +59,11 @@ export function GateIndicator({ gate }: { gate: Gate }) {
       <Fact label="beacon">
         <RelTime value={n.updatedAt} />
       </Fact>
+      {n.livenessUnsupported && (
+        <span className="whitespace-normal text-warning">
+          liveness not served by the beacon node: readiness and budget use agent probes
+        </span>
+      )}
       {n.error && (
         <span className="whitespace-normal text-warning" title={n.error}>
           beacon error: {n.error}

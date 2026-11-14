@@ -295,7 +295,9 @@ func TestMetrics(t *testing.T) {
 	h := newHarness(t, nil)
 	metricsFixture(t, h)
 
-	agent := validatorAgent(t)
+	// The fixture knows the host at generation 3; an older certificate would
+	// be rejected.
+	agent := validatorAgentGeneration(t, 3)
 
 	// One good sync (which also refreshes the host) and one rejected one.
 	req := syncRequest()
@@ -388,7 +390,8 @@ func TestMetricNames(t *testing.T) {
 	metricsFixture(t, h)
 
 	require.Equal(t, http.StatusOK,
-		h.agentPost(validatorAgent(t), protocol.PathSync, syncRequest(), agentCallOpts{}).Code)
+		h.agentPost(validatorAgentGeneration(t, 3), protocol.PathSync, syncRequest(),
+			agentCallOpts{}).Code)
 
 	problems, err := testutil.GatherAndLint(h.reg)
 	require.NoError(t, err)

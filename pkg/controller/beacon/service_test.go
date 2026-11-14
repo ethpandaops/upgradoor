@@ -577,6 +577,7 @@ func TestLivenessUnsupportedThenRecovers(t *testing.T) {
 
 			got := h.svc.Health()
 			assert.False(t, got.LivenessKnown)
+			assert.True(t, got.LivenessUnsupported)
 			assert.Contains(t, got.Error, "validator liveness unavailable")
 			assert.Equal(t, h.clock.Now(), got.UpdatedAt, "the chain view itself is fresh")
 			assert.Equal(t, uint64(2), got.FinalityLagEpochs)
@@ -589,6 +590,7 @@ func TestLivenessUnsupportedThenRecovers(t *testing.T) {
 
 			got = h.svc.Health()
 			assert.False(t, got.LivenessKnown)
+			assert.True(t, got.LivenessUnsupported, "the detection stays in effect between probes")
 			assert.Contains(t, got.Error, "validator liveness unavailable")
 			assert.Equal(t, h.clock.Now(), got.UpdatedAt)
 			assert.Len(t, h.node.livenessCalls(), 1)
@@ -598,6 +600,7 @@ func TestLivenessUnsupportedThenRecovers(t *testing.T) {
 			h.svc.poll(t.Context())
 
 			assert.False(t, h.svc.Health().LivenessKnown)
+			assert.True(t, h.svc.Health().LivenessUnsupported)
 			assert.Len(t, h.node.livenessCalls(), 2)
 			assert.Equal(t, 1, h.warnings("does not serve validator liveness"))
 
@@ -608,6 +611,7 @@ func TestLivenessUnsupportedThenRecovers(t *testing.T) {
 
 			got = h.svc.Health()
 			assert.True(t, got.LivenessKnown)
+			assert.False(t, got.LivenessUnsupported, "cleared when the endpoint answers")
 			assert.Empty(t, got.Error)
 			assert.Equal(t, got.CurrentEpoch-1, got.LivenessEpoch)
 			assert.Equal(t, uint64(4), got.Tracked)
@@ -628,6 +632,7 @@ func TestLivenessTransientFailureIsRetried(t *testing.T) {
 
 	got := h.svc.Health()
 	assert.False(t, got.LivenessKnown, "nothing stored yet")
+	assert.False(t, got.LivenessUnsupported, "a transient failure is not an unsupported endpoint")
 	assert.Contains(t, got.Error, "validator liveness for epoch 9")
 	assert.Contains(t, got.Error, "HTTP 500: state unavailable")
 	assert.Equal(t, h.clock.Now(), got.UpdatedAt)
@@ -657,6 +662,7 @@ func TestLivenessRejectedNewestEpochIsTransient(t *testing.T) {
 
 	got := h.svc.Health()
 	assert.False(t, got.LivenessKnown)
+	assert.False(t, got.LivenessUnsupported)
 	assert.Contains(t, got.Error, "HTTP 400: validator index unknown")
 	assert.NotContains(t, got.Error, "unavailable")
 	assert.Empty(t, h.nodes[1].livenessCalls())

@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
+	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -284,6 +285,42 @@ func TestGate(t *testing.T) {
 				b.w.Health.LivenessKnown = false
 			},
 			want: []string{"liveness data stale"},
+		},
+		{
+			name: "liveness not served by the beacon node: finality alone gates",
+			setup: func(b *worldBuilder) {
+				b.w.Health.LivenessKnown = false
+				b.w.Health.LivenessUnsupported = true
+			},
+			want: []string{},
+		},
+		{
+			name: "liveness not served: rows of an earlier time say nothing",
+			setup: func(b *worldBuilder) {
+				b.w.Health.LivenessKnown = false
+				b.w.Health.LivenessUnsupported = true
+				b.w.Health.CurrentEpoch += 20
+				b.live(b.w.Health.LivenessEpoch, "a", 0)
+			},
+			want: []string{},
+		},
+		{
+			name: "liveness not served: the finality lag still closes the gate",
+			setup: func(b *worldBuilder) {
+				b.w.Health.LivenessKnown = false
+				b.w.Health.LivenessUnsupported = true
+				b.w.Health.FinalityLagEpochs = 4
+			},
+			want: []string{"finality lag 4 epochs > 3"},
+		},
+		{
+			name: "liveness not served: a stale beacon view still closes the gate",
+			setup: func(b *worldBuilder) {
+				b.w.Health.LivenessKnown = false
+				b.w.Health.LivenessUnsupported = true
+				b.w.Health.UpdatedAt = b.w.Now.Add(-2*testEpoch - time.Second)
+			},
+			want: []string{"beacon node unreachable"},
 		},
 		{
 			name: "liveness more than two epochs behind",
@@ -1179,6 +1216,39 @@ func TestHoldDirectives(t *testing.T) {
 	assert.Empty(t, pending())
 }
 
+// A host that reported a controller hold when the controller first saw it
+// (the database was lost) has its row created with the hold wanted
+// (store.RecordSync). The scheduler then finds both sides in agreement: it
+// neither lifts the hold nor grants the host anything.
+func TestAdoptedControllerHoldIsNotReleased(t *testing.T) {
+	b := newWorldBuilder(t)
+	h := b.host("a", 0)
+	h.HoldWanted = true
+	h.HoldReason = store.HoldReasonAdopted
+	h.Status.Hold.Controller = true
+	b.host("b", 0)
+	b.wants("b", packagesNeed("2.0"))
+
+	for range 3 {
+		out := b.step()
+		assert.Empty(t, out.Directives, "no release-hold, no hold")
+		assert.Equal(t, SlotHeld, out.Plan.Hosts["a"].Slot)
+	}
+
+	assert.Empty(t, b.w.Directives)
+	assert.Equal(t, []string{"b"}, b.leasedHosts())
+
+	// What the adoption prevents: the same report on a row without the hold
+	// wanted is a hold to lift.
+	h.HoldWanted = false
+	h.HoldReason = ""
+
+	out := b.step()
+	require.Len(t, out.Directives, 1)
+	assert.Equal(t, protocol.DirectiveReleaseHold, out.Directives[0].Kind)
+	assert.Equal(t, "a", out.Directives[0].Host)
+}
+
 func TestStaleHostIsNotGranted(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.host("a", 0)
@@ -1229,4 +1299,144 @@ func TestReconcileIsIdempotentAndPure(t *testing.T) {
 	assert.Empty(t, second.Directives)
 	assert.Empty(t, second.Audit)
 	assert.Equal(t, first.Plan, second.Plan)
+}
+
+// withoutLiveness makes the beacon view that of a node that does not serve
+// the liveness endpoint.
+func (b *worldBuilder) withoutLiveness() {
+	b.healthMod = func(n *fleet.NetworkHealth) {
+		n.LivenessKnown = false
+		n.LivenessUnsupported = true
+	}
+	b.refreshHealth()
+}
+
+func TestBudgetWithoutLiveness(t *testing.T) {
+	synced := protocol.NodeHealth{
+		EL: &protocol.ELHealth{Reachable: true, Peers: 5},
+		CL: &protocol.CLHealth{Reachable: true, Peers: 5},
+	}
+	syncing := protocol.NodeHealth{
+		EL: &protocol.ELHealth{Reachable: true, Peers: 5},
+		CL: &protocol.CLHealth{Reachable: true, Syncing: true, Peers: 5},
+	}
+
+	b := newWorldBuilder(t)
+	b.withoutLiveness()
+	b.host("synced", 10).Status.Node = synced
+	b.host("syncing", 10).Status.Node = syncing
+	b.host("silent", 10).Status.Node = synced
+	b.host("leased", 10).Status.Node = synced
+	b.host("noprobe", 7)
+	b.host("tooling", 0).Status.Node = syncing
+	b.get("silent").LastSeen = b.w.Now.Add(-b.w.Settings.HostStaleAfter.Std() - time.Second)
+	b.w.Leases = []*fleet.Lease{{ID: "l1", Host: "leased", State: fleet.LeaseVerifying, AgentDoneAt: &b.w.Now}}
+
+	// Rows from before the node stopped serving liveness are not looked at.
+	for _, name := range []string{"synced", "syncing", "silent", "leased", "noprobe"} {
+		b.live(b.w.Health.CurrentEpoch-1, name, 1)
+	}
+
+	plan := Reconcile(b.w).Plan
+
+	assert.True(t, plan.Gate.OK)
+	assert.True(t, plan.Gate.Network.LivenessUnsupported, "the plan says what the budget is built on")
+	assert.Equal(t, Budget{
+		TotalWeight:       47,
+		AllowedWeight:     4.7,
+		UnavailableWeight: 30, // "syncing" (probes), "silent" (stale) and "leased"
+		LeasedHosts:       1,
+		MaxLeasedHosts:    1,
+	}, plan.Budget)
+	assert.Equal(t, HostPlan{Slot: SlotIdle, Weight: 10, Live: 10}, plan.Hosts["synced"])
+	assert.Equal(t, HostPlan{Slot: SlotIdle, Weight: 10, Live: 0}, plan.Hosts["syncing"])
+	assert.Equal(t, HostPlan{Slot: SlotStale, Weight: 10, Live: 0}, plan.Hosts["silent"])
+	assert.Equal(t, HostPlan{Slot: SlotIdle, Weight: 7, Live: 7}, plan.Hosts["noprobe"],
+		"no probe configured: nothing says it is down")
+}
+
+func TestGrantsWithoutLiveness(t *testing.T) {
+	synced := protocol.NodeHealth{CL: &protocol.CLHealth{Reachable: true, Peers: 5}}
+	unreachable := protocol.NodeHealth{CL: &protocol.CLHealth{}}
+
+	t.Run("a fleet with validators rolls, verified by the probes", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.withoutLiveness()
+
+		for _, name := range []string{"a", "b", "c"} {
+			b.host(name, 10).Status.Node = synced
+			b.wants(name, packagesNeed("2.0"))
+		}
+
+		out := b.step()
+		require.True(t, out.Plan.Gate.OK)
+		require.Equal(t, []string{"a"}, b.leasedHosts(), "the canary")
+		assert.Equal(t, uint64(10), b.lease("a").Charged)
+
+		b.finish("a")
+		b.step()
+		b.advance(5 * time.Second)
+		b.step()
+		assert.Equal(t, "probes synced, soaking for 6m24s", b.lease("a").Readiness)
+
+		b.advance(testEpoch)
+		b.step()
+		require.Equal(t, []string{"b"}, b.leasedHosts(), "released by the probe rule, the next host follows")
+
+		b.serve("b")
+		b.serve("c")
+		assert.Equal(t, fleet.RolloutCompleted, b.closed(packagesKey("2.0")).State)
+	})
+
+	t.Run("a host whose probes are not synced is down already: free, and it uses up the budget", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.withoutLiveness()
+		b.host("down", 20).Status.Node = unreachable
+		b.host("up", 20).Status.Node = synced
+		b.host("idle", 60).Status.Node = synced
+		b.wants("down", packagesNeed("2.0"))
+		b.wants("up", packagesNeed("2.0"))
+		b.wants("up", rebootNeed())
+
+		out := b.step()
+
+		// 20 of 100 are down, twice the 10 allowed.
+		assert.Equal(t, []string{"down"}, b.leasedHosts())
+		assert.Equal(t, uint64(0), b.lease("down").Charged)
+		assert.Equal(t, uint64(20), out.Plan.Budget.UnavailableWeight)
+		assert.Equal(t, "budget 20% of 10%", queueReasons(out.Plan)["up"])
+	})
+
+	t.Run("liveness that is merely unknown keeps the gate closed", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.healthMod = func(n *fleet.NetworkHealth) { n.LivenessKnown = false }
+		b.refreshHealth()
+		b.host("a", 10).Status.Node = synced
+		b.wants("a", packagesNeed("2.0"))
+
+		out := b.step()
+
+		assert.Empty(t, b.leasedHosts())
+		assert.Equal(t, map[string]string{"a": "network gate: liveness data stale"}, queueReasons(out.Plan))
+	})
+
+	t.Run("readiness uses the probes even when old liveness rows are around", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.host("a", 10).Status.Node = synced
+		b.wants("a", packagesNeed("2.0"))
+		b.step()
+		require.Equal(t, []string{"a"}, b.leasedHosts())
+
+		// The node stops serving liveness while the lease is open; a view that
+		// still claimed to know liveness must not bring the epoch rule back.
+		b.healthMod = func(n *fleet.NetworkHealth) { n.LivenessUnsupported = true }
+		b.refreshHealth()
+		b.finish("a")
+		b.get("a").Status.Node = unreachable
+		b.step()
+		b.advance(5 * time.Second)
+		b.step()
+
+		assert.Equal(t, "probes do not report synced", b.lease("a").Readiness)
+	})
 }

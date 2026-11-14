@@ -77,6 +77,7 @@ export class MockController {
   private readonly latencyMs: number;
   private readonly now: () => number;
   private readonly actor: () => string;
+  private livenessUnsupported = false;
 
   constructor(opts: MockOptions = {}) {
     this.now = opts.now ?? (() => Date.now());
@@ -94,6 +95,11 @@ export class MockController {
   /** setGateFailing toggles a failing network gate (low participation, finality lag). */
   setGateFailing(failing: boolean): void {
     this.data.gateFailing = failing;
+  }
+
+  /** setLivenessUnsupported makes the beacon node one that does not serve liveness. */
+  setLivenessUnsupported(unsupported: boolean): void {
+    this.livenessUnsupported = unsupported;
   }
 
   /** fetch is a drop-in for the browser's fetch, limited to the API routes. */
@@ -235,7 +241,7 @@ export class MockController {
     const participation = gateTracked > 0 ? (gateLive / gateTracked) * 100 : 100;
     const reasons: string[] = [];
     if (lag > s.maxFinalityLagEpochs) reasons.push(`finality lag ${lag} epochs > ${s.maxFinalityLagEpochs}`);
-    if (participation < s.minParticipationPercent) {
+    if (!this.livenessUnsupported && participation < s.minParticipationPercent) {
       reasons.push(`participation ${formatPercent(participation)} < ${formatPercent(s.minParticipationPercent)}`);
     }
 
@@ -251,8 +257,9 @@ export class MockController {
         currentEpoch: epoch,
         finalizedEpoch: epoch - lag,
         finalityLagEpochs: lag,
-        livenessKnown: true,
+        livenessKnown: !this.livenessUnsupported,
         livenessEpoch: epoch - 1,
+        livenessUnsupported: this.livenessUnsupported,
         tracked,
         live,
       },

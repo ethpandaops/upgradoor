@@ -771,7 +771,9 @@ func (p *pass) blockingExpected(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 		return false
 	}
 
-	if p.now.Sub(r.CreatedAt) > p.set.HostStaleAfter.Std() {
+	// The host had hostStaleAfter to report, counted from the scheduler's
+	// start at the earliest: it could not report to a controller that was down.
+	if p.now.Sub(later(r.CreatedAt, p.w.Since)) > p.set.HostStaleAfter.Std() {
 		return false
 	}
 

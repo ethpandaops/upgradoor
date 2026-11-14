@@ -65,6 +65,9 @@ type Options struct {
 type service struct {
 	log  logrus.FieldLogger
 	opts Options
+	// since is when this scheduler was created (the controller's start). It
+	// is the World's Since: silence is never counted from before it.
+	since time.Time
 
 	// mu serialises reconciles and actions and guards hist.
 	mu   sync.Mutex
@@ -103,6 +106,7 @@ func New(log logrus.FieldLogger, opts Options) Service { //nolint:gocritic // hu
 	return &service{
 		log:   log.WithField("package", "scheduler"),
 		opts:  opts,
+		since: opts.Now(),
 		plan:  &Plan{Queue: []QueueEntry{}, Hosts: map[string]HostPlan{}, Gate: Gate{Reasons: []string{}}},
 		nudge: make(chan struct{}, 1),
 	}
@@ -234,6 +238,7 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 
 	w := &World{
 		Now:      s.opts.Now(),
+		Since:    s.since,
 		Settings: settings,
 		Health:   s.opts.Health(),
 		NewID:    s.opts.NewID,
