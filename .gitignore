@@ -1,0 +1,9 @@
+bin/
+dist/
+*.db
+*.db-*
+coverage.out
+node_modules/
+web/dist/
+.worktrees/
+.tmp/

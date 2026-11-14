@@ -1,0 +1,144 @@
+[
+  {
+    "name": "validator-host",
+    "seed": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "network": "testnet-devnet-0",
+    "hostname": "lighthouse-geth-1",
+    "generation": 0,
+    "validators": {
+      "start": 0,
+      "end": 100
+    },
+    "roles": [
+      "ethereum_node"
+    ],
+    "signerPublicKey": "bjfmlZ55_-dPNHOR35y6kBOOf97cHLMAehaRuRTh264",
+    "hostKey": "3ccsBTOwGo_w6jKJ-xCQ6L5VPI5GOtA1pIHEY8gpUdA",
+    "hostPublicKey": "bxOcmGGG_mz41AN-t6sJ_nzY8zaWYtOYTFFpsC1r7xQ",
+    "certificate": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ1cGdyYWRvb3Itc2lnbmVyIiwibmV0IjoidGVzdG5ldC1kZXZuZXQtMCIsInN1YiI6ImxpZ2h0aG91c2UtZ2V0aC0xIiwiY25mIjp7Imp3ayI6eyJrdHkiOiJPS1AiLCJjcnYiOiJFZDI1NTE5IiwieCI6ImJ4T2NtR0dHX216NDFBTi10NnNKX256WTh6YVdZdE9ZVEZGcHNDMXI3eFEifX0sImdlbiI6MCwidmFsIjp7InN0YXJ0IjowLCJlbmQiOjEwMH0sInJvbGVzIjpbImV0aGVyZXVtX25vZGUiXX0.5p0eet0QJvxwqHSK6nLQewxZN-IKLNfmMCAvwKHRXwet_q25cgBC2wJMELa0TzFnb14DCABKWdSFFGvT5OurDw",
+    "certificateHash": "8b13f1b08ed69d60e1442ac9a607f57caf91b50123bc1054bfb54819afcc5c24",
+    "proofClaims": {
+      "iat": 1800000000,
+      "exp": 1800000060,
+      "jti": "AAECAwQFBgcICQoLDA0ODw",
+      "htm": "POST",
+      "htu": "https://upgradoor.testnet-devnet-0.ethpandaops.io/api/agent/v1/sync",
+      "bh": "8eOdm2zTpg23LAuA5GeecVvX5VwaInYuliNARfRtpVw"
+    },
+    "proofBody": "{\"protocolVersion\":1}",
+    "proof": "eyJhbGciOiJFZERTQSIsInR5cCI6InVwZ3JhZG9vci1wcm9vZitqd3QifQ.eyJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDA2MCwianRpIjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EdyIsImh0bSI6IlBPU1QiLCJodHUiOiJodHRwczovL3VwZ3JhZG9vci50ZXN0bmV0LWRldm5ldC0wLmV0aHBhbmRhb3BzLmlvL2FwaS9hZ2VudC92MS9zeW5jIiwiYmgiOiI4ZU9kbTJ6VHBnMjNMQXVBNUdlZWNWdlg1VndhSW5ZdWxpTkFSZlJ0cFZ3In0.LuXHGafQ-Jv8qfcDJSv9Qhki-vIr3-l8AMVLNjXfAs0vtx071QRlMk6RHOeHSCuZS--sMzxdtWA0kLq_5YvJBA"
+  },
+  {
+    "name": "bootnode-no-validators",
+    "seed": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "network": "testnet-devnet-0",
+    "hostname": "bootnode-1",
+    "generation": 0,
+    "roles": [
+      "bootnode"
+    ],
+    "signerPublicKey": "bjfmlZ55_-dPNHOR35y6kBOOf97cHLMAehaRuRTh264",
+    "hostKey": "BNdr9HRg6lYmCWAAy240YY_nmf1YVixTkDiz3qu0PrM",
+    "hostPublicKey": "1MTXzr59o5MhKbe7xE111NycdN6Rs1ciqfeThKaZIfg",
+    "certificate": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ1cGdyYWRvb3Itc2lnbmVyIiwibmV0IjoidGVzdG5ldC1kZXZuZXQtMCIsInN1YiI6ImJvb3Rub2RlLTEiLCJjbmYiOnsiandrIjp7Imt0eSI6Ik9LUCIsImNydiI6IkVkMjU1MTkiLCJ4IjoiMU1UWHpyNTlvNU1oS2JlN3hFMTExTnljZE42UnMxY2lxZmVUaEthWklmZyJ9fSwiZ2VuIjowLCJyb2xlcyI6WyJib290bm9kZSJdfQ.kFUeVQvNLtVGGx7G63oqPf2_ajARc3SjkuaGmoF5N1VkQcWvBMxtP8eacCqh9od4u68zbRV0JVVh9TaocLLpDQ",
+    "certificateHash": "b8fd3c203d8bc42e9631f11b108b6a14b2c807ee907653e5e5311b5846a216a9",
+    "proofClaims": {
+      "iat": 1800000000,
+      "exp": 1800000060,
+      "jti": "AAECAwQFBgcICQoLDA0ODw",
+      "htm": "POST",
+      "htu": "https://upgradoor.testnet-devnet-0.ethpandaops.io/api/agent/v1/sync",
+      "bh": "47DEQpj8HBSa-_TImW-5JCeuQeRkm5NMpJWZG3hSuFU"
+    },
+    "proofBody": "",
+    "proof": "eyJhbGciOiJFZERTQSIsInR5cCI6InVwZ3JhZG9vci1wcm9vZitqd3QifQ.eyJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDA2MCwianRpIjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EdyIsImh0bSI6IlBPU1QiLCJodHUiOiJodHRwczovL3VwZ3JhZG9vci50ZXN0bmV0LWRldm5ldC0wLmV0aHBhbmRhb3BzLmlvL2FwaS9hZ2VudC92MS9zeW5jIiwiYmgiOiI0N0RFUXBqOEhCU2EtX1RJbVctNUpDZXVRZVJrbTVOTXBKV1pHM2hTdUZVIn0.Z4loaWBsekOx-dQMWxLOX341A62W3PIg65IpT1_0Cv9IDj7bGfgyyIxfSi5kQnWP1jOBhI1J2F8GmAc5qdiHBQ"
+  },
+  {
+    "name": "rotated-generation",
+    "seed": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+    "network": "testnet-devnet-0",
+    "hostname": "lighthouse-geth-1",
+    "generation": 3,
+    "validators": {
+      "start": 0,
+      "end": 100
+    },
+    "roles": [
+      "ethereum_node"
+    ],
+    "signerPublicKey": "bjfmlZ55_-dPNHOR35y6kBOOf97cHLMAehaRuRTh264",
+    "hostKey": "XENap084OugvM7MandFq6497LrCZXQZv0-skCaZgDhg",
+    "hostPublicKey": "-K2HVonrpyt82xAWQQrWp0Lb4hZqc-olsqYdFyzVExM",
+    "certificate": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ1cGdyYWRvb3Itc2lnbmVyIiwibmV0IjoidGVzdG5ldC1kZXZuZXQtMCIsInN1YiI6ImxpZ2h0aG91c2UtZ2V0aC0xIiwiY25mIjp7Imp3ayI6eyJrdHkiOiJPS1AiLCJjcnYiOiJFZDI1NTE5IiwieCI6Ii1LMkhWb25ycHl0ODJ4QVdRUXJXcDBMYjRoWnFjLW9sc3FZZEZ5elZFeE0ifX0sImdlbiI6MywidmFsIjp7InN0YXJ0IjowLCJlbmQiOjEwMH0sInJvbGVzIjpbImV0aGVyZXVtX25vZGUiXX0.I09zaA55mkk9_-KYCz6OrEK4Aprxn1UInmlB_VXnK3niM0f4fT1y539WMOWzd8-mzot4vijzASmJpWs4-x2PBw",
+    "certificateHash": "cd1e13a2a6684d6412f13bf4857295c1876f4177f5b977f9442319fa527cc516",
+    "proofClaims": {
+      "iat": 1800000000,
+      "exp": 1800000060,
+      "jti": "AAECAwQFBgcICQoLDA0ODw",
+      "htm": "POST",
+      "htu": "https://upgradoor.testnet-devnet-0.ethpandaops.io/api/agent/v1/sync",
+      "bh": "8eOdm2zTpg23LAuA5GeecVvX5VwaInYuliNARfRtpVw"
+    },
+    "proofBody": "{\"protocolVersion\":1}",
+    "proof": "eyJhbGciOiJFZERTQSIsInR5cCI6InVwZ3JhZG9vci1wcm9vZitqd3QifQ.eyJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDA2MCwianRpIjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EdyIsImh0bSI6IlBPU1QiLCJodHUiOiJodHRwczovL3VwZ3JhZG9vci50ZXN0bmV0LWRldm5ldC0wLmV0aHBhbmRhb3BzLmlvL2FwaS9hZ2VudC92MS9zeW5jIiwiYmgiOiI4ZU9kbTJ6VHBnMjNMQXVBNUdlZWNWdlg1VndhSW5ZdWxpTkFSZlJ0cFZ3In0.3gAoQJxOEERBLcE4fohMw56hglSRKm4JsNQqSPL3ZEhYUPjFpajce5feoCnmPquLKc5OUtZCSgmZAJc4n7UfAg"
+  },
+  {
+    "name": "roles-sorted-and-deduplicated",
+    "seed": "correct horse battery staple, but at least 32 bytes long!",
+    "network": "glamsterdam-devnet-8",
+    "hostname": "prysm-besu-1",
+    "generation": 0,
+    "validators": {
+      "start": 3100,
+      "end": 3200
+    },
+    "roles": [
+      "ethereum_node",
+      "bootnode",
+      "ethereum_node",
+      "Mev.relay_1"
+    ],
+    "signerPublicKey": "82MCPAkwtIIRxglV_t4vmgFIiAd5zGVPdW872aQ3NCY",
+    "hostKey": "MDSWXBndY96K6uXqztusLaB5gZCEjNXvuJ8AqHbpctc",
+    "hostPublicKey": "Qi5CISqkFHle7Is6DJuw8pwD7kd1x4xN3ahs_mYQT78",
+    "certificate": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ1cGdyYWRvb3Itc2lnbmVyIiwibmV0IjoiZ2xhbXN0ZXJkYW0tZGV2bmV0LTgiLCJzdWIiOiJwcnlzbS1iZXN1LTEiLCJjbmYiOnsiandrIjp7Imt0eSI6Ik9LUCIsImNydiI6IkVkMjU1MTkiLCJ4IjoiUWk1Q0lTcWtGSGxlN0lzNkRKdXc4cHdEN2tkMXg0eE4zYWhzX21ZUVQ3OCJ9fSwiZ2VuIjowLCJ2YWwiOnsic3RhcnQiOjMxMDAsImVuZCI6MzIwMH0sInJvbGVzIjpbIk1ldi5yZWxheV8xIiwiYm9vdG5vZGUiLCJldGhlcmV1bV9ub2RlIl19.IrBC1DJJ8dHkclrxDptmfyDR_KFV_vxTyVi89ypaMfC40rKR7r4POpHYhBqWyr5g1_sJy17wR92L3MOUvSDdBA",
+    "certificateHash": "dfeb53a085315aa380207505c1d9db0de653cc9b35a14f3bfda5627d85b3c0da",
+    "proofClaims": {
+      "iat": 1800000000,
+      "exp": 1800000060,
+      "jti": "AAECAwQFBgcICQoLDA0ODw",
+      "htm": "POST",
+      "htu": "https://upgradoor.glamsterdam-devnet-8.ethpandaops.io/api/agent/v1/sync",
+      "bh": "fsIAnOPqqNQWyFprOeRh1vUk2EtdLMl5iZRgJBiPLo0"
+    },
+    "proofBody": "non-ASCII body ✓ with a newline\n",
+    "proof": "eyJhbGciOiJFZERTQSIsInR5cCI6InVwZ3JhZG9vci1wcm9vZitqd3QifQ.eyJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDA2MCwianRpIjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EdyIsImh0bSI6IlBPU1QiLCJodHUiOiJodHRwczovL3VwZ3JhZG9vci5nbGFtc3RlcmRhbS1kZXZuZXQtOC5ldGhwYW5kYW9wcy5pby9hcGkvYWdlbnQvdjEvc3luYyIsImJoIjoiZnNJQW5PUHFxTlFXeUZwck9lUmgxdlVrMkV0ZExNbDVpWlJnSkJpUExvMCJ9.At6Ihjkcc7sRpDTOw5MSOKNyMDY6O3v6jMX2Rk8VcfFzvqd9yrPfKGfrKFZzmNpPbdbYbxVwuE7ZdqhAF_8CCw"
+  },
+  {
+    "name": "no-roles",
+    "seed": "ünïcödé seed bytes are used as raw UTF-8 input ✓",
+    "network": "net.with.dots",
+    "hostname": "Host_With-Mixed.Case01",
+    "generation": 18446744073709551615,
+    "validators": {
+      "start": 4294967296,
+      "end": 4294967297
+    },
+    "roles": [],
+    "signerPublicKey": "8YcRnn4welD1Q6IUZs1f_eZ7Ss9L5Q440TxwV-0t6mQ",
+    "hostKey": "ktONkvIcM5DxaILF_FFRZqYocTpKQeX5XQdlYoSeR_4",
+    "hostPublicKey": "xWN8jyJMNfQZCILvxUlH4Xkh5V2YaAyRBGUB3JMWV1U",
+    "certificate": "eyJhbGciOiJFZERTQSIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJ1cGdyYWRvb3Itc2lnbmVyIiwibmV0IjoibmV0LndpdGguZG90cyIsInN1YiI6Ikhvc3RfV2l0aC1NaXhlZC5DYXNlMDEiLCJjbmYiOnsiandrIjp7Imt0eSI6Ik9LUCIsImNydiI6IkVkMjU1MTkiLCJ4IjoieFdOOGp5Sk1OZlFaQ0lMdnhVbEg0WGtoNVYyWWFBeVJCR1VCM0pNV1YxVSJ9fSwiZ2VuIjoxODQ0Njc0NDA3MzcwOTU1MTYxNSwidmFsIjp7InN0YXJ0Ijo0Mjk0OTY3Mjk2LCJlbmQiOjQyOTQ5NjcyOTd9LCJyb2xlcyI6W119.hSUYXbJLGyL4t1ZA82dluhEPlgwfqWENHFEk_8oh60VsfFkZYnIYz41NvcyECkePyOrPg7cI_xgoIkTNZHM-CQ",
+    "certificateHash": "0cf0d4c1877b04462880104e445c9a97aca3ce3ebd82fd8efd9e56804af740b1",
+    "proofClaims": {
+      "iat": 1800000000,
+      "exp": 1800000060,
+      "jti": "AAECAwQFBgcICQoLDA0ODw",
+      "htm": "POST",
+      "htu": "https://upgradoor.net.with.dots.example/api/agent/v1/sync",
+      "bh": "LXEWQrcmsEQBYnyp-6wy9chTD7GQPMTbAiWHF5IaSIE"
+    },
+    "proofBody": "x",
+    "proof": "eyJhbGciOiJFZERTQSIsInR5cCI6InVwZ3JhZG9vci1wcm9vZitqd3QifQ.eyJpYXQiOjE4MDAwMDAwMDAsImV4cCI6MTgwMDAwMDA2MCwianRpIjoiQUFFQ0F3UUZCZ2NJQ1FvTERBME9EdyIsImh0bSI6IlBPU1QiLCJodHUiOiJodHRwczovL3VwZ3JhZG9vci5uZXQud2l0aC5kb3RzLmV4YW1wbGUvYXBpL2FnZW50L3YxL3N5bmMiLCJiaCI6IkxYRVdRcmNtc0VRQllueXAtNnd5OWNoVEQ3R1FQTVRiQWlXSEY1SWFTSUUifQ.0Qxi9uY-L87rFiGGFFxR-ybU4uAORx45Lfb8PDoM6x2kcRzwlE_W1EYoviPQe62IKM6GvA6sG_lt8uyy09MXBQ"
+  }
+]

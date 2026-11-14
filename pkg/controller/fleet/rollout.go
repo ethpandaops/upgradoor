@@ -1,0 +1,271 @@
+package fleet
+
+import (
+	"time"
+
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
+)
+
+// RolloutKind is the kind of cause a rollout groups needs by.
+type RolloutKind string
+
+// Rollout kinds.
+const (
+	// RolloutImage: one image reference moving to one digest.
+	RolloutImage RolloutKind = "image"
+	// RolloutPackages: one set of blocked package target versions.
+	RolloutPackages RolloutKind = "packages"
+	// RolloutReboot: hosts that report a reboot need.
+	RolloutReboot RolloutKind = "reboot"
+	// RolloutManual: a staggered roll or reboot of a selection requested by
+	// a person.
+	RolloutManual RolloutKind = "manual"
+)
+
+// RolloutState is the lifecycle state of a rollout.
+type RolloutState string
+
+// Rollout states. Completed, Superseded and Aborted are terminal.
+const (
+	// RolloutActive: hosts are being served (or waiting for budget, gate,
+	// approval or a pause to lift; see the plan for the reason).
+	RolloutActive RolloutState = "active"
+	// RolloutHalted: a host failed. Nothing more is granted for this cause
+	// until a person retries or the cause is superseded (a newer digest).
+	// For image rollouts this is what "the digest is blocked" means.
+	RolloutHalted RolloutState = "halted"
+	// RolloutCompleted: no member host has the need any more.
+	RolloutCompleted RolloutState = "completed"
+	// RolloutSuperseded: the cause changed (the tag moved to a newer digest,
+	// newer package versions appeared) before the rollout finished.
+	RolloutSuperseded RolloutState = "superseded"
+	// RolloutAborted: closed by a person. The same cause opens no new
+	// rollout until a person retries it or the cause changes.
+	RolloutAborted RolloutState = "aborted"
+)
+
+// Terminal reports whether no further transition is possible.
+func (s RolloutState) Terminal() bool {
+	return s == RolloutCompleted || s == RolloutSuperseded || s == RolloutAborted
+}
+
+// Rollout is a group of hosts that share one cause.
+type Rollout struct {
+	ID   string      `json:"id"`
+	Kind RolloutKind `json:"kind"`
+	// Key identifies the cause. At most one non-terminal rollout exists per
+	// key:
+	//   image:<image ref>@<to digest>
+	//   packages:<protocol.PackagesKey>
+	//   reboot
+	//   manual:<rollout id>
+	Key string `json:"key"`
+	// Title is a one-line description for people.
+	Title string `json:"title"`
+
+	// Image, Digest and Revision are set for image rollouts.
+	Image    string `json:"image,omitempty"`
+	Digest   string `json:"digest,omitempty"`
+	Revision string `json:"revision,omitempty"`
+	// Packages is set for packages rollouts.
+	Packages []protocol.PackageChange `json:"packages,omitempty"`
+
+	State RolloutState `json:"state"`
+	// Reason explains State halted / aborted / superseded.
+	Reason string `json:"reason,omitempty"`
+	// Paused stops new grants for this rollout only.
+	Paused bool `json:"paused"`
+	// Approved is set by a person for a rollout whose policy is manual.
+	Approved bool `json:"approved"`
+	// Force skips ordering and soak for this rollout (never the budget).
+	Force bool `json:"force"`
+	// IgnoreBudget additionally skips the budget and the network gate. It
+	// can only be set explicitly by a person and is audited.
+	IgnoreBudget bool `json:"ignoreBudget"`
+	// Canary is the first validator host granted in this rollout.
+	Canary string `json:"canary,omitempty"`
+
+	CreatedBy string     `json:"createdBy"`
+	CreatedAt time.Time  `json:"createdAt"`
+	UpdatedAt time.Time  `json:"updatedAt"`
+	EndedAt   *time.Time `json:"endedAt,omitempty"`
+
+	Hosts []RolloutHost `json:"hosts"`
+}
+
+// Host returns the member entry for a host name, or nil.
+func (r *Rollout) Host(name string) *RolloutHost {
+	for i := range r.Hosts {
+		if r.Hosts[i].Host == name {
+			return &r.Hosts[i]
+		}
+	}
+
+	return nil
+}
+
+// HostState is the state of one host inside a rollout.
+type HostState string
+
+// Host states inside a rollout.
+const (
+	// HostExpected: the controller expects the host to report the need (it
+	// runs the image at another digest) but it has not yet.
+	HostExpected HostState = "expected"
+	// HostPending: the need is reported; waiting for a slot.
+	HostPending HostState = "pending"
+	// HostLeased: a lease that includes this rollout's need is open.
+	HostLeased HostState = "leased"
+	// HostDone: served and ready, or the need disappeared by itself.
+	HostDone HostState = "done"
+	// HostFailed: the lease failed.
+	HostFailed HostState = "failed"
+	// HostSkipped: a person skipped the host for this rollout.
+	HostSkipped HostState = "skipped"
+)
+
+// Settled reports whether the host no longer blocks later stages.
+func (s HostState) Settled() bool {
+	return s == HostDone || s == HostSkipped
+}
+
+// Stage is the ordering class of a host inside a rollout. Stages run
+// strictly in order.
+type Stage int
+
+// Stages.
+const (
+	// StageNoValidators: hosts without validators that are not bootnodes.
+	StageNoValidators Stage = iota
+	// StageCanary: the first validator host, alone.
+	StageCanary
+	// StageBatches: the remaining validator hosts, as the budget allows.
+	StageBatches
+	// StageBootnodes: bootnodes, last and one at a time.
+	StageBootnodes
+)
+
+// RolloutHost is one member host of a rollout.
+type RolloutHost struct {
+	Host  string    `json:"host"`
+	State HostState `json:"state"`
+	Stage Stage     `json:"stage"`
+	// NeedID is the host's need served by this rollout, once reported.
+	NeedID  string `json:"needId,omitempty"`
+	LeaseID string `json:"leaseId,omitempty"`
+	// Error is the failure reason for HostFailed.
+	Error     string    `json:"error,omitempty"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// LeaseState is the lifecycle state of a lease.
+type LeaseState string
+
+// Lease states. Released, Failed and Expired are terminal. A host is
+// "holding a lease" in every non-terminal state.
+const (
+	// LeaseGranted: offered; the agent has not reported an operation yet.
+	LeaseGranted LeaseState = "granted"
+	// LeaseRunning: the agent reports a non-terminal phase.
+	LeaseRunning LeaseState = "running"
+	// LeaseVerifying: the agent reported done; the controller is waiting
+	// for its own readiness check (validators live for soakEpochs, or
+	// probes synced for hosts without validators).
+	LeaseVerifying LeaseState = "verifying"
+	// LeaseReleased: ready; the slot is free again.
+	LeaseReleased LeaseState = "released"
+	// LeaseFailed: the agent reported failed, went silent past the expiry,
+	// or readiness did not arrive in time.
+	LeaseFailed LeaseState = "failed"
+	// LeaseExpired: the agent never started and the lease ran out, or it
+	// finished without disrupting anything. Not a failure.
+	LeaseExpired LeaseState = "expired"
+)
+
+// Terminal reports whether the lease no longer holds a slot.
+func (s LeaseState) Terminal() bool {
+	return s == LeaseReleased || s == LeaseFailed || s == LeaseExpired
+}
+
+// Lease is a slot granted to one host.
+type Lease struct {
+	ID    string     `json:"id"`
+	Host  string     `json:"host"`
+	State LeaseState `json:"state"`
+	// Needs are the granted needs; Rollouts maps each need ID to the
+	// rollout it is served for.
+	Needs    []protocol.Need   `json:"needs"`
+	Rollouts map[string]string `json:"rollouts"`
+
+	// Weight is the host's validator weight at grant time; Charged is the
+	// part of it that was live at grant time, i.e. what the grant cost the
+	// budget.
+	Weight  uint64 `json:"weight"`
+	Charged uint64 `json:"charged"`
+	// Force: readiness is not awaited; the lease is released as soon as the
+	// agent reports done.
+	Force bool `json:"force"`
+	// GrantedBy is "scheduler" or the person behind a manual action.
+	GrantedBy string `json:"grantedBy"`
+
+	GrantedAt time.Time `json:"grantedAt"`
+	ExpiresAt time.Time `json:"expiresAt"`
+	// AgentDoneAt is when the agent first reported a terminal phase.
+	AgentDoneAt *time.Time `json:"agentDoneAt,omitempty"`
+	EndedAt     *time.Time `json:"endedAt,omitempty"`
+
+	// Operation is the agent's last report for this lease.
+	Operation *protocol.Operation `json:"operation,omitempty"`
+	// Readiness is a one-line progress note while verifying.
+	Readiness string `json:"readiness,omitempty"`
+	// Error is the failure reason for LeaseFailed.
+	Error string `json:"error,omitempty"`
+}
+
+// DirectiveState is the controller-side state of a directive.
+type DirectiveState string
+
+// Directive states.
+const (
+	DirectivePending   DirectiveState = "pending"  // sent until acknowledged
+	DirectiveAccepted  DirectiveState = "accepted" // agent took it
+	DirectiveRejected  DirectiveState = "rejected" // agent refused it
+	DirectiveCancelled DirectiveState = "cancelled"
+)
+
+// Directive is an instruction queued for one host.
+type Directive struct {
+	protocol.Directive
+
+	Host  string         `json:"host"`
+	State DirectiveState `json:"state"`
+	// RolloutID links a roll / reboot directive to its manual rollout.
+	RolloutID string    `json:"rolloutId,omitempty"`
+	Error     string    `json:"error,omitempty"`
+	CreatedBy string    `json:"createdBy"`
+	CreatedAt time.Time `json:"createdAt"`
+	UpdatedAt time.Time `json:"updatedAt"`
+}
+
+// AuditEntry is one line of the audit trail.
+type AuditEntry struct {
+	ID   int64     `json:"id"`
+	Time time.Time `json:"time"`
+	// Actor is the person's email (or token subject), "scheduler",
+	// "agent:<host>" or "anonymous" when the API runs open.
+	Actor string `json:"actor"`
+	// Action is a dotted verb: settings.update, action.roll, action.reboot,
+	// action.hold, action.unhold, action.pause, action.resume, action.skip,
+	// action.retry, action.abort, action.forget, host.registered,
+	// host.certificate-changed, lease.granted, lease.released, lease.failed,
+	// rollout.created, rollout.halted, rollout.completed, ...
+	Action string `json:"action"`
+	// Target is the host, rollout or setting the entry is about.
+	Target string `json:"target,omitempty"`
+	// Detail is free-form JSON; for changes it has "before" and "after".
+	Detail map[string]any `json:"detail,omitempty"`
+}
+
+// HostEvent is one line of a host's history (leases and their outcome),
+// derived from the audit trail entries whose target is the host.
+type HostEvent = AuditEntry
