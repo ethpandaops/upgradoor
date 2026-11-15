@@ -72,6 +72,10 @@ type Store interface {
 	ListLiveness(ctx context.Context, epochs int) ([]fleet.Liveness, error)
 	ListRollouts(ctx context.Context, filter store.RolloutFilter) ([]*fleet.Rollout, error)
 	ListLeases(ctx context.Context, filter store.LeaseFilter) ([]*fleet.Lease, error)
+	// GetRollout returns one rollout or store.ErrNotFound.
+	GetRollout(ctx context.Context, id string) (*fleet.Rollout, error)
+	// GetLease returns one lease or store.ErrNotFound.
+	GetLease(ctx context.Context, id string) (*fleet.Lease, error)
 
 	AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error
 	ListAudit(ctx context.Context, filter store.AuditFilter) ([]fleet.AuditEntry, error)
@@ -115,6 +119,10 @@ type Options struct {
 	// AuthProviderURL is the authenticatoor base URL. Empty means every user
 	// route is open and the audit actor is "anonymous".
 	AuthProviderURL string
+	// AuthService is the name of this service in the token's "services"
+	// claim: the token must have basic access to it, and the features that
+	// allow actions are features of it. Empty means DefaultAuthService.
+	AuthService string
 
 	Store     Store
 	Scheduler scheduler.Service
@@ -145,6 +153,10 @@ type Server struct {
 	handler    http.Handler
 	metrics    *metrics
 	users      *userAuth
+	// userRoutes lists the routes behind the user authentication, as
+	// "METHOD pattern". The route tests walk it, so a new route cannot miss
+	// them.
+	userRoutes []string
 
 	syncSlots            chan struct{}
 	inventorySlots       chan struct{}
@@ -193,6 +205,15 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 
 	opts.AuthProviderURL = strings.TrimRight(opts.AuthProviderURL, "/")
 
+	if opts.AuthService == "" {
+		opts.AuthService = DefaultAuthService
+	}
+
+	if !authServicePattern.MatchString(opts.AuthService) {
+		return nil, fmt.Errorf("api: auth service %q is not a service name "+
+			"([a-z0-9][a-z0-9_-]{0,62})", opts.AuthService)
+	}
+
 	publicURLs, err := normalizePublicURLs(opts.PublicURLs, opts.AllowInsecureAgentHTTP)
 	if err != nil {
 		return nil, err
@@ -211,7 +232,7 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		opts:           opts,
 		now:            opts.Now,
 		publicURLs:     publicURLs,
-		users:          newUserAuth(opts.AuthProviderURL, opts.Now),
+		users:          newUserAuth(opts.AuthProviderURL, opts.AuthService, opts.Now),
 		syncSlots:      make(chan struct{}, maxConcurrentSyncs),
 		inventorySlots: make(chan struct{}, maxConcurrentInventories),
 
@@ -331,17 +352,25 @@ func (s *Server) routes(ui http.Handler) http.Handler {
 	handle(http.MethodGet, "/api/v1/public/network", http.HandlerFunc(s.handlePublicNetwork))
 	handle(http.MethodGet, "/api/v1/public/history", http.HandlerFunc(s.handlePublicHistory))
 
-	handle(http.MethodGet, "/api/v1/hosts", s.user(s.handleHosts))
-	handle(http.MethodGet, "/api/v1/hosts/{name}", s.user(s.handleHost))
-	handle(http.MethodGet, "/api/v1/packages", s.user(s.handlePackages))
-	handle(http.MethodGet, "/api/v1/rollouts", s.user(s.handleRollouts))
-	handle(http.MethodGet, "/api/v1/plan", s.user(s.handlePlan))
-	handle(http.MethodGet, "/api/v1/settings", s.user(s.handleGetSettings))
-	handle(http.MethodPut, "/api/v1/settings", s.user(s.handlePutSettings))
-	handle(http.MethodGet, "/api/v1/audit", s.user(s.handleAudit))
+	// A userHandler can only be registered through here, behind the user
+	// authentication.
+	user := func(method, pattern string, handler userHandler) {
+		handle(method, pattern, s.user(handler))
+
+		s.userRoutes = append(s.userRoutes, method+" "+pattern)
+	}
+
+	user(http.MethodGet, "/api/v1/hosts", s.handleHosts)
+	user(http.MethodGet, "/api/v1/hosts/{name}", s.handleHost)
+	user(http.MethodGet, "/api/v1/packages", s.handlePackages)
+	user(http.MethodGet, "/api/v1/rollouts", s.handleRollouts)
+	user(http.MethodGet, "/api/v1/plan", s.handlePlan)
+	user(http.MethodGet, "/api/v1/settings", s.handleGetSettings)
+	user(http.MethodPut, "/api/v1/settings", s.handlePutSettings)
+	user(http.MethodGet, "/api/v1/audit", s.handleAudit)
 
 	for name, handler := range s.actions() {
-		handle(http.MethodPost, "/api/v1/actions/"+name, s.user(handler))
+		user(http.MethodPost, "/api/v1/actions/"+name, handler)
 	}
 
 	handle(http.MethodGet, "/healthz", http.HandlerFunc(s.handleHealthz))

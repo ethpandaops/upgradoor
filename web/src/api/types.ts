@@ -68,6 +68,8 @@ export interface Container {
   configuredImage?: string;
   custom?: boolean;
   registry?: RegistryCheck;
+  /** owners are the teams that own a managed container; absent when nobody does. */
+  owners?: string[];
 }
 
 /** protocol.ELHealth */
@@ -601,6 +603,8 @@ export interface Config {
   network: string;
   version: string;
   authProviderUrl: string;
+  /** authService is the controller's name in a token's "services" claim. */
+  authService: string;
 }
 
 /** api.PublicImageRef */
@@ -672,6 +676,12 @@ export interface HostSummary {
   holdWanted: boolean;
   /** holdReason is the reason of the controller hold (holdWanted); left out when there is none. */
   holdReason?: string;
+  /**
+   * holdBy says who set the controller hold: "team" for a hold set through a
+   * team feature, which a team feature may lift again, "staff" for every
+   * other hold. Left out when the host is not held.
+   */
+  holdBy?: 'team' | 'staff';
   verbs: List<Verb>;
   needs: List<Need>;
   plan: HostPlan;

@@ -7,6 +7,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller"
+	"github.com/ethpandaops/upgradoor/pkg/controller/api"
 	"github.com/ethpandaops/upgradoor/web"
 )
 
@@ -53,6 +54,9 @@ func newControllerCmd(log *logrus.Logger) *cobra.Command {
 		"take the client address from X-Forwarded-For (behind an ingress)")
 	f.StringVar(&cfg.AuthProviderURL, "auth-provider-url", "",
 		"authenticatoor URL, e.g. https://auth.<network>; empty leaves the API open")
+	f.StringVar(&cfg.AuthService, "auth-service", api.DefaultAuthService,
+		"name of this service in the token's services claim; "+
+			"its features (roll, team_roll, ...) are what allows actions")
 	f.StringArrayVar(&cfg.BeaconEndpoints, "beacon-endpoint", nil,
 		"beacon API base URL (repeatable; tried in order)")
 	f.StringArrayVar(&cfg.DefaultSettings, "default-setting", nil,

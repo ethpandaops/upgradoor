@@ -93,7 +93,10 @@ export function Header({
           </Badge>
         ) : authState.loggedIn ? (
           <>
-            <span className="hidden text-xs/5 text-muted sm:inline" title="Logged in as">
+            <span
+              className="hidden text-xs/5 text-muted sm:inline"
+              title={authState.teams.length > 0 ? `Logged in as; teams: ${authState.teams.join(', ')}` : 'Logged in as'}
+            >
               {authState.user ?? 'logged in'}
             </span>
             <Button

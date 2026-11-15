@@ -26,6 +26,7 @@ func (s *Server) handleConfig(w http.ResponseWriter, _ *http.Request) {
 		Network:         s.opts.Network,
 		Version:         s.opts.Version,
 		AuthProviderURL: s.opts.AuthProviderURL,
+		AuthService:     s.opts.AuthService,
 	})
 }
 

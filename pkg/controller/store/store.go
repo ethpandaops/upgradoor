@@ -173,6 +173,10 @@ type HostHold struct {
 	Host   string
 	Wanted bool
 	Reason string
+	// By is fleet.Host.HoldBy: fleet.HoldByTeam for a hold set through a team
+	// feature, empty for every other writer. It is not kept for a hold that
+	// is lifted.
+	By string
 }
 
 // Empty reports whether there is nothing to commit.

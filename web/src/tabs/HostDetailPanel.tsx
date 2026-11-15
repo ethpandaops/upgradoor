@@ -7,13 +7,14 @@ import { AuditTable } from '../components/AuditTable';
 import { Digest, ShortId } from '../components/Digest';
 import { LeaseTable } from '../components/LeaseTable';
 import { LivenessSparkline } from '../components/LivenessSparkline';
+import { ActionButton } from '../components/Permissions';
 import { RelTime } from '../components/RelTime';
-import { Badge, Button, Dash, Empty, ErrorBanner, Loading, Section, Table, Td, Th } from '../components/primitives';
+import { Badge, Dash, Empty, ErrorBanner, Loading, Section, Table, Td, Th } from '../components/primitives';
 import { NeedLine } from '../components/status';
 import { usePoll } from '../hooks/usePoll';
-import { buildHoldRequest } from '../lib/actionRequests';
 import { percentOf, shortRevision } from '../lib/format';
-import { rollableContainers } from './hostRows';
+import { holdIntent } from '../lib/intents';
+import { hostOwners, rollableContainers } from './hostRows';
 
 /**
  * HostDetailPanel is the expanded row of the Hosts table: all containers,
@@ -34,6 +35,7 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
   const history = list(h.history);
   const verbs = list(h.verbs);
   const held = h.holdWanted || h.hold.controller;
+  const owners = hostOwners(h);
 
   return (
     <div className="flex flex-col gap-3">
@@ -41,51 +43,33 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
 
       <div role="group" aria-label={`Actions for ${name}`} className="flex flex-wrap items-center gap-1.5">
         <span className="text-sm/6 font-semibold">{name}</span>
-        <Button
+        <ActionButton
           dense
           disabled={!verbs.includes('roll')}
-          onClick={() => {
-            onAction({ kind: 'roll', hosts: [name], all: false, containerChoices: rollableContainers([h]) });
-          }}
+          onAction={onAction}
+          intent={{ kind: 'roll', hosts: [name], all: false, containerChoices: rollableContainers([h]) }}
         >
           Roll…
-        </Button>
-        <Button
+        </ActionButton>
+        <ActionButton
           dense
           disabled={!verbs.includes('reboot')}
-          onClick={() => {
-            onAction({ kind: 'reboot', hosts: [name], all: false });
-          }}
+          onAction={onAction}
+          intent={{ kind: 'reboot', hosts: [name], all: false }}
         >
           Reboot…
-        </Button>
-        <Button
-          dense
-          onClick={() => {
-            const action = held ? 'unhold' : 'hold';
-            onAction({
-              kind: 'call',
-              title: `${held ? 'Unhold' : 'Hold'} ${name}`,
-              make: reason => ({ action, body: buildHoldRequest([name], reason) }),
-            });
-          }}
-        >
+        </ActionButton>
+        <ActionButton dense onAction={onAction} intent={holdIntent(held ? 'unhold' : 'hold', [name])}>
           {held ? 'Unhold…' : 'Hold…'}
-        </Button>
-        <Button
-          dense
-          variant="danger"
-          onClick={() => {
-            onAction({
-              kind: 'call',
-              title: `Forget ${name}`,
-              danger: true,
-              make: reason => ({ action: 'forget', body: buildHoldRequest([name], reason) }),
-            });
-          }}
-        >
+        </ActionButton>
+        <ActionButton dense variant="danger" onAction={onAction} intent={holdIntent('forget', [name])}>
           Forget…
-        </Button>
+        </ActionButton>
+        {owners.length > 0 && (
+          <span className="text-xs/5 text-muted" title="The teams that own a container of this host">
+            owners: {owners.join(', ')}
+          </span>
+        )}
       </div>
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-3">
@@ -122,7 +106,19 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
                 <Badge tone="warning">local hold file{h.hold.localReason ? `: ${h.hold.localReason}` : ''}</Badge>
               )}{' '}
               {h.hold.controller && (
-                <Badge tone="warning">controller hold{h.holdWanted && h.holdReason ? `: ${h.holdReason}` : ''}</Badge>
+                <Badge
+                  tone="warning"
+                  title={
+                    h.holdBy === 'team'
+                      ? 'Set through a team feature: a member of a team that owns a container of this host can lift it'
+                      : h.holdWanted
+                        ? 'Set by staff, the scheduler or the end of a lease: a team feature does not lift it'
+                        : undefined
+                  }
+                >
+                  controller hold{h.holdWanted && h.holdBy ? ` (${h.holdBy})` : ''}
+                  {h.holdWanted && h.holdReason ? `: ${h.holdReason}` : ''}
+                </Badge>
               )}{' '}
               {h.holdWanted !== h.hold.controller && (
                 <span className="text-muted">
@@ -300,6 +296,7 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
         <tr>
           <Th>Name</Th>
           <Th>Kind</Th>
+          <Th title="The teams that own the container: their members may roll it">Owners</Th>
           <Th>Image</Th>
           <Th>State</Th>
           <Th>Health</Th>
@@ -318,6 +315,7 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
             <tr key={c.id || c.name} className="hover:bg-surface-hover">
               <Td className="font-medium">{c.name}</Td>
               <Td>{c.kind ? c.kind.toUpperCase() : <Dash />}</Td>
+              <Td>{list(c.owners).length > 0 ? list(c.owners).join(', ') : <Dash />}</Td>
               <Td>
                 <span className="font-mono">{c.image}</span>
                 {c.custom && c.configuredImage && (

@@ -2066,10 +2066,31 @@ func skippedMembers(r *fleet.Rollout) []string {
 // retry retries a rollout as a person would, for all hosts or the named
 // ones. Every host the action names as retried is no longer skipped for the
 // rollout's key.
+//
+// A retry of the rollout lifts its halt. A retry of hosts lifts it only when
+// one of the hosts it retried had failed and no member is left failed; the
+// simulation does not take the scheduler's word
+// for that: it looks at the members itself, and tells the oracle that the
+// rollout was retried only when none is failed. A rollout that left its halt
+// with a failed member in it then fails the oracle's halt rule.
 func (s *sim) retry(r *fleet.Rollout, hosts []string) error {
 	res, err := s.svc.Retry(context.Background(), simActor, RolloutHostsRequest{Rollout: r.ID, Hosts: hosts})
 	if err == nil {
-		s.retried = append(s.retried, r.ID)
+		after, getErr := s.store.GetRollout(context.Background(), r.ID)
+		stillFailed := getErr == nil && slices.ContainsFunc(after.Hosts, func(m fleet.RolloutHost) bool {
+			return m.State == fleet.HostFailed
+		})
+
+		// What was retried is read off the rollout as it was before.
+		wasFailed := slices.ContainsFunc(res.Hosts, func(name string) bool {
+			m := r.Host(name)
+
+			return m != nil && m.State == fleet.HostFailed
+		})
+
+		if len(hosts) == 0 || (wasFailed && !stillFailed) {
+			s.retried = append(s.retried, r.ID)
+		}
 
 		for _, name := range res.Hosts {
 			if s.skipped[r.Key][name] {
@@ -2323,7 +2344,6 @@ func TestSimulation(t *testing.T) {
 			"budgeted validator grants without liveness": total.ProbeGrants,
 			"skipped hosts":                              total.Skips,
 			"skips taken back":                           total.SkipsLifted,
-			"skips carried over":                         total.SkipsCarried,
 			"repairs through the closed gate":            total.Repairs,
 			"members in the repair stage":                total.BrokenMembers,
 			"broken hosts granted first":                 total.BrokenFirst,
@@ -2361,6 +2381,7 @@ func TestSimulation(t *testing.T) {
 	if len(failed) == 0 && n >= 1000 {
 		for what, count := range map[string]int{
 			"runs that begin before genesis":                                                          total.BeforeGenesis,
+			"skips carried over":                                                                      total.SkipsCarried,
 			"restarts on rows of an earlier build":                                                    total.PreviousBuilds,
 			"hosts held back by the lease of an aborted rollout":                                      total.FlightAborted,
 			"hosts held back by a lease that was taken up again":                                      total.FlightReopened,

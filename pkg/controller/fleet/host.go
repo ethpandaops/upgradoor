@@ -44,7 +44,15 @@ type Host struct {
 	// into hold / release-hold directives until the agent agrees.
 	HoldWanted bool   `json:"holdWanted"`
 	HoldReason string `json:"holdReason,omitempty"`
+	// HoldBy says through what the hold was set: HoldByTeam when a person
+	// set it with a team feature, empty for every other hold (staff, the
+	// scheduler, the end of a lease, a build from before the field). A team
+	// feature lifts only a hold that was set through one.
+	HoldBy string `json:"holdBy,omitempty"`
 }
+
+// HoldByTeam is Host.HoldBy for a hold set through a team feature.
+const HoldByTeam = "team"
 
 // Weight is the number of validators the host operates.
 func (h *Host) Weight() uint64 { return h.Validators.Count() }

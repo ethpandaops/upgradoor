@@ -9,22 +9,29 @@
 //   ?mock=unreachable              an auth provider is configured but its
 //                                  client script cannot be loaded
 //   &gate=fail                     start with a failing network gate
+//   ?mock=auth&as=team             who the fake client is logged in as:
+//                                  staff (every feature), team (the team
+//                                  features, member of lighthouse) or reader
+//                                  (no feature); the header has the same switch
 //
 // The URL parameters work on the development server and in a VITE_MOCK build
 // only (see mode.ts). A normal build ignores them.
 
 import type { FetchFn } from '../api/client';
 import type { AuthTokenInfo, AuthenticatoorClient } from '../auth/authStore';
-import { MOCK_TOKEN, MockController } from './mockController';
+import { MOCK_AUTH_SERVICE, MOCK_LOGINS, MockController, mockHasFeature, type MockProfile } from './mockController';
 import type { MockMode } from './mode';
 
 export interface MockHandle {
   mode: MockMode;
   fetch: FetchFn;
   controller: MockController;
+  /** client is the fake auth client of auth mode. */
+  client?: FakeAuthenticatoor;
 }
 
 const LOGIN_KEY = 'upgradoor.mock.loggedIn';
+const PROFILE_KEY = 'upgradoor.mock.profile';
 const MOCK_USER = 'mock-user@example.org';
 
 function readLogin(): boolean {
@@ -43,22 +50,68 @@ function writeLogin(loggedIn: boolean): void {
   }
 }
 
-/** fakeAuthenticatoor stands in for <authProviderUrl>/client-v2.js. */
-export function fakeAuthenticatoor(initiallyLoggedIn: boolean = readLogin()): AuthenticatoorClient {
+function readProfile(): MockProfile {
+  try {
+    const stored = sessionStorage.getItem(PROFILE_KEY);
+    return isMockProfile(stored) ? stored : 'staff';
+  } catch {
+    return 'staff';
+  }
+}
+
+function writeProfile(profile: MockProfile): void {
+  try {
+    sessionStorage.setItem(PROFILE_KEY, profile);
+  } catch {
+    // Without storage the choice lasts until the page reloads.
+  }
+}
+
+/** isMockProfile reports whether a value names one of the mock's logins. */
+export function isMockProfile(value: unknown): value is MockProfile {
+  return typeof value === 'string' && Object.hasOwn(MOCK_LOGINS, value);
+}
+
+/** FakeAuthenticatoor is the fake auth client and the switch of who it is logged in as. */
+export interface FakeAuthenticatoor extends AuthenticatoorClient {
+  profile: () => MockProfile;
+  /** setProfile changes who is logged in: the next token, the features and the teams are that login's. */
+  setProfile: (profile: MockProfile) => void;
+}
+
+/**
+ * fakeAuthenticatoor stands in for <authProviderUrl>/client-v2.js. It is
+ * logged in as one of the mock's logins (staff unless told otherwise) and
+ * answers hasFeature and getTeams for it, like the real client does from the
+ * token.
+ */
+export function fakeAuthenticatoor(
+  initiallyLoggedIn: boolean = readLogin(),
+  initialProfile: MockProfile = readProfile()
+): FakeAuthenticatoor {
   let loggedIn = initiallyLoggedIn;
+  let profile = initialProfile;
   const listeners = new Set<(info: AuthTokenInfo) => void>();
+
+  const login = () => MOCK_LOGINS[profile];
 
   const info = (): AuthTokenInfo => ({
     status: loggedIn ? 'authenticated' : 'unauthenticated',
     authenticated: loggedIn,
     user: loggedIn ? MOCK_USER : '',
     exp: loggedIn ? Math.floor(Date.now() / 1000) + 3600 : 0,
+    teams: loggedIn ? [...login().teams] : [],
+    services: loggedIn ? `mock:${profile}` : '',
   });
+
+  const emit = () => {
+    for (const l of listeners) l(info());
+  };
 
   const set = (next: boolean) => {
     loggedIn = next;
     writeLogin(next);
-    for (const l of listeners) l(info());
+    emit();
   };
 
   return {
@@ -69,7 +122,7 @@ export function fakeAuthenticatoor(initiallyLoggedIn: boolean = readLogin()): Au
       listeners.delete(cb);
     },
     getStatus: () => Promise.resolve(info()),
-    getToken: () => Promise.resolve(loggedIn ? MOCK_TOKEN : null),
+    getToken: () => Promise.resolve(loggedIn ? login().token : null),
     login: () => {
       set(true);
       return Promise.resolve(true);
@@ -78,18 +131,30 @@ export function fakeAuthenticatoor(initiallyLoggedIn: boolean = readLogin()): Au
       set(false);
       return Promise.resolve();
     },
+    hasFeature: (service, feature) => loggedIn && service === MOCK_AUTH_SERVICE && mockHasFeature(login(), feature),
+    getTeams: () => (loggedIn ? [...login().teams] : []),
+    profile: () => profile,
+    setProfile: next => {
+      profile = next;
+      writeProfile(next);
+      emit();
+    },
   };
 }
 
 /** installMock creates the mock controller and, in auth mode, the fake auth client. */
 export function installMock(mode: MockMode, search: string): MockHandle {
   const controller = new MockController({ auth: mode !== 'open', latencyMs: 120 });
+  const params = new URLSearchParams(search);
+  let client: FakeAuthenticatoor | undefined;
 
-  if (new URLSearchParams(search).get('gate') === 'fail') controller.setGateFailing(true);
+  if (params.get('gate') === 'fail') controller.setGateFailing(true);
 
   if (mode === 'auth') {
-    window.ethpandaops = { ...window.ethpandaops, authenticatoor: fakeAuthenticatoor() };
+    const as = params.get('as');
+    client = isMockProfile(as) ? fakeAuthenticatoor(readLogin(), as) : fakeAuthenticatoor();
+    window.ethpandaops = { ...window.ethpandaops, authenticatoor: client };
   }
 
-  return { mode, fetch: controller.fetch, controller };
+  return { mode, fetch: controller.fetch, controller, client };
 }

@@ -85,6 +85,19 @@ one place to see which host runs what.
   rollouts, settings, the audit log and all actions need a token from the
   devnet's authenticatoor. `/metrics` is unauthenticated and carries host names
   and counts only; the helm chart keeps it off the Ingress.
+- **A token reads; a feature acts.** Every valid token may read. Each action
+  needs a feature of the service `upgradoor` in the token (`roll`, `reboot`,
+  `hold`, `recover`, `supervise`, `admin`), which the
+  authenticatoor's grants hand out and which nobody has by default. A client
+  team gets the team twins instead (`upgradoor:team_*`): its members may roll
+  the containers their team owns, and reboot, hold and recover the hosts on
+  which it owns one, always staggered and through the budget and the gate.
+  A team lifts only the holds it set itself, and retries its hosts, not
+  rollouts. `force`, "ignore budget", acting on the whole fleet, forgetting
+  hosts, the global pause and the settings need `admin`. Who owns a container is what the host's own
+  agent configuration says. The audit log records the teams of the login and
+  the feature that allowed each action. See
+  [docs/permissions.md](docs/permissions.md).
 
 Known limits of the model are listed in [docs/protocol.md](docs/protocol.md#limits).
 
@@ -95,6 +108,7 @@ Known limits of the model are listed in [docs/protocol.md](docs/protocol.md#limi
 | [docs/install.md](docs/install.md) | Rolling it out on a devnet: seed, Ansible roles, cluster config, watchtower, key rotation |
 | [docs/configuration.md](docs/configuration.md) | Controller flags, `agent.yaml`, settings, file locations, helm values |
 | [docs/operations.md](docs/operations.md) | Day-2 runbook: waiting reasons, halted rollouts, holds, manual actions, failure cases, metrics, troubleshooting |
+| [docs/permissions.md](docs/permissions.md) | Who may do what: features, team features and ownership, grants in the authenticatoor, the order to roll it out |
 | [docs/ui.md](docs/ui.md) | The web UI: tabs, what is public, actions and dialogs, mock mode |
 | [docs/protocol.md](docs/protocol.md) | Identity, sync and inventory, needs, leases, directives, errors, limits |
 | [docs/scheduler.md](docs/scheduler.md) | The scheduler's rule book: rollouts, budget, gate, ordering, readiness |
@@ -153,8 +167,8 @@ holdFile: .tmp/dev/$h/hold
 stateDir: .tmp/dev/$h/state
 verbs: [roll, packages, reboot]
 containers:
-  - {name: geth, kind: el, image: "ethpandaops/geth:master", stopTimeout: 5s}
-  - {name: lighthouse, kind: cl, image: "sigp/lighthouse:latest", stopTimeout: 5s}
+  - {name: geth, kind: el, image: "ethpandaops/geth:master", stopTimeout: 5s, owners: [geth]}
+  - {name: lighthouse, kind: cl, image: "sigp/lighthouse:latest", stopTimeout: 5s, owners: [lighthouse]}
 registry:
   pollInterval: 10s
 packages:
@@ -210,7 +224,11 @@ bin/upgradoor agent --config .tmp/dev/bootnode-1/agent.yaml --fake .tmp/dev/boot
 ```
 
 Open <http://127.0.0.1:8080>. Without `--auth-provider-url` the API is open, so
-every tab is visible without a login.
+every tab is visible and every action allowed without a login. To try the
+permissions, run the auth stub and start the controller with
+`--auth-provider-url http://127.0.0.1:18099`; `--services` and `--teams` of
+the stub choose who the login button logs in
+([docs/development.md](docs/development.md#auth-stub-and-fake-beacon)).
 
 Make something happen through the fake hosts' control endpoints:
 

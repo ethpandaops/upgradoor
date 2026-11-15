@@ -3,6 +3,7 @@ import { useId, useMemo, useState, type SyntheticEvent } from 'react';
 import { errorText } from '../api/client';
 import type { SettingsBody } from '../api/types';
 import { useApp } from '../appContext';
+import { usePermissions } from '../components/Permissions';
 import { Badge, Button, ErrorBanner, INPUT_CLASS, Loading, Table, Td, Th, cx } from '../components/primitives';
 import { usePoll } from '../hooks/usePoll';
 import {
@@ -63,6 +64,7 @@ function SettingsEditor({
 }) {
   const { api } = useApp();
   const formId = useId();
+  const mayWrite = usePermissions().can({ action: 'settings' });
 
   const [form, setForm] = useState<SettingsForm>(() => toForm(body.settings));
   const [saving, setSaving] = useState(false);
@@ -78,7 +80,7 @@ function SettingsEditor({
 
   const submit = async (e: SyntheticEvent) => {
     e.preventDefault();
-    if (invalid || dirty.length === 0 || saving) return;
+    if (invalid || dirty.length === 0 || saving || !mayWrite.allowed) return;
 
     setSaving(true);
     setSaveError(undefined);
@@ -175,7 +177,12 @@ function SettingsEditor({
       )}
 
       <div className="flex flex-wrap items-center gap-2">
-        <Button type="submit" variant="primary" disabled={invalid || dirty.length === 0 || saving}>
+        <Button
+          type="submit"
+          variant="primary"
+          disabled={invalid || dirty.length === 0 || saving || !mayWrite.allowed}
+          title={mayWrite.allowed ? undefined : mayWrite.reason}
+        >
           {saving ? 'Saving…' : 'Save'}
         </Button>
         <Button
@@ -191,11 +198,13 @@ function SettingsEditor({
           Reload
         </Button>
         <span role="status" className="text-xs/5 text-muted">
-          {dirty.length === 0
-            ? 'No unsaved changes.'
-            : invalid
-              ? 'Fix the marked fields to save.'
-              : `${dirty.length} unsaved ${dirty.length === 1 ? 'change' : 'changes'}. Every change is recorded in the audit log.`}
+          {!mayWrite.allowed
+            ? `Read only: ${mayWrite.reason}.`
+            : dirty.length === 0
+              ? 'No unsaved changes.'
+              : invalid
+                ? 'Fix the marked fields to save.'
+                : `${dirty.length} unsaved ${dirty.length === 1 ? 'change' : 'changes'}. Every change is recorded in the audit log.`}
         </span>
       </div>
     </form>

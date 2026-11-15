@@ -284,6 +284,40 @@ func (f *fakeStore) ListLeases(_ context.Context, filter store.LeaseFilter) ([]*
 	return out, nil
 }
 
+func (f *fakeStore) GetRollout(_ context.Context, id string) (*fleet.Rollout, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	for _, r := range f.rollouts {
+		if r.ID == id {
+			return r, nil
+		}
+	}
+
+	return nil, store.ErrNotFound
+}
+
+func (f *fakeStore) GetLease(_ context.Context, id string) (*fleet.Lease, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	for _, l := range f.leases {
+		if l.ID == id {
+			return l, nil
+		}
+	}
+
+	return nil, store.ErrNotFound
+}
+
 func (f *fakeStore) AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -371,6 +405,18 @@ type schedulerCall struct {
 	Name  string
 	Actor string
 	Req   any
+	// Auth is the authorization the call's context carried.
+	Auth scheduler.Authorization
+}
+
+// openAuth is the authorization of every call in open mode.
+var openAuth = scheduler.Authorization{By: authorizedByOpen}
+
+// authOf returns the authorization a scheduler call was made with.
+func authOf(ctx context.Context) scheduler.Authorization {
+	a, _ := scheduler.AuthorizationFrom(ctx)
+
+	return a
 }
 
 // fakeScheduler is a recording scheduler.Service.
@@ -440,11 +486,11 @@ func (f *fakeScheduler) Settings(context.Context) (fleet.Settings, error) {
 	return f.settings, f.settingsErr
 }
 
-func (f *fakeScheduler) UpdateSettings(_ context.Context, actor string, s fleet.Settings) error {
+func (f *fakeScheduler) UpdateSettings(ctx context.Context, actor string, s fleet.Settings) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.calls = append(f.calls, schedulerCall{Name: "settings", Actor: actor, Req: s})
+	f.calls = append(f.calls, schedulerCall{Name: "settings", Actor: actor, Req: s, Auth: authOf(ctx)})
 
 	if f.actionErr != nil {
 		return f.actionErr
@@ -455,11 +501,43 @@ func (f *fakeScheduler) UpdateSettings(_ context.Context, actor string, s fleet.
 	return nil
 }
 
-func (f *fakeScheduler) record(name, actor string, req any) (*scheduler.ActionResult, error) {
+// PatchSettings applies a patch to the fake's settings, like the scheduler:
+// nothing is recorded when nothing changes.
+func (f *fakeScheduler) PatchSettings(
+	ctx context.Context, actor string, apply func(*fleet.Settings) error,
+) (fleet.Settings, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.calls = append(f.calls, schedulerCall{Name: name, Actor: actor, Req: req})
+	if f.settingsErr != nil {
+		return fleet.Settings{}, false, f.settingsErr
+	}
+
+	next := f.settings
+	if err := apply(&next); err != nil {
+		return f.settings, false, err
+	}
+
+	if next == f.settings {
+		return f.settings, false, nil
+	}
+
+	f.calls = append(f.calls, schedulerCall{Name: "settings", Actor: actor, Req: next, Auth: authOf(ctx)})
+
+	if f.actionErr != nil {
+		return f.settings, false, f.actionErr
+	}
+
+	f.settings = next
+
+	return next, true, nil
+}
+
+func (f *fakeScheduler) record(ctx context.Context, name, actor string, req any) (*scheduler.ActionResult, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.calls = append(f.calls, schedulerCall{Name: name, Actor: actor, Req: req, Auth: authOf(ctx)})
 
 	if f.actionErr != nil {
 		return nil, f.actionErr
@@ -468,70 +546,70 @@ func (f *fakeScheduler) record(name, actor string, req any) (*scheduler.ActionRe
 	return f.result, nil
 }
 
-func (f *fakeScheduler) Roll(_ context.Context, actor string, req scheduler.RollRequest) (
+func (f *fakeScheduler) Roll(ctx context.Context, actor string, req scheduler.RollRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("roll", actor, req)
+	return f.record(ctx, "roll", actor, req)
 }
 
-func (f *fakeScheduler) Reboot(_ context.Context, actor string, req scheduler.RebootRequest) (
+func (f *fakeScheduler) Reboot(ctx context.Context, actor string, req scheduler.RebootRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("reboot", actor, req)
+	return f.record(ctx, "reboot", actor, req)
 }
 
-func (f *fakeScheduler) Hold(_ context.Context, actor string, req scheduler.HoldRequest) (
+func (f *fakeScheduler) Hold(ctx context.Context, actor string, req scheduler.HoldRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("hold", actor, req)
+	return f.record(ctx, "hold", actor, req)
 }
 
-func (f *fakeScheduler) Unhold(_ context.Context, actor string, req scheduler.HoldRequest) (
+func (f *fakeScheduler) Unhold(ctx context.Context, actor string, req scheduler.HoldRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("unhold", actor, req)
+	return f.record(ctx, "unhold", actor, req)
 }
 
-func (f *fakeScheduler) Pause(_ context.Context, actor string, req scheduler.ScopeRequest) (
+func (f *fakeScheduler) Pause(ctx context.Context, actor string, req scheduler.ScopeRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("pause", actor, req)
+	return f.record(ctx, "pause", actor, req)
 }
 
-func (f *fakeScheduler) Resume(_ context.Context, actor string, req scheduler.ScopeRequest) (
+func (f *fakeScheduler) Resume(ctx context.Context, actor string, req scheduler.ScopeRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("resume", actor, req)
+	return f.record(ctx, "resume", actor, req)
 }
 
-func (f *fakeScheduler) Skip(_ context.Context, actor string, req scheduler.RolloutHostsRequest) (
+func (f *fakeScheduler) Skip(ctx context.Context, actor string, req scheduler.RolloutHostsRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("skip", actor, req)
+	return f.record(ctx, "skip", actor, req)
 }
 
-func (f *fakeScheduler) Retry(_ context.Context, actor string, req scheduler.RolloutHostsRequest) (
+func (f *fakeScheduler) Retry(ctx context.Context, actor string, req scheduler.RolloutHostsRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("retry", actor, req)
+	return f.record(ctx, "retry", actor, req)
 }
 
-func (f *fakeScheduler) Abort(_ context.Context, actor string, req scheduler.ScopeRequest) (
+func (f *fakeScheduler) Abort(ctx context.Context, actor string, req scheduler.ScopeRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("abort", actor, req)
+	return f.record(ctx, "abort", actor, req)
 }
 
-func (f *fakeScheduler) Forget(_ context.Context, actor string, req scheduler.HoldRequest) (
+func (f *fakeScheduler) Forget(ctx context.Context, actor string, req scheduler.HoldRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("forget", actor, req)
+	return f.record(ctx, "forget", actor, req)
 }
 
-func (f *fakeScheduler) EndLease(_ context.Context, actor string, req scheduler.EndLeaseRequest) (
+func (f *fakeScheduler) EndLease(ctx context.Context, actor string, req scheduler.EndLeaseRequest) (
 	*scheduler.ActionResult, error,
 ) {
-	return f.record("end-lease", actor, req)
+	return f.record(ctx, "end-lease", actor, req)
 }
 
 func (f *fakeScheduler) recorded() []schedulerCall {

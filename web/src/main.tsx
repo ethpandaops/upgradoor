@@ -24,13 +24,22 @@ async function start(): Promise<void> {
     import.meta.env.DEV
   );
   if (mode) {
-    const handle = (await import('./mock/install')).installMock(mode, window.location.search);
+    const install = await import('./mock/install');
+    const handle = install.installMock(mode, window.location.search);
+    const client = handle.client;
     fetchFn = handle.fetch;
     mock = {
       label: mode === 'open' ? 'mock data' : `mock data (${mode})`,
       gateFailing: () => handle.controller.gateFailing,
       setGateFailing: failing => {
         handle.controller.setGateFailing(failing);
+      },
+      login: client && {
+        options: ['staff', 'team', 'reader'],
+        current: () => client.profile(),
+        set: profile => {
+          if (install.isMockProfile(profile)) client.setProfile(profile);
+        },
       },
     };
   }

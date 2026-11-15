@@ -13,8 +13,12 @@ import (
 	"github.com/sirupsen/logrus"
 )
 
-// serviceName is what this binary is, for the token's "services" claim.
-const serviceName = "upgradoor"
+// DefaultAuthService is the name this binary answers to in the token's
+// "services" claim unless Options.AuthService names another.
+const DefaultAuthService = "upgradoor"
+
+// authRealm is the realm of the WWW-Authenticate challenge.
+const authRealm = "upgradoor"
 
 // discoveryTimeout bounds the OIDC discovery request at start-up.
 const discoveryTimeout = 10 * time.Second
@@ -32,14 +36,32 @@ var (
 // Without a provider URL it is open.
 type userAuth struct {
 	providerURL string
-	now         func() time.Time
+	// service is the name of this service in the token's "services" claim.
+	service string
+	now     func() time.Time
 
 	mu       sync.RWMutex
 	verifier auth.Verifier
 }
 
-func newUserAuth(providerURL string, now func() time.Time) *userAuth {
-	return &userAuth{providerURL: providerURL, now: now}
+func newUserAuth(providerURL, service string, now func() time.Time) *userAuth {
+	return &userAuth{providerURL: providerURL, service: service, now: now}
+}
+
+// user is who makes an authenticated request, and what the token says they
+// may do.
+type user struct {
+	// actor is the audit name: the token's email, falling back to its
+	// subject, or "anonymous" in open mode.
+	actor string
+	// open is true when no auth provider is configured: everything is
+	// allowed.
+	open bool
+	// teams are the token's teams.
+	teams []string
+	// services is the token's "services" claim, the directive list the
+	// feature checks read.
+	services string
 }
 
 // open reports whether no provider is configured.
@@ -75,7 +97,7 @@ func (a *userAuth) start(ctx, refreshCtx context.Context, log logrus.FieldLogger
 		JWKSURL:          jwksURL,
 		ExpectedIssuer:   expectedIssuer,
 		ExpectedAudience: parentZone(a.providerURL),
-		ExpectedService:  serviceName,
+		ExpectedService:  a.service,
 		Now:              a.now,
 	})
 	if err != nil {
@@ -89,18 +111,23 @@ func (a *userAuth) start(ctx, refreshCtx context.Context, log logrus.FieldLogger
 	log.WithFields(logrus.Fields{
 		"issuer":   expectedIssuer,
 		"audience": parentZone(a.providerURL),
+		"service":  a.service,
 	}).Info("User authentication enabled")
 
 	return nil
 }
 
-// authenticate returns the audit actor for a request: the token's email,
-// falling back to its subject, or "anonymous" in open mode. The token is
-// taken from the Authorization header only, never from the URL, so it does
-// not end up in access logs.
-func (a *userAuth) authenticate(r *http.Request) (string, error) {
+// authenticate returns who makes a request. The audit actor is the token's
+// email, falling back to its subject, or "anonymous" in open mode. The token
+// is taken from the Authorization header only, never from the URL, so it
+// does not end up in access logs.
+//
+// A token that passes has basic access to this service (the verifier checks
+// the "services" claim for it), which is all a read needs. What else it may
+// do is decided per request by authorize.
+func (a *userAuth) authenticate(r *http.Request) (*user, error) {
 	if a.open() {
-		return actorAnonymous, nil
+		return &user{actor: actorAnonymous, open: true}, nil
 	}
 
 	a.mu.RLock()
@@ -108,25 +135,25 @@ func (a *userAuth) authenticate(r *http.Request) (string, error) {
 	a.mu.RUnlock()
 
 	if verifier == nil {
-		return "", errAuthNotReady
+		return nil, errAuthNotReady
 	}
 
 	scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
 	token = strings.TrimSpace(token)
 
 	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" {
-		return "", errUnauthenticated
+		return nil, errUnauthenticated
 	}
 
 	// An empty host would switch the verifier's host binding off.
 	host := stripPort(r.Host)
 	if host == "" {
-		return "", errUnauthenticated
+		return nil, errUnauthenticated
 	}
 
 	claims, err := verifier.Verify(token, auth.WithRequestHost(host))
 	if err != nil {
-		return "", fmt.Errorf("%w: %w", errUnauthenticated, err)
+		return nil, fmt.Errorf("%w: %w", errUnauthenticated, err)
 	}
 
 	actor := claims.Email
@@ -135,29 +162,36 @@ func (a *userAuth) authenticate(r *http.Request) (string, error) {
 	}
 
 	if actor == "" {
-		return "", errUnauthenticated
+		return nil, errUnauthenticated
 	}
 
-	return actor, nil
+	// The teams decide and are written into audit entries: a token with an
+	// unreasonable number of them is not a login.
+	if len(claims.Teams) > maxTokenTeams {
+		return nil, fmt.Errorf("%w: the token names %d teams, more than %d",
+			errUnauthenticated, len(claims.Teams), maxTokenTeams)
+	}
+
+	return &user{actor: actor, teams: claims.Teams, services: claims.Services}, nil
 }
 
-// userHandler is a handler for an authenticated route; actor is who asks.
-type userHandler func(w http.ResponseWriter, r *http.Request, actor string)
+// userHandler is a handler for an authenticated route; u is who asks.
+type userHandler func(w http.ResponseWriter, r *http.Request, u *user)
 
 // user guards a route with the user authentication.
 func (s *Server) user(next userHandler) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		actor, err := s.users.authenticate(r)
+		u, err := s.users.authenticate(r)
 
 		switch {
 		case err == nil:
-			next(w, r, actor)
+			next(w, r, u)
 		case errors.Is(err, errAuthNotReady):
 			w.Header().Set("Retry-After", "5")
 			s.writeError(w, http.StatusServiceUnavailable, errAuthNotReady.Error())
 		default:
 			s.log.WithError(err).WithField("path", r.URL.Path).Debug("Rejected user request")
-			w.Header().Set("WWW-Authenticate", `Bearer realm="upgradoor"`)
+			w.Header().Set("WWW-Authenticate", `Bearer realm="`+authRealm+`"`)
 			s.writeError(w, http.StatusUnauthorized, errUnauthenticated.Error())
 		}
 	}

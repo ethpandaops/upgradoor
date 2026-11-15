@@ -369,6 +369,8 @@ describe('MockController, broken hosts and leases that a person ends', () => {
           lease: id,
           state: 'running',
           reason: 'host taken away',
+          authorizedBy: 'open',
+          teams: [],
           hold: {
             before: { holdWanted: false, holdReason: '' },
             after: { holdWanted: true, holdReason: 'lease ended by operator' },
@@ -400,6 +402,8 @@ describe('MockController, broken hosts and leases that a person ends', () => {
       lease: id,
       state: 'verifying',
       reason: 'host taken away',
+      authorizedBy: 'open',
+      teams: [],
       hold: {
         before: { holdWanted: true, holdReason: 'mine' },
         after: { holdWanted: true, holdReason: 'mine; lease ended by operator' },

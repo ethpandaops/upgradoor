@@ -35,11 +35,14 @@ export function hostsIntent(
   action: 'skip' | 'retry',
   title: string,
   rollout: string,
-  hosts: readonly string[]
+  hosts: readonly string[],
+  /** rolloutState is the state of the rollout, for the permission to retry hosts of it. */
+  rolloutState?: string
 ): ActionIntent {
   return {
     kind: 'call',
     title,
+    rolloutState,
     make: reason => ({ action, body: buildRolloutHostsRequest(rollout, hosts, reason) }),
   };
 }
@@ -53,6 +56,7 @@ export function endLeaseIntent(lease: string, host: string): ActionIntent {
     kind: 'call',
     title: `End the lease of ${host}`,
     danger: true,
+    leaseHost: host,
     make: reason => ({ action: 'end-lease', body: buildEndLeaseRequest(lease, reason) }),
   };
 }

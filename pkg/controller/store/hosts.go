@@ -14,7 +14,7 @@ import (
 )
 
 const hostColumns = `name, cert_hash, generation, validators_start, validators_end, roles,
-	first_seen, last_seen, remote_addr, status, inventory_hash, hold_wanted, hold_reason`
+	first_seen, last_seen, remote_addr, status, inventory_hash, hold_wanted, hold_reason, hold_by`
 
 // RecordSync upserts the host named by the certificate subject. first_seen
 // is kept for a known host. With a nil Request only the identity, last_seen
@@ -269,7 +269,7 @@ func scanHost(row rowScanner) (*fleet.Host, error) {
 
 	err := row.Scan(&host.Name, &host.CertHash, &generation, &valStart, &valEnd, &roles,
 		&firstSeen, &lastSeen, &host.RemoteAddr, &status, &host.InventoryHash,
-		&host.HoldWanted, &host.HoldReason)
+		&host.HoldWanted, &host.HoldReason, &host.HoldBy)
 	if err != nil {
 		return nil, err
 	}
@@ -303,13 +303,14 @@ func scanHost(row rowScanner) (*fleet.Host, error) {
 	return &host, nil
 }
 
-// SetHostHold sets the controller-side hold switch. It returns ErrNotFound
+// SetHostHold sets the controller-side hold switch, as a hold that was not set
+// through a team feature (Changes.Holds can say otherwise). It returns ErrNotFound
 // for an unknown host.
 func (s *sqliteStore) SetHostHold(
 	ctx context.Context, name string, wanted bool, reason string,
 ) error {
 	err := s.write(ctx, func(tx *sql.Tx) error {
-		return setHostHold(ctx, tx, name, wanted, reason)
+		return setHostHold(ctx, tx, name, wanted, reason, "")
 	})
 	if err != nil {
 		return fmt.Errorf("store: set hold of %s: %w", name, err)
@@ -318,10 +319,18 @@ func (s *sqliteStore) SetHostHold(
 	return nil
 }
 
-func setHostHold(ctx context.Context, tx *sql.Tx, name string, wanted bool, reason string) error {
+// setHostHold writes the hold switch of a host. by is fleet.Host.HoldBy; a
+// host that is not held has none.
+func setHostHold(
+	ctx context.Context, tx *sql.Tx, name string, wanted bool, reason, by string,
+) error {
+	if !wanted {
+		by = ""
+	}
+
 	res, err := tx.ExecContext(ctx,
-		`UPDATE hosts SET hold_wanted = ?, hold_reason = ? WHERE name = ?`,
-		wanted, reason, name)
+		`UPDATE hosts SET hold_wanted = ?, hold_reason = ?, hold_by = ? WHERE name = ?`,
+		wanted, reason, by, name)
 	if err != nil {
 		return err
 	}

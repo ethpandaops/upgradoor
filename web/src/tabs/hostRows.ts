@@ -107,6 +107,7 @@ export function matchesFilter(row: HostRow, filter: string): boolean {
     row.cl?.image,
     row.cl?.digest,
     ...list(row.summary?.roles),
+    ...(row.summary ? hostOwners(row.summary) : []),
     row.summary ? (hostState(row)?.label ?? 'up to date') : undefined,
     row.summary?.plan.reason,
     row.summary?.hold.local ? 'local hold' : undefined,
@@ -189,6 +190,15 @@ export function sortHostRows(rows: readonly HostRow[], key: SortKey, direction: 
 
     return cmp !== 0 ? sign * cmp : collator.compare(a.name, b.name);
   });
+}
+
+/** hostOwners lists the teams that own a managed container of the host, sorted. */
+export function hostOwners(summary: Pick<HostSummary, 'containers'>): string[] {
+  const owners = new Set<string>();
+  for (const c of list(summary.containers)) {
+    if (c.managed) for (const owner of list(c.owners)) owners.add(owner);
+  }
+  return [...owners].sort();
 }
 
 /** rollableContainers lists the managed, non-custom container names of the given hosts. */

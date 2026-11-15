@@ -145,6 +145,14 @@ type Container struct {
 	// Registry is the last registry check for Image; nil for unmanaged and
 	// custom containers.
 	Registry *RegistryCheck `json:"registry,omitempty"`
+
+	// Owners are the teams that own a managed container, from the agent
+	// configuration: sorted, at most MaxOwners, each a team name (ValidOwner).
+	// Absent for unmanaged containers, for containers nobody owns and from
+	// agents built before the field existed. The controller authorizes the
+	// actions of team members with it and serves it to authenticated users
+	// only.
+	Owners []string `json:"owners,omitempty"`
 }
 
 // ShouldRun reports whether the container is meant to be running: it runs,

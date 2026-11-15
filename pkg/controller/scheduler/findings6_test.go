@@ -1387,9 +1387,20 @@ func TestReview6ALeaseTakenUpAgainLeasesItsFailedMemberAgain(t *testing.T) {
 	require.Equal(t, fleet.LeaseFailed, r.storedLease(lease).State)
 	require.Equal(t, fleet.RolloutHalted, r.rollout(rollout).State)
 
-	// Reopened for b alone: a stays failed.
+	// A retry that names only b no longer reopens the rollout: b did not
+	// fail, so nothing changes.
 	_, err := r.svc.Retry(r.ctx, "alice", RolloutHostsRequest{Rollout: rollout, Hosts: []string{"b"}})
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrInvalidAction)
+	require.Equal(t, fleet.RolloutHalted, r.rollout(rollout).State)
+
+	// An active rollout with a failed member is what an earlier build left
+	// behind after such a retry. The row is written as that build wrote it.
+	left := r.rollout(rollout)
+	left.State = fleet.RolloutActive
+	left.Reason = ""
+	require.NoError(t, r.store.Commit(r.ctx, &store.Changes{Rollouts: []*fleet.Rollout{left}}))
+	r.svc.hist = history{}
+
 	require.Equal(t, fleet.RolloutActive, r.rollout(rollout).State)
 	require.Equal(t, fleet.HostFailed, r.rollout(rollout).Host("a").State)
 

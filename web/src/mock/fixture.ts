@@ -270,6 +270,9 @@ function container(
       checkedAt: at(20 + (hash(`check/${host}/${name}`) % 240)),
       pulled: true,
     },
+    // A client's containers belong to the client's team (the validator
+    // client to the consensus client's); the tooling belongs to nobody.
+    owners: spec.kind === 'el' || spec.kind === 'cl' ? [spec.container] : undefined,
   };
 }
 

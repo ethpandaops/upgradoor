@@ -12,6 +12,9 @@ export interface AuthTokenInfo {
   authenticated: boolean;
   user: string;
   exp: number;
+  /** teams and services are the token's claims; a client from before they existed sends neither. */
+  teams?: string[];
+  services?: string;
 }
 
 /** The part of window.ethpandaops.authenticatoor (v2) this UI relies on. */
@@ -22,6 +25,14 @@ export interface AuthenticatoorClient {
   getToken: () => Promise<string | null>;
   login: () => Promise<unknown>;
   logout: () => Promise<unknown>;
+  /**
+   * hasFeature reports whether the current token grants a feature of a
+   * service, default-deny. An authenticatoor from before features serves a
+   * client without it: then the login has no feature.
+   */
+  hasFeature?: (service: string, feature: string) => boolean;
+  /** getTeams returns the current token's teams. */
+  getTeams?: () => string[];
 }
 
 declare global {
@@ -39,6 +50,19 @@ export interface AuthState {
   user: string | null;
   /** providerError is set when the auth client could not be loaded; the UI then stays public. */
   providerError: string | null;
+  /** teams are the teams of the login's token; empty when logged out and in open mode. */
+  teams: readonly string[];
+  /**
+   * services is the token's "services" claim as the client reported it. It
+   * is here so that a login whose grants changed is a new state; what the
+   * login may do is asked with AuthStore.hasFeature, never read from it.
+   */
+  services: string;
+}
+
+/** teamList keeps the strings of what a client reported as teams. */
+function teamList(teams: unknown): string[] {
+  return Array.isArray(teams) ? teams.filter((t): t is string => typeof t === 'string') : [];
 }
 
 /** canViewPrivate reports whether the authenticated views may be requested. */
@@ -64,7 +88,10 @@ export const loadScript: ScriptLoader = src =>
     document.head.appendChild(script);
   });
 
-const INITIAL: AuthState = { ready: false, enabled: false, loggedIn: false, user: null, providerError: null };
+/** NO_CLAIMS is the part of the state of somebody who is not logged in. */
+const NO_CLAIMS = { loggedIn: false, user: null, teams: [], services: '' } as const;
+
+const INITIAL: AuthState = { ready: false, enabled: false, providerError: null, ...NO_CLAIMS };
 
 export class AuthStore implements TokenSource {
   private state: AuthState = INITIAL;
@@ -99,11 +126,11 @@ export class AuthStore implements TokenSource {
 
   private async run(authProviderUrl: string): Promise<void> {
     if (!authProviderUrl) {
-      this.set({ ready: true, enabled: false, loggedIn: false, user: null, providerError: null });
+      this.set({ ready: true, enabled: false, providerError: null, ...NO_CLAIMS });
       return;
     }
 
-    const anonymous: AuthState = { ready: true, enabled: true, loggedIn: false, user: null, providerError: null };
+    const anonymous: AuthState = { ready: true, enabled: true, providerError: null, ...NO_CLAIMS };
 
     try {
       if (!window.ethpandaops?.authenticatoor) {
@@ -175,19 +202,45 @@ export class AuthStore implements TokenSource {
       console.error('auth: logout failed', err);
     });
     // React at once; the status event confirms it.
-    this.set({ ...this.state, loggedIn: false, user: null });
+    this.set({ ...this.state, ...NO_CLAIMS });
   }
+
+  // -------------------------------------------------------- permissions
+
+  /**
+   * hasFeature reports whether the login has a feature of a service, as far
+   * as the page can tell: everything in open mode, nothing while logged out,
+   * nothing when the auth client is too old to answer, and otherwise what
+   * the client reads from the token (default-deny). It decides what the page
+   * offers; the controller decides what happens.
+   */
+  hasFeature = (service: string, feature: string): boolean => {
+    if (!this.state.enabled) return this.state.ready;
+    if (!this.state.loggedIn || !this.client || typeof this.client.hasFeature !== 'function') return false;
+    try {
+      return this.client.hasFeature(service, feature);
+    } catch {
+      return false;
+    }
+  };
 
   // ----------------------------------------------------------- internal
 
   private applyStatus = (info: AuthTokenInfo): void => {
     // "refreshing" still reports authenticated while the old token is valid.
+    if (!info.authenticated) {
+      this.set({ ready: true, enabled: true, providerError: null, ...NO_CLAIMS });
+      return;
+    }
+
     this.set({
       ready: true,
       enabled: true,
-      loggedIn: info.authenticated,
-      user: info.authenticated ? info.user || null : null,
+      loggedIn: true,
+      user: info.user || null,
       providerError: null,
+      teams: teamList(info.teams ?? this.client?.getTeams?.()),
+      services: typeof info.services === 'string' ? info.services : '',
     });
   };
 
@@ -198,7 +251,9 @@ export class AuthStore implements TokenSource {
       prev.enabled === next.enabled &&
       prev.loggedIn === next.loggedIn &&
       prev.user === next.user &&
-      prev.providerError === next.providerError
+      prev.providerError === next.providerError &&
+      prev.services === next.services &&
+      prev.teams.join(',') === next.teams.join(',')
     ) {
       return;
     }

@@ -1,7 +1,6 @@
 package api
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -111,7 +110,7 @@ func (s *Server) writeBodyError(w http.ResponseWriter, err error) {
 }
 
 // handleHosts serves GET /api/v1/hosts.
-func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request, _ string) {
+func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request, _ *user) {
 	ctx := r.Context()
 
 	hosts, err := s.opts.Store.ListHosts(ctx)
@@ -140,7 +139,7 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request, _ string) {
 }
 
 // handleHost serves GET /api/v1/hosts/{name}.
-func (s *Server) handleHost(w http.ResponseWriter, r *http.Request, _ string) {
+func (s *Server) handleHost(w http.ResponseWriter, r *http.Request, _ *user) {
 	ctx := r.Context()
 	name := r.PathValue("name")
 
@@ -245,6 +244,7 @@ func hostSummary(
 		Stale:      host.Stale(now, staleAfter),
 		HoldWanted: host.HoldWanted,
 		HoldReason: host.HoldReason,
+		HoldBy:     holdBy(host),
 		Containers: []protocol.Container{},
 		Verbs:      []protocol.Verb{},
 		Needs:      []protocol.Need{},
@@ -272,6 +272,20 @@ func hostSummary(
 	return sum
 }
 
+// holdBy says for the host views who set the controller hold: "team" for a
+// hold set through a team feature, "staff" for every other hold, nothing for
+// a host that is not held.
+func holdBy(host *fleet.Host) string {
+	switch {
+	case !host.HoldWanted:
+		return ""
+	case host.HoldBy == fleet.HoldByTeam:
+		return fleet.HoldByTeam
+	default:
+		return holdByStaff
+	}
+}
+
 // nonNil returns an empty slice for nil, so JSON carries [] and not null.
 func nonNil[T any](in []T) []T {
 	if in == nil {
@@ -282,7 +296,7 @@ func nonNil[T any](in []T) []T {
 }
 
 // handlePackages serves GET /api/v1/packages.
-func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request, _ string) {
+func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request, _ *user) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	if len(query) < minPackageQuery || len(query) > maxPackageQuery {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf(
@@ -309,7 +323,7 @@ func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request, _ string
 }
 
 // handleRollouts serves GET /api/v1/rollouts.
-func (s *Server) handleRollouts(w http.ResponseWriter, r *http.Request, _ string) {
+func (s *Server) handleRollouts(w http.ResponseWriter, r *http.Request, _ *user) {
 	ctx := r.Context()
 
 	limit, err := queryLimit(r, defaultRolloutLimit, maxRolloutLimit)
@@ -374,7 +388,7 @@ func (s *Server) handleRollouts(w http.ResponseWriter, r *http.Request, _ string
 }
 
 // handlePlan serves GET /api/v1/plan.
-func (s *Server) handlePlan(w http.ResponseWriter, _ *http.Request, _ string) {
+func (s *Server) handlePlan(w http.ResponseWriter, _ *http.Request, _ *user) {
 	plan := s.opts.Scheduler.Plan()
 	if plan == nil {
 		s.writeJSON(w, http.StatusOK, scheduler.Plan{
@@ -398,7 +412,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, _ *http.Request, _ string) {
 }
 
 // handleGetSettings serves GET /api/v1/settings.
-func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request, _ string) {
+func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request, _ *user) {
 	settings, err := s.opts.Scheduler.Settings(r.Context())
 	if err != nil {
 		s.internalError(w, r, err)
@@ -412,92 +426,8 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request, _ str
 	})
 }
 
-// decodeSettings decodes a settings body onto settings: a key that the body
-// does not name keeps the value it has. So a client that does not know a
-// setting (a page of an earlier build) cannot reset it by leaving it out.
-// null is no value for any key.
-func decodeSettings(w http.ResponseWriter, r *http.Request, settings *fleet.Settings) error {
-	var given map[string]json.RawMessage
-	if err := decodeBody(w, r, &given); err != nil {
-		return err
-	}
-
-	if given == nil {
-		return badRequestf("invalid JSON body: the settings must be an object")
-	}
-
-	for key, value := range given {
-		if string(bytes.TrimSpace(value)) == "null" {
-			return badRequestf("invalid JSON body: %s must not be null", key)
-		}
-	}
-
-	raw, err := json.Marshal(given)
-	if err != nil {
-		return badRequestf("invalid JSON body: %s", err.Error())
-	}
-
-	// Onto a copy: a body that fails half way changes nothing.
-	next := *settings
-
-	dec := json.NewDecoder(bytes.NewReader(raw))
-	dec.DisallowUnknownFields()
-
-	if err := dec.Decode(&next); err != nil {
-		return badRequestf("invalid JSON body: %s", err.Error())
-	}
-
-	*settings = next
-
-	return nil
-}
-
-// handlePutSettings serves PUT /api/v1/settings. The body is applied to the
-// stored settings: every key it names is replaced, the others stay. The
-// result is validated as a whole; the scheduler stores and audits the change.
-func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request, actor string) {
-	ctx := r.Context()
-
-	settings, err := s.opts.Scheduler.Settings(ctx)
-	if err != nil {
-		s.internalError(w, r, err)
-
-		return
-	}
-
-	if err = decodeSettings(w, r, &settings); err != nil {
-		s.writeBodyError(w, err)
-
-		return
-	}
-
-	if err = settings.Validate(); err != nil {
-		s.writeError(w, http.StatusBadRequest, err.Error())
-
-		return
-	}
-
-	if err = s.opts.Scheduler.UpdateSettings(ctx, actor, settings); err != nil {
-		s.writeSchedulerError(w, r, err)
-
-		return
-	}
-
-	stored, err := s.opts.Scheduler.Settings(ctx)
-	if err != nil {
-		s.internalError(w, r, err)
-
-		return
-	}
-
-	s.writeJSON(w, http.StatusOK, SettingsBody{
-		Settings: stored,
-		Defaults: s.opts.DefaultSettings,
-	})
-}
-
 // handleAudit serves GET /api/v1/audit, newest first, paged by "before".
-func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, _ string) {
+func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, _ *user) {
 	q := r.URL.Query()
 
 	limit, err := queryLimit(r, defaultAuditLimit, maxAuditLimit)

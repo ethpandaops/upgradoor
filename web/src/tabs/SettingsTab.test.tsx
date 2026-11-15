@@ -173,8 +173,7 @@ describe('SettingsTab', () => {
     await user.clear(input);
     await user.type(input, '2');
 
-    // The session ends before the save: the controller answers 401.
-    await h.client?.logout();
+    // The token is no longer accepted when the save is sent: the controller answers 401.
     h.auth.getToken = () => Promise.resolve('stale-token');
 
     await user.click(screen.getByRole('button', { name: 'Save' }));

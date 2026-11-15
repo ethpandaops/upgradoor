@@ -91,6 +91,16 @@ post() {
         -H 'Content-Type: application/json' -X "${3:-POST}" -d "$2" "$ctl$1"
 }
 
+# expect_status STATUS TOKEN PATH BODY [METHOD]: a request by that login must
+# be answered with STATUS. The answer is left in $work/answer.json.
+expect_status() {
+    local got
+    got=$(curl -s -o "$work/answer.json" -w '%{http_code}' --max-time 10 \
+        -H "Authorization: Bearer $2" -H 'Content-Type: application/json' \
+        -X "${5:-POST}" -d "$4" "$ctl$3")
+    [ "$got" = "$1" ] || die "${5:-POST} $3 $4 answered $got, want $1: $(cat "$work/answer.json")"
+}
+
 # wait_until DESCRIPTION SECONDS COMMAND...: poll until the command succeeds.
 wait_until() {
     local what=$1 secs=$2 deadline
@@ -235,7 +245,15 @@ mkdir -p "$work/data"
 echo $! >"$work/controller.pid"
 wait_until "controller up" 30 curl -fsS "$ctl/healthz"
 
+# Three logins. The stub mints a staff token (every feature) unless told
+# otherwise; a member of the lighthouse team gets the team features only, and
+# a reader a token without any feature.
 token=$(curl -fsS "$auth/mint?email=e2e@example.com" | jq -r .token)
+team_token=$(curl -fsS -G "$auth/mint" --data-urlencode "email=lh@example.com" \
+    --data-urlencode "services=-all,+upgradoor,+upgradoor:team_*" \
+    --data-urlencode "teams=lighthouse" | jq -r .token)
+reader_token=$(curl -fsS -G "$auth/mint" --data-urlencode "email=reader@example.com" \
+    --data-urlencode "services=none" | jq -r .token)
 
 for i in $(seq 1 $nodes); do
     dir=$work/node-$i
@@ -263,9 +281,9 @@ stateDir: /var/lib/upgradoor
 # Only image rolls: this "host" shares the real machine's kernel.
 verbs: [roll]
 containers:
-  - {name: "$el", kind: el, image: "ethereum/client-go:v1.17.6", stopTimeout: 30s}
-  - {name: "$cl", kind: cl, image: "$image", stopTimeout: 30s}
-  - {name: "$vc", kind: vc, image: "$image", stopTimeout: 30s}
+  - {name: "$el", kind: el, image: "ethereum/client-go:v1.17.6", stopTimeout: 30s, owners: [geth]}
+  - {name: "$cl", kind: cl, image: "$image", stopTimeout: 30s, owners: [lighthouse]}
+  - {name: "$vc", kind: vc, image: "$image", stopTimeout: 30s, owners: [lighthouse]}
 registry:
   pollInterval: 10s
   plainHttp: ["$registry"]
@@ -339,6 +357,58 @@ jq_true /api/v1/hosts/node-1 --arg k "$kernel" \
     '.os.runningKernel == $k and (.inventory.packages | length) > 50 and .validators == 32' ||
     die "authenticated host detail incomplete"
 pass "authenticated host detail has kernel, packages and validator range"
+
+# --- permissions ---------------------------------------------------------------
+
+say "permissions: reader, team member, staff"
+jq_true /api/v1/hosts 'all(.hosts[];
+        ([.containers[] | select(.kind == "el") | .owners] == [["geth"]]) and
+        ([.containers[] | select(.kind == "cl") | .owners] == [["lighthouse"]]))' ||
+    die "the authenticated host view does not carry the owners of the agent configuration"
+grep -q owners "$work/public-hosts.json" "$work/public-images.json" &&
+    die "a public view carries owners"
+pass "owners reach the authenticated view and no public view"
+
+el1=$(container "el-1-geth-lighthouse")
+cl1=$(container "cl-1-lighthouse-geth")
+rollouts_before=$(api /api/v1/rollouts | jq '(.open + .recent) | length')
+audit_before=$(api "/api/v1/audit?action=action.&limit=1" | jq '.entries[0].id // 0')
+
+# A reader reads everything and changes nothing.
+[ "$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $reader_token" "$ctl/api/v1/hosts/node-1")" = 200 ] ||
+    die "a login without features cannot read"
+expect_status 403 "$reader_token" /api/v1/actions/hold '{"hosts":["node-3"]}'
+expect_status 403 "$reader_token" /api/v1/actions/roll '{"hosts":["node-3"]}'
+expect_status 403 "$reader_token" /api/v1/settings "$(api /api/v1/settings | jq .settings)" PUT
+
+# A lighthouse member rolls lighthouse, not geth, and not the host as a whole.
+expect_status 403 "$team_token" /api/v1/actions/roll "{\"hosts\":[\"node-1\"],\"containers\":[\"$el1\"]}"
+jq -e --arg c "$el1" '.error == "forbidden: upgradoor:team_roll does not cover container \($c) on host node-1 (owners: geth)"' \
+    "$work/answer.json" >/dev/null || die "the refusal does not name the container: $(cat "$work/answer.json")"
+expect_status 403 "$team_token" /api/v1/actions/roll '{"hosts":["node-1"]}'
+expect_status 403 "$team_token" /api/v1/actions/roll "{\"hosts\":[\"node-1\"],\"containers\":[\"$cl1\"],\"force\":true}"
+expect_status 403 "$team_token" /api/v1/actions/roll '{"all":true}'
+expect_status 403 "$team_token" /api/v1/actions/pause '{}'
+expect_status 403 "$team_token" /api/v1/actions/forget '{"hosts":["node-1"]}'
+expect_status 403 "$team_token" /api/v1/settings "$(api /api/v1/settings | jq .settings)" PUT
+
+[ "$(api /api/v1/rollouts | jq '(.open + .recent) | length')" = "$rollouts_before" ] ||
+    die "a refused request created a rollout"
+[ "$(api "/api/v1/audit?action=action.&limit=1" | jq '.entries[0].id // 0')" = "$audit_before" ] ||
+    die "a refused request was audited"
+jq_true /api/v1/hosts/node-1 '.holdWanted == false' || die "a refused request changed a host"
+pass "refusals: 403, nothing changed, nothing audited"
+
+# One owned container is enough for a host-level action.
+expect_status 200 "$team_token" /api/v1/actions/hold '{"hosts":["node-3"],"reason":"e2e: team hold"}'
+wait_until "node-3 reports the controller hold" 60 jq_true /api/v1/hosts/node-3 '.hold.controller == true'
+jq_true "/api/v1/audit?action=action.hold&limit=1" '.entries[0] |
+        .actor == "lh@example.com" and .target == "node-3" and
+        .detail.authorizedBy == "team_hold" and .detail.teams == ["lighthouse"]' ||
+    die "the team hold is not audited with the team and the feature"
+expect_status 200 "$team_token" /api/v1/actions/unhold '{"hosts":["node-3"],"reason":"e2e: team unhold"}'
+wait_until "node-3 hold lifted" 60 jq_true /api/v1/hosts/node-3 '.hold.controller == false'
+pass "a team member holds and releases a host of its team; the audit log says through which feature"
 
 wait_until "liveness known and gate open" 300 \
     jq_true /api/v1/plan '.gate.ok and .gate.network.livenessKnown and .gate.network.tracked == 128'
@@ -435,6 +505,13 @@ wait_until "manual roll of node-2 completed" 600 \
 post /api/v1/actions/hold '{"hosts":["node-4"],"reason":"e2e: hold"}' >/dev/null
 wait_until "node-4 reports the controller hold" 60 \
     jq_true /api/v1/hosts/node-4 '.hold.controller == true'
+
+# A hold of staff is not a team's to lift, also on a host of the team.
+jq_true /api/v1/hosts/node-4 '.holdBy == "staff"' || die "the staff hold is not shown as staff's"
+expect_status 403 "$team_token" /api/v1/actions/unhold '{"hosts":["node-4"]}'
+jq -e '.error == "forbidden: upgradoor:team_hold does not lift the hold on host node-4 (set by staff)"' \
+    "$work/answer.json" >/dev/null || die "the refusal does not say whose hold it is: $(cat "$work/answer.json")"
+jq_true /api/v1/hosts/node-4 '.holdWanted == true' || die "a team member lifted a staff hold"
 
 post /api/v1/actions/roll '{"all":true,"staggered":true,"reason":"e2e: staggered roll"}' \
     >"$work/action-roll-staggered.json"

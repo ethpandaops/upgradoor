@@ -3,6 +3,7 @@ import { Fragment, useMemo, useState } from 'react';
 import { list, type HostSummary } from '../api/types';
 import { useApp, useAuthState, usePrivateAccess } from '../appContext';
 import { useActions } from '../components/ActionDialog';
+import { ActionButton } from '../components/Permissions';
 import { RelTime } from '../components/RelTime';
 import {
   Badge,
@@ -27,6 +28,7 @@ import { holdIntent } from '../lib/intents';
 import { HostDetailPanel } from './HostDetailPanel';
 import {
   attestingShare,
+  hostOwners,
   hostState,
   matchesFilter,
   mergeHostRows,
@@ -163,53 +165,44 @@ export function HostsTab() {
                     Drop hidden
                   </Button>
                 )}
-                <Button
+                <ActionButton
                   dense
-                  onClick={() => {
-                    actions.request({
-                      kind: 'roll',
-                      hosts: selection,
-                      all: false,
-                      containerChoices: rollableContainers(selectedSummaries),
-                      hiddenHosts: hiddenSelection,
-                    });
+                  onAction={actions.request}
+                  intent={{
+                    kind: 'roll',
+                    hosts: selection,
+                    all: false,
+                    containerChoices: rollableContainers(selectedSummaries),
+                    hiddenHosts: hiddenSelection,
                   }}
                 >
                   Roll…
-                </Button>
-                <Button
+                </ActionButton>
+                <ActionButton
                   dense
-                  onClick={() => {
-                    actions.request({ kind: 'reboot', hosts: selection, all: false, hiddenHosts: hiddenSelection });
-                  }}
+                  onAction={actions.request}
+                  intent={{ kind: 'reboot', hosts: selection, all: false, hiddenHosts: hiddenSelection }}
                 >
                   Reboot…
-                </Button>
-                <Button
-                  dense
-                  onClick={() => {
-                    actions.request(holdIntent('hold', selection, hiddenSelection));
-                  }}
-                >
+                </ActionButton>
+                <ActionButton dense onAction={actions.request} intent={holdIntent('hold', selection, hiddenSelection)}>
                   Hold…
-                </Button>
-                <Button
+                </ActionButton>
+                <ActionButton
                   dense
-                  onClick={() => {
-                    actions.request(holdIntent('unhold', selection, hiddenSelection));
-                  }}
+                  onAction={actions.request}
+                  intent={holdIntent('unhold', selection, hiddenSelection)}
                 >
                   Unhold…
-                </Button>
-                <Button
+                </ActionButton>
+                <ActionButton
                   dense
                   variant="danger"
-                  onClick={() => {
-                    actions.request(holdIntent('forget', selection, hiddenSelection));
-                  }}
+                  onAction={actions.request}
+                  intent={holdIntent('forget', selection, hiddenSelection)}
                 >
                   Forget…
-                </Button>
+                </ActionButton>
                 <Button
                   dense
                   variant="ghost"
@@ -222,29 +215,27 @@ export function HostsTab() {
               </>
             ) : (
               <>
-                <Button
+                <ActionButton
                   dense
                   variant="ghost"
-                  onClick={() => {
-                    actions.request({
-                      kind: 'roll',
-                      hosts: [],
-                      all: true,
-                      containerChoices: rollableContainers(list(hosts.data?.hosts)),
-                    });
+                  onAction={actions.request}
+                  intent={{
+                    kind: 'roll',
+                    hosts: [],
+                    all: true,
+                    containerChoices: rollableContainers(list(hosts.data?.hosts)),
                   }}
                 >
                   Roll all hosts…
-                </Button>
-                <Button
+                </ActionButton>
+                <ActionButton
                   dense
                   variant="ghost"
-                  onClick={() => {
-                    actions.request({ kind: 'reboot', hosts: [], all: true });
-                  }}
+                  onAction={actions.request}
+                  intent={{ kind: 'reboot', hosts: [], all: true }}
                 >
                   Reboot all hosts…
-                </Button>
+                </ActionButton>
               </>
             )}
           </div>
@@ -419,6 +410,14 @@ function HostTableRow({
                   {role}
                 </Badge>
               ))}
+          {s && hostOwners(s).length > 0 && (
+            <span
+              className="rounded-sm border border-border px-1.5 text-xs/5 whitespace-nowrap text-muted"
+              title="Owners: the teams that own a container of this host"
+            >
+              {hostOwners(s).join(' · ')}
+            </span>
+          )}
         </span>
       </Td>
       <Td>

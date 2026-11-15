@@ -13,6 +13,7 @@ import {
 } from '../lib/actionRequests';
 import { hostList, plural } from '../lib/format';
 import { Dialog } from './Dialog';
+import { usePermissions } from './Permissions';
 import { Button, INPUT_CLASS, cx } from './primitives';
 
 /** What the operator asked for; the dialog turns it into one API call. */
@@ -40,6 +41,10 @@ type ActionIntentKind =
       /** make builds the call from the reason typed in the dialog. */
       make: (reason: string) => ActionCall;
       danger?: boolean;
+      /** leaseHost is the host of the lease an end-lease call is about; the permission to end it follows the host. */
+      leaseHost?: string;
+      /** rolloutState is the state of the rollout a retry is about: retrying an aborted one is no recovery of hosts. */
+      rolloutState?: string;
     };
 
 function intentTitle(intent: ActionIntent): string {
@@ -68,14 +73,19 @@ export function ActionDialog({
   onDone: (result: ActionResult) => void;
 }) {
   const { api } = useApp();
+  const permissions = usePermissions();
   const id = useId();
 
+  // Through a team feature alone the controller runs a roll or reboot
+  // staggered, whatever is asked: "now" is not offered then.
+  const mustStagger = intent.kind !== 'call' && permissions.canIntent(intent).staggered;
   const [timing, setTiming] = useState<Timing>(
-    intent.kind !== 'call' && (intent.all || intent.hosts.length > 1) ? 'staggered' : 'now'
+    intent.kind !== 'call' && (mustStagger || intent.all || intent.hosts.length > 1) ? 'staggered' : 'now'
   );
   const [force, setForce] = useState(false);
   const [ignoreBudget, setIgnoreBudget] = useState(false);
-  const [containers, setContainers] = useState<readonly string[]>([]);
+  // A login that may roll only some of the containers starts with those.
+  const [containers, setContainers] = useState<readonly string[]>(() => permissions.ownContainers(intent));
   const [reason, setReason] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(undefined);
@@ -128,6 +138,14 @@ export function ActionDialog({
   const hiddenHosts = intent.hiddenHosts ?? [];
   const danger = disruptive ? ignoreBudget : intent.danger === true;
 
+  // The same rule the controller applies to the call as it stands now.
+  const verdict = permissions.can(
+    call,
+    intent.kind === 'call' ? intent.leaseHost : undefined,
+    intent.kind === 'call' ? intent.rolloutState : undefined
+  );
+  const adminHint = permissions.admin ? '' : `; needs ${permissions.login.service}:admin`;
+
   const submit = async () => {
     setBusy(true);
     setError(undefined);
@@ -148,7 +166,12 @@ export function ActionDialog({
           <Button onClick={onClose} disabled={busy}>
             Cancel
           </Button>
-          <Button variant={danger ? 'danger' : 'primary'} onClick={() => void submit()} disabled={busy}>
+          <Button
+            variant={danger ? 'danger' : 'primary'}
+            onClick={() => void submit()}
+            disabled={busy || !verdict.allowed}
+            title={verdict.allowed ? undefined : verdict.reason}
+          >
             {busy ? 'Sending…' : danger && disruptive ? 'Confirm, ignoring the budget' : 'Confirm'}
           </Button>
         </>
@@ -174,11 +197,12 @@ export function ActionDialog({
             type="radio"
             name={`${id}-timing`}
             checked={timing === 'now'}
+            disabled={mustStagger}
             onChange={() => {
               setTiming('now');
             }}
             label="Now"
-            hint="as fast as budget and gate allow; no canary, no ready check between hosts"
+            hint={`as fast as budget and gate allow; no canary, no ready check between hosts${mustStagger ? adminHint : ''}`}
           />
           <Choice
             type="radio"
@@ -193,12 +217,12 @@ export function ActionDialog({
           <Choice
             type="checkbox"
             checked={timing === 'staggered' && force}
-            disabled={timing !== 'staggered'}
+            disabled={timing !== 'staggered' || !permissions.admin}
             onChange={() => {
               setForce(f => !f);
             }}
             label="Force"
-            hint="skip the order and the ready check (never the budget)"
+            hint={`skip the order and the ready check (never the budget)${adminHint}`}
           />
         </fieldset>
       )}
@@ -234,11 +258,12 @@ export function ActionDialog({
           <Choice
             type="checkbox"
             checked={ignoreBudget}
+            disabled={!permissions.admin}
             onChange={() => {
               setIgnoreBudget(v => !v);
             }}
             label={<span className="font-semibold text-danger">Ignore budget</span>}
-            hint="DANGEROUS: also skips the host limit and the network gate; audited"
+            hint={`DANGEROUS: also skips the host limit and the network gate; audited${adminHint}`}
           />
         </div>
       )}
@@ -269,12 +294,18 @@ export function ActionDialog({
             setReason(e.target.value);
           }}
           onKeyDown={e => {
-            if (e.key === 'Enter' && !busy && !danger) void submit();
+            if (e.key === 'Enter' && !busy && !danger && verdict.allowed) void submit();
           }}
           className={INPUT_CLASS}
           placeholder="why"
         />
       </label>
+
+      {!verdict.allowed && (
+        <p role="note" className="rounded-sm border border-warning bg-warning-subtle px-2 py-1 text-xs/5">
+          Not permitted: {verdict.reason}
+        </p>
+      )}
 
       {error !== undefined && (
         <p role="alert" className="rounded-sm border border-danger bg-danger-subtle px-2 py-1 text-xs/5 text-danger">

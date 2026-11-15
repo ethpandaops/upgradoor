@@ -365,7 +365,9 @@ func TestSettings(t *testing.T) {
 
 	calls := h.sched.recorded()
 	require.Len(t, calls, 1)
-	assert.Equal(t, schedulerCall{Name: "settings", Actor: actorAnonymous, Req: changed}, calls[0])
+	assert.Equal(t, schedulerCall{
+		Name: "settings", Actor: actorAnonymous, Req: changed, Auth: openAuth,
+	}, calls[0])
 
 	assert.Equal(t, changed, decodeJSON[SettingsBody](t, h.get("/api/v1/settings")).Settings)
 }
@@ -394,8 +396,8 @@ func TestSettingsPutKeepsWhatItDoesNotName(t *testing.T) {
 
 		calls := h.sched.recorded()
 		require.Len(t, calls, 1)
-		assert.Equal(t, schedulerCall{Name: "settings", Actor: actorAnonymous, Req: got}, calls[0],
-			"the scheduler gets, and audits, the whole set")
+		assert.Equal(t, schedulerCall{Name: "settings", Actor: actorAnonymous, Req: got, Auth: openAuth},
+			calls[0], "the scheduler gets, and audits, the whole set")
 
 		return got, h
 	}
@@ -432,9 +434,19 @@ func TestSettingsPutKeepsWhatItDoesNotName(t *testing.T) {
 		assert.Equal(t, want, got)
 	})
 
-	t.Run("no key changes nothing", func(t *testing.T) {
-		got, _ := put(t, `{}`)
-		assert.Equal(t, stored, got)
+	t.Run("no key, or only what is set already, changes nothing and reaches no audit entry", func(t *testing.T) {
+		same, err := json.Marshal(stored)
+		require.NoError(t, err)
+
+		for _, body := range []string{`{}`, string(same), `{"minPeers":5,"paused":true}`} {
+			h := newHarness(t, nil)
+			h.sched.set(func(f *fakeScheduler) { f.settings = stored })
+
+			rec := h.sendJSON(http.MethodPut, "/api/v1/settings", body)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			assert.Equal(t, stored, decodeJSON[SettingsBody](t, rec).Settings)
+			assert.Empty(t, h.sched.recorded(), body)
+		}
 	})
 
 	t.Run("a refused body changes nothing", func(t *testing.T) {
@@ -524,7 +536,7 @@ func TestSettingsErrors(t *testing.T) {
 		},
 		{
 			name: "unknown field", body: withField("maxUnavailable", "10"),
-			status: http.StatusBadRequest, contains: "unknown field",
+			status: http.StatusBadRequest, contains: `unknown setting "maxUnavailable"`,
 		},
 		{
 			name: "not json", body: "paused=true", status: http.StatusBadRequest,
@@ -550,12 +562,12 @@ func TestSettingsErrors(t *testing.T) {
 			status: http.StatusRequestEntityTooLarge, contains: "too large",
 		},
 		{
-			name: "scheduler refuses", body: string(valid),
+			name: "scheduler refuses", body: withField("minPeers", "7"),
 			schedErr: fmt.Errorf("%w: a rollout is running", scheduler.ErrInvalidAction),
 			status:   http.StatusConflict, contains: "a rollout is running",
 		},
 		{
-			name: "scheduler fails", body: string(valid),
+			name: "scheduler fails", body: withField("minPeers", "7"),
 			schedErr: errors.New("secret: database is locked"),
 			status:   http.StatusInternalServerError, contains: "internal error",
 		},

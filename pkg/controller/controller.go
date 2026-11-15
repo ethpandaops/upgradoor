@@ -51,6 +51,9 @@ type Config struct {
 	TrustForwardedHeaders bool
 	// AuthProviderURL is the authenticatoor base URL; empty runs the API open.
 	AuthProviderURL string
+	// AuthService is the name of this service in the token's "services"
+	// claim; empty means api.DefaultAuthService.
+	AuthService string
 	// BeaconEndpoints are beacon API base URLs, tried in order.
 	BeaconEndpoints []string
 	// DefaultSettings are "key=value" overrides of the built-in setting
@@ -132,6 +135,7 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		AllowInsecureAgentHTTP: cfg.AllowInsecureAgentHTTP,
 		TrustForwardedHeaders:  cfg.TrustForwardedHeaders,
 		AuthProviderURL:        cfg.AuthProviderURL,
+		AuthService:            cfg.AuthService,
 		Store:                  c.store,
 		Scheduler:              c.scheduler,
 		Beacon:                 c.beacon,

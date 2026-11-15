@@ -6,9 +6,10 @@ import type { ReactNode } from 'react';
 
 import { ApiClient, type FetchFn } from '../api/client';
 import { AppContext } from '../appContext';
-import { AuthStore, type AuthenticatoorClient } from '../auth/authStore';
-import { fakeAuthenticatoor } from '../mock/install';
-import { MOCK_AUTH_URL, MockController } from '../mock/mockController';
+import { AuthStore } from '../auth/authStore';
+import { PermissionsProvider } from '../components/Permissions';
+import { fakeAuthenticatoor, type FakeAuthenticatoor } from '../mock/install';
+import { MOCK_AUTH_SERVICE, MOCK_AUTH_URL, MockController, type MockProfile } from '../mock/mockController';
 
 export interface RecordedCall {
   method: string;
@@ -23,7 +24,7 @@ export interface Harness {
   auth: AuthStore;
   controller: MockController;
   /** client is the fake authenticatoor in auth mode. */
-  client: AuthenticatoorClient | null;
+  client: FakeAuthenticatoor | null;
   calls: RecordedCall[];
   /** userCalls are the recorded requests to non-public routes. */
   userCalls: () => RecordedCall[];
@@ -55,16 +56,18 @@ export function recordingFetch(inner: FetchFn, calls: RecordedCall[]): FetchFn {
  * mode "open": no auth provider. mode "auth": a fake authenticatoor client,
  * logged in or out.
  */
-export async function createHarness(opts: { mode?: 'open' | 'auth'; loggedIn?: boolean } = {}): Promise<Harness> {
+export async function createHarness(
+  opts: { mode?: 'open' | 'auth'; loggedIn?: boolean; profile?: MockProfile } = {}
+): Promise<Harness> {
   const mode = opts.mode ?? 'open';
   const controller = new MockController({ auth: mode === 'auth' });
   const calls: RecordedCall[] = [];
   const auth = new AuthStore(() => Promise.reject(new Error('no script loading in tests')));
   const api = new ApiClient({ fetch: recordingFetch(controller.fetch, calls), tokens: auth });
 
-  let client: AuthenticatoorClient | null = null;
+  let client: FakeAuthenticatoor | null = null;
   if (mode === 'auth') {
-    client = fakeAuthenticatoor(opts.loggedIn ?? false);
+    client = fakeAuthenticatoor(opts.loggedIn ?? false, opts.profile ?? 'staff');
     window.ethpandaops = { authenticatoor: client };
   }
 
@@ -86,6 +89,11 @@ export function renderWithApp(ui: ReactNode, h: Harness): RenderResult {
     network: 'mock-devnet-0',
     version: 'test',
     authProviderUrl: h.auth.getState().enabled ? MOCK_AUTH_URL : '',
+    authService: MOCK_AUTH_SERVICE,
   };
-  return render(<AppContext value={{ api: h.api, auth: h.auth, config }}>{ui}</AppContext>);
+  return render(
+    <AppContext value={{ api: h.api, auth: h.auth, config }}>
+      <PermissionsProvider>{ui}</PermissionsProvider>
+    </AppContext>
+  );
 }

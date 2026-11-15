@@ -70,6 +70,10 @@ type ManagedContainer struct {
 	Image string `yaml:"image"`
 	// StopTimeout is the grace period when stopping (default 300s).
 	StopTimeout time.Duration `yaml:"stopTimeout"`
+	// Owners are the teams that own the container: at most
+	// protocol.MaxOwners team names. The agent reports them; the controller
+	// lets a member of an owning team act on the container.
+	Owners []string `yaml:"owners"`
 }
 
 // DockerConfig locates the Docker daemon.
@@ -212,6 +216,29 @@ func (c *Config) Validate() error {
 		}
 		if !slices.Contains(kinds, m.Kind) {
 			return fmt.Errorf("container %q: unknown kind %q", m.Name, m.Kind)
+		}
+
+		if err := validateOwners(m.Owners); err != nil {
+			return fmt.Errorf("container %q: %w", m.Name, err)
+		}
+	}
+
+	return nil
+}
+
+// validateOwners checks the owners of one managed container.
+func validateOwners(owners []string) error {
+	if len(owners) > protocol.MaxOwners {
+		return fmt.Errorf("more than %d owners", protocol.MaxOwners)
+	}
+
+	for i, name := range owners {
+		if !protocol.ValidOwner(name) {
+			return fmt.Errorf("owner %q is not a team name ([a-z0-9][a-z0-9._-]{0,62})", name)
+		}
+
+		if slices.Contains(owners[:i], name) {
+			return fmt.Errorf("owner %q listed twice", name)
 		}
 	}
 

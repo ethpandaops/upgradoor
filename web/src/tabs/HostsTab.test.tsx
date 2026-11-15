@@ -271,7 +271,7 @@ describe('HostsTab rows', () => {
       within(table)
         .getAllByRole('row')
         .slice(1)
-        .map(r => r.querySelector('td:nth-child(3)')?.textContent);
+        .map(r => r.querySelector('td:nth-child(3) span span')?.textContent);
 
     await user.type(filter, 'silent');
     expect(hosts()).toEqual(['prysm-geth-3']);

@@ -114,8 +114,9 @@ func TestActions(t *testing.T) {
 
 			calls := h.sched.recorded()
 			require.Len(t, calls, 1)
-			assert.Equal(t, schedulerCall{Name: tt.action, Actor: actorAnonymous, Req: tt.want},
-				calls[0])
+			assert.Equal(t, schedulerCall{
+				Name: tt.action, Actor: actorAnonymous, Req: tt.want, Auth: openAuth,
+			}, calls[0])
 		})
 	}
 }

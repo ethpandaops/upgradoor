@@ -47,6 +47,10 @@ const (
 	secretPeerLayer     = "zzEL"
 	secretPauseReason   = "zz paused after the canary; resume to continue"
 	secretAuditActor    = "zz-admin@ethpandaops.io"
+	// Owners are team names; these two carry no "zz", so the catch-all below
+	// is not what finds them.
+	secretOwnerEL = "qq-stealth-el-team"
+	secretOwnerCL = "qq-stealth-cl-team"
 )
 
 var leakSecrets = []string{
@@ -56,7 +60,7 @@ var leakSecrets = []string{
 	secretHoldReason, secretVCImage, secretOtherImage, secretContainerID, secretImageID,
 	secretProbeError, secretRegistryError, secretBeaconError, secretLeaseError,
 	secretReadiness, secretPeerLayer, secretPauseReason,
-	secretAuditActor, "zz", "10.77.", "cluster.local",
+	secretAuditActor, secretOwnerEL, secretOwnerCL, "zz", "10.77.", "cluster.local",
 }
 
 // leakFixture fills the fakes with a host that carries every kind of data
@@ -73,7 +77,7 @@ func leakFixture(t *testing.T, h *harness) {
 				ImageID: secretImageID, Digest: "sha256:e1e1", Revision: "rev-geth-1",
 				Version: "1.16.4", State: "running", Health: "healthy", RestartCount: 2,
 				StartedAt: testEpoch.Add(-time.Hour), Managed: true, Kind: protocol.KindEL,
-				ConfiguredImage: "ethereum/client-go:stable",
+				ConfiguredImage: "ethereum/client-go:stable", Owners: []string{secretOwnerEL},
 				Registry: &protocol.RegistryCheck{
 					Digest: "sha256:e1e1", Revision: "rev-geth-1", CheckedAt: checked,
 					Pulled: true,
@@ -84,6 +88,7 @@ func leakFixture(t *testing.T, h *harness) {
 				ImageID: secretImageID, Digest: clDigest, Revision: "rev-lh-" + clDigest[7:],
 				State: "running", StartedAt: testEpoch.Add(-time.Hour), Managed: true,
 				Kind: protocol.KindCL, ConfiguredImage: "sigp/lighthouse:unstable",
+				Owners: []string{secretOwnerCL},
 				Registry: &protocol.RegistryCheck{
 					Digest: "sha256:c2c2", CheckedAt: checked, Error: secretRegistryError,
 				},
@@ -283,7 +288,7 @@ func TestPublicEndpointsLeakNothing(t *testing.T) {
 				"minParticipationPercent", "epochSeconds",
 			},
 		},
-		{path: "/api/v1/config", allowed: []string{"network", "version", "authProviderUrl"}},
+		{path: "/api/v1/config", allowed: []string{"network", "version", "authProviderUrl", "authService"}},
 	}
 
 	for _, withPlan := range []bool{true, false} {
@@ -336,6 +341,7 @@ func TestLeakFixtureIsVisibleToUsers(t *testing.T) {
 		secretKernelRunning, secretOSPretty, secretAddr, secretCertHash, secretPkgName,
 		secretPkgVersion, secretBlockedPkg, secretAgentVersion, secretHoldReason,
 		secretVCImage, secretOtherImage, secretLeaseError, secretAuditActor,
+		secretOwnerEL, secretOwnerCL,
 	} {
 		assert.Contains(t, raw, secret)
 	}
@@ -701,7 +707,7 @@ func TestConfig(t *testing.T) {
 
 	rec := h.get("/api/v1/config")
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, Config{Network: testNetwork, Version: "v1.2.3-test"},
+	assert.Equal(t, Config{Network: testNetwork, Version: "v1.2.3-test", AuthService: "upgradoor"},
 		decodeJSON[Config](t, rec))
 
 	h = newHarness(t, func(o *Options) { o.AuthProviderURL = "https://auth.testnet.example/" })
@@ -709,7 +715,7 @@ func TestConfig(t *testing.T) {
 	// Public routes work without Start and without a token.
 	assert.Equal(t, Config{
 		Network: testNetwork, Version: "v1.2.3-test",
-		AuthProviderURL: "https://auth.testnet.example",
+		AuthProviderURL: "https://auth.testnet.example", AuthService: "upgradoor",
 	}, decodeJSON[Config](t, h.get("/api/v1/config")))
 }
 

@@ -5,6 +5,7 @@ import type { Config } from './api/types';
 import { AppContext, useAuthState, type AppServices } from './appContext';
 import { canViewPrivate, type AuthState, type AuthStore } from './auth/authStore';
 import { Header } from './components/Header';
+import { PermissionsProvider } from './components/Permissions';
 import { NowProvider } from './components/RelTime';
 import { Badge, Button, Loading, cx } from './components/primitives';
 import { useHashTab } from './hooks/useHashTab';
@@ -31,11 +32,17 @@ const TAB_LABEL: Record<TabId, string> = {
 /** Overview and Hosts have a public view; the rest needs a login. */
 const PRIVATE_TABS: ReadonlySet<TabId> = new Set(['rollouts', 'packages', 'settings', 'audit']);
 
-/** MockControls lets the mock mode flip the network gate from the UI. */
+/** MockControls lets the mock mode flip the network gate and, with a fake auth client, the login from the UI. */
 export interface MockControls {
   label: string;
   gateFailing: () => boolean;
   setGateFailing: (failing: boolean) => void;
+  /** login switches who the fake auth client is logged in as (auth mode only). */
+  login?: {
+    options: readonly string[];
+    current: () => string;
+    set: (profile: string) => void;
+  };
 }
 
 type Boot = { phase: 'loading' } | { phase: 'failed'; error: unknown } | { phase: 'ready'; config: Config };
@@ -102,6 +109,7 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
   const { preference, setPreference } = useTheme();
   const [tab, setTab] = useHashTab<TabId>(TABS, 'overview');
   const [gateFailing, setGateFailing] = useState(() => mock?.gateFailing() ?? false);
+  const [mockLogin, setMockLogin] = useState(() => mock?.login?.current() ?? '');
   const tabRefs = useRef(new Map<TabId, HTMLButtonElement>());
 
   useEffect(() => {
@@ -165,18 +173,39 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
             mockLabel={mock?.label}
             extra={
               mock && (
-                <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
-                  <input
-                    type="checkbox"
-                    checked={gateFailing}
-                    onChange={e => {
-                      mock.setGateFailing(e.target.checked);
-                      setGateFailing(e.target.checked);
-                    }}
-                    className="accent-accent"
-                  />
-                  failing gate
-                </label>
+                <>
+                  <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
+                    <input
+                      type="checkbox"
+                      checked={gateFailing}
+                      onChange={e => {
+                        mock.setGateFailing(e.target.checked);
+                        setGateFailing(e.target.checked);
+                      }}
+                      className="accent-accent"
+                    />
+                    failing gate
+                  </label>
+                  {mock.login && (
+                    <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
+                      login as
+                      <select
+                        value={mockLogin}
+                        onChange={e => {
+                          mock.login?.set(e.target.value);
+                          setMockLogin(e.target.value);
+                        }}
+                        className="rounded-sm border border-border-strong bg-surface px-1 text-foreground"
+                      >
+                        {mock.login.options.map(option => (
+                          <option key={option} value={option}>
+                            {option}
+                          </option>
+                        ))}
+                      </select>
+                    </label>
+                  )}
+                </>
               )
             }
             nav={
@@ -228,7 +257,7 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
           />
 
           <main id="tab-panel" role="tabpanel" aria-labelledby={`tab-${tab}`} className="grow p-4">
-            {panel}
+            <PermissionsProvider>{panel}</PermissionsProvider>
           </main>
         </div>
       </NowProvider>

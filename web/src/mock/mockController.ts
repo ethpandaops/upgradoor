@@ -45,13 +45,61 @@ import {
 } from '../api/types';
 import { formatPercent } from '../lib/format';
 import { parseGoDuration } from '../lib/goDuration';
+import { TEAM_PREFIX, TWINNED, can, type Login, type PermissionCall } from '../lib/permissions';
 import { FIELDS, toForm, validateField } from '../lib/settingsForm';
 import { EPOCH_MS, SECONDS_PER_SLOT, SLOTS_PER_EPOCH, buildMockData, hash, hex, type MockData } from './fixture';
 
-/** The bearer token the mock auth client hands out. */
+/** The bearer token the mock auth client hands out to a staff login. */
 export const MOCK_TOKEN = 'mock-token';
 /** The auth provider URL the mock reports in auth mode. */
 export const MOCK_AUTH_URL = 'https://auth.mock.invalid';
+/** The service name the mock reports. */
+export const MOCK_AUTH_SERVICE = 'upgradoor';
+
+/** Who the fake auth client can be logged in as. */
+export type MockProfile = 'staff' | 'team' | 'reader';
+
+export interface MockLogin {
+  token: string;
+  /** features the token grants; "all" is a grant like upgradoor:all. */
+  features: 'all' | readonly string[];
+  teams: readonly string[];
+}
+
+/**
+ * The mock's logins: staff may do everything, the team member has the team
+ * features (a grant like upgradoor:team_*) and is in the lighthouse team, the
+ * reader has basic access only.
+ */
+export const MOCK_LOGINS: Record<MockProfile, MockLogin> = {
+  staff: { token: MOCK_TOKEN, features: 'all', teams: ['panda'] },
+  team: {
+    token: 'mock-token-team',
+    features: TWINNED.map(f => TEAM_PREFIX + f),
+    teams: ['lighthouse'],
+  },
+  reader: { token: 'mock-token-reader', features: [], teams: [] },
+};
+
+/** mockHasFeature is the feature check of a mock login. */
+export function mockHasFeature(login: MockLogin, feature: string): boolean {
+  return login.features === 'all' || login.features.includes(feature);
+}
+
+/** The actions the mock authorizes; any other name is no route. */
+const ACTIONS: readonly string[] = [
+  'roll',
+  'reboot',
+  'hold',
+  'unhold',
+  'forget',
+  'end-lease',
+  'pause',
+  'resume',
+  'abort',
+  'skip',
+  'retry',
+];
 
 const LIVENESS_EPOCHS = 16;
 /** The controller's default and maximum history window, in epochs. */
@@ -208,6 +256,8 @@ export class MockController {
   private readonly now: () => number;
   private readonly actor: () => string;
   private livenessUnsupported = false;
+  /** authorization is what allowed the request being served; its audit entries record it. */
+  private authorization: { authorizedBy: string; teams: string[] } | undefined;
 
   constructor(opts: MockOptions = {}) {
     this.now = opts.now ?? (() => Date.now());
@@ -279,9 +329,20 @@ export class MockController {
     }
 
     // Everything below is a user route.
+    let login: Login = { open: true, service: MOCK_AUTH_SERVICE, hasFeature: () => true, teams: [] };
+    this.authorization = undefined;
+
     if (this.auth) {
       const header = new Headers(init?.headers).get('Authorization');
-      if (header !== `Bearer ${MOCK_TOKEN}`) throw new HttpError(401, 'missing or invalid bearer token');
+      const known = Object.values(MOCK_LOGINS).find(l => header === `Bearer ${l.token}`);
+      if (!known) throw new HttpError(401, 'missing or invalid bearer token');
+
+      login = {
+        open: false,
+        service: MOCK_AUTH_SERVICE,
+        hasFeature: feature => mockHasFeature(known, feature),
+        teams: known.teams,
+      };
     }
 
     if (method === 'GET') {
@@ -303,14 +364,38 @@ export class MockController {
 
     const body: unknown = typeof init?.body === 'string' ? JSON.parse(init.body) : undefined;
 
-    if (method === 'PUT' && route === 'settings') return this.putSettings(body);
+    if (method === 'PUT' && route === 'settings') {
+      this.authorize(login, { action: 'settings' });
+      return this.putSettings(body);
+    }
 
     if (method === 'POST' && route.startsWith('actions/')) {
-      const result = this.action(route.slice('actions/'.length), body);
+      const name = route.slice('actions/'.length);
+      if (ACTIONS.includes(name)) this.authorize(login, { action: name, body } as PermissionCall);
+
+      const result = this.action(name, body);
       return result;
     }
 
     throw new HttpError(404, `no such route: ${method} ${path}`);
+  }
+
+  /**
+   * authorize refuses a request the login may not make, with the rule the
+   * controller uses, and remembers what allowed it for the audit entries.
+   */
+  private authorize(login: Login, call: PermissionCall): void {
+    const verdict = can(login, call, {
+      hosts: [...this.data.hosts.values()],
+      leaseHost: id => this.data.leases.find(l => l.id === id)?.host,
+      rolloutState: id => this.data.rollouts.find(r => r.id === id)?.state,
+    });
+    if (!verdict.allowed) throw new HttpError(403, `forbidden: ${verdict.reason}`);
+
+    // Through a team feature alone a roll or reboot is run staggered.
+    if (verdict.staggered && (call.action === 'roll' || call.action === 'reboot')) call.body.staggered = true;
+
+    this.authorization = { authorizedBy: verdict.by, teams: [...login.teams] };
   }
 
   // --------------------------------------------------------- chain view
@@ -920,6 +1005,7 @@ export class MockController {
       network: this.data.network,
       version: this.data.version,
       authProviderUrl: this.auth ? MOCK_AUTH_URL : '',
+      authService: MOCK_AUTH_SERVICE,
     };
   }
 
@@ -982,6 +1068,7 @@ export class MockController {
       hold: host.hold,
       holdWanted: host.holdWanted,
       holdReason: host.holdWanted ? host.holdReason : undefined,
+      holdBy: host.holdWanted ? (host.holdBy ?? 'staff') : undefined,
       verbs: host.verbs,
       needs: host.needs,
       plan: plan.hosts?.[host.name] ?? host.plan,
@@ -1093,7 +1180,10 @@ export class MockController {
       if (problem) throw new HttpError(400, `${spec.key} ${problem}`);
     }
 
+    // A body that changes nothing is no change and no entry in the audit log.
     const before = { ...this.data.settings };
+    if (JSON.stringify(before) === JSON.stringify(next)) return this.settingsBody();
+
     this.data.settings = next;
     this.log('settings.update', 'settings', { before, after: { ...next } });
 
@@ -1116,6 +1206,8 @@ export class MockController {
 
   private log(action: string, target: string, detail?: Record<string, unknown>, actor: string = this.actor()): void {
     const id = this.data.audit.reduce((max, e) => Math.max(max, e.id), 0) + 1;
+    // What a person did is recorded with what allowed it.
+    if (this.authorization && actor === this.actor()) detail = { ...detail, ...this.authorization };
     const entry: AuditEntry = { id, time: this.iso(this.now()), actor, action, target, detail };
     this.data.audit.push(entry);
   }
@@ -1283,6 +1375,16 @@ export class MockController {
         rejected[host.name] = 'only the local hold file is set; it can only be removed on the host';
         continue;
       }
+      // Lifting a hold that is not there changes nothing and is not audited.
+      if (action === 'unhold' && !host.holdWanted && !host.hold.controller) {
+        rejected[host.name] = 'the host is not held';
+        continue;
+      }
+      // A hold set through the team feature is a team's; a hold that staff
+      // set stays staff's when a team sets it again.
+      const viaTeam = this.authorization?.authorizedBy.startsWith(TEAM_PREFIX) === true;
+      const teams = viaTeam && (!host.holdWanted || host.holdBy === 'team');
+      host.holdBy = action === 'hold' ? (teams ? 'team' : 'staff') : undefined;
       host.holdWanted = action === 'hold';
       host.holdReason = action === 'hold' && req.reason ? req.reason : undefined;
       // The mock agent agrees at once.
@@ -1367,6 +1469,8 @@ export class MockController {
       if (!before.holdWanted || reason !== before.holdReason) {
         host.holdWanted = true;
         host.holdReason = reason;
+        // The end of a lease is staff's hold from here on.
+        host.holdBy = 'staff';
         // The mock agent agrees at once: a held host reports no needs.
         host.hold = { ...host.hold, controller: true };
         host.needs = [];
@@ -1579,6 +1683,24 @@ export class MockController {
 
     if (action === 'skip' && wanted.length === 0) throw new HttpError(400, 'skip needs at least one host');
 
+    // Reopening an aborted cause is about every host that has it.
+    if (action === 'retry' && r.state === 'aborted' && wanted.length > 0) {
+      throw new HttpError(
+        409,
+        `scheduler: invalid action: rollout ${r.id} is aborted; retrying it reopens its cause for every host, ` +
+          'so it takes no hosts'
+      );
+    }
+
+    // A retry of hosts that retries none of them changes nothing.
+    if (action === 'retry' && wanted.length > 0) {
+      const members = list(r.hosts);
+      if (!wanted.some(name => members.some(m => m.host === name && m.state === 'failed'))) {
+        const why = wanted.map(name => `${name} has neither failed nor been skipped in the rollout`).join('; ');
+        throw new HttpError(409, `scheduler: invalid action: no host could be retried: ${why}`);
+      }
+    }
+
     for (const m of list(r.hosts)) {
       if (wanted.length > 0 && !wanted.includes(m.host)) continue;
 
@@ -1606,7 +1728,16 @@ export class MockController {
       if (!list(r.hosts).some(m => m.host === name)) rejected[name] = 'not a member of the rollout';
     }
 
-    if (action === 'retry') {
+    // A retry of the rollout lifts its halt. A retry of hosts lifts it only
+    // when no member is left failed.
+    const stillFailed = list(r.hosts)
+      .filter(m => m.state === 'failed')
+      .map(m => m.host);
+    // (The mock retries failed hosts only and takes back no skip, so every
+    // retry of hosts retried a failure.)
+    const staysHalted = action === 'retry' && wanted.length > 0 && r.state === 'halted' && stillFailed.length > 0;
+
+    if (action === 'retry' && !staysHalted) {
       r.state = 'active';
       r.reason = undefined;
       r.endedAt = undefined;
@@ -1618,7 +1749,9 @@ export class MockController {
       message:
         action === 'skip'
           ? `Skipped ${applied.length} host(s) in: ${r.title}`
-          : `Rollout active again, ${applied.length} host(s) back to pending: ${r.title}`,
+          : staysHalted
+            ? `${applied.length} host(s) retried; the rollout stays halted: ${stillFailed.join(', ')} still failed`
+            : `Rollout active again, ${applied.length} host(s) back to pending: ${r.title}`,
       rollout: r.id,
       hosts: applied,
       rejected: Object.keys(rejected).length > 0 ? rejected : undefined,

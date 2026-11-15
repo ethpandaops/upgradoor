@@ -29,6 +29,9 @@ const (
 	// before and after of an audit entry.
 	keyHoldWanted = "holdWanted"
 	keyHoldReason = "holdReason"
+	// keyHoldBy says, in the after of a hold, that it was set through a team
+	// feature.
+	keyHoldBy = "holdBy"
 )
 
 // manualRequest is a roll or reboot request in one shape.
@@ -257,6 +260,24 @@ func (s *service) setHold(
 		return nil, err
 	}
 
+	// A request that was allowed through the team feature does not touch a
+	// hold that was not set through it. The API refuses that before it gets
+	// here; this is the same question asked again under the lock, against
+	// the holds as they are now. Nothing is changed when one host is refused.
+	if twin, ok := teamFeatureOf(ctx); ok {
+		for _, h := range hosts {
+			if h.HoldWanted && h.HoldBy != fleet.HoldByTeam {
+				verb := "lift"
+				if wanted {
+					verb = "change"
+				}
+
+				return nil, fmt.Errorf("%w: %s does not %s the hold on host %s (set by staff)",
+					ErrForbidden, twin, verb, h.Name)
+			}
+		}
+	}
+
 	action, reason := "action.unhold", ""
 	if wanted {
 		action, reason = "action.hold", req.Reason
@@ -265,10 +286,19 @@ func (s *service) setHold(
 	}
 
 	res := &ActionResult{}
+	notHeld := 0
 
 	// The store has no transaction over several hosts: when one fails, the
 	// earlier ones stay changed and audited, and the result names them.
 	for _, h := range hosts {
+		// Lifting a hold that is not there changes nothing and is no entry
+		// in the audit log.
+		if !wanted && !h.HoldWanted {
+			notHeld++
+
+			continue
+		}
+
 		if err := s.setHostHold(ctx, actor, action, h, wanted, reason, req.Reason); err != nil {
 			res.Message = fmt.Sprintf("stopped at %s; changed before it: %d host(s)", h.Name, len(res.Hosts))
 
@@ -285,6 +315,14 @@ func (s *service) setHold(
 	res.Message = fmt.Sprintf("hold lifted on %d host(s)", len(res.Hosts))
 	if wanted {
 		res.Message = fmt.Sprintf("%d host(s) on hold", len(res.Hosts))
+	}
+
+	if notHeld > 0 {
+		res.Message += fmt.Sprintf("; %d host(s) were not held", notHeld)
+	}
+
+	if len(res.Hosts) == 0 {
+		return res, nil
 	}
 
 	s.Nudge()
@@ -318,27 +356,81 @@ func (s *service) unholdAllowed(ctx context.Context, hosts []*fleet.Host) error 
 
 // setHostHold changes the hold switch of one host and audits it. A change
 // that could not be audited is taken back.
+//
+// A hold set by a request that was allowed through the team feature is
+// recorded as a team's (fleet.HoldByTeam), which is what lets a team feature
+// lift it again. A hold that is there already and is not a team's stays
+// staff's: a team cannot make a hold its own by setting it again.
 func (s *service) setHostHold(
 	ctx context.Context, actor, action string, h *fleet.Host, wanted bool, reason, given string,
 ) error {
-	if err := s.opts.Store.SetHostHold(ctx, h.Name, wanted, reason); err != nil {
+	by := ""
+	if wanted && throughTeamFeature(ctx) && (!h.HoldWanted || h.HoldBy == fleet.HoldByTeam) {
+		by = fleet.HoldByTeam
+	}
+
+	if err := s.writeHold(ctx, h.Name, wanted, reason, by); err != nil {
 		return fmt.Errorf("scheduler: set hold of %s: %w", h.Name, err)
 	}
 
 	err := s.appendAudit(ctx, s.entry(actor, action, h.Name, map[string]any{
-		keyBefore: map[string]any{keyHoldWanted: h.HoldWanted, keyHoldReason: h.HoldReason},
-		keyAfter:  map[string]any{keyHoldWanted: wanted, keyHoldReason: reason},
+		keyBefore: holdDetail(h.HoldWanted, h.HoldReason, h.HoldBy, false),
+		keyAfter:  holdDetail(wanted, reason, by, h.HoldBy != "" && wanted),
 		keyReason: given,
 	}))
 	if err == nil {
 		return nil
 	}
 
-	if undo := s.opts.Store.SetHostHold(ctx, h.Name, h.HoldWanted, h.HoldReason); undo != nil {
+	if undo := s.writeHold(ctx, h.Name, h.HoldWanted, h.HoldReason, h.HoldBy); undo != nil {
 		return errors.Join(err, fmt.Errorf("scheduler: restore hold of %s: %w", h.Name, undo))
 	}
 
 	return err
+}
+
+// holdDetail is the hold switch of a host in the before or after of an audit
+// entry. Whose hold it is stands in it for a team's hold; for a hold of
+// staff only where it says that a team's hold became staff's (tookOver).
+func holdDetail(wanted bool, reason, by string, tookOver bool) map[string]any {
+	detail := map[string]any{keyHoldWanted: wanted, keyHoldReason: reason}
+
+	switch {
+	case !wanted:
+	case by != "":
+		detail[keyHoldBy] = by
+	case tookOver:
+		detail[keyHoldBy] = holdByStaff
+	}
+
+	return detail
+}
+
+// staffHold returns the hold a host has to carry once a lease of it was
+// ended, and whether that is a change. The hold is staff's, whoever held the
+// host before and whatever the reason of that hold says: the decision is made
+// on the state of the hold (wanted, and whose it is), never on its text. The
+// text only gains the note that a lease was ended.
+func staffHold(h *fleet.Host) (hold store.HostHold, before, after map[string]any, changed bool) {
+	reason := endedHoldReason(h)
+	changed = !h.HoldWanted || h.HoldBy != "" || reason != h.HoldReason
+
+	return store.HostHold{Host: h.Name, Wanted: true, Reason: reason},
+		holdDetail(h.HoldWanted, h.HoldReason, h.HoldBy, false),
+		holdDetail(true, reason, "", h.HoldWanted && h.HoldBy != ""),
+		changed
+}
+
+// writeHold writes the hold switch of a host. Only a team's hold goes through
+// Commit, which can say whose it is; every other hold is written as before.
+func (s *service) writeHold(ctx context.Context, host string, wanted bool, reason, by string) error {
+	if by == "" || !wanted {
+		return s.opts.Store.SetHostHold(ctx, host, wanted, reason)
+	}
+
+	return s.opts.Store.Commit(ctx, &store.Changes{
+		Holds: []store.HostHold{{Host: host, Wanted: wanted, Reason: reason, By: by}},
+	})
 }
 
 // Pause pauses everything (no Rollout) or one rollout.
@@ -548,12 +640,25 @@ func (s *service) Skip(
 	})
 }
 
-// Retry reopens a halted rollout: the failed hosts (all, or the listed
-// ones) return to pending. A listed host that a person skipped returns to
-// pending as well. For an aborted rollout it lifts the block on the cause by
-// opening a new rollout for the same key; the aborted one stays closed. For
-// any other closed rollout it lifts the skips (all, or the listed hosts)
-// that still keep hosts from being served for its key.
+// Retry returns failed hosts of an open rollout to pending.
+//
+// Without hosts it is about the rollout: every failed member returns to
+// pending and a halted rollout is active again, also when no member is
+// failed.
+//
+// With hosts it is about those hosts: the named members that are failed, or
+// that a person skipped, return to pending. The rollout leaves its halt only
+// when one of the hosts returned to pending had failed and no member is
+// failed after that. A failed host that was not named keeps it halted, and
+// taking back a skip lifts no halt: a halt whose failed hosts were all
+// skipped is lifted by a retry of the rollout. When none of the named hosts could be retried nothing changes
+// and the action is refused, with the reason for each host.
+//
+// For an aborted rollout it lifts the block on the cause by opening a new
+// rollout for the same key; the aborted one stays closed. That is about every
+// host with the cause, so it takes no hosts. For any other closed rollout it
+// lifts the skips (all, or the listed hosts) that still keep hosts from
+// being served for its key.
 func (s *service) Retry(
 	ctx context.Context, actor string, req RolloutHostsRequest,
 ) (*ActionResult, error) {
@@ -566,6 +671,13 @@ func (s *service) Retry(
 	}
 
 	if r.State == fleet.RolloutAborted {
+		// Reopening a cause is about every host that has it. A request that
+		// names hosts asks for something else and is not half served.
+		if len(req.Hosts) > 0 {
+			return nil, fmt.Errorf("%w: rollout %s is aborted; retrying it reopens its cause for "+
+				"every host, so it takes no hosts", ErrInvalidAction, r.ID)
+		}
+
 		return s.retryAborted(ctx, actor, r, req.Reason)
 	}
 
@@ -574,6 +686,7 @@ func (s *service) Retry(
 	}
 
 	now := s.opts.Now()
+	retriedFailed := false
 	res := &ActionResult{Rollout: r.ID, Rejected: make(map[string]string, len(req.Hosts))}
 
 	for i := range r.Hosts {
@@ -586,6 +699,8 @@ func (s *service) Retry(
 			(!operatorSkipped(m) || !listed) {
 			continue
 		}
+
+		retriedFailed = retriedFailed || m.State == fleet.HostFailed
 
 		m.State = fleet.HostPending
 		m.Error = ""
@@ -600,22 +715,80 @@ func (s *service) Retry(
 		}
 	}
 
-	if len(res.Hosts) == 0 && r.State != fleet.RolloutHalted {
-		res.Message = "nothing to retry"
-
-		return res, fmt.Errorf("%w: rollout %s is %s and has no failed host to retry",
-			ErrInvalidAction, r.ID, r.State)
-	}
-
 	before := map[string]any{keyState: r.State, keyReason: r.Reason}
-	r.State = fleet.RolloutActive
-	r.Reason = ""
-	res.Message = fmt.Sprintf("rollout reopened, %d host(s) retried", len(res.Hosts))
+
+	if len(req.Hosts) > 0 {
+		// A retry of hosts is about those hosts. When none of them could be
+		// retried nothing changes; and the rollout leaves its halt only when
+		// no member is left failed: somebody else's failed host keeps it
+		// halted.
+		if len(res.Hosts) == 0 {
+			res.Message = "no host could be retried: " + rejectedList(req.Hosts, res.Rejected)
+
+			return res, fmt.Errorf("%w: %s", ErrInvalidAction, res.Message)
+		}
+
+		res.Message = fmt.Sprintf("%d host(s) retried", len(res.Hosts))
+
+		// The halt is lifted by retrying what failed: at least one of the
+		// retried hosts was failed, and none is failed now. Taking back a
+		// skip retries no failure; a halt whose failed hosts were all skipped
+		// is lifted by a retry of the rollout.
+		switch failed := failedMembers(r); {
+		case r.State != fleet.RolloutHalted:
+		case len(failed) > 0:
+			res.Message += fmt.Sprintf("; the rollout stays halted: %s still failed",
+				strings.Join(failed, ", "))
+		case !retriedFailed:
+			res.Message += "; the rollout stays halted: none of the retried hosts had failed " +
+				"(retry the rollout to lift its halt)"
+		default:
+			r.State = fleet.RolloutActive
+			r.Reason = ""
+		}
+	} else {
+		if len(res.Hosts) == 0 && r.State != fleet.RolloutHalted {
+			res.Message = "nothing to retry"
+
+			return res, fmt.Errorf("%w: rollout %s is %s and has no failed host to retry",
+				ErrInvalidAction, r.ID, r.State)
+		}
+
+		r.State = fleet.RolloutActive
+		r.Reason = ""
+		res.Message = fmt.Sprintf("rollout reopened, %d host(s) retried", len(res.Hosts))
+	}
 
 	return res, s.commitRollout(ctx, actor, "action.retry", r, map[string]any{
 		keyHosts: res.Hosts, keyBefore: before,
 		keyAfter: map[string]any{keyState: r.State}, keyReason: req.Reason,
 	})
+}
+
+// failedMembers names the members of a rollout that are failed.
+func failedMembers(r *fleet.Rollout) []string {
+	failed := make([]string, 0, len(r.Hosts))
+
+	for i := range r.Hosts {
+		if r.Hosts[i].State == fleet.HostFailed {
+			failed = append(failed, r.Hosts[i].Host)
+		}
+	}
+
+	return failed
+}
+
+// rejectedList writes why each named host was rejected, in the order given.
+func rejectedList(hosts []string, rejected map[string]string) string {
+	parts := make([]string, 0, len(hosts))
+
+	for _, name := range hosts {
+		if why, ok := rejected[name]; ok {
+			parts = append(parts, name+" "+why)
+		}
+	}
+
+	return strings.Join(parts, "; ")
 }
 
 // retrySkipped lifts the skips a closed rollout still holds for its key.
@@ -854,7 +1027,7 @@ func (s *service) EndLease(
 	}
 
 	again := l.Cancelled != nil
-	if again && (host == nil || host.HoldWanted) {
+	if again && (host == nil || (host.HoldWanted && host.HoldBy == "")) {
 		return &ActionResult{
 			Message: fmt.Sprintf("lease %s of %s was already ended by %s; it is open until the agent reports",
 				l.ID, l.Host, l.Cancelled.By),
@@ -882,12 +1055,11 @@ func (s *service) EndLease(
 	}
 
 	if host != nil {
-		if reason := endedHoldReason(host); !host.HoldWanted || reason != host.HoldReason {
-			changes.Holds = []store.HostHold{{Host: l.Host, Wanted: true, Reason: reason}}
-			detail["hold"] = map[string]any{
-				keyBefore: map[string]any{keyHoldWanted: host.HoldWanted, keyHoldReason: host.HoldReason},
-				keyAfter:  map[string]any{keyHoldWanted: true, keyHoldReason: reason},
-			}
+		// The hold of an ended lease is staff's. A hold that a team set
+		// before becomes staff's here, in the commit of the cancel.
+		if hold, before, after, changed := staffHold(host); changed {
+			changes.Holds = []store.HostHold{hold}
+			detail["hold"] = map[string]any{keyBefore: before, keyAfter: after}
 		}
 
 		if host.HoldWanted {

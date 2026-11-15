@@ -204,6 +204,7 @@ func (s *fakeStore) recordSync(h *fleet.Host) (adopted bool) {
 		c.FirstSeen = old.FirstSeen
 		c.HoldWanted = old.HoldWanted
 		c.HoldReason = old.HoldReason
+		c.HoldBy = old.HoldBy
 	} else {
 		c.FirstSeen = h.LastSeen
 
@@ -325,6 +326,7 @@ func (s *fakeStore) SetHostHold(_ context.Context, name string, wanted bool, rea
 
 	h.HoldWanted = wanted
 	h.HoldReason = reason
+	h.HoldBy = ""
 
 	return nil
 }
@@ -503,6 +505,11 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 	for _, hold := range ch.Holds {
 		s.hosts[hold.Host].HoldWanted = hold.Wanted
 		s.hosts[hold.Host].HoldReason = hold.Reason
+		s.hosts[hold.Host].HoldBy = ""
+
+		if hold.Wanted {
+			s.hosts[hold.Host].HoldBy = hold.By
+		}
 	}
 
 	for _, r := range ch.Rollouts {

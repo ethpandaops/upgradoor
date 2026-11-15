@@ -352,7 +352,7 @@ func (s *sqliteStore) Commit(ctx context.Context, changes *Changes) error {
 		}
 
 		for _, hold := range changes.Holds {
-			if err := setHostHold(ctx, tx, hold.Host, hold.Wanted, hold.Reason); err != nil {
+			if err := setHostHold(ctx, tx, hold.Host, hold.Wanted, hold.Reason, hold.By); err != nil {
 				return fmt.Errorf("hold of %s: %w", hold.Host, err)
 			}
 		}

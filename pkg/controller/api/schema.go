@@ -35,7 +35,10 @@
 //	GET  /healthz
 //
 // "user" routes need a bearer token from the authenticatoor when
-// --auth-provider-url is set and are open otherwise. The public routes are
+// --auth-provider-url is set and are open otherwise. Every such token may
+// read; PUT and POST need a feature of this service in the token, or its
+// team twin for targets a team of the token owns (authz.go, actions.go), and
+// are answered 403 without it. The public routes are
 // the only unauthenticated view of host data and must never carry package
 // versions, kernels, OS details, addresses or anything else not listed in
 // their types.
@@ -62,6 +65,10 @@ type Config struct {
 	// AuthProviderURL is the authenticatoor base URL; empty means the API is
 	// open and the UI shows everything without a login.
 	AuthProviderURL string `json:"authProviderUrl"`
+	// AuthService is the name of this service in a token's "services" claim.
+	// The UI asks the auth client for the features of this service to know
+	// which buttons to offer.
+	AuthService string `json:"authService"`
 }
 
 // PublicImageRef is the public description of one running image.
@@ -143,9 +150,13 @@ type HostSummary struct {
 	// HoldReason is the reason of the controller hold (HoldWanted): what the
 	// person gave, or that a lease of the host was ended. It is for the
 	// authenticated views only.
-	HoldReason string          `json:"holdReason,omitempty"`
-	Verbs      []protocol.Verb `json:"verbs"`
-	Needs      []protocol.Need `json:"needs"`
+	HoldReason string `json:"holdReason,omitempty"`
+	// HoldBy says who set the controller hold: "team" for a hold set through
+	// a team feature, which a team feature may lift again, "staff" for every
+	// other hold. Absent when the host is not held.
+	HoldBy string          `json:"holdBy,omitempty"`
+	Verbs  []protocol.Verb `json:"verbs"`
+	Needs  []protocol.Need `json:"needs"`
 
 	// Plan is the scheduler's view: slot state, attesting validators and
 	// waiting reason.

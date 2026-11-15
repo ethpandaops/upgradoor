@@ -27,6 +27,11 @@ var (
 	// ErrInvalidAction is returned when an action cannot apply in the
 	// current state; the message says why.
 	ErrInvalidAction = errors.New("scheduler: invalid action")
+	// ErrForbidden is returned when the authorization the request carries
+	// (WithAuthorization) does not allow what the action would do to the
+	// state it finds under the lock; the message says what, and the API
+	// answers 403 with it.
+	ErrForbidden = errors.New("scheduler: forbidden")
 )
 
 // Service is the scheduler. It reconciles on a timer and whenever Nudge is
@@ -48,6 +53,16 @@ type Service interface {
 	Settings(ctx context.Context) (fleet.Settings, error)
 	// UpdateSettings validates, stores and audits new settings.
 	UpdateSettings(ctx context.Context, actor string, settings fleet.Settings) error
+	// PatchSettings changes the settings in one step under the scheduler's
+	// lock: apply is given a copy of the effective settings and changes what
+	// the caller names; the result is validated, stored and audited with the
+	// values before and after. Nothing a concurrent action or patch wrote in
+	// the meantime is lost: apply sees it. An error of apply is returned as it
+	// is and changes nothing. When apply changes nothing, nothing is stored
+	// and nothing is audited; changed says which.
+	PatchSettings(
+		ctx context.Context, actor string, apply func(settings *fleet.Settings) error,
+	) (settings fleet.Settings, changed bool, err error)
 
 	// Roll requests a manual image roll.
 	Roll(ctx context.Context, actor string, req RollRequest) (*ActionResult, error)

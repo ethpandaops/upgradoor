@@ -406,6 +406,8 @@ func (h *history) follow(changes *store.Changes) {
 // write commits changes and keeps the history in step. After a failed write
 // the history is read again: the store may or may not have applied it.
 func (s *service) write(ctx context.Context, changes *store.Changes) error {
+	stampAuthorization(ctx, changes.Audit)
+
 	if err := s.opts.Store.Commit(ctx, changes); err != nil {
 		s.hist = history{}
 
@@ -677,6 +679,42 @@ func (s *service) UpdateSettings(ctx context.Context, actor string, settings fle
 	return nil
 }
 
+// PatchSettings changes the settings in one step under the lock.
+func (s *service) PatchSettings(
+	ctx context.Context, actor string, apply func(settings *fleet.Settings) error,
+) (fleet.Settings, bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	current, err := s.Settings(ctx)
+	if err != nil {
+		return fleet.Settings{}, false, err
+	}
+
+	next := current
+
+	if err := apply(&next); err != nil {
+		return current, false, err
+	}
+
+	if err := next.Validate(); err != nil {
+		return current, false, fmt.Errorf("%w: %w", ErrInvalidAction, err)
+	}
+
+	// Nothing named, or what is named is what is there: no write, no entry.
+	if next == current {
+		return current, false, nil
+	}
+
+	if err := s.saveSettings(ctx, actor, "settings.update", &next, ""); err != nil {
+		return current, false, err
+	}
+
+	s.Nudge()
+
+	return next, true, nil
+}
+
 // saveSettings stores settings and audits the change with before and after.
 // The caller holds mu.
 func (s *service) saveSettings(
@@ -732,6 +770,8 @@ func (s *service) entry(actor, action, target string, detail map[string]any) fle
 }
 
 func (s *service) appendAudit(ctx context.Context, entries ...fleet.AuditEntry) error {
+	stampAuthorization(ctx, entries)
+
 	if err := s.opts.Store.AppendAudit(ctx, entries...); err != nil {
 		return fmt.Errorf("scheduler: append audit: %w", err)
 	}

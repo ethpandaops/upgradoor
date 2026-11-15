@@ -15,6 +15,7 @@ import { useApp, useAuthState, usePrivateAccess } from '../appContext';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { Digest } from '../components/Digest';
 import { LeaseProgress } from '../components/LeaseProgress';
+import { ActionButton } from '../components/Permissions';
 import { RelTime, useSharedNow } from '../components/RelTime';
 import { Timeline, TimelineLegend } from '../components/Timeline';
 import { Badge, Button, Card, ErrorBanner, Loading, Meter, Segmented, cx } from '../components/primitives';
@@ -439,24 +440,18 @@ function SchedulerTile({
       tone={plan.paused ? 'warning' : undefined}
       aside={
         plan.paused ? (
-          <Button
+          <ActionButton
             dense
             variant="primary"
-            onClick={() => {
-              onAction(scopeIntent('resume', 'Resume everything', ''));
-            }}
+            onAction={onAction}
+            intent={scopeIntent('resume', 'Resume everything', '')}
           >
             Resume all…
-          </Button>
+          </ActionButton>
         ) : (
-          <Button
-            dense
-            onClick={() => {
-              onAction(scopeIntent('pause', 'Pause everything', ''));
-            }}
-          >
+          <ActionButton dense onAction={onAction} intent={scopeIntent('pause', 'Pause everything', '')}>
             Pause all…
-          </Button>
+          </ActionButton>
         )
       }
     >
@@ -573,77 +568,67 @@ function AttentionRow({
   switch (item.kind) {
     case 'paused':
       buttons = (
-        <Button
+        <ActionButton
           dense
           variant="primary"
-          onClick={() => {
-            onAction(scopeIntent('resume', 'Resume everything', ''));
-          }}
+          onAction={onAction}
+          intent={scopeIntent('resume', 'Resume everything', '')}
         >
           Resume all…
-        </Button>
+        </ActionButton>
       );
       break;
     case 'approval':
       buttons = r && (
-        <Button
+        <ActionButton
           dense
           variant="primary"
-          onClick={() => {
-            onAction(scopeIntent('resume', `Approve rollout: ${r.title}`, r.id));
-          }}
+          onAction={onAction}
+          intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id)}
         >
           Approve…
-        </Button>
+        </ActionButton>
       );
       break;
     case 'rollout-paused':
       buttons = r && (
-        <Button
+        <ActionButton
           dense
           variant="primary"
-          onClick={() => {
-            onAction(scopeIntent('resume', `Resume rollout: ${r.title}`, r.id));
-          }}
+          onAction={onAction}
+          intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id)}
         >
           Resume…
-        </Button>
+        </ActionButton>
       );
       break;
     case 'halted':
       buttons = r && (
         <>
-          <Button
+          <ActionButton
             dense
             variant="primary"
-            onClick={() => {
-              onAction(hostsIntent('retry', `Retry rollout: ${r.title}`, r.id, []));
-            }}
+            onAction={onAction}
+            intent={hostsIntent('retry', `Retry rollout: ${r.title}`, r.id, [])}
           >
             Retry…
-          </Button>
-          <Button
+          </ActionButton>
+          <ActionButton
             dense
             variant="danger"
-            onClick={() => {
-              onAction(scopeIntent('abort', `Abort rollout: ${r.title}`, r.id));
-            }}
+            onAction={onAction}
+            intent={scopeIntent('abort', `Abort rollout: ${r.title}`, r.id)}
           >
             Abort…
-          </Button>
+          </ActionButton>
         </>
       );
       break;
     case 'held':
       buttons = (
-        <Button
-          dense
-          onClick={() => {
-            onAction(holdIntent('unhold', item.hosts));
-          }}
-        >
+        <ActionButton dense onAction={onAction} intent={holdIntent('unhold', item.hosts)}>
           Unhold…
-        </Button>
+        </ActionButton>
       );
       break;
     case 'policy-paused':

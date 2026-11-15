@@ -39,8 +39,8 @@ func findContainer(list []protocol.Container, name string) *protocol.Container {
 	return nil
 }
 
-// enrichContainers fills Managed, Kind, ConfiguredImage, Custom and Registry
-// of the observed containers and returns the tags to follow.
+// enrichContainers fills Managed, Kind, ConfiguredImage, Custom, Registry and
+// Owners of the observed containers and returns the tags to follow.
 //
 // A managed container whose image reference differs from the configured one
 // is custom: somebody swapped the image on purpose. It is reported, never
@@ -53,6 +53,7 @@ func enrichContainers(
 	for i := range list {
 		c := &list[i]
 		c.Managed, c.Kind, c.ConfiguredImage, c.Custom, c.Registry = false, "", "", false, nil
+		c.Owners = nil
 
 		m := cfg.Managed(c.Name)
 		if m == nil {
@@ -62,6 +63,7 @@ func enrichContainers(
 		c.Managed = true
 		c.Kind = m.Kind
 		c.ConfiguredImage = m.Image
+		c.Owners = protocol.CleanOwners(m.Owners)
 		c.Custom = !SameReference(c.Image, m.Image)
 
 		if c.Custom || !isTagReference(c.Image) {

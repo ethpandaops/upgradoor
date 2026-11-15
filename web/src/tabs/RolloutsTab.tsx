@@ -14,10 +14,10 @@ import { useApp } from '../appContext';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { Digest, ShortId } from '../components/Digest';
 import { LeaseTable, PeerChecks } from '../components/LeaseTable';
+import { ActionButton } from '../components/Permissions';
 import { RelTime } from '../components/RelTime';
 import {
   Badge,
-  Button,
   Dash,
   Empty,
   ErrorBanner,
@@ -217,24 +217,18 @@ function PlanBar({ plan, onAction }: { plan: Plan; onAction: (intent: ActionInte
           planned <RelTime value={plan.computedAt} />
         </span>
         {plan.paused ? (
-          <Button
+          <ActionButton
             dense
             variant="primary"
-            onClick={() => {
-              onAction(scopeIntent('resume', 'Resume everything', ''));
-            }}
+            onAction={onAction}
+            intent={scopeIntent('resume', 'Resume everything', '')}
           >
             Resume all…
-          </Button>
+          </ActionButton>
         ) : (
-          <Button
-            dense
-            onClick={() => {
-              onAction(scopeIntent('pause', 'Pause everything', ''));
-            }}
-          >
+          <ActionButton dense onAction={onAction} intent={scopeIntent('pause', 'Pause everything', '')}>
             Pause all…
-          </Button>
+          </ActionButton>
         )}
       </span>
     </div>
@@ -364,56 +358,47 @@ function RolloutCard({
 
         <span className="ml-auto inline-flex flex-wrap gap-1">
           {waitsForApproval && !r.paused && (
-            <Button
+            <ActionButton
               dense
               variant="primary"
-              onClick={() => {
-                onAction(scopeIntent('resume', `Approve rollout: ${r.title}`, r.id));
-              }}
+              onAction={onAction}
+              intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id)}
             >
               Approve…
-            </Button>
+            </ActionButton>
           )}
           {r.paused ? (
-            <Button
+            <ActionButton
               dense
               variant="primary"
-              onClick={() => {
-                onAction(scopeIntent('resume', `Resume rollout: ${r.title}`, r.id));
-              }}
+              onAction={onAction}
+              intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id)}
             >
               Resume…
-            </Button>
+            </ActionButton>
           ) : (
-            <Button
-              dense
-              onClick={() => {
-                onAction(scopeIntent('pause', `Pause rollout: ${r.title}`, r.id));
-              }}
-            >
+            <ActionButton dense onAction={onAction} intent={scopeIntent('pause', `Pause rollout: ${r.title}`, r.id)}>
               Pause…
-            </Button>
+            </ActionButton>
           )}
           {(r.state === 'halted' || failed.length > 0) && (
-            <Button
+            <ActionButton
               dense
               variant="primary"
-              onClick={() => {
-                onAction(hostsIntent('retry', `Retry rollout: ${r.title}`, r.id, []));
-              }}
+              onAction={onAction}
+              intent={hostsIntent('retry', `Retry rollout: ${r.title}`, r.id, [])}
             >
               Retry…
-            </Button>
+            </ActionButton>
           )}
-          <Button
+          <ActionButton
             dense
             variant="danger"
-            onClick={() => {
-              onAction(scopeIntent('abort', `Abort rollout: ${r.title}`, r.id));
-            }}
+            onAction={onAction}
+            intent={scopeIntent('abort', `Abort rollout: ${r.title}`, r.id)}
           >
             Abort…
-          </Button>
+          </ActionButton>
         </span>
       </div>
 
@@ -498,26 +483,24 @@ function RolloutCard({
               <Td>
                 <span className="inline-flex gap-1">
                   {(h.state === 'pending' || h.state === 'expected' || h.state === 'failed') && (
-                    <Button
+                    <ActionButton
                       dense
                       aria-label={`Skip ${h.host} in ${r.title}`}
-                      onClick={() => {
-                        onAction(hostsIntent('skip', `Skip ${h.host}`, r.id, [h.host]));
-                      }}
+                      onAction={onAction}
+                      intent={hostsIntent('skip', `Skip ${h.host}`, r.id, [h.host])}
                     >
                       Skip
-                    </Button>
+                    </ActionButton>
                   )}
                   {h.state === 'failed' && (
-                    <Button
+                    <ActionButton
                       dense
                       aria-label={`Retry ${h.host} in ${r.title}`}
-                      onClick={() => {
-                        onAction(hostsIntent('retry', `Retry ${h.host}`, r.id, [h.host]));
-                      }}
+                      onAction={onAction}
+                      intent={hostsIntent('retry', `Retry ${h.host}`, r.id, [h.host], r.state)}
                     >
                       Retry
-                    </Button>
+                    </ActionButton>
                   )}
                 </span>
               </Td>
@@ -580,15 +563,14 @@ function RecentRollouts({
               </Td>
               <Td>
                 {r.state === 'aborted' && (
-                  <Button
+                  <ActionButton
                     dense
                     aria-label={`Retry ${r.title}`}
-                    onClick={() => {
-                      onAction(hostsIntent('retry', `Retry rollout: ${r.title}`, r.id, []));
-                    }}
+                    onAction={onAction}
+                    intent={hostsIntent('retry', `Retry rollout: ${r.title}`, r.id, [])}
                   >
                     Retry
-                  </Button>
+                  </ActionButton>
                 )}
               </Td>
             </tr>

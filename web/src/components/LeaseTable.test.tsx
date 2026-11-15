@@ -5,6 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import type { Lease, LeaseState, StepStatus } from '../api/types';
 import { describeCall } from '../lib/actionRequests';
 import { endLeaseIntent } from '../lib/intents';
+import { createHarness, renderWithApp } from '../test/harness';
 import { LeaseTable } from './LeaseTable';
 
 function lease(host: string, state: LeaseState, over: Partial<Lease> = {}): Lease {
@@ -30,7 +31,7 @@ describe('LeaseTable', () => {
   it('offers End for every open lease, and not again for one that is ending', async () => {
     const onEnd = vi.fn<(l: Lease) => void>();
     const cancelled = { at: '2026-01-01T00:01:00Z', by: 'alice@example.org', state: 'running' as const };
-    render(
+    renderWithApp(
       <LeaseTable
         label="Active leases"
         onEnd={onEnd}
@@ -40,7 +41,8 @@ describe('LeaseTable', () => {
           lease('host-verifying', 'verifying'),
           lease('host-ending', 'running', { cancelled }),
         ]}
-      />
+      />,
+      await createHarness({ mode: 'open' })
     );
 
     for (const host of ['host-granted', 'host-running', 'host-verifying']) {

@@ -465,6 +465,8 @@ func (s *Server) sync(r *http.Request, cert *identity.Certificate, body []byte) 
 			req.ProtocolVersion, protocol.Version)
 	}
 
+	req.Containers = cleanContainers(req.Containers)
+
 	now := s.now().UTC()
 	remote := s.remoteAddr(r)
 
@@ -510,6 +512,36 @@ func (s *Server) sync(r *http.Request, cert *identity.Certificate, body []byte) 
 	s.opts.Scheduler.Nudge()
 
 	return resp, nil
+}
+
+// cleanContainers makes what a host reports about its containers unambiguous
+// before it is stored, because what is stored is what authorizes. A container
+// name stands for one container: Docker has no two of a name, so of several
+// entries with one name the first is kept and the others are dropped. Owners
+// are kept only in the form a team name has, and only for the containers the
+// host manages.
+func cleanContainers(in []protocol.Container) []protocol.Container {
+	out := make([]protocol.Container, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+
+	for i := range in {
+		c := in[i]
+
+		if _, dup := seen[c.Name]; dup {
+			continue
+		}
+
+		seen[c.Name] = struct{}{}
+		c.Owners = protocol.CleanOwners(c.Owners)
+
+		if !c.Managed {
+			c.Owners = nil
+		}
+
+		out = append(out, c)
+	}
+
+	return out
 }
 
 // identityAudit builds the audit entries for a new host and for a changed

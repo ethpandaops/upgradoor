@@ -6,7 +6,6 @@ import (
 	"slices"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
-	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -934,20 +933,23 @@ func (p *pass) reopen(hv *hostView, closed *fleet.Lease, op *protocol.Operation)
 // (action.go, EndLease): without it the host would be granted the same work
 // the moment the lease ends again. It is written in the transaction of the
 // reopened lease, and audited. A person lifts it when the lease has ended.
+//
+// The hold is staff's. A hold that a team set on the host in the meantime
+// becomes staff's with it, whatever its reason says (staffHold).
 func (p *pass) holdEnded(hv *hostView, l *fleet.Lease) {
-	reason := endedHoldReason(hv.h)
-	if hv.h.HoldWanted && reason == hv.h.HoldReason {
+	hold, before, after, changed := staffHold(hv.h)
+	if !changed {
 		return
 	}
 
-	p.holds = append(p.holds, store.HostHold{Host: l.Host, Wanted: true, Reason: reason})
+	p.holds = append(p.holds, hold)
 	hv.held = true
 
 	p.record("host.held", l.Host, map[string]any{
 		keyLease:  l.ID,
 		keyReason: "a lease that a person ended was taken up again",
-		keyBefore: map[string]any{keyHoldWanted: hv.h.HoldWanted, keyHoldReason: hv.h.HoldReason},
-		keyAfter:  map[string]any{keyHoldWanted: true, keyHoldReason: reason},
+		keyBefore: before,
+		keyAfter:  after,
 	})
 }
 

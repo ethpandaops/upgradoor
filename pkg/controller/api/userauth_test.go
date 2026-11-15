@@ -23,6 +23,8 @@ const (
 	discoveredIssuer = "https://auth.testnet.example"
 	tokenScope       = "*.testnet.example"
 	userEmail        = "alice@ethpandaops.io"
+	// staffServices is the "services" claim of a staff token.
+	staffServices = "+upgradoor:all"
 )
 
 // authProvider is a stand-in authenticatoor: discovery document and JWKS.
@@ -86,10 +88,14 @@ func (p *authProvider) issuerName() string {
 func (p *authProvider) issuer(t *testing.T, mod func(*issuer.Config)) *issuer.RS256Issuer {
 	t.Helper()
 
+	// Unless mod says otherwise the token is one of a staff member: every
+	// feature of this service. A token with basic access only is minted with
+	// grant.
 	cfg := issuer.Config{
 		ActiveKey: p.key,
 		TTL:       30 * time.Minute,
 		Scope:     tokenScope,
+		Services:  staffServices,
 		Now:       p.clock.Now,
 	}
 
@@ -120,6 +126,20 @@ func (p *authProvider) token(t *testing.T, subject, email string, mod func(*issu
 	return tok
 }
 
+// grant mints a token for userEmail with the given "services" claim (empty:
+// no claim) and teams, the way the authenticatoor mints one for an identity.
+func (p *authProvider) grant(t *testing.T, services string, teams ...string) string {
+	t.Helper()
+
+	tok, claims, err := p.issuer(t, func(c *issuer.Config) { c.Services = services }).
+		IssueFor(issuer.Identity{Subject: "alice", Email: userEmail, Teams: teams}, nil)
+	require.NoError(t, err)
+	require.Equal(t, services, claims.Services)
+	require.ElementsMatch(t, teams, claims.Teams)
+
+	return "Bearer " + tok
+}
+
 // authHarness is a started Server with an auth provider.
 func authHarness(t *testing.T, discovery bool) (*harness, *authProvider) {
 	t.Helper()
@@ -145,10 +165,9 @@ type userRoute struct {
 }
 
 func userRoutes() []userRoute {
-	settings, err := json.Marshal(fleet.DefaultSettings())
-	if err != nil {
-		panic(err)
-	}
+	// A body that changes a setting of the defaults: one that changes nothing
+	// does not reach the scheduler.
+	settings := []byte(`{"minPeers":7}`)
 
 	return []userRoute{
 		{method: http.MethodGet, path: "/api/v1/hosts"},
@@ -431,6 +450,9 @@ func TestOpenMode(t *testing.T) {
 
 			// No token, and a token nobody checks.
 			for _, authorization := range []string{"", "Bearer whatever"} {
+				// The same settings body twice is a change only the first time.
+				h.sched.set(func(f *fakeScheduler) { f.settings = fleet.DefaultSettings() })
+
 				rec := h.serve(route.request(authorization))
 				require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			}

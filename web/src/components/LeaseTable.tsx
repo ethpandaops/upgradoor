@@ -1,8 +1,10 @@
 import { list, type Lease, type Need, type PeerCheck } from '../api/types';
 import { formatDuration, secondsBetween } from '../lib/format';
+import { endLeaseIntent } from '../lib/intents';
 import { ShortId } from './Digest';
+import { ActionButton } from './Permissions';
 import { RelTime } from './RelTime';
-import { Badge, Button, Dash, Table, Td, Th } from './primitives';
+import { Badge, Dash, Table, Td, Th } from './primitives';
 import { LeaseStateBadge, StepBadge, needSummary } from './status';
 
 function stepLabel(needs: readonly Need[], needId: string): string {
@@ -141,7 +143,7 @@ export function LeaseTable({
               {closed && <Td>{took === null ? <Dash /> : formatDuration(took)}</Td>}
               {onEnd && (
                 <Td>
-                  <Button
+                  <ActionButton
                     dense
                     variant="danger"
                     disabled={ending}
@@ -150,12 +152,13 @@ export function LeaseTable({
                         ? 'This lease is ending: it stays open until the agent reports or the lease expires.'
                         : 'End this lease: the agent stops after the step in progress and the host is put on hold'
                     }
-                    onClick={() => {
+                    intent={endLeaseIntent(l.id, l.host)}
+                    onAction={() => {
                       onEnd(l);
                     }}
                   >
                     End…
-                  </Button>
+                  </ActionButton>
                 </Td>
               )}
             </tr>

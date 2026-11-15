@@ -167,4 +167,71 @@ describe('AuthStore', () => {
     expect(load).toHaveBeenCalledTimes(1);
     expect(fake.client.addEventListener).toHaveBeenCalledTimes(1);
   });
+
+  it('has every feature in open mode, and none before it started', async () => {
+    const store = new AuthStore(noScript);
+    expect(store.hasFeature('upgradoor', 'roll')).toBe(false);
+
+    await store.start('');
+    expect(store.hasFeature('upgradoor', 'roll')).toBe(true);
+    expect(store.getState().teams).toEqual([]);
+  });
+
+  it('asks the auth client for features and takes the teams of the status event', async () => {
+    const fake = fakeClient({ ...status(true), teams: ['geth', 'lighthouse'], services: '+upgradoor:team_*' });
+    const hasFeature = vi.fn((service: string, feature: string) => service === 'upgradoor' && feature === 'team_roll');
+    window.ethpandaops = { authenticatoor: { ...fake.client, hasFeature } };
+
+    const store = new AuthStore(noScript);
+    const seen = vi.fn();
+    store.subscribe(seen);
+    await store.start('https://auth.example.org');
+
+    expect(store.getState()).toMatchObject({ teams: ['geth', 'lighthouse'], services: '+upgradoor:team_*' });
+    expect(store.hasFeature('upgradoor', 'team_roll')).toBe(true);
+    expect(store.hasFeature('upgradoor', 'roll')).toBe(false);
+    expect(store.hasFeature('spamoor', 'team_roll')).toBe(false);
+
+    // New grants are a new state, so the views decide again.
+    seen.mockClear();
+    fake.push({ ...status(true), teams: ['geth'], services: '+upgradoor:all' });
+    expect(seen).toHaveBeenCalledTimes(1);
+    expect(store.getState().teams).toEqual(['geth']);
+
+    // Logged out: no teams, no feature, whatever the client would say.
+    hasFeature.mockReturnValue(true);
+    fake.push(status(false));
+    expect(store.getState()).toMatchObject({ loggedIn: false, teams: [], services: '' });
+    expect(store.hasFeature('upgradoor', 'team_roll')).toBe(false);
+  });
+
+  it('has no feature with an auth client from before features', async () => {
+    const fake = fakeClient(status(true));
+    window.ethpandaops = { authenticatoor: fake.client };
+
+    const store = new AuthStore(noScript);
+    await store.start('https://auth.example.org');
+
+    expect(store.getState()).toMatchObject({ loggedIn: true, teams: [], services: '' });
+    expect(store.hasFeature('upgradoor', 'roll')).toBe(false);
+  });
+
+  it('takes the teams from getTeams when the status event has none, and survives a client that throws', async () => {
+    const fake = fakeClient(status(true));
+    window.ethpandaops = {
+      authenticatoor: {
+        ...fake.client,
+        getTeams: () => ['panda', 7 as unknown as string],
+        hasFeature: () => {
+          throw new Error('broken client');
+        },
+      },
+    };
+
+    const store = new AuthStore(noScript);
+    await store.start('https://auth.example.org');
+
+    expect(store.getState().teams).toEqual(['panda']);
+    expect(store.hasFeature('upgradoor', 'roll')).toBe(false);
+  });
 });
