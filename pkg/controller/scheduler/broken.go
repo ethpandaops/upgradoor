@@ -329,6 +329,17 @@ func (ld ledger) brokenSince(host, group string) *fleet.Lease {
 	return nil
 }
 
+// brokenAny reports whether the host is broken for any group.
+func (ld ledger) brokenAny(host string) bool {
+	for group := range ld[host] {
+		if ld.brokenSince(host, group) != nil {
+			return true
+		}
+	}
+
+	return false
+}
+
 // leases returns the leases of the ledger, each once, in a stable order.
 func (ld ledger) leases() []*fleet.Lease {
 	out := make([]*fleet.Lease, 0, len(ld))

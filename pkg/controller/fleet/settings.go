@@ -84,6 +84,20 @@ type Settings struct {
 	PolicyPackages Policy `json:"policyPackages"`
 	PolicyReboot   Policy `json:"policyReboot"`
 
+	// PauseAfterCanaryImage, PauseAfterCanaryPackages and
+	// PauseAfterCanaryReboot pause a rollout that serves needs of that kind
+	// when it has its first success, until a person resumes it.
+	PauseAfterCanaryImage    bool `json:"pauseAfterCanaryImage"`
+	PauseAfterCanaryPackages bool `json:"pauseAfterCanaryPackages"`
+	PauseAfterCanaryReboot   bool `json:"pauseAfterCanaryReboot"`
+
+	// ReadyPeerShare is the share (0-1) of the fleet's median peer count that
+	// each client of a host must have before its slot is released, next to
+	// MinPeers. 0, the default, is off: a host whose client has a lower peer
+	// limit than the others would never be ready with a share above what that
+	// limit allows.
+	ReadyPeerShare float64 `json:"readyPeerShare"`
+
 	// Paused is the global pause: nothing new is granted.
 	Paused bool `json:"paused"`
 }
@@ -119,6 +133,21 @@ func (s *Settings) PolicyFor(kind protocol.NeedKind) Policy {
 	}
 }
 
+// PauseAfterCanaryFor reports whether a rollout that serves needs of the kind
+// is paused when it has its first success.
+func (s *Settings) PauseAfterCanaryFor(kind protocol.NeedKind) bool {
+	switch kind {
+	case protocol.NeedImage:
+		return s.PauseAfterCanaryImage
+	case protocol.NeedPackages:
+		return s.PauseAfterCanaryPackages
+	case protocol.NeedReboot:
+		return s.PauseAfterCanaryReboot
+	default:
+		return false
+	}
+}
+
 // EffectiveMinPeers is the number of peers a node must have in a fleet in
 // which nodes hosts run a node: MinPeers, but never more than half of the
 // other nodes (rounded up, at least 1). Two or three nodes need 1 peer, four
@@ -145,6 +174,11 @@ func (s *Settings) Validate() error {
 
 	if s.MinPeers < 1 {
 		return errors.New("minPeers must be at least 1")
+	}
+
+	// Written so that NaN fails too.
+	if !(s.ReadyPeerShare >= 0 && s.ReadyPeerShare <= 1) {
+		return errors.New("readyPeerShare must be between 0 and 1")
 	}
 
 	if s.LeaseTTL.Std() < time.Minute {

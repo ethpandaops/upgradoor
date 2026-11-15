@@ -1,4 +1,4 @@
-import { list, type Lease, type Need } from '../api/types';
+import { list, type Lease, type Need, type PeerCheck } from '../api/types';
 import { formatDuration, secondsBetween } from '../lib/format';
 import { ShortId } from './Digest';
 import { RelTime } from './RelTime';
@@ -10,6 +10,26 @@ function stepLabel(needs: readonly Need[], needId: string): string {
   if (!need) return needId;
   if (need.kind === 'image') return need.image?.container ?? 'image';
   return need.kind;
+}
+
+/**
+ * PeerChecks shows how a host's clients compared with the fleet in the last
+ * readiness check of its lease: "EL 28 peers, fleet median 31, needs 16". A
+ * client below what it needs is marked.
+ */
+export function PeerChecks({ checks }: { checks: readonly PeerCheck[] | undefined }) {
+  if (!checks || checks.length === 0) return null;
+
+  return (
+    <span className="block text-muted" aria-label="Peers compared with the fleet">
+      {checks.map((c, i) => (
+        <span key={c.layer} className={c.peers < c.needs ? 'text-danger' : undefined}>
+          {i > 0 && ' · '}
+          {c.layer} {c.peers} peers, fleet median {c.median}, needs {c.needs}
+        </span>
+      ))}
+    </span>
+  );
 }
 
 /**
@@ -106,6 +126,7 @@ export function LeaseTable({
                 ) : (
                   <Dash />
                 )}
+                <PeerChecks checks={l.peerChecks} />
               </Td>
               <Td className="font-mono" title={`weight ${l.weight}, charged ${l.charged}`}>
                 {l.charged}/{l.weight}

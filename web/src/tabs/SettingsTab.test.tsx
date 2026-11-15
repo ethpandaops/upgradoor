@@ -32,6 +32,14 @@ describe('SettingsTab', () => {
     expect(within(form).getByLabelText('Readiness timeout')).toHaveValue('30m');
     expect(within(form).getByLabelText('Policy: images')).toHaveValue('auto');
     expect(within(form).getByLabelText('Policy: reboots')).toHaveValue('manual');
+    // Off by default; the fixture has it on at a quarter.
+    expect(within(form).getByLabelText('Ready peer share')).toHaveValue('0.25');
+    expect(rowOf(form, 'Ready peer share')).toHaveTextContent('use default');
+    // One switch per kind; the fixture has the one for images on.
+    expect(within(form).getByLabelText('Pause after canary: images')).toBeChecked();
+    expect(within(form).getByLabelText('Pause after canary: packages')).not.toBeChecked();
+    expect(within(form).getByLabelText('Pause after canary: reboots')).not.toBeChecked();
+    expect(rowOf(form, 'Pause after canary: images')).toHaveTextContent('off');
     expect(within(form).getByLabelText('Global pause')).not.toBeChecked();
 
     // The Default column.
@@ -81,6 +89,10 @@ describe('SettingsTab', () => {
       policyImage: 'auto',
       policyPackages: 'manual',
       policyReboot: 'manual',
+      pauseAfterCanaryImage: true,
+      pauseAfterCanaryPackages: false,
+      pauseAfterCanaryReboot: false,
+      readyPeerShare: 0.25,
       paused: true,
     });
 
@@ -121,6 +133,7 @@ describe('SettingsTab', () => {
       ['Max finality lag', '1', 'must be at least 2'],
       ['Ready epochs', '1.5', 'must be a whole number'],
       ['Min peers', '0', 'must be at least 1'],
+      ['Ready peer share', '1.5', 'must be between 0 and 1'],
       ['Lease TTL', '30', 'must be a duration like 30m, 90s or 1h30m'],
       ['Host stale after', '10s', 'must be at least 30s'],
       ['Readiness timeout', '30s', 'must be at least 1m'],

@@ -69,6 +69,24 @@ describe('attentionItems', () => {
     expect(item?.rollout?.id).toBe('B');
   });
 
+  it('says of a rollout that the scheduler paused after its canary that it is so', () => {
+    const items = attentionItems({
+      gate: gate(true),
+      paused: false,
+      queue: [entry('h1', 1, 'rollout-paused', ['A'], 'A'), entry('h2', 2, 'rollout-paused', ['B'], 'B')],
+      rollouts: [
+        rollout('A', { paused: true, pauseReason: 'paused after the canary; resume to continue' }),
+        rollout('B', { paused: true }),
+      ],
+      hosts: [],
+    });
+
+    expect(items.map(i => [i.kind, i.title, i.rollout?.id])).toEqual([
+      ['rollout-paused', 'Rollout A is paused after its canary', 'A'],
+      ['rollout-paused', 'Rollout B is paused', 'B'],
+    ]);
+  });
+
   it('offers no rollout when an old controller leaves the choice open', () => {
     const [item] = attentionItems({
       gate: gate(true),

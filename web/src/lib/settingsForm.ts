@@ -6,7 +6,7 @@ import { formatGoDuration, normalizeGoDuration, parseGoDuration } from './goDura
 
 export type SettingKey = keyof Settings;
 
-export type FieldKind = 'percent' | 'count' | 'duration' | 'policy' | 'switch';
+export type FieldKind = 'percent' | 'share' | 'count' | 'duration' | 'policy' | 'switch';
 
 export interface FieldSpec {
   key: SettingKey;
@@ -21,6 +21,9 @@ export interface FieldSpec {
 export const POLICIES: readonly Policy[] = ['auto', 'manual', 'paused'];
 
 const POLICY_HINT = 'auto: roll out by itself · manual: queue and wait for approval · paused: queue, grant nothing';
+
+const CANARY_HINT =
+  'Pause a rollout of this kind when its first host (the canary) is ready, until a person resumes it. Also for a staggered manual action of the kind.';
 
 /** The settings in display order. */
 export const FIELDS: readonly FieldSpec[] = [
@@ -58,6 +61,12 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: 'Peers each of the execution and the consensus client must have for the node to count as back. At least 1; the controller asks for at most half of the other nodes.',
   },
   {
+    key: 'readyPeerShare',
+    label: 'Ready peer share',
+    kind: 'share',
+    hint: 'Off at 0. Share of the fleet’s median peer count (0–1) that each client must have before a host’s slot is released, next to Min peers: EL against EL, CL against CL, of the hosts that hold no lease, are not broken and are at head with peers. Not applied with fewer than three such hosts. Start with 0.25: a client with a lower peer limit than the others never passes a share above what that limit allows.',
+  },
+  {
     key: 'leaseTtl',
     label: 'Lease TTL',
     kind: 'duration',
@@ -81,6 +90,9 @@ export const FIELDS: readonly FieldSpec[] = [
   { key: 'policyImage', label: 'Policy: images', kind: 'policy', hint: POLICY_HINT },
   { key: 'policyPackages', label: 'Policy: packages', kind: 'policy', hint: POLICY_HINT },
   { key: 'policyReboot', label: 'Policy: reboots', kind: 'policy', hint: POLICY_HINT },
+  { key: 'pauseAfterCanaryImage', label: 'Pause after canary: images', kind: 'switch', hint: CANARY_HINT },
+  { key: 'pauseAfterCanaryPackages', label: 'Pause after canary: packages', kind: 'switch', hint: CANARY_HINT },
+  { key: 'pauseAfterCanaryReboot', label: 'Pause after canary: reboots', kind: 'switch', hint: CANARY_HINT },
   {
     key: 'paused',
     label: 'Global pause',
@@ -117,6 +129,12 @@ export function validateField(spec: FieldSpec, raw: string): string | null {
       if (text === '' || !/^\d+(\.\d+)?$/.test(text)) return 'must be a number between 0 and 100';
       const n = Number(text);
       return n < 0 || n > 100 ? 'must be between 0 and 100' : null;
+    }
+    case 'share': {
+      // ".5" and "0." are numbers too.
+      if (!/^(\d+(\.\d*)?|\.\d+)$/.test(text)) return 'must be a number between 0 and 1';
+      const n = Number(text);
+      return n < 0 || n > 1 ? 'must be between 0 and 1' : null;
     }
     case 'count': {
       if (!/^\d+$/.test(text)) return 'must be a whole number';
@@ -164,6 +182,10 @@ export function fromForm(form: SettingsForm): Settings {
     policyImage: form.policyImage as Policy,
     policyPackages: form.policyPackages as Policy,
     policyReboot: form.policyReboot as Policy,
+    pauseAfterCanaryImage: form.pauseAfterCanaryImage === 'true',
+    pauseAfterCanaryPackages: form.pauseAfterCanaryPackages === 'true',
+    pauseAfterCanaryReboot: form.pauseAfterCanaryReboot === 'true',
+    readyPeerShare: Number(form.readyPeerShare),
     paused: form.paused === 'true',
   };
 }
@@ -178,7 +200,7 @@ export function sameValue(spec: FieldSpec, a: string, b: string): boolean {
     const mx = parseGoDuration(x);
     return mx !== null && mx === parseGoDuration(y);
   }
-  if (spec.kind === 'percent' || spec.kind === 'count') {
+  if (spec.kind === 'percent' || spec.kind === 'share' || spec.kind === 'count') {
     return x !== '' && y !== '' && Number(x) === Number(y);
   }
   return false;

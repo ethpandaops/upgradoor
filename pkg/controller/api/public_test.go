@@ -43,6 +43,9 @@ const (
 	secretRegistryError = "zz registry said 401 for token ghp_zzzz"
 	secretBeaconError   = `Get "http://zz-beacon.cluster.local:5052/eth/v1/node/syncing": dial tcp 10.77.0.3:5052`
 	secretLeaseError    = "zz container exited 137"
+	secretReadiness     = "zz EL peers 4, the fleet's median is 31 (needs 16)"
+	secretPeerLayer     = "zzEL"
+	secretPauseReason   = "zz paused after the canary; resume to continue"
 	secretAuditActor    = "zz-admin@ethpandaops.io"
 )
 
@@ -52,6 +55,7 @@ var leakSecrets = []string{
 	secretPkgCandidate, secretBlockedPkg, secretBlockedTo, secretAgentVersion, secretBootID,
 	secretHoldReason, secretVCImage, secretOtherImage, secretContainerID, secretImageID,
 	secretProbeError, secretRegistryError, secretBeaconError, secretLeaseError,
+	secretReadiness, secretPeerLayer, secretPauseReason,
 	secretAuditActor, "zz", "10.77.", "cluster.local",
 }
 
@@ -178,6 +182,15 @@ func leakFixture(t *testing.T, h *harness) {
 	h.store.leases = []*fleet.Lease{{
 		ID: "lease-zz", Host: "lighthouse-geth-1", State: fleet.LeaseFailed,
 		Needs: needs, Error: secretLeaseError,
+		// What the last readiness check compared with the fleet.
+		Readiness:  secretReadiness,
+		PeerChecks: []fleet.PeerCheck{{Layer: secretPeerLayer, Peers: 4, Median: 31, Needs: 16}},
+	}}
+	// A rollout that the scheduler paused, with its reason.
+	h.store.rollouts = []*fleet.Rollout{{
+		ID: "rollout-zz", Kind: fleet.RolloutReboot, Key: "reboot", Title: "reboot",
+		State: fleet.RolloutActive, Paused: true, PauseReason: secretPauseReason,
+		Hosts: []fleet.RolloutHost{{Host: "lighthouse-geth-1", State: fleet.HostPending}},
 	}}
 	// Per-host liveness: the public history may only show its sum.
 	h.store.liveness = []fleet.Liveness{
@@ -325,6 +338,19 @@ func TestLeakFixtureIsVisibleToUsers(t *testing.T) {
 		secretVCImage, secretOtherImage, secretLeaseError, secretAuditActor,
 	} {
 		assert.Contains(t, raw, secret)
+	}
+
+	// The pause reason of a rollout and the comparison of a lease with the
+	// fleet are for users too, and for nobody else (the keys are in no public
+	// view: TestPublicEndpointsLeakNothing).
+	rec = h.get("/api/v1/rollouts")
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	raw = rec.Body.String()
+	for _, want := range []string{
+		`"pauseReason":"` + secretPauseReason + `"`, `"peerChecks":[{"layer":"` + secretPeerLayer + `"`, secretReadiness,
+	} {
+		assert.Contains(t, raw, want)
 	}
 }
 

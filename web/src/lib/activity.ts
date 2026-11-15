@@ -101,7 +101,9 @@ export function attentionItems(input: {
             : q.wait === 'approval'
               ? `${name} waits for approval`
               : q.wait === 'rollout-paused'
-                ? `${name} is paused`
+                ? rollout?.pauseReason
+                  ? `${name} is paused after its canary`
+                  : `${name} is paused`
                 : `${name}: its policy is set to paused`,
         detail: q.wait === 'halted' ? (rollout?.reason ?? q.reason) : '',
         hosts: [],

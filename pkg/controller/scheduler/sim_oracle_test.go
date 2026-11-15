@@ -65,6 +65,10 @@ type simFacts struct {
 	// retried names the rollouts a person retried since the last
 	// observation.
 	retried []string
+	// resumed names the rollouts a person resumed since the last observation;
+	// paused the rollouts a person paused and has not resumed.
+	resumed []string
+	paused  map[string]bool
 	// skipped holds, per rollout key, the hosts a person skipped for it and
 	// has not retried, and that have reported the need ever since.
 	skipped map[string]map[string]bool
@@ -207,6 +211,19 @@ type oracle struct {
 	// stuck counts, per rollout and host, the committed reconciles in a row
 	// that left the host waiting although nothing held it back.
 	stuck map[string]int
+	// soaked names the rollouts that, by the oracle's own derivation, were
+	// paused when they had their first success and that no person has resumed
+	// since; firsts the rollouts that had their first success in this
+	// observation, each with the lease that was it.
+	soaked map[string]bool
+	firsts map[string]string
+	// refs are the reference hosts of this observation, each with the probes
+	// of its last sync: what a host that comes back is compared with.
+	refs map[string]protocol.NodeHealth
+	// fleetWait is, per lease that a committed reconcile left waiting for the
+	// fleet's share of peers, what stood then: the run the lease had on
+	// record, the host's sync and the controller's start.
+	fleetWait map[string]oracleFleetWait
 	// counts says how often the oracle saw what the simulation wants to have
 	// seen: a broken host granted first and one repaired; a host held back
 	// by a lease in flight, and of those the leases of an aborted rollout, the
@@ -235,6 +252,16 @@ type oracleCounts struct {
 	// neverStarted: leases that had failed without the agent's word and were
 	// expired when the agent said that it never started them.
 	neverStarted int
+	// canaryPauses: rollouts paused at their first success; canaryResumes:
+	// those a person resumed after that. peerBlocks: reconciles that left a
+	// lease waiting for peers below the fleet; peerPasses: leases released
+	// with a client compared; peerSkips: leases released with a client that
+	// fewer than three reference hosts probe; peerTimeouts: leases that failed
+	// as not ready while they waited for the fleet's share; peerHeld: leases
+	// that waited for it over more than one reconcile with their run intact.
+	canaryPauses, canaryResumes       int
+	peerBlocks, peerPasses, peerSkips int
+	peerTimeouts, peerHeld            int
 }
 
 // sameTime reports whether two optional times are the same moment.
@@ -314,6 +341,9 @@ func newOracle() *oracle {
 
 		repairCanary: make(map[string]bool, 8),
 		stuck:        make(map[string]int, 8),
+		soaked:       make(map[string]bool, 2),
+		fleetWait:    make(map[string]oracleFleetWait, 2),
+		firsts:       make(map[string]string, 2),
 	}
 }
 
@@ -328,6 +358,15 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 		delete(o.halted, id)
 	}
 
+	for _, id := range f.resumed {
+		if o.soaked[id] {
+			o.counts.canaryResumes++
+		}
+
+		delete(o.soaked, id)
+	}
+
+	o.refs = o.references(f, snap)
 	o.trackRuns(f, snap)
 	o.repairEnded = false
 
@@ -411,10 +450,15 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 		if l.State.Terminal() {
 			delete(o.runs, l.ID)
 			delete(o.verifying, l.ID)
+			delete(o.fleetWait, l.ID)
 		}
 	}
 
 	if err := o.checkBooks(f, snap); err != nil {
+		return err
+	}
+
+	if err := o.checkPauses(f, snap); err != nil {
 		return err
 	}
 
@@ -653,8 +697,16 @@ func (o *oracle) checkBooks(f *simFacts, snap *simSnapshot) error {
 				l.ID, l.Host, l.State, l.Readiness, l.Error)
 		}
 
-		if !f.fresh || l.State != fleet.LeaseVerifying || l.Force {
+		if f.fresh && l.State == fleet.LeaseVerifying && l.Force {
+			return fmt.Errorf("lease %s of %s is forced and is being checked for readiness (%q)", l.ID, l.Host, l.Readiness)
+		}
+
+		if !f.fresh || l.State != fleet.LeaseVerifying {
 			continue
+		}
+
+		if err := o.checkPeerNote(f, l); err != nil {
+			return err
 		}
 
 		since, seen := o.verifying[l.ID]
@@ -1373,6 +1425,10 @@ func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) e
 			}
 		}
 
+		if err := o.checkPeerTimeout(f, l, host); err != nil {
+			return err
+		}
+
 		o.haltedBy(f, snap, l)
 	case fleet.LeaseExpired:
 		// An agent whose clock is slow may have started the lease after the
@@ -1406,6 +1462,10 @@ func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) e
 
 			if o.reopened[l.ID] && !o.again[l.ID][id] {
 				continue
+			}
+
+			if !o.succeeded[id] {
+				o.firsts[id] = l.ID
 			}
 
 			o.succeeded[id] = true
@@ -1618,6 +1678,11 @@ func (o *oracle) checkRelease(f *simFacts, l *fleet.Lease, host *simHostFact) er
 			host.lastSync.Format(time.TimeOnly), oracleNode(host.status))
 	}
 
+	// And its clients have the share of the fleet's peers.
+	if err := o.checkReleasePeers(f, l, host); err != nil {
+		return err
+	}
+
 	// The agent is still heard: an old sync says nothing about now.
 	if f.stale(host) {
 		return fmt.Errorf("lease %s of %s released although its agent is silent: last sync %s ago, controller "+
@@ -1634,9 +1699,22 @@ func (o *oracle) checkRelease(f *simFacts, l *fleet.Lease, host *simHostFact) er
 			"is on record", l.ID, l.Host, peers)
 	}
 
-	spanned := false
+	spanned, window := oracleSpans(f, run)
+	if !spanned {
+		return fmt.Errorf("lease %s of %s released on a run of syncs with the node at head with %d peers that "+
+			"spans %s, it must span %s (first sync %s, newest %s, controller started %s)", l.ID, l.Host, peers,
+			run.newest.Sub(run.first), window, run.first.Format(time.TimeOnly), run.newest.Format(time.TimeOnly),
+			f.since.Format(time.TimeOnly))
+	}
 
-	var window time.Duration
+	return nil
+}
+
+// oracleSpans reports whether a run of syncs spans readyEpochs epochs: some
+// sync of it lies that long before its newest one, measured in the epochs
+// that begin with the one that sync was in. window is the last span asked for.
+func oracleSpans(f *simFacts, run oracleRun) (spanned bool, window time.Duration) {
+	epochs := f.settings.ReadyEpochs
 
 	for _, at := range run.syncs {
 		// A sync from before the chain began counts from its genesis: no
@@ -1646,20 +1724,11 @@ func (o *oracle) checkRelease(f *simFacts, l *fleet.Lease, host *simHostFact) er
 		window = f.epochStart(first + epochs).Sub(f.epochStart(first))
 
 		if epochs == 0 || run.newest.Sub(at) >= window {
-			spanned = true
-
-			break
+			return true, window
 		}
 	}
 
-	if !spanned {
-		return fmt.Errorf("lease %s of %s released on a run of syncs with the node at head with %d peers that "+
-			"spans %s, it must span %s (first sync %s, newest %s, controller started %s)", l.ID, l.Host, peers,
-			run.newest.Sub(run.first), window, run.first.Format(time.TimeOnly), run.newest.Format(time.TimeOnly),
-			f.since.Format(time.TimeOnly))
-	}
-
-	return nil
+	return false, window
 }
 
 // oracleMinPeers is the number of peers each client of a node must have:
@@ -1685,6 +1754,314 @@ func oracleMinPeers(f *simFacts) int {
 	default:
 		return f.settings.MinPeers
 	}
+}
+
+// oracleCanaryPause is the pause reason of a rollout that was paused after
+// its canary; oracleFleetNote is what the readiness note of a lease says
+// while its host's peers are below the fleet's.
+const (
+	oracleCanaryPause = "paused after the canary; resume to continue"
+	oracleFleetNote   = "the fleet's median is"
+)
+
+// oraclePauses reports whether a rollout is to pause at its first success:
+// the setting of its kind says so. A manual rollout is of the kind of what
+// its directives ask for: a roll is about images, a reboot about reboots.
+func oraclePauses(f *simFacts, snap *simSnapshot, r *fleet.Rollout) bool {
+	switch r.Kind {
+	case fleet.RolloutImage:
+		return f.settings.PauseAfterCanaryImage
+	case fleet.RolloutPackages:
+		return f.settings.PauseAfterCanaryPackages
+	case fleet.RolloutReboot:
+		return f.settings.PauseAfterCanaryReboot
+	default:
+	}
+
+	for _, d := range snap.directives {
+		if d.RolloutID != r.ID {
+			continue
+		}
+
+		if d.Kind == protocol.DirectiveRoll {
+			return f.settings.PauseAfterCanaryImage
+		}
+
+		return f.settings.PauseAfterCanaryReboot
+	}
+
+	return false
+}
+
+// checkPauses: the pause after the canary. A rollout is paused by the
+// scheduler exactly when it has had its first success by the oracle's own
+// record (a lease that the oracle saw released and found ready, with its
+// steps for the rollout done), in the very reconcile that released that
+// lease, if the setting of its kind asks for it then, it is not forced, it is
+// still open after that reconcile and no person had paused it; and it stays
+// paused, with the reason that says so, until a person resumes it. Never at
+// another moment, never twice, never a rollout that its first success closed.
+func (o *oracle) checkPauses(f *simFacts, snap *simSnapshot) error {
+	for _, r := range snap.rollouts {
+		if o.firsts[r.ID] != "" && !r.Force && !r.State.Terminal() && !f.paused[r.ID] && oraclePauses(f, snap, r) {
+			o.soaked[r.ID] = true
+			o.counts.canaryPauses++
+		}
+
+		marked := r.PauseReason == oracleCanaryPause
+
+		switch {
+		case marked != o.soaked[r.ID]:
+			return fmt.Errorf("rollout %s (%s, %s) carries the pause reason %q; by the oracle's record it is paused "+
+				"after its canary and not resumed: %v (first success in this reconcile: lease %q, succeeded: %v, a person "+
+				"paused it: %v)",
+				r.ID, r.Key, r.State, r.PauseReason, o.soaked[r.ID], o.firsts[r.ID], o.succeeded[r.ID], f.paused[r.ID])
+		case r.PauseReason != "" && !r.Paused:
+			return fmt.Errorf("rollout %s (%s) carries the pause reason %q and is not paused", r.ID, r.Key, r.PauseReason)
+		}
+	}
+
+	clear(o.firsts)
+
+	return nil
+}
+
+// references are the hosts a host that comes back is compared with, as the
+// reconcile found them: hosts that held no lease before it (by the oracle's
+// record of the leases), that are broken for nothing (by the oracle's record
+// of how the leases ended, before this observation takes in what ended in
+// it), that are not stale and whose last sync shows the node at head with the
+// required peers.
+func (o *oracle) references(f *simFacts, snap *simSnapshot) map[string]protocol.NodeHealth {
+	leased := make(map[string]bool, len(snap.leases))
+
+	for _, l := range snap.leases {
+		if was, known := o.leases[l.ID]; known && !was.Terminal() {
+			leased[l.Host] = true
+		}
+	}
+
+	peers := oracleMinPeers(f)
+	refs := make(map[string]protocol.NodeHealth, len(f.hosts))
+
+	for name, host := range f.hosts {
+		if leased[name] || host.status == nil || f.stale(host) || !oracleNodeBack(host.status.Node, peers) {
+			continue
+		}
+
+		broken := false
+
+		for thing := range o.words[name] {
+			broken = broken || o.wordOf(name, thing).broke
+		}
+
+		if !broken {
+			refs[name] = host.status.Node
+		}
+	}
+
+	return refs
+}
+
+// oracleFleetPeers is how the peers of one node compare with the fleet.
+type oracleFleetPeers struct {
+	// note says which client is below, and by how much; empty when none is.
+	note string
+	// compared: a client was held against the fleet; skipped: a client the
+	// node probes was not, for want of three reference hosts.
+	compared, skipped bool
+}
+
+// belowFleet holds the peers of each client of a node against the median of
+// the same client on the reference hosts: the host must have readyPeerShare
+// of it. A client that the node does not probe is not compared, nor one that
+// fewer than three reference hosts probe; with readyPeerShare 0 nothing is.
+func (o *oracle) belowFleet(f *simFacts, name string, node protocol.NodeHealth) oracleFleetPeers {
+	var out oracleFleetPeers
+
+	share := f.settings.ReadyPeerShare
+	if share <= 0 {
+		return out
+	}
+
+	clients := []struct {
+		layer  string
+		probed bool
+		peers  int
+		of     func(n protocol.NodeHealth) (int, bool)
+	}{
+		{layer: "EL", of: func(n protocol.NodeHealth) (int, bool) {
+			if n.EL == nil {
+				return 0, false
+			}
+
+			return n.EL.Peers, true
+		}},
+		{layer: "CL", of: func(n protocol.NodeHealth) (int, bool) {
+			if n.CL == nil {
+				return 0, false
+			}
+
+			return n.CL.Peers, true
+		}},
+	}
+
+	for _, c := range clients {
+		c.peers, c.probed = c.of(node)
+		if !c.probed {
+			continue
+		}
+
+		others := make([]int, 0, len(o.refs))
+
+		for ref, refNode := range o.refs {
+			if peers, ok := c.of(refNode); ok && ref != name {
+				others = append(others, peers)
+			}
+		}
+
+		if len(others) < 3 {
+			out.skipped = true
+
+			continue
+		}
+
+		out.compared = true
+
+		// The median: half of the others (rounded up) have that many or fewer.
+		slices.Sort(others)
+
+		median := others[len(others)/2]
+		if len(others)%2 == 0 {
+			median = others[len(others)/2-1]
+		}
+
+		// The smallest count that is at least the share of the median.
+		needs := 0
+		for float64(needs) < share*float64(median)-1e-6 {
+			needs++
+		}
+
+		if c.peers < needs && out.note == "" {
+			out.note = fmt.Sprintf("%s peers %d, %s %d (needs %d)", c.layer, c.peers, oracleFleetNote, median, needs)
+		}
+	}
+
+	return out
+}
+
+// checkReleasePeers: a lease is not released while a client of its node has
+// fewer peers than the share of the fleet's median.
+func (o *oracle) checkReleasePeers(f *simFacts, l *fleet.Lease, host *simHostFact) error {
+	fleetPeers := o.belowFleet(f, l.Host, host.status.Node)
+	if fleetPeers.note != "" {
+		return fmt.Errorf("lease %s of %s released although its node is below the fleet: %s", l.ID, l.Host, fleetPeers.note)
+	}
+
+	if fleetPeers.compared {
+		o.counts.peerPasses++
+	}
+
+	if fleetPeers.skipped {
+		o.counts.peerSkips++
+	}
+
+	return nil
+}
+
+// oracleFleetWait is what stood when a committed reconcile left a lease
+// waiting for the fleet's share of peers.
+type oracleFleetWait struct {
+	// run is the start of the run of healthy syncs the lease had on record;
+	// sync the host's last sync; since the controller's start.
+	run, sync, since time.Time
+}
+
+// checkPeerNote holds the readiness note of a lease that a committed
+// reconcile left being checked against the oracle's own comparison of the
+// host's last sync with the fleet. The comparison is the last thing asked,
+// once, and it ends no run:
+//
+//   - a lease that waits for the fleet's share waits for exactly what the
+//     oracle finds, with the oracle's reference hosts;
+//   - it waits for it only when it is ready otherwise as far as the node goes:
+//     the run of healthy syncs that the oracle has on record spans
+//     readyEpochs epochs;
+//   - and it keeps its run while it waits. Where the next committed reconcile
+//     finds the host at head with the required peers again, in a sync that
+//     came within hostStaleAfter of the one before and under the same
+//     controller, the run on the lease is the one it had: nothing but a bad
+//     sync, a gap or a restart ends a run.
+func (o *oracle) checkPeerNote(f *simFacts, l *fleet.Lease) error {
+	host := f.hosts[l.Host]
+	if host == nil || host.status == nil {
+		delete(o.fleetWait, l.ID)
+
+		return nil
+	}
+
+	was, waited := o.fleetWait[l.ID]
+	delete(o.fleetWait, l.ID)
+
+	if waited && was.since.Equal(f.since) && host.lastSync.Sub(was.sync) <= f.settings.HostStaleAfter.Std() &&
+		!f.stale(host) && oracleNodeBack(host.status.Node, oracleMinPeers(f)) {
+		if l.SyncedSince == nil || !l.SyncedSince.Equal(was.run) {
+			return fmt.Errorf("lease %s of %s waited for the fleet's share of peers with its run of healthy syncs "+
+				"begun at %s; nothing ended that run, and the lease now has it begun at %v (%q)", l.ID, l.Host,
+				was.run.Format(time.TimeOnly), l.SyncedSince, l.Readiness)
+		}
+
+		o.counts.peerHeld++
+	}
+
+	if !strings.Contains(l.Readiness, oracleFleetNote) {
+		return nil
+	}
+
+	if want := o.belowFleet(f, l.Host, host.status.Node).note; l.Readiness != want {
+		return fmt.Errorf("lease %s of %s waits with %q; by the oracle's comparison with the reference hosts %v "+
+			"(readyPeerShare %v, node %s): %q", l.ID, l.Host, l.Readiness, slices.Sorted(maps.Keys(o.refs)),
+			f.settings.ReadyPeerShare, oracleNode(host.status), want)
+	}
+
+	run, running := o.runs[l.ID]
+	if spanned, window := oracleSpans(f, run); !running || !spanned {
+		return fmt.Errorf("lease %s of %s waits with %q before its node was at head with peers for %s: the "+
+			"comparison comes last (run on record: %v, first sync %s, newest %s)", l.ID, l.Host, l.Readiness, window,
+			running, run.first.Format(time.TimeOnly), run.newest.Format(time.TimeOnly))
+	}
+
+	if l.SyncedSince == nil {
+		return fmt.Errorf("lease %s of %s waits with %q and has no run of healthy syncs on record", l.ID, l.Host, l.Readiness)
+	}
+
+	o.counts.peerBlocks++
+	o.fleetWait[l.ID] = oracleFleetWait{run: *l.SyncedSince, sync: host.lastSync, since: f.since}
+
+	return nil
+}
+
+// checkPeerTimeout looks at a lease that failed as not ready while it waited
+// for the fleet's share of peers: what it waited for is what the oracle finds
+// in the host's last sync.
+func (o *oracle) checkPeerTimeout(f *simFacts, l *fleet.Lease, host *simHostFact) error {
+	if !strings.Contains(l.Error, oracleFleetNote) {
+		return nil
+	}
+
+	want := ""
+	if host != nil && host.status != nil {
+		want = o.belowFleet(f, l.Host, host.status.Node).note
+	}
+
+	if want == "" || !strings.HasPrefix(l.Error, "not ready after") || !strings.HasSuffix(l.Error, want) {
+		return fmt.Errorf("lease %s of %s failed as %q; by the oracle's comparison with the reference hosts %v: %q",
+			l.ID, l.Host, l.Error, slices.Sorted(maps.Keys(o.refs)), want)
+	}
+
+	o.counts.peerTimeouts++
+
+	return nil
 }
 
 // oracleNodeBack reports whether the probes of one sync show the node at
@@ -1982,6 +2359,8 @@ func (o *oracle) checkRolloutGrant(
 		return fmt.Errorf("lease %s failed in it and nobody retried it", o.halted[r.ID])
 	case r.Paused:
 		return errors.New("the rollout is paused")
+	case o.soaked[r.ID]:
+		return errors.New("the rollout had its first success, is to pause after it, and nobody resumed it")
 	case oraclePolicy(v.f, r) != "":
 		return errors.New(oraclePolicy(v.f, r))
 	case m == nil || m.State != fleet.HostLeased || m.LeaseID != l.ID:
@@ -2133,7 +2512,8 @@ func (o *oracle) checkProgress(v *oracleView) error {
 	seen := make(map[string]bool, len(o.stuck))
 
 	for _, r := range v.snap.rollouts {
-		if f.settings.Paused || r.State != fleet.RolloutActive || r.Paused || r.Force ||
+		// A rollout that was paused after its canary waits for a person.
+		if f.settings.Paused || r.State != fleet.RolloutActive || r.Paused || o.soaked[r.ID] || r.Force ||
 			o.halted[r.ID] != "" || oraclePolicy(f, r) != "" {
 			continue
 		}

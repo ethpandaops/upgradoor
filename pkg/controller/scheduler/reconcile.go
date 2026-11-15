@@ -237,6 +237,12 @@ type pass struct {
 	ended map[string]bool
 	// holds are the controller holds this pass puts on hosts (holdEnded).
 	holds []store.HostHold
+	// first maps a rollout to the lease whose release in this pass was its
+	// first success (pauseAfterCanary).
+	first map[string]*fleet.Lease
+	// refs are the hosts that a host under a readiness check is compared with,
+	// as the pass found them (references).
+	refs []*hostView
 }
 
 // lastLeaseEnd is when the host's most recent lease ended, this pass
@@ -279,6 +285,7 @@ func newPass(w *World) *pass {
 		closedLatest:   make(map[string]*fleet.Rollout, len(w.Closed)),
 		hostKeys:       make(map[string]map[string]bool, len(w.Hosts)),
 		ended:          make(map[string]bool, 2),
+		first:          make(map[string]*fleet.Lease, 1),
 	}
 
 	for _, r := range w.Closed {
@@ -526,6 +533,7 @@ func cloneLease(l *fleet.Lease) *fleet.Lease {
 	c.SyncedUntil = cloneTime(l.SyncedUntil)
 	c.EndedAt = cloneTime(l.EndedAt)
 	c.Operation = cloneOperation(l.Operation)
+	c.PeerChecks = slices.Clone(l.PeerChecks)
 
 	if l.Cancelled != nil {
 		cancelled := *l.Cancelled

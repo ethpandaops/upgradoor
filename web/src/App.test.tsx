@@ -62,7 +62,7 @@ describe('App in public mode (auth configured, logged out)', () => {
     expect(userCalls().every(c => c.authorization === 'Bearer mock-token')).toBe(true);
 
     await user.click(screen.getByRole('tab', { name: 'Rollouts' }));
-    expect(await screen.findByRole('heading', { name: /Open rollouts \(3\)/ })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: /Open rollouts \(4\)/ })).toBeInTheDocument();
 
     await user.click(screen.getByRole('button', { name: 'Logout' }));
 

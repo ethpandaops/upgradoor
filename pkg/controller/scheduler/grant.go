@@ -21,15 +21,18 @@ const (
 	reasonHeld          = "held"
 	reasonPaused        = "paused"
 	reasonRolloutPaused = "rollout paused"
-	reasonApproval      = "waiting for approval (policy manual)"
-	reasonPolicyPaused  = "policy paused"
-	reasonHaltedPrefix  = "rollout halted: "
-	reasonVerb          = "verb not allowed by the agent"
-	reasonGatePrefix    = "network gate: "
-	reasonAfter         = "after "
-	reasonAfterCanary   = "after canary "
-	reasonAfterRepair   = "after repair of "
-	reasonNext          = "next"
+	// reasonCanaryPause is the pause reason of a rollout that the scheduler
+	// paused when it had its first success (pauseAfterCanary).
+	reasonCanaryPause  = "paused after the canary; resume to continue"
+	reasonApproval     = "waiting for approval (policy manual)"
+	reasonPolicyPaused = "policy paused"
+	reasonHaltedPrefix = "rollout halted: "
+	reasonVerb         = "verb not allowed by the agent"
+	reasonGatePrefix   = "network gate: "
+	reasonAfter        = "after "
+	reasonAfterCanary  = "after canary "
+	reasonAfterRepair  = "after repair of "
+	reasonNext         = "next"
 )
 
 // Gate reasons.
@@ -257,8 +260,10 @@ func (p *pass) policyVerdict(r *fleet.Rollout) verdict {
 	}
 
 	switch {
-	case r.Paused:
-		return verdict{rank: rankRolloutPaused, reason: reasonRolloutPaused}
+	case r.Paused && r.State == fleet.RolloutActive:
+		// A rollout that is halted says so, paused or not: the failure is what
+		// a person must look at first. Its pause shows once it is retried.
+		return verdict{rank: rankRolloutPaused, reason: cmpOr(r.PauseReason, reasonRolloutPaused)}
 	case policy == fleet.PolicyManual && !r.Approved:
 		return verdict{rank: rankApproval, reason: reasonApproval}
 	case policy == fleet.PolicyPaused:

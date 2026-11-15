@@ -1,6 +1,7 @@
 package api
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -411,25 +412,72 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request, _ str
 	})
 }
 
-// handlePutSettings serves PUT /api/v1/settings. The body replaces all
-// settings; the scheduler stores and audits the change.
+// decodeSettings decodes a settings body onto settings: a key that the body
+// does not name keeps the value it has. So a client that does not know a
+// setting (a page of an earlier build) cannot reset it by leaving it out.
+// null is no value for any key.
+func decodeSettings(w http.ResponseWriter, r *http.Request, settings *fleet.Settings) error {
+	var given map[string]json.RawMessage
+	if err := decodeBody(w, r, &given); err != nil {
+		return err
+	}
+
+	if given == nil {
+		return badRequestf("invalid JSON body: the settings must be an object")
+	}
+
+	for key, value := range given {
+		if string(bytes.TrimSpace(value)) == "null" {
+			return badRequestf("invalid JSON body: %s must not be null", key)
+		}
+	}
+
+	raw, err := json.Marshal(given)
+	if err != nil {
+		return badRequestf("invalid JSON body: %s", err.Error())
+	}
+
+	// Onto a copy: a body that fails half way changes nothing.
+	next := *settings
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+
+	if err := dec.Decode(&next); err != nil {
+		return badRequestf("invalid JSON body: %s", err.Error())
+	}
+
+	*settings = next
+
+	return nil
+}
+
+// handlePutSettings serves PUT /api/v1/settings. The body is applied to the
+// stored settings: every key it names is replaced, the others stay. The
+// result is validated as a whole; the scheduler stores and audits the change.
 func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request, actor string) {
 	ctx := r.Context()
 
-	var settings fleet.Settings
-	if err := decodeBody(w, r, &settings); err != nil {
+	settings, err := s.opts.Scheduler.Settings(ctx)
+	if err != nil {
+		s.internalError(w, r, err)
+
+		return
+	}
+
+	if err = decodeSettings(w, r, &settings); err != nil {
 		s.writeBodyError(w, err)
 
 		return
 	}
 
-	if err := settings.Validate(); err != nil {
+	if err = settings.Validate(); err != nil {
 		s.writeError(w, http.StatusBadRequest, err.Error())
 
 		return
 	}
 
-	if err := s.opts.Scheduler.UpdateSettings(ctx, actor, settings); err != nil {
+	if err = s.opts.Scheduler.UpdateSettings(ctx, actor, settings); err != nil {
 		s.writeSchedulerError(w, r, err)
 
 		return

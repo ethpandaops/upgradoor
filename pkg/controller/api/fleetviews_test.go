@@ -347,11 +347,16 @@ func TestSettings(t *testing.T) {
 	changed.MaxUnavailablePercent = 25
 	changed.LeaseTTL = fleet.Duration(45 * time.Minute)
 	changed.PolicyReboot = fleet.PolicyAuto
+	changed.PauseAfterCanaryImage = true
+	changed.ReadyPeerShare = 0.25
 	changed.Paused = true
 
 	body, err := json.Marshal(changed)
 	require.NoError(t, err)
 	require.Contains(t, string(body), `"leaseTtl":"45m0s"`)
+	require.Contains(t, string(body), `"pauseAfterCanaryImage":true`)
+	require.Contains(t, string(body), `"pauseAfterCanaryPackages":false`)
+	require.Contains(t, string(body), `"readyPeerShare":0.25`)
 
 	rec = h.sendJSON(http.MethodPut, "/api/v1/settings", string(body))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
@@ -363,6 +368,90 @@ func TestSettings(t *testing.T) {
 	assert.Equal(t, schedulerCall{Name: "settings", Actor: actorAnonymous, Req: changed}, calls[0])
 
 	assert.Equal(t, changed, decodeJSON[SettingsBody](t, h.get("/api/v1/settings")).Settings)
+}
+
+// A PUT changes the keys it names and no others: a page of an earlier build,
+// which does not know the newer settings and leaves them out, resets none of
+// them (nor did it reset the others before, but it did reset these).
+func TestSettingsPutKeepsWhatItDoesNotName(t *testing.T) {
+	stored := fleet.DefaultSettings()
+	stored.ReadyPeerShare = 0.25
+	stored.PauseAfterCanaryImage = true
+	stored.PauseAfterCanaryReboot = true
+	stored.Paused = true
+	stored.MinPeers = 5
+
+	put := func(t *testing.T, body string) (fleet.Settings, *harness) {
+		t.Helper()
+
+		h := newHarness(t, nil)
+		h.sched.set(func(f *fakeScheduler) { f.settings = stored })
+
+		rec := h.sendJSON(http.MethodPut, "/api/v1/settings", body)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+		got := decodeJSON[SettingsBody](t, rec).Settings
+
+		calls := h.sched.recorded()
+		require.Len(t, calls, 1)
+		assert.Equal(t, schedulerCall{Name: "settings", Actor: actorAnonymous, Req: got}, calls[0],
+			"the scheduler gets, and audits, the whole set")
+
+		return got, h
+	}
+
+	t.Run("the body of a page that knows neither the peer share nor the pause switches", func(t *testing.T) {
+		old := `{"maxUnavailablePercent":20,"minParticipationPercent":90,"maxFinalityLagEpochs":3,"readyEpochs":1,` +
+			`"minPeers":3,"leaseTtl":"30m","hostStaleAfter":"2m","readinessTimeout":"30m","policyImage":"auto",` +
+			`"policyPackages":"auto","policyReboot":"manual","paused":false}`
+
+		got, _ := put(t, old)
+
+		want := stored
+		want.MaxUnavailablePercent = 20
+		want.MinPeers = 3
+		want.Paused = false
+		assert.Equal(t, want, got, "what it names is changed; the peer share and the switches are as they were")
+	})
+
+	t.Run("one key changes that key", func(t *testing.T) {
+		got, _ := put(t, `{"readyPeerShare":0.4}`)
+
+		want := stored
+		want.ReadyPeerShare = 0.4
+		assert.Equal(t, want, got)
+	})
+
+	t.Run("explicit values change them, also to off", func(t *testing.T) {
+		got, _ := put(t, `{"readyPeerShare":0,"pauseAfterCanaryImage":false,"pauseAfterCanaryPackages":true}`)
+
+		want := stored
+		want.ReadyPeerShare = 0
+		want.PauseAfterCanaryImage = false
+		want.PauseAfterCanaryPackages = true
+		assert.Equal(t, want, got)
+	})
+
+	t.Run("no key changes nothing", func(t *testing.T) {
+		got, _ := put(t, `{}`)
+		assert.Equal(t, stored, got)
+	})
+
+	t.Run("a refused body changes nothing", func(t *testing.T) {
+		h := newHarness(t, nil)
+		h.sched.set(func(f *fakeScheduler) { f.settings = stored })
+
+		for _, body := range []string{
+			`{"readyPeerShare":0.4,"paused":null}`, `{"readyPeerShare":0.4,"minPeers":0}`,
+			`{"readyPeerShare":0.4,"leaseTtl":"soon"}`, `{"readyPeerShare":0.4,"nosuch":1}`,
+		} {
+			rec := h.sendJSON(http.MethodPut, "/api/v1/settings", body)
+			require.Equal(t, http.StatusBadRequest, rec.Code, body)
+		}
+
+		assert.Empty(t, h.sched.recorded())
+		assert.Equal(t, stored, decodeJSON[SettingsBody](t, h.get("/api/v1/settings")).Settings)
+	})
 }
 
 func TestSettingsErrors(t *testing.T) {
@@ -400,6 +489,18 @@ func TestSettingsErrors(t *testing.T) {
 			contains: "maxFinalityLagEpochs",
 		},
 		{
+			name: "peer share above 1", body: withField("readyPeerShare", "1.5"),
+			status: http.StatusBadRequest, contains: "readyPeerShare must be between 0 and 1",
+		},
+		{
+			name: "peer share below 0", body: withField("readyPeerShare", "-0.5"),
+			status: http.StatusBadRequest, contains: "readyPeerShare must be between 0 and 1",
+		},
+		{
+			name: "a pause switch that is no boolean", body: withField("pauseAfterCanaryReboot", `"yes"`),
+			status: http.StatusBadRequest, contains: "pauseAfterCanaryReboot",
+		},
+		{
 			name: "unknown policy", body: withField("policyImage", `"yolo"`),
 			status: http.StatusBadRequest, contains: "invalid policy",
 		},
@@ -408,8 +509,18 @@ func TestSettingsErrors(t *testing.T) {
 			status: http.StatusBadRequest, contains: "invalid duration",
 		},
 		{
-			name: "partial body leaves required values at zero", body: `{"paused":true}`,
-			status: http.StatusBadRequest, contains: "maxFinalityLagEpochs",
+			name: "null for a key", body: withField("readyPeerShare", "null"),
+			status: http.StatusBadRequest, contains: "readyPeerShare must not be null",
+		},
+		{
+			name: "null for a key that an old page knows", body: `{"paused":null}`,
+			status: http.StatusBadRequest, contains: "paused must not be null",
+		},
+		{name: "null", body: "null", status: http.StatusBadRequest, contains: "must be an object"},
+		{name: "not an object", body: "[]", status: http.StatusBadRequest, contains: "invalid JSON"},
+		{
+			name: "one key that makes the whole invalid", body: `{"minPeers":0}`,
+			status: http.StatusBadRequest, contains: "minPeers",
 		},
 		{
 			name: "unknown field", body: withField("maxUnavailable", "10"),

@@ -13,7 +13,7 @@ import {
 import { useApp } from '../appContext';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { Digest, ShortId } from '../components/Digest';
-import { LeaseTable } from '../components/LeaseTable';
+import { LeaseTable, PeerChecks } from '../components/LeaseTable';
 import { RelTime } from '../components/RelTime';
 import {
   Badge,
@@ -309,6 +309,7 @@ function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, le
             </>
           )}
           {lease.readiness && <span className="text-muted"> — {lease.readiness}</span>}
+          <PeerChecks checks={lease.peerChecks} />
         </span>
       );
     }
@@ -354,7 +355,7 @@ function RolloutCard({
         <Badge>{r.kind}</Badge>
         <h3 className="text-sm/6 font-semibold">{r.title}</h3>
         <RolloutStateBadge state={r.state} />
-        {r.paused && <Badge tone="warning">paused</Badge>}
+        {r.paused && <Badge tone="warning">{r.pauseReason ? 'paused after the canary' : 'paused'}</Badge>}
         {waitsForApproval && <Badge tone="warning">waiting for approval</Badge>}
         {policy === 'paused' && <Badge tone="warning">policy paused</Badge>}
         {r.force && <Badge tone="warning">force</Badge>}

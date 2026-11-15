@@ -87,6 +87,36 @@ describe('LeaseTable', () => {
   });
 });
 
+describe('LeaseTable, the comparison with the fleet', () => {
+  it('shows the peers of each client next to the readiness note, and marks the one that is below', () => {
+    render(
+      <LeaseTable
+        label="Active leases"
+        leases={[
+          lease('host-below', 'verifying', {
+            readiness: "CL peers 4, the fleet's median is 31 (needs 16)",
+            peerChecks: [
+              { layer: 'EL', peers: 28, median: 31, needs: 16 },
+              { layer: 'CL', peers: 4, median: 31, needs: 16 },
+            ],
+          }),
+          lease('host-plain', 'verifying', { readiness: 'node is syncing' }),
+        ]}
+      />
+    );
+
+    const below = row('host-below');
+    expect(below).toHaveTextContent("CL peers 4, the fleet's median is 31 (needs 16)");
+
+    const checks = within(below).getByLabelText('Peers compared with the fleet');
+    expect(checks).toHaveTextContent('EL 28 peers, fleet median 31, needs 16 · CL 4 peers, fleet median 31, needs 16');
+    expect(within(checks).getByText(/CL 4 peers/)).toHaveClass('text-danger');
+    expect(within(checks).getByText(/EL 28 peers/)).not.toHaveClass('text-danger');
+
+    expect(within(row('host-plain')).queryByLabelText('Peers compared with the fleet')).toBeNull();
+  });
+});
+
 describe('endLeaseIntent', () => {
   it('describes the end of a lease as a request, without a broken host', () => {
     const intent = endLeaseIntent('ls-1', 'host-a');

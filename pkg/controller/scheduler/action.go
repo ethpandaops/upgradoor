@@ -400,6 +400,7 @@ func (s *service) Resume(ctx context.Context, actor string, req ScopeRequest) (*
 	}
 
 	r.Paused = false
+	r.PauseReason = ""
 
 	if approve {
 		r.Approved = true

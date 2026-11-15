@@ -250,6 +250,7 @@ function FieldInput({
         />
       );
     case 'percent':
+    case 'share':
     case 'count':
     case 'duration':
       return (

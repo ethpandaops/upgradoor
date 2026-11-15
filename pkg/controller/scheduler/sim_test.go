@@ -41,6 +41,12 @@ import (
 // that the lease is cancelled and decline a lease they have not started, a
 // quarter of the agents are of a build that knows neither, and now and then
 // an operation runs for longer than any leaseTtl.
+// In every third seed rollouts of some kinds are paused after their canary
+// (a person resumes them now and then), and in every other seed a host that
+// comes back is compared with the peers of the fleet (readyPeerShare 0.5 or
+// 0.75); the hosts differ in how many peers they find, and in half of those
+// seeds one host never finds enough of them for the comparison, until the
+// world is healed.
 // The store gives every row back as the SQLite store does (fakestore_test.go).
 // After
 // every step the oracle (sim_oracle_test.go) asserts the invariants of
@@ -60,6 +66,7 @@ const (
 
 // simReasons are the forms a waiting reason may take.
 var simReasons = regexp.MustCompile(`^(held|agent silent|paused|rollout paused|` +
+	`paused after the canary; resume to continue|` +
 	`waiting for approval \(policy manual\)|policy paused|rollout halted: .+|` +
 	`verb not allowed by the agent|network gate: .+|after .+|` +
 	`budget [0-9.]+% of [0-9.]+%|host limit \d+ of \d+|next)$`)
@@ -84,6 +91,13 @@ type sim struct {
 	// is the store's write count at that observation.
 	retried  []string
 	observed int
+	// resumed are the rollouts a person resumed since the last observation;
+	// paused is the person's own record of the rollouts they paused and have
+	// not resumed. It is lost with the database.
+	resumed []string
+	paused  map[string]bool
+	// starved: one host of the run stays below the fleet's share of peers.
+	starved bool
 	// skipped is the person's own record of the hosts skipped per rollout
 	// key: set by a skip, cleared by a retry that names the host (or lifts
 	// the skips of a closed rollout), by the host syncing without the need
@@ -175,9 +189,25 @@ type simStats struct {
 	HoldsExtended int
 	// UnholdsRefused are the unholds that were refused because a lease the
 	// person had ended was still open.
-	UnholdsRefused                  int
-	ForgottenBroken                 int
-	ConvergeTicks, MaxConvergeTicks int
+	UnholdsRefused int
+	// PauseSeeds are the seeds with a pause after the canary and ShareSeeds
+	// those with the comparison with the fleet. By the oracle's own derivation:
+	// CanaryPauses are the rollouts paused at their first success,
+	// CanaryResumes those a person resumed after that; PeerBlocks are the
+	// reconciles that left a lease waiting for peers below the fleet,
+	// PeerPasses the leases released with a client compared, PeerSkips those
+	// released with a client that fewer than three reference hosts probe.
+	// StarvedSeeds are the seeds with a host that stays below the fleet,
+	// PeerTimeouts the leases that failed as not ready waiting for the fleet's
+	// share, PeerHeld the leases that waited for it over more than one
+	// reconcile with their run of healthy syncs intact.
+	PauseSeeds, ShareSeeds            int
+	CanaryPauses, CanaryResumes       int
+	PeerBlocks, PeerPasses, PeerSkips int
+	StarvedSeeds                      int
+	PeerTimeouts, PeerHeld            int
+	ForgottenBroken                   int
+	ConvergeTicks, MaxConvergeTicks   int
 	// Waits counts the waiting reasons seen in plans, by their first word.
 	Waits map[string]int
 }
@@ -234,6 +264,16 @@ func (a *simStats) add(b *simStats) {
 	a.Declined += b.Declined
 	a.SparedByCancel += b.SparedByCancel
 	a.UnholdsRefused += b.UnholdsRefused
+	a.PauseSeeds += b.PauseSeeds
+	a.ShareSeeds += b.ShareSeeds
+	a.CanaryPauses += b.CanaryPauses
+	a.CanaryResumes += b.CanaryResumes
+	a.PeerBlocks += b.PeerBlocks
+	a.PeerPasses += b.PeerPasses
+	a.PeerSkips += b.PeerSkips
+	a.StarvedSeeds += b.StarvedSeeds
+	a.PeerTimeouts += b.PeerTimeouts
+	a.PeerHeld += b.PeerHeld
 	a.HoldsExtended += b.HoldsExtended
 	a.NeverStarted += b.NeverStarted
 	a.SparedUntouched += b.SparedUntouched
@@ -325,6 +365,13 @@ func (s *sim) countLedger() {
 	s.stats.SparedUntouched += c.sparedUntouched
 	s.stats.ReopenedFailed += c.reopenedFailed
 	s.stats.ForgottenBroken += c.forgottenBroken
+	s.stats.CanaryPauses += c.canaryPauses
+	s.stats.CanaryResumes += c.canaryResumes
+	s.stats.PeerBlocks += c.peerBlocks
+	s.stats.PeerPasses += c.peerPasses
+	s.stats.PeerSkips += c.peerSkips
+	s.stats.PeerTimeouts += c.peerTimeouts
+	s.stats.PeerHeld += c.peerHeld
 
 	// The oracle is replaced when the database is lost: count each once.
 	s.oracle.counts = oracleCounts{}
@@ -436,6 +483,18 @@ func (s *sim) countWorld() {
 	if s.world.livenessUnsupported {
 		s.stats.Unsupported = 1
 	}
+
+	if d := &s.defaults; d.PauseAfterCanaryImage || d.PauseAfterCanaryPackages || d.PauseAfterCanaryReboot {
+		s.stats.PauseSeeds = 1
+	}
+
+	if s.defaults.ReadyPeerShare > 0 {
+		s.stats.ShareSeeds = 1
+	}
+
+	if s.starved {
+		s.stats.StarvedSeeds = 1
+	}
 }
 
 func newSim(seed uint64) (*sim, error) {
@@ -460,6 +519,7 @@ func newSim(seed uint64) (*sim, error) {
 		log:     log,
 		skipped: make(map[string]map[string]bool, 4),
 		holds:   make(map[string]bool, 4),
+		paused:  make(map[string]bool, 2),
 
 		registered: make(map[string]time.Time, 16),
 		cancelled:  make(map[string]fleet.LeaseState, 2),
@@ -511,6 +571,32 @@ func newSim(seed uint64) (*sim, error) {
 		PolicyImage:             policy(),
 		PolicyPackages:          policy(),
 		PolicyReboot:            policy(),
+	}
+
+	// Both from the seed, not from the random stream, so that the other seeds
+	// keep their histories. Every third seed pauses rollouts after their
+	// canary, for one to three of the kinds.
+	if seed%3 == 1 {
+		kinds := 1 + (seed/3)%7
+		s.defaults.PauseAfterCanaryImage = kinds&1 != 0
+		s.defaults.PauseAfterCanaryPackages = kinds&2 != 0
+		s.defaults.PauseAfterCanaryReboot = kinds&4 != 0
+	}
+
+	// Every other seed compares a host that comes back with the fleet.
+	switch seed % 4 {
+	case 0:
+		s.defaults.ReadyPeerShare = 0.5
+	case 2:
+		s.defaults.ReadyPeerShare = 0.75
+	}
+
+	// In half of those, one host that probes its node never finds more than
+	// a few peers: at head, with the peers it is required to have, and below
+	// any share of what the others have. Its leases wait for the comparison
+	// and fail at readinessTimeout, until the world is healed.
+	if s.defaults.ReadyPeerShare > 0 && (seed/4)%2 == 0 {
+		s.starved = s.world.starve(int(seed / 8))
 	}
 
 	if err := s.defaults.Validate(); err != nil {
@@ -825,6 +911,8 @@ func (s *sim) facts(fresh bool) *simFacts {
 		publishedEpoch: w.publishedEpoch,
 		havePublished:  w.storedLiveness(),
 		retried:        s.retried,
+		resumed:        s.resumed,
+		paused:         s.paused,
 		skipped:        s.skipped,
 		holds:          s.holds,
 		registered:     s.registered,
@@ -876,7 +964,7 @@ func (s *sim) facts(fresh bool) *simFacts {
 // at again.
 func (s *sim) observe(fresh bool) error {
 	writes := s.store.writeCount()
-	if !fresh && writes == s.observed && len(s.retried) == 0 {
+	if !fresh && writes == s.observed && len(s.retried) == 0 && len(s.resumed) == 0 {
 		return nil
 	}
 
@@ -885,6 +973,7 @@ func (s *sim) observe(fresh bool) error {
 	rollouts, leases, directives := s.store.view()
 	err := s.oracle.observe(s.facts(fresh), &simSnapshot{rollouts: rollouts, leases: leases, directives: directives})
 	s.retried = nil
+	s.resumed = nil
 
 	return err
 }
@@ -1154,6 +1243,8 @@ func (s *sim) loseDatabase() error {
 	s.oracle = newOracle()
 	s.observed = 0
 	s.retried = nil
+	s.resumed = nil
+	s.paused = make(map[string]bool, 2)
 	s.skipped = make(map[string]map[string]bool, 4)
 	s.registered = make(map[string]time.Time, 16)
 	s.cancelled = make(map[string]fleet.LeaseState, 2)
@@ -1670,12 +1761,13 @@ func (s *sim) rolloutAction(n int) error {
 	switch n % 7 {
 	case 0:
 		res, err := s.svc.Pause(ctx, simActor, ScopeRequest{Rollout: r.ID})
+		if err == nil {
+			s.paused[r.ID] = true
+		}
 
 		return s.act("pause "+r.ID, res, err)
 	case 1, 2, 3:
-		res, err := s.svc.Resume(ctx, simActor, ScopeRequest{Rollout: r.ID})
-
-		return s.act("resume "+r.ID, res, err)
+		return s.resume(r.ID)
 	case 4:
 		res, err := s.svc.Abort(ctx, simActor, ScopeRequest{Rollout: r.ID, Reason: "sim"})
 
@@ -1798,6 +1890,7 @@ func (s *sim) converge() error {
 		a.silentUntil, a.outageUntil, a.localHold, a.rebootSticks = time.Time{}, time.Time{}, false, false
 		a.syncingUntil, a.elOfflineUntil, a.elDownUntil = time.Time{}, time.Time{}, time.Time{}
 		a.peerCapUntil, a.elLag = time.Time{}, 0
+		a.peerMax = max(a.peerMax, simPeers)
 		a.dead, a.sloppy, a.blind = false, false, false
 	}
 
@@ -1870,7 +1963,6 @@ func (s *sim) openRollouts() string {
 // operate is the person of the convergence phase: lift holds and pauses,
 // retry what halted, and reopen aborted causes that hosts still report.
 func (s *sim) operate() error {
-	ctx := context.Background()
 	rollouts, _, _ := s.store.view()
 	open := make(map[string]bool, len(rollouts))
 
@@ -1890,9 +1982,8 @@ func (s *sim) operate() error {
 		open[r.Key] = true
 
 		if r.Paused {
-			res, err := s.svc.Resume(ctx, simActor, ScopeRequest{Rollout: r.ID})
-			if actErr := s.act("resume "+r.ID, res, err); actErr != nil {
-				return actErr
+			if err := s.resume(r.ID); err != nil {
+				return err
 			}
 		}
 
@@ -1933,6 +2024,19 @@ func (s *sim) operate() error {
 	}
 
 	return nil
+}
+
+// resume is the person who resumes a rollout, and takes down that they did:
+// whatever paused the rollout, a person or the scheduler after its canary, it
+// is not paused any more.
+func (s *sim) resume(id string) error {
+	res, err := s.svc.Resume(context.Background(), simActor, ScopeRequest{Rollout: id})
+	if err == nil {
+		s.resumed = append(s.resumed, id)
+		delete(s.paused, id)
+	}
+
+	return s.act("resume "+id, res, err)
 }
 
 // noteHolds takes down what a hold or unhold did to the named hosts, as the
@@ -2111,12 +2215,14 @@ func simSeeds(t *testing.T) (first, n uint64) {
 //   - 8303: a lease that was taken up again after a person had skipped its
 //     member is no success of the rollout; the others wait for a canary;
 //   - 9335, 10077: a lease that a person ended, taken up again after the hold
-//     had been lifted, holds its host again.
+//     had been lifted, holds its host again;
+//   - 1165: a rollout whose first success is a lease that was adopted, and
+//     carries no needs, pauses after it like any other.
 //
 // A seed says what it said only as long as the generator draws the same
 // history from it; the rules themselves are pinned by name elsewhere.
 func TestSimulationFoundSeeds(t *testing.T) {
-	for _, seed := range []uint64{8303, 9335, 10077} {
+	for _, seed := range []uint64{8303, 9335, 10077, 1165} {
 		t.Run(strconv.FormatUint(seed, 10), func(t *testing.T) {
 			if report, _ := runSim(seed, 300); report != "" {
 				t.Error(report)
@@ -2236,6 +2342,14 @@ func TestSimulation(t *testing.T) {
 			"waits for a verb the agent lacks":           total.Waits["verb"],
 			"waits for the budget":                       total.Waits["budget"], "waits for the host limit": total.Waits["host"],
 			"waits for the gate": total.Waits["network"], "waits for the order": total.Waits["after"],
+			"seeds with a pause after the canary":                 total.PauseSeeds,
+			"seeds with the comparison with the fleet":            total.ShareSeeds,
+			"rollouts paused after their canary":                  total.CanaryPauses,
+			"rollouts resumed after the pause after their canary": total.CanaryResumes,
+			"leases held back for peers below the fleet":          total.PeerBlocks,
+			"leases released with their peers compared":           total.PeerPasses,
+			"leases released with too few reference hosts":        total.PeerSkips,
+			"seeds with a host that stays below the fleet":        total.StarvedSeeds,
 		} {
 			if count == 0 {
 				t.Errorf("the simulation never produced any %s", what)
@@ -2265,6 +2379,8 @@ func TestSimulation(t *testing.T) {
 			"failed leases taken up again":                                                            total.ReopenedFailed,
 			"broken hosts that a person forgot":                                                       total.ForgottenBroken,
 			"hosts broken by a lease of a rollout that had been aborted":                              total.BrokenAfterAbort,
+			"leases that failed as not ready waiting for the fleet's share of peers":                  total.PeerTimeouts,
+			"leases that waited for the fleet's share over several reconciles and kept their run":     total.PeerHeld,
 		} {
 			if count == 0 {
 				t.Errorf("the simulation never produced any %s", what)

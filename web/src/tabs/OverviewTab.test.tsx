@@ -75,7 +75,7 @@ describe('OverviewTab, logged in', () => {
     expect(screen.getByRole('region', { name: 'Outage budget' })).toHaveTextContent(
       /[\d.]+% of 10% validators offline/
     );
-    expect(screen.getByRole('region', { name: 'Scheduler' })).toHaveTextContent('1 in progress · 4 up next · 6 stuck');
+    expect(screen.getByRole('region', { name: 'Scheduler' })).toHaveTextContent('1 in progress · 4 up next · 7 stuck');
 
     // Up next holds only what starts by itself, in queue order, with an estimate.
     const next = screen.getByRole('region', { name: 'Up next' });
@@ -95,6 +95,7 @@ describe('OverviewTab, logged in', () => {
     expect(attention).toHaveTextContent('waits for approval');
     expect(attention).toHaveTextContent('4 hosts wait.');
     expect(attention).toHaveTextContent('is halted');
+    expect(attention).toHaveTextContent('is paused after its canary');
     expect(attention).toHaveTextContent('prysm-geth-3 is silent');
 
     // The timeline has a lane per host with work and a legend for the lanes.

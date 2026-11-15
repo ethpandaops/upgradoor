@@ -30,6 +30,8 @@ const (
 // advanceLeases moves every open lease along its lifecycle from the host's
 // last sync.
 func (p *pass) advanceLeases() {
+	p.refs = p.references()
+
 	for _, l := range p.leases {
 		hv := p.hosts[l.Host]
 		if hv == nil {
@@ -151,12 +153,23 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 		return
 	}
 
+	l.PeerChecks = nil
 	ready, note := p.ready(l, hv)
 
 	// The needs of the sync that reported done may predate the operation:
 	// only a later sync says whether it took effect.
 	if ready && !hv.h.LastSeen.After(*l.AgentDoneAt) {
 		ready, note = false, noteAwaitSync
+	}
+
+	// Last, and only of a host that is ready otherwise: its peers against the
+	// fleet's, as both stand now. Falling short keeps the lease, not more: the
+	// run of healthy syncs stays, so the lease is released in the first pass
+	// in which the host does not fall short.
+	if ready {
+		if below := p.belowFleet(l, hv.h.Status.Node); below != "" {
+			ready, note = false, below
+		}
 	}
 
 	l.Readiness = note
@@ -388,6 +401,111 @@ func (p *pass) nodeReady(l *fleet.Lease, hv *hostView) (ready bool, note string)
 	return true, note
 }
 
+// minReferences is the fewest reference hosts a client's peer count is
+// compared with. maxComparedPeers bounds the peer counts that are compared:
+// what an agent reports beyond it (or below zero) is taken as the bound, so
+// that no report can make the arithmetic overflow.
+const (
+	minReferences    = 3
+	maxComparedPeers = 1_000_000
+)
+
+// comparedPeers is a reported peer count as it enters the comparison.
+func comparedPeers(n int) int {
+	return min(max(n, 0), maxComparedPeers)
+}
+
+// peerLayers are the clients whose peer counts are compared with the fleet,
+// each with its own kind: EL with EL, CL with CL.
+var peerLayers = []struct {
+	name  string
+	peers func(n protocol.NodeHealth) (peers int, probed bool)
+}{
+	{"EL", func(n protocol.NodeHealth) (int, bool) {
+		if n.EL == nil {
+			return 0, false
+		}
+
+		return comparedPeers(n.EL.Peers), true
+	}},
+	{"CL", func(n protocol.NodeHealth) (int, bool) {
+		if n.CL == nil {
+			return 0, false
+		}
+
+		return comparedPeers(n.CL.Peers), true
+	}},
+}
+
+// references are the hosts that a host under a readiness check is compared
+// with, as the pass finds them before it changes anything: hosts that hold no
+// lease, are broken for nothing, are not stale and whose last sync shows the
+// node at head with the required peers. The host of a lease that is compared
+// is never among them: it held that lease when the pass began. (A host whose
+// operation the pass adopts later held none then, and is one for this pass.)
+// There are none when readyPeerShare is 0.
+func (p *pass) references() []*hostView {
+	if p.set.ReadyPeerShare <= 0 {
+		return nil
+	}
+
+	floor := p.minPeers()
+	refs := make([]*hostView, 0, len(p.names))
+
+	for _, name := range p.names {
+		hv := p.hosts[name]
+		if hv.lease == nil && !hv.stale && hv.h.Status != nil && hv.h.Status.Node.Synced(floor) &&
+			!p.ledger.brokenAny(name) {
+			refs = append(refs, hv)
+		}
+	}
+
+	return refs
+}
+
+// belowFleet compares the peer count of each client of a node with the
+// median of the same client on the reference hosts (the lower of the two
+// middle values of an even number of them) and names the first that has fewer
+// than readyPeerShare of it; "" when none has. A client that the node does
+// not probe, or that fewer than minReferences reference hosts probe, is not
+// compared. What was compared is kept on the lease for people. It is asked
+// once per pass, of a host that is ready otherwise (verify).
+func (p *pass) belowFleet(l *fleet.Lease, node protocol.NodeHealth) string {
+	below := ""
+
+	for _, layer := range peerLayers {
+		peers, probed := layer.peers(node)
+		if !probed {
+			continue
+		}
+
+		fleetPeers := make([]int, 0, len(p.refs))
+
+		for _, ref := range p.refs {
+			if n, ok := layer.peers(ref.h.Status.Node); ok {
+				fleetPeers = append(fleetPeers, n)
+			}
+		}
+
+		if len(fleetPeers) < minReferences {
+			continue
+		}
+
+		slices.Sort(fleetPeers)
+
+		median := fleetPeers[(len(fleetPeers)-1)/2]
+		needs := int(math.Ceil(p.set.ReadyPeerShare*float64(median) - budgetEpsilon))
+
+		l.PeerChecks = append(l.PeerChecks, fleet.PeerCheck{Layer: layer.name, Peers: peers, Median: median, Needs: needs})
+
+		if peers < needs && below == "" {
+			below = fmt.Sprintf("%s peers %d, the fleet's median is %d (needs %d)", layer.name, peers, median, needs)
+		}
+	}
+
+	return below
+}
+
 // endRun ends the lease's run of healthy syncs.
 func endRun(l *fleet.Lease) {
 	l.SyncedSince = nil
@@ -462,6 +580,10 @@ func (p *pass) releaseLease(l *fleet.Lease) {
 		m := r.Host(l.Host)
 
 		if stepsDone(l, r.ID) {
+			if !p.succeeded(r) {
+				p.first[r.ID] = l
+			}
+
 			p.setMember(m, fleet.HostDone)
 
 			continue

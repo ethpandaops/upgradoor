@@ -50,6 +50,84 @@ async function stagger(mock: MockController, hosts: string[], force = false) {
 
 const stagesOf = (r: Rollout) => Object.fromEntries(list(r.hosts).map(m => [m.host, m.stage]));
 
+describe('MockController, a rollout paused after its canary', () => {
+  const REASON = 'paused after the canary; resume to continue';
+
+  it('queues its hosts with the reason, as a paused rollout, and resume lifts it', async () => {
+    const mock = new MockController();
+    const paused = list((await call<Rollouts>(mock, 'rollouts')).open).find(r => r.pauseReason !== undefined);
+    if (!paused) throw new Error('the fixture has no rollout paused after its canary');
+
+    expect(paused.paused).toBe(true);
+    expect(paused.pauseReason).toBe(REASON);
+    expect(paused.canary).toBe('grandine-erigon-1');
+    expect(list(paused.hosts).find(m => m.host === paused.canary)?.state).toBe('done');
+
+    const waiting = list((await call<Plan>(mock, 'plan')).queue).find(q => q.host === 'grandine-erigon-2');
+    expect(waiting?.reason).toBe(REASON);
+    expect(waiting?.wait).toBe('rollout-paused');
+    expect(waiting?.rollout).toBe(paused.id);
+    expect(clearsByItself(waiting?.wait)).toBe(false);
+
+    // The audit trail says who paused it.
+    expect(mock.data.audit.some(e => e.action === 'rollout.paused' && e.actor === 'scheduler')).toBe(true);
+
+    await call<ActionResult>(mock, 'actions/resume', { rollout: paused.id, reason: 'looks good' });
+
+    const resumed = list((await call<Rollouts>(mock, 'rollouts')).open).find(r => r.id === paused.id);
+    expect(resumed?.paused).toBe(false);
+    expect(resumed?.pauseReason).toBeUndefined();
+
+    const after = list((await call<Plan>(mock, 'plan')).queue).find(q => q.host === 'grandine-erigon-2');
+    expect(after?.reason).not.toBe(REASON);
+    expect(after?.wait).not.toBe('rollout-paused');
+  });
+
+  it('shows the halt of a rollout that is halted and paused, like the scheduler', async () => {
+    const mock = new MockController();
+    const halted = list((await call<Rollouts>(mock, 'rollouts')).open).find(r => r.state === 'halted');
+    if (!halted) throw new Error('the fixture has no halted rollout');
+
+    const waiting = async () =>
+      list((await call<Plan>(mock, 'plan')).queue).filter(
+        q => q.rollout === halted.id && (q.wait === 'halted' || q.wait === 'rollout-paused')
+      );
+    const before = await waiting();
+    expect(before.length).toBeGreaterThan(0);
+    expect(before.every(q => q.wait === 'halted')).toBe(true);
+
+    await call<ActionResult>(mock, 'actions/pause', { rollout: halted.id, reason: 'wait' });
+
+    expect(await waiting()).toStrictEqual(before);
+  });
+
+  it('keeps the plain reason for a rollout that a person paused', async () => {
+    const mock = new MockController();
+    const paused = list((await call<Rollouts>(mock, 'rollouts')).open).find(r => r.pauseReason !== undefined);
+    if (!paused) throw new Error('the fixture has no rollout paused after its canary');
+
+    await call<ActionResult>(mock, 'actions/resume', { rollout: paused.id, reason: '' });
+    await call<ActionResult>(mock, 'actions/pause', { rollout: paused.id, reason: 'wait' });
+
+    const waiting = list((await call<Plan>(mock, 'plan')).queue).find(q => q.host === 'grandine-erigon-2');
+    expect(waiting?.reason).toBe('rollout paused');
+    expect(waiting?.wait).toBe('rollout-paused');
+  });
+
+  it('carries the comparison with the fleet on the lease that was released on it', async () => {
+    const mock = new MockController();
+    const rollouts = await call<Rollouts>(mock, 'rollouts');
+    const lease = list(rollouts.recentLeases).find(l => l.host === 'grandine-erigon-1');
+
+    expect(lease?.peerChecks).toStrictEqual([
+      { layer: 'EL', peers: 27, median: 31, needs: 8 },
+      { layer: 'CL', peers: 49, median: 52, needs: 13 },
+    ]);
+    // A lease that still waits for something else was not compared yet.
+    expect(list(rollouts.leases).find(l => l.state === 'verifying')?.peerChecks).toBeUndefined();
+  });
+});
+
 describe('MockController, the order inside a rollout', () => {
   it('makes a host with validators that fits the budget the canary and lets the rest wait, the bootnode too', async () => {
     const mock = await roomy(new MockController());
@@ -551,12 +629,55 @@ describe('MockController, PUT settings', () => {
     expect((await call<SettingsBody>(mock, 'settings')).settings).toStrictEqual(settings);
   });
 
-  it('answers 400 for a missing or mistyped key instead of failing', async () => {
+  it('validates the peer share and the pause switches like the controller', async () => {
+    const mock = new MockController();
+    const { settings, defaults } = await call<SettingsBody>(mock, 'settings');
+
+    expect(defaults.readyPeerShare).toBe(0);
+    expect(settings.readyPeerShare).toBe(0.25);
+    expect(defaults.pauseAfterCanaryImage).toBe(false);
+
+    expect((await put(mock, { ...settings, readyPeerShare: 1.5 })).status).toBe(400);
+    expect((await put(mock, { ...settings, readyPeerShare: -0.1 })).status).toBe(400);
+    expect((await put(mock, { ...settings, readyPeerShare: '0.5' })).status).toBe(400);
+    expect((await put(mock, { ...settings, pauseAfterCanaryReboot: 'yes' })).status).toBe(400);
+    expect((await put(mock, { ...settings, readyPeerShare: 0, pauseAfterCanaryReboot: true })).status).toBe(200);
+
+    const stored = (await call<SettingsBody>(mock, 'settings')).settings;
+    expect(stored.readyPeerShare).toBe(0);
+    expect(stored.pauseAfterCanaryReboot).toBe(true);
+  });
+
+  it('changes the keys a PUT names and keeps the others, like the controller', async () => {
     const mock = new MockController();
     const { settings } = await call<SettingsBody>(mock, 'settings');
-    const without = Object.fromEntries(Object.entries(settings).filter(([key]) => key !== 'minPeers'));
 
-    expect((await put(mock, without)).status).toBe(400);
+    // The body of a page that knows neither the peer share nor the pause switches.
+    const old = Object.fromEntries(
+      Object.entries({ ...settings, minPeers: 5 }).filter(
+        ([key]) => key !== 'readyPeerShare' && !key.startsWith('pauseAfterCanary')
+      )
+    );
+    expect((await put(mock, old)).status).toBe(200);
+    expect((await call<SettingsBody>(mock, 'settings')).settings).toStrictEqual({ ...settings, minPeers: 5 });
+
+    expect((await put(mock, { readyPeerShare: 0.4 })).status).toBe(200);
+    expect((await call<SettingsBody>(mock, 'settings')).settings).toStrictEqual({
+      ...settings,
+      minPeers: 5,
+      readyPeerShare: 0.4,
+    });
+
+    expect((await put(mock, { readyPeerShare: null })).status).toBe(400);
+    expect((await put(mock, { paused: null })).status).toBe(400);
+    expect((await put(mock, { minPeers: 0 })).status).toBe(400);
+    expect((await call<SettingsBody>(mock, 'settings')).settings.readyPeerShare).toBe(0.4);
+  });
+
+  it('answers 400 for a mistyped key instead of failing', async () => {
+    const mock = new MockController();
+    const { settings } = await call<SettingsBody>(mock, 'settings');
+
     expect((await put(mock, { ...settings, minPeers: '3' })).status).toBe(400);
     expect((await put(mock, { ...settings, minPeers: 0 })).status).toBe(400);
     expect((await put(mock, null)).status).toBe(400);

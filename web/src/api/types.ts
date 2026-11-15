@@ -323,6 +323,11 @@ export interface Rollout {
   state: RolloutState;
   reason?: string;
   paused: boolean;
+  /**
+   * Why the scheduler paused the rollout by itself: "paused after the canary;
+   * resume to continue". Empty when a person paused it, and once it is resumed.
+   */
+  pauseReason?: string;
   approved: boolean;
   force: boolean;
   ignoreBudget: boolean;
@@ -351,6 +356,18 @@ export interface LeaseCancel {
   reason?: string;
 }
 
+/** fleet.PeerCheck: one client's peer count held against the fleet in the readiness check of a lease. */
+export interface PeerCheck {
+  /** "EL" or "CL". */
+  layer: string;
+  /** What the host's client reported. */
+  peers: number;
+  /** The median of the reference hosts. */
+  median: number;
+  /** The share of the median that the host must have. */
+  needs: number;
+}
+
 /** fleet.Lease */
 export interface Lease {
   id: string;
@@ -370,6 +387,8 @@ export interface Lease {
   endedAt?: string;
   operation?: Operation;
   readiness?: string;
+  /** The comparison with the fleet that the last readiness check made, per client it applied to. */
+  peerChecks?: PeerCheck[];
   error?: string;
   /**
    * Set once a person ended the lease. While the lease is open the agent is
@@ -404,6 +423,12 @@ export interface Settings {
   policyImage: Policy;
   policyPackages: Policy;
   policyReboot: Policy;
+  /** Pause a rollout of the kind when its first host is ready, until a person resumes it. */
+  pauseAfterCanaryImage: boolean;
+  pauseAfterCanaryPackages: boolean;
+  pauseAfterCanaryReboot: boolean;
+  /** Share (0–1) of the fleet's median peer count a client must have before a slot is released; 0, the default, is off. */
+  readyPeerShare: number;
   paused: boolean;
 }
 

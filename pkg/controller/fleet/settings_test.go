@@ -1,10 +1,13 @@
 package fleet
 
 import (
+	"math"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 func TestEffectiveMinPeers(t *testing.T) {
@@ -43,4 +46,29 @@ func TestSettingsDefaultsAndValidation(t *testing.T) {
 
 	s.MinPeers = 1
 	require.NoError(t, s.Validate())
+}
+
+func TestSettingsCanaryPauseAndPeerShare(t *testing.T) {
+	s := DefaultSettings()
+	assert.Zero(t, s.ReadyPeerShare, "the comparison with the fleet is off by default")
+
+	for _, kind := range []protocol.NeedKind{protocol.NeedImage, protocol.NeedPackages, protocol.NeedReboot} {
+		assert.False(t, s.PauseAfterCanaryFor(kind), "%s: no pause after the canary by default", kind)
+	}
+
+	s.PauseAfterCanaryPackages = true
+	assert.True(t, s.PauseAfterCanaryFor(protocol.NeedPackages))
+	assert.False(t, s.PauseAfterCanaryFor(protocol.NeedImage))
+	assert.False(t, s.PauseAfterCanaryFor(protocol.NeedReboot))
+	assert.False(t, s.PauseAfterCanaryFor(""))
+
+	for _, share := range []float64{0, 0.5, 1} {
+		s.ReadyPeerShare = share
+		require.NoError(t, s.Validate(), "%v", share)
+	}
+
+	for _, share := range []float64{-0.1, 1.01, math.NaN()} {
+		s.ReadyPeerShare = share
+		require.EqualError(t, s.Validate(), "readyPeerShare must be between 0 and 1", "%v", share)
+	}
 }

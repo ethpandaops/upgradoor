@@ -137,6 +137,9 @@ type Rollout struct {
 	Reason string `json:"reason,omitempty"`
 	// Paused stops new grants for this rollout only.
 	Paused bool `json:"paused"`
+	// PauseReason says why the scheduler paused the rollout by itself (after
+	// its canary). Empty when a person paused it, and once it is resumed.
+	PauseReason string `json:"pauseReason,omitempty"`
 	// Approved is set by a person for a rollout whose policy is manual.
 	Approved bool `json:"approved"`
 	// Force skips the order inside the rollout and the readiness check (never
@@ -289,6 +292,18 @@ type LeaseCancel struct {
 	Reason string     `json:"reason,omitempty"`
 }
 
+// PeerCheck is the comparison of one client's peer count with the fleet in
+// the readiness check of a lease.
+type PeerCheck struct {
+	// Layer is "EL" or "CL".
+	Layer string `json:"layer"`
+	// Peers is what the host's client reported, Median the median of the
+	// reference hosts, Needs the share of it that the host must have.
+	Peers  int `json:"peers"`
+	Median int `json:"median"`
+	Needs  int `json:"needs"`
+}
+
 // Lease is a slot granted to one host.
 type Lease struct {
 	ID    string     `json:"id"`
@@ -331,6 +346,10 @@ type Lease struct {
 	Operation *protocol.Operation `json:"operation,omitempty"`
 	// Readiness is a one-line progress note while verifying.
 	Readiness string `json:"readiness,omitempty"`
+	// PeerChecks is the comparison with the fleet that the last readiness
+	// check made, per client it applied to. It is for people: no decision
+	// reads it.
+	PeerChecks []PeerCheck `json:"peerChecks,omitempty"`
 	// Error is the failure reason for LeaseFailed.
 	Error string `json:"error,omitempty"`
 	// Cancelled is set once a person ended the lease. While the lease is

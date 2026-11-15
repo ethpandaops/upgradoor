@@ -58,12 +58,15 @@ const LIVENESS_EPOCHS = 16;
 const HISTORY_DEFAULT = 128;
 const HISTORY_MAX = 512;
 
+/** The pause reason of a rollout that the scheduler paused at its first success (docs/scheduler.md, Ordering, 4). */
+export const CANARY_PAUSE = 'paused after the canary; resume to continue';
+
 /** waitKind classifies a waiting reason the way the scheduler does. */
 function waitKind(reason: string): WaitKind {
   if (reason === 'held') return 'held';
   if (reason === 'agent silent') return 'silent';
   if (reason === 'paused') return 'paused';
-  if (reason === 'rollout paused') return 'rollout-paused';
+  if (reason === 'rollout paused' || reason === CANARY_PAUSE) return 'rollout-paused';
   if (reason.startsWith('waiting for approval')) return 'approval';
   if (reason === 'policy paused') return 'policy-paused';
   if (reason.startsWith('rollout halted')) return 'halted';
@@ -689,7 +692,7 @@ export class MockController {
 
     const active = memberOf.filter(r => r.state === 'active');
     const usable = active.filter(r => !r.paused);
-    if (active.length > 0 && usable.length === 0) return 'rollout paused';
+    if (active.length > 0 && usable.length === 0) return active[0]?.pauseReason ?? 'rollout paused';
 
     const approved = usable.filter(r => this.policy(r) !== 'manual' || r.approved);
     if (usable.length > 0 && approved.length === 0) return 'waiting for approval (policy manual)';
@@ -1056,27 +1059,34 @@ export class MockController {
     return { settings: { ...this.data.settings }, defaults: { ...this.data.defaults } };
   }
 
-  /** putSettings answers like the controller: 400 for an unknown key, a missing one or a value out of range. */
+  /**
+   * putSettings answers like the controller: the keys the body names are
+   * replaced and the others keep their value, so a page that does not know a
+   * setting cannot reset it. 400 for an unknown key, for null, for a value of
+   * the wrong type and for a result out of range.
+   */
   private putSettings(body: unknown): SettingsBody {
     if (typeof body !== 'object' || body === null || Array.isArray(body)) {
       throw new HttpError(400, 'settings must be a JSON object');
     }
 
-    const given = body as Record<string, unknown>;
-    const known = new Set<string>(FIELDS.map(f => f.key));
+    const specs = new Map<string, (typeof FIELDS)[number]>(FIELDS.map(f => [f.key, f]));
 
-    for (const key of Object.keys(given)) {
-      if (!known.has(key)) throw new HttpError(400, `unknown field "${key}"`);
-    }
+    for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+      const spec = specs.get(key);
+      if (!spec) throw new HttpError(400, `unknown field "${key}"`);
+      if (value === null) throw new HttpError(400, `${key} must not be null`);
 
-    for (const spec of FIELDS) {
-      const value = given[spec.key];
       const wanted =
-        spec.kind === 'switch' ? 'boolean' : spec.kind === 'percent' || spec.kind === 'count' ? 'number' : 'string';
-      if (typeof value !== wanted) throw new HttpError(400, `${spec.key} must be a ${wanted}`);
+        spec.kind === 'switch'
+          ? 'boolean'
+          : spec.kind === 'percent' || spec.kind === 'share' || spec.kind === 'count'
+            ? 'number'
+            : 'string';
+      if (typeof value !== wanted) throw new HttpError(400, `${key} must be a ${wanted}`);
     }
 
-    const next = body as Settings;
+    const next = { ...this.data.settings, ...(body as Partial<Settings>) };
     const form = toForm(next);
     for (const spec of FIELDS) {
       const problem = validateField(spec, form[spec.key]);
@@ -1084,7 +1094,7 @@ export class MockController {
     }
 
     const before = { ...this.data.settings };
-    this.data.settings = { ...next };
+    this.data.settings = next;
     this.log('settings.update', 'settings', { before, after: { ...next } });
 
     return this.settingsBody();
@@ -1530,7 +1540,11 @@ export class MockController {
     if (r.state !== 'active' && r.state !== 'halted') throw new HttpError(409, `rollout ${r.id} is ${r.state}`);
 
     r.paused = action === 'pause';
-    if (action === 'resume') r.approved = true;
+    // A resume lifts the pause after the canary like any other, and takes its reason along.
+    if (action === 'resume') {
+      r.approved = true;
+      r.pauseReason = undefined;
+    }
     r.updatedAt = this.iso(this.now());
     this.log(`action.${action}`, r.id, { reason: req.reason });
 

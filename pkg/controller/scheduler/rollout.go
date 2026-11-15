@@ -149,7 +149,54 @@ func (p *pass) syncRollouts() {
 
 		p.syncMembers(r, created[r.ID])
 		p.complete(r)
+		p.pauseAfterCanary(r)
 	}
+}
+
+// pauseAfterCanary pauses a rollout that had its first success in this pass
+// and is still open, when the setting of the kind it serves asks for it. It
+// is the pause a person sets (Rollout.Paused), with a reason of its own, and a
+// person's resume lifts it. A rollout has one first success, so it is paused
+// once; a forced rollout has no canary, and one that a person paused already
+// stays as it is.
+func (p *pass) pauseAfterCanary(r *fleet.Rollout) {
+	l := p.first[r.ID]
+	if l == nil || r.Force || r.Paused || r.State.Terminal() || !p.set.PauseAfterCanaryFor(p.servedKind(r)) {
+		return
+	}
+
+	r.Paused = true
+	r.PauseReason = reasonCanaryPause
+
+	p.record("rollout.paused", r.ID, map[string]any{
+		keyKey: r.Key, keyReason: reasonCanaryPause, keyLease: l.ID,
+	})
+}
+
+// servedKind is the kind of need a rollout serves. A manual rollout serves
+// what its directives ask for: a roll is about images, a reboot about reboots.
+func (p *pass) servedKind(r *fleet.Rollout) protocol.NeedKind {
+	switch r.Kind {
+	case fleet.RolloutImage:
+		return protocol.NeedImage
+	case fleet.RolloutPackages:
+		return protocol.NeedPackages
+	case fleet.RolloutReboot:
+		return protocol.NeedReboot
+	default:
+	}
+
+	for _, d := range p.directives {
+		switch {
+		case d.RolloutID != r.ID:
+		case d.Kind == protocol.DirectiveRoll:
+			return protocol.NeedImage
+		case d.Kind == protocol.DirectiveReboot:
+			return protocol.NeedReboot
+		}
+	}
+
+	return ""
 }
 
 // openKeys are the keys of the non-terminal rollouts.

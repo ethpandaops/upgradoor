@@ -84,6 +84,7 @@ const VC_IMAGE: Record<string, string> = {
 
 export const LIGHTHOUSE_IMAGE = (CL.lighthouse as ImageSpec).image;
 export const NETHERMIND_IMAGE = (EL.nethermind as ImageSpec).image;
+export const GRANDINE_IMAGE = (CL.grandine as ImageSpec).image;
 
 /** currentDigest is the digest a tag points at in the registry. */
 export const currentDigest = (image: string) => digest(`${image}/current`);
@@ -150,7 +151,7 @@ function specs(): HostSpec[] {
   patch('lodestar-reth-1', { reboot: true });
   patch('lodestar-reth-3', { localHold: 'debugging reth OOM, do not touch (pk)', oldDocker: true });
   patch('prysm-geth-3', { stale: true, oldDocker: true });
-  patch('grandine-erigon-2', { customEL: 'erigontech/erigon:pr-17012-debug' });
+  patch('grandine-erigon-2', { customEL: 'erigontech/erigon:pr-17012-debug', behind: [GRANDINE_IMAGE] });
   patch('teku-reth-1', { security: true });
   patch('prysm-erigon-1', { security: true });
 
@@ -229,6 +230,10 @@ export function defaultSettings(): Settings {
     policyImage: 'auto',
     policyPackages: 'auto',
     policyReboot: 'manual',
+    pauseAfterCanaryImage: false,
+    pauseAfterCanaryPackages: false,
+    pauseAfterCanaryReboot: false,
+    readyPeerShare: 0,
     paused: false,
   };
 }
@@ -557,6 +562,21 @@ export function buildMockData(now: number = Date.now()): MockData {
     },
   };
 
+  const grDigest = currentDigest(GRANDINE_IMAGE);
+  const grNeed = (c: string): Need => ({
+    id: `image/${c}/${grDigest}`,
+    kind: 'image',
+    image: {
+      container: c,
+      image: GRANDINE_IMAGE,
+      fromDigest: previousDigest(GRANDINE_IMAGE),
+      toDigest: grDigest,
+      toRevision: revision(grDigest),
+    },
+  });
+
+  const grandineRollout = `ro-${hex('rollout/grandine', 16)}`;
+  const leaseGrandine = `ls-${hex('lease/grandine-erigon-1', 16)}`;
   const lighthouseRollout = `ro-${hex('rollout/lighthouse', 16)}`;
   const nethermindRollout = `ro-${hex('rollout/nethermind', 16)}`;
   const rebootRollout = `ro-${hex('rollout/reboot', 16)}`;
@@ -631,6 +651,31 @@ export function buildMockData(now: number = Date.now()): MockData {
         pending('lighthouse-nethermind-1', 3, 'image/nethermind/', 3 * 3600 + 11 * 60),
         pending('nimbus-nethermind-2', 3, 'image/nethermind/', 3 * 3600 + 11 * 60),
         pending('nimbus-nethermind-3', 3, 'image/nethermind/', 3 * 3600 + 11 * 60),
+      ],
+    },
+    {
+      // The canary is done and ready; with pauseAfterCanaryImage on, the
+      // rollout waits for a person before the second host goes.
+      id: grandineRollout,
+      kind: 'image',
+      key: `image:${GRANDINE_IMAGE}@${grDigest}`,
+      title: `${GRANDINE_IMAGE} → ${grDigest.slice(7, 19)}`,
+      image: GRANDINE_IMAGE,
+      digest: grDigest,
+      revision: revision(grDigest),
+      state: 'active',
+      paused: true,
+      pauseReason: 'paused after the canary; resume to continue',
+      approved: false,
+      force: false,
+      ignoreBudget: false,
+      canary: 'grandine-erigon-1',
+      createdBy: 'scheduler',
+      createdAt: at(95 * 60),
+      updatedAt: at(78 * 60),
+      hosts: [
+        withLease(member('grandine-erigon-1', 'done', 2, at(78 * 60)), leaseGrandine, grNeed('grandine').id),
+        pending('grandine-erigon-2', 3, 'image/grandine/', 94 * 60),
       ],
     },
     {
@@ -762,6 +807,41 @@ export function buildMockData(now: number = Date.now()): MockData {
         disrupted: true,
       },
       readiness: 'validators attesting: 0 of 1 epochs with at least 115 of 128',
+    },
+    {
+      id: leaseGrandine,
+      host: 'grandine-erigon-1',
+      state: 'released',
+      needs: [grNeed('grandine'), grNeed('grandine-validator')],
+      rollouts: {
+        [grNeed('grandine').id]: grandineRollout,
+        [grNeed('grandine-validator').id]: grandineRollout,
+      },
+      weight: VALIDATORS_PER_HOST,
+      charged: VALIDATORS_PER_HOST,
+      force: false,
+      grantedBy: 'scheduler',
+      grantedAt: at(93 * 60),
+      expiresAt: at(63 * 60),
+      agentDoneAt: at(92 * 60),
+      endedAt: at(78 * 60),
+      operation: {
+        leaseId: leaseGrandine,
+        phase: 'done',
+        startedAt: at(93 * 60 - 6),
+        updatedAt: at(92 * 60),
+        steps: [
+          { needId: grNeed('grandine').id, status: 'done' },
+          { needId: grNeed('grandine-validator').id, status: 'done' },
+        ],
+        disrupted: true,
+      },
+      readiness: 'ready: node at head with peers, validators attesting',
+      // What it was released on: a quarter of the fleet's median (readyPeerShare 0.25).
+      peerChecks: [
+        { layer: 'EL', peers: 27, median: 31, needs: 8 },
+        { layer: 'CL', peers: 49, median: 52, needs: 13 },
+      ],
     },
     {
       id: leaseCanary,
@@ -900,6 +980,24 @@ export function buildMockData(now: number = Date.now()): MockData {
   log(2 * 3600 + 50 * 60 - 1, 'scheduler', 'rollout.halted', nethermindRollout, {
     reason: 'nimbus-nethermind-1: container nethermind restarted 14 times while verifying',
   });
+  log(96 * 60, 'bob@example.org', 'settings.update', 'settings', {
+    before: { ...defaults },
+    after: { ...defaults, pauseAfterCanaryImage: true, readyPeerShare: 0.25 },
+  });
+  log(95 * 60, 'scheduler', 'rollout.created', grandineRollout, { image: GRANDINE_IMAGE, digest: grDigest });
+  log(93 * 60, 'scheduler', 'lease.granted', 'grandine-erigon-1', {
+    lease: leaseGrandine,
+    rollout: grandineRollout,
+    canary: true,
+  });
+  log(78 * 60, 'scheduler', 'lease.released', 'grandine-erigon-1', {
+    lease: leaseGrandine,
+    readiness: 'ready: node at head with peers, validators attesting',
+  });
+  log(78 * 60 - 1, 'scheduler', 'rollout.paused', grandineRollout, {
+    reason: 'paused after the canary; resume to continue',
+    lease: leaseGrandine,
+  });
   log(47 * 60, 'scheduler', 'rollout.created', lighthouseRollout, { image: LIGHTHOUSE_IMAGE, digest: lhDigest });
   log(46 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-1', {
     lease: leaseCanary,
@@ -910,6 +1008,12 @@ export function buildMockData(now: number = Date.now()): MockData {
     lease: leaseCanary,
     readiness: 'ready: node at head with peers, validators attesting',
   });
+  // The lighthouse rollout paused after its canary too, and was resumed.
+  log(38 * 60 - 1, 'scheduler', 'rollout.paused', lighthouseRollout, {
+    reason: 'paused after the canary; resume to continue',
+    lease: leaseCanary,
+  });
+  log(37 * 60, 'alice@example.org', 'action.resume', lighthouseRollout, { reason: 'the canary looks good' });
   log(36 * 60, 'scheduler', 'lease.granted', 'rpc-1', { lease: leaseRpc, rollout: lighthouseRollout });
   log(21 * 60, 'scheduler', 'lease.released', 'rpc-1', {
     lease: leaseRpc,
@@ -927,7 +1031,7 @@ export function buildMockData(now: number = Date.now()): MockData {
     rollouts,
     leases,
     audit,
-    settings: { ...defaults },
+    settings: { ...defaults, pauseAfterCanaryImage: true, readyPeerShare: 0.25 },
     defaults,
     gateFailing: false,
     seq: 1000,

@@ -64,7 +64,11 @@ type simAgent struct {
 	weight   uint64
 	bootnode bool
 	probes   bool
-	verbs    []protocol.Verb
+	// peerMax is how many peers the host's clients have once they found them
+	// all again. It follows from the host's number, so that no seed draws a
+	// different history for it.
+	peerMax int
+	verbs   []protocol.Verb
 
 	containers []*simContainer
 	// pkgInstalled and pkgSeen are versions of the blocked package.
@@ -291,6 +295,7 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 			name:         fmt.Sprintf("host-%02d", i),
 			bootnode:     i < bootnodes,
 			probes:       rng.IntN(10) < 7,
+			peerMax:      simPeers + i%simPeerSpread,
 			verbs:        slices.Clone(allVerbs),
 			pkgInstalled: 1,
 			pkgSeen:      1,
@@ -354,6 +359,31 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 	}
 
 	return w
+}
+
+// simPeersStarved is how many peers the clients of a starved host find: as
+// many as a node is ever required to have (minPeers is 5 at most), and fewer
+// than half of what any other host finds.
+const simPeersStarved = 5
+
+// starve makes one of the hosts that probe their node find no more than
+// simPeersStarved peers, the n-th of them, and reports whether there is one.
+func (w *simWorld) starve(n int) bool {
+	probed := make([]*simAgent, 0, len(w.agents))
+
+	for _, a := range w.agents {
+		if a.probes {
+			probed = append(probed, a)
+		}
+	}
+
+	if len(probed) == 0 {
+		return false
+	}
+
+	probed[n%len(probed)].peerMax = simPeersStarved
+
+	return true
 }
 
 func (w *simWorld) newDigest(kind int) string {
@@ -427,8 +457,8 @@ func (w *simWorld) describe() string {
 	var b strings.Builder
 
 	for _, a := range w.agents {
-		fmt.Fprintf(&b, "  %s weight=%d bootnode=%v probes=%v verbs=%v localHold=%v dead=%v sloppy=%v blind=%v oldBuild=%v prevBuild=%v:",
-			a.name, a.weight, a.bootnode, a.probes, a.verbs, a.localHold, a.dead, a.sloppy, a.blind, a.oldBuild, a.prevBuild)
+		fmt.Fprintf(&b, "  %s weight=%d bootnode=%v probes=%v peers=%d verbs=%v localHold=%v dead=%v sloppy=%v blind=%v oldBuild=%v prevBuild=%v:",
+			a.name, a.weight, a.bootnode, a.probes, a.peerMax, a.verbs, a.localHold, a.dead, a.sloppy, a.blind, a.oldBuild, a.prevBuild)
 
 		for _, c := range a.containers {
 			fmt.Fprintf(&b, " %s=%s(managed=%v custom=%v)", c.name, c.image, c.managed, c.custom)
@@ -456,11 +486,15 @@ func (w *simWorld) attesting(a *simAgent) uint64 {
 	return a.weight
 }
 
-// simPeers is how many peers a node has once it found them all again;
+// simPeers is how many peers a node has at least once it found them all
+// again, and simPeerSpread how many values that number takes over the hosts
+// (12 to 16: the fewest are three quarters of the most, so that a host at its
+// full number is never below the largest readyPeerShare of a run);
 // simPeerEvery is how long each of them takes after the node came back.
 const (
-	simPeers     = 12
-	simPeerEvery = 3 * time.Second
+	simPeers      = 12
+	simPeerSpread = 5
+	simPeerEvery  = 3 * time.Second
 )
 
 // clPeers is how many peers the consensus client has: none while the node is
@@ -486,7 +520,7 @@ func (w *simWorld) peersAfter(a *simAgent, lag time.Duration) int {
 		return 0
 	}
 
-	peers := int(min(simPeers, max(0, w.now.Sub(later(a.upAt, a.outageUntil))-lag)/simPeerEvery))
+	peers := int(min(time.Duration(a.peerMax), max(0, w.now.Sub(later(a.upAt, a.outageUntil))-lag)/simPeerEvery))
 	if w.now.Before(a.peerCapUntil) {
 		peers = min(peers, a.peerCap)
 	}

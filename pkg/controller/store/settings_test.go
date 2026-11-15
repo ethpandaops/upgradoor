@@ -231,7 +231,54 @@ func TestSettingsFieldsCoverEveryField(t *testing.T) {
 		"maxUnavailablePercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyEpochs", "minPeers",
 		"leaseTtl", "hostStaleAfter", "readinessTimeout",
 		"policyImage", "policyPackages", "policyReboot", "paused",
+		"pauseAfterCanaryImage", "pauseAfterCanaryPackages", "pauseAfterCanaryReboot", "readyPeerShare",
 	}, keysOf(fields))
+}
+
+// Settings that an earlier build stored know neither the pause after the
+// canary nor the comparison with the fleet: they load with the defaults of
+// both, which are off, and a save writes nothing for them.
+func TestSettingsOfAnEarlierBuildLoadWithTheNewDefaults(t *testing.T) {
+	ctx := context.Background()
+	defaults := fleet.DefaultSettings()
+
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			s := backend.open(t)
+
+			for key, value := range map[string]string{
+				"maxUnavailablePercent": "20", "minPeers": "5", "policyReboot": `"auto"`, "paused": "true",
+			} {
+				_, err := rawDB(t, s).Exec(`INSERT INTO settings (key, value) VALUES (?, ?)`, key, value)
+				require.NoError(t, err)
+			}
+
+			got, err := s.LoadSettings(ctx, defaults)
+			require.NoError(t, err)
+
+			assert.Equal(t, 5, got.MinPeers)
+			assert.Zero(t, got.ReadyPeerShare, "no row: the comparison stays off")
+			assert.False(t, got.PauseAfterCanaryImage)
+			assert.False(t, got.PauseAfterCanaryPackages)
+			assert.False(t, got.PauseAfterCanaryReboot)
+
+			require.NoError(t, s.SaveSettings(ctx, defaults, got))
+			assert.Len(t, storedSettings(t, s), 4)
+
+			// Turning either on is a row.
+			got.ReadyPeerShare = 0.25
+			got.PauseAfterCanaryPackages = true
+			require.NoError(t, s.SaveSettings(ctx, defaults, got))
+
+			stored := storedSettings(t, s)
+			assert.Equal(t, "0.25", stored["readyPeerShare"])
+			assert.Equal(t, "true", stored["pauseAfterCanaryPackages"])
+
+			again, err := s.LoadSettings(ctx, defaults)
+			require.NoError(t, err)
+			assert.Equal(t, got, again)
+		})
+	}
 }
 
 func keysOf[V any](m map[string]V) []string {
