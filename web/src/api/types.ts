@@ -158,8 +158,11 @@ export interface Need {
 /** protocol.Phase */
 export type Phase = 'draining' | 'applying' | 'rebooting' | 'starting' | 'verifying' | 'done' | 'failed';
 
-/** protocol.StepStatus */
-export type StepStatus = 'pending' | 'running' | 'done' | 'failed' | 'superseded' | 'refused';
+/**
+ * protocol.StepStatus. `cancelled`: the lease was cancelled before the step
+ * had begun; nothing was disrupted for it and it is not a failure.
+ */
+export type StepStatus = 'pending' | 'running' | 'done' | 'failed' | 'superseded' | 'refused' | 'cancelled';
 
 /** protocol.Step */
 export interface Step {
@@ -334,6 +337,20 @@ export interface Rollout {
 /** fleet.LeaseState */
 export type LeaseState = 'granted' | 'running' | 'verifying' | 'released' | 'failed' | 'expired';
 
+/**
+ * fleet.LeaseCancel: the mark of a lease that a person ended while it was
+ * open (the end-lease action). The lease stays open and keeps its slot until
+ * it ends by one of the ordinary ways.
+ */
+export interface LeaseCancel {
+  at: string;
+  /** The person, as recorded in the audit log. */
+  by: string;
+  /** The state the lease was in when it was cancelled. For people: no rule reads it. */
+  state: LeaseState;
+  reason?: string;
+}
+
 /** fleet.Lease */
 export interface Lease {
   id: string;
@@ -354,6 +371,11 @@ export interface Lease {
   operation?: Operation;
   readiness?: string;
   error?: string;
+  /**
+   * Set once a person ended the lease. While the lease is open the agent is
+   * told with every sync and stops after the step in progress.
+   */
+  cancelled?: LeaseCancel;
 }
 
 /** fleet.AuditEntry */
@@ -414,7 +436,14 @@ export interface HoldRequest {
   reason: string;
 }
 
-/** scheduler.EndLeaseRequest: the body of end-lease. */
+/**
+ * scheduler.EndLeaseRequest: the body of end-lease. The action is a request
+ * to cancel an open lease (granted, running or verifying): the lease is
+ * marked (Lease.cancelled) and stays open until the agent reports or the
+ * lease runs out, and the host is put on controller hold. Ending a lease
+ * that is already cancelled changes nothing and succeeds; a lease that has
+ * ended is answered 409.
+ */
 export interface EndLeaseRequest {
   lease: string;
   reason: string;
@@ -616,6 +645,8 @@ export interface HostSummary {
   uptimeSeconds: number;
   hold: Hold;
   holdWanted: boolean;
+  /** holdReason is the reason of the controller hold (holdWanted); left out when there is none. */
+  holdReason?: string;
   verbs: List<Verb>;
   needs: List<Need>;
   plan: HostPlan;

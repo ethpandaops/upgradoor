@@ -68,9 +68,10 @@ type Service interface {
 	Retry(ctx context.Context, actor string, req RolloutHostsRequest) (*ActionResult, error)
 	// Abort closes a rollout. Open leases finish.
 	Abort(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
-	// EndLease ends one open lease that the agent has started as failed
-	// ("ended by operator"). The host is broken from then on and goes first;
-	// a lease that held back the rollouts of its group no longer does.
+	// EndLease asks for the end of one open lease: the lease is marked
+	// cancelled and its host put on hold in one transaction. The lease stays
+	// open, with its place in the budget, until the agent reports that it has
+	// stopped (or the lease ends by one of the ordinary ways).
 	EndLease(ctx context.Context, actor string, req EndLeaseRequest) (*ActionResult, error)
 	// Forget deletes hosts that are gone. Refused while a host holds a lease.
 	Forget(ctx context.Context, actor string, req HoldRequest) (*ActionResult, error)

@@ -177,12 +177,13 @@ export function describeCall(call: ActionCall): string[] {
       ];
     case 'end-lease':
       return [
-        `End lease ${call.body.lease} as failed ("ended by operator"). The host no longer counts as holding a ` +
-          'lease, the rollouts the lease served halt, and rollouts that waited for it go on.',
-        'The host is broken from then on: it goes first in every rollout of the same image or the packages ' +
-          'until a lease succeeds on it. Hold the host to take it out of the way.',
-        'The agent is not stopped: it finishes the operation it has started. ' +
-          'Refused for a lease the agent has not started; that one ends by itself.',
+        `End lease ${call.body.lease}. The agent begins no further step: it completes the step in progress ` +
+          'and stops. A lease the agent has not started is not started.',
+        'The host is put on hold. The lease stays open and keeps its slot until the agent reports ' +
+          '(or the lease expires); then it ends, as "ended by operator" if the agent had started it.',
+        'A change of which the agent had applied a step by then counts against the host: it was never shown to ' +
+          'be back, so it goes first next time. A change of which nothing was begun does not.',
+        'Unhold the host when the lease has ended and it is in order; until the lease has ended, unhold is refused.',
       ];
     case 'pause':
       return call.body.rollout === ''

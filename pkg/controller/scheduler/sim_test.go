@@ -35,7 +35,12 @@ import (
 // seventh the beacon node announces a slot phase far in the future that is
 // out of bounds. Now and then the controller restarts on closed rollouts as
 // the builds before this one wrote them, with the fields those builds kept.
-// A person ends a lease now and then.
+// A person ends a lease now and then, whatever state it is in: the lease
+// stays open and the host is held. Agents begin the steps of an operation one
+// after the other; those of the current build begin none once they are told
+// that the lease is cancelled and decline a lease they have not started, a
+// quarter of the agents are of a build that knows neither, and now and then
+// an operation runs for longer than any leaseTtl.
 // The store gives every row back as the SQLite store does (fakestore_test.go).
 // After
 // every step the oracle (sim_oracle_test.go) asserts the invariants of
@@ -89,7 +94,12 @@ type sim struct {
 	holds map[string]bool
 	// registered is when the current database first saw each host.
 	registered map[string]time.Time
-	stats      simStats
+	// cancelled is the person's own record of the leases they ended: the
+	// state each was in at that moment. It is lost with the database.
+	cancelled map[string]fleet.LeaseState
+	// checked is, per agent, how many of the steps it began were looked at.
+	checked map[string]int
+	stats   simStats
 }
 
 // simStats counts what happened, so that the test can tell a simulation that
@@ -141,7 +151,33 @@ type simStats struct {
 	FlightRetried, FlightNextToOpen             int
 	EndedByOperator, BrokenByOperator           int
 	BrokenAfterAbort                            int
-	ConvergeTicks, MaxConvergeTicks             int
+	// Cancels are the leases a person ended, by the state they were in;
+	// CancelsOldBuild those on agents that do not know the cancel mark,
+	// CancelsLongOp those whose operation ran for longer than five minutes.
+	// StepsBegun are the steps agents began, StepsCancelled those they did not
+	// begin because the lease was cancelled, Declined the leases agents said
+	// they would not start. SparedByCancel are the leases that ended as ended
+	// by operator and said nothing about their host; ReopenedFailed the failed
+	// leases that were taken up again when their agent came back;
+	// ForgottenBroken the hosts that were broken when a person forgot them.
+	Cancels                              map[fleet.LeaseState]int
+	CancelsOldBuild, CancelsLongOp       int
+	StepsBegun, StepsCancelled, Declined int
+	SparedByCancel, ReopenedFailed       int
+	// SparedUntouched are the leases that failed for another reason after a
+	// person had ended them and said nothing about a thing that never began.
+	SparedUntouched int
+	// NeverStarted are the leases that failed without the agent's word and
+	// were expired when the agent said that it never started them.
+	NeverStarted int
+	// HoldsExtended are the holds that were there before a lease was ended
+	// and whose reason was extended by the cancel.
+	HoldsExtended int
+	// UnholdsRefused are the unholds that were refused because a lease the
+	// person had ended was still open.
+	UnholdsRefused                  int
+	ForgottenBroken                 int
+	ConvergeTicks, MaxConvergeTicks int
 	// Waits counts the waiting reasons seen in plans, by their first word.
 	Waits map[string]int
 }
@@ -191,6 +227,27 @@ func (a *simStats) add(b *simStats) {
 	a.EndedByOperator += b.EndedByOperator
 	a.BrokenByOperator += b.BrokenByOperator
 	a.BrokenAfterAbort += b.BrokenAfterAbort
+	a.CancelsOldBuild += b.CancelsOldBuild
+	a.CancelsLongOp += b.CancelsLongOp
+	a.StepsBegun += b.StepsBegun
+	a.StepsCancelled += b.StepsCancelled
+	a.Declined += b.Declined
+	a.SparedByCancel += b.SparedByCancel
+	a.UnholdsRefused += b.UnholdsRefused
+	a.HoldsExtended += b.HoldsExtended
+	a.NeverStarted += b.NeverStarted
+	a.SparedUntouched += b.SparedUntouched
+	a.ReopenedFailed += b.ReopenedFailed
+	a.ForgottenBroken += b.ForgottenBroken
+
+	if a.Cancels == nil {
+		a.Cancels = make(map[fleet.LeaseState]int, 3)
+	}
+
+	for k, v := range b.Cancels {
+		a.Cancels[k] += v
+	}
+
 	a.SettledClosed += b.SettledClosed
 	a.ConvergeTicks += b.ConvergeTicks
 	a.MaxConvergeTicks = max(a.MaxConvergeTicks, b.MaxConvergeTicks)
@@ -231,6 +288,21 @@ func (s *sim) countLease(l *fleet.Lease) {
 		slices.ContainsFunc(l.Operation.Steps, func(st protocol.Step) bool { return st.Status == protocol.StepDone }) {
 		s.stats.MixedLeases++
 	}
+
+	if l.Operation == nil {
+		return
+	}
+
+	for _, st := range l.Operation.Steps {
+		switch {
+		case st.Status == protocol.StepCancelled:
+			s.stats.StepsCancelled++
+		case st.Status == protocol.StepRefused && st.Error == "the lease is not to be started":
+			s.stats.Declined++
+
+			return
+		}
+	}
 }
 
 // countLedger takes over what the oracle counted. The oracle starts over
@@ -248,6 +320,14 @@ func (s *sim) countLedger() {
 	s.stats.EndedByOperator += c.endedByOperator
 	s.stats.BrokenByOperator += c.brokenByOperator
 	s.stats.BrokenAfterAbort += c.brokenAfterAbort
+	s.stats.SparedByCancel += c.sparedByCancel
+	s.stats.NeverStarted += c.neverStarted
+	s.stats.SparedUntouched += c.sparedUntouched
+	s.stats.ReopenedFailed += c.reopenedFailed
+	s.stats.ForgottenBroken += c.forgottenBroken
+
+	// The oracle is replaced when the database is lost: count each once.
+	s.oracle.counts = oracleCounts{}
 }
 
 // count reads the run's totals off the audit trail and the store.
@@ -382,7 +462,10 @@ func newSim(seed uint64) (*sim, error) {
 		holds:   make(map[string]bool, 4),
 
 		registered: make(map[string]time.Time, 16),
+		cancelled:  make(map[string]fleet.LeaseState, 2),
+		checked:    make(map[string]int, 16),
 	}
+	s.stats.Cancels = make(map[fleet.LeaseState]int, 3)
 
 	// Taken from the seed, not from the random stream, so that the other
 	// seeds keep their histories.
@@ -513,28 +596,45 @@ func (s *sim) tick(d time.Duration) error {
 	return s.reconcile()
 }
 
-// checkStarts: an agent stops containers only under a lease that is open at
-// that moment, unless its clock is slow and the lease expired on it. A lease the store has never seen (the database was lost) is
-// adopted at the agent's next sync.
+// checkStarts looks at every step an agent began since the last look, not
+// only at the start of its operation. A step begins only under a lease that
+// is open at that moment, unless the agent's clock is slow and the lease
+// expired on it. A lease the store has never seen (the database was lost) is
+// adopted at the agent's next sync. And an agent of the current build begins
+// no step once it has taken in that its lease was cancelled or is no longer
+// offered.
 func (s *sim) checkStarts() error {
 	for _, a := range s.world.agents {
-		if a.op == nil || !a.op.Disrupted || !a.op.StartedAt.Equal(s.world.now) {
-			continue
-		}
+		begins := a.begins[s.checked[a.name]:]
+		s.checked[a.name] = len(a.begins)
 
-		l, err := s.store.GetLease(context.Background(), a.op.LeaseID)
+		for _, b := range begins {
+			if told, ok := a.cancelSeen[b.lease]; ok && !a.oldBuild && b.at.After(told) {
+				return fmt.Errorf("%s began step %s of lease %s at %s, after it was told at %s that the lease is cancelled",
+					a.name, b.need, b.lease, b.at.Format(time.TimeOnly), told.Format(time.TimeOnly))
+			}
 
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-		case err != nil:
-			return err
-		case (a.overrun || len(a.late) > 0) && l.State == fleet.LeaseExpired && l.Host == a.name:
-			// Its clock is slow: it starts a lease the controller has expired,
-			// or one the controller expired in favour of the lease it ran
-			// late. The controller takes the lease up again.
-		case l.State.Terminal() || l.Host != a.name:
-			return fmt.Errorf("%s started to stop containers for lease %s, which is %s (host %s)",
-				a.name, l.ID, l.State, l.Host)
+			l, err := s.store.GetLease(context.Background(), b.lease)
+
+			switch {
+			case errors.Is(err, store.ErrNotFound):
+			case err != nil:
+				return err
+			case (a.overrun || len(a.late) > 0) && l.State == fleet.LeaseExpired && l.Host == a.name:
+				// Its clock is slow: it starts a lease the controller has expired,
+				// or one the controller expired in favour of the lease it ran
+				// late. The controller takes the lease up again.
+			case l.State == fleet.LeaseFailed && l.Error == reasonAgentSilent && l.Host == a.name &&
+				l.EndedAt != nil && !a.lastSync.After(*l.EndedAt):
+				// The agent has been silent for so long that the controller gave
+				// the lease up, and it has not been heard since: nobody could
+				// tell it. The lease is taken up again when it reports.
+			case l.State.Terminal() || l.Host != a.name:
+				return fmt.Errorf("%s began step %s for lease %s, which is %s (host %s)",
+					a.name, b.need, l.ID, l.State, l.Host)
+			}
+
+			s.stats.StepsBegun++
 		}
 	}
 
@@ -573,6 +673,16 @@ func (s *sim) syncAgents() error {
 		a.lastSync = w.now
 		a.lastSent = req
 
+		// The agent's record of what it said about a lease ends with the
+		// first report that its operation is over. (A lease that was adopted
+		// is restated without needs; an agent that had forgotten the operation
+		// answers with an empty one, which says nothing about the first.)
+		if op := req.Operation; op != nil {
+			if prev := a.reported[op.LeaseID]; prev == nil || !prev.Phase.Terminal() {
+				a.reported[op.LeaseID] = cloneOperation(op)
+			}
+		}
+
 		resp, err := s.svc.Assignment(ctx, a.name)
 		if err != nil {
 			return fmt.Errorf("assignment of %s: %w", a.name, err)
@@ -588,11 +698,34 @@ func (s *sim) syncAgents() error {
 	return nil
 }
 
-// checkAssignment: a sync response carries only committed state.
+// checkAssignment: a sync response carries only committed state. A lease
+// that a person ended is restated with the cancel mark for as long as it is
+// open, except while the agent has not reported an operation for it: then it
+// is not offered at all.
 func (s *sim) checkAssignment(a *simAgent, resp *Assignment) error {
 	open, err := s.store.ListLeases(context.Background(), store.LeaseFilter{OpenOnly: true, Host: a.name})
 	if err != nil {
 		return err
+	}
+
+	if len(open) > 0 {
+		_, cancelled := s.cancelled[open[0].ID]
+		// Withheld from an agent that has not said that it has it.
+		reported := a.lastSent != nil && a.lastSent.Operation != nil && a.lastSent.Operation.LeaseID == open[0].ID
+		withheld := cancelled && open[0].State == fleet.LeaseGranted && !reported
+
+		switch {
+		case withheld && resp.Lease != nil:
+			return fmt.Errorf("assignment of %s offers lease %s, which a person ended before the agent started it",
+				a.name, resp.Lease.ID)
+		case withheld && resp.Queue != nil:
+			return fmt.Errorf("assignment of %s queues the host, which holds lease %s", a.name, open[0].ID)
+		case withheld:
+			return nil
+		case resp.Lease != nil && resp.Lease.Cancel != cancelled:
+			return fmt.Errorf("assignment of %s: lease %s cancel mark %v, a person ended it: %v",
+				a.name, resp.Lease.ID, resp.Lease.Cancel, cancelled)
+		}
 	}
 
 	switch {
@@ -695,6 +828,7 @@ func (s *sim) facts(fresh bool) *simFacts {
 		skipped:        s.skipped,
 		holds:          s.holds,
 		registered:     s.registered,
+		cancelled:      s.cancelled,
 		epochStart:     w.epochStart,
 		epochOf:        w.epochOf,
 		fresh:          fresh,
@@ -728,6 +862,8 @@ func (s *sim) facts(fresh bool) *simFacts {
 			disrupted:  a.disrupted,
 			late:       a.late,
 			doneAt:     a.doneAt,
+			reported:   a.reported,
+			oldBuild:   a.oldBuild,
 		}
 	}
 
@@ -1020,6 +1156,7 @@ func (s *sim) loseDatabase() error {
 	s.retried = nil
 	s.skipped = make(map[string]map[string]bool, 4)
 	s.registered = make(map[string]time.Time, 16)
+	s.cancelled = make(map[string]fleet.LeaseState, 2)
 
 	for _, a := range s.world.agents {
 		s.world.dropped[a.name] = true
@@ -1360,11 +1497,7 @@ func (s *sim) operatorAction() error {
 
 		return s.act(fmt.Sprintf("hold %v", hosts), res, err)
 	case n < 60:
-		hosts := s.someHosts()
-		res, err := s.svc.Unhold(ctx, simActor, HoldRequest{Hosts: hosts})
-		s.noteHolds(hosts)
-
-		return s.act(fmt.Sprintf("unhold %v", hosts), res, err)
+		return s.unhold(s.someHosts())
 	case n < 80:
 		return s.manualAction()
 	case n < 94:
@@ -1379,6 +1512,7 @@ func (s *sim) operatorAction() error {
 		// what the person noted about it.
 		if s.store.host(hosts[0]) == nil {
 			s.world.dropped[hosts[0]] = true
+			s.oracle.forget(hosts[0])
 
 			for _, byHost := range s.skipped {
 				delete(byHost, hosts[0])
@@ -1389,10 +1523,63 @@ func (s *sim) operatorAction() error {
 	}
 }
 
-// endLease is the person who ends an open lease: any one, whatever it does.
-// The agent finishes what it has started; the host is broken from then on. A
-// lease that the agent has not started as far as the controller knows is
-// refused.
+// unhold is the person who lifts the hold of hosts, at any time. By the
+// person's own record of the leases they ended, the action is refused, for
+// all its hosts, exactly while one of them holds such a lease that is still
+// open; otherwise it is not refused as invalid.
+func (s *sim) unhold(hosts []string) error {
+	ctx := context.Background()
+
+	open, err := s.store.ListLeases(ctx, store.LeaseFilter{OpenOnly: true})
+	if err != nil {
+		return err
+	}
+
+	ending := ""
+
+	for _, l := range open {
+		if _, cancelled := s.cancelled[l.ID]; cancelled && slices.Contains(hosts, l.Host) {
+			ending = l.ID
+		}
+	}
+
+	held := make(map[string]bool, len(hosts))
+
+	for _, name := range hosts {
+		if h := s.store.host(name); h != nil {
+			held[name] = h.HoldWanted
+		}
+	}
+
+	res, err := s.svc.Unhold(ctx, simActor, HoldRequest{Hosts: hosts})
+	s.noteHolds(hosts)
+
+	switch {
+	case ending != "" && err == nil:
+		return fmt.Errorf("unhold %v was allowed while lease %s, which a person ended, is open", hosts, ending)
+	case ending != "" && !errors.Is(err, errWrite):
+		s.stats.UnholdsRefused++
+
+		for _, name := range hosts {
+			if h := s.store.host(name); h != nil && h.HoldWanted != held[name] {
+				return fmt.Errorf("unhold %v was refused for lease %s and changed the hold of %s", hosts, ending, name)
+			}
+		}
+	case ending == "" && errors.Is(err, ErrInvalidAction):
+		return fmt.Errorf("unhold %v was refused although none of the hosts holds a lease a person ended: %w",
+			hosts, err)
+	}
+
+	return s.act(fmt.Sprintf("unhold %v", hosts), res, err)
+}
+
+// simHoldEnded is what the reason of a host's controller hold says once a
+// lease of the host was ended.
+const simHoldEnded = "lease ended by operator"
+
+// endLease is the person who ends an open lease: any one, whatever it does,
+// started or not, ended before or not. Every open lease can be ended; the
+// lease stays open and the host is held from that moment on.
 func (s *sim) endLease() error {
 	ctx := context.Background()
 
@@ -1401,14 +1588,74 @@ func (s *sim) endLease() error {
 		return err
 	}
 
-	id := "nosuchlease"
-	if len(open) > 0 {
-		id = open[s.rng.IntN(len(open))].ID
+	if len(open) == 0 {
+		res, endErr := s.svc.EndLease(ctx, simActor, EndLeaseRequest{Lease: "nosuchlease", Reason: "sim"})
+
+		return s.act("end lease nosuchlease", res, endErr)
 	}
 
-	res, err := s.svc.EndLease(ctx, simActor, EndLeaseRequest{Lease: id, Reason: "sim"})
+	was := open[s.rng.IntN(len(open))]
 
-	return s.act("end lease "+id, res, err)
+	// What the person saw of the host's hold before.
+	heldBefore, reasonBefore := false, ""
+	if h := s.store.host(was.Host); h != nil {
+		heldBefore, reasonBefore = h.HoldWanted, h.HoldReason
+	}
+
+	res, err := s.svc.EndLease(ctx, simActor, EndLeaseRequest{Lease: was.ID, Reason: "sim"})
+
+	switch {
+	case errors.Is(err, errWrite):
+	case err != nil:
+		return fmt.Errorf("end lease %s of %s (%s) was refused: %w", was.ID, was.Host, was.State, err)
+	default:
+		_, again := s.cancelled[was.ID]
+		if !again {
+			s.cancelled[was.ID] = was.State
+			s.stats.Cancels[was.State]++
+
+			if a := s.world.byName[was.Host]; a != nil && a.oldBuild {
+				s.stats.CancelsOldBuild++
+			}
+
+			if a := s.world.byName[was.Host]; a != nil && a.op != nil && a.opEnd.Sub(a.op.StartedAt) > 5*time.Minute {
+				s.stats.CancelsLongOp++
+			}
+		}
+
+		// The person sees the host held afterwards, also when the lease had
+		// been ended before: the hold cannot have been lifted meanwhile.
+		s.noteHolds([]string{was.Host})
+
+		if h := s.store.host(was.Host); h != nil && !h.HoldWanted {
+			return fmt.Errorf("lease %s of %s was ended and the host is not held", was.ID, was.Host)
+		}
+
+		// The hold says that a lease was ended under it, also when somebody
+		// had held the host before, and it keeps what that person gave.
+		if h := s.store.host(was.Host); h != nil && !again {
+			if !strings.Contains(h.HoldReason, simHoldEnded) || (heldBefore && !strings.HasPrefix(h.HoldReason, reasonBefore)) {
+				return fmt.Errorf("lease %s of %s was ended; the host was held before: %v (%q), and the reason of its "+
+					"hold is now %q", was.ID, was.Host, heldBefore, reasonBefore, h.HoldReason)
+			}
+
+			if heldBefore && reasonBefore != "" && !strings.Contains(reasonBefore, simHoldEnded) {
+				s.stats.HoldsExtended++
+			}
+		}
+
+		now, getErr := s.store.GetLease(ctx, was.ID)
+		if getErr != nil {
+			return getErr
+		}
+
+		if now.State != was.State {
+			return fmt.Errorf("ending lease %s of %s moved it from %s to %s: only its agent's report, its expiry or "+
+				"a reconcile ends a lease", was.ID, was.Host, was.State, now.State)
+		}
+	}
+
+	return s.act(fmt.Sprintf("end lease %s of %s (%s)", was.ID, was.Host, was.State), res, err)
 }
 
 // rolloutAction pauses, resumes (approves), aborts or skips in one rollout.
@@ -1629,11 +1876,8 @@ func (s *sim) operate() error {
 
 	for _, a := range s.world.agents {
 		if h := s.store.host(a.name); h != nil && h.HoldWanted {
-			res, err := s.svc.Unhold(ctx, simActor, HoldRequest{Hosts: []string{a.name}})
-			s.noteHolds([]string{a.name})
-
-			if actErr := s.act("unhold "+a.name, res, err); actErr != nil {
-				return actErr
+			if err := s.unhold([]string{a.name}); err != nil {
+				return err
 			}
 		}
 	}
@@ -1861,6 +2105,26 @@ func simSeeds(t *testing.T) (first, n uint64) {
 	return 0, 300
 }
 
+// TestSimulationFoundSeeds replays the seeds on which the simulation has
+// found something, whatever range of seeds TestSimulation runs:
+//
+//   - 8303: a lease that was taken up again after a person had skipped its
+//     member is no success of the rollout; the others wait for a canary;
+//   - 9335, 10077: a lease that a person ended, taken up again after the hold
+//     had been lifted, holds its host again.
+//
+// A seed says what it said only as long as the generator draws the same
+// history from it; the rules themselves are pinned by name elsewhere.
+func TestSimulationFoundSeeds(t *testing.T) {
+	for _, seed := range []uint64{8303, 9335, 10077} {
+		t.Run(strconv.FormatUint(seed, 10), func(t *testing.T) {
+			if report, _ := runSim(seed, 300); report != "" {
+				t.Error(report)
+			}
+		})
+	}
+}
+
 // TestSimulation drives random fleets through random histories and checks
 // the invariants of docs/scheduler.md after every step, then convergence. A
 // failure names the seed, the fleet, the settings and the last steps; the
@@ -1960,6 +2224,10 @@ func TestSimulation(t *testing.T) {
 			"broken hosts repaired":                      total.Repaired,
 			"hosts held back by a lease in flight":       total.FlightHeld,
 			"leases ended by a person":                   total.EndedByOperator,
+			"granted leases a person ended":              total.Cancels[fleet.LeaseGranted],
+			"running leases a person ended":              total.Cancels[fleet.LeaseRunning],
+			"verifying leases a person ended":            total.Cancels[fleet.LeaseVerifying],
+			"steps that agents began":                    total.StepsBegun,
 			"runs with a slot phase out of bounds":       total.FuturePhases,
 			"failed leases with a step done":             total.MixedLeases,
 			"slot-duration forks":                        total.Forks,
@@ -1978,14 +2246,25 @@ func TestSimulation(t *testing.T) {
 	// What is rare shows in a long run only.
 	if len(failed) == 0 && n >= 1000 {
 		for what, count := range map[string]int{
-			"runs that begin before genesis":                                   total.BeforeGenesis,
-			"restarts on rows of an earlier build":                             total.PreviousBuilds,
-			"hosts held back by the lease of an aborted rollout":               total.FlightAborted,
-			"hosts held back by a lease that was taken up again":               total.FlightReopened,
-			"hosts held back in a rollout that a retry opened":                 total.FlightRetried,
-			"hosts held back in a rollout that was open when the other closed": total.FlightNextToOpen,
-			"hosts broken by a lease that a person ended":                      total.BrokenByOperator,
-			"hosts broken by a lease of a rollout that had been aborted":       total.BrokenAfterAbort,
+			"runs that begin before genesis":                                                          total.BeforeGenesis,
+			"restarts on rows of an earlier build":                                                    total.PreviousBuilds,
+			"hosts held back by the lease of an aborted rollout":                                      total.FlightAborted,
+			"hosts held back by a lease that was taken up again":                                      total.FlightReopened,
+			"hosts held back in a rollout that a retry opened":                                        total.FlightRetried,
+			"hosts held back in a rollout that was open when the other closed":                        total.FlightNextToOpen,
+			"hosts broken by a lease that a person ended with its steps done":                         total.BrokenByOperator,
+			"unholds refused while a lease that a person ended was open":                              total.UnholdsRefused,
+			"holds that were there before a lease was ended, reason extended":                         total.HoldsExtended,
+			"silent leases expired when the agent said it never started them":                         total.NeverStarted,
+			"leases of an earlier agent build that failed after a cancel and spared what never began": total.SparedUntouched,
+			"leases a person ended that broke nobody":                                                 total.SparedByCancel,
+			"steps not begun because the lease was cancelled":                                         total.StepsCancelled,
+			"leases an agent declined to start":                                                       total.Declined,
+			"leases ended on agents that do not know the cancel mark":                                 total.CancelsOldBuild,
+			"leases ended during an operation of more than five minutes":                              total.CancelsLongOp,
+			"failed leases taken up again":                                                            total.ReopenedFailed,
+			"broken hosts that a person forgot":                                                       total.ForgottenBroken,
+			"hosts broken by a lease of a rollout that had been aborted":                              total.BrokenAfterAbort,
 		} {
 			if count == 0 {
 				t.Errorf("the simulation never produced any %s", what)

@@ -158,15 +158,25 @@ type AuditFilter struct {
 
 // Changes is one atomic set of scheduler writes. Rollouts, leases and
 // directives are upserted by ID; a rollout's Hosts replace its member rows.
+// Holds set the controller-side hold switch of hosts, like SetHostHold; a
+// host that does not exist fails the whole set with ErrNotFound.
 type Changes struct {
 	Rollouts   []*fleet.Rollout
 	Leases     []*fleet.Lease
 	Directives []*fleet.Directive
+	Holds      []HostHold
 	Audit      []fleet.AuditEntry
+}
+
+// HostHold is one change of a host's controller-side hold switch.
+type HostHold struct {
+	Host   string
+	Wanted bool
+	Reason string
 }
 
 // Empty reports whether there is nothing to commit.
 func (c *Changes) Empty() bool {
 	return len(c.Rollouts) == 0 && len(c.Leases) == 0 &&
-		len(c.Directives) == 0 && len(c.Audit) == 0
+		len(c.Directives) == 0 && len(c.Holds) == 0 && len(c.Audit) == 0
 }

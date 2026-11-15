@@ -415,6 +415,21 @@ func (n *NetworkHealth) EpochDuration() time.Duration {
 	return length
 }
 
+// LastEpochDuration returns the length of an epoch of the last phase that
+// can be worked with, or 0 when there is none. It is a rough bound for a view
+// whose current epoch cannot be placed (EpochDuration is 0 then).
+func (n *NetworkHealth) LastEpochDuration() time.Duration {
+	t, ok := n.timing()
+	if !ok {
+		return 0
+	}
+
+	// Valid: checked by usableTiming.
+	length, _ := epochLength(t.slotsPerEpoch, t.phases[len(t.phases)-1].SlotMs)
+
+	return length
+}
+
 // Participation is Live/Tracked, or 1 when nothing is tracked.
 func (n *NetworkHealth) Participation() float64 {
 	if n.Tracked == 0 {

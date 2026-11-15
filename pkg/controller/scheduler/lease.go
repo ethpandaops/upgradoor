@@ -6,6 +6,7 @@ import (
 	"slices"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
+	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -129,6 +130,19 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 	if l.AgentDoneAt == nil {
 		doneAt := p.now
 		l.AgentDoneAt = &doneAt
+	}
+
+	if l.Cancelled != nil {
+		// A person ended the lease, and the agent's report that its operation
+		// is over is on record: it stopped when it was told, or finished all
+		// the same (an older build, or the cancel came too late), or the lease
+		// was being verified when it was ended. The lease ends here: nobody
+		// waits for the readiness of a host that a person took out of the
+		// rollout. What the end says about the host is read off the report
+		// alone (verdictOf), never off the moment of the click.
+		p.failLease(l, reasonEndedByOperator)
+
+		return
 	}
 
 	if l.Force {
@@ -468,18 +482,17 @@ func (p *pass) releaseLease(l *fleet.Lease) {
 // failLease ends a lease as failed and halts every rollout it served,
 // except rollouts whose own steps are all done while another step failed.
 func (p *pass) failLease(l *fleet.Lease, reason string) {
-	p.endLease(l, fleet.LeaseFailed)
+	// The reason first: what the end says about the host depends on it.
 	l.Error = reason
+	p.endLease(l, fleet.LeaseFailed)
 
-	otherFailed := l.Operation != nil && slices.ContainsFunc(l.Operation.Steps,
-		func(s protocol.Step) bool { return s.Status == protocol.StepFailed })
-
+	spared := stepFailed(l)
 	halted := make([]string, 0, len(l.Rollouts))
 
 	for _, r := range p.leaseRollouts(l) {
 		m := r.Host(l.Host)
 
-		if otherFailed && stepsDone(l, r.ID) {
+		if spared && stepsDone(l, r.ID) {
 			// Done, but not through a lease that passed readiness: it is no
 			// success of the rollout.
 			m.LeaseID = ""
@@ -634,7 +647,9 @@ func stepStatus(op *protocol.Operation, needID string) protocol.StepStatus {
 
 // adoptOperations makes every host that works on an operation hold a lease
 // for it: an operation for a lease the controller does not know is adopted,
-// and one for a lease that expired as not started is reopened.
+// and one for a lease that expired as not started, or failed without the
+// agent's word, is reopened. A lease that failed that way and that its agent
+// says it never started is expired (neverStarted).
 func (p *pass) adoptOperations() {
 	for _, name := range p.names {
 		hv := p.hosts[name]
@@ -644,20 +659,33 @@ func (p *pass) adoptOperations() {
 			continue
 		}
 
+		closed := p.w.ClosedLeases[op.LeaseID]
+
 		// An operation that ended without stopping anything needs no lease.
+		// But a lease that failed without the agent's word did not fail by
+		// what the agent now says: it never started it.
 		if op.Phase == protocol.PhaseDone && !op.Disrupted {
+			if closed != nil && closed.State == fleet.LeaseFailed && resumes(closed, hv.h) {
+				p.neverStarted(hv, closed, op)
+			}
+
 			continue
 		}
 
-		closed := p.w.ClosedLeases[op.LeaseID]
-		if closed != nil && (closed.State != fleet.LeaseExpired || closed.Host != name) {
-			// The lease ended with this operation; the agent repeats it until
-			// it sees a response without the lease.
+		if closed != nil && !resumes(closed, hv.h) {
 			continue
 		}
 
 		if hv.lease != nil {
-			if hv.lease.State != fleet.LeaseGranted {
+			// The agent holds one operation. A lease of the host that it has
+			// started (running: advanceRunning has just failed it for want of
+			// its operation; verifying: its operation is behind it) cannot be
+			// open next to this one, so only a granted one is found here. An
+			// agent that is at work cannot start it: it is expired in favour of
+			// the lease the agent works on. An agent whose operation is over can
+			// start it at any moment, so it stays, and the report is passed
+			// over: the host is back up, and the lease it reports keeps its end.
+			if hv.lease.State != fleet.LeaseGranted || op.Phase.Terminal() {
 				continue
 			}
 
@@ -674,15 +702,62 @@ func (p *pass) adoptOperations() {
 	}
 }
 
+// resumes reports whether an operation that the host reports for a lease
+// which has ended means that the lease did not end when the controller said
+// so: the host works under it, or has worked under it, without the controller
+// having taken that into account.
+//
+//   - An expired lease stopped nothing by the controller's account. An
+//     operation for it that stopped something (the caller has passed over the
+//     ones that did not) says otherwise.
+//   - A failed lease that ended without the agent's final word (the agent was
+//     silent, or no longer reported the operation: the report on record is
+//     missing or not terminal) is taken up again when the agent reports the
+//     operation after all, in a sync from after the lease ended (the last
+//     sync from before it is what the lease failed on). Otherwise the host
+//     would be down, or back up
+//     again, under a lease that the controller has closed: it would not count
+//     against the budget while it is down, nobody would look whether it comes
+//     back, and it would stay broken although the operation succeeded.
+//
+// What stays ignored: the report for a lease that ended with the agent's
+// final word on record (released, failed on the agent's failure or on
+// readiness, expired as undisrupted). The agent repeats that report until it
+// sees a response without the lease; it says nothing new. The report for a
+// lease that belongs to another host: there is no lease to give it. And a
+// report of an operation that is over while the host holds a lease it has
+// been granted since (adoptOperations): the host is up again and may start
+// that lease at any moment.
+func resumes(closed *fleet.Lease, host *fleet.Host) bool {
+	if closed.Host != host.Name {
+		return false
+	}
+
+	switch closed.State {
+	case fleet.LeaseExpired:
+		return true
+	case fleet.LeaseFailed:
+		final := closed.Operation != nil && closed.Operation.Phase.Terminal()
+
+		return !final && closed.EndedAt != nil && host.LastSeen.After(*closed.EndedAt)
+	default:
+		return false
+	}
+}
+
 func (p *pass) knownLease(id string) bool {
 	return slices.ContainsFunc(p.leases, func(l *fleet.Lease) bool { return l.ID == id })
 }
 
-// reopen takes back the expiry of a lease whose agent started after all:
-// its sync from before the start arrived after the grace period, or the
-// agent ran past its deadline. The host is down, so it holds the lease
-// again; where it still waits in the open rollouts the lease served, it is
-// leased again. Where a rollout it served was closed meanwhile nothing is to
+// reopen takes back the end of a lease whose agent works on it after all
+// (resumes): it expired, and the agent's sync from before the start arrived
+// after the grace period or the agent ran past its deadline; or it failed for
+// the agent's silence, and the agent is back with the operation. What the
+// first end said about the host is void (ledger.retract). A rollout that
+// halted for it stays halted until a person retries it. The host is down, so
+// it holds the lease
+// again; where it still waits in the open rollouts the lease served, or is
+// still failed by this lease, it is leased again. Where a rollout it served was closed meanwhile nothing is to
 // be done: the lease is open, so it is in flight for the rollouts that follow
 // (inFlight), and how it ends is on record like the end of any lease.
 func (p *pass) reopen(hv *hostView, closed *fleet.Lease, op *protocol.Operation) {
@@ -697,12 +772,15 @@ func (p *pass) reopen(hv *hostView, closed *fleet.Lease, op *protocol.Operation)
 			continue
 		}
 
+		// The member waits again (the lease had expired, or a person retried
+		// it), or it is still failed by this very lease.
 		m := r.Host(l.Host)
-		if m == nil || m.State != fleet.HostPending {
+		if m == nil || (m.State != fleet.HostPending && (m.State != fleet.HostFailed || m.LeaseID != l.ID)) {
 			continue
 		}
 
 		m.LeaseID = l.ID
+		m.Error = ""
 		p.setMember(m, fleet.HostLeased)
 	}
 
@@ -710,8 +788,70 @@ func (p *pass) reopen(hv *hostView, closed *fleet.Lease, op *protocol.Operation)
 	p.origLeases[l.ID] = closed
 	hv.lease = l
 
-	p.record("lease.reopened", l.Host, map[string]any{keyLease: l.ID, "phase": string(op.Phase)})
+	p.ledger.retract(closed)
+
+	p.record("lease.reopened", l.Host, map[string]any{
+		keyLease: l.ID, "phase": string(op.Phase), "was": string(closed.State),
+	})
+
+	// The host worked under the lease, or still does: the hold that belongs
+	// to its cancel is in place again before anything else is decided.
+	if l.Cancelled != nil && (op.Disrupted || !op.Phase.Terminal()) {
+		p.holdEnded(hv, l)
+	}
+
 	p.applyOperation(l, hv, op)
+}
+
+// holdEnded puts the host of a lease that a person ended back on controller
+// hold, if it is not held for that any more. A cancelled lease whose host is
+// not held exists only by being taken up again: the lease had ended without
+// its agent's word (expired as not started, failed as silent), a person
+// lifted the hold, which is allowed once the lease has ended, and then the
+// agent reported the operation after all. The hold is part of the cancel
+// (action.go, EndLease): without it the host would be granted the same work
+// the moment the lease ends again. It is written in the transaction of the
+// reopened lease, and audited. A person lifts it when the lease has ended.
+func (p *pass) holdEnded(hv *hostView, l *fleet.Lease) {
+	reason := endedHoldReason(hv.h)
+	if hv.h.HoldWanted && reason == hv.h.HoldReason {
+		return
+	}
+
+	p.holds = append(p.holds, store.HostHold{Host: l.Host, Wanted: true, Reason: reason})
+	hv.held = true
+
+	p.record("host.held", l.Host, map[string]any{
+		keyLease:  l.ID,
+		keyReason: "a lease that a person ended was taken up again",
+		keyBefore: map[string]any{keyHoldWanted: hv.h.HoldWanted, keyHoldReason: hv.h.HoldReason},
+		keyAfter:  map[string]any{keyHoldWanted: true, keyHoldReason: reason},
+	})
+}
+
+// neverStarted gives a lease that failed without the agent's final word
+// (resumes: the agent was silent, or no longer reported the operation) the
+// end it had when its agent, back again, reports that it stopped nothing
+// under it: it declined the lease, or every step was refused or superseded.
+// Such a lease cost nothing, so it is expired, like a lease whose agent says
+// so in time. What the failure said about the host is void: the host is not
+// broken by it, and its member is not failed because of it (it waits again).
+// A rollout that halted for it stays halted until a person retries it, as for
+// every lease that is taken up again.
+//
+// It is the reopen path, with the operation's end applied in the same pass
+// (applyOperation expires the lease). The row is expired with the agent's
+// report on record from then on, which nothing takes up again, so a restart
+// finds the same. The lease the host holds meanwhile, if any, stays its
+// lease: the reported operation is over and holds no slot.
+func (p *pass) neverStarted(hv *hostView, closed *fleet.Lease, op *protocol.Operation) {
+	held := hv.lease
+
+	p.reopen(hv, closed, op)
+
+	if held != nil {
+		hv.lease = held
+	}
 }
 
 // adopt creates the lease row for an unknown operation in the reported

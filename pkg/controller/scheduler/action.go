@@ -25,6 +25,10 @@ const (
 	keyState    = "state"
 	keyKey      = "key"
 	keyRollouts = "rollouts"
+	// keyHoldWanted and keyHoldReason are the hold switch of a host in the
+	// before and after of an audit entry.
+	keyHoldWanted = "holdWanted"
+	keyHoldReason = "holdReason"
 )
 
 // manualRequest is a roll or reboot request in one shape.
@@ -256,6 +260,8 @@ func (s *service) setHold(
 	action, reason := "action.unhold", ""
 	if wanted {
 		action, reason = "action.hold", req.Reason
+	} else if err := s.unholdAllowed(ctx, hosts); err != nil {
+		return nil, err
 	}
 
 	res := &ActionResult{}
@@ -286,6 +292,30 @@ func (s *service) setHold(
 	return res, nil
 }
 
+// unholdAllowed refuses to lift the hold of a host whose lease a person
+// ended and that is still open. The hold is part of the cancel: it is what
+// keeps the host from being offered the same work again the moment the lease
+// has ended. Lifting it before that would undo the cancel without anybody
+// seeing it. Nothing is changed when one of the hosts is refused.
+func (s *service) unholdAllowed(ctx context.Context, hosts []*fleet.Host) error {
+	leases, err := s.opts.Store.ListLeases(ctx, store.LeaseFilter{OpenOnly: true})
+	if err != nil {
+		return fmt.Errorf("scheduler: list open leases: %w", err)
+	}
+
+	for _, h := range hosts {
+		for _, l := range leases {
+			if l.Host == h.Name && !l.State.Terminal() && l.Cancelled != nil {
+				return fmt.Errorf("%w: lease %s of %s was ended by %s and is still open (%s); "+
+					"the hold can be lifted once the lease has ended",
+					ErrInvalidAction, l.ID, h.Name, l.Cancelled.By, l.State)
+			}
+		}
+	}
+
+	return nil
+}
+
 // setHostHold changes the hold switch of one host and audits it. A change
 // that could not be audited is taken back.
 func (s *service) setHostHold(
@@ -296,8 +326,8 @@ func (s *service) setHostHold(
 	}
 
 	err := s.appendAudit(ctx, s.entry(actor, action, h.Name, map[string]any{
-		keyBefore: map[string]any{"holdWanted": h.HoldWanted, "holdReason": h.HoldReason},
-		keyAfter:  map[string]any{"holdWanted": wanted, "holdReason": reason},
+		keyBefore: map[string]any{keyHoldWanted: h.HoldWanted, keyHoldReason: h.HoldReason},
+		keyAfter:  map[string]any{keyHoldWanted: wanted, keyHoldReason: reason},
 		keyReason: given,
 	}))
 	if err == nil {
@@ -764,25 +794,33 @@ func (s *service) Abort(ctx context.Context, actor string, req ScopeRequest) (*A
 	return &ActionResult{Rollout: r.ID, Message: "rollout aborted"}, nil
 }
 
-// EndLease ends one open lease as failed, with the reason "ended by
-// operator". It is what a person does about a lease that nobody expects to
-// end by itself any more (an agent that reports progress for hours, a host
-// that was taken away by hand): while the lease is open the host counts as
-// unavailable, and a lease of a closed rollout holds back the rollouts that
-// follow it. The end is the end of a failed lease in every respect: the host
-// is failed in the open rollouts the lease served, those halt, and the host
-// is broken for what the lease carried, so it goes first from then on.
+// EndLease asks for the end of one open lease. It is what a person does
+// about a lease that nobody expects to end by itself any more (an agent that
+// reports progress for hours, a host that is being taken away): while the
+// lease is open the host counts as unavailable, and a lease of a closed
+// rollout holds back the rollouts that follow it.
 //
-// Only a lease that the agent has started can be ended (it reported an
-// operation: the lease is running or being verified). The agent is not told
-// to stop: it learns that the controller no longer holds the lease from the
-// next sync response, finishes the operation it has started, and takes no
-// other lease before that. A lease that is only granted is refused: the
-// agent may start it at any moment until its deadline without the controller
-// knowing, and a host must not go down under a lease that somebody has
-// declared over. Such a lease ends by itself, and soon: it expires when the
-// agent syncs without having started it, and fails as silent at the latest
-// 2 * leaseTtl + 1 min after the grant.
+// The action ends nothing by itself. It marks the lease as cancelled and, in
+// the same transaction, puts the host on controller hold; a host that is
+// held already keeps its hold, and the reason of that hold is extended by
+// the cancel (endedHoldReason). The lease stays open: it keeps its place in
+// the budget, in the host limit and in the gate, because the host is as far
+// down as it was a moment ago. From the next sync on the agent is told
+// (protocol.Lease.Cancel) and begins no further step; when it reports the end
+// of its operation the lease ends as failed with the reason "ended by
+// operator" (applyOperation). A lease that is being verified ends that way in
+// the next reconcile (verify): its operation is over. A lease that is only
+// granted is no longer offered and ends when the agent says that it did not
+// start it, or expires. An agent that stays silent fails the lease as it
+// fails any other.
+//
+// The hold is what keeps the host from being offered the same work again the
+// moment the lease has ended. It cannot be lifted while the lease is open
+// (unholdAllowed); a person lifts it when the lease has ended and the host is
+// in order.
+//
+// Ending a lease that is already cancelled changes nothing and succeeds,
+// unless its host is not held: then the hold is put back.
 func (s *service) EndLease(
 	ctx context.Context, actor string, req EndLeaseRequest,
 ) (*ActionResult, error) {
@@ -793,55 +831,93 @@ func (s *service) EndLease(
 		return nil, fmt.Errorf("%w: no lease named", ErrInvalidAction)
 	}
 
-	w, err := s.loadWorld(ctx)
-	if err != nil {
-		return nil, err
+	l, err := s.opts.Store.GetLease(ctx, req.Lease)
+
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil, fmt.Errorf("%w: %s", ErrUnknownLease, req.Lease)
+	case err != nil:
+		return nil, fmt.Errorf("scheduler: get lease %s: %w", req.Lease, err)
+	case l.State.Terminal():
+		return nil, fmt.Errorf("%w: lease %s is %s", ErrInvalidAction, l.ID, l.State)
 	}
 
-	// The lease ends by the rule every failed lease ends by.
-	p := newPass(w)
+	hosts, err := s.opts.Store.ListHosts(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: list hosts: %w", err)
+	}
 
-	idx := slices.IndexFunc(p.leases, func(l *fleet.Lease) bool { return l.ID == req.Lease })
-	if idx < 0 {
-		l, err := s.opts.Store.GetLease(ctx, req.Lease)
+	var host *fleet.Host
+	if idx := slices.IndexFunc(hosts, func(h *fleet.Host) bool { return h.Name == l.Host }); idx >= 0 {
+		host = hosts[idx]
+	}
 
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			return nil, fmt.Errorf("%w: %s", ErrUnknownLease, req.Lease)
-		case err != nil:
-			return nil, fmt.Errorf("scheduler: get lease %s: %w", req.Lease, err)
-		default:
-			return nil, fmt.Errorf("%w: lease %s is %s", ErrInvalidAction, l.ID, l.State)
+	again := l.Cancelled != nil
+	if again && (host == nil || host.HoldWanted) {
+		return &ActionResult{
+			Message: fmt.Sprintf("lease %s of %s was already ended by %s; it is open until the agent reports",
+				l.ID, l.Host, l.Cancelled.By),
+			Hosts: []string{l.Host},
+		}, nil
+	}
+
+	detail := map[string]any{
+		keyLease:  l.ID,
+		keyState:  l.State,
+		keyReason: req.Reason,
+	}
+	changes := &store.Changes{}
+	message := fmt.Sprintf("lease %s of %s is ending", l.ID, l.Host)
+
+	if again {
+		// Only the hold is missing (a row from a build that let the hold be
+		// lifted while the lease was open): it is put back.
+		message = fmt.Sprintf("lease %s of %s was already ended by %s", l.ID, l.Host, l.Cancelled.By)
+	} else {
+		l.Cancelled = &fleet.LeaseCancel{
+			At: s.opts.Now(), By: actorName(actor), State: l.State, Reason: req.Reason,
+		}
+		changes.Leases = []*fleet.Lease{l}
+	}
+
+	if host != nil {
+		if reason := endedHoldReason(host); !host.HoldWanted || reason != host.HoldReason {
+			changes.Holds = []store.HostHold{{Host: l.Host, Wanted: true, Reason: reason}}
+			detail["hold"] = map[string]any{
+				keyBefore: map[string]any{keyHoldWanted: host.HoldWanted, keyHoldReason: host.HoldReason},
+				keyAfter:  map[string]any{keyHoldWanted: true, keyHoldReason: reason},
+			}
+		}
+
+		if host.HoldWanted {
+			message += "; the host stays on hold"
+		} else {
+			message += "; the host is on hold"
 		}
 	}
 
-	l := p.leases[idx]
-	before := l.State
-
-	if l.State == fleet.LeaseGranted {
-		return nil, fmt.Errorf("%w: the agent has not started lease %s; it ends by itself, at the latest %s",
-			ErrInvalidAction, l.ID, l.ExpiresAt.Add(leaseStartGrace+w.Settings.LeaseTTL.Std()).UTC().Format(time.RFC3339))
-	}
-
-	p.failLease(l, reasonEndedByOperator)
-
-	out := p.outcome(nil)
-	changes := out.Changes()
-	changes.Audit = append([]fleet.AuditEntry{s.entry(actor, "action.end-lease", l.Host, map[string]any{
-		keyLease:  l.ID,
-		keyBefore: map[string]any{keyState: before},
-		keyAfter:  map[string]any{keyState: l.State},
-		keyReason: req.Reason,
-	})}, changes.Audit...)
+	changes.Audit = []fleet.AuditEntry{s.entry(actor, "action.end-lease", l.Host, detail)}
 
 	if err := s.commit(ctx, changes); err != nil {
 		return nil, err
 	}
 
-	return &ActionResult{
-		Message: fmt.Sprintf("lease %s of %s ended as failed", l.ID, l.Host),
-		Hosts:   []string{l.Host},
-	}, nil
+	return &ActionResult{Message: message, Hosts: []string{l.Host}}, nil
+}
+
+// endedHoldReason is the reason of the host's controller hold once a lease
+// of the host was ended. A hold that somebody set before stays, and its
+// reason says that a lease was ended under it as well: whoever lifts that
+// hold later sees that it also stands for the cancel.
+func endedHoldReason(h *fleet.Host) string {
+	switch {
+	case !h.HoldWanted || h.HoldReason == "":
+		return holdReasonEnded
+	case strings.Contains(h.HoldReason, holdReasonEnded):
+		return h.HoldReason
+	default:
+		return h.HoldReason + "; " + holdReasonEnded
+	}
 }
 
 // Forget deletes hosts that are gone. A host that holds a lease is refused.

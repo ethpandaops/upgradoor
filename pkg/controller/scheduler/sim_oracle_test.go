@@ -35,6 +35,12 @@ type simHostFact struct {
 	doneAt    map[string]time.Time
 	// late names the leases the agent started with a slow clock.
 	late map[string]bool
+	// reported is the agent's own record, per lease ID, of the last operation
+	// it sent to the controller for the lease. What the end of a lease means
+	// the oracle reads off this record, not off the row the scheduler keeps.
+	reported map[string]*protocol.Operation
+	// oldBuild: the agent does not know the cancel mark.
+	oldBuild bool
 }
 
 func (h *simHostFact) held() bool {
@@ -75,6 +81,10 @@ type simFacts struct {
 	// sync that created its row. A lost database and a forgotten host start
 	// over.
 	registered map[string]time.Time
+	// cancelled is the person's record of the leases they ended. The state
+	// each was in at that moment is kept for the statistics; nothing is
+	// judged by it.
+	cancelled map[string]fleet.LeaseState
 	// fresh is true when a reconcile has just been committed against
 	// exactly these facts.
 	fresh bool
@@ -151,17 +161,33 @@ type oracle struct {
 	// reference, the packages), as the oracle first saw the lease; needs that
 	// are about nothing of the kind (a reboot, a manual action) are left out.
 	carries map[string]map[string]string
-	// word is the oracle's own record of who is broken: per host and thing,
-	// the last lease the oracle saw end that said something about it, and
-	// what it said. It is written when the oracle sees a lease end, in the
-	// order in which it sees them end, and by nothing else.
-	word map[string]map[string]oracleWord
+	// words is the oracle's own record of who is broken: per host and thing,
+	// every lease the oracle saw end that said something about it, and what
+	// it said, in the order in which it saw them end. The last one counts. A
+	// lease that is taken up again takes back what its end said; a host that
+	// a person forgets has no record.
+	words map[string]map[string][]oracleWord
+	// ended is, per lease that has ended, when the oracle saw it end and
+	// whether the agent's final report was on record then.
+	ended map[string]oracleEnd
+	// cancelSeen names the cancelled leases the oracle has looked at.
+	cancelSeen map[string]bool
 	// succeeded names the rollouts in which a lease that the oracle saw
 	// released and judged ready itself had served all its needs.
 	succeeded map[string]bool
 	// reopened are the leases that were taken up again after they had
-	// expired.
+	// ended.
 	reopened map[string]bool
+	// members is the oracle's own book of the members of the open rollouts
+	// as they stood at the observation before this one: per rollout and
+	// host, the state and the lease. It is what a reconcile found.
+	members map[string]map[string]oracleMember
+	// again names, per lease that was taken up again, the rollouts it serves
+	// since: those in which, by the oracle's book, the host's member waited
+	// or was still failed by that lease when it was taken up, and which no
+	// person had skipped the host for. The oracle decides it when it sees the
+	// lease taken up, from what it had on record before.
+	again map[string]map[string]bool
 	// grants are the leases the oracle saw granted; repairs the leases that
 	// passed a closed gate, or were adopted under one.
 	grants  map[string]bool
@@ -187,12 +213,46 @@ type oracle struct {
 	// leases that were taken up again, the rollouts that a person's retry
 	// opened and the rollouts that were open before the lease's rollout was
 	// closed; and the leases a person ended.
-	counts struct {
-		brokenFirst, repaired                            int
-		flightHeld, flightAborted, flightReopened        int
-		flightRetried, flightNextToOpen, endedByOperator int
-		brokenByOperator, brokenAfterAbort               int
+	counts oracleCounts
+}
+
+// oracleCounts is what the oracle saw of the cases the simulation wants to
+// have seen.
+type oracleCounts struct {
+	brokenFirst, repaired                            int
+	flightHeld, flightAborted, flightReopened        int
+	flightRetried, flightNextToOpen, endedByOperator int
+	brokenByOperator, brokenAfterAbort               int
+	// sparedByCancel: leases that ended as ended by operator and said nothing
+	// about their host. reopenedFailed: failed leases taken up again.
+	// forgottenBroken: hosts that were broken when a person forgot them.
+	sparedByCancel, reopenedFailed, forgottenBroken int
+	// sparedUntouched: leases that failed for another reason after a person
+	// had ended them and said nothing for a thing none of whose steps ever
+	// began (reported as cancelled, which only agents of an earlier build do
+	// after a failure).
+	sparedUntouched int
+	// neverStarted: leases that had failed without the agent's word and were
+	// expired when the agent said that it never started them.
+	neverStarted int
+}
+
+// sameTime reports whether two optional times are the same moment.
+func sameTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
 	}
+
+	return a.Equal(*b)
+}
+
+// oracleEnd is how the oracle saw a lease end.
+type oracleEnd struct {
+	at time.Time
+	// stamp is the end the lease itself carried.
+	stamp *time.Time
+	// final: the lease carried a terminal report of its agent.
+	final bool
 }
 
 // oracleWord is what the end of a lease said about its host for one thing.
@@ -239,9 +299,13 @@ func newOracle() *oracle {
 		charged:    make(map[string]uint64, 64),
 		serves:     make(map[string]map[string]string, 64),
 		carries:    make(map[string]map[string]string, 64),
-		word:       make(map[string]map[string]oracleWord, 16),
+		words:      make(map[string]map[string][]oracleWord, 16),
+		ended:      make(map[string]oracleEnd, 64),
+		cancelSeen: make(map[string]bool, 2),
 		succeeded:  make(map[string]bool, 8),
 		reopened:   make(map[string]bool, 2),
+		members:    make(map[string]map[string]oracleMember, 8),
+		again:      make(map[string]map[string]bool, 2),
 		grants:     make(map[string]bool, 64),
 		repairs:    make(map[string]bool, 8),
 		canary:     make(map[string]string, 8),
@@ -289,15 +353,16 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 			o.carries[l.ID] = oracleCarries(l)
 		}
 
-		// A lease that is taken up again is not the grant the oracle saw; its
-		// host may have become the canary in between.
-		if known && was.Terminal() && !l.State.Terminal() {
-			delete(o.grants, l.ID)
-			o.reopened[l.ID] = true
-			o.noteCanary(snap, l)
+		again, err := o.takenUp(f, snap, l, was, known)
+		if err != nil {
+			return err
 		}
 
-		if l.State != was {
+		if err := o.checkCancel(f, l); err != nil {
+			return err
+		}
+
+		if l.State != was || again {
 			if err := o.checkLeaseEnd(f, snap, l); err != nil {
 				return err
 			}
@@ -307,6 +372,10 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 	o.adopt(f, snap, adopted, leased)
 
 	if err := o.checkBroken(f, snap); err != nil {
+		return err
+	}
+
+	if err := o.checkReports(f, snap); err != nil {
 		return err
 	}
 
@@ -354,12 +423,136 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 		o.canary[r.ID] = r.Canary
 	}
 
+	o.bookMembers(snap)
+
 	if f.fresh {
 		if err := o.checkProgress(view); err != nil {
 			return err
 		}
 
 		return checkMembership(f, snap)
+	}
+
+	return nil
+}
+
+// takenUp looks at a lease that left a terminal state: it is open again, or
+// (again is true) it was taken up and ended again between two looks, which
+// shows as a lease that ended at another time. Such a lease is not the grant
+// the oracle saw; its host may have become the canary in between. What its
+// end said about the host is taken back.
+func (o *oracle) takenUp(
+	f *simFacts, snap *simSnapshot, l *fleet.Lease, was fleet.LeaseState, known bool,
+) (again bool, err error) {
+	if !known || !was.Terminal() {
+		return false, nil
+	}
+
+	again = l.State.Terminal() && !sameTime(o.ended[l.ID].stamp, l.EndedAt)
+	if again && !o.resumed(f, l, was) {
+		return false, fmt.Errorf("lease %s, which had ended as %s, ended again as %s", l.ID, was, l.State)
+	}
+
+	if !again && l.State.Terminal() {
+		return false, nil
+	}
+
+	delete(o.grants, l.ID)
+	o.reopened[l.ID] = true
+	o.noteCanary(snap, l)
+	o.retract(l)
+
+	if err := o.servesAgain(f, snap, l); err != nil {
+		return false, err
+	}
+
+	if was == fleet.LeaseFailed {
+		o.counts.reopenedFailed++
+	}
+
+	if was == fleet.LeaseFailed && again && l.State == fleet.LeaseExpired {
+		o.counts.neverStarted++
+	}
+
+	return again, nil
+}
+
+// oracleMember is one member of a rollout in the oracle's book.
+type oracleMember struct {
+	state fleet.HostState
+	lease string
+}
+
+// bookMembers writes down the members of the open rollouts as this
+// observation found them.
+func (o *oracle) bookMembers(snap *simSnapshot) {
+	clear(o.members)
+
+	for _, r := range snap.rollouts {
+		if r.State.Terminal() {
+			continue
+		}
+
+		book := make(map[string]oracleMember, len(r.Hosts))
+		for i := range r.Hosts {
+			book[r.Hosts[i].Host] = oracleMember{state: r.Hosts[i].State, lease: r.Hosts[i].LeaseID}
+		}
+
+		o.members[r.ID] = book
+	}
+}
+
+// servesAgain decides, for a lease that has just been taken up again, which
+// of the rollouts it was granted for it serves from now on, and holds the
+// scheduler's rows against that. The lease serves a rollout again where the
+// rollout was open and the host's member waited (pending, or leased by a
+// lease the host had not started, which gives way), or was still failed by
+// this very lease, at the observation before; a member that a
+// person had skipped, that another lease had failed, or that was settled some
+// other way is not its member any more. The oracle takes this from its own
+// book and from the person's record of skips, not from the rows the reopen
+// wrote: those rows must agree with it while the lease is open.
+func (o *oracle) servesAgain(f *simFacts, snap *simSnapshot, l *fleet.Lease) error {
+	again := make(map[string]bool, len(o.serves[l.ID]))
+
+	for _, id := range o.serves[l.ID] {
+		before, booked := o.members[id][l.Host]
+		r := snap.rollout(id)
+
+		// A lease the host had been granted since and had not started is
+		// expired in favour of the one its agent works on: its member waits.
+		waits := before.state == fleet.HostPending ||
+			(before.state == fleet.HostLeased && before.lease != l.ID && o.leases[before.lease] == fleet.LeaseGranted)
+
+		again[id] = booked && r != nil && !f.skipped[r.Key][l.Host] &&
+			(waits || (before.state == fleet.HostFailed && before.lease == l.ID))
+	}
+
+	o.again[l.ID] = again
+
+	if l.State.Terminal() {
+		return nil
+	}
+
+	for id, serves := range again {
+		r := snap.rollout(id)
+		if r == nil || r.State.Terminal() {
+			continue
+		}
+
+		m := r.Host(l.Host)
+		leased := m != nil && m.State == fleet.HostLeased && m.LeaseID == l.ID
+
+		if leased != serves {
+			state := fleet.HostState("no member")
+			if m != nil {
+				state = m.State
+			}
+
+			return fmt.Errorf("lease %s of %s was taken up again; by the oracle's book its member in rollout %s was %q "+
+				"(lease %q) before, so it serves the rollout again: %v, but the member is now %s",
+				l.ID, l.Host, id, o.members[id][l.Host].state, o.members[id][l.Host].lease, serves, state)
+		}
 	}
 
 	return nil
@@ -405,15 +598,16 @@ func (o *oracle) noteCanary(snap *simSnapshot, l *fleet.Lease) {
 // oracleStepsDone reports whether the agent reported done for every need
 // that the lease serves for the rollout, by the oracle's own record of what
 // the lease serves.
-func (o *oracle) oracleStepsDone(l *fleet.Lease, rollout string) bool {
+func (o *oracle) oracleStepsDone(f *simFacts, l *fleet.Lease, rollout string) bool {
 	found := false
+	report := oracleReport(f, l)
 
 	for need, id := range o.serves[l.ID] {
 		if id != rollout {
 			continue
 		}
 
-		if l.Operation == nil || stepStatus(l.Operation, need) != protocol.StepDone {
+		if report == nil || stepStatus(report, need) != protocol.StepDone {
 			return false
 		}
 
@@ -481,11 +675,11 @@ func (o *oracle) checkBooks(f *simFacts, snap *simSnapshot) error {
 		return nil
 	}
 
-	return o.checkMemberBooks(snap, open)
+	return o.checkMemberBooks(f, snap, open)
 }
 
 // checkMemberBooks is the part of checkBooks about members and canaries.
-func (o *oracle) checkMemberBooks(snap *simSnapshot, open map[string]*fleet.Lease) error {
+func (o *oracle) checkMemberBooks(f *simFacts, snap *simSnapshot, open map[string]*fleet.Lease) error {
 	for _, r := range snap.rollouts {
 		if r.State.Terminal() {
 			continue
@@ -506,7 +700,7 @@ func (o *oracle) checkMemberBooks(snap *simSnapshot, open map[string]*fleet.Leas
 				}
 
 				l := snap.lease(m.LeaseID)
-				if state != fleet.LeaseReleased || l == nil || !o.oracleStepsDone(l, r.ID) {
+				if state != fleet.LeaseReleased || l == nil || !o.oracleStepsDone(f, l, r.ID) {
 					return fmt.Errorf("member %s of rollout %s is done through lease %s, which is %s and did not "+
 						"finish every step for the rollout", m.Host, r.ID, m.LeaseID, state)
 				}
@@ -630,26 +824,107 @@ func oracleCarries(l *fleet.Lease) map[string]string {
 	return out
 }
 
+// oracleEndedOnReport reports whether a person ended the lease (by the
+// person's own record) and it then failed with the agent's report on record
+// that the operation is over. When the person clicked, before or after the
+// agent finished, before or after a reconcile saw the report, makes no
+// difference: only the steps of that report say what the end means.
+//
+// The report must have reached the controller: an agent that declined a
+// lease says so once and forgets it when the response no longer carries the
+// lease; if no reconcile read that sync, the controller never had the report
+// (its row has none), and the lease ends as any lease whose agent says
+// nothing.
+func oracleEndedOnReport(f *simFacts, l *fleet.Lease) bool {
+	_, cancelled := f.cancelled[l.ID]
+	report := oracleReport(f, l)
+	received := l.Operation != nil && l.Operation.Phase.Terminal()
+
+	return cancelled && l.State == fleet.LeaseFailed && received &&
+		report != nil && report.Phase == protocol.PhaseDone
+}
+
+// oracleReport is the agent's own record of the last operation it reported
+// for the lease, or nil when it reported none. The row the scheduler keeps
+// of that report (Lease.Operation) is held against it when the lease ends
+// (checkLeaseEnd), and is otherwise not what the oracle judges by. Only of a
+// host that this database does not know any more (a person forgot it) is
+// the row all there is.
+func oracleReport(f *simFacts, l *fleet.Lease) *protocol.Operation {
+	if host := f.hosts[l.Host]; host != nil {
+		return host.reported[l.ID]
+	}
+
+	return l.Operation
+}
+
+// oracleCancelSpares reports whether a failed lease that a person ended says
+// nothing about its host for a thing no step of which failed: the lease ended
+// on the agent's report and no step of the thing is done (anyDone is false:
+// nothing of it was applied), or no step of the thing ever began (untouched),
+// however the lease failed.
+func oracleCancelSpares(f *simFacts, l *fleet.Lease, anyDone, untouched bool) bool {
+	_, cancelled := f.cancelled[l.ID]
+
+	return (oracleEndedOnReport(f, l) && !anyDone) || (cancelled && untouched)
+}
+
+// wordOf is the last word on the host for the thing.
+func (o *oracle) wordOf(host, thing string) oracleWord {
+	if words := o.words[host][thing]; len(words) > 0 {
+		return words[len(words)-1]
+	}
+
+	return oracleWord{}
+}
+
+// retract takes back what the ends of a lease said: it is open again.
+func (o *oracle) retract(l *fleet.Lease) {
+	for thing, words := range o.words[l.Host] {
+		o.words[l.Host][thing] = slices.DeleteFunc(words, func(w oracleWord) bool { return w.lease == l.ID })
+	}
+}
+
+// forget drops the record of a host that a person forgot: a host that returns
+// under the name is a new host.
+func (o *oracle) forget(host string) {
+	for thing := range o.words[host] {
+		if o.wordOf(host, thing).broke {
+			o.counts.forgottenBroken++
+
+			break
+		}
+	}
+
+	delete(o.words, host)
+}
+
 // noteEnd writes down what the end of a lease says about its host, for every
 // thing the lease carried a step of:
 //
 //   - released (the oracle has judged the readiness itself, checkRelease)
 //     with every step of the thing done: the host is in order;
 //   - failed: the host is broken, unless every step of the thing was done
-//     and the agent reported another step failed;
+//     and the agent reported another step failed; or a person had ended the
+//     lease, the agent reported its operation as ended, and by that report
+//     no step of the thing failed and none was done (with one of them done
+//     something was applied and the host never shown to be back: broken);
+//     or a person had ended the lease and no step of the thing ever began;
 //   - anything else (expired; released with a step of the thing not done)
 //     says nothing, and what was said before stands.
-func (o *oracle) noteEnd(snap *simSnapshot, l *fleet.Lease) {
+func (o *oracle) noteEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) {
 	things := make(map[string]bool, 2)
 	for _, thing := range o.carries[l.ID] {
 		things[thing] = true
 	}
 
-	stepFailed := l.Operation != nil && slices.ContainsFunc(l.Operation.Steps,
+	report := oracleReport(f, l)
+	stepFailed := report != nil && slices.ContainsFunc(report.Steps,
 		func(s protocol.Step) bool { return s.Status == protocol.StepFailed })
+	spared := false
 
 	for thing := range things {
-		done := true
+		done, anyDone, failed, untouched := true, false, false, true
 		rollout := ""
 
 		for need, of := range o.carries[l.ID] {
@@ -657,9 +932,15 @@ func (o *oracle) noteEnd(snap *simSnapshot, l *fleet.Lease) {
 				continue
 			}
 
-			if l.Operation == nil || stepStatus(l.Operation, need) != protocol.StepDone {
-				done = false
+			status := protocol.StepStatus("")
+			if report != nil {
+				status = stepStatus(report, need)
 			}
+
+			done = done && status == protocol.StepDone
+			anyDone = anyDone || status == protocol.StepDone
+			failed = failed || status == protocol.StepFailed
+			untouched = untouched && status == protocol.StepCancelled
 
 			if id := o.serves[l.ID][need]; id != "" && (rollout == "" || id < rollout) {
 				rollout = id
@@ -670,21 +951,29 @@ func (o *oracle) noteEnd(snap *simSnapshot, l *fleet.Lease) {
 
 		switch {
 		case l.State == fleet.LeaseReleased && done:
-		case l.State == fleet.LeaseFailed && (!done || !stepFailed):
-			broke = true
-		default:
+		case l.State != fleet.LeaseFailed:
 			continue
+		case done && stepFailed:
+			continue
+		case failed:
+			broke = true
+		case oracleCancelSpares(f, l, anyDone, untouched):
+			spared = true
+
+			continue
+		default:
+			broke = true
 		}
 
-		if o.word[l.Host] == nil {
-			o.word[l.Host] = make(map[string]oracleWord, 2)
+		if o.words[l.Host] == nil {
+			o.words[l.Host] = make(map[string][]oracleWord, 2)
 		}
 
-		was, said := o.word[l.Host][thing]
-		o.word[l.Host][thing] = oracleWord{lease: l.ID, rollout: rollout, broke: broke}
+		was := o.wordOf(l.Host, thing)
+		o.words[l.Host][thing] = append(o.words[l.Host][thing], oracleWord{lease: l.ID, rollout: rollout, broke: broke})
 
 		switch r := snap.rollout(rollout); {
-		case !broke && said && was.broke:
+		case !broke && was.broke:
 			o.counts.repaired++
 		case !broke:
 		case l.Error == oracleEndedByOperator:
@@ -693,6 +982,117 @@ func (o *oracle) noteEnd(snap *simSnapshot, l *fleet.Lease) {
 			o.counts.brokenAfterAbort++
 		}
 	}
+
+	if spared {
+		o.countSpared(l)
+	}
+}
+
+// countSpared counts a failed lease that a person had ended and that said
+// nothing about its host for some thing: by whether it ended on the agent's
+// report, or failed for another reason with that thing never begun.
+func (o *oracle) countSpared(l *fleet.Lease) {
+	if l.Error == oracleEndedByOperator {
+		o.counts.sparedByCancel++
+	} else {
+		o.counts.sparedUntouched++
+	}
+}
+
+// checkCancel looks at a lease that a person ended. For as long as it is
+// open its host is on controller hold: the hold is part of the cancel, and
+// no unhold takes it away. It is never released: a person took the host out.
+func (o *oracle) checkCancel(f *simFacts, l *fleet.Lease) error {
+	if _, cancelled := f.cancelled[l.ID]; !cancelled {
+		return nil
+	}
+
+	if l.State == fleet.LeaseReleased {
+		return fmt.Errorf("lease %s of %s was released although a person ended it", l.ID, l.Host)
+	}
+
+	host := f.hosts[l.Host]
+
+	if !l.State.Terminal() && host != nil && !host.holdWanted {
+		return fmt.Errorf("lease %s of %s was ended by a person, is still open (%s), and its host is not on "+
+			"controller hold", l.ID, l.Host, l.State)
+	}
+
+	if o.cancelSeen[l.ID] {
+		return nil
+	}
+
+	o.cancelSeen[l.ID] = true
+
+	if host != nil && !host.held() {
+		return fmt.Errorf("lease %s of %s was ended by a person and its host is not held", l.ID, l.Host)
+	}
+
+	return nil
+}
+
+// checkReports: what an agent reports is not ignored. After a committed
+// reconcile, an operation that stopped something and that the agent reports
+// in a sync from after its lease ended, for a lease that ended without the
+// agent's final report, has its lease open again (or ended again, with the
+// report): the host is down under it, or was. An operation that stopped
+// nothing, reported that way for a lease that failed, has that lease expired.
+// And an operation for a lease this database has never seen is adopted.
+func (o *oracle) checkReports(f *simFacts, snap *simSnapshot) error {
+	if !f.fresh {
+		return nil
+	}
+
+	for name, host := range f.hosts {
+		if host.status == nil || host.status.Operation == nil {
+			continue
+		}
+
+		op := host.status.Operation
+		l := snap.lease(op.LeaseID)
+
+		// The agent says that it never started the lease. If the lease failed
+		// without the agent's word, it did not fail: it stopped nothing, and
+		// is expired.
+		if !op.Disrupted {
+			end, ended := o.ended[op.LeaseID]
+			if op.Phase == protocol.PhaseDone && l != nil && l.State == fleet.LeaseFailed && l.Host == name &&
+				ended && !end.final && host.lastSync.After(end.at) && !host.disrupted[l.ID] {
+				return fmt.Errorf("%s reports in a sync from after lease %s failed (%q) that it never started it, "+
+					"and the lease is still failed", name, l.ID, l.Error)
+			}
+
+			continue
+		}
+
+		// An operation that is over does not displace a lease the host was
+		// granted since: the host is up, and may start that one at any moment.
+		other := slices.ContainsFunc(snap.leases, func(x *fleet.Lease) bool {
+			return x.Host == name && x.ID != op.LeaseID && !x.State.Terminal()
+		})
+		if op.Phase.Terminal() && other {
+			continue
+		}
+
+		if l == nil {
+			return fmt.Errorf("%s reports operation %s (%s), which stopped something, and no lease was adopted for it",
+				name, op.LeaseID, op.Phase)
+		}
+
+		end, ended := o.ended[l.ID]
+		if !l.State.Terminal() || l.Host != name || !ended || end.final || !host.lastSync.After(end.at) {
+			continue
+		}
+
+		// The oracle saw it end without the report and still sees it ended
+		// without it.
+		if l.Operation == nil || !l.Operation.Phase.Terminal() {
+			return fmt.Errorf("%s reports operation %s (%s) in a sync from after its lease ended as %s (%q) without "+
+				"the agent's final report: the lease was not taken up again", name, op.LeaseID, op.Phase, l.State, l.Error)
+		}
+	}
+
+	return nil
 }
 
 // oracleEndedByOperator is the failure reason of a lease that a person ended.
@@ -704,7 +1104,7 @@ const oracleBrokenNote = "broken since lease "
 // broken reports whether the host is broken for the thing the rollout is
 // about: the last lease that said something about it failed the host.
 func (o *oracle) broken(r *fleet.Rollout, host string) bool {
-	return o.word[host][oracleGroup(r)].broke
+	return o.wordOf(host, oracleGroup(r)).broke
 }
 
 // checkBroken holds what the scheduler says about broken hosts against the
@@ -729,7 +1129,7 @@ func (o *oracle) checkBroken(f *simFacts, snap *simSnapshot) error {
 				continue
 			}
 
-			word := o.word[m.Host][oracleGroup(r)]
+			word := o.wordOf(m.Host, oracleGroup(r))
 			first := m.Stage == fleet.StageRepair
 			noted := strings.HasPrefix(m.Error, oracleBrokenNote)
 
@@ -848,8 +1248,7 @@ func (o *oracle) checkStates(f *simFacts, snap *simSnapshot) error {
 		seen[l.ID] = true
 
 		if was, ok := o.leases[l.ID]; ok && was.Terminal() && l.State != was {
-			host := f.hosts[l.Host]
-			if was != fleet.LeaseExpired || host == nil || !host.disrupted[l.ID] {
+			if !o.resumed(f, l, was) {
 				return fmt.Errorf("lease %s left terminal state %s for %s", l.ID, was, l.State)
 			}
 		}
@@ -880,6 +1279,37 @@ func (o *oracle) checkStates(f *simFacts, snap *simSnapshot) error {
 	return nil
 }
 
+// resumed reports whether a lease may have left a terminal state: it had
+// expired and the world says the agent did stop something for it; or it had
+// failed without the agent's final report, and the agent reports the
+// operation in a sync from after that end. When the world says that the
+// agent stopped nothing under such a failed lease, the one thing that may
+// have happened to it is that it is expired now: the agent says it never
+// started it.
+func (o *oracle) resumed(f *simFacts, l *fleet.Lease, was fleet.LeaseState) bool {
+	host := f.hosts[l.Host]
+	if host == nil {
+		return false
+	}
+
+	switch was {
+	case fleet.LeaseExpired:
+		return host.disrupted[l.ID]
+	case fleet.LeaseFailed:
+		end := o.ended[l.ID]
+		op := host.status.Operation
+		back := !end.final && op != nil && op.LeaseID == l.ID && host.lastSync.After(end.at)
+
+		if !host.disrupted[l.ID] {
+			return back && l.State == fleet.LeaseExpired && op.Phase == protocol.PhaseDone && !op.Disrupted
+		}
+
+		return back
+	default:
+		return false
+	}
+}
+
 // checkLeaseEnd looks at a lease that changed state. A failed lease halts
 // the rollouts it served; a released or expired one must agree with what the
 // agent really did.
@@ -888,6 +1318,9 @@ func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) e
 
 	if l.State.Terminal() {
 		o.leaseEnd[l.Host] = f.now
+		o.ended[l.ID] = oracleEnd{
+			at: f.now, stamp: cloneTime(l.EndedAt), final: l.Operation != nil && l.Operation.Phase.Terminal(),
+		}
 
 		if o.repairs[l.ID] {
 			o.repairEnded = true
@@ -898,12 +1331,20 @@ func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) e
 		}
 	}
 
+	if err := checkRecordedReport(f, l); err != nil {
+		return err
+	}
+
 	// What the end says about the host is written down once the checks below
 	// have found it in order.
-	defer o.noteEnd(snap, l)
+	defer o.noteEnd(f, snap, l)
 
 	switch l.State {
 	case fleet.LeaseFailed:
+		if err := o.checkFailure(f, l, host); err != nil {
+			return err
+		}
+
 		// A controller outage is not the agent's silence: the agent has
 		// leaseTtl from the controller's start to be heard.
 		if l.Error == reasonAgentSilent {
@@ -932,7 +1373,7 @@ func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) e
 			}
 		}
 
-		o.haltedBy(snap, l)
+		o.haltedBy(f, snap, l)
 	case fleet.LeaseExpired:
 		// An agent whose clock is slow may have started the lease after the
 		// controller had every reason to think it would not: the lease is
@@ -952,11 +1393,22 @@ func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) e
 
 		// A lease that the oracle found ready is a success of every rollout
 		// for which, by the oracle's record of what it served, all its steps
-		// are done.
+		// are done. A lease that was taken up again serves only the rollouts
+		// in which, by the oracle's own book, its member was to be leased
+		// again (servesAgain; haltedBy has the same rule): where a person
+		// skipped the host meanwhile, or the member was settled some other
+		// way, the lease is no success of that rollout, and the rollout still
+		// sends a canary first.
 		for _, id := range o.serves[l.ID] {
-			if !l.Force && o.oracleStepsDone(l, id) {
-				o.succeeded[id] = true
+			if l.Force || !o.oracleStepsDone(f, l, id) {
+				continue
 			}
+
+			if o.reopened[l.ID] && !o.again[l.ID][id] {
+				continue
+			}
+
+			o.succeeded[id] = true
 		}
 	default:
 	}
@@ -964,10 +1416,63 @@ func (o *oracle) checkLeaseEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) e
 	return nil
 }
 
+// checkRecordedReport: the row of an ended lease keeps the agent's final
+// report as the agent sent it. An end is judged by the steps of that report,
+// so the scheduler must not have changed one.
+func checkRecordedReport(f *simFacts, l *fleet.Lease) error {
+	report := oracleReport(f, l)
+	if !l.State.Terminal() || report == nil || l.Operation == nil ||
+		!report.Phase.Terminal() || !l.Operation.Phase.Terminal() {
+		return nil
+	}
+
+	if !slices.Equal(report.Steps, l.Operation.Steps) {
+		return fmt.Errorf("lease %s of %s ended with the steps %v on record, but its agent reported %v",
+			l.ID, l.Host, l.Operation.Steps, report.Steps)
+	}
+
+	return nil
+}
+
+// checkFailure: a lease fails for a reason the world knows.
+//
+//   - It does not fail while its agent reports the operation as going on,
+//     unless the agent has been silent since. In particular, ending a lease
+//     fails nothing: the lease stays open, with its place in the budget and
+//     the host limit, until the agent has stopped.
+//   - It fails as ended by operator only when a person ended it and the
+//     agent's report that the operation ended is on record; and with that
+//     report on a lease a person ended, that is its reason.
+func (o *oracle) checkFailure(f *simFacts, l *fleet.Lease, host *simHostFact) error {
+	_, cancelled := f.cancelled[l.ID]
+
+	if host != nil && host.status != nil && l.Error != reasonAgentSilent {
+		if op := host.status.Operation; op != nil && op.LeaseID == l.ID && !op.Phase.Terminal() {
+			return fmt.Errorf("lease %s of %s failed as %q while its agent reports the operation in phase %s",
+				l.ID, l.Host, l.Error, op.Phase)
+		}
+	}
+
+	switch {
+	case l.Error == oracleEndedByOperator && !cancelled:
+		return fmt.Errorf("lease %s of %s failed as %q, but nobody ended it", l.ID, l.Host, l.Error)
+	case l.Error == oracleEndedByOperator && !oracleEndedOnReport(f, l):
+		return fmt.Errorf("lease %s of %s failed as %q without the agent's report that its operation ended",
+			l.ID, l.Host, l.Error)
+	case oracleEndedOnReport(f, l) && l.Error != oracleEndedByOperator:
+		return fmt.Errorf("lease %s of %s was ended by a person, its agent reports the operation as ended, and it "+
+			"failed as %q", l.ID, l.Host, l.Error)
+	}
+
+	return nil
+}
+
 // haltedBy records the rollouts a failed lease halts: all it served, except
-// those whose own steps are done while another step failed.
-func (o *oracle) haltedBy(snap *simSnapshot, l *fleet.Lease) {
-	stepFailed := l.Operation != nil && slices.ContainsFunc(l.Operation.Steps,
+// those whose own steps are done while another step failed. A lease that a
+// person ended spares none.
+func (o *oracle) haltedBy(f *simFacts, snap *simSnapshot, l *fleet.Lease) {
+	report := oracleReport(f, l)
+	stepFailed := report != nil && slices.ContainsFunc(report.Steps,
 		func(s protocol.Step) bool { return s.Status == protocol.StepFailed })
 
 	done := make(map[string]bool, len(l.Rollouts))
@@ -976,7 +1481,7 @@ func (o *oracle) haltedBy(snap *simSnapshot, l *fleet.Lease) {
 	}
 
 	for needID, id := range l.Rollouts {
-		if l.Operation == nil || stepStatus(l.Operation, needID) != protocol.StepDone {
+		if report == nil || stepStatus(report, needID) != protocol.StepDone {
 			done[id] = false
 		}
 	}
@@ -987,9 +1492,10 @@ func (o *oracle) haltedBy(snap *simSnapshot, l *fleet.Lease) {
 			continue
 		}
 
-		// A lease that was taken up again after it had expired serves only the
-		// rollouts in which the host was still waiting then.
-		if m := r.Host(l.Host); o.reopened[l.ID] && (m.State != fleet.HostFailed || m.LeaseID != l.ID) {
+		// A lease that was taken up again serves only the rollouts in which the
+		// host was still waiting then (or still failed by it), by the oracle's
+		// own book (servesAgain).
+		if o.reopened[l.ID] && !o.again[l.ID][id] {
 			continue
 		}
 

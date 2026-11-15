@@ -25,8 +25,12 @@ import (
 
 const (
 	// reasonEndedByOperator is the failure reason of a lease that a person
-	// ended.
+	// ended (end-lease), once the agent's report that its operation is over
+	// is on record.
 	reasonEndedByOperator = "ended by operator"
+	// holdReasonEnded is the reason of the controller hold that ending a
+	// lease puts on its host.
+	holdReasonEnded = "lease ended by operator"
 	// brokenPrefix starts the note on a waiting member whose host is broken
 	// for the rollout's group. The note is for people and is written anew in
 	// every pass; what makes the member go first is the lease it names.
@@ -41,8 +45,10 @@ type leaseVerdict int
 
 const (
 	// verdictNone: the lease says nothing. It stopped nothing (expired), its
-	// steps of the group were not done although it was released, or they were
-	// done and the lease failed on a step of something else.
+	// steps of the group were not done although it was released, they were
+	// done and the lease failed on a step of something else, or a person
+	// ended the lease and by the agent's report nothing of the group was
+	// applied.
 	verdictNone leaseVerdict = iota
 	// verdictRepaired: the lease was released, which it is only after the host
 	// passed readiness, with every step of the group done.
@@ -100,6 +106,12 @@ func leaseGroups(l *fleet.Lease) []string {
 // groupDone reports whether the agent reported done for every step the lease
 // carries of the group.
 func groupDone(l *fleet.Lease, group string) bool {
+	return groupAll(l, group, protocol.StepDone)
+}
+
+// groupAll reports whether the agent reported the status for every step the
+// lease carries of the group.
+func groupAll(l *fleet.Lease, group string, status protocol.StepStatus) bool {
 	if l.Operation == nil {
 		return false
 	}
@@ -112,7 +124,7 @@ func groupDone(l *fleet.Lease, group string) bool {
 			continue
 		}
 
-		if stepStatus(l.Operation, n.ID) != protocol.StepDone {
+		if stepStatus(l.Operation, n.ID) != status {
 			return false
 		}
 
@@ -122,11 +134,32 @@ func groupDone(l *fleet.Lease, group string) bool {
 	return found
 }
 
-// verdictOf judges an ended lease for one group the way its end settles the
-// host's member in a rollout of the group (releaseLease, failLease,
-// expireLease): done through a released lease is a repair, failed is broken,
-// and an end that leaves the member waiting or done without a lease says
-// nothing.
+// groupFailed reports whether the agent reported a step of the group failed.
+func groupFailed(l *fleet.Lease, group string) bool {
+	return groupAny(l, group, protocol.StepFailed)
+}
+
+// groupAny reports whether the agent reported the status for a step the
+// lease carries of the group.
+func groupAny(l *fleet.Lease, group string, status protocol.StepStatus) bool {
+	if l.Operation == nil {
+		return false
+	}
+
+	for i := range l.Needs {
+		n := &l.Needs[i]
+		if needGroup(n) == group && stepStatus(l.Operation, n.ID) == status {
+			return true
+		}
+	}
+
+	return false
+}
+
+// verdictOf judges an ended lease for one group. It is the table under
+// "Broken hosts" in docs/scheduler.md: a host is repaired by a lease that was
+// released with the group's steps done, and broken by a lease that failed,
+// unless the failure is provably not about the group.
 func verdictOf(l *fleet.Lease, group string) leaseVerdict {
 	switch l.State {
 	case fleet.LeaseReleased:
@@ -136,13 +169,33 @@ func verdictOf(l *fleet.Lease, group string) leaseVerdict {
 
 		return verdictNone
 	case fleet.LeaseFailed:
-		if groupDone(l, group) && stepFailed(l) {
+		switch {
+		case groupDone(l, group) && stepFailed(l):
 			// The steps of the group were done and another step failed: the
 			// member is spared (failLease).
 			return verdictNone
+		case groupFailed(l, group):
+			return verdictBroke
+		case l.Error == reasonEndedByOperator && !groupAny(l, group, protocol.StepDone):
+			// A person ended the lease and by the agent's final report
+			// nothing of this group was applied: its steps were cancelled,
+			// refused, superseded or never begun. That shows nothing about
+			// the host. With one step done something was applied and the
+			// host was never shown to be back: when in doubt, below. Only
+			// the report counts, not when the person clicked.
+			return verdictNone
+		case l.Cancelled != nil && groupAll(l, group, protocol.StepCancelled):
+			// The lease failed for another reason after it was cancelled, but
+			// no step of this group was ever begun. Only agents of an earlier
+			// build report that: they said cancelled for the steps they never
+			// began also when the operation failed. An agent of the current
+			// build reports those steps as after any failure (pending), so a
+			// cancel that is followed by a failure breaks the host for every
+			// group of the lease, below.
+			return verdictNone
+		default:
+			return verdictBroke
 		}
-
-		return verdictBroke
 	default:
 		return verdictNone
 	}
@@ -156,7 +209,9 @@ func stepFailed(l *fleet.Lease) bool {
 
 // endedAfter orders ended leases of one host: by end, then grant, then ID. A
 // host holds one lease at a time, so the ends alone order them; the rest only
-// makes the order total.
+// makes the order total. Neither the ID nor the grant says which lease is the
+// last one: IDs are random, and a lease that was taken up again after it had
+// expired ends after leases that were granted later.
 func endedAfter(a, b *fleet.Lease) bool {
 	var endA, endB int64
 
@@ -175,10 +230,20 @@ func endedAfter(a, b *fleet.Lease) bool {
 	) > 0
 }
 
-// ledger holds, per host and group, the most recent ended lease that settled
-// the host for the group (verdictOf is not verdictNone). It is a digest of
-// the lease table: built from it, and kept in step as leases end.
-type ledger map[string]map[string]*fleet.Lease
+// ledgerDepth is how many leases the ledger keeps per host and group. The
+// most recent one is what counts. The one before it is kept for the case that
+// the most recent one is taken up again by its agent (reopen): what it said
+// at its first end is void then, and the one before it holds again. Only a
+// host's most recent lease can be taken up again (the agent holds one
+// operation, and it is the last one it started), and it comes back into the
+// ledger when it ends again, so two are enough.
+const ledgerDepth = 2
+
+// ledger holds, per host and group, the most recent ended leases that settled
+// the host for the group (verdictOf is not verdictNone), newest first. It is
+// a digest of the lease table: built from it, and kept in step as leases end
+// and are taken up again.
+type ledger map[string]map[string][]*fleet.Lease
 
 // newLedger builds the ledger of a set of leases; open ones are passed over.
 func newLedger(leases []*fleet.Lease) ledger {
@@ -191,26 +256,62 @@ func newLedger(leases []*fleet.Lease) ledger {
 	return ld
 }
 
-// note takes in a lease. One that is open or says nothing changes nothing.
+// note takes in a lease. One that is open or says nothing leaves what the
+// leases before it said.
 func (ld ledger) note(l *fleet.Lease) {
 	if l == nil || !l.State.Terminal() {
 		return
 	}
 
 	for _, group := range leaseGroups(l) {
+		// A lease is in the ledger once, with its last end.
+		ld.drop(l.Host, group, l.ID)
+
 		if verdictOf(l, group) == verdictNone {
 			continue
 		}
 
 		byGroup := ld[l.Host]
 		if byGroup == nil {
-			byGroup = make(map[string]*fleet.Lease, 2)
+			byGroup = make(map[string][]*fleet.Lease, 2)
 			ld[l.Host] = byGroup
 		}
 
-		if cur := byGroup[group]; cur == nil || cur.ID == l.ID || endedAfter(l, cur) {
-			byGroup[group] = l
-		}
+		entries := append(slices.Clone(byGroup[group]), l)
+
+		slices.SortStableFunc(entries, func(a, b *fleet.Lease) int {
+			switch {
+			case endedAfter(a, b):
+				return -1
+			case endedAfter(b, a):
+				return 1
+			default:
+				return 0
+			}
+		})
+
+		byGroup[group] = entries[:min(len(entries), ledgerDepth)]
+	}
+}
+
+// drop removes the lease with the ID from what is on record for the host and
+// the group.
+func (ld ledger) drop(host, group, id string) {
+	entries := ld[host][group]
+	if len(entries) == 0 {
+		return
+	}
+
+	ld[host][group] = slices.DeleteFunc(slices.Clone(entries), func(e *fleet.Lease) bool {
+		return e.ID == id
+	})
+}
+
+// retract takes back what the end of a lease said: the lease is open again
+// (reopen).
+func (ld ledger) retract(l *fleet.Lease) {
+	for group := range ld[l.Host] {
+		ld.drop(l.Host, group, l.ID)
 	}
 }
 
@@ -221,8 +322,8 @@ func (ld ledger) brokenSince(host, group string) *fleet.Lease {
 		return nil
 	}
 
-	if l := ld[host][group]; l != nil && verdictOf(l, group) == verdictBroke {
-		return l
+	if entries := ld[host][group]; len(entries) > 0 && verdictOf(entries[0], group) == verdictBroke {
+		return entries[0]
 	}
 
 	return nil
@@ -234,11 +335,13 @@ func (ld ledger) leases() []*fleet.Lease {
 	seen := make(map[string]bool, len(ld))
 
 	for _, byGroup := range ld {
-		for _, l := range byGroup {
-			if !seen[l.ID] {
-				seen[l.ID] = true
+		for _, entries := range byGroup {
+			for _, l := range entries {
+				if !seen[l.ID] {
+					seen[l.ID] = true
 
-				out = append(out, l)
+					out = append(out, l)
+				}
 			}
 		}
 	}

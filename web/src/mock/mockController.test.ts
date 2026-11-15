@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'vitest';
 
-import { list, type ActionResult, type Plan, type Rollout, type Rollouts, type SettingsBody } from '../api/types';
+import {
+  list,
+  type ActionResult,
+  type HostDetail,
+  type Plan,
+  type Rollout,
+  type Rollouts,
+  type SettingsBody,
+  type StepStatus,
+} from '../api/types';
 import { clearsByItself } from '../lib/timeline';
 import { MockController } from './mockController';
 
@@ -209,46 +218,318 @@ describe('MockController, broken hosts and leases that a person ends', () => {
     expect(waits.get('nimbus-nethermind-1')?.wait).not.toBe('order');
   });
 
-  it('ends a lease that the agent has started as failed: its rollout halts and the host is broken', async () => {
-    const mock = await roomy(new MockController());
-    const before = await open(mock, 'lighthouse');
-    const lease = before.leases.find(l => l.host === 'lighthouse-geth-2');
-    expect(lease?.state).toBe('verifying');
+  const HOST = 'lighthouse-geth-2';
+  type AuditRows = { entries: { action: string; target?: string; detail?: Record<string, unknown> }[] };
+  const endEntries = async (mock: MockController) =>
+    (await call<AuditRows>(mock, 'audit?limit=50')).entries.filter(e => e.action === 'action.end-lease');
 
-    const res = await call<ActionResult>(mock, 'actions/end-lease', { lease: lease?.id, reason: 'host taken away' });
-    expect(res.hosts).toStrictEqual(['lighthouse-geth-2']);
+  /** clocked is a mock whose clock the test moves; the fixture's open lease is put into the given state. */
+  const clocked = async (state: 'granted' | 'running' | 'verifying', steps: StepStatus[] = []) => {
+    const clock = { now: Date.parse('2026-01-01T00:00:00Z') };
+    const mock = await roomy(new MockController({ now: () => clock.now }));
+    const lease = mock.data.leases.find(l => l.host === HOST && l.state === 'verifying');
+    if (!lease?.operation) throw new Error('the fixture lacks the verifying lease');
 
-    const { rollout, leases, recent } = await open(mock, 'lighthouse');
-    expect(leases.some(l => l.id === lease?.id)).toBe(false);
-    expect(recent.find(l => l.id === lease?.id)).toMatchObject({ state: 'failed', error: 'ended by operator' });
-    expect(rollout).toMatchObject({ state: 'halted', reason: 'lighthouse-geth-2: ended by operator' });
-    expect(member(rollout, 'lighthouse-geth-2')).toMatchObject({ state: 'failed', error: 'ended by operator' });
+    if (state !== 'verifying') {
+      lease.state = state;
+      lease.agentDoneAt = undefined;
+      lease.readiness = undefined;
+      if (state === 'granted') lease.operation = undefined;
+      else {
+        lease.operation = {
+          ...lease.operation,
+          phase: 'applying',
+          steps: list(lease.needs).map((n, i) => ({ needId: n.id, status: steps[i] ?? 'pending' })),
+        };
+      }
+    }
 
-    const audit = await call<{ entries: { action: string; target?: string; detail?: Record<string, unknown> }[] }>(
-      mock,
-      'audit?limit=5'
-    );
-    expect(audit.entries.find(e => e.action === 'action.end-lease')).toMatchObject({
-      target: 'lighthouse-geth-2',
-      detail: { lease: lease?.id, reason: 'host taken away' },
+    const end = (reason = 'host taken away') =>
+      call<ActionResult>(mock, 'actions/end-lease', { lease: lease.id, reason });
+    const pass = (seconds: number) => {
+      clock.now += seconds * 1000;
+    };
+
+    return { mock, id: lease.id, end, pass };
+  };
+
+  /** retried: the rollout is retried; the member of the host, as the next plan leaves it. */
+  const retried = async (mock: MockController, rollout: string) => {
+    await call<ActionResult>(mock, 'actions/retry', { rollout, hosts: [], reason: 'again' });
+    await call<Plan>(mock, 'plan');
+    return member((await open(mock, 'lighthouse')).rollout, HOST);
+  };
+
+  it('takes ending a lease as a request: the lease stays open and counted, and the host is held', async () => {
+    const { mock, id, end } = await clocked('running', ['running']);
+    const budget = (await call<Plan>(mock, 'plan')).budget;
+
+    const res = await end();
+    expect(res).toMatchObject({ message: `lease ${id} of ${HOST} is ending; the host is on hold`, hosts: [HOST] });
+
+    const { rollout, leases } = await open(mock, 'lighthouse');
+    expect(leases.find(l => l.id === id)).toMatchObject({
+      state: 'running',
+      cancelled: { by: 'anonymous', state: 'running', reason: 'host taken away' },
+    });
+    expect(rollout.state).toBe('active');
+    expect(member(rollout, HOST)).toMatchObject({ state: 'leased', leaseId: id });
+
+    const plan = await call<Plan>(mock, 'plan');
+    expect(plan.budget).toStrictEqual(budget);
+    expect(plan.hosts?.[HOST]).toMatchObject({ slot: 'leased', leaseId: id });
+    expect(await call<HostDetail>(mock, `hosts/${HOST}`)).toMatchObject({
+      holdWanted: true,
+      hold: { controller: true },
     });
 
-    // Retried, it goes first.
-    await call<ActionResult>(mock, 'actions/retry', { rollout: rollout.id, hosts: [], reason: 'again' });
-    await call<Plan>(mock, 'plan');
-    const after = await open(mock, 'lighthouse');
-    expect(member(after.rollout, 'lighthouse-geth-2')).toMatchObject({
-      stage: 1,
-      error: `broken since lease ${lease?.id ?? ''} (rollout ${rollout.id})`,
+    expect(await endEntries(mock)).toStrictEqual([
+      expect.objectContaining({
+        target: HOST,
+        actor: 'anonymous',
+        detail: {
+          lease: id,
+          state: 'running',
+          reason: 'host taken away',
+          hold: {
+            before: { holdWanted: false, holdReason: '' },
+            after: { holdWanted: true, holdReason: 'lease ended by operator' },
+          },
+        },
+      }),
+    ]);
+  });
+
+  it('takes ending a lease twice as ending it once', async () => {
+    const { mock, id, end } = await clocked('verifying');
+    await end();
+
+    const again = await end('once more');
+    expect(again.message).toContain(`lease ${id} of ${HOST} was already ended by anonymous`);
+    expect(again.hosts).toStrictEqual([HOST]);
+
+    const { leases } = await open(mock, 'lighthouse');
+    expect(leases.find(l => l.id === id)?.cancelled).toMatchObject({ state: 'verifying', reason: 'host taken away' });
+    expect(await endEntries(mock)).toHaveLength(1);
+  });
+
+  it('keeps the hold of a host that is held already, and names the cancel in its reason', async () => {
+    const { mock, id, end } = await clocked('verifying');
+    await call<ActionResult>(mock, 'actions/hold', { hosts: [HOST], reason: 'mine' });
+
+    expect((await end()).message).toBe(`lease ${id} of ${HOST} is ending; the host stays on hold`);
+    expect((await endEntries(mock))[0]?.detail).toStrictEqual({
+      lease: id,
+      state: 'verifying',
+      reason: 'host taken away',
+      hold: {
+        before: { holdWanted: true, holdReason: 'mine' },
+        after: { holdWanted: true, holdReason: 'mine; lease ended by operator' },
+      },
+    });
+    expect(await call<HostDetail>(mock, `hosts/${HOST}`)).toMatchObject({
+      holdWanted: true,
+      holdReason: 'mine; lease ended by operator',
     });
   });
 
-  it('refuses to end a lease that is unknown or over', async () => {
+  it('refuses to lift the hold while the lease that was ended is open', async () => {
+    const { mock, id, end, pass } = await clocked('running', ['running', 'pending']);
+    await end();
+
+    const unhold = async () =>
+      mock.fetch('/api/v1/actions/unhold', { method: 'POST', body: JSON.stringify({ hosts: [HOST], reason: '' }) });
+
+    const refused = await unhold();
+    expect(refused.status).toBe(409);
+    expect(await refused.json()).toMatchObject({
+      error: expect.stringContaining(`lease ${id} of ${HOST} was ended by anonymous and is still open`) as unknown,
+    });
+    expect(await call<HostDetail>(mock, `hosts/${HOST}`)).toMatchObject({
+      holdWanted: true,
+      holdReason: 'lease ended by operator',
+    });
+
+    // The agent reports; the lease has ended; the hold can be lifted.
+    pass(30);
+    expect((await unhold()).status).toBe(200);
+
+    const host = await call<HostDetail>(mock, `hosts/${HOST}`);
+    expect(host.holdWanted).toBe(false);
+    expect(host.holdReason).toBeUndefined();
+  });
+
+  it('puts the hold back when a lease that was ended is ended again and its host is not held', async () => {
+    const { mock, id, end } = await clocked('running', ['running']);
+    await end();
+
+    // A row of a build that let the hold be lifted.
+    const host = mock.data.hosts.get(HOST);
+    if (!host) throw new Error('no host');
+    host.holdWanted = false;
+    host.holdReason = undefined;
+
+    expect((await end()).message).toBe(`lease ${id} of ${HOST} was already ended by anonymous; the host is on hold`);
+    expect(await call<HostDetail>(mock, `hosts/${HOST}`)).toMatchObject({
+      holdWanted: true,
+      holdReason: 'lease ended by operator',
+    });
+    expect(await endEntries(mock)).toHaveLength(2);
+  });
+
+  it('fails a cancelled lease that is verifying at the next pass: its rollout halts and the host is broken', async () => {
+    const { mock, id, end, pass } = await clocked('verifying');
+    await end();
+    pass(5);
+
+    const { rollout, leases, recent } = await open(mock, 'lighthouse');
+    expect(leases.some(l => l.id === id)).toBe(false);
+    expect(recent.find(l => l.id === id)).toMatchObject({ state: 'failed', error: 'ended by operator' });
+    expect(rollout).toMatchObject({ state: 'halted', reason: `${HOST}: ended by operator` });
+    expect(member(rollout, HOST)).toMatchObject({ state: 'failed', error: 'ended by operator', leaseId: id });
+
+    // Retried, it goes first.
+    expect(await retried(mock, rollout.id)).toMatchObject({
+      stage: 1,
+      error: `broken since lease ${id} (rollout ${rollout.id})`,
+    });
+  });
+
+  it('expires a cancelled lease that the agent has not started: nothing halts and the host is not broken', async () => {
+    const { mock, id, end, pass } = await clocked('granted');
+    const res = await end();
+    expect(res.message).toBe(`lease ${id} of ${HOST} is ending; the host is on hold`);
+
+    pass(29);
+    const before = await open(mock, 'lighthouse');
+    expect(before.leases.find(l => l.id === id)).toMatchObject({ state: 'granted', cancelled: { state: 'granted' } });
+    expect((await call<Plan>(mock, 'plan')).hosts?.[HOST]).toMatchObject({ slot: 'leased', leaseId: id });
+
+    // The agent's next sync: it declines the lease it is no longer offered.
+    pass(1);
+    const { rollout, leases, recent } = await open(mock, 'lighthouse');
+    expect(leases.some(l => l.id === id)).toBe(false);
+    expect(recent.find(l => l.id === id)).toMatchObject({ state: 'expired' });
+    expect(recent.find(l => l.id === id)?.error).toBeUndefined();
+    expect(rollout.state).toBe('active');
+
+    const m = member(rollout, HOST);
+    expect(m).toMatchObject({ state: 'pending', stage: 3 });
+    expect(m?.leaseId).toBeUndefined();
+    expect(m?.error).toBeUndefined();
+
+    // Held until a person unholds it.
+    const plan = await call<Plan>(mock, 'plan');
+    expect(plan.hosts?.[HOST]).toMatchObject({ slot: 'held', reason: 'held' });
+    await call<ActionResult>(mock, 'actions/unhold', { hosts: [HOST], reason: 'in order' });
+    expect((await call<Plan>(mock, 'plan')).hosts?.[HOST]?.slot).toBe('queued');
+  });
+
+  it('lets a cancelled lease of a silent agent run out', async () => {
+    const { mock, id, end, pass } = await clocked('granted');
+    mock.data.seenAgo.set(HOST, 600);
+    await end();
+
+    pass(60);
+    expect((await open(mock, 'lighthouse')).leases.some(l => l.id === id)).toBe(true);
+
+    pass(3600);
+    expect((await open(mock, 'lighthouse')).recent.find(l => l.id === id)).toMatchObject({ state: 'expired' });
+  });
+
+  it('ends a cancelled running lease after the step in progress; one step of the group was applied, so the host is broken', async () => {
+    const { mock, id, end, pass } = await clocked('running', ['running', 'pending']);
+    await end();
+
+    pass(29);
+    expect((await open(mock, 'lighthouse')).leases.find(l => l.id === id)).toMatchObject({ state: 'running' });
+
+    pass(1);
+    const { rollout, leases, recent } = await open(mock, 'lighthouse');
+    expect(leases.some(l => l.id === id)).toBe(false);
+
+    const ended = recent.find(l => l.id === id);
+    expect(ended).toMatchObject({ state: 'failed', error: 'ended by operator', cancelled: { state: 'running' } });
+    expect(list(ended?.operation?.steps).map(s => s.status)).toStrictEqual(['done', 'cancelled']);
+
+    // Its member failed and the rollout halts.
+    expect(rollout).toMatchObject({ state: 'halted', reason: `${HOST}: ended by operator` });
+    expect(member(rollout, HOST)).toMatchObject({ state: 'failed', error: 'ended by operator' });
+
+    // One container of the image was recreated and the host was never shown
+    // to be back: retried, it goes first.
+    expect(await retried(mock, rollout.id)).toMatchObject({
+      state: 'pending',
+      stage: 1,
+      error: `broken since lease ${id} (rollout ${rollout.id})`,
+    });
+
+    // The lease is over: ending it now is refused.
+    const res = await mock.fetch('/api/v1/actions/end-lease', {
+      method: 'POST',
+      body: JSON.stringify({ lease: id, reason: '' }),
+    });
+    expect(res.status).toBe(409);
+    expect(await res.json()).toMatchObject({ error: expect.stringContaining('is failed') as unknown });
+  });
+
+  it('does not break the host when nothing of the group was applied before the agent stopped', async () => {
+    const { mock, id, end, pass } = await clocked('running', ['superseded', 'pending']);
+    const lease = mock.data.leases.find(l => l.id === id);
+    if (lease?.operation) lease.operation.disrupted = true;
+    await end();
+    pass(30);
+
+    const { rollout, recent } = await open(mock, 'lighthouse');
+    expect(list(recent.find(l => l.id === id)?.operation?.steps).map(s => s.status)).toStrictEqual([
+      'superseded',
+      'cancelled',
+    ]);
+    expect(rollout.state).toBe('halted');
+
+    const m = await retried(mock, rollout.id);
+    expect(m).toMatchObject({ state: 'pending', stage: 3 });
+    expect(m?.error).toBeUndefined();
+  });
+
+  it('breaks the host when the stopped operation had done every step, whenever the lease was ended', async () => {
+    const { mock, id, end, pass } = await clocked('running', ['done', 'running']);
+    await end();
+    pass(30);
+
+    // The change was applied and the host was never shown to be back: the
+    // same as for a lease that is ended while it is verified.
+    const { rollout, recent } = await open(mock, 'lighthouse');
+    expect(recent.find(l => l.id === id)).toMatchObject({ state: 'failed', error: 'ended by operator' });
+    expect(rollout).toMatchObject({ state: 'halted', reason: `${HOST}: ended by operator` });
+    expect(member(rollout, HOST)).toMatchObject({ state: 'failed', error: 'ended by operator', leaseId: id });
+
+    expect(await retried(mock, rollout.id)).toMatchObject({
+      stage: 1,
+      error: `broken since lease ${id} (rollout ${rollout.id})`,
+    });
+  });
+
+  it('breaks the host when a step of a cancelled lease failed', async () => {
+    const { mock, id, end, pass } = await clocked('running', ['failed', 'pending']);
+    await end();
+    pass(30);
+
+    const { rollout } = await open(mock, 'lighthouse');
+    expect(rollout.state).toBe('halted');
+    expect(await retried(mock, rollout.id)).toMatchObject({
+      stage: 1,
+      error: `broken since lease ${id} (rollout ${rollout.id})`,
+    });
+  });
+
+  it('refuses to end a lease that is unknown, unnamed or over', async () => {
     const mock = new MockController();
     const end = async (lease: string) =>
       mock.fetch('/api/v1/actions/end-lease', { method: 'POST', body: JSON.stringify({ lease, reason: '' }) });
 
     expect((await end('nosuchlease')).status).toBe(404);
+    expect((await end('')).status).toBe(400);
 
     const { recent } = await open(mock, 'lighthouse');
     const over = recent.find(l => l.state === 'released');

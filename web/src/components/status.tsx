@@ -74,6 +74,7 @@ const STEP_TONE: Record<StepStatus, Tone> = {
   failed: 'danger',
   superseded: 'neutral',
   refused: 'warning',
+  cancelled: 'neutral',
 };
 
 export function StepBadge({ status, title }: { status: StepStatus; title?: string }) {

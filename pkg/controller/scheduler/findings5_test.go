@@ -830,42 +830,50 @@ func TestReview5Finding4APersonEndsALeaseInFlight(t *testing.T) {
 		assert.Equal(t, "after a", queueReasons(r.svc.Plan())["b"])
 	})
 
-	t.Run("ending the lease lifts the wait", func(t *testing.T) {
-		r, ra, rb := inFlight(t)
+	// Ending the lease is a request (the sixth review, findings6_test.go): the
+	// wait lasts until the agent has stopped, and the host is held.
+	t.Run("ending the lease lifts the wait once the agent has stopped", func(t *testing.T) {
+		r, _, rb := inFlight(t)
 		lease := r.assignment("a").Lease.ID
 
 		res, err := r.endLease("a")
 		require.NoError(t, err)
 		assert.Equal(t, []string{"a"}, res.Hosts)
 
+		// The lease is open and in flight as before: the host is still down.
+		r.pass()
+		assert.Equal(t, []string{"a"}, r.leased())
+		assert.Equal(t, map[string]string{"b": "after a", "c": "after a"}, queueReasons(r.svc.Plan()))
+		assert.True(t, r.assignment("a").Lease.Cancel)
+
+		// The agent stops and says so.
+		r.sync("a", func(st *protocol.SyncRequest) {
+			st.Operation = &protocol.Operation{
+				LeaseID: lease, Phase: protocol.PhaseDone, Disrupted: true,
+				Steps: []protocol.Step{{
+					NeedID: imageNeed("c", imgLighthouse, digestA).ID, Status: protocol.StepCancelled,
+				}},
+			}
+			st.Hold.Controller = true
+			st.Needs = nil
+		})
+		r.pass()
+
 		ended, err := r.store.GetLease(r.ctx, lease)
 		require.NoError(t, err)
 		assert.Equal(t, fleet.LeaseFailed, ended.State)
 		assert.Equal(t, "ended by operator", ended.Error)
-		assert.Nil(t, r.assignment("a").Lease, "the agent is no longer offered the lease")
-
-		// Audited like every action, with the scheduler's own entry for the
-		// lease.
-		entry := r.store.lastAuditOf("action.end-lease")
-		assert.Equal(t, "alice", entry.Actor)
-		assert.Equal(t, "a", entry.Target)
-		assert.Equal(t, lease, entry.Detail[keyLease])
-		assert.Equal(t, "taken away", entry.Detail[keyReason])
+		assert.Nil(t, r.assignment("a").Lease)
 		assert.Equal(t, actorScheduler, r.store.lastAuditOf("lease.failed").Actor)
 
-		// a is broken now. It is expected in the rollout of B and has had its
-		// hostStaleAfter to report: nobody waits for it, and the rollout goes
-		// on with a canary.
-		r.pass()
-
+		// Nobody waits for a lease any more, nor for the host: it is held, and
+		// the cancel did not break it.
 		next := r.rollout(rb)
-		assert.Equal(t, []string{"a"}, repairStage(next))
-		assert.Equal(t, brokenBy(lease, ra), next.Host("a").Error)
-		assert.Equal(t, []string{"b"}, r.leased(), "nobody waits for a lease any more")
+		assert.Empty(t, repairStage(next))
+		assert.Equal(t, []string{"b"}, r.leased())
 		assert.Equal(t, "b", next.Canary)
 
-		// The agent still reports the operation it had started. The lease
-		// stays ended: it is neither taken up again nor adopted.
+		// The agent still repeats its report. The lease stays ended.
 		r.advance(time.Minute)
 		r.pass()
 
@@ -874,70 +882,21 @@ func TestReview5Finding4APersonEndsALeaseInFlight(t *testing.T) {
 		assert.Equal(t, fleet.LeaseFailed, ended.State)
 		assert.Equal(t, []string{"b"}, r.leased())
 
-		// When a reports the need of B it goes first: it waits for nobody,
-		// only for the one slot that three hosts have, and c waits for it.
+		// Unheld, a is an ordinary member of the rollout of B.
+		_, err = r.svc.Unhold(r.ctx, "alice", HoldRequest{Hosts: []string{"a"}})
+		require.NoError(t, err)
+		r.sync("a", func(st *protocol.SyncRequest) { st.Hold.Controller = false })
 		r.seesImage(digestB, "a")
 		r.pass()
-		assert.Equal(t, map[string]string{"a": "host limit 1 of 1", "c": "after a"}, queueReasons(r.svc.Plan()))
 
-		r.done("b")
-		assert.Equal(t, []string{"a"}, r.leased())
-		assert.Equal(t, "after a", queueReasons(r.svc.Plan())["c"])
-
-		// Repaired, it is in order.
-		r.done("a")
-		assert.Equal(t, fleet.HostDone, r.rollout(rb).Host("a").State)
-		assert.Empty(t, r.rollout(rb).Host("a").Error)
-	})
-
-	t.Run("a lease of an open rollout: its rollout halts and the host goes first after the retry", func(t *testing.T) {
-		r := newReplay(t, false)
-		hosts := []string{"a", "b", "c"}
-
-		for _, name := range hosts {
-			r.addHost(name, 0)
-		}
-
-		r.seesImage(digestA, hosts...)
-		r.pass()
-		require.Equal(t, []string{"a"}, r.leased())
-
-		// Not started as far as the controller knows: the agent may start it
-		// at any moment, so it is not for a person to declare it over.
-		_, err := r.endLease("a")
-		require.ErrorIs(t, err, ErrInvalidAction)
-		assert.Contains(t, err.Error(), "the agent has not started lease")
-		assert.Equal(t, []string{"a"}, r.leased())
-
-		lease := r.running("a")
-		r.pass()
-
-		_, err = r.endLease("a")
-		require.NoError(t, err)
-
-		ra := r.openRollout(imageKey(imgLighthouse, digestA))
-		assert.Equal(t, fleet.RolloutHalted, ra.State)
-		assert.Equal(t, "a: ended by operator", ra.Reason)
-		assert.Equal(t, fleet.HostFailed, ra.Host("a").State)
-		assert.Equal(t, "ended by operator", ra.Host("a").Error)
-
-		r.pass()
-		assert.Empty(t, r.leased(), "a halted rollout grants nothing")
-
-		r.retry(ra.ID)
-		r.sync("a", func(st *protocol.SyncRequest) { st.Operation = nil })
-		r.pass()
-
-		ra = r.rollout(ra.ID)
-		assert.Equal(t, []string{"a"}, repairStage(ra))
-		assert.Equal(t, brokenBy(lease, ra.ID), ra.Host("a").Error)
-		assert.Equal(t, []string{"a"}, r.leased())
-		assert.Equal(t, map[string]string{"b": "after a", "c": "after a"}, queueReasons(r.svc.Plan()))
+		next = r.rollout(rb)
+		assert.Empty(t, repairStage(next))
+		assert.Empty(t, next.Host("a").Error)
+		assert.Equal(t, map[string]string{"a": "after canary b", "c": "after canary b"}, queueReasons(r.svc.Plan()))
 	})
 
 	t.Run("what cannot be ended", func(t *testing.T) {
 		r, _, _ := inFlight(t)
-		lease := r.assignment("a").Lease.ID
 
 		_, err := r.svc.EndLease(r.ctx, "alice", EndLeaseRequest{})
 		require.ErrorIs(t, err, ErrInvalidAction)
@@ -945,8 +904,8 @@ func TestReview5Finding4APersonEndsALeaseInFlight(t *testing.T) {
 		_, err = r.svc.EndLease(r.ctx, "alice", EndLeaseRequest{Lease: "nosuchlease"})
 		require.ErrorIs(t, err, ErrUnknownLease)
 
-		_, err = r.endLease("a")
-		require.NoError(t, err)
+		lease := r.assignment("a").Lease.ID
+		r.fail("a")
 
 		_, err = r.svc.EndLease(r.ctx, "alice", EndLeaseRequest{Lease: lease})
 		require.ErrorIs(t, err, ErrInvalidAction, "a lease that has ended")
@@ -965,7 +924,9 @@ func TestReview5Finding4APersonEndsALeaseInFlight(t *testing.T) {
 
 		r.seesImage(digestA, "a", "b", "c")
 		r.pass()
-		r.running("a")
+
+		lease := r.running("a")
+
 		r.pass()
 		r.abort(r.openRollout(imageKey(imgLighthouse, digestA)).ID)
 		r.advance(time.Minute)
@@ -975,14 +936,20 @@ func TestReview5Finding4APersonEndsALeaseInFlight(t *testing.T) {
 		_, err := r.endLease("a")
 		require.NoError(t, err)
 
-		// Broken and expected to report: the others wait for it.
 		r.pass()
-		require.Empty(t, r.leased())
+		require.Equal(t, []string{"a"}, r.leased())
 		require.Equal(t, map[string]string{"b": "after a", "c": "after a"}, queueReasons(r.svc.Plan()))
 
-		r.seesImage(digestB, "a")
+		r.sync("a", func(st *protocol.SyncRequest) {
+			st.Operation = &protocol.Operation{
+				LeaseID: lease, Phase: protocol.PhaseDone, Disrupted: true,
+				Steps: []protocol.Step{{
+					NeedID: imageNeed("c", imgLighthouse, digestA).ID, Status: protocol.StepCancelled,
+				}},
+			}
+		})
 		r.pass()
-		require.Equal(t, []string{"a"}, r.leased(), "it reports the need: first")
+		require.Equal(t, []string{"b"}, r.leased(), "the wait is over, and a is held")
 
 		return r
 	})

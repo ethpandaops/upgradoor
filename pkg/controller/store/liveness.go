@@ -45,6 +45,14 @@ func (s *sqliteStore) SaveLiveness(ctx context.Context, rows []fleet.Liveness) e
 	return nil
 }
 
+// livenessQuery reads the rows of the newest epochs. It is read on every
+// reconcile tick.
+const livenessQuery = `
+	SELECT host, epoch, live, total FROM validator_liveness
+	WHERE epoch IN (
+		SELECT DISTINCT epoch FROM validator_liveness ORDER BY epoch DESC LIMIT ?)
+	ORDER BY epoch DESC, host`
+
 // ListLiveness returns the rows of the newest `epochs` epochs for which any
 // row exists, newest epoch first and by host within an epoch.
 func (s *sqliteStore) ListLiveness(ctx context.Context, epochs int) ([]fleet.Liveness, error) {
@@ -55,12 +63,7 @@ func (s *sqliteStore) ListLiveness(ctx context.Context, epochs int) ([]fleet.Liv
 	}
 
 	err := s.read(ctx, func(tx *sql.Tx) error {
-		return queryRows(ctx, tx, `
-			SELECT host, epoch, live, total FROM validator_liveness
-			WHERE epoch IN (
-				SELECT DISTINCT epoch FROM validator_liveness ORDER BY epoch DESC LIMIT ?)
-			ORDER BY epoch DESC, host`,
-			[]any{epochs},
+		return queryRows(ctx, tx, livenessQuery, []any{epochs},
 			func(row rowScanner) error {
 				var (
 					host               string

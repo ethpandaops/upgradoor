@@ -428,11 +428,15 @@ func (s *service) handleLease(
 ) bool {
 	if cur := s.store.Snapshot().Current; cur != nil {
 		if lease != nil && lease.ID == cur.Lease.ID {
+			if lease.Cancel {
+				s.cancelLease(cur.Lease.ID)
+			}
+
 			return false
 		}
 
 		if !cur.Operation.Phase.Terminal() {
-			// The controller no longer holds the lease, and nothing was
+			// The controller no longer offers the lease, and nothing was
 			// touched for it yet: it must not be started any more.
 			if !cur.Started {
 				s.withdrawLease(cur.Lease.ID)
@@ -504,6 +508,38 @@ func (s *service) withdrawLease(id string) {
 	}
 }
 
+// cancelLease marks the persisted lease as cancelled by a person. An
+// operation that has not started declines it; one that has started begins no
+// further step (operation.proceed). The mark is kept in memory even when it
+// cannot be written, so that a cancel is never lost to a full disk while the
+// agent runs; the controller restates it on every sync.
+func (s *service) cancelLease(id string) {
+	cancelled := false
+
+	err := s.store.Apply(func(st *persistedState) {
+		cur := st.Current
+		if cur == nil || cur.Lease.ID != id || cur.Cancelled || cur.Operation.Phase.Terminal() {
+			return
+		}
+
+		cur.Cancelled = true
+		cur.Lease.Cancel = true
+		cancelled = true
+	})
+
+	if !cancelled {
+		return
+	}
+
+	if err != nil {
+		s.log.WithError(err).WithField("lease", id).
+			Error("cannot persist that the lease was cancelled; honouring it all the same")
+	}
+
+	s.log.WithField("lease", id).
+		Warn("the lease was cancelled; no further step of it is begun")
+}
+
 // acceptLease persists a new lease with its deadline and only then starts
 // the operation.
 func (s *service) acceptLease(ctx context.Context, lease *protocol.Lease) bool {
@@ -511,6 +547,17 @@ func (s *service) acceptLease(ctx context.Context, lease *protocol.Lease) bool {
 
 	if lease.ID == "" {
 		log.Warn("ignoring a lease without an ID")
+
+		return false
+	}
+
+	if lease.Cancel {
+		// Nothing was done for it, and nothing will be.
+		if s.ignoredLease != lease.ID {
+			s.ignoredLease = lease.ID
+
+			log.Warn("ignoring a lease that was cancelled before the agent had it")
+		}
 
 		return false
 	}

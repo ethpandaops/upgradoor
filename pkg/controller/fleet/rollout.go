@@ -44,10 +44,72 @@ const (
 	RolloutAborted RolloutState = "aborted"
 )
 
-// Terminal reports whether no further transition is possible.
-func (s RolloutState) Terminal() bool {
-	return s == RolloutCompleted || s == RolloutSuperseded || s == RolloutAborted
+// stateClass says of one lifecycle state whether it is open. A state is
+// declared once, as a constant, and classified once, in the table of its
+// type (rolloutStates, leaseStates): Terminal and the lists of open states,
+// which the store's queries are built from, are read off that table. A state
+// that is declared and not in its table fails TestEveryStateIsClassified, so
+// a new state cannot be left out of "open" by forgetting a list.
+type stateClass[S ~string] struct {
+	State S
+	// Open: the rollout still serves hosts; the lease still holds a slot.
+	Open bool
 }
+
+// openStates lists the open states of a table, in its order.
+func openStates[S ~string](table []stateClass[S]) []S {
+	open := make([]S, 0, len(table))
+
+	for _, c := range table {
+		if c.Open {
+			open = append(open, c.State)
+		}
+	}
+
+	return open
+}
+
+// allStates lists the states of a table, in its order.
+func allStates[S ~string](table []stateClass[S]) []S {
+	all := make([]S, 0, len(table))
+
+	for _, c := range table {
+		all = append(all, c.State)
+	}
+
+	return all
+}
+
+// terminalState reports whether the table knows the state as one that is not
+// open. A state it does not know is not terminal: whatever carries it is
+// still looked at.
+func terminalState[S ~string](table []stateClass[S], s S) bool {
+	for _, c := range table {
+		if c.State == s {
+			return !c.Open
+		}
+	}
+
+	return false
+}
+
+// rolloutStates classifies every rollout state.
+var rolloutStates = []stateClass[RolloutState]{
+	{State: RolloutActive, Open: true},
+	{State: RolloutHalted, Open: true},
+	{State: RolloutCompleted},
+	{State: RolloutSuperseded},
+	{State: RolloutAborted},
+}
+
+// RolloutStates lists every rollout state, the open ones first.
+func RolloutStates() []RolloutState { return allStates(rolloutStates) }
+
+// OpenRolloutStates lists the states of a rollout that is not Terminal.
+func OpenRolloutStates() []RolloutState { return openStates(rolloutStates) }
+
+// Terminal reports whether no further transition is possible.
+func (s RolloutState) Terminal() bool { return terminalState(rolloutStates, s) }
 
 // Rollout is a group of hosts that share one cause.
 type Rollout struct {
@@ -193,9 +255,38 @@ const (
 	LeaseExpired LeaseState = "expired"
 )
 
+// leaseStates classifies every lease state.
+var leaseStates = []stateClass[LeaseState]{
+	{State: LeaseGranted, Open: true},
+	{State: LeaseRunning, Open: true},
+	{State: LeaseVerifying, Open: true},
+	{State: LeaseReleased},
+	{State: LeaseFailed},
+	{State: LeaseExpired},
+}
+
+// LeaseStates lists every lease state, the open ones first.
+func LeaseStates() []LeaseState { return allStates(leaseStates) }
+
+// OpenLeaseStates lists the states in which a lease holds a slot: the ones
+// that are not Terminal.
+func OpenLeaseStates() []LeaseState { return openStates(leaseStates) }
+
 // Terminal reports whether the lease no longer holds a slot.
-func (s LeaseState) Terminal() bool {
-	return s == LeaseReleased || s == LeaseFailed || s == LeaseExpired
+func (s LeaseState) Terminal() bool { return terminalState(leaseStates, s) }
+
+// LeaseCancel is the mark of a lease that a person ended while it was open
+// (the end-lease action). The lease stays open and keeps its slot until it
+// ends by one of the ordinary ways.
+type LeaseCancel struct {
+	At time.Time `json:"at"`
+	// By is the person, as recorded in the audit log.
+	By string `json:"by"`
+	// State is the state the lease was in when it was cancelled. It is for
+	// people (audit, UI): no decision reads it. What the end of the lease
+	// says about its host is read off the agent's final report.
+	State  LeaseState `json:"state"`
+	Reason string     `json:"reason,omitempty"`
 }
 
 // Lease is a slot granted to one host.
@@ -242,6 +333,10 @@ type Lease struct {
 	Readiness string `json:"readiness,omitempty"`
 	// Error is the failure reason for LeaseFailed.
 	Error string `json:"error,omitempty"`
+	// Cancelled is set once a person ended the lease. While the lease is
+	// open the agent is told with every sync (protocol.Lease.Cancel) and
+	// stops after the step in progress.
+	Cancelled *LeaseCancel `json:"cancelled,omitempty"`
 }
 
 // DirectiveState is the controller-side state of a directive.

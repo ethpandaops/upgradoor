@@ -30,6 +30,7 @@ const (
 // Store is the part of store.Store the scheduler uses.
 type Store interface {
 	ListHosts(ctx context.Context) ([]*fleet.Host, error)
+	GetHost(ctx context.Context, name string) (*fleet.Host, error)
 	SetHostHold(ctx context.Context, name string, wanted bool, reason string) error
 	DeleteHost(ctx context.Context, name string) error
 	ListLiveness(ctx context.Context, epochs int) ([]fleet.Liveness, error)
@@ -303,9 +304,13 @@ type history struct {
 }
 
 // noteLease takes in a lease that was read or written. The history keeps
-// the lease itself: nobody changes a lease after it has ended.
+// the lease itself: nobody changes a lease after it has ended. A lease that
+// is open says nothing; if it had ended before (it was taken up again), what
+// that end said is taken back.
 func (h *history) noteLease(l *fleet.Lease) {
 	if !l.State.Terminal() {
+		h.ledger.retract(l)
+
 		return
 	}
 
@@ -555,10 +560,33 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 	}
 
 	now := s.opts.Now()
+	// withheld: the host holds a lease that is not offered.
+	withheld := false
 
 	for _, l := range leases {
 		if l.State.Terminal() || l.Host != host {
 			continue
+		}
+
+		// A lease that a person ended before the agent reported an operation
+		// for it is no longer offered: an agent that has not started it must
+		// not, and one that does not know the cancel mark would. The agent
+		// that holds it unstarted declines it when it is no longer offered.
+		// One that reports an operation for it has it, whatever the scheduler
+		// has made of that report so far: to it the lease is restated, with
+		// the mark, so that it keeps a finished operation until the scheduler
+		// has taken it in.
+		if l.Cancelled != nil && l.State == fleet.LeaseGranted {
+			reported, repErr := s.reportsOperation(ctx, host, l.ID)
+			if repErr != nil {
+				return nil, repErr
+			}
+
+			if !reported {
+				withheld = true
+
+				break
+			}
 		}
 
 		a.Lease = &protocol.Lease{
@@ -567,6 +595,7 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 			ExpiresAt:  l.ExpiresAt,
 			TTLSeconds: max(int64(l.ExpiresAt.Sub(now)/time.Second), 0),
 			Needs:      []protocol.Need{},
+			Cancel:     l.Cancelled != nil,
 		}
 
 		// An adopted lease is restated without needs. The agent that still
@@ -592,7 +621,7 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 		}
 	}
 
-	if a.Lease == nil {
+	if a.Lease == nil && !withheld {
 		for _, q := range s.Plan().Queue {
 			if q.Host == host {
 				a.Queue = &protocol.Queue{Position: q.Position, Reason: q.Reason}
@@ -603,6 +632,21 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 	}
 
 	return a, nil
+}
+
+// reportsOperation reports whether the host's last sync carries an operation
+// for the lease.
+func (s *service) reportsOperation(ctx context.Context, host, lease string) (bool, error) {
+	h, err := s.opts.Store.GetHost(ctx, host)
+
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return false, nil
+	case err != nil:
+		return false, fmt.Errorf("scheduler: get host %s: %w", host, err)
+	}
+
+	return h.Status != nil && h.Status.Operation != nil && h.Status.Operation.LeaseID == lease, nil
 }
 
 // Settings returns the effective settings.

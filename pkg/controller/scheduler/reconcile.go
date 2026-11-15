@@ -97,10 +97,12 @@ type World struct {
 	// when the agent did start after all.
 	ClosedLeases map[string]*fleet.Lease
 	// Ended are terminal leases. It must hold at least, for every host and
-	// every group (an image reference, the packages), the most recent lease
-	// that failed the host for the group or repaired it (verdictOf); the whole
-	// lease table is right too. Which hosts are broken is derived from it and
-	// from the leases that end in the reconcile.
+	// every group (an image reference, the packages), the two most recent
+	// leases that failed the host for the group or repaired it (verdictOf);
+	// the whole lease table is right too. Which hosts are broken is derived
+	// from it and from the leases that end in the reconcile. (Two, because the
+	// most recent one may be taken up again by its agent: what the one before
+	// it said then holds again.)
 	Ended []*fleet.Lease
 	// LastLeaseEnd is, per host, when its most recent terminal lease ended.
 	// A host without an entry never held a lease this database knows of.
@@ -116,8 +118,12 @@ type Outcome struct {
 	Rollouts   []*fleet.Rollout
 	Leases     []*fleet.Lease
 	Directives []*fleet.Directive
-	Audit      []fleet.AuditEntry
-	Plan       *Plan
+	// Holds are the controller holds the pass puts on hosts: the hold of a
+	// lease that a person ended, put back when the lease is taken up again
+	// (reopen). The scheduler never lifts a hold.
+	Holds []store.HostHold
+	Audit []fleet.AuditEntry
+	Plan  *Plan
 }
 
 // Changes returns the outcome as one store transaction.
@@ -126,6 +132,7 @@ func (o *Outcome) Changes() *store.Changes {
 		Rollouts:   o.Rollouts,
 		Leases:     o.Leases,
 		Directives: o.Directives,
+		Holds:      o.Holds,
 		Audit:      o.Audit,
 	}
 }
@@ -228,6 +235,8 @@ type pass struct {
 	before *budgetState
 	// ended names the hosts whose lease ended in this pass.
 	ended map[string]bool
+	// holds are the controller holds this pass puts on hosts (holdEnded).
+	holds []store.HostHold
 }
 
 // lastLeaseEnd is when the host's most recent lease ended, this pass
@@ -266,7 +275,7 @@ func newPass(w *World) *pass {
 		origDirectives: make(map[string]*fleet.Directive, len(w.Directives)),
 		rows:           make(map[string]map[uint64]fleet.Liveness, len(w.Hosts)),
 		needs:          make(map[string]map[string][]protocol.Need, len(w.Rollouts)+2),
-		ledger:         newLedger(w.Ended),
+		ledger:         make(ledger, len(w.Hosts)),
 		closedLatest:   make(map[string]*fleet.Rollout, len(w.Closed)),
 		hostKeys:       make(map[string]map[string]bool, len(w.Hosts)),
 		ended:          make(map[string]bool, 2),
@@ -347,6 +356,20 @@ func newPass(w *World) *pass {
 		c := *d
 		p.directives = append(p.directives, &c)
 		p.origDirectives[c.ID] = d
+	}
+
+	// A host that was forgotten and returns under its name is a new host: what
+	// a lease said that ended before this database first saw the host (again)
+	// is not about it. Nor does an earlier end of a lease that is open again
+	// say anything.
+	for _, l := range w.Ended {
+		hv := p.hosts[l.Host]
+		if hv == nil || p.origLeases[l.ID] != nil ||
+			(l.EndedAt != nil && l.EndedAt.Before(hv.h.FirstSeen)) {
+			continue
+		}
+
+		p.ledger.note(l)
 	}
 
 	return p
@@ -449,7 +472,7 @@ func (p *pass) setMember(m *fleet.RolloutHost, state fleet.HostState) {
 
 // outcome collects what changed against the world.
 func (p *pass) outcome(plan *Plan) *Outcome {
-	out := &Outcome{Audit: p.audit, Plan: plan}
+	out := &Outcome{Audit: p.audit, Holds: p.holds, Plan: plan}
 
 	for _, r := range p.rollouts {
 		orig := p.origRollouts[r.ID]
@@ -503,6 +526,11 @@ func cloneLease(l *fleet.Lease) *fleet.Lease {
 	c.SyncedUntil = cloneTime(l.SyncedUntil)
 	c.EndedAt = cloneTime(l.EndedAt)
 	c.Operation = cloneOperation(l.Operation)
+
+	if l.Cancelled != nil {
+		cancelled := *l.Cancelled
+		c.Cancelled = &cancelled
+	}
 
 	if l.Rollouts != nil {
 		c.Rollouts = make(map[string]string, len(l.Rollouts))

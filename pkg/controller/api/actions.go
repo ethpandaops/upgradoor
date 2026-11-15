@@ -29,7 +29,7 @@ func (s *Server) actions() map[string]userHandler {
 		"hold":   action(s, validateHostsRequest, sched.Hold),
 		"unhold": action(s, validateHostsRequest, sched.Unhold),
 		"forget": action(s, validateHostsRequest, sched.Forget),
-		// End one open lease that its agent has started, as failed.
+		// Ask for the end of one open lease: it is marked, its host is held.
 		"end-lease": action(s, validateEndLease, sched.EndLease),
 		"pause":     action(s, validateScope(false), sched.Pause),
 		"resume":    action(s, validateScope(false), sched.Resume),

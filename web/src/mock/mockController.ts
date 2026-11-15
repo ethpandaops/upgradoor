@@ -98,22 +98,62 @@ function rolloutGroup(r: Rollout): string {
   return '';
 }
 
+/** The failure reason of a lease that a person ended, and the reason of the hold that ending it sets. */
+const ENDED_BY_OPERATOR = 'ended by operator';
+const HOLD_REASON_ENDED = 'lease ended by operator';
+
+/** The mock agents sync every 30 s; a cancelled lease they hold ends with their next sync. */
+const SYNC_MS = 30_000;
+/** The mock scheduler reconciles every 5 s; a cancelled lease that is verifying ends with the next pass. */
+const RECONCILE_MS = 5_000;
+
+const isOpen = (l: Lease) => !['released', 'failed', 'expired'].includes(l.state);
+
+/** stepFailed: the agent reported a step of the lease failed. */
+function stepFailed(l: Lease): boolean {
+  return list(l.operation?.steps).some(s => s.status === 'failed');
+}
+
+/** endedHoldReason: the reason of a host's controller hold once a lease of the host was ended. */
+function endedHoldReason(held: boolean, reason: string): string {
+  if (!held || reason === '') return HOLD_REASON_ENDED;
+  return reason.includes(HOLD_REASON_ENDED) ? reason : `${reason}; ${HOLD_REASON_ENDED}`;
+}
+
+/** stepsDone: the agent reported every step the lease carries for the rollout done. */
+function stepsDone(l: Lease, rollout: string): boolean {
+  const steps = list(l.operation?.steps);
+  const mine = Object.entries(dict(l.rollouts)).filter(([, id]) => id === rollout);
+  return mine.length > 0 && mine.every(([need]) => steps.find(s => s.needId === need)?.status === 'done');
+}
+
 /**
- * leaseVerdict is what the end of a lease says about its host for a group:
- * released with every step of the group done repairs it, failed breaks it
- * (unless those steps were done and another step failed), anything else
- * (expired, released without the step) says nothing.
+ * leaseVerdict is what the end of a lease says about its host for a group
+ * (the table under "Broken hosts" in docs/scheduler.md): released with every
+ * step of the group done repairs it; failed breaks it, unless the group's
+ * steps were done and another step failed, or a person ended the lease and
+ * by the agent's final report no step of the group is done (with one of
+ * them done something was applied and the host never shown to be back:
+ * broken, whenever the person clicked), or the lease was cancelled and no
+ * step of the group was ever begun; anything else (expired, released
+ * without the step) says nothing.
  */
 function leaseVerdict(l: Lease, group: string): 'repaired' | 'broke' | undefined {
   const mine = list(l.needs).filter(n => needGroup(n) === group);
   if (mine.length === 0) return undefined;
 
   const steps = list(l.operation?.steps);
-  const done = mine.every(n => steps.find(s => s.needId === n.id)?.status === 'done');
+  const status = (n: Need) => steps.find(s => s.needId === n.id)?.status;
+  const done = mine.every(n => status(n) === 'done');
 
   if (l.state === 'released') return done ? 'repaired' : undefined;
-  if (l.state === 'failed') return done && steps.some(s => s.status === 'failed') ? undefined : 'broke';
-  return undefined;
+  if (l.state !== 'failed') return undefined;
+
+  if (done && stepFailed(l)) return undefined;
+  if (mine.some(n => status(n) === 'failed')) return 'broke';
+  if (l.error === ENDED_BY_OPERATOR && !mine.some(n => status(n) === 'done')) return undefined;
+  if (l.cancelled && mine.every(n => status(n) === 'cancelled')) return undefined;
+  return 'broke';
 }
 
 /** succeeded: the rollout has served a member successfully (one is done through a lease). */
@@ -217,6 +257,8 @@ export class MockController {
 
     if (!path.startsWith('/api/v1/')) throw new HttpError(404, `no such route: ${path}`);
     const route = path.slice('/api/v1/'.length);
+
+    this.settleCancelled();
 
     if (method === 'GET') {
       switch (route) {
@@ -936,6 +978,7 @@ export class MockController {
       uptimeSeconds: host.uptimeSeconds + Math.floor((this.now() - this.data.createdAt) / 1000),
       hold: host.hold,
       holdWanted: host.holdWanted,
+      holdReason: host.holdWanted ? host.holdReason : undefined,
       verbs: host.verbs,
       needs: host.needs,
       plan: plan.hosts?.[host.name] ?? host.plan,
@@ -1210,12 +1253,28 @@ export class MockController {
     const rejected: Record<string, string> = {};
     const applied: string[] = [];
 
+    // The hold is part of a cancel: it cannot be lifted while the lease that
+    // a person ended is open. Nothing is changed then.
+    if (action === 'unhold') {
+      for (const host of hosts) {
+        const l = this.data.leases.find(x => x.host === host.name && isOpen(x) && x.cancelled);
+        if (l?.cancelled) {
+          throw new HttpError(
+            409,
+            `scheduler: invalid action: lease ${l.id} of ${host.name} was ended by ${l.cancelled.by} and is still ` +
+              `open (${l.state}); the hold can be lifted once the lease has ended`
+          );
+        }
+      }
+    }
+
     for (const host of hosts) {
       if (action === 'unhold' && host.hold.local && !host.hold.controller && !host.holdWanted) {
         rejected[host.name] = 'only the local hold file is set; it can only be removed on the host';
         continue;
       }
       host.holdWanted = action === 'hold';
+      host.holdReason = action === 'hold' && req.reason ? req.reason : undefined;
       // The mock agent agrees at once.
       host.hold = { ...host.hold, controller: action === 'hold' };
       if (action === 'hold') host.needs = [];
@@ -1256,35 +1315,196 @@ export class MockController {
   }
 
   /**
-   * endLease ends one open lease that its agent has started as failed
-   * ("ended by operator"): the host is failed in the open rollouts the lease
-   * served, those halt, and the host is broken from then on.
+   * endLease is a request to end one open lease (granted, running or
+   * verifying). The lease is marked cancelled and stays open, counted against
+   * the budget and the host limit, until it ends by one of the ordinary ways
+   * (settleCancelled). In the same step the host is put on controller hold; a
+   * hold that is there already stays, and its reason is extended by the
+   * cancel. Ending a lease that is cancelled already changes nothing, unless
+   * its host is not held: then the hold is put back.
    */
   private endLease(req: EndLeaseRequest): ActionResult {
+    if (!req.lease) throw new HttpError(400, 'scheduler: invalid action: no lease named');
+
     const l = this.data.leases.find(x => x.id === req.lease);
     if (!l) throw new HttpError(404, `scheduler: unknown lease: ${req.lease}`);
-    if (['released', 'failed', 'expired'].includes(l.state)) {
-      throw new HttpError(409, `scheduler: invalid action: lease ${l.id} is ${l.state}`);
-    }
-    if (l.state === 'granted') {
-      throw new HttpError(409, `scheduler: invalid action: the agent has not started lease ${l.id}; it ends by itself`);
+    if (!isOpen(l)) throw new HttpError(409, `scheduler: invalid action: lease ${l.id} is ${l.state}`);
+    const host = this.data.hosts.get(l.host);
+
+    if (l.cancelled && (!host || host.holdWanted)) {
+      return {
+        message: `lease ${l.id} of ${l.host} was already ended by ${l.cancelled.by}; it is open until the agent reports`,
+        hosts: [l.host],
+      };
     }
 
+    const detail: Record<string, unknown> = { lease: l.id, state: l.state, reason: req.reason };
+    let message = `lease ${l.id} of ${l.host} is ending`;
+
+    if (l.cancelled) {
+      // Only the hold is missing: it is put back.
+      message = `lease ${l.id} of ${l.host} was already ended by ${l.cancelled.by}`;
+    } else {
+      l.cancelled = { at: this.iso(this.now()), by: this.actor(), state: l.state, reason: req.reason || undefined };
+    }
+
+    // A host that somebody holds already keeps that hold; its reason names
+    // the cancel as well.
+    if (host) {
+      const before = { holdWanted: host.holdWanted, holdReason: host.holdReason ?? '' };
+      const reason = endedHoldReason(before.holdWanted, before.holdReason);
+
+      if (!before.holdWanted || reason !== before.holdReason) {
+        host.holdWanted = true;
+        host.holdReason = reason;
+        // The mock agent agrees at once: a held host reports no needs.
+        host.hold = { ...host.hold, controller: true };
+        host.needs = [];
+        detail.hold = { before, after: { holdWanted: true, holdReason: reason } };
+      }
+
+      message += before.holdWanted ? '; the host stays on hold' : '; the host is on hold';
+    }
+
+    this.log('action.end-lease', l.host, detail);
+
+    return { message, hosts: [l.host] };
+  }
+
+  /**
+   * settleCancelled is the part of the scheduler's pass and of the agents
+   * that the mock plays, before every request: it ends the open leases that a
+   * person has ended, the way the controller ends them.
+   *
+   *  - verifying: at the next pass (RECONCILE_MS after the cancel) the lease
+   *    fails as "ended by operator"; the host is broken, as by any lease that
+   *    fails while it is verified.
+   *  - granted: the agent is no longer offered the lease. With its next sync
+   *    (SYNC_MS after the cancel) it declines it; a silent agent says
+   *    nothing and the lease runs out. Either way it expires, the members
+   *    wait again and nothing halts.
+   *  - running: with its next sync the agent has completed the step in
+   *    progress and reports the operation ended, the steps it never began as
+   *    cancelled. The lease fails as "ended by operator" (or expires, when
+   *    nothing was disrupted). What that says about the host is read off the
+   *    report: a group of which a step is done breaks it, as when the lease
+   *    was verifying; a group of which nothing was done says nothing.
+   *
+   * A running lease of a silent agent stays open: the mock does not play the
+   * leaseTtl of a silent agent.
+   */
+  private settleCancelled(): void {
+    const now = this.now();
+
+    for (const l of this.data.leases) {
+      if (!l.cancelled || !isOpen(l)) continue;
+
+      const since = now - Date.parse(l.cancelled.at);
+      const synced = since >= SYNC_MS && !this.isStale(l.host);
+
+      switch (l.state) {
+        case 'verifying':
+          if (since >= RECONCILE_MS) this.failLease(l, ENDED_BY_OPERATOR);
+          break;
+        case 'granted':
+          if (synced) {
+            l.operation = {
+              leaseId: l.id,
+              phase: 'done',
+              startedAt: this.iso(now),
+              updatedAt: this.iso(now),
+              steps: list(l.needs).map(n => ({ needId: n.id, status: 'refused' })),
+              disrupted: false,
+            };
+            this.expireLease(l, 'nothing was disrupted: every step was superseded or refused');
+          } else if (now >= Date.parse(l.expiresAt)) {
+            this.expireLease(l, 'the agent did not start before the lease expired');
+          }
+          break;
+        case 'running': {
+          if (!synced) break;
+
+          const before = list(l.operation?.steps);
+          const steps = list(l.needs).map(n => {
+            const s = before.find(x => x.needId === n.id);
+            if (s?.status === 'running') return { ...s, status: 'done' as const };
+            if (!s || s.status === 'pending') return { needId: n.id, status: 'cancelled' as const };
+            return s;
+          });
+          const disrupted = (l.operation?.disrupted ?? false) || steps.some(s => s.status === 'done');
+
+          l.operation = {
+            leaseId: l.id,
+            startedAt: l.operation?.startedAt ?? l.grantedAt,
+            phase: 'done',
+            updatedAt: this.iso(now),
+            steps,
+            disrupted,
+          };
+          l.agentDoneAt = this.iso(now);
+
+          if (disrupted) this.failLease(l, ENDED_BY_OPERATOR);
+          else this.expireLease(l, 'nothing was disrupted: every step was superseded or refused');
+          break;
+        }
+      }
+    }
+  }
+
+  /** leaseMembers is the host's member, leased by the lease, in every open rollout the lease served. */
+  private leaseMembers(l: Lease): { rollout: Rollout; member: RolloutHost }[] {
+    const out: { rollout: Rollout; member: RolloutHost }[] = [];
+    for (const rollout of this.openRollouts()) {
+      const member = list(rollout.hosts).find(x => x.host === l.host && x.state === 'leased' && x.leaseId === l.id);
+      if (member) out.push({ rollout, member });
+    }
+    return out;
+  }
+
+  /** expireLease ends a lease that cost no availability; its members wait again and nothing halts. */
+  private expireLease(l: Lease, reason: string): void {
     const now = this.iso(this.now());
-    const reason = 'ended by operator';
-    const before = l.state;
-    l.state = 'failed';
+    const members = this.leaseMembers(l);
+    l.state = 'expired';
+    l.endedAt = now;
+    l.readiness = undefined;
+
+    for (const { member } of members) {
+      member.state = 'pending';
+      member.leaseId = undefined;
+      member.updatedAt = now;
+    }
+
+    this.log('lease.expired', l.host, { lease: l.id, reason }, 'scheduler');
+  }
+
+  /**
+   * failLease ends a lease as failed and halts every open rollout it served,
+   * except rollouts whose own steps are all done while another step failed:
+   * there the member is done, but not through a lease, so it is no success of
+   * the rollout. A lease that a person ended spares none.
+   */
+  private failLease(l: Lease, reason: string): void {
+    const now = this.iso(this.now());
+    const members = this.leaseMembers(l);
     l.error = reason;
+    l.state = 'failed';
     l.endedAt = now;
 
+    const spared = stepFailed(l);
     const halted: string[] = [];
-    for (const r of this.openRollouts()) {
-      const m = list(r.hosts).find(x => x.host === l.host && x.state === 'leased' && x.leaseId === l.id);
-      if (!m) continue;
+
+    for (const { rollout: r, member: m } of members) {
+      m.updatedAt = now;
+
+      if (spared && stepsDone(l, r.id)) {
+        m.state = 'done';
+        m.leaseId = undefined;
+        continue;
+      }
 
       m.state = 'failed';
       m.error = reason;
-      m.updatedAt = now;
       halted.push(r.id);
 
       if (r.state === 'active') {
@@ -1295,15 +1515,7 @@ export class MockController {
       }
     }
 
-    this.log('action.end-lease', l.host, {
-      lease: l.id,
-      before: { state: before },
-      after: { state: l.state },
-      reason: req.reason,
-    });
     this.log('lease.failed', l.host, { lease: l.id, reason, rollouts: halted }, 'scheduler');
-
-    return { message: `lease ${l.id} of ${l.host} ended as failed`, hosts: [l.host] };
   }
 
   private pause(action: 'pause' | 'resume', req: ScopeRequest): ActionResult {

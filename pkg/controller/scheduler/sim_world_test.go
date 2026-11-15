@@ -126,6 +126,23 @@ type simAgent struct {
 	// stepFail is the index of the step of the running operation that fails
 	// while the others succeed; -1 for none.
 	stepFail int
+	// oldBuild: the agent is of a build that knows neither the cancel mark of
+	// a lease nor that a lease it is no longer offered must not be started. It
+	// starts what it holds and finishes what it started.
+	oldBuild bool
+	// prevBuild: the agent knows the cancel mark, but is of the build that
+	// reported the steps it never began as cancelled also when the operation
+	// failed. Agents of the current build report them as after any failure
+	// (pending, not attempted) then. Which agents these are follows from the
+	// host's number, so that no seed draws a different history for it.
+	prevBuild bool
+	// beginAt is, per step of the running operation, when the step begins;
+	// the zero time for a step that is not executed. The steps of an operation
+	// begin one after the other.
+	beginAt []time.Time
+	// cancelled: the agent has taken in that its lease was cancelled. It
+	// begins no further step.
+	cancelled bool
 
 	syncingUntil   time.Time
 	syncingEL      bool
@@ -142,9 +159,25 @@ type simAgent struct {
 	// late names the leases the agent started with a slow clock: possibly
 	// after the controller had expired them.
 	late map[string]bool
+	// begins is every step the agent ever began, in order; cancelSeen is, per
+	// lease, when the agent took in that the lease was cancelled or withdrawn.
+	// An old build takes in neither.
+	begins     []simBegin
+	cancelSeen map[string]time.Time
 
 	lastSync time.Time
 	lastSent *protocol.SyncRequest
+	// reported is, per lease ID, the operation the agent sent to the
+	// controller for the lease, up to the first report that it is over: its
+	// own record of what it said.
+	reported map[string]*protocol.Operation
+}
+
+// simBegin is one step that an agent began: the first disruptive thing it
+// did for the need.
+type simBegin struct {
+	lease, need string
+	at          time.Time
 }
 
 func (a *simAgent) allows(v protocol.Verb) bool { return slices.Contains(a.verbs, v) }
@@ -265,6 +298,10 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 			disrupted:    make(map[string]bool, 8),
 			late:         make(map[string]bool, 2),
 			doneAt:       make(map[string]time.Time, 8),
+			reported:     make(map[string]*protocol.Operation, 8),
+			cancelSeen:   make(map[string]time.Time, 2),
+			oldBuild:     rng.IntN(4) == 0,
+			prevBuild:    i%3 == 1,
 			localHold:    rng.IntN(25) == 0,
 			dead:         rng.IntN(20) == 0,
 			sloppy:       rng.IntN(5) == 0,
@@ -390,8 +427,8 @@ func (w *simWorld) describe() string {
 	var b strings.Builder
 
 	for _, a := range w.agents {
-		fmt.Fprintf(&b, "  %s weight=%d bootnode=%v probes=%v verbs=%v localHold=%v dead=%v sloppy=%v blind=%v:",
-			a.name, a.weight, a.bootnode, a.probes, a.verbs, a.localHold, a.dead, a.sloppy, a.blind)
+		fmt.Fprintf(&b, "  %s weight=%d bootnode=%v probes=%v verbs=%v localHold=%v dead=%v sloppy=%v blind=%v oldBuild=%v prevBuild=%v:",
+			a.name, a.weight, a.bootnode, a.probes, a.verbs, a.localHold, a.dead, a.sloppy, a.blind, a.oldBuild, a.prevBuild)
 
 		for _, c := range a.containers {
 			fmt.Fprintf(&b, " %s=%s(managed=%v custom=%v)", c.name, c.image, c.managed, c.custom)
@@ -709,6 +746,8 @@ func (w *simWorld) work(a *simAgent) {
 		return
 	}
 
+	w.beginSteps(a)
+
 	if !w.now.Before(a.opEnd) {
 		w.finishOperation(a)
 
@@ -788,7 +827,8 @@ func (w *simWorld) stepFor(a *simAgent, n *protocol.Need) protocol.StepStatus {
 	return protocol.StepRunning
 }
 
-// startOperation begins the work on the persisted lease.
+// startOperation begins the work on the persisted lease. Its steps begin one
+// after the other in the first half of the operation; the first begins now.
 func (w *simWorld) startOperation(a *simAgent) {
 	op := &protocol.Operation{
 		LeaseID:   a.lease.ID,
@@ -800,14 +840,20 @@ func (w *simWorld) startOperation(a *simAgent) {
 
 	a.reboot = false
 	a.stepFail = -1
+	a.beginAt = make([]time.Time, len(a.lease.Needs))
+
+	runs := make([]int, 0, len(a.lease.Needs))
 
 	for i := range a.lease.Needs {
 		n := &a.lease.Needs[i]
 		status := w.stepFor(a, n)
 
 		if status == protocol.StepRunning {
+			status = protocol.StepPending
 			op.Disrupted = true
 			a.reboot = a.reboot || n.Kind == protocol.NeedReboot
+
+			runs = append(runs, i)
 		}
 
 		op.Steps = append(op.Steps, protocol.Step{NeedID: n.ID, Status: status})
@@ -831,15 +877,85 @@ func (w *simWorld) startOperation(a *simAgent) {
 	if a.overrun {
 		a.late[op.LeaseID] = true
 	}
+
 	a.opEnd = w.now.Add(time.Duration(4+w.rng.IntN(80)) * time.Second)
 	a.opFail = !w.calm && w.rng.IntN(25) == 0
 
-	// Now and then one step of several fails while the others succeed.
-	if !w.calm && len(op.Steps) > 1 && w.rng.IntN(6) == 0 {
-		if i := w.rng.IntN(len(op.Steps)); op.Steps[i].Status == protocol.StepRunning {
-			a.stepFail = i
-		}
+	// Now and then an operation takes long: longer than any leaseTtl. Its
+	// lease stays open for as long as the agent reports.
+	if !w.calm && w.rng.IntN(12) == 0 {
+		a.opEnd = w.now.Add(time.Duration(330+w.rng.IntN(600)) * time.Second)
 	}
+
+	for k, i := range runs {
+		a.beginAt[i] = w.now.Add(a.opEnd.Sub(w.now) / 2 * time.Duration(k) / time.Duration(len(runs)))
+	}
+
+	// Now and then one step of several fails while the others succeed.
+	if !w.calm && len(runs) > 1 && w.rng.IntN(4) == 0 {
+		a.stepFail = runs[w.rng.IntN(len(runs))]
+	}
+
+	w.beginSteps(a)
+}
+
+// beginSteps begins the steps of the running operation whose time has come.
+// An agent that has taken in the cancel of its lease begins none.
+func (w *simWorld) beginSteps(a *simAgent) {
+	for i := range a.op.Steps {
+		step := &a.op.Steps[i]
+		if step.Status != protocol.StepPending || a.beginAt[i].IsZero() || w.now.Before(a.beginAt[i]) {
+			continue
+		}
+
+		if a.cancelled {
+			continue
+		}
+
+		step.Status = protocol.StepRunning
+		a.op.UpdatedAt = w.now
+		a.begins = append(a.begins, simBegin{lease: a.op.LeaseID, need: step.NeedID, at: w.now})
+	}
+}
+
+// decline ends a lease that the agent has not started and never will: it was
+// cancelled, or the controller no longer offers it. Nothing is touched, and
+// the agent says so.
+func (w *simWorld) decline(a *simAgent) {
+	op := &protocol.Operation{
+		LeaseID:   a.lease.ID,
+		Phase:     protocol.PhaseDone,
+		StartedAt: w.now,
+		UpdatedAt: w.now,
+		Steps:     make([]protocol.Step, 0, len(a.lease.Needs)),
+	}
+
+	for i := range a.lease.Needs {
+		op.Steps = append(op.Steps, protocol.Step{
+			NeedID: a.lease.Needs[i].ID, Status: protocol.StepRefused, Error: "the lease is not to be started",
+		})
+	}
+
+	a.op = op
+	a.cancelSeen[op.LeaseID] = w.now
+}
+
+// cancel lets an agent take in that its lease was cancelled: one that has not
+// started declines it, one that has begins no further step.
+func (w *simWorld) cancel(a *simAgent) {
+	if a.cancelled || (a.op != nil && a.op.Phase.Terminal()) {
+		return
+	}
+
+	a.cancelled = true
+
+	if a.op == nil {
+		w.decline(a)
+
+		return
+	}
+
+	a.cancelSeen[a.op.LeaseID] = w.now
 }
 
 // finishOperation ends the running operation and applies what it did.
@@ -848,6 +964,10 @@ func (w *simWorld) finishOperation(a *simAgent) {
 	op.UpdatedAt = w.now
 	a.down = false
 	w.comeBack(a)
+
+	// A step that had not begun when the agent took in the cancel never
+	// began. How it is reported is settled when the operation's end is known.
+	defer w.reportUnbegun(a, op)
 
 	if a.opFail {
 		// Nothing was changed; the containers are back on what they ran.
@@ -920,6 +1040,31 @@ func (w *simWorld) finishOperation(a *simAgent) {
 
 	if op.Phase == protocol.PhaseDone {
 		a.doneAt[op.LeaseID] = w.now
+	}
+}
+
+// reportUnbegun gives the steps that never began (the agent had taken in the
+// cancel of its lease) their final status, as the agent's build reports it:
+// cancelled when the cancel is what ended the operation; after a failure, as
+// after any failure (pending, not attempted). The build before that one said
+// cancelled in both cases.
+func (w *simWorld) reportUnbegun(a *simAgent, op *protocol.Operation) {
+	failed := op.Phase == protocol.PhaseFailed
+
+	for i := range op.Steps {
+		step := &op.Steps[i]
+		if step.Status != protocol.StepPending || a.beginAt[i].IsZero() {
+			continue
+		}
+
+		if failed && !a.prevBuild {
+			step.Error = "not attempted: " + op.Error
+
+			continue
+		}
+
+		step.Status = protocol.StepCancelled
+		step.Error = "cancelled before it had begun"
 	}
 }
 
@@ -1066,18 +1211,31 @@ func (w *simWorld) respond(a *simAgent, resp *Assignment) {
 	switch {
 	case resp.Lease == nil && busy:
 		// Once started, the agent finishes.
+	case resp.Lease == nil && a.lease != nil && a.op == nil && a.oldBuild:
+		// An old build keeps the lease it holds and starts it in its time.
+	case resp.Lease == nil && a.lease != nil && a.op == nil:
+		// The controller no longer offers the lease and nothing was done for
+		// it: it is not started any more, and the agent says so.
+		w.decline(a)
 	case resp.Lease == nil:
 		// The controller no longer offers the lease: a finished operation is
-		// forgotten, an unstarted lease dropped.
+		// forgotten.
 		a.op = nil
 		a.lease = nil
+		a.cancelled = false
 	case a.lease != nil && a.lease.ID == resp.Lease.ID:
+		if resp.Lease.Cancel && !a.oldBuild {
+			w.cancel(a)
+		}
 	case busy:
+	case resp.Lease.Cancel && !a.oldBuild:
+		// A lease that is offered cancelled is not taken.
 	default:
 		l := *resp.Lease
 		l.Needs = slices.Clone(resp.Lease.Needs)
 		a.lease = &l
 		a.op = nil
+		a.cancelled = false
 		a.deadline = w.now.Add(time.Duration(l.TTLSeconds) * time.Second)
 
 		if l.ExpiresAt.Before(a.deadline) {

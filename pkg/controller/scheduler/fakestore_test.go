@@ -130,6 +130,12 @@ func storedLease(l *fleet.Lease) *fleet.Lease {
 	bare.SyncedUntil = storedAtPtr(bare.SyncedUntil)
 	bare.EndedAt = storedAtPtr(bare.EndedAt)
 
+	if l.Cancelled != nil {
+		c := *l.Cancelled
+		c.At = storedAt(c.At)
+		bare.Cancelled = &c
+	}
+
 	if l.Operation != nil {
 		op := *l.Operation
 		op.StartedAt = storedAt(op.StartedAt)
@@ -294,6 +300,14 @@ func (s *fakeStore) ListHosts(context.Context) ([]*fleet.Host, error) {
 	slices.SortFunc(out, func(a, b *fleet.Host) int { return cmp.Compare(a.Name, b.Name) })
 
 	return out, nil
+}
+
+func (s *fakeStore) GetHost(_ context.Context, name string) (*fleet.Host, error) {
+	if h := s.host(name); h != nil {
+		return h, nil
+	}
+
+	return nil, store.ErrNotFound
 }
 
 func (s *fakeStore) SetHostHold(_ context.Context, name string, wanted bool, reason string) error {
@@ -477,6 +491,18 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 
 	if err := s.writable(); err != nil {
 		return err
+	}
+
+	// All or nothing, like the transaction of the SQLite store.
+	for _, hold := range ch.Holds {
+		if s.hosts[hold.Host] == nil {
+			return store.ErrNotFound
+		}
+	}
+
+	for _, hold := range ch.Holds {
+		s.hosts[hold.Host].HoldWanted = hold.Wanted
+		s.hosts[hold.Host].HoldReason = hold.Reason
 	}
 
 	for _, r := range ch.Rollouts {

@@ -94,7 +94,7 @@ func (b *worldBuilder) host(name string, weight uint64, roles ...string) *fleet.
 	h := &fleet.Host{
 		Name:      name,
 		Roles:     roles,
-		FirstSeen: b.w.Now.Add(-24 * time.Hour),
+		FirstSeen: b.w.Now.Add(-30 * 24 * time.Hour),
 		LastSeen:  b.w.Now,
 		Status:    &protocol.SyncRequest{Verbs: slices.Clone(allVerbs)},
 	}
@@ -244,6 +244,18 @@ func applyOutcome(w *World, out *Outcome) {
 		} else {
 			delete(w.ClosedLeases, l.ID)
 			w.Leases = append(w.Leases, l)
+		}
+	}
+
+	// As the store does: a hold of the outcome sets the host's switch. The
+	// host is replaced, not changed: the pass may still read the old one.
+	for _, hold := range out.Holds {
+		for i, h := range w.Hosts {
+			if h.Name == hold.Host {
+				c := *h
+				c.HoldWanted, c.HoldReason = hold.Wanted, hold.Reason
+				w.Hosts[i] = &c
+			}
 		}
 	}
 

@@ -27,8 +27,11 @@ ensure-web: web/dist/index.html
 
 test: test-go test-web
 
+# The tick cost test compares times and is skipped under the race detector;
+# it runs once without it.
 test-go:
 	go test -race -timeout 10m ./...
+	go test -timeout 10m -run '^TestTickCost' ./pkg/controller/scheduler/
 
 test-web:
 	cd web && npm ci && npm run typecheck && npm test

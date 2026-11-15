@@ -15,9 +15,10 @@ function stepLabel(needs: readonly Need[], needId: string): string {
 /**
  * LeaseTable lists leases with the agent's phase, the per-need steps and the
  * controller's readiness note. `closed` switches the time columns to the
- * history form (ended, duration). With `onEnd` every open lease that its
- * agent has started gets a button to end it; a lease that is only granted
- * ends by itself and cannot be ended.
+ * history form (ended, duration). With `onEnd` every open lease gets a
+ * button to end it. An open lease that a person has ended already says so
+ * ("ending (cancelled by <actor>)") and its button is disabled: it stays open
+ * until the agent reports or the lease expires.
  */
 export function LeaseTable({
   leases,
@@ -57,6 +58,7 @@ export function LeaseTable({
           const needs = list(l.needs);
           const steps = list(l.operation?.steps);
           const took = secondsBetween(l.grantedAt, l.endedAt);
+          const ending = l.cancelled !== undefined && ['granted', 'running', 'verifying'].includes(l.state);
 
           return (
             <tr key={l.id} className="hover:bg-surface-hover">
@@ -68,6 +70,7 @@ export function LeaseTable({
                 <span className="inline-flex items-center gap-1">
                   <LeaseStateBadge state={l.state} />
                   {l.force && <Badge tone="warning">force</Badge>}
+                  {ending && <span className="text-muted">ending (cancelled by {l.cancelled?.by})</span>}
                 </span>
               </Td>
               <Td>{l.operation ? <span className="font-mono">{l.operation.phase}</span> : <Dash />}</Td>
@@ -120,11 +123,11 @@ export function LeaseTable({
                   <Button
                     dense
                     variant="danger"
-                    disabled={l.state !== 'running' && l.state !== 'verifying'}
+                    disabled={ending}
                     title={
-                      l.state === 'granted'
-                        ? 'The agent has not started this lease; it ends by itself.'
-                        : 'End this lease as failed'
+                      ending
+                        ? 'This lease is ending: it stays open until the agent reports or the lease expires.'
+                        : 'End this lease: the agent stops after the step in progress and the host is put on hold'
                     }
                     onClick={() => {
                       onEnd(l);

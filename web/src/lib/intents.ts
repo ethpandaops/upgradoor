@@ -44,7 +44,10 @@ export function hostsIntent(
   };
 }
 
-/** endLeaseIntent ends one open lease that its agent has started, as failed. */
+/**
+ * endLeaseIntent asks to end one open lease (granted, running or verifying):
+ * the agent stops after the step in progress and the host is put on hold.
+ */
 export function endLeaseIntent(lease: string, host: string): ActionIntent {
   return {
     kind: 'call',

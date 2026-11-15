@@ -309,20 +309,24 @@ func (s *sqliteStore) SetHostHold(
 	ctx context.Context, name string, wanted bool, reason string,
 ) error {
 	err := s.write(ctx, func(tx *sql.Tx) error {
-		res, err := tx.ExecContext(ctx,
-			`UPDATE hosts SET hold_wanted = ?, hold_reason = ? WHERE name = ?`,
-			wanted, reason, name)
-		if err != nil {
-			return err
-		}
-
-		return requireRow(res)
+		return setHostHold(ctx, tx, name, wanted, reason)
 	})
 	if err != nil {
 		return fmt.Errorf("store: set hold of %s: %w", name, err)
 	}
 
 	return nil
+}
+
+func setHostHold(ctx context.Context, tx *sql.Tx, name string, wanted bool, reason string) error {
+	res, err := tx.ExecContext(ctx,
+		`UPDATE hosts SET hold_wanted = ?, hold_reason = ? WHERE name = ?`,
+		wanted, reason, name)
+	if err != nil {
+		return err
+	}
+
+	return requireRow(res)
 }
 
 // DeleteHost removes a host with its inventory, packages, upgradable, needs

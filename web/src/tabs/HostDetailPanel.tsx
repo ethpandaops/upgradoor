@@ -121,10 +121,13 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
               {h.hold.local && (
                 <Badge tone="warning">local hold file{h.hold.localReason ? `: ${h.hold.localReason}` : ''}</Badge>
               )}{' '}
-              {h.hold.controller && <Badge tone="warning">controller hold</Badge>}{' '}
+              {h.hold.controller && (
+                <Badge tone="warning">controller hold{h.holdWanted && h.holdReason ? `: ${h.holdReason}` : ''}</Badge>
+              )}{' '}
               {h.holdWanted !== h.hold.controller && (
                 <span className="text-muted">
-                  ({h.holdWanted ? 'hold' : 'release'} requested, waiting for the agent)
+                  ({h.holdWanted ? `hold requested${h.holdReason ? `: ${h.holdReason}` : ''}` : 'release requested'},
+                  waiting for the agent)
                 </span>
               )}
             </Fact>

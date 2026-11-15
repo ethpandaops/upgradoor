@@ -87,7 +87,7 @@ func (h *harness) refreshHealth() {
 // addHost stores a host that synced now with the given needs.
 func (h *harness) addHost(name string, weight uint64, needs ...protocol.Need) *fleet.Host {
 	host := &fleet.Host{
-		Name: name, FirstSeen: h.now, LastSeen: h.now,
+		Name: name, FirstSeen: h.now.Add(-30 * 24 * time.Hour), LastSeen: h.now,
 		Status: &protocol.SyncRequest{Verbs: slices.Clone(allVerbs), Needs: needs},
 	}
 

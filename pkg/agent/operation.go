@@ -80,6 +80,10 @@ type operation struct {
 	// failed is true once a step failed; the remaining steps are skipped,
 	// the containers are still brought back.
 	failed bool
+	// cancelled is true once a step was not begun because the lease was
+	// cancelled; the remaining steps are skipped like after a failure, and
+	// the containers are brought back the same way.
+	cancelled bool
 }
 
 // operationPlan is the outcome of validating a lease: what will be done and
@@ -145,13 +149,34 @@ func (o *operation) run(ctx context.Context) {
 // offering before the agent had begun.
 const reasonWithdrawn = "the controller no longer offered the lease before the operation started"
 
+// reasonCancelled is why a lease is not started that a person ended before
+// the agent had begun, and the note on the steps of a started operation that
+// were not begun for the same reason.
+const (
+	reasonCancelled     = "the lease was cancelled before the operation started"
+	reasonStepCancelled = "cancelled: the lease was ended before this step had begun"
+)
+
+// revoked returns why a lease that has not started must not be started any
+// more, or "".
+func (r *operationRecord) revoked() string {
+	switch {
+	case r.Cancelled:
+		return reasonCancelled
+	case r.Withdrawn:
+		return reasonWithdrawn
+	default:
+		return ""
+	}
+}
+
 // begin decides whether to act on a freshly persisted lease and, if so,
 // executes it.
 func (o *operation) begin(ctx context.Context, st *persistedState) error {
 	rec := st.Current
 
-	if rec.Withdrawn {
-		return o.decline(protocol.PhaseDone, protocol.StepRefused, reasonWithdrawn)
+	if reason := rec.revoked(); reason != "" {
+		return o.decline(protocol.PhaseDone, protocol.StepRefused, reason)
 	}
 
 	if !o.now().Before(rec.Deadline) {
@@ -202,9 +227,9 @@ func (o *operation) begin(ctx context.Context, st *persistedState) error {
 		first = protocol.PhaseDraining
 	}
 
-	// The start and the withdrawal of a lease exclude each other: whichever
-	// is written first stands.
-	withdrawn := false
+	// The start of a lease excludes its withdrawal and its cancellation:
+	// whichever is written first stands.
+	revoked := ""
 
 	err = o.store.Update(func(st *persistedState) {
 		cur := st.Current
@@ -212,9 +237,7 @@ func (o *operation) begin(ctx context.Context, st *persistedState) error {
 			return
 		}
 
-		if cur.Withdrawn {
-			withdrawn = true
-
+		if revoked = cur.revoked(); revoked != "" {
 			return
 		}
 
@@ -242,8 +265,8 @@ func (o *operation) begin(ctx context.Context, st *persistedState) error {
 		return nil
 	}
 
-	if withdrawn {
-		return o.decline(protocol.PhaseDone, protocol.StepRefused, reasonWithdrawn)
+	if revoked != "" {
+		return o.decline(protocol.PhaseDone, protocol.StepRefused, revoked)
 	}
 
 	o.notify()
@@ -559,6 +582,13 @@ func (o *operation) planImage(
 // bounded by its own timeout. The agent's Stop waits for them. Only what
 // follows can be interrupted, because the state file says how to go on:
 // waiting for the reboot and the waits of starting and verifying.
+//
+// A cancelled lease (Lease.Cancel) is the one thing that stops a started
+// operation short: every disruptive call (the stop of a container ahead of a
+// reboot, the package upgrade, a recreate, the reboot) first asks proceed,
+// and once that says no, nothing further is begun. What was begun is
+// completed, and bringBack runs as after a failed step: the containers that
+// ran before the operation are started again.
 func (o *operation) execute(ctx context.Context, plan *operationPlan) error {
 	work := context.WithoutCancel(ctx)
 
@@ -569,7 +599,7 @@ func (o *operation) execute(ctx context.Context, plan *operationPlan) error {
 	o.applyPackages(work, plan)
 	o.applyImages(work, plan)
 
-	if len(plan.reboot) > 0 && !o.failed {
+	if len(plan.reboot) > 0 && !o.stopped() {
 		if o.reboot(work, plan) {
 			if err := o.awaitReboot(ctx, plan.reboot); err != nil {
 				return err
@@ -585,6 +615,10 @@ func (o *operation) execute(ctx context.Context, plan *operationPlan) error {
 func (o *operation) resume(ctx context.Context, rec *operationRecord) error {
 	phase := rec.Operation.Phase
 	o.failed = rec.Operation.Error != ""
+	// A cancel that the process before this one took in still holds: the
+	// steps it kept from beginning were not begun because of it, and are
+	// reported as cancelled (finish).
+	o.cancelled = rec.Cancelled
 
 	o.log.WithField("phase", phase).Info("resuming operation from the state file")
 
@@ -627,7 +661,13 @@ func (o *operation) drain(ctx context.Context, plan *operationPlan) {
 	o.setPhase(protocol.PhaseDraining)
 
 	for _, name := range o.ordered(plan.wasRunning, drainOrder) {
-		o.markDisrupted()
+		if !o.proceed(nil) {
+			return
+		}
+
+		if !o.markDisrupted(ctx, plan.reboot) {
+			return
+		}
 
 		timeout := o.stopTimeout(name)
 		log := o.log.WithFields(logrus.Fields{logContainer: name, "timeout": timeout})
@@ -657,14 +697,17 @@ func (o *operation) drain(ctx context.Context, plan *operationPlan) {
 // applyPackages upgrades the granted blocked packages. ctx is the
 // uninterruptible context of execute.
 func (o *operation) applyPackages(ctx context.Context, plan *operationPlan) {
-	if o.failed || len(plan.packageIDs) == 0 {
+	if o.stopped() || len(plan.packageIDs) == 0 || !o.proceed(plan.packageIDs) {
 		return
 	}
 
 	o.setPhase(protocol.PhaseApplying)
-	o.setSteps(plan.packageIDs, protocol.StepRunning, "")
+
 	// Upgrading Docker restarts the daemon and with it every container.
-	o.markDisrupted()
+	if !o.markDisrupted(ctx, plan.packageIDs) {
+		return
+	}
+
 	o.touch(plan.wasRunning)
 
 	o.log.WithField("packages", plan.packages).Info("upgrading packages")
@@ -693,12 +736,12 @@ func (o *operation) applyImages(ctx context.Context, plan *operationPlan) {
 		return
 	}
 
-	if !o.failed {
+	if !o.stopped() {
 		o.setPhase(protocol.PhaseApplying)
 	}
 
 	for i := range plan.images {
-		if o.failed {
+		if o.stopped() {
 			break
 		}
 
@@ -738,8 +781,13 @@ func (o *operation) recreate(ctx context.Context, plan *operationPlan, task *ima
 	start := len(plan.reboot) == 0 && slices.Contains(plan.wasRunning, name)
 	timeout := o.stopTimeout(name)
 
-	o.setSteps(task.ids, protocol.StepRunning, "")
-	o.markDisrupted()
+	if !o.proceed(task.ids) {
+		return
+	}
+
+	if !o.markDisrupted(ctx, task.ids) {
+		return
+	}
 
 	log.WithField("start", start).Info("recreating container")
 
@@ -808,12 +856,20 @@ func (o *operation) digestMismatch(
 // boot. ctx is the uninterruptible context of execute: stopping the agent
 // between the drain and the reboot would leave the host drained for nothing.
 func (o *operation) reboot(ctx context.Context, plan *operationPlan) bool {
-	var err error
+	var (
+		err       error
+		cancelled bool
+	)
 
 	for range persistAttempts {
 		err = o.store.Update(func(st *persistedState) {
 			cur := st.Current
 			if cur == nil {
+				return
+			}
+
+			// The reboot has not begun: a cancel wins.
+			if cancelled = cur.Cancelled; cancelled {
 				return
 			}
 
@@ -831,6 +887,12 @@ func (o *operation) reboot(ctx context.Context, plan *operationPlan) bool {
 		}
 
 		sleep(ctx, o.poll)
+	}
+
+	if cancelled {
+		o.stop()
+
+		return false
 	}
 
 	if err != nil {
@@ -1092,12 +1154,21 @@ func (o *operation) finish() {
 		cur := st.Current
 		cur.Operation.Phase = phase
 
-		if cur.Operation.Phase == protocol.PhaseFailed {
-			for i := range cur.Operation.Steps {
-				s := &cur.Operation.Steps[i]
-				if s.Status == protocol.StepPending && s.Error == "" {
-					s.Error = "not attempted: " + cur.Operation.Error
-				}
+		for i := range cur.Operation.Steps {
+			s := &cur.Operation.Steps[i]
+
+			switch {
+			case s.Status != protocol.StepPending:
+			case o.cancelled && !o.failed:
+				// Not begun because the lease was cancelled, and nothing
+				// failed. After a failure the steps that were not begun are
+				// reported as after any failure, whether or not a cancel
+				// arrived as well and whichever process of the agent finishes
+				// the operation: the report must not depend on a restart.
+				s.Status = protocol.StepCancelled
+				s.Error = reasonStepCancelled
+			case phase == protocol.PhaseFailed && s.Error == "":
+				s.Error = "not attempted: " + cur.Operation.Error
 			}
 		}
 
@@ -1115,9 +1186,12 @@ func (o *operation) finish() {
 		"took":      o.now().Sub(rec.Operation.StartedAt).Round(time.Second),
 	})
 
-	if o.failed {
+	switch {
+	case o.failed:
 		log.WithField("error", rec.Operation.Error).Error("operation failed")
-	} else {
+	case o.cancelled:
+		log.Warn("operation ended: the lease was cancelled, the remaining steps were not begun")
+	default:
 		log.Info("operation done")
 	}
 
@@ -1194,6 +1268,50 @@ func markSteps(rec *operationRecord, ids []string, status protocol.StepStatus, r
 	}
 }
 
+// stopped reports whether no further step is to be begun: one failed, or the
+// lease was cancelled.
+func (o *operation) stopped() bool { return o.failed || o.cancelled }
+
+// stop records that the lease was cancelled before a step had begun.
+func (o *operation) stop() {
+	if !o.cancelled {
+		o.cancelled = true
+
+		o.log.Warn("the lease was cancelled: beginning no further step, bringing the host back")
+	}
+}
+
+// proceed is asked right before every disruptive call. It reports whether the
+// call may be made, and in the same critical section of the state store marks
+// the steps it begins as running: a cancel that the sync loop writes
+// (service.cancelLease) either comes first, and the step is never begun, or
+// comes after, and the step counts as begun and is completed. ids are the
+// steps the call begins; none for the stop of a container ahead of a reboot,
+// which belongs to no step of its own.
+func (o *operation) proceed(ids []string) bool {
+	if o.cancelled {
+		return false
+	}
+
+	ok := false
+
+	o.apply(func(st *persistedState) {
+		if st.Current.Cancelled {
+			return
+		}
+
+		ok = true
+
+		markSteps(st.Current, ids, protocol.StepRunning, "")
+	})
+
+	if !ok {
+		o.stop()
+	}
+
+	return ok
+}
+
 // fail records the first failure of the operation.
 func (o *operation) fail(reason string) {
 	o.failed = true
@@ -1207,12 +1325,51 @@ func (o *operation) fail(reason string) {
 	})
 }
 
-func (o *operation) markDisrupted() {
+// markDisrupted is called right before the first call that stops something,
+// and reports whether that call may be made: only with the mark on disk.
+// Unlike the rest of an operation's progress (apply), this one write is not
+// kept in memory when it fails. If the process died after the call, the next
+// one would find in the state file an operation that stopped nothing: it
+// fails it (killed in draining or applying, see resume) and then skips the
+// bring-back, which runs only for an operation that disrupted something, so
+// the containers that were stopped would stay down; and its report would say
+// that nothing was disrupted, which the controller reads as "the lease cost
+// nothing". So nothing disruptive happens without the mark on disk: when it
+// cannot be written, the steps the call would have begun fail, before
+// anything is touched. ids are those steps.
+func (o *operation) markDisrupted(ctx context.Context, ids []string) bool {
 	if o.disrupted() {
-		return
+		return true
 	}
 
-	o.apply(func(st *persistedState) { st.Current.Operation.Disrupted = true })
+	var err error
+
+	for attempt := range persistAttempts {
+		if attempt > 0 {
+			sleep(ctx, o.poll)
+		}
+
+		err = o.store.Update(func(st *persistedState) {
+			if st.Current != nil {
+				st.Current.Operation.Disrupted = true
+				st.Current.Operation.UpdatedAt = o.now()
+			}
+		})
+		if err == nil {
+			return true
+		}
+	}
+
+	// The error names a temporary file, a different one each time: it goes to
+	// the log, not into the report.
+	o.log.WithError(err).Error("cannot persist the state before the first disruptive call")
+
+	const msg = "cannot write the state file before the first disruptive call; nothing was touched"
+
+	o.fail(msg)
+	o.setSteps(ids, protocol.StepFailed, msg)
+
+	return false
 }
 
 func (o *operation) clearDisrupted() {

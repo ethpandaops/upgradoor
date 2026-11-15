@@ -7,6 +7,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -157,6 +158,27 @@ func percent(v float64) string {
 	return strconv.FormatFloat(math.Floor(v*10+budgetEpsilon)/10, 'f', -1, 64) + "%"
 }
 
+// fallbackEpoch is the epoch length the age of the beacon view is measured in
+// when the view's own timing places no epoch at all: 32 slots of 12 s.
+const fallbackEpoch = 32 * 12 * time.Second
+
+// viewStaleAfter is how old the beacon view may be before the node counts as
+// unreachable: two epochs. While the current epoch cannot be placed, the
+// epochs of the last phase that can be worked with are taken, and
+// fallbackEpoch when there is none.
+func viewStaleAfter(n *fleet.NetworkHealth) time.Duration {
+	epoch := n.EpochDuration()
+	if epoch <= 0 {
+		epoch = n.LastEpochDuration()
+	}
+
+	if epoch <= 0 {
+		epoch = fallbackEpoch
+	}
+
+	return 2 * epoch
+}
+
 // gate evaluates the network gate.
 func (p *pass) gate() Gate {
 	g := Gate{Network: p.w.Health, Reasons: []string{}}
@@ -164,11 +186,15 @@ func (p *pass) gate() Gate {
 	epoch := n.EpochDuration()
 
 	switch {
+	case n.UpdatedAt.IsZero() || p.now.Sub(n.UpdatedAt) > viewStaleAfter(n):
+		// A node that does not answer is unreachable, whatever it said about
+		// its timing while it still answered.
+		g.Reasons = append(g.Reasons, gateBeacon)
 	case n.TimingError != "":
 		// The node answers, but what it says about slots and epochs cannot be
 		// worked with: that is not a node that is unreachable.
 		g.Reasons = append(g.Reasons, gateTimingPrefix+n.TimingError)
-	case n.UpdatedAt.IsZero() || epoch <= 0 || p.now.Sub(n.UpdatedAt) > 2*epoch:
+	case epoch <= 0:
 		g.Reasons = append(g.Reasons, gateBeacon)
 	}
 

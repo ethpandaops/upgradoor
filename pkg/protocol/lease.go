@@ -10,7 +10,11 @@ import "time"
 //   - Do not start a lease whose deadline has passed. The deadline is the
 //     earlier of ExpiresAt and (time of first receipt + TTLSeconds), which
 //     tolerates clock skew in either direction.
-//   - Once started, finish, whatever happens to the lease afterwards.
+//   - Once started, finish, whatever happens to the lease afterwards, with one
+//     exception: a lease that is restated with Cancel set. The agent then
+//     begins no further step, completes the step in progress, brings the
+//     containers back and reports the remaining steps as cancelled. A lease
+//     that it has not started is never started.
 //   - Validate every need locally (verb allowed, no hold, container managed
 //     and not custom, tag unchanged, pulled digest equals ToDigest, package in
 //     the configured blocked set). The lease grants a slot; it cannot widen
@@ -23,6 +27,10 @@ type Lease struct {
 	TTLSeconds int64 `json:"ttlSeconds"`
 	// Needs are the granted needs: copies of needs the agent reported.
 	Needs []Need `json:"needs"`
+	// Cancel is set while a person has ended the lease and it is still open.
+	// It is restated with the lease on every sync. An agent that does not
+	// know the field finishes its operation.
+	Cancel bool `json:"cancel,omitempty"`
 }
 
 // Phase is the phase of an operation.
@@ -59,6 +67,9 @@ const (
 	// StepRefused: local policy forbids the need (verb not allowed, hold,
 	// unmanaged container). Nothing was disrupted for it.
 	StepRefused StepStatus = "refused"
+	// StepCancelled: the lease was cancelled (Lease.Cancel) before the step
+	// had begun. Nothing was disrupted for it and it is not a failure.
+	StepCancelled StepStatus = "cancelled"
 )
 
 // Step is the per-need result inside an operation.

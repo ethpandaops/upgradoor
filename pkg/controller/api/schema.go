@@ -140,8 +140,12 @@ type HostSummary struct {
 	UptimeSeconds int64                `json:"uptimeSeconds"`
 	Hold          protocol.Hold        `json:"hold"`
 	HoldWanted    bool                 `json:"holdWanted"`
-	Verbs         []protocol.Verb      `json:"verbs"`
-	Needs         []protocol.Need      `json:"needs"`
+	// HoldReason is the reason of the controller hold (HoldWanted): what the
+	// person gave, or that a lease of the host was ended. It is for the
+	// authenticated views only.
+	HoldReason string          `json:"holdReason,omitempty"`
+	Verbs      []protocol.Verb `json:"verbs"`
+	Needs      []protocol.Need `json:"needs"`
 
 	// Plan is the scheduler's view: slot state, attesting validators and
 	// waiting reason.

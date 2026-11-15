@@ -36,6 +36,10 @@ type pinned struct {
 	ids  int
 	// digest is the digest the open rollout rolls to.
 	digest string
+	// said is, per lease ID, what the agent reported when it differs from
+	// what the history writes on the lease row. Without an entry the agent
+	// said what the row says: the histories are written from the rows.
+	said map[string]*protocol.Operation
 }
 
 func newPinned(t *testing.T) *pinned {
@@ -269,6 +273,23 @@ func (p *pinned) observe() error {
 
 	for _, l := range p.snap.leases {
 		snap.leases = append(snap.leases, cloneLease(l))
+
+		// The agent's own record of what it reported for the lease.
+		host := p.f.hosts[l.Host]
+		if host == nil {
+			continue
+		}
+
+		if host.reported == nil {
+			host.reported = make(map[string]*protocol.Operation, 2)
+		}
+
+		switch said, differs := p.said[l.ID]; {
+		case differs:
+			host.reported[l.ID] = said
+		case l.Operation != nil:
+			host.reported[l.ID] = cloneOperation(l.Operation)
+		}
 	}
 
 	err := p.o.observe(p.f, snap)
@@ -678,36 +699,230 @@ func TestOracleAcceptsRowsOfAnEarlierBuild(t *testing.T) {
 	p.ok()
 }
 
+// cancel lets a person end the host's lease, as the scheduler writes it: the
+// lease stays as it is, the host is held. The person notes the state.
+func (p *pinned) cancel(host string) *fleet.Lease {
+	l := p.lease(host)
+
+	if p.f.cancelled == nil {
+		p.f.cancelled = make(map[string]fleet.LeaseState, 1)
+	}
+
+	p.f.cancelled[l.ID] = l.State
+	p.f.hosts[host].holdWanted = true
+
+	return l
+}
+
+// reports makes the host's last sync carry an operation for its lease.
+func (p *pinned) reports(l *fleet.Lease, phase protocol.Phase, status protocol.StepStatus) *protocol.Operation {
+	op := &protocol.Operation{
+		LeaseID: l.ID, Phase: phase, Disrupted: true,
+		Steps: []protocol.Step{{NeedID: l.Needs[0].ID, Status: status}},
+	}
+	p.f.hosts[l.Host].status.Operation = op
+	p.f.hosts[l.Host].disrupted[l.ID] = true
+
+	return op
+}
+
+// stopped ends a cancelled lease as the scheduler does when the agent
+// reports that it stopped: failed, ended by operator, with the report.
+func (p *pinned) stopped(l *fleet.Lease, status protocol.StepStatus) {
+	l.Operation = cloneOperation(p.reports(l, protocol.PhaseDone, status))
+	l.State, l.Error = fleet.LeaseFailed, oracleEndedByOperator
+}
+
 func TestOracleAcceptsALeaseEndedByAPerson(t *testing.T) {
 	// v1 is out for the rollout of digest A, which a person aborts. The next
 	// rollout waits for that lease, for as long as the agent takes. A person
-	// ends the lease: v1 is broken and goes first, and nobody waits for a
-	// lease any more.
+	// ends the lease: it stays open, v1 is held, and the others go on waiting
+	// until the agent has stopped. Then nobody waits for a lease any more, nor
+	// for v1: it is held, and the cancel did not break it.
 	p := newPinned(t)
 	l := p.grant("v1")
+	p.ok()
+	l.State = fleet.LeaseRunning
+	p.reports(l, protocol.PhaseApplying, protocol.StepRunning)
 	p.ok()
 	p.rollout().State = fleet.RolloutAborted
 	p.ok()
 
-	next := p.successor()
+	p.successor()
 
 	for range 2 * simStuckPasses {
 		p.reconciled()
 	}
 
-	l.State, l.Error = fleet.LeaseFailed, oracleEndedByOperator
-	p.f.hosts["v1"].disrupted[l.ID] = true
+	p.cancel("v1")
 	p.ok()
 
-	p.broken(next, "v1")
+	for range 2 * simStuckPasses {
+		p.reconciled()
+	}
+
+	p.stopped(l, protocol.StepCancelled)
 	p.reconciled()
+
+	p.grant("v2")
+	p.ok()
+	p.release("v2")
+	p.ok()
+	p.grant("v3")
+	p.grant("n1")
+	p.ok()
+}
+
+func TestOracleAcceptsALeaseEndedWhileItWasVerified(t *testing.T) {
+	// The operation was complete when a person ended the lease: what the
+	// cancel cut short is the wait for readiness. The host is broken, as by
+	// any lease that fails while it is verified.
+	p := newPinned(t)
 	p.grant("v1")
 	p.ok()
-	p.release("v1")
+
+	l := p.verifying("v1")
+	p.cancel("v1")
 	p.ok()
+
+	l.State, l.Error = fleet.LeaseFailed, oracleEndedByOperator
+	p.rollout().Host("v1").State = fleet.HostFailed
+	p.rollout().State = fleet.RolloutHalted
+	p.ok()
+
+	p.successor("v1")
+}
+
+func TestOracleAcceptsALeaseEndedAtWorkWithItsStepsDone(t *testing.T) {
+	// The person ended the lease while the agent worked, and the agent
+	// finished the step all the same (the last step, or an agent that does not
+	// know the cancel). The change was applied and the host was never shown
+	// to be back: it is broken, exactly as if the click had come a moment
+	// later, while the lease was verified.
+	p := newPinned(t)
+	l := p.grant("v1")
+	p.ok()
+	l.State = fleet.LeaseRunning
+	p.reports(l, protocol.PhaseApplying, protocol.StepRunning)
+	p.cancel("v1")
+	p.ok()
+
+	p.stopped(l, protocol.StepDone)
+	p.rollout().Host("v1").State = fleet.HostFailed
+	p.rollout().State = fleet.RolloutHalted
+	p.ok()
+
+	p.successor("v1")
+}
+
+func TestOracleAcceptsAFailedLeaseTakenUpAgain(t *testing.T) {
+	// The agent was silent for longer than leaseTtl and the lease failed. It
+	// comes back with the operation: the lease is open again, and what its
+	// failure said about the host is taken back. Released, the host is in
+	// order.
+	p := newPinned(t)
+	l := p.grant("v1")
+	p.ok()
+	l.State = fleet.LeaseRunning
+	l.Operation = cloneOperation(p.reports(l, protocol.PhaseApplying, protocol.StepRunning))
+	p.ok()
+
+	p.f.since = p.f.now.Add(-time.Hour)
+	p.f.hosts["v1"].lastSync = p.f.now.Add(-2 * time.Hour)
+	l.State, l.Error = fleet.LeaseFailed, reasonAgentSilent
+	p.rollout().Host("v1").State = fleet.HostFailed
+	p.rollout().State = fleet.RolloutHalted
+	p.reconciled()
+
+	// Still the sync from before: nothing to take up.
+	p.reconciled()
+
+	p.f.now = p.f.now.Add(time.Minute)
+	p.f.health.UpdatedAt = p.f.now
+	p.f.hosts["v1"].lastSync = p.f.now
+
+	for _, h := range p.f.hosts {
+		h.lastSync = p.f.now
+	}
+
+	l.State, l.Error = fleet.LeaseRunning, ""
+	p.rollout().Host("v1").State = fleet.HostLeased
+	p.reconciled()
+
+	// A second rollout of the same reference does not find v1 broken while
+	// its lease is open again.
+	next := p.follow()
+	p.reconciled()
+	require.NotEqual(t, fleet.StageRepair, next.Host("v1").Stage)
+}
+
+func TestOracleAcceptsACanaryAfterAReopenedLeaseThatServedNoMember(t *testing.T) {
+	// Found by the simulation (seed 8303). The lease of v1 failed as silent.
+	// A person skipped v1 and retried the rollout. Then the agent came back
+	// and finished: the lease was taken up again and released. Its member was
+	// skipped when it was taken up, so the lease served no member and is no
+	// success of the rollout: the rollout still sends a canary first, and the
+	// others wait for it. That wait is the order, not a host left behind.
+	p := newPinned(t)
+	l := p.grant("v1")
+	p.ok()
+	l.State = fleet.LeaseRunning
+	l.Operation = cloneOperation(p.reports(l, protocol.PhaseApplying, protocol.StepRunning))
+	p.ok()
+
+	p.f.since = p.f.now.Add(-time.Hour)
+	p.f.hosts["v1"].lastSync = p.f.now.Add(-2 * time.Hour)
+	l.State, l.Error = fleet.LeaseFailed, reasonAgentSilent
+	p.rollout().Host("v1").State = fleet.HostFailed
+	p.rollout().State = fleet.RolloutHalted
+	p.reconciled()
+
+	// Skipped and retried.
+	p.f.skipped = map[string]map[string]bool{p.rollout().Key: {"v1": true}}
+	m := p.rollout().Host("v1")
+	m.State, m.Error = fleet.HostSkipped, skippedPrefix
+	p.rollout().State = fleet.RolloutActive
+	p.f.retried = []string{p.rollout().ID}
+	p.ok()
+
+	// The agent is back and done; the lease is taken up again and released.
+	p.f.now = p.f.now.Add(time.Minute)
+	p.f.health.UpdatedAt = p.f.now
+
+	for _, h := range p.f.hosts {
+		h.lastSync = p.f.now
+	}
+
+	l.State, l.Error = fleet.LeaseRunning, ""
+	p.reconciled()
+
+	l.Operation = nil
+	p.done("v1")
+	l.State = fleet.LeaseVerifying
+	p.reconciled()
+
+	p.f.hosts["v1"].lastSync = p.f.now
+	l.State = fleet.LeaseReleased
+	p.reconciled()
+	require.Equal(t, fleet.HostSkipped, p.rollout().Host("v1").State)
+
+	// The canary goes, alone, for as long as it takes.
 	p.grant("v2")
-	p.grant("v3")
 	p.ok()
+
+	for range 2 * simStuckPasses {
+		p.reconciled()
+	}
+}
+
+func TestOracleAcceptsAForgottenHostThatReturns(t *testing.T) {
+	// v1 failed and is broken. A person forgets the host; the host that
+	// returns under the name is a new one.
+	p := newPinned(t)
+	p.breakIn("v1")
+	p.o.forget("v1")
+	p.successor()
+	p.reconciled()
 }
 
 func TestOracleAcceptsLeasesThatSayNothing(t *testing.T) {
@@ -1069,19 +1284,245 @@ func TestOracleRejectsBadHistories(t *testing.T) {
 			want: "member v2 of rollout r1 (image:" + imgGeth + "@" + digestA + ") is in stage 1",
 		},
 		{
-			name: "ended by a person: the host is not first afterwards",
+			name: "ended by a person: the lease fails while its agent still works",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				l.State = fleet.LeaseRunning
+				p.reports(l, protocol.PhaseApplying, protocol.StepRunning)
+				p.cancel("v1")
+
+				l.State, l.Error = fleet.LeaseFailed, oracleEndedByOperator
+			},
+			want: `lease l1 of v1 failed as "ended by operator" while its agent reports the operation in phase applying`,
+		},
+		{
+			name: "ended by a person: the host is not held",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+				p.cancel("v1")
+				p.f.hosts["v1"].holdWanted = false
+			},
+			want: "lease l1 of v1 was ended by a person, is still open (granted), and its host is not on controller hold",
+		},
+		{
+			name: "ended by a person: the hold is lifted while the lease is open",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				l.State = fleet.LeaseRunning
+				p.reports(l, protocol.PhaseApplying, protocol.StepRunning)
+				p.cancel("v1")
+				p.ok()
+				p.f.hosts["v1"].holdWanted = false
+			},
+			want: "lease l1 of v1 was ended by a person, is still open (running), and its host is not on controller hold",
+		},
+		{
+			name: "ended by a person: the host is not held when the lease has ended",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				p.cancel("v1")
+				p.stopped(l, protocol.StepCancelled)
+				p.f.hosts["v1"].holdWanted = false
+			},
+			want: "lease l1 of v1 was ended by a person and its host is not held",
+		},
+		{
+			name: "ended by a person at work: the host is first afterwards",
 			bad: func(p *pinned) {
 				l := p.grant("v1")
 				p.ok()
 				p.rollout().State = fleet.RolloutAborted
 				p.ok()
-				p.successor()
 
-				l.State, l.Error = fleet.LeaseFailed, oracleEndedByOperator
-				p.f.hosts["v1"].disrupted[l.ID] = true
+				next := p.successor()
+
+				p.cancel("v1")
+				p.ok()
+				p.stopped(l, protocol.StepCancelled)
+				p.broken(next, "v1")
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is in stage 1",
+		},
+		{
+			name: "ended by a person at work, every step done: the host is not first afterwards",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				l.State = fleet.LeaseRunning
+				p.reports(l, protocol.PhaseApplying, protocol.StepRunning)
+				p.cancel("v1")
+				p.ok()
+
+				p.stopped(l, protocol.StepDone)
+				p.rollout().Host("v1").State = fleet.HostFailed
+				p.rollout().State = fleet.RolloutHalted
+				p.ok()
+				p.follow()
 				p.f.fresh = true
 			},
 			want: "member v1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is in stage 3",
+		},
+		{
+			name: "ended by a person at work, every step done: the rollout goes on",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				l.State = fleet.LeaseRunning
+				p.reports(l, protocol.PhaseApplying, protocol.StepRunning)
+				p.cancel("v1")
+				p.ok()
+
+				p.stopped(l, protocol.StepDone)
+				p.rollout().Host("v1").State = fleet.HostDone
+				p.rollout().Host("v1").LeaseID = ""
+			},
+			want: "although lease l1 failed in it and nobody retried it",
+		},
+		{
+			name: "ended while it was verified: the host is not first afterwards",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+
+				l := p.verifying("v1")
+				p.cancel("v1")
+				p.ok()
+
+				l.State, l.Error = fleet.LeaseFailed, oracleEndedByOperator
+				p.rollout().Host("v1").State = fleet.HostFailed
+				p.rollout().State = fleet.RolloutHalted
+				p.ok()
+				p.follow()
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is in stage 3",
+		},
+		{
+			name: "the row of an ended lease does not carry the steps the agent reported",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				p.cancel("v1")
+				p.ok()
+				p.stopped(l, protocol.StepDone)
+				p.rollout().Host("v1").State = fleet.HostFailed
+				p.rollout().State = fleet.RolloutHalted
+
+				// The agent said done; the row says cancelled.
+				p.said = map[string]*protocol.Operation{l.ID: cloneOperation(l.Operation)}
+				l.Operation.Steps[0].Status = protocol.StepCancelled
+			},
+			want: "but its agent reported",
+		},
+		{
+			name: "ended by operator, and nobody ended it",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				l.State, l.Error = fleet.LeaseFailed, oracleEndedByOperator
+			},
+			want: "but nobody ended it",
+		},
+		{
+			name: "ended by a person at work: failed as ended by operator without the agent's report",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				p.cancel("v1")
+				p.ok()
+				l.State, l.Error = fleet.LeaseFailed, oracleEndedByOperator
+			},
+			want: "without the agent's report that its operation ended",
+		},
+		{
+			name: "ended by a person, the agent stopped: failed for another reason",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				p.cancel("v1")
+				p.ok()
+				p.stopped(l, protocol.StepCancelled)
+				l.Error = "not ready after 30m0s"
+			},
+			want: "its agent reports the operation as ended",
+		},
+		{
+			name: "ended by a person: released all the same",
+			bad: func(p *pinned) {
+				p.grant("v1")
+				p.ok()
+				p.cancel("v1")
+				p.ok()
+				p.release("v1")
+			},
+			want: "was released although a person ended it",
+		},
+		{
+			name: "the report of an agent that came back is ignored",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				l.State = fleet.LeaseRunning
+				l.Operation = cloneOperation(p.reports(l, protocol.PhaseApplying, protocol.StepRunning))
+				p.ok()
+
+				p.f.since = p.f.now.Add(-time.Hour)
+				p.f.hosts["v1"].lastSync = p.f.now.Add(-2 * time.Hour)
+				l.State, l.Error = fleet.LeaseFailed, reasonAgentSilent
+				p.rollout().Host("v1").State = fleet.HostFailed
+				p.rollout().State = fleet.RolloutHalted
+				p.reconciled()
+
+				p.f.now = p.f.now.Add(time.Minute)
+				p.f.health.UpdatedAt = p.f.now
+
+				for _, h := range p.f.hosts {
+					h.lastSync = p.f.now
+				}
+
+				p.f.fresh = true
+			},
+			want: "the lease was not taken up again",
+		},
+		{
+			name: "a lease that failed with the agent's final report is taken up again",
+			bad: func(p *pinned) {
+				l := p.grant("v1")
+				p.ok()
+				p.fail("v1", true)
+				p.ok()
+
+				p.reports(l, protocol.PhaseFailed, protocol.StepFailed)
+				l.State = fleet.LeaseRunning
+			},
+			want: "lease l1 left terminal state failed for running",
+		},
+		{
+			name: "an operation for a lease nobody knows is not adopted",
+			bad: func(p *pinned) {
+				p.f.hosts["v1"].status.Operation = &protocol.Operation{
+					LeaseID: "lost", Phase: protocol.PhaseApplying, Disrupted: true,
+				}
+				p.f.fresh = true
+			},
+			want: "no lease was adopted for it",
+		},
+		{
+			name: "forgotten: the host that returns is first",
+			bad: func(p *pinned) {
+				p.breakIn("v1")
+				p.o.forget("v1")
+
+				next := p.follow()
+				p.broken(next, "v1")
+				p.f.fresh = true
+			},
+			want: "member v1 of rollout r2 (image:" + imgGeth + "@" + digestB + ") is in stage 1",
 		},
 		{
 			name: "in flight: a canary is chosen while a lease of the closed rollout is still open",

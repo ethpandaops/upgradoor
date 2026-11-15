@@ -50,6 +50,8 @@ func TestHosts(t *testing.T) {
 	assert.Equal(t, int64(86400), one.UptimeSeconds)
 	assert.True(t, one.Hold.Local)
 	assert.True(t, one.HoldWanted)
+	assert.Equal(t, secretHoldReason, one.HoldReason, "the reason of the controller hold, for those who are signed in")
+	assert.Empty(t, boot.HoldReason)
 	assert.Equal(t, []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages}, one.Verbs)
 	assert.Len(t, one.Needs, 2)
 	assert.Equal(t, scheduler.SlotHeld, one.Plan.Slot)

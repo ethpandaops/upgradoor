@@ -344,7 +344,7 @@ func TestRestartPersistence(t *testing.T) {
 
 	first := New(log, path)
 	require.NoError(t, first.Start(ctx))
-	assert.Equal(t, 3, applied())
+	assert.Equal(t, 4, applied())
 
 	addHost(t, first, "node-1", &identity.ValidatorRange{Start: 0, End: 100})
 	inv := testInventory(20)
@@ -375,7 +375,7 @@ func TestRestartPersistence(t *testing.T) {
 	var version int
 
 	require.NoError(t, rawDB(t, second).QueryRow(`PRAGMA user_version`).Scan(&version))
-	assert.Equal(t, 3, version)
+	assert.Equal(t, 4, version)
 
 	host, err := second.GetHost(ctx, "node-1")
 	require.NoError(t, err)

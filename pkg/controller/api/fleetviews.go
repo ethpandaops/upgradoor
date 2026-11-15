@@ -243,6 +243,7 @@ func hostSummary(
 		LastSeen:   host.LastSeen,
 		Stale:      host.Stale(now, staleAfter),
 		HoldWanted: host.HoldWanted,
+		HoldReason: host.HoldReason,
 		Containers: []protocol.Container{},
 		Verbs:      []protocol.Verb{},
 		Needs:      []protocol.Need{},

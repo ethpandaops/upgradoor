@@ -11,29 +11,102 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// ListRollouts returns rollouts with their hosts, newest first (by creation
-// time). The hosts of a rollout are ordered by host name.
-func (s *sqliteStore) ListRollouts(
-	ctx context.Context, filter RolloutFilter,
-) ([]*fleet.Rollout, error) {
+// rolloutHostsQuery reads the members of one rollout.
+const rolloutHostsQuery = `
+	SELECT host, state, stage, need_id, lease_id, error, updated_at
+	FROM rollout_hosts WHERE rollout_id = ? ORDER BY host`
+
+// The queries below are read on every reconcile tick (the open rollouts, the
+// open leases, the pending directives) and on every sync of an agent (its
+// open lease, its pending directives). None of the three tables is pruned, so
+// each of them names the states it wants: a positive list is what lets SQLite
+// use the index on state, where "state NOT IN (...)" reads the whole table.
+
+// rolloutsQuery builds the query of ListRollouts.
+func rolloutsQuery(filter RolloutFilter) (query string, args []any) {
 	var cond conditions
 
 	if filter.OpenOnly {
-		cond.add(`state NOT IN (?, ?, ?)`, string(fleet.RolloutCompleted),
-			string(fleet.RolloutSuperseded), string(fleet.RolloutAborted))
+		open := fleet.OpenRolloutStates()
+		states := make([]any, 0, len(open))
+
+		for _, state := range open {
+			states = append(states, string(state))
+		}
+
+		cond.add(`state IN (`+placeholders(len(open))+`)`, states...)
 	}
 
-	query := `SELECT data FROM rollouts` + cond.where() + ` ORDER BY created_at DESC, id DESC`
+	query = `SELECT data FROM rollouts` + cond.where() + ` ORDER BY created_at DESC, id DESC`
 	if filter.Limit > 0 {
 		query += ` LIMIT ?`
 
 		cond.args = append(cond.args, filter.Limit)
 	}
 
+	return query, cond.args
+}
+
+// leasesQuery builds the query of ListLeases.
+func leasesQuery(filter LeaseFilter) (query string, args []any) {
+	var cond conditions
+
+	if filter.Host != "" {
+		cond.add(`host = ?`, filter.Host)
+	}
+
+	if filter.OpenOnly {
+		// The states come from the one definition of "open":
+		// fleet.LeaseState.Terminal.
+		open := fleet.OpenLeaseStates()
+		states := make([]any, 0, len(open))
+
+		for _, state := range open {
+			states = append(states, string(state))
+		}
+
+		cond.add(`state IN (`+placeholders(len(open))+`)`, states...)
+	}
+
+	query = `SELECT data FROM leases` + cond.where() + ` ORDER BY granted_at DESC, id DESC`
+	if filter.Limit > 0 {
+		query += ` LIMIT ?`
+
+		cond.args = append(cond.args, filter.Limit)
+	}
+
+	return query, cond.args
+}
+
+// directivesQuery builds the query of ListDirectives.
+func directivesQuery(filter DirectiveFilter) (query string, args []any) {
+	var cond conditions
+
+	if filter.Host != "" {
+		cond.add(`host = ?`, filter.Host)
+	}
+
+	if filter.PendingOnly {
+		cond.add(`state = ?`, string(fleet.DirectivePending))
+	}
+
+	query = `SELECT id, host, kind, container, reason, state, rollout_id, error, created_by,
+		created_at, updated_at FROM directives` + cond.where() + ` ORDER BY created_at, id`
+
+	return query, cond.args
+}
+
+// ListRollouts returns rollouts with their hosts, newest first (by creation
+// time). The hosts of a rollout are ordered by host name.
+func (s *sqliteStore) ListRollouts(
+	ctx context.Context, filter RolloutFilter,
+) ([]*fleet.Rollout, error) {
+	query, args := rolloutsQuery(filter)
+
 	rollouts := make([]*fleet.Rollout, 0, 16)
 
 	err := s.read(ctx, func(tx *sql.Tx) error {
-		err := queryRows(ctx, tx, query, cond.args, func(row rowScanner) error {
+		err := queryRows(ctx, tx, query, args, func(row rowScanner) error {
 			rollout, err := scanRollout(row)
 			if err != nil {
 				return err
@@ -102,9 +175,7 @@ func loadRolloutHosts(ctx context.Context, tx *sql.Tx, rollouts []*fleet.Rollout
 		return nil
 	}
 
-	stmt, err := tx.PrepareContext(ctx, `
-		SELECT host, state, stage, need_id, lease_id, error, updated_at
-		FROM rollout_hosts WHERE rollout_id = ? ORDER BY host`)
+	stmt, err := tx.PrepareContext(ctx, rolloutHostsQuery)
 	if err != nil {
 		return err
 	}
@@ -149,28 +220,12 @@ func loadRolloutHosts(ctx context.Context, tx *sql.Tx, rollouts []*fleet.Rollout
 
 // ListLeases returns leases, newest first (by grant time).
 func (s *sqliteStore) ListLeases(ctx context.Context, filter LeaseFilter) ([]*fleet.Lease, error) {
-	var cond conditions
-
-	if filter.Host != "" {
-		cond.add(`host = ?`, filter.Host)
-	}
-
-	if filter.OpenOnly {
-		cond.add(`state NOT IN (?, ?, ?)`, string(fleet.LeaseReleased),
-			string(fleet.LeaseFailed), string(fleet.LeaseExpired))
-	}
-
-	query := `SELECT data FROM leases` + cond.where() + ` ORDER BY granted_at DESC, id DESC`
-	if filter.Limit > 0 {
-		query += ` LIMIT ?`
-
-		cond.args = append(cond.args, filter.Limit)
-	}
+	query, args := leasesQuery(filter)
 
 	leases := make([]*fleet.Lease, 0, 16)
 
 	err := s.read(ctx, func(tx *sql.Tx) error {
-		return queryRows(ctx, tx, query, cond.args, func(row rowScanner) error {
+		return queryRows(ctx, tx, query, args, func(row rowScanner) error {
 			lease, err := scanLease(row)
 			if err != nil {
 				return err
@@ -227,23 +282,12 @@ func scanLease(row rowScanner) (*fleet.Lease, error) {
 func (s *sqliteStore) ListDirectives(
 	ctx context.Context, filter DirectiveFilter,
 ) ([]*fleet.Directive, error) {
-	var cond conditions
-
-	if filter.Host != "" {
-		cond.add(`host = ?`, filter.Host)
-	}
-
-	if filter.PendingOnly {
-		cond.add(`state = ?`, string(fleet.DirectivePending))
-	}
-
-	query := `SELECT id, host, kind, container, reason, state, rollout_id, error, created_by,
-		created_at, updated_at FROM directives` + cond.where() + ` ORDER BY created_at, id`
+	query, args := directivesQuery(filter)
 
 	directives := make([]*fleet.Directive, 0, 16)
 
 	err := s.read(ctx, func(tx *sql.Tx) error {
-		return queryRows(ctx, tx, query, cond.args, func(row rowScanner) error {
+		return queryRows(ctx, tx, query, args, func(row rowScanner) error {
 			var (
 				d                    fleet.Directive
 				kind, state          string
@@ -304,6 +348,12 @@ func (s *sqliteStore) Commit(ctx context.Context, changes *Changes) error {
 		for i, directive := range changes.Directives {
 			if err := upsertDirective(ctx, tx, directive); err != nil {
 				return fmt.Errorf("directive %d: %w", i, err)
+			}
+		}
+
+		for _, hold := range changes.Holds {
+			if err := setHostHold(ctx, tx, hold.Host, hold.Wanted, hold.Reason); err != nil {
+				return fmt.Errorf("hold of %s: %w", hold.Host, err)
 			}
 		}
 
@@ -400,6 +450,12 @@ func upsertLease(ctx context.Context, tx *sql.Tx, lease *fleet.Lease) error {
 	stored.SyncedSince = storedTimePtr(stored.SyncedSince)
 	stored.SyncedUntil = storedTimePtr(stored.SyncedUntil)
 	stored.EndedAt = storedTimePtr(stored.EndedAt)
+
+	if lease.Cancelled != nil {
+		cancelled := *lease.Cancelled
+		cancelled.At = storedTime(cancelled.At)
+		stored.Cancelled = &cancelled
+	}
 
 	if lease.Operation != nil {
 		operation := *lease.Operation
