@@ -7,6 +7,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 const (
@@ -44,7 +46,7 @@ func kernelReleaseFromPackage(name string) (string, bool) {
 
 // kernelReleasesFromPackages returns the releases of the installed kernel
 // image packages.
-func kernelReleasesFromPackages(pkgs []installedPackage) []string {
+func kernelReleasesFromPackages(pkgs []protocol.Package) []string {
 	var releases []string
 
 	for i := range pkgs {

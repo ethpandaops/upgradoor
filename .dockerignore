@@ -1,0 +1,8 @@
+# Only the sources go into the build context: the image installs and builds
+# the web UI itself, and a local node_modules or dist would overwrite that.
+.git
+.claude
+.tmp
+bin
+web/node_modules
+web/dist

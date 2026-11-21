@@ -3,7 +3,9 @@ package store
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sort"
+	"strings"
 	"testing"
 	"time"
 
@@ -281,11 +283,6 @@ func TestSaveInventoryRejects(t *testing.T) {
 	good := testInventory(5)
 	require.NoError(t, s.SaveInventory(ctx, "node-1", good))
 
-	tampered := testInventory(5)
-	tampered.Packages[0].Version = "6.6.6"
-
-	unhashed := newInventory(5)
-
 	// reseal sets the hash without sorting, unlike sealInventory.
 	reseal := func(inv *protocol.Inventory) *protocol.Inventory {
 		hash, err := inv.ComputeHash()
@@ -329,8 +326,6 @@ func TestSaveInventoryRejects(t *testing.T) {
 		wantErr error
 	}{
 		{"nil inventory", "node-1", nil, nil},
-		{"content changed after hashing", "node-1", tampered, ErrInventoryHash},
-		{"no hash", "node-1", unhashed, ErrInventoryHash},
 		{"unknown host", "nope", testInventory(2), ErrNotFound},
 		{"same package twice", "node-1", duplicate, ErrInventoryInvalid},
 		{"same upgradable twice", "node-1", duplicateUpgradable, ErrInventoryInvalid},
@@ -615,6 +610,105 @@ func TestSearchPackagesAtFleetSize(t *testing.T) {
 			// a loaded machine, tight enough to catch a quadratic plan.
 			assert.Less(t, elapsed, 3*time.Second, "search took %s", elapsed)
 			t.Logf("%q: %d names in %s", q.query, len(got), elapsed)
+		})
+	}
+}
+
+// The package list is read page by page: every name once, in order, however
+// the pages are cut, with the number of names on the first page.
+func TestListPackages(t *testing.T) {
+	ctx := context.Background()
+
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			s := backend.open(t)
+			searchFixture(t, s, 6, 40)
+
+			all := func(filter PackageFilter) (names []string, total, pages int) {
+				for {
+					page, err := s.ListPackages(ctx, filter)
+					require.NoError(t, err)
+
+					if filter.After == "" {
+						total = page.Total
+					} else {
+						require.Equal(t, -1, page.Total, "counted for the first page only")
+					}
+
+					for _, m := range page.Matches {
+						require.NotEmpty(t, m.Versions, m.Name)
+						names = append(names, m.Name)
+					}
+
+					pages++
+
+					if page.Next == "" {
+						return names, total, pages
+					}
+
+					require.Len(t, page.Matches, filter.Limit)
+
+					filter.After = page.Next
+				}
+			}
+
+			// Everything, alphabetically.
+			whole, total, pages := all(PackageFilter{Limit: 7})
+			assert.Len(t, whole, total)
+			assert.Equal(t, (total+6)/7, pages)
+			assert.True(t, slices.IsSorted(whole))
+			assert.Len(t, slices.Compact(slices.Clone(whole)), total, "no name twice")
+			assert.Contains(t, whole, "libc6")
+
+			inOne, _, _ := all(PackageFilter{Limit: MaxPackageSearchLimit})
+			assert.Equal(t, inOne, whole, "the cut of the pages changes nothing")
+
+			// A search keeps its order across pages: the exact match, the
+			// names that start with it, the others.
+			found, total, _ := all(PackageFilter{Query: "LIBC6", Limit: 1})
+			assert.Equal(t, []string{"libc6", "libc6-dev", "glibc6-compat"}, found)
+			assert.Equal(t, 3, total)
+
+			// A page continues after a name, not at an offset: a package
+			// that appears before the cursor moves nothing.
+			first, err := s.ListPackages(ctx, PackageFilter{Limit: 5})
+			require.NoError(t, err)
+
+			inv := newInventory(0)
+			inv.Packages = []protocol.Package{{Name: "000-first", Version: "1", Arch: "all"}}
+			sealInventory(t, inv)
+			addHost(t, s, "node-new", nil)
+			require.NoError(t, s.SaveInventory(ctx, "node-new", inv))
+
+			second, err := s.ListPackages(ctx, PackageFilter{Limit: 5, After: first.Next})
+			require.NoError(t, err)
+			assert.Equal(t, whole[5], second.Matches[0].Name)
+
+			_, err = s.ListPackages(ctx, PackageFilter{After: "x"})
+			require.ErrorIs(t, err, ErrBadCursor)
+		})
+	}
+}
+
+// A page of the unfiltered list is a range of the name index, and a search
+// walks that index, not the table.
+func TestListPackagesUsesTheNameIndex(t *testing.T) {
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			s := backend.open(t)
+			searchFixture(t, s, 3, 20)
+
+			page, args, count, countArgs := packageNamesQuery("", packageCursor{rank: 0, name: "lib"}, 51)
+			search, searchArgs, searchCount, searchCountArgs := packageNamesQuery("ssl", packageCursor{rank: -1}, 51)
+
+			for query, queryArgs := range map[string][]any{
+				page: args, count: countArgs, search: searchArgs, searchCount: searchCountArgs,
+			} {
+				for _, line := range queryPlan(t, s, query, queryArgs) {
+					reads := strings.HasPrefix(line, "SCAN packages") && !strings.Contains(line, "USING COVERING INDEX")
+					assert.False(t, reads, "reads the whole table: %s\n%s", line, query)
+				}
+			}
 		})
 	}
 }

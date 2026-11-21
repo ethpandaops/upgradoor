@@ -1,11 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
 	"os"
-	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -103,7 +103,7 @@ func loadCredentials(cfg *agent.Config) (*identity.Credentials, error) {
 		return nil, fmt.Errorf("read host certificate: %w", err)
 	}
 
-	creds, err := identity.NewCredentials(key, string(trimSpace(rawCert)))
+	creds, err := identity.NewCredentials(key, string(bytes.TrimSpace(rawCert)))
 	if err != nil {
 		return nil, fmt.Errorf("host certificate %s: %w", cfg.CertFile, err)
 	}
@@ -111,28 +111,23 @@ func loadCredentials(cfg *agent.Config) (*identity.Credentials, error) {
 	return creds, nil
 }
 
-func trimSpace(b []byte) []byte {
-	for len(b) > 0 && (b[len(b)-1] == '\n' || b[len(b)-1] == '\r' || b[len(b)-1] == ' ') {
-		b = b[:len(b)-1]
-	}
-
-	return b
-}
-
 // realDeps wires Docker, the registry resolver and the OS layer.
 func realDeps(log *logrus.Logger, cfg *agent.Config, deps *agent.Deps) (func(), error) {
-	runtime, err := docker.New(log, cfg.Docker.Host, docker.WithAuthFile(cfg.Registry.AuthFile))
+	// One set of logins for the registry lookups and the pulls.
+	logins, err := registry.LoadLogins(log, cfg.Registry.AuthFile)
+	if err != nil {
+		return nil, err
+	}
+
+	runtime, err := docker.New(log, cfg.Docker.Host, logins.Lookup)
 	if err != nil {
 		return nil, fmt.Errorf("docker: %w", err)
 	}
 
 	resolver, err := registry.New(log, registry.Options{
-		AuthFile:  cfg.Registry.AuthFile,
+		Logins:    logins,
 		PlainHTTP: cfg.Registry.PlainHTTP,
 		CAFile:    cfg.Registry.CAFile,
-		Timeout:   30 * time.Second,
-		// The revision label is read from the local image after the pull.
-		SkipRevision: true,
 	})
 	if err != nil {
 		_ = runtime.Close()
@@ -142,10 +137,7 @@ func realDeps(log *logrus.Logger, cfg *agent.Config, deps *agent.Deps) (func(), 
 
 	deps.Runtime = runtime
 	deps.Registry = resolver
-	deps.System = system.New(log, system.Options{
-		Blocked:           cfg.Packages.Blocked,
-		InventoryInterval: cfg.Packages.InventoryInterval,
-	})
+	deps.System = system.New(log, system.Options{Blocked: cfg.Packages.Blocked})
 
 	return func() {
 		if err := runtime.Close(); err != nil {

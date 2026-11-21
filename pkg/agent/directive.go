@@ -3,6 +3,7 @@ package agent
 import (
 	"cmp"
 	"fmt"
+	"strings"
 
 	"github.com/sirupsen/logrus"
 
@@ -18,6 +19,9 @@ type pendingRoll struct {
 	// key is the normalised image reference, ticket the watcher request.
 	key    string
 	ticket uint64
+	// local is true for a roll requested through the local socket: it is
+	// not the controller's to withdraw, and its answer goes to the socket.
+	local bool
 }
 
 // handleDirectives applies every directive of a sync response that has not
@@ -60,8 +64,8 @@ func (s *service) handleDirectives(directives []protocol.Directive, obs *observa
 	}
 
 	// A roll the controller no longer asks for is not carried out.
-	for id := range s.pendingRolls {
-		if _, ok := listed[id]; !ok {
+	for id, p := range s.pendingRolls {
+		if _, ok := listed[id]; !ok && !p.local {
 			delete(s.pendingRolls, id)
 		}
 	}
@@ -109,9 +113,12 @@ func (s *service) applyDirective(d *protocol.Directive, obs *observation) bool {
 
 			log.WithField(logContainer, d.Container).
 				Info("manual roll requested: checking the registry and pulling the image")
+			s.auditDirective(d, "")
 
 			return false
 		}
+	case protocol.DirectiveOverride:
+		reject = s.overrideDirective(d)
 	default:
 		reject = fmt.Sprintf("unknown directive kind %q", d.Kind)
 	}
@@ -124,7 +131,83 @@ func (s *service) applyDirective(d *protocol.Directive, obs *observation) bool {
 		return false
 	}
 
+	s.auditDirective(d, reject)
+
 	return s.concludeDirective(log, d.ID, need, reject)
+}
+
+// actorOf is who the controller says asked for a directive. The answer that
+// carried the directive is the controller's (its signature was verified, or
+// verification is switched off for development); the user in it is the
+// controller's word.
+func actorOf(d *protocol.Directive) *origin {
+	who := &origin{source: auditController, user: "unknown", directive: d.ID}
+
+	if d.By != nil {
+		who.user = cmp.Or(firstLine(d.By.User), "unknown")
+		who.teams = protocol.CleanOwners(d.By.Teams)
+		who.feature = firstLine(d.By.Feature)
+	}
+
+	return who
+}
+
+// auditDirective records in the host's audit log what a person asked for
+// through the controller and whether the host took it. An override directive
+// is recorded where the file is written; a recheck is nobody's request.
+func (s *service) auditDirective(d *protocol.Directive, reject string) {
+	who := actorOf(d)
+	rec := AuditRecord{
+		Source: auditController, User: who.user, Teams: who.teams, Feature: who.feature,
+		Directive: d.ID, Container: d.Container, Reason: d.Reason, Result: auditAccepted,
+	}
+
+	switch d.Kind {
+	case protocol.DirectiveRoll:
+		rec.Action = "roll.request"
+	case protocol.DirectiveReboot:
+		rec.Action = "reboot.request"
+	case protocol.DirectiveHold:
+		rec.Action = "hold.set"
+	case protocol.DirectiveReleaseHold:
+		rec.Action = "hold.release"
+	default:
+		return
+	}
+
+	if reject != "" {
+		rec.Result, rec.Error = auditRefused, reject
+	}
+
+	s.audit.record(rec)
+}
+
+// overrideDirective writes what an override directive asks for into the
+// overrides file, within what this host's configuration lets the controller
+// override. It returns the reason of a refusal, or "".
+func (s *service) overrideDirective(d *protocol.Directive) string {
+	who := actorOf(d)
+
+	var err error
+
+	switch {
+	case d.Override == nil || d.Container == "":
+		err = refusedf("the override directive names no container or no override")
+	case !s.cfg.Allows(protocol.VerbRoll):
+		// Recorded like every refusal.
+		err = s.changeOverride(who, d.Container, d.Reason,
+			func(*Override) (*Override, *Override, error) {
+				return nil, nil, refusedf("verb roll is not allowed on this host")
+			})
+	default:
+		err = s.instructOverride(who, d.Container, d.Override, d.Reason)
+	}
+
+	if err == nil {
+		return ""
+	}
+
+	return strings.TrimPrefix(err.Error(), errRefused.Error()+": ")
 }
 
 // concludeDirective persists the answer to a directive together with the
@@ -132,7 +215,7 @@ func (s *service) applyDirective(d *protocol.Directive, obs *observation) bool {
 func (s *service) concludeDirective(
 	log logrus.FieldLogger, id string, need *protocol.Need, reject string,
 ) bool {
-	h := handledDirective{ID: id, Status: protocol.DirectiveAccepted, At: s.now()}
+	h := handledDirective{ID: id, Status: protocol.DirectiveAccepted}
 	if reject != "" {
 		h.Status, h.Error = protocol.DirectiveRejected, reject
 	}
@@ -208,7 +291,7 @@ func (s *service) resolvePendingRolls(obs *observation) {
 		})
 
 		if reason := s.rollRefusal(p.container, obs); reason != "" {
-			if s.concludeDirective(log, id, nil, reason) {
+			if s.concludeRoll(log, id, &p, nil, reason) {
 				delete(s.pendingRolls, id)
 			}
 
@@ -247,10 +330,22 @@ func (s *service) resolvePendingRolls(obs *observation) {
 			}
 		}
 
-		if s.concludeDirective(log, id, need, reject) {
+		if s.concludeRoll(log, id, &p, need, reject) {
 			delete(s.pendingRolls, id)
 		}
 	}
+}
+
+// concludeRoll answers a roll whose image is resolved: the directive of the
+// controller, or the roll requested on the host.
+func (s *service) concludeRoll(
+	log logrus.FieldLogger, id string, p *pendingRoll, need *protocol.Need, reject string,
+) bool {
+	if p.local {
+		return s.concludeLocalRoll(id, need, reject)
+	}
+
+	return s.concludeDirective(log, id, need, reject)
 }
 
 // directiveAcks returns the acks for the directives the controller repeated

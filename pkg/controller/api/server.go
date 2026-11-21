@@ -25,35 +25,12 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// Suggested limits for the http.Server that serves Handler(). The handler
-// bounds every body it reads; these bound the time a client may take. The
-// agent endpoints additionally put their own deadline on reading the body.
-// WriteTimeout must leave room for an inventory upload (up to
-// protocol.MaxInventoryBody) over a slow link.
-const (
-	// ReadHeaderTimeout bounds the time to read the request headers.
-	ReadHeaderTimeout = 10 * time.Second
-	// ReadTimeout bounds the time to read a whole request.
-	ReadTimeout = 60 * time.Second
-	// WriteTimeout bounds the time from the end of the headers to the end of
-	// the answer.
-	WriteTimeout = 90 * time.Second
-	// IdleTimeout bounds how long a keep-alive connection may sit idle.
-	IdleTimeout = 120 * time.Second
-	// MaxHeaderBytes bounds the request headers. A certificate and a proof
-	// are well below 2 KiB together.
-	MaxHeaderBytes = 32 << 10
-)
-
 const (
 	// maxUserBody bounds the body of authenticated PUT and POST requests.
 	maxUserBody = 64 << 10
 
 	headerContentType = "Content-Type"
 	contentTypeJSON   = "application/json; charset=utf-8"
-
-	// agentPathPrefix is the root of the agent API.
-	agentPathPrefix = "/api/agent/"
 
 	// actorAnonymous is the audit actor when the API runs open.
 	actorAnonymous = "anonymous"
@@ -67,9 +44,23 @@ type Store interface {
 
 	SaveInventory(ctx context.Context, host string, inv *protocol.Inventory) error
 	GetInventory(ctx context.Context, host string) (*protocol.Inventory, error)
-	SearchPackages(ctx context.Context, query string, limit int) ([]store.PackageMatch, error)
+	ListPackages(ctx context.Context, filter store.PackageFilter) (*store.PackagePage, error)
 
-	ListLiveness(ctx context.Context, epochs int) ([]fleet.Liveness, error)
+	// ListSlotParticipation returns the slot rows from fromSlot on, oldest
+	// first; SumHostSlotParticipation their per-host part summed over
+	// buckets of bucketSlots slots.
+	ListSlotParticipation(ctx context.Context, fromSlot uint64) ([]fleet.SlotParticipation, error)
+	SumHostSlotParticipation(
+		ctx context.Context, fromSlot, bucketSlots uint64,
+	) ([]fleet.HostSlotBucket, error)
+	// SumHostSlotRuns returns the runs of slots from fromSlot to toSlot in
+	// which a host missed attestations, ordered by host and first slot. Rows
+	// of a host no more than gap slots apart are one run, and only runs of at
+	// least minSlots slots are returned; for the hosts in perSlot every row
+	// is a run of its own, and all of them are returned.
+	SumHostSlotRuns(
+		ctx context.Context, fromSlot, toSlot, gap, minSlots uint64, perSlot []string,
+	) ([]fleet.HostSlotRun, error)
 	ListRollouts(ctx context.Context, filter store.RolloutFilter) ([]*fleet.Rollout, error)
 	ListLeases(ctx context.Context, filter store.LeaseFilter) ([]*fleet.Lease, error)
 	// GetRollout returns one rollout or store.ErrNotFound.
@@ -112,6 +103,11 @@ type Options struct {
 	// AllowInsecureAgentHTTP accepts proofs for plain http URLs (local
 	// development).
 	AllowInsecureAgentHTTP bool
+	// AnswerSigner signs every answer of the agent API with the controller
+	// key. Nil leaves them unsigned, which only an agent that runs without
+	// controller keys takes (development only; the controller wiring demands
+	// an explicit opt-out for it).
+	AnswerSigner *identity.AnswerSigner
 	// TrustForwardedHeaders takes the remote address from X-Forwarded-For.
 	// Set it only behind a proxy that sets the header itself.
 	TrustForwardedHeaders bool
@@ -159,13 +155,23 @@ type Server struct {
 	userRoutes []string
 
 	syncSlots            chan struct{}
+	pacer                *pacer
 	inventorySlots       chan struct{}
 	syncReadTimeout      time.Duration
 	inventoryReadTimeout time.Duration
 
-	// auditBacklog holds identity audit entries whose write failed.
-	auditMu      sync.Mutex
-	auditBacklog []fleet.AuditEntry
+	// events is the hub of the event streams; it runs between Start and Stop.
+	events            eventHubs
+	streamMinInterval time.Duration
+	streamDebounce    time.Duration
+	streamHeartbeat   time.Duration
+
+	// overlapAudited remembers, per host, the hosts its reported validator
+	// range last overlapped with: an overlap is audited once per episode.
+	// validatorsAudited limits the audit entries about one host's range. Both
+	// are guarded by generationMu.
+	overlapAudited    map[string]string
+	validatorsAudited map[string]time.Time
 
 	// generationAudited remembers, per host, when a certificate that was
 	// rejected for its generation was last audited.
@@ -234,10 +240,15 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		publicURLs:     publicURLs,
 		users:          newUserAuth(opts.AuthProviderURL, opts.AuthService, opts.Now),
 		syncSlots:      make(chan struct{}, maxConcurrentSyncs),
+		pacer:          newPacer(),
 		inventorySlots: make(chan struct{}, maxConcurrentInventories),
 
 		syncReadTimeout:      syncReadTimeout,
 		inventoryReadTimeout: inventoryReadTimeout,
+
+		streamMinInterval: streamMinInterval,
+		streamDebounce:    streamDebounce,
+		streamHeartbeat:   streamHeartbeat,
 	}
 
 	s.metrics, err = newMetrics(s.log, opts.Registry, s)
@@ -291,8 +302,9 @@ func normalizePublicURLs(raw []string, allowHTTP bool) ([]string, error) {
 // Handler returns the HTTP handler for every route.
 func (s *Server) Handler() http.Handler { return s.handler }
 
-// Start builds the user token verifier when an auth provider is configured.
-// The verifier refreshes its keys in the background until Stop.
+// Start builds the user token verifier when an auth provider is configured
+// and starts the hub of the event streams. The verifier refreshes its keys in
+// the background until Stop.
 func (s *Server) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -311,17 +323,19 @@ func (s *Server) Start(ctx context.Context) error {
 		return err
 	}
 
+	s.events.start(refreshCtx, s.log, s)
 	s.cancel = cancel
 
 	return nil
 }
 
-// Stop ends the background key refresh.
+// Stop ends the background key refresh and closes the event streams.
 func (s *Server) Stop() error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	if s.cancel != nil {
+		s.events.stop()
 		s.cancel()
 		s.cancel = nil
 	}
@@ -329,18 +343,14 @@ func (s *Server) Stop() error {
 	return nil
 }
 
-// routes builds the mux. Unknown paths go to the web UI, which answers
-// unknown /api/ paths with a JSON 404; a known path with another method is
-// answered 405. Below /api/agent/ both are answered in the agent protocol's
-// error shape and counted like every other agent request.
+// routes builds the mux. Everything else, a known path with another method
+// included, goes to the web UI, which answers unknown /api/ paths with a JSON
+// 404.
 func (s *Server) routes(ui http.Handler) http.Handler {
 	mux := http.NewServeMux()
-	methods := make(map[string][]string, 32)
 
 	handle := func(method, pattern string, handler http.Handler) {
 		mux.Handle(method+" "+pattern, handler)
-
-		methods[pattern] = append(methods[pattern], method)
 	}
 
 	handle(http.MethodPost, protocol.PathSync, http.HandlerFunc(s.handleSync))
@@ -350,7 +360,8 @@ func (s *Server) routes(ui http.Handler) http.Handler {
 	handle(http.MethodGet, "/api/v1/public/hosts", http.HandlerFunc(s.handlePublicHosts))
 	handle(http.MethodGet, "/api/v1/public/images", http.HandlerFunc(s.handlePublicImages))
 	handle(http.MethodGet, "/api/v1/public/network", http.HandlerFunc(s.handlePublicNetwork))
-	handle(http.MethodGet, "/api/v1/public/history", http.HandlerFunc(s.handlePublicHistory))
+	handle(http.MethodGet, pathPublicEvents, http.HandlerFunc(s.handlePublicEvents))
+	handle(http.MethodGet, "/api/v1/public/slots", http.HandlerFunc(s.handlePublicSlots))
 
 	// A userHandler can only be registered through here, behind the user
 	// authentication.
@@ -362,12 +373,16 @@ func (s *Server) routes(ui http.Handler) http.Handler {
 
 	user(http.MethodGet, "/api/v1/hosts", s.handleHosts)
 	user(http.MethodGet, "/api/v1/hosts/{name}", s.handleHost)
+	user(http.MethodGet, "/api/v1/clients", s.handleClients)
+	user(http.MethodGet, "/api/v1/clients/{client}/hosts", s.handleClientHosts)
 	user(http.MethodGet, "/api/v1/packages", s.handlePackages)
 	user(http.MethodGet, "/api/v1/rollouts", s.handleRollouts)
 	user(http.MethodGet, "/api/v1/plan", s.handlePlan)
 	user(http.MethodGet, "/api/v1/settings", s.handleGetSettings)
 	user(http.MethodPut, "/api/v1/settings", s.handlePutSettings)
 	user(http.MethodGet, "/api/v1/audit", s.handleAudit)
+	user(http.MethodGet, pathEvents, s.handleEvents)
+	user(http.MethodGet, "/api/v1/slots", s.handleSlots)
 
 	for name, handler := range s.actions() {
 		user(http.MethodPost, "/api/v1/actions/"+name, handler)
@@ -381,50 +396,7 @@ func (s *Server) routes(ui http.Handler) http.Handler {
 		Timeout:             20 * time.Second,
 	}))
 
-	// The catch-all takes every method, so the mux never answers 405 by
-	// itself. known holds the same paths without methods to tell "wrong
-	// method" from "no such path".
-	known := http.NewServeMux()
-
-	agentEndpoints := map[string]string{
-		protocol.PathSync:      endpointSync,
-		protocol.PathInventory: endpointInventory,
-	}
-
-	for pattern, allowed := range methods {
-		allow := strings.Join(allowed, ", ")
-		endpoint, agent := agentEndpoints[pattern]
-
-		known.HandleFunc(pattern, func(w http.ResponseWriter, r *http.Request) {
-			w.Header().Set("Allow", allow)
-
-			if agent {
-				s.agentFailure(w, r, endpoint,
-					agentErrorf(http.StatusMethodNotAllowed, "method not allowed"))
-
-				return
-			}
-
-			s.writeError(w, http.StatusMethodNotAllowed, "method not allowed")
-		})
-	}
-
-	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		if handler, pattern := known.Handler(r); pattern != "" {
-			handler.ServeHTTP(w, r)
-
-			return
-		}
-
-		if strings.HasPrefix(r.URL.Path, agentPathPrefix) {
-			s.agentFailure(w, r, endpointUnknown,
-				agentErrorf(http.StatusNotFound, "not found"))
-
-			return
-		}
-
-		ui.ServeHTTP(w, r)
-	})
+	mux.Handle("/", ui)
 
 	return apiHeaders(mux)
 }

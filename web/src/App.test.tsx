@@ -2,21 +2,21 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
-import { App } from './App';
+import { App, visibleTabs } from './App';
 import { ApiClient } from './api/client';
 import { AuthStore } from './auth/authStore';
 import { fakeAuthenticatoor } from './mock/install';
-import { MockController } from './mock/mockController';
+import { MockController, type MockProfile } from './mock/mockController';
 import { PUBLIC_PATHS, recordingFetch, type RecordedCall } from './test/harness';
 
-const TABS = ['Rollouts', 'Packages', 'Settings', 'Audit'];
+const TABS = ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Settings', 'Audit'];
 
-function boot(opts: { auth: boolean; loggedIn?: boolean; unreachable?: boolean }) {
+function boot(opts: { auth: boolean; loggedIn?: boolean; unreachable?: boolean; profile?: MockProfile }) {
   const controller = new MockController({ auth: opts.auth });
   const calls: RecordedCall[] = [];
 
   if (opts.auth && !opts.unreachable) {
-    window.ethpandaops = { authenticatoor: fakeAuthenticatoor(opts.loggedIn ?? false) };
+    window.ethpandaops = { authenticatoor: fakeAuthenticatoor(opts.loggedIn ?? false, opts.profile ?? 'staff') };
   }
 
   const auth = new AuthStore(() => Promise.reject(new Error('cannot load client-v2.js')));
@@ -27,17 +27,21 @@ function boot(opts: { auth: boolean; loggedIn?: boolean; unreachable?: boolean }
   return { calls, userCalls, user: userEvent.setup() };
 }
 
+// The tabs of the page; a view may have tabs of its own.
+const tabNames = () =>
+  within(screen.getByRole('tablist', { name: 'Views' }))
+    .getAllByRole('tab')
+    .map(t => t.textContent);
+
 describe('App in public mode (auth configured, logged out)', () => {
-  it('never calls an authenticated endpoint, whatever tab is opened', async () => {
+  it('offers only the public views and never calls an authenticated endpoint', async () => {
     const { calls, userCalls, user } = boot({ auth: true, loggedIn: false });
 
     await screen.findByRole('region', { name: 'Network gate' });
     expect(screen.getByRole('button', { name: 'Login' })).toBeInTheDocument();
 
-    for (const name of TABS) {
-      await user.click(screen.getByRole('tab', { name: new RegExp(name) }));
-      expect(screen.getByRole('tabpanel')).toHaveTextContent('only served to logged-in users');
-    }
+    // What needs a login is not in the menu.
+    expect(tabNames()).toEqual(['Overview', 'Hosts']);
 
     await user.click(screen.getByRole('tab', { name: 'Hosts' }));
     await screen.findByRole('table', { name: 'Hosts' });
@@ -47,7 +51,22 @@ describe('App in public mode (auth configured, logged out)', () => {
     expect(calls.every(c => c.authorization === null)).toBe(true);
   });
 
-  it('shows the private views after a login and hides them again after logout', async () => {
+  it('opens the overview for the URL of a tab that is not offered', async () => {
+    window.location.hash = '#settings';
+    const { userCalls } = boot({ auth: true, loggedIn: false });
+
+    await screen.findByRole('region', { name: 'Network gate' });
+
+    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.queryByRole('form', { name: 'Settings' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
+    await waitFor(() => {
+      expect(window.location.hash).toBe('#overview');
+    });
+    expect(userCalls()).toEqual([]);
+  });
+
+  it('shows the private views after a login and takes them away again after logout', async () => {
     const { userCalls, user } = boot({ auth: true, loggedIn: false });
     await screen.findByRole('region', { name: 'Network gate' });
     expect(screen.queryByRole('region', { name: 'In progress' })).not.toBeInTheDocument();
@@ -56,6 +75,9 @@ describe('App in public mode (auth configured, logged out)', () => {
 
     expect(await screen.findByText('mock-user@example.org')).toBeInTheDocument();
     await screen.findByRole('region', { name: 'In progress' });
+    // The mock logs in staff: every tab, the settings included.
+    expect(tabNames()).toEqual(TABS);
+
     await user.click(screen.getByRole('tab', { name: 'Hosts' }));
     await screen.findByRole('columnheader', { name: /Kernel/ });
     expect(userCalls().length).toBeGreaterThan(0);
@@ -64,25 +86,70 @@ describe('App in public mode (auth configured, logged out)', () => {
     await user.click(screen.getByRole('tab', { name: 'Rollouts' }));
     expect(await screen.findByRole('heading', { name: /Open rollouts \(4\)/ })).toBeInTheDocument();
 
+    // The login ends while a private tab is shown: the overview, and no error.
     await user.click(screen.getByRole('button', { name: 'Logout' }));
 
-    expect(await screen.findByRole('tabpanel')).toHaveTextContent('only served to logged-in users');
+    await waitFor(() => {
+      expect(tabNames()).toEqual(['Overview', 'Hosts']);
+    });
+    expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+    expect(await screen.findByRole('region', { name: 'Network gate' })).toBeInTheDocument();
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument();
     expect(within(screen.getByRole('banner')).getByRole('button', { name: 'Login' })).toBeInTheDocument();
-    expect(within(screen.getByRole('tabpanel')).getByRole('button', { name: 'Login' })).toBeInTheDocument();
   });
 
   it('reports an unreachable auth provider and stays public', async () => {
     vi.spyOn(console, 'error').mockImplementation(() => undefined);
-    const { userCalls, user } = boot({ auth: true, unreachable: true });
+    const { userCalls } = boot({ auth: true, unreachable: true });
 
     await screen.findByRole('region', { name: 'Network gate' });
 
     expect(screen.getByText('auth provider unreachable')).toBeInTheDocument();
     expect(screen.queryByRole('button', { name: 'Login' })).not.toBeInTheDocument();
-
-    await user.click(screen.getByRole('tab', { name: /Audit/ }));
-    expect(screen.getByRole('alert')).toHaveTextContent('The auth provider is unreachable');
+    expect(tabNames()).toEqual(['Overview', 'Hosts']);
     expect(userCalls()).toEqual([]);
+  });
+});
+
+describe('the menu of a login', () => {
+  // Who the mock's fake auth client is logged in as: staff holds every
+  // feature, a team member the team features, a reader none.
+  const cases: [MockProfile, string[]][] = [
+    ['staff', ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Settings', 'Audit']],
+    ['team', ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Audit']],
+    ['reader', ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Audit']],
+  ];
+
+  it.each(cases)('offers a %s login the tabs it can use', async (profile, tabs) => {
+    window.location.hash = '#settings';
+    boot({ auth: true, loggedIn: true, profile });
+
+    await screen.findByText('mock-user@example.org');
+    await waitFor(() => {
+      expect(tabNames()).toEqual(tabs);
+    });
+
+    if (tabs.includes('Settings')) {
+      // Only who may change the settings is shown them.
+      expect(await screen.findByRole('form', { name: 'Settings' })).toBeInTheDocument();
+    } else {
+      expect(await screen.findByRole('region', { name: 'In progress' })).toBeInTheDocument();
+      expect(screen.getByRole('tab', { name: 'Overview' })).toHaveAttribute('aria-selected', 'true');
+      expect(screen.queryByRole('form', { name: 'Settings' })).not.toBeInTheDocument();
+    }
+  });
+
+  it('decides by what the login may do', () => {
+    expect(visibleTabs({ priv: false, admin: false })).toEqual(['overview', 'hosts']);
+    expect(visibleTabs({ priv: true, admin: false })).toEqual([
+      'overview',
+      'hosts',
+      'clients',
+      'rollouts',
+      'packages',
+      'audit',
+    ]);
+    expect(visibleTabs({ priv: true, admin: true })).toHaveLength(7);
   });
 });
 
@@ -113,6 +180,8 @@ describe('App in open mode (no auth provider)', () => {
     await user.keyboard('{ArrowRight}');
     expect(window.location.hash).toBe('#hosts');
     await screen.findByRole('table', { name: 'Hosts' });
+    await user.keyboard('{ArrowRight}');
+    expect(window.location.hash).toBe('#clients');
     await user.keyboard('{ArrowRight}');
 
     const rollouts = screen.getByRole('tab', { name: 'Rollouts' });

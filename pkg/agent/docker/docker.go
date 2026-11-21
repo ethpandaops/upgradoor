@@ -61,16 +61,13 @@
 //   - Anonymous volumes are re-attached by name through HostConfig.Mounts
 //     so their data survives (Ansible itself would start with empty ones).
 //     From then on Docker treats them as named: "docker rm -v" keeps them.
-//   - A fixed MAC address is kept for the network the container was
-//     created on (Docker 25 or newer). Fixed MAC addresses of networks
-//     connected later are not reported by the daemon and are lost.
+//   - A fixed MAC address is not kept: the replacement gets a generated
+//     one.
 //   - The log driver, IPC mode, cgroup namespace mode, runtime and the
 //     masked and read-only paths are reported with the daemon defaults
 //     filled in and are passed on as such.
-//   - Containers created with auto-remove are refused.
-//   - Credential helpers (credsStore, credHelpers) are not run; only
-//     credentials stored in the "auths" section of the Docker config file
-//     are used for pulls.
+//   - Containers created with auto-remove and containers with links
+//     (--link) are refused, before anything is stopped.
 package docker
 
 import (
@@ -78,6 +75,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"slices"
 	"sort"
 	"strings"
 	"sync"
@@ -93,11 +91,6 @@ import (
 )
 
 var _ agent.ContainerRuntime = (*Runtime)(nil)
-
-// legacyInspectVersion is the newest API version whose container inspect
-// still has Config.MacAddress, the only place where the daemon tells a
-// user-specified MAC address from a generated one.
-const legacyInspectVersion = "1.51"
 
 // engine is the part of the Docker Engine API client the runtime uses.
 type engine interface {
@@ -134,7 +127,6 @@ type engine interface {
 	NetworkConnect(
 		ctx context.Context, networkID string, options client.NetworkConnectOptions,
 	) (client.NetworkConnectResult, error)
-	ClientVersion() string
 	Close() error
 }
 
@@ -142,9 +134,7 @@ type engine interface {
 type Runtime struct {
 	log    logrus.FieldLogger
 	engine engine
-	// legacy speaks legacyInspectVersion; nil when unavailable.
-	legacy   engine
-	authFile string
+	login  Login
 
 	// recreateMu serialises Recreate and the recovery of interrupted ones.
 	recreateMu sync.Mutex
@@ -156,25 +146,15 @@ type Runtime struct {
 	pulled   map[string]string
 }
 
-// Option configures a Runtime.
-type Option func(*Runtime)
-
-// WithAuthFile sets the Docker config file (config.json) that holds the
-// registry credentials used for pulls. A missing file means anonymous
-// pulls. Without this option the file is $DOCKER_CONFIG/config.json or
-// ~/.docker/config.json.
-func WithAuthFile(path string) Option {
-	return func(r *Runtime) {
-		if path != "" {
-			r.authFile = path
-		}
-	}
-}
+// Login returns the login for a registry host (as agent.Reference.Host
+// spells it); ok is false when there is none.
+type Login func(registryHost string) (username, password string, ok bool)
 
 // New returns a Runtime for the daemon at host (for example
 // unix:///var/run/docker.sock). It does not connect; the API version is
-// negotiated with the daemon on the first request.
-func New(log logrus.FieldLogger, host string, opts ...Option) (*Runtime, error) {
+// negotiated with the daemon on the first request. Images of a registry
+// login knows are pulled with that login, all others anonymously (nil: all).
+func New(log logrus.FieldLogger, host string, login Login) (*Runtime, error) {
 	if log == nil {
 		return nil, errors.New("docker: logger is required")
 	}
@@ -189,45 +169,22 @@ func New(log logrus.FieldLogger, host string, opts ...Option) (*Runtime, error) 
 	}
 
 	r := &Runtime{
-		log:      log.WithField("package", "docker"),
-		engine:   cli,
-		authFile: defaultAuthFile(),
-		pulled:   make(map[string]string, 8),
-	}
-
-	legacy, err := client.New(
-		client.WithHost(host),
-		client.WithUserAgent("upgradoor-agent"),
-		client.WithAPIVersion(legacyInspectVersion),
-	)
-	if err != nil {
-		r.log.WithError(err).Warn("No legacy API client, fixed MAC addresses will not be kept")
-	} else {
-		r.legacy = legacy
-	}
-
-	for _, opt := range opts {
-		opt(r)
+		log:    log.WithField("package", "docker"),
+		engine: cli,
+		login:  login,
+		pulled: make(map[string]string, 8),
 	}
 
 	return r, nil
 }
 
-// Close releases the connections to the daemon.
+// Close releases the connection to the daemon.
 func (r *Runtime) Close() error {
-	var errs []error
-
 	if err := r.engine.Close(); err != nil {
-		errs = append(errs, fmt.Errorf("close docker client: %w", err))
+		return fmt.Errorf("close docker client: %w", err)
 	}
 
-	if r.legacy != nil {
-		if err := r.legacy.Close(); err != nil {
-			errs = append(errs, fmt.Errorf("close legacy docker client: %w", err))
-		}
-	}
-
-	return errors.Join(errs...)
+	return nil
 }
 
 // Observe implements agent.ContainerRuntime.
@@ -316,6 +273,8 @@ func (r *Runtime) describe(
 
 	if ctr.Config != nil {
 		out.Image = ctr.Config.Image
+		out.Command = slices.Clone(ctr.Config.Cmd)
+		out.Base = agent.BaseFromLabels(ctr.Config.Labels)
 	}
 
 	if ctr.State != nil {
@@ -334,8 +293,9 @@ func (r *Runtime) describe(
 	if img != nil {
 		out.Digest = r.digestOf(out.Image, img)
 
+		out.Revision = revisionOf(img)
+
 		if img.Config != nil {
-			out.Revision = img.Config.Labels[labelImageRevision]
 			out.Version = img.Config.Labels[labelImageVersion]
 		}
 	}
@@ -394,18 +354,27 @@ func (r *Runtime) digestOf(ref string, img *client.ImageInspectResult) string {
 
 func pulledKey(repo, imageID string) string { return repo + "\x00" + imageID }
 
-// LocalDigest implements agent.ContainerRuntime.
-func (r *Runtime) LocalDigest(ctx context.Context, ref string) (string, error) {
-	if _, err := repositoryOf(ref); err != nil {
-		return "", err
+// LocalImage implements agent.ContainerRuntime.
+func (r *Runtime) LocalImage(ctx context.Context, ref string) (digest, revision string, err error) {
+	if _, err = repositoryOf(ref); err != nil {
+		return "", "", err
 	}
 
 	img, err := r.inspectImage(ctx, ref)
 	if err != nil || img == nil {
-		return "", err
+		return "", "", err
 	}
 
-	return r.digestOf(ref, img), nil
+	return r.digestOf(ref, img), revisionOf(img), nil
+}
+
+// revisionOf returns the revision label of an image, "" when it has none.
+func revisionOf(img *client.ImageInspectResult) string {
+	if img.Config == nil {
+		return ""
+	}
+
+	return img.Config.Labels[labelImageRevision]
 }
 
 // Stop implements agent.ContainerRuntime.

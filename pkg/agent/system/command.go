@@ -22,14 +22,13 @@ const (
 	cmdDpkgQuery = "dpkg-query"
 	cmdDpkg      = "dpkg"
 	cmdAptGet    = "apt-get"
-	cmdAptCache  = "apt-cache"
-	cmdUname     = "uname"
 	cmdSystemctl = "systemctl"
 )
 
 const (
-	// maxCommandStdout bounds the captured standard output of one command.
-	// A dpkg-query listing of a large host is well below 1 MiB.
+	// maxCommandStdout bounds the captured standard output of one command,
+	// far above what any of them prints: a dpkg-query listing of a large
+	// host is well below 1 MiB.
 	maxCommandStdout = 64 << 20
 	// maxCommandErrorOutput is how much of a failed command's combined
 	// output ends up in the error.
@@ -100,7 +99,7 @@ func (e *CommandError) Unwrap() error {
 // systemctl is limited to the single invocation "systemctl reboot".
 func commandAllowed(name string, args []string) bool {
 	switch name {
-	case cmdDpkgQuery, cmdDpkg, cmdAptGet, cmdAptCache, cmdUname:
+	case cmdDpkgQuery, cmdDpkg, cmdAptGet:
 		return true
 	case cmdSystemctl:
 		return slices.Equal(args, []string{"reboot"})
@@ -138,7 +137,7 @@ func (execRunner) Run(ctx context.Context, name string, args ...string) ([]byte,
 		combined = &tailBuffer{limit: maxCommandErrorOutput}
 	)
 
-	// path is one of six fixed programs resolved in fixed directories and
+	// path is one of four fixed programs resolved in fixed directories and
 	// args is an argument vector; nothing goes through a shell.
 	cmd := exec.CommandContext(ctx, path, args...)
 	cmd.Env = commandEnv

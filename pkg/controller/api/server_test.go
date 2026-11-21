@@ -4,7 +4,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -163,35 +162,8 @@ func TestAPIHeaders(t *testing.T) {
 	req.Header.Set("Access-Control-Request-Method", "POST")
 
 	rec := h.serve(req)
-	assert.Equal(t, http.StatusMethodNotAllowed, rec.Code)
+	assert.Equal(t, http.StatusNotFound, rec.Code)
 	assert.Empty(t, rec.Header().Get("Access-Control-Allow-Origin"))
-}
-
-func TestMethodChecks(t *testing.T) {
-	h := newHarness(t, nil)
-
-	tests := []struct {
-		method string
-		path   string
-		allow  string
-	}{
-		{method: http.MethodPost, path: "/api/v1/config", allow: "GET"},
-		{method: http.MethodDelete, path: "/api/v1/public/hosts", allow: "GET"},
-		{method: http.MethodPost, path: "/api/v1/hosts", allow: "GET"},
-		{method: http.MethodDelete, path: "/api/v1/hosts/lighthouse-geth-1", allow: "GET"},
-		{method: http.MethodPost, path: "/api/v1/settings", allow: "GET, PUT"},
-		{method: http.MethodPut, path: "/api/v1/actions/forget", allow: "POST"},
-		{method: http.MethodPost, path: "/metrics", allow: "GET"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.method+" "+tt.path, func(t *testing.T) {
-			rec := h.sendJSON(tt.method, tt.path, "{}")
-			require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
-			assert.Equal(t, tt.allow, rec.Header().Get("Allow"))
-			assert.Empty(t, h.sched.recorded())
-		})
-	}
 }
 
 func TestWebUI(t *testing.T) {
@@ -235,7 +207,7 @@ func TestWebUI(t *testing.T) {
 			// In the agent protocol's error shape, see TestAgentUnknownPath.
 			name: "unknown agent api path", path: "/api/agent/v2/sync", status: 404,
 			ctype: contentTypeJSON,
-			body:  `{"error":"not found","serverTime":"2026-11-14T12:00:00Z"}` + "\n",
+			body:  `{"error":"not found"}` + "\n",
 		},
 		{
 			name: "api prefix alone", path: "/api/", status: 404,
@@ -300,7 +272,7 @@ func TestMetrics(t *testing.T) {
 	agent := validatorAgentGeneration(t, 3)
 
 	// One good sync (which also refreshes the host) and one rejected one.
-	req := syncRequest()
+	req := validatorSyncRequest()
 	req.OS.RebootRequired = true
 	req.Pending.Security = 4
 
@@ -324,13 +296,6 @@ func TestMetrics(t *testing.T) {
 		"upgradoor_hosts 3",
 		"upgradoor_hosts_stale 1",
 		"upgradoor_hosts_reboot_required 2",
-		`upgradoor_host_pending_security_updates{host="lighthouse-geth-1"} 4`,
-		`upgradoor_host_pending_security_updates{host="lighthouse-geth-2"} 4`,
-		`upgradoor_host_last_seen_timestamp_seconds{host="lighthouse-geth-1"} ` +
-			strconv.FormatFloat(float64(testEpoch.Unix()), 'g', -1, 64),
-		`upgradoor_host_validators_live{host="lighthouse-geth-1"} 90`,
-		`upgradoor_host_validators_total{host="lighthouse-geth-1"} 100`,
-		`upgradoor_host_validators_total{host="bootnode-1"} 0`,
 		"upgradoor_leases_open 1",
 		`upgradoor_rollouts{state="active"} 2`,
 		`upgradoor_rollouts{state="halted"} 0`,
@@ -346,11 +311,10 @@ func TestMetrics(t *testing.T) {
 		assert.Contains(t, body, line+"\n")
 	}
 
-	// Liveness of a host the plan knows nothing about is absent, not zero.
-	assert.NotContains(t, body, `upgradoor_host_validators_live{host="lighthouse-geth-2"}`)
-	assert.NotContains(t, body, `upgradoor_host_pending_security_updates{host="bootnode-1"}`)
+	// /metrics is unauthenticated: no host names, versions, kernels, addresses
+	// or hashes.
+	assert.NotContains(t, body, "host=")
 
-	// /metrics is unauthenticated: no versions, kernels, addresses or hashes.
 	for _, secret := range leakSecrets {
 		assert.NotContains(t, body, secret)
 	}
@@ -396,12 +360,7 @@ func TestMetricNames(t *testing.T) {
 	problems, err := testutil.GatherAndLint(h.reg)
 	require.NoError(t, err)
 
-	// upgradoor_host_validators_total is a gauge under the name the metric
-	// list of this project specifies; promlint reserves the suffix for
-	// counters. Every other metric must be clean.
-	for _, p := range problems {
-		assert.Equal(t, "upgradoor_host_validators_total", p.Metric, p.Text)
-	}
+	assert.Empty(t, problems)
 
 	count, err := testutil.GatherAndCount(h.reg)
 	require.NoError(t, err)

@@ -5,56 +5,14 @@ import (
 	"errors"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent/fakehost"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
-
-// field walks nested JSON objects.
-func field(t *testing.T, doc map[string]any, path ...string) any {
-	t.Helper()
-
-	var cur any = doc
-
-	for _, key := range path {
-		obj, ok := cur.(map[string]any)
-		require.True(t, ok, "%v: %q is not in an object", path, key)
-
-		cur, ok = obj[key]
-		require.True(t, ok, "%v: no %q", path, key)
-	}
-
-	return cur
-}
-
-// awaitNeeds waits for a sync that reports all the given needs and returns
-// them as the agent reported them, in the given order.
-func awaitNeeds(t *testing.T, e *env, ids ...string) []protocol.Need {
-	t.Helper()
-
-	req := e.ctrl.await("needs "+strings.Join(ids, ", "), func(req *protocol.SyncRequest) bool {
-		for _, id := range ids {
-			if !hasNeed(req, id) {
-				return false
-			}
-		}
-
-		return true
-	})
-
-	out := make([]protocol.Need, 0, len(ids))
-	for _, id := range ids {
-		out = append(out, findNeed(t, &req, id))
-	}
-
-	return out
-}
 
 func TestLeaseIsPersistedBeforeActing(t *testing.T) {
 	e := newEnv(t, baseScenario())
@@ -222,7 +180,7 @@ func TestDigestMismatchFailsWhenTheTagStillPointsThere(t *testing.T) {
 
 	assert.Empty(t, disruptive(e.host.Calls()))
 	assert.Equal(t, gethV1, e.host.Container("geth").Digest)
-	assert.Equal(t, fakehost.StateRunning, e.host.Container("geth").State)
+	assert.Equal(t, protocol.StateRunning, e.host.Container("geth").State)
 }
 
 func TestRollOrder(t *testing.T) {
@@ -316,7 +274,7 @@ func TestRebootOrder(t *testing.T) {
 	assert.Equal(t, "boot-1", e.host.BootID())
 
 	for _, name := range []string{"geth", "teku", "validator", "dora"} {
-		assert.Equal(t, fakehost.StateRunning, e.host.Container(name).State, name)
+		assert.Equal(t, protocol.StateRunning, e.host.Container(name).State, name)
 	}
 
 	req := e.ctrl.await("all served", func(req *protocol.SyncRequest) bool {
@@ -400,7 +358,7 @@ func TestRebootSurvivesTheAgentRestart(t *testing.T) {
 	assert.Equal(t, "boot", field(t, e.stateOnDisk(), "current", "bootId"))
 
 	for _, name := range []string{"geth", "teku", "validator"} {
-		assert.NotEqual(t, fakehost.StateRunning, e.host.Container(name).State, name+" is drained")
+		assert.NotEqual(t, protocol.StateRunning, e.host.Container(name).State, name+" is drained")
 	}
 
 	callsBefore := len(e.host.Calls())
@@ -425,7 +383,7 @@ func TestRebootSurvivesTheAgentRestart(t *testing.T) {
 		e.host.Calls()[callsBefore:])
 
 	for _, name := range []string{"geth", "teku", "validator"} {
-		assert.Equal(t, fakehost.StateRunning, e.host.Container(name).State, name)
+		assert.Equal(t, protocol.StateRunning, e.host.Container(name).State, name)
 	}
 
 	assert.Equal(t, gethV2, e.host.Container("geth").Digest)
@@ -478,7 +436,7 @@ func TestRebootThatNeverHappensFails(t *testing.T) {
 	assert.Equal(t, "boot", e.host.BootID())
 
 	for _, name := range []string{"geth", "teku", "validator"} {
-		assert.Equal(t, fakehost.StateRunning, e.host.Container(name).State, name)
+		assert.Equal(t, protocol.StateRunning, e.host.Container(name).State, name)
 	}
 }
 
@@ -521,7 +479,7 @@ func TestFailedStepStillRestartsContainers(t *testing.T) {
 		"start geth", "start teku", "start validator",
 	}, disruptive(e.host.Calls()))
 
-	assert.Equal(t, fakehost.StateRunning, e.host.Container("teku").State)
+	assert.Equal(t, protocol.StateRunning, e.host.Container("teku").State)
 	assert.Equal(t, gethV2, e.host.Container("geth").Digest, "no rollback")
 	assert.Equal(t, vcV1, e.host.Container("validator").Digest)
 
@@ -707,35 +665,14 @@ func TestOperationIsNotForgottenBeforeItWasReported(t *testing.T) {
 	e.ctrl.set(func(c *controller) { c.autoRelease = false })
 	e.host.SetRegistry(gethImage, gethV2, "")
 
-	var (
-		entered     = make(chan struct{})
-		release     = make(chan struct{})
-		enterOnce   sync.Once
-		releaseOnce sync.Once
-	)
-
-	letGo := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(letGo)
-
-	e.host.OnCall(func(call string) {
-		if strings.HasPrefix(call, "recreate geth") {
-			enterOnce.Do(func() {
-				close(entered)
-				<-release
-			})
-		}
-	})
+	entered, letGo := blockIn(e, "recreate geth")
 
 	e.start()
 
 	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2))
 	e.ctrl.grant(e.lease("lease-1", needs...))
 
-	select {
-	case <-entered:
-	case <-time.After(awaitTimeout):
-		require.FailNow(t, "the operation never started")
-	}
+	awaitParked(t, entered, "recreate geth")
 
 	var gateOnce sync.Once
 
@@ -779,39 +716,14 @@ func TestAnotherLeaseWaitsForTheCurrentOperation(t *testing.T) {
 	e.host.SetRegistry(tekuImage, tekuV2, "")
 
 	// The first operation hangs in its recreate until the test lets go.
-	var (
-		entered = make(chan struct{})
-		release = make(chan struct{})
-		once    sync.Once
-	)
-
-	e.host.OnCall(func(call string) {
-		if strings.HasPrefix(call, "recreate geth") {
-			once.Do(func() {
-				close(entered)
-				<-release
-			})
-		}
-	})
-
-	t.Cleanup(func() {
-		select {
-		case <-release:
-		default:
-			close(release)
-		}
-	})
+	entered, release := blockIn(e, "recreate geth")
 
 	e.start()
 
 	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2), protocol.ImageNeedID("teku", tekuV2))
 	e.ctrl.grant(e.lease("lease-1", needs[0]))
 
-	select {
-	case <-entered:
-	case <-time.After(awaitTimeout):
-		require.FailNow(t, "the first operation never started")
-	}
+	awaitParked(t, entered, "recreate geth")
 
 	// The controller changes its mind in the middle of it.
 	e.ctrl.grant(e.lease("lease-2", needs[1]))
@@ -831,7 +743,7 @@ func TestAnotherLeaseWaitsForTheCurrentOperation(t *testing.T) {
 	assert.Equal(t, []string{"recreate geth " + gethV2 + " start=true"}, disruptive(e.host.Calls()),
 		"the second lease is not started while the first is open")
 
-	close(release)
+	release()
 
 	// The first one finishes and is reported; only then the second runs.
 	op1 := e.ctrl.awaitFinished("lease-1")
@@ -878,31 +790,20 @@ func TestKilledOperationIsResumedAsFailed(t *testing.T) {
 	ctx, kill := context.WithCancel(t.Context())
 	defer kill()
 
-	var (
-		parked  atomic.Bool
-		inCall  = make(chan struct{})
-		release = make(chan struct{})
-	)
-
-	e.host.OnCall(func(call string) {
-		if strings.HasPrefix(call, "recreate geth") && parked.CompareAndSwap(false, true) {
-			close(inCall)
-			<-release
-		}
-	})
+	inCall, release := blockIn(e, "recreate geth")
 
 	dead := e.newAgent()
 	require.NoError(t, dead.Start(ctx))
 
 	t.Cleanup(func() {
-		close(release)
+		release()
 		require.NoError(t, dead.Stop())
 	})
 
 	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2), protocol.ImageNeedID("teku", tekuV2))
 	e.ctrl.grant(e.lease("lease-cut", needs...))
 
-	<-inCall
+	awaitParked(t, inCall, "recreate geth")
 	kill()
 
 	assert.Equal(t, "applying", field(t, e.stateOnDisk(), "current", "operation", "phase"))
@@ -910,7 +811,6 @@ func TestKilledOperationIsResumedAsFailed(t *testing.T) {
 	// Nobody knows what the cut-off step left behind. The next agent
 	// process does not guess: it fails the step, brings the containers
 	// back and reports.
-	e.host.OnCall(nil)
 	e.start()
 
 	op := e.ctrl.awaitFinished("lease-cut")
@@ -963,7 +863,7 @@ func TestStopFinishesTheDisruptiveSteps(t *testing.T) {
 	}, disruptive(e.host.Calls()))
 	assert.Equal(t, gethV2, e.host.Container("geth").Digest)
 	assert.Equal(t, tekuV2, e.host.Container("teku").Digest)
-	assert.Equal(t, fakehost.StateRunning, e.host.Container("teku").State)
+	assert.Equal(t, protocol.StateRunning, e.host.Container("teku").State)
 	assert.Equal(t, "verifying", field(t, e.stateOnDisk(), "current", "operation", "phase"))
 
 	e.host.OnCall(nil)
@@ -1032,22 +932,6 @@ func TestStopDuringTheDrainStillReboots(t *testing.T) {
 	assert.Equal(t, []string{"start geth", "start teku", "start validator"}, calls[len(calls)-3:])
 }
 
-// awaitLeaseOnDisk waits until the agent has persisted a lease.
-func awaitLeaseOnDisk(t *testing.T, e *env, id string) {
-	t.Helper()
-
-	require.Eventually(t, func() bool {
-		cur, ok := e.stateOnDisk()["current"].(map[string]any)
-		if !ok {
-			return false
-		}
-
-		lease, ok := cur["lease"].(map[string]any)
-
-		return ok && lease["id"] == id
-	}, awaitTimeout, 2*time.Millisecond)
-}
-
 // A Docker daemon that does not answer when the lease arrives is no reason
 // to report a failed operation, which would halt the rollout: the agent
 // looks again for as long as the lease is good.
@@ -1058,10 +942,7 @@ func TestHostThatCannotBeExaminedDoesNotFailTheLease(t *testing.T) {
 
 	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2))
 
-	e.host.Fail("observe", errors.New("docker daemon is restarting"))
-	e.ctrl.grant(e.lease("lease-retry", needs...))
-
-	awaitLeaseOnDisk(t, e, "lease-retry")
+	grantUnexamined(t, e, "docker daemon is restarting", e.lease("lease-retry", needs...))
 	e.ctrl.awaitSyncs(8)
 
 	for _, s := range e.ctrl.allSyncs() {
@@ -1087,12 +968,9 @@ func TestLeaseRunsOutWhileTheHostCannotBeExamined(t *testing.T) {
 
 	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2))
 
-	e.host.Fail("observe", errors.New("docker daemon is gone"))
-	e.ctrl.grant(e.lease("lease-blind", needs...))
-
 	// Let the agent look (in vain) while the lease is still good, then let
 	// the lease run out.
-	awaitLeaseOnDisk(t, e, "lease-blind")
+	grantUnexamined(t, e, "docker daemon is gone", e.lease("lease-blind", needs...))
 	e.ctrl.awaitSyncs(8)
 	e.clockOffset.Store(int64(2 * time.Minute))
 
@@ -1123,28 +1001,21 @@ func TestLeaseWithdrawnBeforeItStartedIsNotStarted(t *testing.T) {
 
 	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2), protocol.ImageNeedID("teku", tekuV2))
 
-	// The host cannot be examined: the agent holds the lease and has not
-	// started it.
-	e.host.Fail("observe", errors.New("docker daemon is restarting"))
-	e.ctrl.grant(e.lease("lease-gone", needs[0]))
-	awaitLeaseOnDisk(t, e, "lease-gone")
+	grantUnexamined(t, e, "docker daemon is restarting", e.lease("lease-gone", needs[0]))
 
 	// The controller no longer offers it.
 	e.ctrl.set(func(c *controller) { c.lease = nil })
-	e.ctrl.awaitSyncs(e.ctrl.syncCount() + 3)
+	e.ctrl.awaitSyncs(3)
 
 	// The host can be examined again, well before the lease's deadline.
 	e.host.Fail("observe", nil)
 
-	req := e.ctrl.await("the refusal", func(req *protocol.SyncRequest) bool {
-		return req.Operation != nil && req.Operation.LeaseID == "lease-gone" && req.Operation.Phase.Terminal()
-	})
-	op := req.Operation
+	op := e.ctrl.awaitFinished("lease-gone")
 
 	assert.Equal(t, protocol.PhaseDone, op.Phase)
 	assert.False(t, op.Disrupted)
-	assert.Equal(t, protocol.StepRefused, stepOf(t, *op, needs[0].ID).Status)
-	assert.Contains(t, stepOf(t, *op, needs[0].ID).Error, "no longer offered the lease")
+	assert.Equal(t, protocol.StepRefused, stepOf(t, op, needs[0].ID).Status)
+	assert.Contains(t, stepOf(t, op, needs[0].ID).Error, "no longer offered the lease")
 	assert.Empty(t, disruptive(e.host.Calls()), "nothing was touched")
 	assert.Equal(t, gethV1, e.host.Container("geth").Digest)
 
@@ -1190,25 +1061,281 @@ func TestRollStartsACrashedContainerButNotAStoppedOne(t *testing.T) {
 	assert.Equal(t, vcV2, e.host.Container("validator").Digest, "rolled all the same")
 }
 
-func TestContainerShouldRun(t *testing.T) {
+// The cancel outlives the agent process. Two images; the lease is ended
+// while the first is recreated, and the agent is stopped while it verifies.
+// The process that takes the operation up from the state file reports the
+// step that was never begun as cancelled, not as pending.
+func TestCancelIsRememberedAcrossAnAgentRestart(t *testing.T) {
+	e := newEnv(t, baseScenario())
+	e.host.SetRegistry(gethImage, gethV2, "")
+	e.host.SetRegistry(tekuImage, tekuV2, "")
+
+	entered, release := blockIn(e, "recreate geth")
+
+	ctx, sigterm := context.WithCancel(t.Context())
+	defer sigterm()
+
+	svc := e.newAgent()
+	require.NoError(t, svc.Start(ctx))
+
+	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2), protocol.ImageNeedID("teku", tekuV2))
+	e.ctrl.grant(e.lease("lease-cancel", needs...))
+
+	awaitParked(t, entered, "recreate geth")
+	cancel(t, e)
+
+	// The agent is told to stop, and the recreate ends. Stop waits for the
+	// step in progress and for the containers to be started; the verifying
+	// wait is given up.
+	sigterm()
+	release()
+	require.NoError(t, svc.Stop())
+
+	require.Equal(t, "verifying", field(t, e.stateOnDisk(), "current", "operation", "phase"))
+	require.Equal(t, true, field(t, e.stateOnDisk(), "current", "cancelled"))
+	assert.NotContains(t, strings.Join(disruptive(e.host.Calls()), "\n"), "recreate teku")
+
+	// A new process finds the operation in its state file.
+	e.start()
+
+	op := e.ctrl.awaitFinished("lease-cancel")
+
+	assert.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.Equal(t, protocol.StepDone, stepOf(t, op, needs[0].ID).Status)
+
+	step := stepOf(t, op, needs[1].ID)
+	assert.Equal(t, protocol.StepCancelled, step.Status, "not begun because of the cancel, also after a restart")
+	assert.Contains(t, step.Error, "cancelled")
+	assert.NotContains(t, strings.Join(disruptive(e.host.Calls()), "\n"), "recreate teku")
+	assert.Equal(t, tekuV1, e.host.Container("teku").Digest)
+	assertAllRunning(t, e)
+}
+
+// A person ends a lease while the agent is inside a disruptive call. That
+// call is completed and counts as done; nothing else is begun, the steps
+// that had not begun are reported cancelled, and what was stopped is started
+// again by the path that brings a host back after a failed step.
+func TestCancelDuringAnOperation(t *testing.T) {
+	const cancelled, done = protocol.StepCancelled, protocol.StepDone
+
+	var (
+		gethNeed = protocol.ImageNeedID("geth", gethV2)
+		tekuNeed = protocol.ImageNeedID("teku", tekuV2)
+		starts   = []string{"start geth", "start teku", "start validator"}
+	)
+
 	tests := []struct {
-		state string
-		code  int
-		want  bool
+		name string
+		// images are the tags that have moved; packages and reboot are the
+		// other needs of the host.
+		images   map[string]string
+		packages bool
+		reboot   bool
+		// parkAt is the call the agent is inside when the cancel arrives.
+		parkAt string
+		needs  []string
+		want   []protocol.StepStatus
+		// geth is the digest of the execution client afterwards.
+		geth  string
+		check func(t *testing.T, calls []string)
 	}{
-		{protocol.StateRunning, 0, true},
-		{protocol.StateRestarting, 0, true},
-		{protocol.StateExited, 1, true},
-		{protocol.StateDead, 2, true},
-		{protocol.StateExited, 0, false},
-		{protocol.StateExited, 137, false},
-		{protocol.StateExited, 143, false},
-		{"created", 0, false},
-		{"paused", 0, false},
+		{
+			// Two images and a reboot. The first disruptive call is the stop
+			// of the validator client ahead of the reboot: no other container
+			// is stopped, none is recreated, the host is not rebooted.
+			name:   "in the first stop of the drain",
+			images: map[string]string{gethImage: gethV2, tekuImage: tekuV2},
+			reboot: true,
+			parkAt: "stop validator",
+			needs:  []string{gethNeed, tekuNeed, protocol.RebootNeedID},
+			want:   []protocol.StepStatus{cancelled, cancelled, cancelled},
+			geth:   gethV1,
+			check: func(t *testing.T, calls []string) {
+				t.Helper()
+
+				assert.Equal(t, starts, callsAfter(calls, "stop validator"),
+					"after the call in progress the host is only brought back")
+			},
+		},
+		{
+			// Without a reboot the first disruptive call is the recreate of
+			// the execution client; the consensus client is left alone.
+			name:   "in a recreate",
+			images: map[string]string{gethImage: gethV2, tekuImage: tekuV2},
+			parkAt: "recreate geth",
+			needs:  []string{gethNeed, tekuNeed},
+			want:   []protocol.StepStatus{done, cancelled},
+			geth:   gethV2,
+			check: func(t *testing.T, calls []string) {
+				t.Helper()
+
+				joined := strings.Join(calls, "\n")
+				assert.NotContains(t, joined, "recreate teku")
+				assert.NotContains(t, joined, "stop ")
+				assert.NotContains(t, joined, "reboot")
+			},
+		},
+		{
+			// The upgrade ends; the recreate that follows it is not begun.
+			name:     "in the package upgrade, ahead of a recreate",
+			images:   map[string]string{gethImage: gethV2},
+			packages: true,
+			parkAt:   "upgrade ",
+			needs:    []string{packagesNeed().ID, gethNeed},
+			want:     []protocol.StepStatus{done, cancelled},
+			geth:     gethV1,
+			check: func(t *testing.T, calls []string) {
+				t.Helper()
+
+				assert.NotContains(t, strings.Join(calls, "\n"), "recreate")
+			},
+		},
+		{
+			// The host is drained. The upgrade ends; the reboot, which had
+			// not begun, is not issued (operation.reboot asks under the state
+			// lock), and the drained containers are started again.
+			name:     "in the package upgrade, ahead of the reboot",
+			packages: true,
+			reboot:   true,
+			parkAt:   "upgrade ",
+			needs:    []string{packagesNeed().ID, protocol.RebootNeedID},
+			want:     []protocol.StepStatus{done, cancelled},
+			geth:     gethV1,
+			check: func(t *testing.T, calls []string) {
+				t.Helper()
+
+				assert.NotContains(t, calls, "reboot")
+				assert.Equal(t, starts, callsAfter(calls, "upgrade "),
+					"after the upgrade the host is only brought back")
+			},
+		},
+		{
+			// The execution client is the last container the drain stops.
+			// That stop is completed; the upgrade is not begun
+			// (operation.applyPackages asks first), nor is the reboot.
+			name:     "between the drain and the package upgrade",
+			packages: true,
+			reboot:   true,
+			parkAt:   "stop geth",
+			needs:    []string{packagesNeed().ID, protocol.RebootNeedID},
+			want:     []protocol.StepStatus{cancelled, cancelled},
+			geth:     gethV1,
+			check: func(t *testing.T, calls []string) {
+				t.Helper()
+
+				assert.Equal(t, append([]string{"stop validator", "stop teku", "stop geth"}, starts...),
+					calls, "drained, then only brought back: no upgrade, no reboot")
+			},
+		},
+		{
+			// Nothing is left to keep from beginning: the operation ends as
+			// it would have.
+			name:   "after the last step has begun",
+			images: map[string]string{gethImage: gethV2},
+			parkAt: "recreate geth",
+			needs:  []string{gethNeed},
+			want:   []protocol.StepStatus{done},
+			geth:   gethV2,
+			check:  func(*testing.T, []string) {},
+		},
 	}
 
 	for _, tt := range tests {
-		c := protocol.Container{State: tt.state, ExitCode: tt.code}
-		assert.Equal(t, tt.want, c.ShouldRun(), "%s exit %d", tt.state, tt.code)
+		t.Run(tt.name, func(t *testing.T) {
+			sc := baseScenario()
+			sc.RebootRequired = tt.reboot
+
+			e := newEnv(t, sc)
+
+			for image, digest := range tt.images {
+				e.host.SetRegistry(image, digest, "")
+			}
+
+			if tt.packages {
+				e.host.SetUpgradable(dockerUpgrade())
+			}
+
+			entered, release := blockIn(e, tt.parkAt)
+
+			e.start()
+
+			needs := awaitNeeds(t, e, tt.needs...)
+			e.ctrl.grant(e.lease("lease-cancel", needs...))
+
+			awaitParked(t, entered, tt.parkAt)
+			cancel(t, e)
+			release()
+
+			op := e.ctrl.awaitFinished("lease-cancel")
+
+			assert.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+			assert.True(t, op.Disrupted, "the host was touched")
+
+			for i, id := range tt.needs {
+				step := stepOf(t, op, id)
+				assert.Equal(t, tt.want[i], step.Status, id)
+
+				if tt.want[i] == cancelled {
+					assert.Contains(t, step.Error, "cancelled", id)
+				}
+			}
+
+			tt.check(t, disruptive(e.host.Calls()))
+
+			assertAllRunning(t, e)
+			assert.Equal(t, tt.geth, e.host.Container("geth").Digest)
+			assert.Equal(t, tekuV1, e.host.Container("teku").Digest)
+			assert.Equal(t, "boot", e.host.BootID(), "no reboot")
+		})
 	}
+}
+
+// What the agent reports does not depend on whether it was restarted. The
+// recreate of the first of two images fails and the lease is ended while it
+// runs; the agent is stopped before it could finish (the start of the
+// execution client keeps failing until then) and a new process ends the
+// operation from the state file. The step that was never begun is reported
+// as after any failure (pending, not attempted): it is reported as cancelled
+// only when the cancel is what stopped the operation.
+func TestReportAfterAFailedStepDoesNotDependOnARestart(t *testing.T) {
+	e := newEnv(t, baseScenario())
+	e.host.SetRegistry(gethImage, gethV2, "")
+	e.host.SetRegistry(tekuImage, tekuV2, "")
+	e.host.Fail("recreate:geth", errors.New("no space left on device"))
+	e.host.Fail("start:geth", errors.New("docker daemon is restarting"))
+
+	entered, release := blockIn(e, "recreate geth")
+
+	ctx, sigterm := context.WithCancel(t.Context())
+	defer sigterm()
+
+	svc := e.newAgent()
+	require.NoError(t, svc.Start(ctx))
+
+	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2), protocol.ImageNeedID("teku", tekuV2))
+	e.ctrl.grant(e.lease("lease-cancel", needs...))
+
+	awaitParked(t, entered, "recreate geth")
+	cancel(t, e)
+
+	sigterm()
+	release()
+	require.NoError(t, svc.Stop())
+
+	require.Equal(t, "starting", field(t, e.stateOnDisk(), "current", "operation", "phase"))
+	require.Equal(t, true, field(t, e.stateOnDisk(), "current", "cancelled"))
+
+	e.host.Fail("start:geth", nil)
+	e.start()
+
+	op := e.ctrl.awaitFinished("lease-cancel")
+
+	assert.NotContains(t, strings.Join(disruptive(e.host.Calls()), "\n"), "recreate teku")
+	assert.Equal(t, protocol.PhaseFailed, op.Phase)
+	assert.Equal(t, protocol.StepFailed, stepOf(t, op, needs[0].ID).Status)
+
+	step := stepOf(t, op, needs[1].ID)
+	assert.Equal(t, protocol.StepPending, step.Status,
+		"not begun because a step failed: reported as after any failure")
+	assert.Contains(t, step.Error, "not attempted")
 }

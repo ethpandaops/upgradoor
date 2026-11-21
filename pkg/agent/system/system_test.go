@@ -188,12 +188,10 @@ func TestStatus(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, inv.Hash, status.InventoryHash)
 
-	// containerd.io is on hold: apt-cache policy is not even asked, and
-	// nothing ever runs apt-get update.
-	for _, call := range runner.recorded() {
-		assert.NotContains(t, call, "apt-cache")
-		assert.NotContains(t, call, "update")
-	}
+	// containerd.io is blocked and installed, but on hold: a full upgrade
+	// leaves it where it is, so it is no need. And nothing ever runs
+	// apt-get update for a status.
+	assert.Equal(t, []string{keyArch, keyDpkgQuery, keySimulate}, runner.recorded())
 
 	// The reboot flag is read on every call, not cached.
 	writeFile(t, root, pathRebootRequired, "*** System restart required ***\n")
@@ -265,252 +263,35 @@ func TestInventory(t *testing.T) {
 	assert.Equal(t, testRunning, again.Kernels.Installed[0])
 }
 
-// A blocked package the full upgrade leaves out (kept back) is found through
-// apt-cache policy, unless a person put it on hold.
-func TestBlockedPackageKeptBack(t *testing.T) {
-	sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-
-	unheld := strings.Replace(string(capture(t, "dpkg-query.txt")),
-		"containerd.io\t1.7.27-1\tamd64\thold ok installed",
-		"containerd.io\t1.7.27-1\tamd64\tinstall ok installed", 1)
-	runner.set(keyDpkgQuery, []byte(unheld), nil)
-	runner.set("apt-cache policy containerd.io", capture(t, "apt-cache-policy.txt"), nil)
-
-	status, err := sys.Status(t.Context())
-	require.NoError(t, err)
-
-	assert.Equal(t, protocol.Pending{Upgradable: 8, Security: 5, Blocked: 2}, status.Pending)
-	assert.Equal(t, []protocol.PackageChange{
-		{Name: "containerd.io", From: "1.7.27-1", To: "2.4.2-4~debian.13~trixie"},
-		{
-			Name: "docker-ce-cli",
-			From: "5:28.1.0-1~debian.13~trixie",
-			To:   "5:29.9.3-1~debian.13~trixie",
-		},
-	}, status.Blocked)
-
-	inv, err := sys.Inventory(t.Context())
-	require.NoError(t, err)
-	assert.Equal(t, protocol.Upgradable{
-		Name: "containerd.io", Arch: "amd64", Current: "1.7.27-1",
-		Candidate: "2.4.2-4~debian.13~trixie", Origin: "trixie/stable", Blocked: true,
-	}, inv.Upgradable[0])
-
-	// docker-ce is blocked but not installed, docker-ce-cli is already in
-	// the simulation: only containerd.io is looked up.
-	assert.Equal(t, 1, runner.count("apt-cache policy containerd.io"))
-}
-
-// A kept-back blocked package whose candidate is published in a regular
-// suite and in the security suite is a security upgrade, whichever archive
-// the version table lists first.
-func TestBlockedPackageKeptBackFromSecurity(t *testing.T) {
-	sys, runner, _ := newCaptureSystem(t, []string{"bash"})
-	runner.set("apt-cache policy bash", []byte("bash:\n"+
-		"  Installed: 5.2.37-2+b10\n"+
-		"  Candidate: 5.2.37-2+b11\n"+
-		"  Version table:\n"+
-		"     5.2.37-2+b11 500\n"+
-		"        500 http://deb.debian.org/debian trixie/main amd64 Packages\n"+
-		"        500 http://deb.debian.org/debian-security trixie-security/main amd64 Packages\n"+
-		" *** 5.2.37-2+b10 100\n"+
-		"        100 /var/lib/dpkg/status\n"), nil)
-
-	inv, err := sys.Inventory(t.Context())
-	require.NoError(t, err)
-
-	var bash []protocol.Upgradable
-
-	for _, up := range inv.Upgradable {
-		if up.Name == "bash" {
-			bash = append(bash, up)
-		}
-	}
-
-	require.Len(t, bash, 1)
-	assert.Equal(t, "5.2.37-2+b11", bash[0].Candidate)
-	assert.Equal(t, "trixie/main,trixie-security/main", bash[0].Origin)
-	assert.True(t, bash[0].Security)
-	assert.True(t, bash[0].Blocked)
-}
-
-func TestBlockedPolicyCandidateNotNewer(t *testing.T) {
-	sys, runner, _ := newCaptureSystem(t, []string{"bash"})
-
-	runner.set("apt-cache policy bash", []byte("bash:\n"+
-		"  Installed: 5.2.37-2+b10\n"+
-		"  Candidate: 5.2.37-2+b10\n"+
-		"  Version table:\n"+
-		" *** 5.2.37-2+b10 500\n"+
-		"        500 http://deb.debian.org/debian trixie/main amd64 Packages\n"+
-		"        100 /var/lib/dpkg/status\n"), nil)
-
-	status, err := sys.Status(t.Context())
-	require.NoError(t, err)
-	assert.Empty(t, status.Blocked)
-	assert.Zero(t, status.Pending.Blocked)
-	assert.Equal(t, 1, runner.count("apt-cache policy bash"))
-}
-
 func TestInvalidBlockedNamesAreDropped(t *testing.T) {
-	sys, runner, _ := newCaptureSystem(t, []string{"-oAPT::Update::Pre-Invoke::=reboot", "bash;id"})
+	sys, _, _ := newCaptureSystem(t, []string{"-oAPT::Update::Pre-Invoke::=reboot", "bash;id"})
 
 	_, err := sys.Status(t.Context())
 	require.NoError(t, err)
 	assert.Empty(t, sys.blocked)
-
-	for _, call := range runner.recorded() {
-		assert.NotContains(t, call, "apt-cache")
-	}
 }
 
-func TestKernelSelection(t *testing.T) {
-	tests := []struct {
-		name          string
-		boot          []string
-		packages      []string
-		running       string
-		wantInstalled []string
-		wantNewest    string
-	}{
-		{
-			name:          "numeric order, not lexical",
-			boot:          []string{"vmlinuz-6.12.94+deb13-amd64", "vmlinuz-6.12.107+deb13-amd64"},
-			running:       "6.12.94+deb13-amd64",
-			wantInstalled: []string{"6.12.94+deb13-amd64", "6.12.107+deb13-amd64"},
-			wantNewest:    "6.12.107+deb13-amd64",
-		},
-		{
-			name: "boot and packages are merged",
-			boot: []string{"vmlinuz-6.1.0-9-amd64", "initrd.img-6.1.0-9-amd64", "config-6.1.0-9-amd64"},
-			packages: []string{
-				"linux-image-6.1.0-9-amd64", "linux-image-6.1.0-13-amd64", "linux-image-amd64",
-				"linux-image-6.1.0-21-amd64-dbg", "linux-image-6.1.0-10-amd64-unsigned",
-				"linux-headers-6.1.0-30-amd64", "linux-image-unsigned-6.1.0-11-generic",
-			},
-			running: "6.1.0-9-amd64",
-			wantInstalled: []string{
-				"6.1.0-9-amd64", "6.1.0-10-amd64", "6.1.0-11-generic", "6.1.0-13-amd64",
-			},
-			wantNewest: "6.1.0-13-amd64",
-		},
-		{
-			name: "leftovers in /boot are not kernels",
-			boot: []string{
-				"vmlinuz-6.1.0-9-amd64", "vmlinuz-6.1.0-99-amd64.old", "vmlinuz-6.1.0-98-amd64.dpkg-tmp",
-				"vmlinuz", "vmlinuz-rescue", "System.map-6.1.0-97-amd64", "vmlinux-6.1.0-10-arm64",
-			},
-			running:       "6.1.0-9-amd64",
-			wantInstalled: []string{"6.1.0-9-amd64", "6.1.0-10-arm64"},
-			wantNewest:    "6.1.0-10-arm64",
-		},
-		{
-			name:          "ubuntu flavours",
-			boot:          []string{"vmlinuz-6.8.0-45-generic", "vmlinuz-6.8.0-100-generic"},
-			running:       "6.8.0-100-generic",
-			wantInstalled: []string{"6.8.0-45-generic", "6.8.0-100-generic"},
-			wantNewest:    "6.8.0-100-generic",
-		},
-		{
-			name:          "running kernel newer than anything installed",
-			boot:          []string{"vmlinuz-6.1.0-9-amd64"},
-			running:       "6.5.0-1-amd64",
-			wantInstalled: []string{"6.1.0-9-amd64"},
-			wantNewest:    "6.1.0-9-amd64",
-		},
-		{
-			name:          "no kernel of its own (container): the running one",
-			running:       "6.12.113+deb13-amd64",
-			wantInstalled: []string{},
-			wantNewest:    "6.12.113+deb13-amd64",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			root := t.TempDir()
-			writeFile(t, root, pathBootID, testBootID+"\n")
-			writeFile(t, root, pathUptime, "1.00 1.00\n")
-			writeFile(t, root, pathKernelRelease, tt.running+"\n")
-			writeFile(t, root, pathOSRelease, "ID=debian\n")
-
-			for _, name := range tt.boot {
-				writeFile(t, root, filepath.Join(pathBoot, name), "")
-			}
-
-			var listing strings.Builder
-
-			listing.WriteString("base-files\t13\tamd64\tinstall ok installed\n")
-
-			for _, name := range tt.packages {
-				listing.WriteString(name + "\t1.0\tamd64\tinstall ok installed\n")
-			}
-
-			runner := &fakeRunner{responses: map[string]fakeResponse{
-				keyDpkgQuery: {out: []byte(listing.String())},
-				keySimulate:  {},
-				keyArch:      {out: []byte("amd64\n")},
-			}}
-			sys := New(testLogger(), Options{Root: root, Runner: runner})
-
-			inv, err := sys.Inventory(t.Context())
-			require.NoError(t, err)
-			assert.Equal(t, tt.wantInstalled, inv.Kernels.Installed)
-			assert.Equal(t, tt.wantNewest, inv.Kernels.Newest)
-			assert.Equal(t, tt.running, inv.Kernels.Running)
-
-			status, err := sys.Status(t.Context())
-			require.NoError(t, err)
-			assert.Equal(t, tt.wantNewest, status.OS.NewestKernel)
-			assert.Equal(t, tt.running, status.OS.RunningKernel)
-		})
-	}
-}
-
-func TestKernelInstalledAfterCollectionShowsInStatus(t *testing.T) {
-	sys, _, root := newCaptureSystem(t, nil)
-
-	status, err := sys.Status(t.Context())
-	require.NoError(t, err)
-	assert.Equal(t, "6.12.107+deb13-cloud-amd64", status.OS.NewestKernel)
-
-	// unattended-upgrades installs a kernel between two inventory runs.
-	writeFile(t, root, filepath.Join(pathBoot, "vmlinuz-6.12.117+deb13-cloud-amd64"), "")
-
-	status, err = sys.Status(t.Context())
-	require.NoError(t, err)
-	assert.Equal(t, "6.12.117+deb13-cloud-amd64", status.OS.NewestKernel)
-}
-
-func TestFallbacksWithoutProcFiles(t *testing.T) {
+// /etc/os-release may be missing on a host that only has the vendor's file.
+func TestOSReleaseFallback(t *testing.T) {
 	sys, runner, root := newCaptureSystem(t, nil)
 
-	require.NoError(t, os.Remove(filepath.Join(root, pathKernelRelease)))
-	require.NoError(t, os.Rename(filepath.Join(root, pathOSRelease),
-		filepath.Join(root, "os-release.moved")))
-
-	moved, err := os.ReadFile(filepath.Join(root, "os-release.moved"))
+	content, err := os.ReadFile(filepath.Join(root, pathOSRelease))
 	require.NoError(t, err)
-	writeFile(t, root, pathOSReleaseLib, string(moved))
-
-	runner.set("uname -r", []byte("6.12.107+deb13-cloud-amd64\n"), nil)
-	runner.set(keyArch, nil, &CommandError{Name: cmdDpkg, ExitCode: 127, Err: errors.New("gone")})
-	runner.set("uname -m", []byte("aarch64\n"), nil)
+	require.NoError(t, os.Remove(filepath.Join(root, pathOSRelease)))
+	writeFile(t, root, pathOSReleaseLib, string(content))
 
 	status, err := sys.Status(t.Context())
 	require.NoError(t, err)
-	assert.Equal(t, "6.12.107+deb13-cloud-amd64", status.OS.RunningKernel)
-	assert.Equal(t, "arm64", status.OS.Arch)
 	assert.Equal(t, "debian", status.OS.ID)
 
 	// The architecture is asked once.
 	_, err = sys.Status(t.Context())
 	require.NoError(t, err)
-	assert.Equal(t, 1, runner.count("uname -m"))
+	assert.Equal(t, 1, runner.count(keyArch))
 }
 
 func TestStatusErrors(t *testing.T) {
-	for _, missing := range []string{pathBootID, pathUptime, pathOSRelease} {
+	for _, missing := range []string{pathBootID, pathUptime, pathOSRelease, pathKernelRelease} {
 		t.Run("missing "+missing, func(t *testing.T) {
 			sys, _, root := newCaptureSystem(t, nil)
 			require.NoError(t, os.Remove(filepath.Join(root, missing)))
@@ -519,6 +300,20 @@ func TestStatusErrors(t *testing.T) {
 			require.Error(t, err)
 		})
 	}
+
+	t.Run("dpkg cannot tell the architecture", func(t *testing.T) {
+		sys, runner, _ := newCaptureSystem(t, nil)
+		failure := &CommandError{Name: cmdDpkg, ExitCode: 127, Err: errors.New("gone")}
+		runner.set(keyArch, nil, failure)
+
+		_, err := sys.Status(t.Context())
+		require.ErrorIs(t, err, failure)
+
+		runner.set(keyArch, []byte("\n"), nil)
+
+		_, err = sys.Status(t.Context())
+		require.ErrorContains(t, err, "dpkg printed nothing")
+	})
 
 	t.Run("dpkg-query fails", func(t *testing.T) {
 		sys, runner, _ := newCaptureSystem(t, nil)
@@ -628,8 +423,7 @@ func TestInventoryHashStability(t *testing.T) {
 }
 
 func TestInventoryIsCachedForTheInterval(t *testing.T) {
-	runner, root := captureRunner(t), captureRoot(t)
-	sys := New(testLogger(), Options{Root: root, Runner: runner, InventoryInterval: 10 * time.Minute})
+	sys, runner, _ := newCaptureSystem(t, nil)
 
 	now := time.Date(2026, 11, 14, 10, 0, 0, 0, time.UTC)
 	sys.now = func() time.Time { return now }
@@ -646,7 +440,7 @@ func TestInventoryIsCachedForTheInterval(t *testing.T) {
 	assert.Equal(t, 1, runner.count(keySimulate))
 	assert.Equal(t, 1, runner.count(keyArch))
 
-	now = now.Add(10*time.Minute - time.Second)
+	now = now.Add(inventoryInterval - time.Second)
 
 	_, err := sys.Status(t.Context())
 	require.NoError(t, err)
@@ -672,7 +466,7 @@ func TestStaleInventoryIsServedWhenRefreshFails(t *testing.T) {
 		Name: cmdDpkgQuery, ExitCode: 2, Err: errors.New("exit status 2"),
 	})
 
-	now = now.Add(defaultInventoryInterval)
+	now = now.Add(inventoryInterval)
 
 	stale, err := sys.Inventory(t.Context())
 	require.NoError(t, err)
@@ -712,7 +506,7 @@ func TestConcurrentCallsDuringRefresh(t *testing.T) {
 	require.NoError(t, err)
 
 	clock.Lock()
-	now = now.Add(defaultInventoryInterval)
+	now = now.Add(inventoryInterval)
 	clock.Unlock()
 
 	entered, release := make(chan struct{}), make(chan struct{})
@@ -764,339 +558,6 @@ func TestConcurrentCallsDuringRefresh(t *testing.T) {
 	assert.Equal(t, 2, runner.count(keyDpkgQuery))
 }
 
-func TestUpgradePackagesRefusals(t *testing.T) {
-	tests := []struct {
-		name  string
-		names []string
-	}{
-		{"not blocked", []string{"bash"}},
-		{"one of several not blocked", []string{"docker-ce", "openssl"}},
-		{"nothing named", nil},
-		{"empty name", []string{""}},
-		{"option", []string{"--allow-downgrades"}},
-		{"short option", []string{"-y"}},
-		{"version selector", []string{"docker-ce=5:27.0.0-1"}},
-		{"release selector", []string{"docker-ce/trixie-backports"}},
-		{"architecture qualifier", []string{"docker-ce:i386"}},
-		{"removal suffix", []string{"docker-ce-"}},
-		{"shell metacharacters", []string{"docker-ce; reboot"}},
-		{"whitespace", []string{"docker-ce bash"}},
-		{"upper case", []string{"Docker-CE"}},
-		{"glob", []string{"docker-*"}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-
-			err := sys.UpgradePackages(t.Context(), tt.names)
-			require.ErrorIs(t, err, ErrPackageNotAllowed)
-			assert.Empty(t, runner.recorded(), "nothing may be executed")
-		})
-	}
-}
-
-func TestUpgradePackages(t *testing.T) {
-	sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-
-	before, err := sys.Inventory(t.Context())
-	require.NoError(t, err)
-	runner.reset()
-
-	install := keyInstall + "containerd.io docker-ce-cli"
-	runner.set(keyUpdate, []byte("Reading package lists...\n"), nil)
-	runner.set("apt-cache policy docker-ce-cli", capture(t, "apt-cache-policy.txt"), nil)
-	runner.set(install, []byte("1 upgraded, 0 newly installed, 0 to remove and 6 not upgraded.\n"), nil)
-
-	// After the upgrade dpkg and apt report the new state.
-	upgraded := strings.Replace(string(capture(t, "dpkg-query.txt")),
-		"docker-ce-cli\t5:28.1.0-1~debian.13~trixie", "docker-ce-cli\t5:29.9.3-1~debian.13~trixie", 1)
-	simulated := strings.ReplaceAll(string(capture(t, "apt-get-simulate.txt")),
-		"Inst docker-ce-cli", "Skip docker-ce-cli")
-
-	runner.mu.Lock()
-	runner.hook = func(_ context.Context, key string) {
-		if key == install {
-			// Called with the runner unlocked.
-			runner.set(keyDpkgQuery, []byte(upgraded), nil)
-			runner.set(keySimulate, []byte(simulated), nil)
-		}
-	}
-	runner.mu.Unlock()
-
-	// Duplicates collapse, order is normalised.
-	require.NoError(t, sys.UpgradePackages(t.Context(),
-		[]string{"docker-ce-cli", "containerd.io", "docker-ce-cli"}))
-
-	calls := runner.recorded()
-	require.GreaterOrEqual(t, len(calls), 5)
-	assert.Equal(t, []string{keyDpkgQuery, keyUpdate, install}, calls[:3],
-		"installed check, update, then install, nothing else")
-	assert.Equal(t, 2, runner.count(keyDpkgQuery), "inventory refreshed right after")
-
-	// The refreshed inventory is served without another collection.
-	runner.reset()
-
-	after, err := sys.Inventory(t.Context())
-	require.NoError(t, err)
-	assert.Empty(t, runner.recorded())
-	assert.NotEqual(t, before.Hash, after.Hash)
-	assert.Contains(t, after.Packages, protocol.Package{
-		Name: "docker-ce-cli", Version: "5:29.9.3-1~debian.13~trixie", Arch: "amd64",
-	})
-
-	status, err := sys.Status(t.Context())
-	require.NoError(t, err)
-	assert.Empty(t, status.Blocked)
-	assert.Equal(t, protocol.Pending{Upgradable: 6, Security: 5}, status.Pending)
-}
-
-// apt-get install takes a name it does not know for a regular expression
-// ("containerd.io" selects "containerd-io" too), so names of packages that
-// are not installed never reach apt.
-func TestUpgradePackagesNotInstalled(t *testing.T) {
-	t.Run("only not installed: apt does not run", func(t *testing.T) {
-		// docker-ce is blocked and known to apt, but not installed.
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-
-		require.NoError(t, sys.UpgradePackages(t.Context(), []string{"docker-ce"}))
-		assert.Equal(t, []string{keyDpkgQuery}, runner.recorded())
-	})
-
-	t.Run("regex-like name of a package nobody knows", func(t *testing.T) {
-		// As a regular expression "docker.ce" matches the installed
-		// "docker-ce-cli".
-		sys, runner, _ := newCaptureSystem(t, []string{"docker.ce", "docker-ce-cli"})
-
-		require.NoError(t, sys.UpgradePackages(t.Context(), []string{"docker.ce"}))
-		assert.Equal(t, []string{keyDpkgQuery}, runner.recorded())
-	})
-
-	t.Run("mixed: only the installed ones are passed to apt", func(t *testing.T) {
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-		install := keyInstall + "containerd.io docker-ce-cli"
-		runner.set(keyUpdate, nil, nil)
-		runner.set(install, []byte("done\n"), nil)
-
-		require.NoError(t, sys.UpgradePackages(t.Context(), dockerBlocked))
-
-		calls := runner.recorded()
-		require.GreaterOrEqual(t, len(calls), 3)
-		assert.Equal(t, []string{keyDpkgQuery, keyUpdate, install}, calls[:3])
-
-		for _, call := range calls {
-			if strings.HasPrefix(call, "apt-get install") {
-				assert.Equal(t, install, call)
-			}
-		}
-	})
-
-	t.Run("installed list unavailable: apt does not run", func(t *testing.T) {
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-		runner.set(keyDpkgQuery, nil, &CommandError{
-			Name: cmdDpkgQuery, ExitCode: 2, Err: errors.New("exit status 2"),
-		})
-
-		err := sys.UpgradePackages(t.Context(), []string{"docker-ce-cli"})
-		require.Error(t, err)
-		assert.NotErrorIs(t, err, ErrPackageNotAllowed)
-		assert.Equal(t, []string{keyDpkgQuery}, runner.recorded())
-	})
-}
-
-// apt-get update does not wait for the lock of the package lists, which
-// apt-daily.service holds while it runs.
-func TestUpgradePackagesListsLocked(t *testing.T) {
-	locked := func(t *testing.T) *CommandError {
-		t.Helper()
-
-		return &CommandError{
-			Name: cmdAptGet, Args: []string{"update"}, ExitCode: 100,
-			Err:    errors.New("exit status 100"),
-			Output: string(capture(t, "apt-get-update-locked.txt")),
-		}
-	}
-
-	install := keyInstall + "docker-ce-cli"
-
-	t.Run("retried until the lock is free", func(t *testing.T) {
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-		sys.listsLockRetry = time.Millisecond
-
-		runner.set(keyUpdate, nil, locked(t))
-		runner.set(install, []byte("done\n"), nil)
-
-		attempts := 0
-		runner.hook = func(_ context.Context, key string) {
-			if key != keyUpdate {
-				return
-			}
-
-			// The third attempt is the last one that finds the lock held.
-			if attempts++; attempts == 3 {
-				runner.set(keyUpdate, []byte("Reading package lists...\n"), nil)
-			}
-		}
-
-		require.NoError(t, sys.UpgradePackages(t.Context(), []string{"docker-ce-cli"}))
-		assert.Equal(t, 4, runner.count(keyUpdate))
-		assert.Equal(t, 1, runner.count(install))
-	})
-
-	t.Run("gives up after the lock wait", func(t *testing.T) {
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-		sys.listsLockRetry = time.Millisecond
-
-		var (
-			mu    sync.Mutex
-			clock = time.Now()
-		)
-
-		sys.now = func() time.Time {
-			mu.Lock()
-			defer mu.Unlock()
-
-			return clock
-		}
-
-		runner.set(keyUpdate, nil, locked(t))
-		runner.hook = func(_ context.Context, key string) {
-			if key == keyUpdate {
-				mu.Lock()
-				clock = clock.Add(aptLockTimeout / 2)
-				mu.Unlock()
-			}
-		}
-
-		err := sys.UpgradePackages(t.Context(), []string{"docker-ce-cli"})
-
-		var cmdErr *CommandError
-
-		require.ErrorAs(t, err, &cmdErr)
-		assert.Contains(t, err.Error(), "Could not get lock /var/lib/apt/lists/lock")
-		assert.Equal(t, 2, runner.count(keyUpdate))
-		assert.Zero(t, runner.count(install))
-	})
-
-	t.Run("cancelled while waiting", func(t *testing.T) {
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-		sys.listsLockRetry = time.Hour
-
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-
-		runner.set(keyUpdate, nil, locked(t))
-		runner.hook = func(_ context.Context, key string) {
-			if key == keyUpdate {
-				// The answer is still "locked"; the wait is interrupted.
-				time.AfterFunc(10*time.Millisecond, cancel)
-			}
-		}
-
-		err := sys.UpgradePackages(ctx, []string{"docker-ce-cli"})
-		require.ErrorIs(t, err, context.Canceled)
-		assert.Contains(t, err.Error(), "Could not get lock")
-		assert.Equal(t, 1, runner.count(keyUpdate))
-		assert.Zero(t, runner.count(install))
-	})
-
-	t.Run("other update failures are not retried", func(t *testing.T) {
-		assert.False(t, isListsLockError(errors.New("plain")))
-		assert.False(t, isListsLockError(&CommandError{
-			Output: "E: The repository 'http://x stable Release' is not signed.",
-		}))
-		assert.True(t, isListsLockError(locked(t)))
-	})
-}
-
-func TestUpgradePackagesFailures(t *testing.T) {
-	aptFailure := func(output string) *CommandError {
-		return &CommandError{
-			Name: cmdAptGet, ExitCode: 100, Err: errors.New("exit status 100"), Output: output,
-		}
-	}
-
-	t.Run("update fails: install is not attempted", func(t *testing.T) {
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-		runner.set(keyUpdate, nil, aptFailure("E: The repository 'http://x stable Release' is not signed."))
-
-		err := sys.UpgradePackages(t.Context(), []string{"docker-ce-cli"})
-		require.Error(t, err)
-		assert.Contains(t, err.Error(), "is not signed")
-		assert.Equal(t, 1, runner.count(keyUpdate), "not a lock failure: not retried")
-		assert.Zero(t, runner.count(keyInstall+"docker-ce-cli"))
-	})
-
-	t.Run("install fails: output in the error, inventory refreshed", func(t *testing.T) {
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-		runner.set(keyUpdate, nil, nil)
-		runner.set(keyInstall+"docker-ce-cli", nil,
-			aptFailure("dpkg: error processing package docker-ce-cli (--configure)"))
-
-		err := sys.UpgradePackages(t.Context(), []string{"docker-ce-cli"})
-
-		var cmdErr *CommandError
-
-		require.ErrorAs(t, err, &cmdErr)
-		assert.Equal(t, 100, cmdErr.ExitCode)
-		assert.Contains(t, err.Error(), "dpkg: error processing package docker-ce-cli")
-		assert.Equal(t, 2, runner.count(keyDpkgQuery))
-	})
-
-	t.Run("cancelled before start: nothing runs", func(t *testing.T) {
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-
-		ctx, cancel := context.WithCancel(t.Context())
-		cancel()
-
-		err := sys.UpgradePackages(ctx, []string{"docker-ce-cli"})
-		require.ErrorIs(t, err, context.Canceled)
-		assert.Empty(t, runner.recorded())
-	})
-
-	t.Run("cancelled during update: install is not attempted", func(t *testing.T) {
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-		runner.set(keyUpdate, nil, nil)
-
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-
-		runner.hook = func(_ context.Context, key string) {
-			if key == keyUpdate {
-				cancel()
-			}
-		}
-
-		err := sys.UpgradePackages(ctx, []string{"docker-ce-cli"})
-		require.ErrorIs(t, err, context.Canceled)
-		assert.Zero(t, runner.count(keyInstall+"docker-ce-cli"))
-	})
-
-	t.Run("cancelled during install: install is not interrupted", func(t *testing.T) {
-		sys, runner, _ := newCaptureSystem(t, dockerBlocked)
-		install := keyInstall + "docker-ce-cli"
-		runner.set(keyUpdate, nil, nil)
-		runner.set(install, []byte("done\n"), nil)
-
-		ctx, cancel := context.WithCancel(t.Context())
-		defer cancel()
-
-		var installCtxErr error
-
-		runner.hook = func(runCtx context.Context, key string) {
-			if key == install {
-				cancel()
-
-				installCtxErr = runCtx.Err()
-			}
-		}
-
-		require.NoError(t, sys.UpgradePackages(ctx, []string{"docker-ce-cli"}))
-		require.NoError(t, installCtxErr, "the install context outlives the caller's")
-		assert.Equal(t, 2, runner.count(keyDpkgQuery), "inventory refreshed although cancelled")
-	})
-}
-
 func TestReboot(t *testing.T) {
 	t.Run("accepted", func(t *testing.T) {
 		sys, runner, _ := newCaptureSystem(t, nil)
@@ -1137,13 +598,4 @@ func TestReboot(t *testing.T) {
 
 		require.Error(t, sys.Reboot(t.Context()))
 	})
-}
-
-func TestNewDefaults(t *testing.T) {
-	sys := New(testLogger(), Options{})
-
-	assert.Equal(t, "/", sys.root)
-	assert.Equal(t, defaultInventoryInterval, sys.interval)
-	assert.IsType(t, execRunner{}, sys.runner)
-	assert.Empty(t, sys.blocked)
 }

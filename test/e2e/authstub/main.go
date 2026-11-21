@@ -74,7 +74,10 @@ const clientJS = `(function () {
 // features lists the features the stub's client can answer for: the ones of
 // the controller and their team twins.
 func features() []string {
-	twinned := []string{api.FeatureRoll, api.FeatureReboot, api.FeatureHold, api.FeatureRecover}
+	twinned := []string{
+		api.FeatureRoll, api.FeatureReboot, api.FeatureHold, api.FeatureRecover,
+		api.FeatureClientPolicy, api.FeatureImageOverride, api.FeatureFlagOverride,
+	}
 	out := make([]string, 0, 2+2*len(twinned))
 	out = append(out, api.FeatureSupervise, api.FeatureAdmin)
 

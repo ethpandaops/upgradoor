@@ -2,12 +2,9 @@ package store
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/sirupsen/logrus"
-	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -126,95 +123,26 @@ func TestSettings(t *testing.T) {
 	}
 }
 
-func TestLoadSettingsIgnoresBadRows(t *testing.T) {
+// Every row is one SaveSettings wrote: anything else is an error, and the
+// defaults come back with it.
+func TestLoadSettingsRefusesBadRows(t *testing.T) {
 	ctx := context.Background()
 	defaults := fleet.DefaultSettings()
 
-	log, hook := logrustest.NewNullLogger()
-	s := startStore(t, New(log, filepath.Join(t.TempDir(), "upgradoor.db")))
+	for _, row := range []string{
+		`('notASetting', '"whatever"')`,
+		`('leaseTtl', '"not a duration"')`,
+		`('paused', 'tru')`,
+	} {
+		t.Run(row, func(t *testing.T) {
+			s := newFileStore(t)
 
-	_, err := rawDB(t, s).Exec(`
-		INSERT INTO settings (key, value) VALUES
-			('readyEpochs', '4'),
-			('removedInV2', '"whatever"'),
-			('leaseTtl', '"not a duration"'),
-			('maxFinalityLagEpochs', '"three"'),
-			('paused', 'tru'),
-			('policyImage', '"manual"')`)
-	require.NoError(t, err)
-
-	got, err := s.LoadSettings(ctx, defaults)
-	require.NoError(t, err)
-
-	want := defaults
-	want.ReadyEpochs = 4
-	want.PolicyImage = fleet.PolicyManual
-	assert.Equal(t, want, got, "good rows apply; unknown and undecodable ones leave the default")
-
-	warned := make(map[string]string, 4)
-
-	for _, entry := range hook.AllEntries() {
-		if entry.Level != logrus.WarnLevel {
-			continue
-		}
-
-		key, ok := entry.Data["key"].(string)
-		require.True(t, ok)
-
-		warned[key] = entry.Message
-	}
-
-	require.Len(t, warned, 4)
-	assert.Contains(t, warned["removedInV2"], "unknown key")
-	assert.Contains(t, warned["leaseTtl"], "invalid value")
-	assert.Contains(t, warned["maxFinalityLagEpochs"], "invalid value")
-	assert.Contains(t, warned["paused"], "invalid value")
-
-	// Saving cleans the table up: only real differences remain.
-	require.NoError(t, s.SaveSettings(ctx, defaults, got))
-	assert.Equal(t, map[string]string{"readyEpochs": "4", "policyImage": `"manual"`}, storedSettings(t, s))
-}
-
-// A value stored as soakEpochs, the former name of readyEpochs, is read as
-// readyEpochs without a warning; a stored readyEpochs wins over it; the next
-// save leaves only the new key.
-func TestLoadSettingsReadsTheFormerSoakEpochs(t *testing.T) {
-	ctx := context.Background()
-	defaults := fleet.DefaultSettings()
-
-	tests := []struct {
-		name   string
-		rows   string
-		want   uint64
-		stored map[string]string
-	}{
-		{"only the former key", `('soakEpochs', '3')`, 3, map[string]string{"readyEpochs": "3"}},
-		{"both keys", `('soakEpochs', '3'), ('readyEpochs', '2')`, 2, map[string]string{"readyEpochs": "2"}},
-		{"the former key at the default", `('soakEpochs', '1')`, 1, map[string]string{}},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			log, hook := logrustest.NewNullLogger()
-			s := startStore(t, New(log, filepath.Join(t.TempDir(), "upgradoor.db")))
-
-			_, err := rawDB(t, s).Exec(`INSERT INTO settings (key, value) VALUES ` + tt.rows)
+			_, err := rawDB(t, s).Exec(`INSERT INTO settings (key, value) VALUES ('readyEpochs', '4'), ` + row)
 			require.NoError(t, err)
-
-			for range 2 {
-				got, loadErr := s.LoadSettings(ctx, defaults)
-				require.NoError(t, loadErr)
-				assert.Equal(t, tt.want, got.ReadyEpochs)
-			}
-
-			for _, entry := range hook.AllEntries() {
-				assert.NotEqual(t, logrus.WarnLevel, entry.Level, entry.Message)
-			}
 
 			got, err := s.LoadSettings(ctx, defaults)
-			require.NoError(t, err)
-			require.NoError(t, s.SaveSettings(ctx, defaults, got))
-			assert.Equal(t, tt.stored, storedSettings(t, s))
+			require.Error(t, err)
+			assert.Equal(t, defaults, got)
 		})
 	}
 }
@@ -228,57 +156,12 @@ func TestSettingsFieldsCoverEveryField(t *testing.T) {
 	// Every field of fleet.Settings must have its own key: a field with
 	// `json:"-"` or omitempty would silently never be stored.
 	assert.ElementsMatch(t, []string{
-		"maxUnavailablePercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyEpochs", "minPeers",
+		"maxUnavailablePercent", "maxIndependentPercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyEpochs", "minPeers",
 		"leaseTtl", "hostStaleAfter", "readinessTimeout",
 		"policyImage", "policyPackages", "policyReboot", "paused",
 		"pauseAfterCanaryImage", "pauseAfterCanaryPackages", "pauseAfterCanaryReboot", "readyPeerShare",
+		"policyClients",
 	}, keysOf(fields))
-}
-
-// Settings that an earlier build stored know neither the pause after the
-// canary nor the comparison with the fleet: they load with the defaults of
-// both, which are off, and a save writes nothing for them.
-func TestSettingsOfAnEarlierBuildLoadWithTheNewDefaults(t *testing.T) {
-	ctx := context.Background()
-	defaults := fleet.DefaultSettings()
-
-	for _, backend := range backends {
-		t.Run(backend.name, func(t *testing.T) {
-			s := backend.open(t)
-
-			for key, value := range map[string]string{
-				"maxUnavailablePercent": "20", "minPeers": "5", "policyReboot": `"auto"`, "paused": "true",
-			} {
-				_, err := rawDB(t, s).Exec(`INSERT INTO settings (key, value) VALUES (?, ?)`, key, value)
-				require.NoError(t, err)
-			}
-
-			got, err := s.LoadSettings(ctx, defaults)
-			require.NoError(t, err)
-
-			assert.Equal(t, 5, got.MinPeers)
-			assert.Zero(t, got.ReadyPeerShare, "no row: the comparison stays off")
-			assert.False(t, got.PauseAfterCanaryImage)
-			assert.False(t, got.PauseAfterCanaryPackages)
-			assert.False(t, got.PauseAfterCanaryReboot)
-
-			require.NoError(t, s.SaveSettings(ctx, defaults, got))
-			assert.Len(t, storedSettings(t, s), 4)
-
-			// Turning either on is a row.
-			got.ReadyPeerShare = 0.25
-			got.PauseAfterCanaryPackages = true
-			require.NoError(t, s.SaveSettings(ctx, defaults, got))
-
-			stored := storedSettings(t, s)
-			assert.Equal(t, "0.25", stored["readyPeerShare"])
-			assert.Equal(t, "true", stored["pauseAfterCanaryPackages"])
-
-			again, err := s.LoadSettings(ctx, defaults)
-			require.NoError(t, err)
-			assert.Equal(t, got, again)
-		})
-	}
 }
 
 func keysOf[V any](m map[string]V) []string {

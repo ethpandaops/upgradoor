@@ -20,6 +20,14 @@ const (
 	// RolloutManual: a staggered roll or reboot of a selection requested by
 	// a person.
 	RolloutManual RolloutKind = "manual"
+	// RolloutLocal: what one host asks for itself: its overrides file says
+	// something else than a container runs, or a roll was requested on the
+	// host. It has one member, the host.
+	RolloutLocal RolloutKind = "local"
+	// RolloutSpec: one container moving to what agent.yaml now says (image,
+	// command line) on every host that reports the same spec: the soft
+	// deploy of a change Ansible made.
+	RolloutSpec RolloutKind = "spec"
 )
 
 // RolloutState is the lifecycle state of a rollout.
@@ -39,77 +47,19 @@ const (
 	// RolloutSuperseded: the cause changed (the tag moved to a newer digest,
 	// newer package versions appeared) before the rollout finished.
 	RolloutSuperseded RolloutState = "superseded"
-	// RolloutAborted: closed by a person. The same cause opens no new
-	// rollout until a person retries it or the cause changes.
+	// RolloutAborted: a manual rollout that a person closed.
 	RolloutAborted RolloutState = "aborted"
 )
 
-// stateClass says of one lifecycle state whether it is open. A state is
-// declared once, as a constant, and classified once, in the table of its
-// type (rolloutStates, leaseStates): Terminal and the lists of open states,
-// which the store's queries are built from, are read off that table. A state
-// that is declared and not in its table fails TestEveryStateIsClassified, so
-// a new state cannot be left out of "open" by forgetting a list.
-type stateClass[S ~string] struct {
-	State S
-	// Open: the rollout still serves hosts; the lease still holds a slot.
-	Open bool
-}
-
-// openStates lists the open states of a table, in its order.
-func openStates[S ~string](table []stateClass[S]) []S {
-	open := make([]S, 0, len(table))
-
-	for _, c := range table {
-		if c.Open {
-			open = append(open, c.State)
-		}
-	}
-
-	return open
-}
-
-// allStates lists the states of a table, in its order.
-func allStates[S ~string](table []stateClass[S]) []S {
-	all := make([]S, 0, len(table))
-
-	for _, c := range table {
-		all = append(all, c.State)
-	}
-
-	return all
-}
-
-// terminalState reports whether the table knows the state as one that is not
-// open. A state it does not know is not terminal: whatever carries it is
-// still looked at.
-func terminalState[S ~string](table []stateClass[S], s S) bool {
-	for _, c := range table {
-		if c.State == s {
-			return !c.Open
-		}
-	}
-
-	return false
-}
-
-// rolloutStates classifies every rollout state.
-var rolloutStates = []stateClass[RolloutState]{
-	{State: RolloutActive, Open: true},
-	{State: RolloutHalted, Open: true},
-	{State: RolloutCompleted},
-	{State: RolloutSuperseded},
-	{State: RolloutAborted},
-}
-
-// RolloutStates lists every rollout state, the open ones first.
-func RolloutStates() []RolloutState { return allStates(rolloutStates) }
-
 // OpenRolloutStates lists the states of a rollout that is not Terminal.
-func OpenRolloutStates() []RolloutState { return openStates(rolloutStates) }
+func OpenRolloutStates() []RolloutState {
+	return []RolloutState{RolloutActive, RolloutHalted}
+}
 
 // Terminal reports whether no further transition is possible.
-func (s RolloutState) Terminal() bool { return terminalState(rolloutStates, s) }
+func (s RolloutState) Terminal() bool {
+	return s == RolloutCompleted || s == RolloutSuperseded || s == RolloutAborted
+}
 
 // Rollout is a group of hosts that share one cause.
 type Rollout struct {
@@ -121,14 +71,22 @@ type Rollout struct {
 	//   packages:<protocol.PackagesKey>
 	//   reboot
 	//   manual:<rollout id>
+	//   local:<host>:<digest of the IDs of the host's local needs>
 	Key string `json:"key"`
 	// Title is a one-line description for people.
 	Title string `json:"title"`
 
-	// Image, Digest and Revision are set for image rollouts.
+	// Container is the container a spec rollout moves.
+	Container string `json:"container,omitempty"`
+	// Image, Digest and Revision are set for image rollouts, and for spec
+	// rollouts the image the container is recreated from.
 	Image    string `json:"image,omitempty"`
 	Digest   string `json:"digest,omitempty"`
 	Revision string `json:"revision,omitempty"`
+	// Client is the client whose image policy an image rollout answers to:
+	// the client of the container that first reported the need. Empty when
+	// that container has none; the rollout then answers to policyImage.
+	Client string `json:"client,omitempty"`
 	// Packages is set for packages rollouts.
 	Packages []protocol.PackageChange `json:"packages,omitempty"`
 
@@ -137,8 +95,9 @@ type Rollout struct {
 	Reason string `json:"reason,omitempty"`
 	// Paused stops new grants for this rollout only.
 	Paused bool `json:"paused"`
-	// PauseReason says why the scheduler paused the rollout by itself (after
-	// its canary). Empty when a person paused it, and once it is resumed.
+	// PauseReason says why the rollout is paused when it is not simply a
+	// person's pause: the scheduler paused it after its canary, or a person
+	// aborted it. Empty once it is resumed.
 	PauseReason string `json:"pauseReason,omitempty"`
 	// Approved is set by a person for a rollout whose policy is manual.
 	Approved bool `json:"approved"`
@@ -151,7 +110,7 @@ type Rollout struct {
 	// Canary is the host that goes alone until the rollout has its first
 	// success. Empty for a forced rollout, for a rollout with a single member
 	// and for a rollout whose first success came without one (a broken host
-	// that was repaired, or a repair through the closed gate).
+	// that was repaired).
 	Canary string `json:"canary,omitempty"`
 
 	CreatedBy string     `json:"createdBy"`
@@ -191,7 +150,9 @@ const (
 	HostDone HostState = "done"
 	// HostFailed: the lease failed.
 	HostFailed HostState = "failed"
-	// HostSkipped: a person skipped the host for this rollout.
+	// HostSkipped: the host is left out of this rollout: a person skipped it
+	// (RolloutHost.SkippedBy), the host was forgotten, or its agent rejected
+	// the directive of a manual rollout.
 	HostSkipped HostState = "skipped"
 )
 
@@ -203,8 +164,8 @@ func (s HostState) Settled() bool {
 // Stage is the place of a host inside a rollout: hosts the change already
 // broke go first, then one canary alone, then the rest. It is set anew in
 // every reconcile of an open rollout for the members that wait, from the
-// lease table (which hosts are broken) and Rollout.Canary; a member that was
-// served keeps the stage it was served in.
+// hosts' marks (Host.Broken) and Rollout.Canary; a member that was served
+// keeps the stage it was served in.
 type Stage int
 
 // Stages, in serving order. The zero value is no stage.
@@ -227,10 +188,13 @@ type RolloutHost struct {
 	// NeedID is the host's need served by this rollout, once reported.
 	NeedID  string `json:"needId,omitempty"`
 	LeaseID string `json:"leaseId,omitempty"`
-	// Error is the failure reason for HostFailed, the note of a skip, or, on
-	// a member that waits in the repair stage, the lease in which its host
-	// last failed ("broken since lease <id> (rollout <id>)").
-	Error     string    `json:"error,omitempty"`
+	// Error is the failure reason for HostFailed, or why a skipped host is
+	// left out.
+	Error string `json:"error,omitempty"`
+	// SkippedBy names the person who skipped the host; empty for a host the
+	// scheduler left out by itself. In a rollout of an observed cause such a
+	// skip keeps the rollout open while the host still has the need.
+	SkippedBy string    `json:"skippedBy,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
@@ -258,36 +222,26 @@ const (
 	LeaseExpired LeaseState = "expired"
 )
 
-// leaseStates classifies every lease state.
-var leaseStates = []stateClass[LeaseState]{
-	{State: LeaseGranted, Open: true},
-	{State: LeaseRunning, Open: true},
-	{State: LeaseVerifying, Open: true},
-	{State: LeaseReleased},
-	{State: LeaseFailed},
-	{State: LeaseExpired},
-}
-
-// LeaseStates lists every lease state, the open ones first.
-func LeaseStates() []LeaseState { return allStates(leaseStates) }
-
 // OpenLeaseStates lists the states in which a lease holds a slot: the ones
 // that are not Terminal.
-func OpenLeaseStates() []LeaseState { return openStates(leaseStates) }
+func OpenLeaseStates() []LeaseState {
+	return []LeaseState{LeaseGranted, LeaseRunning, LeaseVerifying}
+}
 
 // Terminal reports whether the lease no longer holds a slot.
-func (s LeaseState) Terminal() bool { return terminalState(leaseStates, s) }
+func (s LeaseState) Terminal() bool {
+	return s == LeaseReleased || s == LeaseFailed || s == LeaseExpired
+}
 
 // LeaseCancel is the mark of a lease that a person ended while it was open
-// (the end-lease action). The lease stays open and keeps its slot until it
-// ends by one of the ordinary ways.
+// (the end-lease action). The lease stays open and keeps its slot until its
+// agent reports or goes silent, and then ends as failed.
 type LeaseCancel struct {
 	At time.Time `json:"at"`
 	// By is the person, as recorded in the audit log.
 	By string `json:"by"`
 	// State is the state the lease was in when it was cancelled. It is for
-	// people (audit, UI): no decision reads it. What the end of the lease
-	// says about its host is read off the agent's final report.
+	// people (audit, UI): no decision reads it.
 	State  LeaseState `json:"state"`
 	Reason string     `json:"reason,omitempty"`
 }
@@ -316,15 +270,16 @@ type Lease struct {
 
 	// Weight is the host's validator weight at grant time; Charged is the
 	// part of it that was live at grant time, i.e. what the grant cost the
-	// budget.
+	// budget. Both are for people: no decision reads them.
 	Weight  uint64 `json:"weight"`
 	Charged uint64 `json:"charged"`
+	// Impact is the class of the lease: the heaviest impact class of the
+	// containers its needs are about, node for packages and reboots. It
+	// decides which limit the lease counts for and how readiness is judged.
+	Impact protocol.Impact `json:"impact,omitempty"`
 	// Force: readiness is not awaited; the lease is released as soon as the
 	// agent reports done.
 	Force bool `json:"force"`
-	// Repair: the lease was granted through the repair exception of a closed
-	// network gate. At most one such lease is open at a time.
-	Repair bool `json:"repair,omitempty"`
 	// GrantedBy is "scheduler" or the person behind a manual action.
 	GrantedBy string `json:"grantedBy"`
 
@@ -401,7 +356,3 @@ type AuditEntry struct {
 	// Detail is free-form JSON; for changes it has "before" and "after".
 	Detail map[string]any `json:"detail,omitempty"`
 }
-
-// HostEvent is one line of a host's history (leases and their outcome),
-// derived from the audit trail entries whose target is the host.
-type HostEvent = AuditEntry

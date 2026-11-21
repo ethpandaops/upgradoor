@@ -184,29 +184,23 @@ func (s *System) readRebootRequired() (required bool, pkgs []string, err error) 
 	return true, pkgs, nil
 }
 
-// runningKernel returns the running kernel release (uname -r).
-func (s *System) runningKernel(ctx context.Context) (string, error) {
-	if raw, err := os.ReadFile(s.path(pathKernelRelease)); err == nil {
-		if release := strings.TrimSpace(string(raw)); release != "" {
-			return release, nil
-		}
-	}
-
-	out, err := s.runner.Run(ctx, cmdUname, "-r")
+// runningKernel returns the running kernel release (what uname -r prints).
+func (s *System) runningKernel() (string, error) {
+	raw, err := os.ReadFile(s.path(pathKernelRelease))
 	if err != nil {
 		return "", fmt.Errorf("running kernel: %w", err)
 	}
 
-	release := strings.TrimSpace(string(out))
+	release := strings.TrimSpace(string(raw))
 	if release == "" {
-		return "", errors.New("running kernel: uname -r printed nothing")
+		return "", fmt.Errorf("running kernel: %s is empty", s.path(pathKernelRelease))
 	}
 
 	return release, nil
 }
 
-// architecture returns the dpkg architecture (amd64, arm64, ...), falling
-// back to the machine name from uname. The value is cached once known.
+// architecture returns the dpkg architecture (amd64, arm64, ...). The value
+// is cached once known.
 func (s *System) architecture(ctx context.Context) (string, error) {
 	s.mu.RLock()
 	arch := s.arch
@@ -217,25 +211,13 @@ func (s *System) architecture(ctx context.Context) (string, error) {
 	}
 
 	out, err := s.runner.Run(ctx, cmdDpkg, "--print-architecture")
-	if err == nil {
-		arch = strings.TrimSpace(string(out))
+	if err != nil {
+		return "", fmt.Errorf("architecture: %w", err)
 	}
 
+	arch = strings.TrimSpace(string(out))
 	if arch == "" {
-		if ctxErr := ctx.Err(); ctxErr != nil {
-			return "", fmt.Errorf("architecture: %w", ctxErr)
-		}
-
-		machine, unameErr := s.runner.Run(ctx, cmdUname, "-m")
-		if unameErr != nil {
-			return "", fmt.Errorf("architecture: %w", errors.Join(err, unameErr))
-		}
-
-		arch = debianArch(strings.TrimSpace(string(machine)))
-	}
-
-	if arch == "" {
-		return "", errors.New("architecture: dpkg and uname printed nothing")
+		return "", errors.New("architecture: dpkg printed nothing")
 	}
 
 	s.mu.Lock()
@@ -243,22 +225,4 @@ func (s *System) architecture(ctx context.Context) (string, error) {
 	s.mu.Unlock()
 
 	return arch, nil
-}
-
-// debianArch maps a uname machine name to the Debian architecture name.
-func debianArch(machine string) string {
-	switch machine {
-	case "x86_64":
-		return "amd64"
-	case "aarch64":
-		return "arm64"
-	case "armv7l":
-		return "armhf"
-	case "i686", "i586", "i386":
-		return "i386"
-	case "ppc64le":
-		return "ppc64el"
-	default:
-		return machine
-	}
 }

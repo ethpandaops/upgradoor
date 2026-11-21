@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"strings"
 	"time"
+
+	"github.com/ethpandaops/upgradoor/pkg/agent"
 )
 
 const (
@@ -68,16 +70,16 @@ func (r *Resolver) dropToken(key, value string) {
 // fetchToken follows a Bearer challenge as the distribution token
 // specification describes. The scope asked for is always pull on the one
 // repository, whatever the challenge suggests.
-func (r *Resolver) fetchToken(ctx context.Context, ref Reference, challenge map[string]string) (token, error) {
+func (r *Resolver) fetchToken(ctx context.Context, ref agent.Reference, challenge map[string]string) (token, error) {
 	realm, err := url.Parse(challenge["realm"])
 	if err != nil || realm.Host == "" {
-		return token{}, fmt.Errorf("registry: %s sent an unusable bearer realm", ref.APIHost())
+		return token{}, fmt.Errorf("registry: %s sent an unusable bearer realm", apiHost(ref))
 	}
 
 	// Credentials may travel to the realm, so it gets the transport security
 	// of the registry itself: plain http only for a plain-http registry.
 	if realm.Scheme != schemeHTTPS && (realm.Scheme != schemeHTTP || !r.isPlainHTTP(ref)) {
-		return token{}, fmt.Errorf("registry: %s sent a bearer realm that is not https", ref.APIHost())
+		return token{}, fmt.Errorf("registry: %s sent a bearer realm that is not https", apiHost(ref))
 	}
 
 	q := realm.Query()
@@ -96,8 +98,8 @@ func (r *Resolver) fetchToken(ctx context.Context, ref Reference, challenge map[
 
 	req.Header.Set("User-Agent", userAgent)
 
-	if creds, ok := r.creds[ref.Host]; ok {
-		req.Header.Set("Authorization", creds.basic())
+	if login, ok := r.logins[ref.Host]; ok {
+		req.Header.Set("Authorization", login.basic())
 	}
 
 	resp, err := r.client.Do(req)
@@ -108,7 +110,7 @@ func (r *Resolver) fetchToken(ctx context.Context, ref Reference, challenge map[
 	defer closeBody(resp)
 
 	if resp.StatusCode != http.StatusOK {
-		return token{}, &StatusError{Method: http.MethodGet, URL: realm.Host + realm.Path, Code: resp.StatusCode}
+		return token{}, &statusError{Method: http.MethodGet, URL: realm.Host + realm.Path, Code: resp.StatusCode}
 	}
 
 	body, err := readCapped(resp.Body, maxTokenBytes)

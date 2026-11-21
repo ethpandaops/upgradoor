@@ -1,61 +1,55 @@
 import { useMemo, useState, type PointerEvent } from 'react';
 
-import { list, type ParticipationPoint, type PublicHistory } from '../api/types';
+import { list, type Outage, type SlotHistory } from '../api/types';
 import { useWidth } from '../hooks/useWidth';
-import { formatDuration, formatPercent } from '../lib/format';
-import type { BarState, TimelineBar, TimelineModel, WorkKind } from '../lib/timeline';
+import { formatDuration, formatPercent, percentOf, plural } from '../lib/format';
+import {
+  buildSlotWindow,
+  packOutages,
+  slotWindowEnd,
+  type OutageBlock,
+  type OutageGroup,
+  type SlotColumn,
+  type SlotWindow,
+} from '../lib/slotHistory';
 import { cx } from './primitives';
+import { WORK_LABEL } from './status';
 
-const KIND_LABEL: Record<WorkKind, string> = {
-  image: 'Image roll',
-  packages: 'Package upgrade',
-  reboot: 'Reboot',
-};
-
-const KIND_FILL: Record<WorkKind, string> = {
+const WORK_FILL: Record<string, string> = {
   image: 'fill-series-image',
   packages: 'fill-series-packages',
   reboot: 'fill-series-reboot',
+  mixed: 'fill-series-image',
 };
 
-const KIND_STROKE: Record<WorkKind, string> = {
-  image: 'stroke-series-image',
-  packages: 'stroke-series-packages',
-  reboot: 'stroke-series-reboot',
-};
-
-const KIND_BG: Record<WorkKind, string> = {
-  image: 'bg-series-image',
-  packages: 'bg-series-packages',
-  reboot: 'bg-series-reboot',
-};
-
-const STATE_LABEL: Record<BarState, string> = {
-  done: 'finished',
-  failed: 'failed',
-  active: 'in progress',
-  planned: 'planned (estimate)',
-};
-
-const KINDS: readonly WorkKind[] = ['image', 'packages', 'reboot'];
-
-// Geometry, in CSS pixels.
-const GUTTER = 172;
-// Without lanes the gutter only holds the percent ticks.
-const PUBLIC_GUTTER = 48;
-const PAD_RIGHT = 14;
-const CHART_TOP = 22;
-const CHART_HEIGHT = 112;
-const LANES_GAP = 20;
-const ROW = 22;
-const BAR = 12;
+// Geometry, in CSS pixels. Nothing here depends on the data or on the size
+// of the fleet: the graph keeps its size while slots arrive and however many
+// hosts there are.
+const GUTTER = 72;
+const GUTTER_PUBLIC = 52;
+const PAD_RIGHT = 8;
+const CHART_TOP = 8;
+const CHART_HEIGHT = 140;
+const STRIPS_GAP = 10;
+const ROW = 18;
+const CELL = 10;
 const AXIS = 22;
-const MAX_ROWS = 14;
+const LANE = 18;
+const BLOCK = 14;
+const BAND_GAP = 6;
+/** The lanes of the two kinds of outage. They are lanes of blocks, not of hosts. */
+const LANES: Record<OutageGroup, number> = { work: 3, off: 3 };
+const LABEL_CHAR = 6.9;
+const MAX_NAMES = 8;
 
 const TICK_STEPS_MIN = [1, 2, 5, 10, 15, 30, 60, 120, 180, 360, 720];
 
-function clock(ms: number): string {
-  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+function clock(ms: number, seconds = false): string {
+  return new Date(ms).toLocaleTimeString([], {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: seconds ? '2-digit' : undefined,
+  });
 }
 
 function timeTicks(from: number, to: number, width: number): number[] {
@@ -69,147 +63,232 @@ function timeTicks(from: number, to: number, width: number): number[] {
   return ticks;
 }
 
-function percentTicks(min: number): number[] {
-  const span = 100 - min;
-  const step = span <= 10 ? 2.5 : span <= 20 ? 5 : span <= 50 ? 10 : 25;
-  const ticks: number[] = [];
-  for (let v = 100; v >= min - 1e-9; v -= step) ticks.push(v);
-  return ticks;
+/** rect is one rectangle of an SVG path. */
+function rect(x: number, y: number, w: number, h: number): string {
+  return `M${x.toFixed(2)},${y.toFixed(2)}h${w.toFixed(2)}v${h.toFixed(2)}h${(-w).toFixed(2)}z`;
 }
 
-function share(p: ParticipationPoint): number {
-  return p.total > 0 ? (p.live / p.total) * 100 : 100;
+/** The percent ticks of the participation scale, besides the gate's threshold. */
+const PERCENT_TICKS = [100, 99, 95, 75, 50, 0];
+
+/**
+ * scaleY places a participation percentage between 0 (100%) and 1 (0%). The
+ * scale is a square root of what is missing: it stretches the top, so a dip
+ * of one percent is a tenth of the height and can be seen, while the outage
+ * of a quarter of the fleet (half the height) still fits the same panel.
+ */
+function scaleY(percent: number): number {
+  return Math.sqrt(Math.min(100, Math.max(0, 100 - percent)) / 100);
 }
 
-/** pickRows keeps the rows that matter most when there are too many: running, then planned, then the latest past. */
-function pickRows(model: TimelineModel, from: number, to: number) {
-  const visible = model.rows
-    .map(r => ({ host: r.host, bars: r.bars.filter(b => b.end >= from && b.start <= to) }))
-    .filter(r => r.bars.length > 0);
-
-  if (visible.length <= MAX_ROWS) return { rows: visible, hidden: 0 };
-
-  const rank = (bars: readonly TimelineBar[]) => {
-    if (bars.some(b => b.state === 'active')) return 0;
-    const planned = bars.find(b => b.state === 'planned');
-    if (planned) return 1 + planned.start / 1e14;
-    return 3 - (bars[bars.length - 1] as TimelineBar).end / 1e14;
-  };
-  const keep = new Set(
-    [...visible]
-      .sort((a, b) => rank(a.bars) - rank(b.bars))
-      .slice(0, MAX_ROWS)
-      .map(r => r.host)
-  );
-
-  return { rows: visible.filter(r => keep.has(r.host)), hidden: visible.length - keep.size };
+function slotsLabel(c: SlotColumn): string {
+  return c.slots === 1 ? `Slot ${c.slot}` : `Slots ${c.slot}–${c.slot + c.slots - 1}`;
 }
 
 interface Hover {
   x: number;
   y: number;
-  time: number;
-  point?: ParticipationPoint;
-  bar?: TimelineBar;
+  column: number;
+  block?: OutageBlock;
+}
+
+function workLabel(block: OutageBlock): string {
+  if (block.group === 'off') return 'Offline';
+  const work = block.work;
+  return work === 'image' || work === 'packages' || work === 'reboot' ? WORK_LABEL[work] : 'Update';
+}
+
+/** blockNames are the names a block can show, and how many hosts it stands for beyond them. */
+function blockNames(block: OutageBlock): { names: string[]; more: number } {
+  const names = [...new Set(block.outages.flatMap(o => list(o.names)))].sort((a, b) =>
+    a.localeCompare(b, undefined, { numeric: true })
+  );
+  const shown = names.slice(0, MAX_NAMES);
+  return { names: shown, more: Math.max(0, block.hosts - shown.length) };
+}
+
+/** blockText is what is written in a block: the longest of its forms that fits. */
+function blockText(block: OutageBlock, width: number): string {
+  const single = block.hosts === 1 ? (block.outages[0]?.names?.[0] ?? '') : '';
+  const kind = workLabel(block).toLowerCase();
+  const forms =
+    block.hosts === 1
+      ? [
+          `${single} · ${block.failed ? `${kind} failed` : kind}`,
+          block.failed ? `✕ ${single}` : single,
+          block.failed ? '✕' : '',
+        ]
+      : block.group === 'off'
+        ? [`${block.hosts} hosts offline`, `${block.hosts} offline`, String(block.hosts)]
+        : [
+            `${kind} · ${block.hosts} hosts${block.failed ? ' · some failed' : ''}`,
+            `${kind} · ${block.hosts}`,
+            `${block.hosts} hosts`,
+            String(block.hosts),
+          ];
+
+  return forms.find(f => f.length * LABEL_CHAR + 8 <= width) ?? '';
+}
+
+function blockSummary(block: OutageBlock): string {
+  const { names, more } = blockNames(block);
+  const who = block.hosts === 1 ? (names[0] ?? 'a host') : plural(block.hosts, 'host');
+  const what = block.group === 'off' ? 'offline' : `${workLabel(block).toLowerCase()}${block.failed ? ', failed' : ''}`;
+  return `${who}: ${what}${block.hosts > 1 ? ` (${names.join(', ')}${more > 0 ? ` and ${more} more` : ''})` : ''}`;
 }
 
 /**
- * Timeline draws two panels over one time axis: the network's attestation
- * participation per epoch against the gate's threshold, and below it one lane
- * per host with its leases: finished, running and (right of "now") planned.
- * Without a model (logged out) only the participation panel is drawn.
+ * Timeline is the participation graph. One time axis, one column per slot
+ * (or per bucket of slots in a long window), the newest at the right edge:
+ *
+ *   - on top, how many of the fleet's validators that had to attest in the
+ *     slot got their attestation into a block, as a full-height column split
+ *     into attested and missed, against the gate's threshold;
+ *   - below it a strip for the blocks (a mark where a proposal was missed);
+ *   - with outages (a login), what was off, as blocks on the same axis in
+ *     two bands: hosts upgradoor was working on, and hosts that were offline
+ *     without it. A block is a span of time, not a host: blocks are packed
+ *     into a few lanes, and blocks of one kind that overlap more than fit
+ *     are one block that counts its hosts. So the graph has one height for
+ *     four hosts and for a thousand.
  */
 export function Timeline({
   history,
-  model,
+  outages,
   now,
   rangeMs,
-  futureMs,
   emptyNote = 'No participation data in this window yet',
+  onOpenHost,
 }: {
-  history: PublicHistory | undefined;
-  model: TimelineModel | undefined;
+  history: SlotHistory | undefined;
+  /** outages are the spans during which hosts were off; undefined without a login, which hides the bands. */
+  outages: readonly Outage[] | undefined;
   now: number;
   rangeMs: number;
-  futureMs: number;
-  /** emptyNote is shown in the participation panel when it has no point to draw. */
+  /** emptyNote is shown in the participation panel when it has nothing to draw. */
   emptyNote?: string;
+  /** onOpenHost is called for a click on a block of one host. */
+  onOpenHost?: (host: string) => void;
 }) {
   const [ref, width] = useWidth<HTMLDivElement>(960);
   const [hover, setHover] = useState<Hover | null>(null);
 
-  const from = now - rangeMs;
-  const to = now + (model ? futureMs : 0);
-  const plotLeft = model ? GUTTER : PUBLIC_GUTTER;
-  const plotRight = Math.max(plotLeft + 80, width - PAD_RIGHT);
-  const x = (t: number) => plotLeft + ((t - from) / (to - from)) * (plotRight - plotLeft);
-
-  const points = useMemo(
-    () =>
-      list(history?.epochs)
-        .map(p => ({ p, t: Date.parse(p.time) }))
-        .filter(d => Number.isFinite(d.t) && d.t >= from && d.t <= now),
-    [history, from, now]
+  // The window moves on by whole columns: it is rebuilt when the clock
+  // enters the next one or an answer arrives, not every second.
+  const end = slotWindowEnd(history, now);
+  const win = useMemo<SlotWindow | undefined>(
+    () => (history && end !== undefined ? buildSlotWindow(history, end, rangeMs) : undefined),
+    [history, end, rangeMs]
   );
-  const threshold = history?.minParticipationPercent;
 
-  const lowest = Math.min(threshold ?? 100, ...points.map(d => share(d.p)));
-  const yMin = Math.max(0, Math.floor((lowest - 2) / 5) * 5);
-  const y = (v: number) => CHART_TOP + ((100 - v) / (100 - yMin || 1)) * CHART_HEIGHT;
+  const bands = outages !== undefined;
+  const plotLeft = bands ? GUTTER : GUTTER_PUBLIC;
+  const plotRight = Math.max(plotLeft + 80, width - PAD_RIGHT);
+  const plotWidth = plotRight - plotLeft;
+  const count = win?.columns.length ?? 1;
+  const colWidth = plotWidth / count;
+  const startMs = win?.startMs ?? now - rangeMs;
+  const endMs = win?.endMs ?? now;
+  const x = (t: number) => plotLeft + ((t - startMs) / (endMs - startMs)) * plotWidth;
+
   const chartBottom = CHART_TOP + CHART_HEIGHT;
-
-  const picked = useMemo(() => (model ? pickRows(model, from, to) : undefined), [model, from, to]);
-  const rows = picked?.rows ?? [];
-  const lanesTop = chartBottom + LANES_GAP;
-  const lanesHeight = model ? Math.max(rows.length, 1) * ROW : 0;
-  const axisTop = model ? lanesTop + lanesHeight : chartBottom;
+  const y = (percent: number) => CHART_TOP + scaleY(percent) * CHART_HEIGHT;
+  const blocksTop = chartBottom + STRIPS_GAP;
+  const workTop = blocksTop + ROW + BAND_GAP;
+  const offTop = workTop + LANES.work * LANE + BAND_GAP;
+  const bandTop = (group: OutageGroup) => (group === 'work' ? workTop : offTop);
+  const axisTop = bands ? offTop + LANES.off * LANE + 4 : blocksTop + ROW + 4;
   const height = axisTop + AXIS;
 
-  const line = points.map((d, i) => `${i === 0 ? 'M' : 'L'}${x(d.t).toFixed(1)},${y(share(d.p)).toFixed(1)}`).join(' ');
-  const first = points[0];
-  const last = points[points.length - 1];
-  const area =
-    first && last ? `${line} L${x(last.t).toFixed(1)},${chartBottom} L${x(first.t).toFixed(1)},${chartBottom} Z` : '';
+  const layout = useMemo(
+    () => (outages ? packOutages(outages, { startMs, endMs, width: plotWidth, lanes: LANES }) : undefined),
+    [outages, startMs, endMs, plotWidth]
+  );
+  const blocks = layout?.blocks ?? [];
+
+  // Everything drawn per column is a handful of paths, built when the data
+  // or the width changes: a pointer that moves redraws the overlay only.
+  const marks = useMemo(() => {
+    const attested: string[] = [];
+    const missed: string[] = [];
+    const worst: string[] = [];
+    const quiet: string[] = [];
+    const noBlock: string[] = [];
+    if (!win) return { attested: '', missed: '', worst: '', quiet: '', noBlock: '', any: false };
+
+    const gap = colWidth >= 3 ? 1 : 0;
+    const w = Math.max(colWidth - gap, 0.5);
+    const cellTop = blocksTop + (ROW - CELL) / 2;
+    let any = false;
+
+    win.columns.forEach((c, i) => {
+      const x0 = plotLeft + i * colWidth;
+
+      if (c.recorded > 0) (c.missed > 0 ? noBlock : quiet).push(rect(x0, cellTop, w, CELL));
+      if (c.recorded === 0 || c.assigned === 0) return;
+      any = true;
+
+      // From the top: missed on average, then down to the worst slot of the
+      // column, then attested. A miss is at least two pixels high.
+      let yMean = y((c.included / c.assigned) * 100);
+      if (c.included < c.assigned) yMean = Math.max(yMean, CHART_TOP + 2);
+      let yWorst = c.worstAssigned > 0 ? y((c.worstIncluded / c.worstAssigned) * 100) : yMean;
+      yWorst = Math.min(Math.max(yWorst, yMean), chartBottom);
+
+      if (yMean > CHART_TOP) missed.push(rect(x0, CHART_TOP, w, yMean - CHART_TOP));
+      if (yWorst > yMean) worst.push(rect(x0, yMean, w, yWorst - yMean));
+      if (chartBottom > yWorst) attested.push(rect(x0, yWorst, w, chartBottom - yWorst));
+    });
+
+    return {
+      attested: attested.join(''),
+      missed: missed.join(''),
+      worst: worst.join(''),
+      quiet: quiet.join(''),
+      noBlock: noBlock.join(''),
+      any,
+    };
+    // y and blocksTop are constants of the geometry.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [win, plotLeft, colWidth]);
+
+  const threshold = history?.minParticipationPercent;
+  const hoverColumn = hover ? win?.columns[hover.column] : undefined;
+
+  const blockAt = (px: number, py: number): OutageBlock | undefined =>
+    blocks.find(b => {
+      const top = bandTop(b.group) + b.lane * LANE;
+      return py >= top && py < top + LANE && px >= plotLeft + b.x - 2 && px <= plotLeft + b.x + b.width + 2;
+    });
 
   const onMove = (e: PointerEvent<SVGSVGElement>) => {
     const box = e.currentTarget.getBoundingClientRect();
     const px = e.clientX - box.left;
     const py = e.clientY - box.top;
-    if (px < plotLeft || px > plotRight) {
+    if (!win || px < plotLeft || px >= plotRight || py > axisTop) {
       setHover(null);
       return;
     }
 
-    const time = from + ((px - plotLeft) / (plotRight - plotLeft)) * (to - from);
-    let point: ParticipationPoint | undefined;
-    let best = Infinity;
-    for (const d of points) {
-      const dist = Math.abs(d.t - time);
-      if (dist < best) {
-        best = dist;
-        point = d.p;
-      }
-    }
-    // A point further away than one epoch and a half is not "at" the pointer.
-    if (history && best > history.epochSeconds * 1500) point = undefined;
-
-    let bar: TimelineBar | undefined;
-    const row = rows[Math.floor((py - lanesTop) / ROW)];
-    if (row && py >= lanesTop) {
-      const slack = ((to - from) / (plotRight - plotLeft)) * 4;
-      bar = row.bars.find(b => time >= b.start - slack && time <= b.end + slack);
-    }
-
-    setHover({ x: px, y: py, time, point, bar });
+    const column = Math.min(count - 1, Math.floor((px - plotLeft) / colWidth));
+    setHover({ x: px, y: py, column, block: blockAt(px, py) });
   };
 
-  const summary = last
-    ? `Participation ${formatPercent(share(last.p))} in epoch ${last.p.epoch}` +
-      (model ? `; ${rows.length} hosts with work in the window` : '')
+  const latest = win?.latest;
+  const summary = latest
+    ? `Attestations: ${latest.included} of ${latest.assigned} included in ${slotsLabel(latest).toLowerCase()} (${percentOf(
+        latest.included,
+        latest.assigned
+      )})` + (bands ? `; ${blocks.length === 0 ? 'nothing is off' : plural(blocks.length, 'outage block')}` : '')
     : 'No participation data yet';
 
+  const offSlots = history?.offSlots ?? 0;
+  const offHosts = history?.outageHosts ?? 0;
+
   return (
-    <div ref={ref} className="relative">
+    // No width of its own: the graph takes the width it is given and never
+    // widens what it stands in, at any window width.
+    <div ref={ref} className="relative w-0 min-w-full">
       <svg
         role="img"
         aria-label={summary}
@@ -221,62 +300,42 @@ export function Timeline({
           setHover(null);
         }}
       >
-        {/* The future: where the bars are an estimate. */}
-        {model && (
-          <rect
-            x={x(now)}
-            y={CHART_TOP - 8}
-            width={Math.max(0, plotRight - x(now))}
-            height={axisTop - CHART_TOP + 8}
-            className="fill-surface-raised"
-          />
-        )}
-
-        {/* Participation panel */}
-        {(!model || x(now) - plotLeft > 190) && (
-          <text x={plotLeft} y={10} className="fill-muted text-xs font-medium">
-            Attestation participation
-          </text>
-        )}
-        {percentTicks(yMin).map(v => (
+        {/* Participation: percent of the attestations due in the slot. */}
+        {PERCENT_TICKS.map(v => (
           <g key={v}>
             <line x1={plotLeft} x2={plotRight} y1={y(v)} y2={y(v)} className="stroke-border" />
-            <text x={plotLeft - 8} y={y(v) + 4} textAnchor="end" className="fill-faint text-xs tabular-nums">
-              {formatPercent(v)}
-            </text>
+            {/* The threshold's label takes the place of a tick it would sit on. */}
+            {(threshold === undefined || Math.abs(y(threshold) - y(v)) > 12) && (
+              <text x={plotLeft - 8} y={y(v) + 4} textAnchor="end" className="fill-faint text-xs tabular-nums">
+                {formatPercent(v)}
+              </text>
+            )}
           </g>
         ))}
-        {threshold !== undefined && points.length > 0 && (
+        <path d={marks.attested} className="fill-accent/30" />
+        <path d={marks.worst} className="fill-danger-solid/40" />
+        <path d={marks.missed} className="fill-danger-solid" />
+        {threshold !== undefined && (
           <g>
-            <line x1={plotLeft} x2={x(now)} y1={y(threshold)} y2={y(threshold)} className="stroke-danger" />
-            <title>{`Gate threshold ${formatPercent(threshold)}`}</title>
-          </g>
-        )}
-        {area && <path d={area} className="fill-accent/10" />}
-        {line && (
-          <path
-            d={line}
-            fill="none"
-            strokeWidth={2}
-            strokeLinejoin="round"
-            strokeLinecap="round"
-            className="stroke-accent"
-          />
-        )}
-        {last && (
-          <>
-            <circle cx={x(last.t)} cy={y(share(last.p))} r={4} strokeWidth={2} className="fill-accent stroke-surface" />
+            <line
+              x1={plotLeft}
+              x2={plotRight}
+              y1={y(threshold)}
+              y2={y(threshold)}
+              strokeDasharray="5 3"
+              className="stroke-foreground"
+            />
             <text
-              x={model ? x(last.t) + 9 : x(last.t)}
-              y={model ? y(share(last.p)) + 4 : y(share(last.p)) + (y(share(last.p)) - CHART_TOP < 18 ? 18 : -9)}
-              textAnchor={model ? 'start' : 'end'}
+              x={plotLeft - 8}
+              y={y(threshold) + 4}
+              textAnchor="end"
               className="fill-foreground text-xs font-semibold tabular-nums"
             >
-              {formatPercent(share(last.p))}
+              {formatPercent(threshold)}
             </text>
-          </>
+          </g>
         )}
-        {points.length === 0 && (
+        {!marks.any && (
           <text
             x={(plotLeft + plotRight) / 2}
             y={CHART_TOP + CHART_HEIGHT / 2}
@@ -287,191 +346,171 @@ export function Timeline({
           </text>
         )}
 
-        {/* Lanes */}
-        {model && (
-          <g>
-            <text x={plotLeft} y={lanesTop - 6} className="fill-muted text-xs font-medium">
-              Host outages
-            </text>
-            <text x={plotRight} y={lanesTop - 6} textAnchor="end" className="fill-faint text-xs">
-              planned →
-            </text>
-            {rows.length === 0 && (
-              <text x={plotLeft + 4} y={lanesTop + ROW / 2 + 4} className="fill-muted text-xs">
-                No host was taken down in this window and none is planned.
-              </text>
-            )}
-            {rows.map((row, i) => {
-              const top = lanesTop + i * ROW;
-              return (
-                <g key={row.host}>
-                  <line x1={plotLeft} x2={plotRight} y1={top + ROW} y2={top + ROW} className="stroke-border" />
+        {/* Blocks: a mark where a proposal was missed. */}
+        <text x={plotLeft - 8} y={blocksTop + ROW / 2 + 4} textAnchor="end" className="fill-muted text-xs">
+          Blocks
+        </text>
+        <path d={marks.quiet} className="fill-accent/30" />
+        <path d={marks.noBlock} className="fill-danger-solid" />
+
+        {/* What was off: updates by upgradoor, and hosts that were offline without it. */}
+        {bands && (
+          <>
+            {(['work', 'off'] as const).map(group => (
+              <g key={group}>
+                <rect
+                  x={plotLeft}
+                  y={bandTop(group)}
+                  width={plotWidth}
+                  height={LANES[group] * LANE}
+                  rx={3}
+                  className="fill-surface-raised/60"
+                />
+                <text
+                  x={plotLeft - 8}
+                  y={bandTop(group) + (LANES[group] * LANE) / 2 + 4}
+                  textAnchor="end"
+                  className="fill-muted text-xs"
+                >
+                  {group === 'work' ? 'Updates' : 'Offline'}
+                </text>
+              </g>
+            ))}
+            {/* A band without a block is good news, and says so. */}
+            {win &&
+              (['work', 'off'] as const)
+                .filter(group => !blocks.some(b => b.group === group))
+                .map(group => (
                   <text
-                    x={plotLeft - 8}
-                    y={top + ROW / 2 + 4}
-                    textAnchor="end"
-                    className={cx('text-xs', hover?.bar?.host === row.host ? 'fill-foreground' : 'fill-muted')}
+                    key={group}
+                    x={(plotLeft + plotRight) / 2}
+                    y={bandTop(group) + (LANES[group] * LANE) / 2 + 4}
+                    textAnchor="middle"
+                    className="fill-success text-xs font-medium"
                   >
-                    {row.host.length > 25 ? `${row.host.slice(0, 24)}…` : row.host}
+                    {group === 'work'
+                      ? '✓ Nothing is off: no host was updated in this window'
+                      : '✓ Nothing is off: no host was offline in this window'}
                   </text>
-                  {row.bars.map(b => {
-                    const x0 = Math.max(plotLeft, x(b.start));
-                    const x1 = Math.min(plotRight, x(b.end));
-                    const w = Math.max(3, x1 - x0);
-                    const hovered = hover?.bar === b;
-                    const key = `${b.state}/${b.start}`;
-                    const yBar = top + (ROW - BAR) / 2;
-                    const name = `${row.host}: ${KIND_LABEL[b.kind]}, ${STATE_LABEL[b.state]}, ${clock(b.start)} to ${
-                      b.state === 'active' ? 'now' : clock(b.end)
-                    }`;
-                    // The label of a failed bar needs room before the next bar (a retry).
-                    const following = row.bars[row.bars.indexOf(b) + 1];
-                    const room = (following ? x(following.start) : plotRight) - (x0 + w);
+                ))}
+            {blocks.map(b => {
+              const top = bandTop(b.group) + b.lane * LANE + (LANE - BLOCK) / 2;
+              const left = plotLeft + b.x;
+              const text = blockText(b, b.width);
+              const single = b.hosts === 1 ? b.outages[0]?.names?.[0] : undefined;
+              const open = single !== undefined && onOpenHost !== undefined;
+              const fill =
+                b.group === 'off'
+                  ? 'fill-foreground/55'
+                  : b.failed
+                    ? 'fill-danger-solid'
+                    : WORK_FILL[b.work ?? 'mixed'];
 
-                    if (b.state === 'planned') {
-                      return (
-                        <rect
-                          key={key}
-                          x={x0 + 0.75}
-                          y={yBar + 0.75}
-                          width={Math.max(2, w - 1.5)}
-                          height={BAR - 1.5}
-                          rx={3}
-                          strokeWidth={1.5}
-                          className={cx(KIND_FILL[b.kind], KIND_STROKE[b.kind])}
-                          fillOpacity={hovered ? 0.4 : 0.15}
-                        >
-                          <title>{name}</title>
-                        </rect>
-                      );
-                    }
-
-                    return (
-                      <g key={key}>
-                        <rect
-                          x={x0}
-                          y={yBar}
-                          width={w}
-                          height={BAR}
-                          rx={3}
-                          opacity={b.state === 'done' && !hovered ? 0.75 : 1}
-                          className={b.state === 'failed' ? 'fill-danger-solid' : KIND_FILL[b.kind]}
-                        >
-                          <title>{name}</title>
-                        </rect>
-                        {b.state === 'failed' && room >= 64 && (
-                          <text x={x0 + w + 4} y={yBar + BAR - 2} className="fill-danger text-xs font-semibold">
-                            ✕ failed
-                          </text>
-                        )}
-                        {b.state === 'active' && (
-                          <circle
-                            cx={x0 + w}
-                            cy={yBar + BAR / 2}
-                            r={4}
-                            strokeWidth={2}
-                            className={cx(KIND_FILL[b.kind], 'animate-pulse stroke-surface')}
-                          />
-                        )}
-                      </g>
-                    );
-                  })}
+              return (
+                <g
+                  key={`${b.group}/${b.lane}/${b.x.toFixed(1)}`}
+                  role={open ? 'button' : 'img'}
+                  tabIndex={0}
+                  aria-label={blockSummary(b)}
+                  className={cx('outline-hidden', open && 'cursor-pointer')}
+                  onFocus={() => {
+                    const column = Math.min(count - 1, Math.max(0, Math.floor((b.x + b.width / 2) / colWidth)));
+                    setHover({ x: left + b.width / 2, y: top, column, block: b });
+                  }}
+                  onBlur={() => {
+                    setHover(null);
+                  }}
+                  onClick={() => {
+                    if (single && onOpenHost) onOpenHost(single);
+                  }}
+                  onKeyDown={e => {
+                    if (e.key === 'Enter' && single && onOpenHost) onOpenHost(single);
+                  }}
+                >
+                  <rect
+                    x={left}
+                    y={top}
+                    width={b.width}
+                    height={BLOCK}
+                    rx={3}
+                    className={cx(fill, hover?.block === b && 'stroke-foreground')}
+                    strokeWidth={hover?.block === b ? 1.5 : 0}
+                  />
+                  {text && (
+                    <text
+                      x={left + 5}
+                      y={top + BLOCK - 3.5}
+                      pointerEvents="none"
+                      className={cx('text-xs font-medium', b.group === 'off' ? 'fill-background' : 'fill-white')}
+                    >
+                      {text}
+                    </text>
+                  )}
                 </g>
               );
             })}
-          </g>
-        )}
-
-        {/* Now */}
-        {model && (
-          <g>
-            <line x1={x(now)} x2={x(now)} y1={CHART_TOP - 8} y2={axisTop} className="stroke-border-strong" />
-            <text x={x(now)} y={10} textAnchor="middle" className="fill-foreground text-xs font-semibold">
-              now
-            </text>
-          </g>
+          </>
         )}
 
         {/* Time axis */}
         <line x1={plotLeft} x2={plotRight} y1={axisTop} y2={axisTop} className="stroke-border-strong" />
-        {timeTicks(from, to, plotRight - plotLeft).map(t => (
+        {timeTicks(startMs, endMs, plotWidth).map(t => (
           <g key={t}>
             <line x1={x(t)} x2={x(t)} y1={axisTop} y2={axisTop + 4} className="stroke-border-strong" />
-            <text x={x(t)} y={axisTop + 16} textAnchor="middle" className="fill-faint text-xs tabular-nums">
-              {clock(t)}
-            </text>
-          </g>
-        ))}
-
-        {/* Crosshair */}
-        {hover && (
-          <g pointerEvents="none">
-            <line x1={hover.x} x2={hover.x} y1={CHART_TOP - 8} y2={axisTop} className="stroke-muted" />
-            {hover.point && (
-              <circle
-                cx={x(Date.parse(hover.point.time))}
-                cy={y(share(hover.point))}
-                r={4}
-                strokeWidth={2}
-                className="fill-accent stroke-surface"
-              />
+            {x(t) > plotLeft + 20 && x(t) < plotRight - 64 && (
+              <text x={x(t)} y={axisTop + 16} textAnchor="middle" className="fill-faint text-xs tabular-nums">
+                {clock(t)}
+              </text>
             )}
           </g>
+        ))}
+        <text x={plotRight} y={axisTop + 16} textAnchor="end" className="fill-muted text-xs font-medium">
+          now
+        </text>
+
+        {/* The column under the pointer. */}
+        {hover && !hover.block && (
+          <rect
+            pointerEvents="none"
+            x={plotLeft + hover.column * colWidth}
+            y={CHART_TOP}
+            width={Math.max(colWidth, 1)}
+            height={axisTop - CHART_TOP}
+            className="fill-foreground/15"
+          />
         )}
       </svg>
 
-      {picked !== undefined && picked.hidden > 0 && (
-        <p className="pl-43 text-xs/5 text-muted">
-          {picked.hidden} more {picked.hidden === 1 ? 'host' : 'hosts'} not shown.
+      {win && (
+        <p className="text-xs/5 text-muted">
+          {win.bucketSlots === 1
+            ? `One column is one slot (${formatDuration(win.slotMs / 1000)}).`
+            : `One column is ${win.bucketSlots} slots (${formatDuration(
+                (win.bucketSlots * win.slotMs) / 1000
+              )}): solid red is the average missed, light red reaches its worst slot.`}{' '}
+          The scale is stretched towards 100%, so a small dip shows.
+          {bands &&
+            ` A block is a span of time, not a host: blocks of one kind that overlap more than fit are one block that counts its hosts.${
+              offSlots > 0
+                ? ` Offline: a host whose validators missed attestations in ${offSlots} or more slots within an epoch of each other while upgradoor was not working on it.`
+                : ''
+            }${offHosts > 0 ? ` ${plural(offHosts, 'host')} ${offHosts === 1 ? 'was' : 'were'} off in this window.` : ''}`}
         </p>
       )}
 
-      {hover && (hover.point || hover.bar) && (
+      {hover && win && (hover.block || hoverColumn) && (
         <div
           role="tooltip"
-          className="pointer-events-none absolute z-10 flex w-60 flex-col gap-1 rounded-md border border-border-strong bg-surface p-2 text-xs/5 shadow-lg"
+          className="pointer-events-none absolute z-10 flex w-66 flex-col gap-1 rounded-md border border-border-strong bg-surface p-2 text-xs/5 shadow-lg"
           style={{
-            left: Math.max(0, hover.x + 256 > width ? hover.x - 252 : hover.x + 12),
-            top: Math.max(0, Math.min(hover.y - 12, height - 96)),
+            left: Math.max(0, hover.x + 284 > width ? hover.x - 276 : hover.x + 14),
+            top: Math.max(0, Math.min(hover.y - 12, height - 150)),
           }}
         >
-          <span className="text-muted">
-            {clock(hover.time)}
-            {hover.time > now && ` · in ${formatDuration((hover.time - now) / 1000)}`}
-          </span>
-          {hover.point && (
-            <span className="flex items-baseline gap-1.5">
-              <span aria-hidden="true" className="h-0.5 w-3 self-center rounded-full bg-accent" />
-              <span className="font-semibold">{formatPercent(share(hover.point))}</span>
-              <span className="text-muted">
-                attesting, epoch {hover.point.epoch} ({hover.point.live}/{hover.point.total})
-              </span>
-            </span>
-          )}
-          {hover.bar && (
-            <span className="flex flex-col border-t border-border pt-1">
-              <span className="flex items-center gap-1.5">
-                <span
-                  aria-hidden="true"
-                  className={cx(
-                    'size-2 rounded-xs',
-                    hover.bar.state === 'failed' ? 'bg-danger-solid' : KIND_BG[hover.bar.kind]
-                  )}
-                />
-                <span className="font-semibold">{hover.bar.host}</span>
-              </span>
-              <span>
-                {KIND_LABEL[hover.bar.kind]}, {STATE_LABEL[hover.bar.state]}
-              </span>
-              <span className="text-muted">
-                {hover.bar.state === 'planned'
-                  ? `starts about ${clock(hover.bar.start)} · now: ${hover.bar.detail}`
-                  : `${clock(hover.bar.start)} – ${hover.bar.state === 'active' ? 'now' : clock(hover.bar.end)} (${formatDuration((hover.bar.end - hover.bar.start) / 1000)})`}
-              </span>
-              {hover.bar.state !== 'planned' && (
-                <span className="whitespace-normal text-muted">{hover.bar.detail}</span>
-              )}
-            </span>
+          {hover.block ? (
+            <BlockTip block={hover.block} now={now} canOpen={onOpenHost !== undefined} />
+          ) : (
+            hoverColumn && <ColumnTip column={hoverColumn} win={win} now={now} />
           )}
         </div>
       )}
@@ -479,39 +518,175 @@ export function Timeline({
   );
 }
 
+/** BlockTip says what a block stands for: who, what, from when to when, and what it took out. */
+function BlockTip({ block, now, canOpen }: { block: OutageBlock; now: number; canOpen: boolean }) {
+  const { names, more } = blockNames(block);
+  const from = Math.min(...block.outages.map(o => Date.parse(o.from)));
+  const to = Math.max(...block.outages.map(o => Date.parse(o.to)));
+  const validators = block.outages.reduce((n, o) => n + o.validators, 0);
+  const missed = block.outages.reduce((n, o) => n + o.missed, 0);
+  const assigned = block.outages.reduce((n, o) => n + o.assigned, 0);
+  const failed = block.outages.filter(o => o.failed).reduce((n, o) => n + o.hosts, 0);
+  const before = block.outages.some(o => o.fromStart);
+
+  return (
+    <>
+      <span className="flex items-center gap-1.5">
+        <span
+          aria-hidden="true"
+          className={cx(
+            'size-2.5 shrink-0 rounded-xs',
+            block.group === 'off'
+              ? 'bg-foreground/55'
+              : block.failed
+                ? 'bg-danger-solid'
+                : (WORK_FILL[block.work ?? 'mixed'] ?? '').replace('fill-', 'bg-')
+          )}
+        />
+        <span className="font-semibold">
+          {workLabel(block)} · {block.hosts === 1 ? names[0] : plural(block.hosts, 'host')}
+        </span>
+      </span>
+      <span className="text-muted">
+        {block.group === 'off'
+          ? 'Not attesting, and upgradoor was not working on it.'
+          : block.open
+            ? 'In progress.'
+            : failed > 0
+              ? block.hosts === 1
+                ? 'Failed.'
+                : `${failed} of ${block.hosts} failed.`
+              : 'Finished.'}
+      </span>
+      <span className="tabular-nums">
+        {before ? 'before ' : ''}
+        {clock(from)} – {block.open ? 'now' : clock(to)}{' '}
+        <span className="text-muted">({formatDuration(((block.open ? now : to) - from) / 1000)})</span>
+      </span>
+      {(validators > 0 || assigned > 0) && (
+        <span>
+          {validators > 0 && `${plural(validators, 'validator')} out`}
+          {validators > 0 && assigned > 0 && ' · '}
+          {assigned > 0 && (
+            <span className={missed > 0 ? 'text-danger' : 'text-muted'}>
+              {missed} of {assigned} attestations missed
+            </span>
+          )}
+        </span>
+      )}
+      {block.hosts > 1 && (
+        <span className="border-t border-border pt-1 whitespace-normal text-muted">
+          {names.join(', ')}
+          {more > 0 && ` and ${more} more`}
+        </span>
+      )}
+      {block.hosts === 1 && canOpen && <span className="text-faint">Click to find the host in the Hosts tab.</span>}
+    </>
+  );
+}
+
+function ColumnTip({ column, win, now }: { column: SlotColumn; win: SlotWindow; now: number }) {
+  const epoch = Math.floor(column.slot / Math.max(1, win.slotsPerEpoch));
+  const lastEpoch = Math.floor((column.slot + column.slots - 1) / Math.max(1, win.slotsPerEpoch));
+  const bucketed = column.slots > 1;
+
+  return (
+    <>
+      <span className="flex flex-wrap items-baseline gap-x-1.5">
+        <span className="font-semibold">{slotsLabel(column)}</span>
+        <span className="text-muted">
+          epoch {epoch === lastEpoch ? epoch : `${epoch}–${lastEpoch}`} · {clock(column.time, true)}
+          {bucketed && `–${clock(column.time + column.slots * win.slotMs, true)}`}
+        </span>
+      </span>
+
+      {column.recorded === 0 ? (
+        <span className="text-muted">
+          {column.time + column.slots * win.slotMs > now - 3 * win.slotMs
+            ? 'Not settled yet: a slot is counted two slots after it began.'
+            : 'No data: the controller was not watching the chain.'}
+        </span>
+      ) : (
+        <>
+          {column.assigned > 0 ? (
+            <span className="flex items-baseline gap-1.5">
+              <span
+                aria-hidden="true"
+                className={cx(
+                  'size-2 shrink-0 rounded-xs',
+                  column.included < column.assigned ? 'bg-danger-solid' : 'bg-accent/30'
+                )}
+              />
+              <span>
+                <span className="font-semibold tabular-nums">
+                  {column.included} of {column.assigned}
+                </span>{' '}
+                attested ({percentOf(column.included, column.assigned)})
+                {bucketed && column.worstAssigned > 0 && (
+                  <span className="text-muted">
+                    {' '}
+                    · worst slot {column.worstIncluded} of {column.worstAssigned}
+                  </span>
+                )}
+              </span>
+            </span>
+          ) : (
+            <span className="text-muted">No attestation was due from this fleet.</span>
+          )}
+          <span className={column.missed > 0 ? 'font-medium text-danger' : 'text-muted'}>
+            {bucketed
+              ? column.missed > 0
+                ? `${column.missed} of ${column.recorded} blocks missed`
+                : `all ${column.recorded} blocks proposed`
+              : column.missed > 0
+                ? 'Block missed'
+                : 'Block proposed'}
+            {bucketed && column.recorded < column.slots && ` · ${column.slots - column.recorded} slots without data`}
+          </span>
+        </>
+      )}
+    </>
+  );
+}
+
 /**
- * TimelineLegend keys the chart: the gate's threshold and, with lanes, their
- * colours (what is done to a host) and bar styles (when).
+ * TimelineLegend keys the graph: what the two colours of a column mean, the
+ * gate's threshold and, with a login, the kinds of block below the columns.
  */
 export function TimelineLegend({ lanes, threshold }: { lanes: boolean; threshold: number | undefined }) {
+  const swatch = (className: string, label: string) => (
+    <li key={label} className="inline-flex items-center gap-1.5">
+      <span aria-hidden="true" className={cx('h-2.5 w-4 rounded-xs', className)} />
+      {label}
+    </li>
+  );
+
   return (
     <ul aria-label="Legend" className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs/5 text-muted">
+      <li className="inline-flex items-center gap-1.5">
+        <span aria-hidden="true" className="size-2.5 rounded-xs bg-accent/30" />
+        Attested
+      </li>
+      <li className="inline-flex items-center gap-1.5">
+        <span aria-hidden="true" className="size-2.5 rounded-xs bg-danger-solid" />
+        Missed
+      </li>
       {threshold !== undefined && (
         <li
           className="inline-flex items-center gap-1.5"
-          title="The gate closes when participation falls below this line. The gate leaves the validators of hosts that are being updated out of its count, so a planned outage can dip the line below the threshold without closing it."
+          title="The gate closes when the participation of an epoch falls below this line. It leaves the validators of hosts that are being updated out of its count, so a planned outage can take single slots below the line without closing it."
         >
-          <span aria-hidden="true" className="h-px w-4 bg-danger" />
-          Gate threshold {formatPercent(threshold)}, not counting hosts being updated
+          <span aria-hidden="true" className="w-4 border-t border-dashed border-foreground" />
+          Gate threshold {formatPercent(threshold)}
         </li>
       )}
-      {lanes &&
-        KINDS.map(k => (
-          <li key={k} className="inline-flex items-center gap-1.5">
-            <span aria-hidden="true" className={cx('h-2.5 w-4 rounded-xs', KIND_BG[k])} />
-            {KIND_LABEL[k]}
-          </li>
-        ))}
       {lanes && (
         <>
-          <li className="inline-flex items-center gap-1.5">
-            <span aria-hidden="true" className="h-2.5 w-4 rounded-xs border-2 border-muted" />
-            Planned (estimate)
-          </li>
-          <li className="inline-flex items-center gap-1.5">
-            <span aria-hidden="true" className="h-2.5 w-4 rounded-xs bg-danger-solid" />
-            Failed
-          </li>
+          {swatch('bg-series-image', 'Image roll')}
+          {swatch('bg-series-packages', 'Packages')}
+          {swatch('bg-series-reboot', 'Reboot')}
+          {swatch('bg-danger-solid', 'Failed update')}
+          {swatch('bg-foreground/55', 'Offline')}
         </>
       )}
     </ul>

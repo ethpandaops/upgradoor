@@ -72,23 +72,28 @@ func TestInventoryCollectionIsBounded(t *testing.T) {
 	assert.ErrorIs(t, logged, context.DeadlineExceeded)
 }
 
-func TestMissingInventoryIsNotLoggedAsANilError(t *testing.T) {
-	log, logs := test.NewNullLogger()
+func TestLeaseDeadline(t *testing.T) {
+	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
 
-	svc := &service{
-		log: log,
-		deps: Deps{System: &inventorySystem{
-			//nolint:nilnil // exactly the answer under test
-			inventory: func(context.Context) (*protocol.Inventory, error) { return nil, nil },
-		}},
-		inventoryTimeout: time.Second,
+	tests := []struct {
+		name    string
+		expires time.Time
+		ttl     int64
+		want    time.Time
+	}{
+		{name: "clocks agree", expires: now.Add(30 * time.Minute), ttl: 1800, want: now.Add(30 * time.Minute)},
+		{name: "controller clock ahead", expires: now.Add(2 * time.Hour), ttl: 1800, want: now.Add(30 * time.Minute)},
+		{name: "controller clock behind", expires: now.Add(-time.Hour), ttl: 1800, want: now.Add(-time.Hour)},
+		{name: "restated late", expires: now.Add(10 * time.Minute), ttl: 600, want: now.Add(10 * time.Minute)},
+		{name: "no ttl", expires: now.Add(time.Hour), ttl: 0, want: now},
+		{name: "negative ttl", expires: now.Add(time.Hour), ttl: -5, want: now},
+		{name: "no expiry", ttl: 60, want: now.Add(time.Minute)},
 	}
 
-	// No client is set: nothing may be uploaded.
-	svc.sendInventory(t.Context())
-
-	entry := logs.LastEntry()
-	require.NotNil(t, entry)
-	assert.Contains(t, entry.Message, "no inventory")
-	assert.NotContains(t, entry.Data, logrus.ErrorKey)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := leaseDeadline(&protocol.Lease{ExpiresAt: tt.expires, TTLSeconds: tt.ttl}, now)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

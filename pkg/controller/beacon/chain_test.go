@@ -7,8 +7,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 )
 
 // rawSpec builds spec values the way a node sends them: decimal strings.
@@ -183,39 +181,9 @@ func TestChainTiming(t *testing.T) {
 			}
 
 			for epoch, offset := range tt.epochStarts {
-				assert.Equal(t, testGenesis.Add(offset), timing.epochStart(epoch),
+				assert.Equal(t, testGenesis.Add(offset), epochStart(timing, epoch),
 					"start of epoch %d", epoch)
 			}
-		})
-	}
-}
-
-func TestNewestSettledEpoch(t *testing.T) {
-	timing, err := newChainTiming(testGenesis, rawSpec(t, map[string]any{
-		"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "8",
-	}))
-	require.NoError(t, err)
-
-	tests := []struct {
-		name   string
-		now    time.Time
-		want   uint64
-		wantOK bool
-	}{
-		{name: "before genesis", now: testGenesis.Add(-time.Minute)},
-		{name: "first epoch", now: at(0, 50*time.Second)},
-		{name: "epoch 0 just ended", now: at(1, 11*time.Second)},
-		{name: "epoch 0 settled", now: at(1, 12*time.Second), want: 0, wantOK: true},
-		{name: "epoch 9 just ended", now: at(10, 5*time.Second), want: 8, wantOK: true},
-		{name: "epoch 9 settled", now: at(10, 12*time.Second), want: 9, wantOK: true},
-		{name: "late in epoch 10", now: at(10, 95*time.Second), want: 9, wantOK: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, ok := timing.newestSettledEpoch(tt.now)
-			assert.Equal(t, tt.wantOK, ok)
-			assert.Equal(t, tt.want, got)
 		})
 	}
 }
@@ -241,29 +209,10 @@ func TestWholeSeconds(t *testing.T) {
 // for the scheduler and the API places every epoch where the service's own
 // timing does, across forks that change the slot duration, one of them to a
 // slot that is not a whole number of seconds.
-func TestPublishedPhasesPlaceEpochsLikeTheService(t *testing.T) {
-	timing, err := newChainTiming(testGenesis, rawSpec(t, map[string]any{
-		"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "8",
-		"SLOT_DURATION_MS_AAA": "6000", "AAA_FORK_EPOCH": "3",
-		"SLOT_DURATION_MS_BBB": "4500", "BBB_FORK_EPOCH": "7",
-	}))
-	require.NoError(t, err)
 
-	health := fleet.NetworkHealth{SlotsPerEpoch: timing.slotsPerEpoch, Phases: timing.published()}
-	require.Len(t, health.Phases, 3)
+// epochStart is where the timing places the start of an epoch.
+func epochStart(timing *chainTiming, epoch uint64) time.Time {
+	start, _ := timing.clock.EpochStart(epoch)
 
-	start := testGenesis
-
-	for epoch := range uint64(12) {
-		got, ok := health.EpochStart(epoch)
-		require.True(t, ok)
-		assert.Equal(t, start, got, "start of epoch %d", epoch)
-		assert.Equal(t, epoch, timing.epochAt(start), "the service's epoch at that time")
-
-		at, ok := health.EpochAt(start.Add(time.Millisecond))
-		require.True(t, ok)
-		assert.Equal(t, epoch, at)
-
-		start = start.Add(8 * timing.slotDuration(epoch))
-	}
+	return start
 }

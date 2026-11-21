@@ -226,13 +226,6 @@ func TestOwnHealthcheck(t *testing.T) {
 	}
 }
 
-func TestLegacyLinks(t *testing.T) {
-	assert.Nil(t, legacyLinks(nil))
-	assert.Equal(t,
-		[]string{"db:database", "cache:cache", "plain"},
-		legacyLinks([]string{"/db:/app/database", "/cache:/app/cache", "/plain"}))
-}
-
 func TestBindDestination(t *testing.T) {
 	tests := map[string]string{
 		"/host/data:/data":       "/data",
@@ -290,7 +283,6 @@ func inspected() *container.InspectResponse {
 				network.MustParsePort("30303/tcp"): {{HostIP: netip.MustParseAddr("0.0.0.0"), HostPort: "30303"}},
 			},
 			RestartPolicy: container.RestartPolicy{Name: container.RestartPolicyAlways},
-			Links:         []string{"/db:/geth/database"},
 			Mounts: []mount.Mount{
 				{Type: mount.TypeVolume, Source: "viamount", Target: "/viamount"},
 			},
@@ -357,7 +349,7 @@ func testImage() *dockerspec.DockerOCIImageConfig {
 func TestBuildCreateSpec(t *testing.T) {
 	old := inspected()
 
-	spec, err := buildCreateSpec(old, testImage(), "02:aa:bb:cc:dd:01")
+	spec, err := buildCreateSpec(old, testImage())
 	require.NoError(t, err)
 
 	assert.Equal(t, "geth", spec.Name)
@@ -386,7 +378,6 @@ func TestBuildCreateSpec(t *testing.T) {
 
 	host := spec.HostConfig
 	assert.Equal(t, old.HostConfig.Binds, host.Binds, "binds are passed on untouched")
-	assert.Equal(t, []string{"db:database"}, host.Links)
 	assert.Equal(t, container.RestartPolicyAlways, host.RestartPolicy.Name)
 	assert.Equal(t, old.HostConfig.PortBindings, host.PortBindings)
 	assert.Equal(t, []string{"no-new-privileges:true"}, host.SecurityOpt)
@@ -402,8 +393,7 @@ func TestBuildCreateSpec(t *testing.T) {
 	assert.Equal(t, &network.EndpointSettings{
 		IPAMConfig: &network.EndpointIPAMConfig{IPv4Address: netip.MustParseAddr("10.9.0.10")},
 		Aliases:    []string{"el"},
-		MacAddress: network.HardwareAddr{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x01},
-	}, spec.PrimaryEndpoint, "only what the user specified")
+	}, spec.PrimaryEndpoint, "only what the user specified: the MAC address is a new one")
 	assert.Equal(t, []networkAttachment{
 		{Network: "extra-a", Endpoint: &network.EndpointSettings{
 			Aliases:    []string{"alias-a"},
@@ -470,7 +460,7 @@ func TestBuildCreateSpecNetworkModes(t *testing.T) {
 			old.HostConfig.NetworkMode = tt.mode
 			old.NetworkSettings.Networks = tt.networks
 
-			spec, err := buildCreateSpec(old, testImage(), "")
+			spec, err := buildCreateSpec(old, testImage())
 			require.NoError(t, err)
 
 			assert.Equal(t, tt.wantPrimary, spec.Primary)
@@ -503,7 +493,7 @@ func TestBuildCreateSpecKeepsExplicitHostname(t *testing.T) {
 	old.Config.Hostname = "geth-1"
 	old.Config.Domainname = "example.org"
 
-	spec, err := buildCreateSpec(old, testImage(), "")
+	spec, err := buildCreateSpec(old, testImage())
 	require.NoError(t, err)
 	assert.Equal(t, "geth-1", spec.Config.Hostname)
 	assert.Equal(t, "example.org", spec.Config.Domainname)
@@ -513,7 +503,7 @@ func TestBuildCreateSpecWithoutImageConfig(t *testing.T) {
 	// An image without any configuration: everything is the container's.
 	old := inspected()
 
-	spec, err := buildCreateSpec(old, nil, "")
+	spec, err := buildCreateSpec(old, nil)
 	require.NoError(t, err)
 	assert.Equal(t, old.Config.Env, spec.Config.Env)
 	assert.Equal(t, old.Config.Entrypoint, spec.Config.Entrypoint)
@@ -525,13 +515,28 @@ func TestBuildCreateSpecRejects(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*container.InspectResponse)
-		mac    string
+		want   string
 	}{
-		{name: "no config", mutate: func(c *container.InspectResponse) { c.Config = nil }},
-		{name: "no host config", mutate: func(c *container.InspectResponse) { c.HostConfig = nil }},
-		{name: "no name", mutate: func(c *container.InspectResponse) { c.Name = "/" }},
-		{name: "auto-remove", mutate: func(c *container.InspectResponse) { c.HostConfig.AutoRemove = true }},
-		{name: "invalid MAC", mutate: func(*container.InspectResponse) {}, mac: "not-a-mac"},
+		{name: "no name", mutate: func(c *container.InspectResponse) { c.Name = "/" }, want: "no name"},
+		{
+			name:   "auto-remove",
+			mutate: func(c *container.InspectResponse) { c.HostConfig.AutoRemove = true },
+			want:   "auto-remove",
+		},
+		{
+			name: "links on the default bridge",
+			mutate: func(c *container.InspectResponse) {
+				c.HostConfig.Links = []string{"/db:/geth/database"}
+			},
+			want: "links",
+		},
+		{
+			name: "links on a network",
+			mutate: func(c *container.InspectResponse) {
+				c.NetworkSettings.Networks["extra-b"].Links = []string{"db:database"}
+			},
+			want: "links",
+		},
 	}
 
 	for _, tt := range tests {
@@ -539,34 +544,8 @@ func TestBuildCreateSpecRejects(t *testing.T) {
 			old := inspected()
 			tt.mutate(old)
 
-			_, err := buildCreateSpec(old, testImage(), tt.mac)
-			require.Error(t, err)
-		})
-	}
-
-	_, err := buildCreateSpec(nil, testImage(), "")
-	require.Error(t, err)
-}
-
-func TestConfigMAC(t *testing.T) {
-	tests := []struct {
-		name        string
-		raw         string
-		wantMAC     string
-		wantPresent bool
-	}{
-		{name: "fixed", raw: `{"Config":{"MacAddress":"02:aa:bb:cc:dd:01"}}`, wantMAC: "02:aa:bb:cc:dd:01", wantPresent: true},
-		{name: "not fixed, old API", raw: `{"Config":{"MacAddress":""}}`, wantPresent: true},
-		{name: "field gone, new API", raw: `{"Config":{"Image":"x"}}`},
-		{name: "no config", raw: `{}`},
-		{name: "garbage", raw: `{`},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			mac, present := configMAC([]byte(tt.raw))
-			assert.Equal(t, tt.wantMAC, mac)
-			assert.Equal(t, tt.wantPresent, present)
+			_, err := buildCreateSpec(old, testImage())
+			require.ErrorContains(t, err, tt.want)
 		})
 	}
 }

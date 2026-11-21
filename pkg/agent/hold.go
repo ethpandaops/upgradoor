@@ -83,6 +83,34 @@ func (h *holds) ReleaseController() error {
 	return syncDir(filepath.Dir(h.controllerFile))
 }
 
+// SetLocal creates the local hold file for a person who asked for it on the
+// host (the 'upgradoor host hold' command). It is the same file a person
+// creates by hand.
+func (h *holds) SetLocal(reason string) error {
+	if h.localFile == "" {
+		return errors.New("no hold file is configured")
+	}
+
+	if err := os.MkdirAll(filepath.Dir(h.localFile), 0o755); err != nil {
+		return fmt.Errorf("create the directory of the hold file: %w", err)
+	}
+
+	if err := writeFileAtomic(h.localFile, []byte(firstLine(reason)+"\n"), 0o644); err != nil {
+		return fmt.Errorf("set local hold: %w", err)
+	}
+
+	return nil
+}
+
+// ReleaseLocal removes the local hold file.
+func (h *holds) ReleaseLocal() error {
+	if err := os.Remove(h.localFile); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return fmt.Errorf("release local hold: %w", err)
+	}
+
+	return nil
+}
+
 // readFlagFile reports whether path exists and returns its first line.
 func readFlagFile(path string) (reason string, present bool, err error) {
 	if path == "" {

@@ -27,31 +27,17 @@ import (
 // The simulation drives the real Service over an in-memory store with a
 // random fleet, simulated agents, a simulated registry and network, random
 // operator actions, controller restarts (some after an outage longer than
-// leaseTtl) and store write failures. Nodes come back from an operation
-// syncing, without their EL or slow to find peers, lose peers they had, and
-// agents go silent while their host is checked for readiness. In every fifth
-// seed the beacon node does not serve the liveness endpoint for the whole
-// run; every fourth run begins before the chain's genesis, and in every
-// seventh the beacon node announces a slot phase far in the future that is
-// out of bounds. Now and then the controller restarts on closed rollouts as
-// the builds before this one wrote them, with the fields those builds kept.
-// A person ends a lease now and then, whatever state it is in: the lease
-// stays open and the host is held. Agents begin the steps of an operation one
-// after the other; those of the current build begin none once they are told
-// that the lease is cancelled and decline a lease they have not started, a
-// quarter of the agents are of a build that knows neither, and now and then
-// an operation runs for longer than any leaseTtl.
-// In every third seed rollouts of some kinds are paused after their canary
-// (a person resumes them now and then), and in every other seed a host that
-// comes back is compared with the peers of the fleet (readyPeerShare 0.5 or
-// 0.75); the hosts differ in how many peers they find, and in half of those
-// seeds one host never finds enough of them for the comparison, until the
-// world is healed.
-// The store gives every row back as the SQLite store does (fakestore_test.go).
-// After
-// every step the oracle (sim_oracle_test.go) asserts the invariants of
-// docs/scheduler.md from the world's own state; at the end of a run the world
-// is healed and everything must converge.
+// leaseTtl, some on an empty database) and store write failures. Nodes come
+// back from an operation syncing, without their EL or slow to find peers,
+// lose peers they had, and agents go silent. Every fourth run begins before
+// the chain's genesis, every third pauses rollouts after their canary and
+// every other compares a host that comes back with the peers of the fleet.
+//
+// After every reconcile and every action the oracle (sim_oracle_test.go)
+// holds the committed state against its invariants; now and then the same
+// reconcile is run on a freshly started scheduler, which must decide the
+// same; at the end of a run the world is healed and everything must
+// converge.
 //
 // Reproduce a failure with UPGRADOOR_SIM_SEED=<seed>; run more seeds with
 // UPGRADOOR_SIM_SEEDS=<n>.
@@ -65,11 +51,11 @@ const (
 )
 
 // simReasons are the forms a waiting reason may take.
-var simReasons = regexp.MustCompile(`^(held|agent silent|paused|rollout paused|` +
-	`paused after the canary; resume to continue|` +
-	`waiting for approval \(policy manual\)|policy paused|rollout halted: .+|` +
+var simReasons = regexp.MustCompile(`^(held|known offline|agent silent|working on an operation without a lease|paused|rollout paused|` +
+	`paused after the canary; resume to continue|aborted(: .+)?; resume to continue|` +
+	`waiting for approval \(policy manual\)|rollout halted: .+|` +
 	`verb not allowed by the agent|network gate: .+|after .+|` +
-	`budget [0-9.]+% of [0-9.]+%|host limit \d+ of \d+|next)$`)
+	`budget [0-9.]+% of [0-9.]+%|host limit \d+ of \d+|independent limit \d+ of \d+)$`)
 
 // sim is one simulation run.
 type sim struct {
@@ -87,345 +73,55 @@ type sim struct {
 	ids   int
 	step  int
 	trail []string
-	// retried are the rollouts retried since the last observation; observed
-	// is the store's write count at that observation.
-	retried  []string
-	observed int
-	// resumed are the rollouts a person resumed since the last observation;
-	// paused is the person's own record of the rollouts they paused and have
-	// not resumed. It is lost with the database.
-	resumed []string
-	paused  map[string]bool
-	// starved: one host of the run stays below the fleet's share of peers.
-	starved bool
-	// skipped is the person's own record of the hosts skipped per rollout
-	// key: set by a skip, cleared by a retry that names the host (or lifts
-	// the skips of a closed rollout), by the host syncing without the need
-	// while it is not held, and by forgetting the host.
-	skipped map[string]map[string]bool
-	// holds is the person's own record of the hosts on controller hold. It
-	// outlives the controller's database.
-	holds map[string]bool
-	// registered is when the current database first saw each host.
-	registered map[string]time.Time
-	// cancelled is the person's own record of the leases they ended: the
-	// state each was in at that moment. It is lost with the database.
-	cancelled map[string]fleet.LeaseState
-	// checked is, per agent, how many of the steps it began were looked at.
+	// retried are the rollouts retried since the last observation.
+	retried []string
+	// cancelled names the leases a person ended. It is lost with the
+	// database.
+	cancelled map[string]bool
+	// checked is, per agent, how many of the steps it began were looked at;
+	// started names the leases whose operation was seen to begin.
 	checked map[string]int
-	stats   simStats
+	started map[string]bool
+	// stats counts what happened, so that the test can tell a simulation that
+	// exercised the rules from one that idled.
+	stats simStats
 }
 
-// simStats counts what happened, so that the test can tell a simulation that
-// exercised the rules from one that idled.
-type simStats struct {
-	Seeds, Hosts                          int
-	Grants, Released, Failed, Expired     int
-	Completed, Superseded, Aborted, Halts int
-	ForcedGrants, ExemptGrants, Bundled   int
-	Restarts, WriteFailures, Shadows      int
-	LostDatabases, Adopted                int
-	// Outages are restarts after more than leaseTtl of downtime and
-	// OutageLeases the open leases they found; Unsupported are the seeds
-	// without liveness and ProbeGrants the budgeted grants to validator
-	// hosts in them.
-	Outages, OutageLeases    int
-	Unsupported, ProbeGrants int
-	// HoldsAdopted counts hosts that were held on the agent when a
-	// controller without a record of them first saw them.
-	HoldsAdopted                     int
-	Skips, SkipsLifted, SkipsCarried int
-	// Repairs are the leases granted through the closed gate, BrokenMembers
-	// the members in the repair stage, MixedLeases the failed leases in which
-	// a step was done.
-	Repairs, BrokenMembers, MixedLeases int
-	// Forks are the changes of the slot duration and SettledClosed the
-	// members of closed rollouts that got the outcome of a lease that ended
-	// after the rollout had closed.
-	Forks, SettledClosed int
-	// Reopened are the expired leases that were taken up again.
-	Reopened int
-	// BeforeGenesis are the runs that began before the chain did,
-	// FuturePhases those in which the beacon node announced a slot phase out
-	// of bounds for the far future, PreviousBuilds the restarts on rows of
-	// the builds before this one. The others count what the oracle saw by its
-	// own record of the leases: broken hosts that were granted first
-	// (BrokenFirst) and repaired (Repaired); hosts held back by a lease in
-	// flight (FlightHeld), of those the ones behind a lease of an aborted
-	// rollout (FlightAborted), behind a lease that was taken up again
-	// (FlightReopened), in a rollout that a person's retry opened
-	// (FlightRetried) and in a rollout that was open before the lease's
-	// rollout was closed (FlightNextToOpen); the leases a person ended
-	// (EndedByOperator) and the hosts those broke (BrokenByOperator); and the
-	// hosts broken by a lease of a rollout that had been aborted
-	// (BrokenAfterAbort).
-	BeforeGenesis, FuturePhases, PreviousBuilds int
-	BrokenFirst, Repaired                       int
-	FlightHeld, FlightAborted, FlightReopened   int
-	FlightRetried, FlightNextToOpen             int
-	EndedByOperator, BrokenByOperator           int
-	BrokenAfterAbort                            int
-	// Cancels are the leases a person ended, by the state they were in;
-	// CancelsOldBuild those on agents that do not know the cancel mark,
-	// CancelsLongOp those whose operation ran for longer than five minutes.
-	// StepsBegun are the steps agents began, StepsCancelled those they did not
-	// begin because the lease was cancelled, Declined the leases agents said
-	// they would not start. SparedByCancel are the leases that ended as ended
-	// by operator and said nothing about their host; ReopenedFailed the failed
-	// leases that were taken up again when their agent came back;
-	// ForgottenBroken the hosts that were broken when a person forgot them.
-	Cancels                              map[fleet.LeaseState]int
-	CancelsOldBuild, CancelsLongOp       int
-	StepsBegun, StepsCancelled, Declined int
-	SparedByCancel, ReopenedFailed       int
-	// SparedUntouched are the leases that failed for another reason after a
-	// person had ended them and said nothing about a thing that never began.
-	SparedUntouched int
-	// NeverStarted are the leases that failed without the agent's word and
-	// were expired when the agent said that it never started them.
-	NeverStarted int
-	// HoldsExtended are the holds that were there before a lease was ended
-	// and whose reason was extended by the cancel.
-	HoldsExtended int
-	// UnholdsRefused are the unholds that were refused because a lease the
-	// person had ended was still open.
-	UnholdsRefused int
-	// PauseSeeds are the seeds with a pause after the canary and ShareSeeds
-	// those with the comparison with the fleet. By the oracle's own derivation:
-	// CanaryPauses are the rollouts paused at their first success,
-	// CanaryResumes those a person resumed after that; PeerBlocks are the
-	// reconciles that left a lease waiting for peers below the fleet,
-	// PeerPasses the leases released with a client compared, PeerSkips those
-	// released with a client that fewer than three reference hosts probe.
-	// StarvedSeeds are the seeds with a host that stays below the fleet,
-	// PeerTimeouts the leases that failed as not ready waiting for the fleet's
-	// share, PeerHeld the leases that waited for it over more than one
-	// reconcile with their run of healthy syncs intact.
-	PauseSeeds, ShareSeeds            int
-	CanaryPauses, CanaryResumes       int
-	PeerBlocks, PeerPasses, PeerSkips int
-	StarvedSeeds                      int
-	PeerTimeouts, PeerHeld            int
-	ForgottenBroken                   int
-	ConvergeTicks, MaxConvergeTicks   int
-	// Waits counts the waiting reasons seen in plans, by their first word.
-	Waits map[string]int
-}
+// simStats counts events by name.
+type simStats map[string]int
 
-func (a *simStats) add(b *simStats) {
-	a.Seeds += b.Seeds
-	a.Hosts += b.Hosts
-	a.Grants += b.Grants
-	a.Released += b.Released
-	a.Failed += b.Failed
-	a.Expired += b.Expired
-	a.Completed += b.Completed
-	a.Superseded += b.Superseded
-	a.Aborted += b.Aborted
-	a.Halts += b.Halts
-	a.ForcedGrants += b.ForcedGrants
-	a.ExemptGrants += b.ExemptGrants
-	a.Bundled += b.Bundled
-	a.Restarts += b.Restarts
-	a.WriteFailures += b.WriteFailures
-	a.Shadows += b.Shadows
-	a.LostDatabases += b.LostDatabases
-	a.Outages += b.Outages
-	a.OutageLeases += b.OutageLeases
-	a.Unsupported += b.Unsupported
-	a.ProbeGrants += b.ProbeGrants
-	a.HoldsAdopted += b.HoldsAdopted
-	a.Adopted += b.Adopted
-	a.Skips += b.Skips
-	a.SkipsLifted += b.SkipsLifted
-	a.SkipsCarried += b.SkipsCarried
-	a.Repairs += b.Repairs
-	a.BrokenMembers += b.BrokenMembers
-	a.MixedLeases += b.MixedLeases
-	a.Forks += b.Forks
-	a.Reopened += b.Reopened
-	a.BeforeGenesis += b.BeforeGenesis
-	a.FuturePhases += b.FuturePhases
-	a.PreviousBuilds += b.PreviousBuilds
-	a.BrokenFirst += b.BrokenFirst
-	a.Repaired += b.Repaired
-	a.FlightHeld += b.FlightHeld
-	a.FlightAborted += b.FlightAborted
-	a.FlightReopened += b.FlightReopened
-	a.FlightRetried += b.FlightRetried
-	a.FlightNextToOpen += b.FlightNextToOpen
-	a.EndedByOperator += b.EndedByOperator
-	a.BrokenByOperator += b.BrokenByOperator
-	a.BrokenAfterAbort += b.BrokenAfterAbort
-	a.CancelsOldBuild += b.CancelsOldBuild
-	a.CancelsLongOp += b.CancelsLongOp
-	a.StepsBegun += b.StepsBegun
-	a.StepsCancelled += b.StepsCancelled
-	a.Declined += b.Declined
-	a.SparedByCancel += b.SparedByCancel
-	a.UnholdsRefused += b.UnholdsRefused
-	a.PauseSeeds += b.PauseSeeds
-	a.ShareSeeds += b.ShareSeeds
-	a.CanaryPauses += b.CanaryPauses
-	a.CanaryResumes += b.CanaryResumes
-	a.PeerBlocks += b.PeerBlocks
-	a.PeerPasses += b.PeerPasses
-	a.PeerSkips += b.PeerSkips
-	a.StarvedSeeds += b.StarvedSeeds
-	a.PeerTimeouts += b.PeerTimeouts
-	a.PeerHeld += b.PeerHeld
-	a.HoldsExtended += b.HoldsExtended
-	a.NeverStarted += b.NeverStarted
-	a.SparedUntouched += b.SparedUntouched
-	a.ReopenedFailed += b.ReopenedFailed
-	a.ForgottenBroken += b.ForgottenBroken
+func (a simStats) add(b simStats) {
+	for k, v := range b {
+		if k == statMaxConverge {
+			a[k] = max(a[k], v)
 
-	if a.Cancels == nil {
-		a.Cancels = make(map[fleet.LeaseState]int, 3)
-	}
-
-	for k, v := range b.Cancels {
-		a.Cancels[k] += v
-	}
-
-	a.SettledClosed += b.SettledClosed
-	a.ConvergeTicks += b.ConvergeTicks
-	a.MaxConvergeTicks = max(a.MaxConvergeTicks, b.MaxConvergeTicks)
-
-	if a.Waits == nil {
-		a.Waits = make(map[string]int, len(b.Waits))
-	}
-
-	for k, v := range b.Waits {
-		a.Waits[k] += v
-	}
-}
-
-// countRollout counts the members in the repair stage and those that were
-// settled after their rollout had closed.
-func (s *sim) countRollout(r *fleet.Rollout) {
-	for i := range r.Hosts {
-		m := &r.Hosts[i]
-		if r.State.Terminal() && r.EndedAt != nil && m.UpdatedAt.After(*r.EndedAt) &&
-			(m.State == fleet.HostFailed || m.State == fleet.HostDone) {
-			s.stats.SettledClosed++
+			continue
 		}
 
-		if m.Stage == fleet.StageRepair {
-			s.stats.BrokenMembers++
-		}
+		a[k] += v
 	}
 }
 
-// countLease counts the repairs and the failed leases in which a step was
-// done.
-func (s *sim) countLease(l *fleet.Lease) {
-	if l.Repair {
-		s.stats.Repairs++
-	}
+// statMaxConverge is the longest convergence of any seed, in ticks.
+const statMaxConverge = "longest convergence (ticks)"
 
-	if l.State == fleet.LeaseFailed && l.Operation != nil &&
-		slices.ContainsFunc(l.Operation.Steps, func(st protocol.Step) bool { return st.Status == protocol.StepDone }) {
-		s.stats.MixedLeases++
-	}
-
-	if l.Operation == nil {
-		return
-	}
-
-	for _, st := range l.Operation.Steps {
-		switch {
-		case st.Status == protocol.StepCancelled:
-			s.stats.StepsCancelled++
-		case st.Status == protocol.StepRefused && st.Error == "the lease is not to be started":
-			s.stats.Declined++
-
-			return
-		}
-	}
-}
-
-// countLedger takes over what the oracle counted. The oracle starts over
-// when the database is lost.
-func (s *sim) countLedger() {
-	c := &s.oracle.counts
-
-	s.stats.BrokenFirst += c.brokenFirst
-	s.stats.Repaired += c.repaired
-	s.stats.FlightHeld += c.flightHeld
-	s.stats.FlightAborted += c.flightAborted
-	s.stats.FlightReopened += c.flightReopened
-	s.stats.FlightRetried += c.flightRetried
-	s.stats.FlightNextToOpen += c.flightNextToOpen
-	s.stats.EndedByOperator += c.endedByOperator
-	s.stats.BrokenByOperator += c.brokenByOperator
-	s.stats.BrokenAfterAbort += c.brokenAfterAbort
-	s.stats.SparedByCancel += c.sparedByCancel
-	s.stats.NeverStarted += c.neverStarted
-	s.stats.SparedUntouched += c.sparedUntouched
-	s.stats.ReopenedFailed += c.reopenedFailed
-	s.stats.ForgottenBroken += c.forgottenBroken
-	s.stats.CanaryPauses += c.canaryPauses
-	s.stats.CanaryResumes += c.canaryResumes
-	s.stats.PeerBlocks += c.peerBlocks
-	s.stats.PeerPasses += c.peerPasses
-	s.stats.PeerSkips += c.peerSkips
-	s.stats.PeerTimeouts += c.peerTimeouts
-	s.stats.PeerHeld += c.peerHeld
-
-	// The oracle is replaced when the database is lost: count each once.
-	s.oracle.counts = oracleCounts{}
+// auditStats names the audit actions that are counted.
+var auditStats = map[string]string{
+	"lease.granted":      "grants",
+	"lease.released":     "released leases",
+	"lease.failed":       "failed leases",
+	"lease.expired":      "expired leases",
+	"rollout.completed":  "completed rollouts",
+	"rollout.superseded": "superseded rollouts",
+	"rollout.halted":     "halts",
+	"action.abort":       "aborted rollouts",
 }
 
 // count reads the run's totals off the audit trail and the store.
 func (s *sim) count() {
-	s.countLedger()
-
 	for _, action := range s.store.auditActions() {
-		switch action {
-		case "lease.granted":
-			s.stats.Grants++
-		case "lease.released":
-			s.stats.Released++
-		case "lease.failed":
-			s.stats.Failed++
-		case "lease.expired":
-			s.stats.Expired++
-		case "lease.adopted":
-			s.stats.Adopted++
-		case "lease.reopened":
-			s.stats.Reopened++
-		case "rollout.completed":
-			s.stats.Completed++
-		case "rollout.superseded":
-			s.stats.Superseded++
-		case "rollout.halted":
-			s.stats.Halts++
-		case "action.abort":
-			s.stats.Aborted++
-		}
-	}
-
-	// A skip that outlived its rollout shows as a member that joined a later
-	// rollout of the same key as skipped.
-	seen := make(map[string]bool, 8)
-	all, _, _ := s.store.view()
-
-	s.stats.Forks = len(s.world.phases) - 1
-
-	for _, r := range all {
-		s.countRollout(r)
-
-		for i := range r.Hosts {
-			if !operatorSkipped(&r.Hosts[i]) && !strings.HasPrefix(r.Hosts[i].Error, skipLiftedPrefix) {
-				continue
-			}
-
-			if id := r.Key + " " + r.Hosts[i].Host; seen[id] {
-				s.stats.SkipsCarried++
-			} else {
-				seen[id] = true
-			}
+		if name, ok := auditStats[action]; ok {
+			s.stats[name]++
 		}
 	}
 
@@ -446,55 +142,23 @@ func (s *sim) count() {
 		}
 
 		if l.Force {
-			s.stats.ForcedGrants++
+			s.stats["forced grants"]++
 		}
-
-		s.countLease(l)
 
 		if exempt {
-			s.stats.ExemptGrants++
-		}
-
-		if s.world.livenessUnsupported && !exempt && l.Weight > 0 && l.GrantedBy != grantedByAdoption {
-			s.stats.ProbeGrants++
+			s.stats["budget-exempt grants"]++
 		}
 
 		if len(ids) > 1 {
-			s.stats.Bundled++
+			s.stats["bundled leases"]++
 		}
 	}
 
-	s.countWorld()
-}
-
-// countWorld counts what kind of world the run was in.
-func (s *sim) countWorld() {
-	s.stats.Hosts = len(s.world.agents)
-	s.stats.Seeds = 1
-
-	if s.world.start.Before(testGenesis) {
-		s.stats.BeforeGenesis = 1
-	}
-
-	if s.world.bogus != nil {
-		s.stats.FuturePhases = 1
-	}
-
-	if s.world.livenessUnsupported {
-		s.stats.Unsupported = 1
-	}
-
-	if d := &s.defaults; d.PauseAfterCanaryImage || d.PauseAfterCanaryPackages || d.PauseAfterCanaryReboot {
-		s.stats.PauseSeeds = 1
-	}
-
-	if s.defaults.ReadyPeerShare > 0 {
-		s.stats.ShareSeeds = 1
-	}
-
-	if s.starved {
-		s.stats.StarvedSeeds = 1
-	}
+	s.stats["seeds"]++
+	s.stats["hosts"] += len(s.world.agents)
+	s.stats["slot-duration forks"] += len(s.world.phases) - 1
+	s.stats["grants through the closed gate"] += s.oracle.exceptions
+	s.stats["hosts seen working without a lease"] += s.oracle.working
 }
 
 func newSim(seed uint64) (*sim, error) {
@@ -511,52 +175,25 @@ func newSim(seed uint64) (*sim, error) {
 
 	rng := rand.New(rand.NewPCG(seed, 0x5eed))
 	s := &sim{
-		seed:    seed,
-		rng:     rng,
-		world:   newSimWorld(rng, start),
-		store:   newFakeStore(),
-		oracle:  newOracle(),
-		log:     log,
-		skipped: make(map[string]map[string]bool, 4),
-		holds:   make(map[string]bool, 4),
-		paused:  make(map[string]bool, 2),
-
-		registered: make(map[string]time.Time, 16),
-		cancelled:  make(map[string]fleet.LeaseState, 2),
-		checked:    make(map[string]int, 16),
-	}
-	s.stats.Cancels = make(map[fleet.LeaseState]int, 3)
-
-	// Taken from the seed, not from the random stream, so that the other
-	// seeds keep their histories.
-	s.world.livenessUnsupported = seed%5 == 4
-
-	// Every seventh run the beacon node announces a slot phase that is out of
-	// bounds, for an epoch far beyond the run: slots of two hours, or a start
-	// that does not follow from the phase before it. What is invalid in the
-	// future invalidates nothing now.
-	if seed%7 == 5 {
-		at := 1_000_000 + seed%1000
-		bogus := fleet.SlotPhase{Epoch: at, Start: s.world.epochStart(at), SlotMs: 2 * fleet.MaxSlotMs}
-
-		if seed%2 == 0 {
-			bogus.SlotMs = simSecondsPerSlot * 1000
-			bogus.Start = bogus.Start.Add(time.Second)
-		}
-
-		s.world.bogus = &bogus
+		seed:      seed,
+		rng:       rng,
+		world:     newSimWorld(rng, start),
+		store:     newFakeStore(),
+		oracle:    newOracle(),
+		log:       log,
+		cancelled: make(map[string]bool, 2),
+		checked:   make(map[string]int, 16),
+		started:   make(map[string]bool, 64),
+		stats:     make(simStats, 32),
 	}
 
 	pick := func(values ...float64) float64 { return values[rng.IntN(len(values))] }
 	policy := func() fleet.Policy {
-		switch rng.IntN(8) {
-		case 0:
+		if rng.IntN(6) == 0 {
 			return fleet.PolicyManual
-		case 1:
-			return fleet.PolicyPaused
-		default:
-			return fleet.PolicyAuto
 		}
+
+		return fleet.PolicyAuto
 	}
 
 	s.defaults = fleet.Settings{
@@ -572,6 +209,10 @@ func newSim(seed uint64) (*sim, error) {
 		PolicyPackages:          policy(),
 		PolicyReboot:            policy(),
 	}
+
+	// From the seed, not from the random stream, so that the other seeds keep
+	// their histories.
+	s.defaults.MaxIndependentPercent = []float64{0, 10, 25, 100}[(seed/7)%4]
 
 	// Both from the seed, not from the random stream, so that the other seeds
 	// keep their histories. Every third seed pauses rollouts after their
@@ -589,14 +230,6 @@ func newSim(seed uint64) (*sim, error) {
 		s.defaults.ReadyPeerShare = 0.5
 	case 2:
 		s.defaults.ReadyPeerShare = 0.75
-	}
-
-	// In half of those, one host that probes its node never finds more than
-	// a few peers: at head, with the peers it is required to have, and below
-	// any share of what the others have. Its leases wait for the comparison
-	// and fail at readinessTimeout, until the world is healed.
-	if s.defaults.ReadyPeerShare > 0 && (seed/4)%2 == 0 {
-		s.starved = s.world.starve(int(seed / 8))
 	}
 
 	if err := s.defaults.Validate(); err != nil {
@@ -621,6 +254,7 @@ func (s *sim) service(st *fakeStore, newID func() string) (*service, error) {
 	svc, ok := New(s.log, Options{
 		Store:    st,
 		Health:   s.world.health,
+		Liveness: st.listLiveness,
 		Defaults: s.defaults,
 		Now:      func() time.Time { return s.world.now },
 		NewID:    newID,
@@ -682,23 +316,32 @@ func (s *sim) tick(d time.Duration) error {
 	return s.reconcile()
 }
 
-// checkStarts looks at every step an agent began since the last look, not
-// only at the start of its operation. A step begins only under a lease that
-// is open at that moment, unless the agent's clock is slow and the lease
-// expired on it. A lease the store has never seen (the database was lost) is
-// adopted at the agent's next sync. And an agent of the current build begins
-// no step once it has taken in that its lease was cancelled or is no longer
-// offered.
+// checkStarts looks at every step an agent began since the last look. An
+// agent begins an operation only under a lease that is open at that moment,
+// with two exceptions, in each of which the host works without a lease from
+// its next sync on: the agent's clock is slow and the lease expired on it, or
+// the store has never seen the lease (the database was lost). An operation
+// that has begun is finished, whatever becomes of its lease, except that an
+// agent begins no step once it has taken in that its lease was cancelled or
+// is no longer offered.
 func (s *sim) checkStarts() error {
 	for _, a := range s.world.agents {
 		begins := a.begins[s.checked[a.name]:]
 		s.checked[a.name] = len(a.begins)
 
 		for _, b := range begins {
-			if told, ok := a.cancelSeen[b.lease]; ok && !a.oldBuild && b.at.After(told) {
+			if told, ok := a.cancelSeen[b.lease]; ok && b.at.After(told) {
 				return fmt.Errorf("%s began step %s of lease %s at %s, after it was told at %s that the lease is cancelled",
 					a.name, b.need, b.lease, b.at.Format(time.TimeOnly), told.Format(time.TimeOnly))
 			}
+
+			s.stats["steps that agents began"]++
+
+			if s.started[b.lease] {
+				continue
+			}
+
+			s.started[b.lease] = true
 
 			l, err := s.store.GetLease(context.Background(), b.lease)
 
@@ -707,20 +350,13 @@ func (s *sim) checkStarts() error {
 			case err != nil:
 				return err
 			case (a.overrun || len(a.late) > 0) && l.State == fleet.LeaseExpired && l.Host == a.name:
-				// Its clock is slow: it starts a lease the controller has expired,
-				// or one the controller expired in favour of the lease it ran
-				// late. The controller takes the lease up again.
-			case l.State == fleet.LeaseFailed && l.Error == reasonAgentSilent && l.Host == a.name &&
-				l.EndedAt != nil && !a.lastSync.After(*l.EndedAt):
-				// The agent has been silent for so long that the controller gave
-				// the lease up, and it has not been heard since: nobody could
-				// tell it. The lease is taken up again when it reports.
+				// Its clock is slow: it starts a lease the controller has
+				// expired.
 			case l.State.Terminal() || l.Host != a.name:
-				return fmt.Errorf("%s began step %s for lease %s, which is %s (host %s)",
-					a.name, b.need, l.ID, l.State, l.Host)
+				return fmt.Errorf("%s began the operation of lease %s with step %s, and the lease is %s (host %s)",
+					a.name, l.ID, b.need, l.State, l.Host)
 			}
-
-			s.stats.StepsBegun++
+			s.stats["steps that agents began"]++
 		}
 	}
 
@@ -741,20 +377,10 @@ func (s *sim) syncAgents() error {
 		req := w.request(a)
 		host := &fleet.Host{Name: a.name, Validators: a.val, LastSeen: w.now, Status: req}
 
-		if a.bootnode {
-			host.Roles = []string{fleet.RoleBootnode}
-		}
-
-		if s.store.host(a.name) == nil {
-			s.registered[a.name] = w.now
-		}
-
 		if s.store.recordSync(host) {
-			s.stats.HoldsAdopted++
+			s.stats["holds adopted from the agents"]++
 			s.note("%s: registered on hold, as its agent reports", a.name)
 		}
-
-		s.needsGone(a, req)
 
 		a.lastSync = w.now
 		a.lastSent = req
@@ -795,7 +421,7 @@ func (s *sim) checkAssignment(a *simAgent, resp *Assignment) error {
 	}
 
 	if len(open) > 0 {
-		_, cancelled := s.cancelled[open[0].ID]
+		cancelled := s.cancelled[open[0].ID]
 		// Withheld from an agent that has not said that it has it.
 		reported := a.lastSent != nil && a.lastSent.Operation != nil && a.lastSent.Operation.LeaseID == open[0].ID
 		withheld := cancelled && open[0].State == fleet.LeaseGranted && !reported
@@ -848,9 +474,9 @@ func (s *sim) reconcile() error {
 	if err := s.svc.reconcile(ctx); err != nil {
 		if errors.Is(err, errWrite) {
 			s.note("  reconcile failed: %v", err)
-			s.stats.WriteFailures++
+			s.stats["write failures"]++
 
-			return s.observe(false)
+			return s.observe()
 		}
 
 		return fmt.Errorf("reconcile: %w", err)
@@ -886,10 +512,10 @@ func (s *sim) reconcile() error {
 			return fmt.Errorf("a restarted scheduler planned differently:\nrestarted: %s\nrunning: %s", got, want)
 		}
 
-		s.stats.Shadows++
+		s.stats["restart comparisons"]++
 	}
 
-	if err := s.observe(true); err != nil {
+	if err := s.observe(); err != nil {
 		return err
 	}
 
@@ -897,29 +523,22 @@ func (s *sim) reconcile() error {
 }
 
 // facts collects the world's state for the oracle.
-func (s *sim) facts(fresh bool) *simFacts {
+func (s *sim) facts() *simFacts {
 	w := s.world
 	settings, _ := s.store.LoadSettings(context.Background(), s.defaults)
+	health := w.health()
+	epoch := w.epochOf(health.UpdatedAt)
 
 	f := &simFacts{
 		now:            w.now,
 		since:          s.since,
 		settings:       settings,
-		health:         w.health(),
+		health:         health,
 		hosts:          make(map[string]*simHostFact, len(w.agents)),
-		rows:           w.published,
 		publishedEpoch: w.publishedEpoch,
 		havePublished:  w.storedLiveness(),
+		epoch:          w.epochStart(epoch + 1).Sub(w.epochStart(epoch)),
 		retried:        s.retried,
-		resumed:        s.resumed,
-		paused:         s.paused,
-		skipped:        s.skipped,
-		holds:          s.holds,
-		registered:     s.registered,
-		cancelled:      s.cancelled,
-		epochStart:     w.epochStart,
-		epochOf:        w.epochOf,
-		fresh:          fresh,
 	}
 
 	for _, a := range w.agents {
@@ -930,50 +549,26 @@ func (s *sim) facts(fresh bool) *simFacts {
 
 		live := w.publishedLive(a)
 
-		if w.livenessUnsupported {
-			// The probe rule: the last sync as the agent sent it, and how long
-			// ago that was as far as this controller can know.
-			live = a.weight
-
-			silent := w.now.Sub(later(a.lastSync, s.since)) > settings.HostStaleAfter.Std()
-			if silent || (a.lastSent != nil && !oracleNodeBack(a.lastSent.Node, 1)) {
-				live = 0
-			}
-		}
-
 		f.hosts[a.name] = &simHostFact{
 			weight:     a.weight,
 			live:       live,
 			holdWanted: registered.HoldWanted,
+			offline:    registered.KnownOffline(w.now),
 			lastSync:   a.lastSync,
 			status:     a.lastSent,
-			disrupted:  a.disrupted,
-			late:       a.late,
-			doneAt:     a.doneAt,
 			reported:   a.reported,
-			oldBuild:   a.oldBuild,
 		}
 	}
 
 	return f
 }
 
-// observe hands the committed state to the oracle. It does so after every
-// reconcile, also one that wrote nothing: a host that is stuck shows in
-// reconciles that change nothing. An action that wrote nothing is not looked
-// at again.
-func (s *sim) observe(fresh bool) error {
-	writes := s.store.writeCount()
-	if !fresh && writes == s.observed && len(s.retried) == 0 && len(s.resumed) == 0 {
-		return nil
-	}
-
-	s.observed = writes
-
-	rollouts, leases, directives := s.store.view()
-	err := s.oracle.observe(s.facts(fresh), &simSnapshot{rollouts: rollouts, leases: leases, directives: directives})
+// observe hands the committed state to the oracle, after every reconcile
+// and every action.
+func (s *sim) observe() error {
+	rollouts, leases, _ := s.store.view()
+	err := s.oracle.observe(s.facts(), &simSnapshot{rollouts: rollouts, leases: leases})
 	s.retried = nil
-	s.resumed = nil
 
 	return err
 }
@@ -988,12 +583,32 @@ func (s *sim) checkPlan() error {
 	}
 
 	leased := make(map[string]bool, len(open))
+	independent := 0
+
 	for _, l := range open {
 		leased[l.Host] = true
+
+		if l.Impact == protocol.ImpactIndependent {
+			independent++
+		}
 	}
 
-	if plan.Budget.LeasedHosts != len(leased) {
-		return fmt.Errorf("plan counts %d leased hosts, %d leases are open", plan.Budget.LeasedHosts, len(leased))
+	// A host that works without a lease takes a slot like one that holds one;
+	// an independent lease takes a place in its own limit.
+	f := s.facts()
+	slots := len(leased) - independent
+
+	for name, h := range f.hosts {
+		if !leased[name] && f.working(h) {
+			slots++
+		}
+	}
+
+	if plan.Budget.LeasedHosts != slots || plan.Budget.IndependentHosts != independent {
+		return fmt.Errorf("plan counts %d leased and %d independent hosts, %d leases are open "+
+			"(%d independent) and %d hosts work without one",
+			plan.Budget.LeasedHosts, plan.Budget.IndependentHosts, len(leased), independent,
+			slots+independent-len(leased))
 	}
 
 	for i, q := range plan.Queue {
@@ -1008,12 +623,8 @@ func (s *sim) checkPlan() error {
 			return fmt.Errorf("plan queues %s for no rollout", q.Host)
 		}
 
-		if s.stats.Waits == nil {
-			s.stats.Waits = make(map[string]int, 12)
-		}
-
 		word, _, _ := strings.Cut(q.Reason, " ")
-		s.stats.Waits[word]++
+		s.stats["waits: "+word]++
 	}
 
 	return nil
@@ -1032,7 +643,7 @@ func (s *sim) act(what string, res *ActionResult, err error) error {
 		return fmt.Errorf("%s: %w", what, err)
 	}
 
-	return s.observe(false)
+	return s.observe()
 }
 
 func (s *sim) agent() *simAgent { return s.world.agents[s.rng.IntN(len(s.world.agents))] }
@@ -1130,7 +741,7 @@ func (s *sim) randomStep() error {
 	case n < 665:
 		s.nodeEvent()
 	case n < 690:
-		s.stats.Restarts++
+		s.stats["restarts"]++
 
 		if s.rng.IntN(4) == 0 {
 			return s.outage()
@@ -1152,8 +763,6 @@ func (s *sim) randomStep() error {
 		s.note("store: failing=%v", s.store.failing())
 	case n < 726:
 		return s.loseDatabase()
-	case n < 729:
-		return s.previousBuild()
 	default:
 		return s.operatorAction()
 	}
@@ -1208,8 +817,8 @@ func (s *sim) outage() error {
 		return err
 	}
 
-	s.stats.Outages++
-	s.stats.OutageLeases += len(carried)
+	s.stats["outages longer than leaseTtl"]++
+	s.stats["open leases carried over an outage"] += len(carried)
 
 	if err := s.reconcile(); err != nil {
 		return err
@@ -1232,135 +841,23 @@ func (s *sim) outage() error {
 
 // loseDatabase restarts the controller on an empty database: rollouts,
 // leases, settings and liveness are gone. Agents that are in the middle of an
-// operation keep reporting it, and the scheduler must adopt those leases.
+// operation keep reporting it.
 func (s *sim) loseDatabase() error {
 	s.note("database lost")
-	s.stats.LostDatabases++
-
-	s.countLedger()
+	s.stats["lost databases"]++
+	s.stats["grants through the closed gate"] += s.oracle.exceptions
+	s.stats["hosts seen working without a lease"] += s.oracle.working
 
 	s.store = newFakeStore()
 	s.oracle = newOracle()
-	s.observed = 0
 	s.retried = nil
-	s.resumed = nil
-	s.paused = make(map[string]bool, 2)
-	s.skipped = make(map[string]map[string]bool, 4)
-	s.registered = make(map[string]time.Time, 16)
-	s.cancelled = make(map[string]fleet.LeaseState, 2)
+	s.cancelled = make(map[string]bool, 2)
 
 	for _, a := range s.world.agents {
 		s.world.dropped[a.name] = true
 	}
 
 	return s.boot(s.store)
-}
-
-// previousBuild restarts the controller on closed rollouts as the builds
-// before this one wrote them. Those builds kept on a rollout what it took
-// over from the rollouts before it and what it left to those after it
-// (inherited, bequest, bequeathed, and carriedFrom on a member); this build
-// keeps none of it and must read such rows without minding. The oldest of
-// them never gave a member of a closed rollout the outcome of a lease that
-// ended after the rollout was closed: such a member is still leased, by a
-// lease that is long over. Who is broken is read off the lease table, which
-// every build wrote alike, so none of this may change a decision.
-func (s *sim) previousBuild() error {
-	if s.store.failing() {
-		return nil
-	}
-
-	rollouts, leases, _ := s.store.snapshot()
-	rewritten := make([]*fleet.Rollout, 0, len(rollouts))
-
-	for _, r := range rollouts {
-		if !r.State.Terminal() || r.EndedAt == nil {
-			continue
-		}
-
-		for _, l := range leases {
-			m := r.Host(l.Host)
-			served := slices.ContainsFunc(sortedKeys(l.Rollouts), func(need string) bool { return l.Rollouts[need] == r.ID })
-
-			// A lease that ended after the rollout was closed was never
-			// settled in it.
-			if m == nil || !served || l.EndedAt == nil || !l.EndedAt.After(*r.EndedAt) || operatorSkipped(m) {
-				continue
-			}
-
-			m.State, m.LeaseID, m.Error = fleet.HostLeased, l.ID, ""
-		}
-
-		legacy, err := s.legacyRow(r)
-		if err != nil {
-			return err
-		}
-
-		rewritten = append(rewritten, legacy)
-	}
-
-	s.note("the closed rollouts are rows of an earlier build (%d), controller restart", len(rewritten))
-	s.stats.PreviousBuilds++
-
-	s.store.put(rewritten...)
-
-	return s.boot(s.store)
-}
-
-// legacyRow gives a rollout the fields that the builds before this one
-// stored with it, at random, and reads it the way the store reads a row.
-func (s *sim) legacyRow(r *fleet.Rollout) (*fleet.Rollout, error) {
-	raw, err := json.Marshal(r)
-	if err != nil {
-		return nil, fmt.Errorf("legacy row: %w", err)
-	}
-
-	row := make(map[string]any, 24)
-	if err = json.Unmarshal(raw, &row); err != nil {
-		return nil, fmt.Errorf("legacy row: %w", err)
-	}
-
-	entry := func() map[string]any {
-		e := map[string]any{"host": s.agent().name, "from": fmt.Sprintf("x%05d", s.rng.IntN(s.ids+1))}
-		if s.rng.IntN(2) == 0 {
-			e["lease"] = fmt.Sprintf("x%05d", s.rng.IntN(s.ids+1))
-		}
-
-		return e
-	}
-
-	if s.rng.IntN(2) == 0 {
-		row["inherited"] = []any{entry()}
-	}
-
-	// The build before this one recorded the bequest with a marker; the one
-	// before that without.
-	switch s.rng.IntN(3) {
-	case 0:
-		row["bequest"] = []any{entry(), entry()}
-		row["bequeathed"] = true
-	case 1:
-		row["bequest"] = []any{entry()}
-	}
-
-	if members, ok := row["hosts"].([]any); ok {
-		for _, m := range members {
-			if member, ok := m.(map[string]any); ok && s.rng.IntN(3) == 0 {
-				member["carriedFrom"] = fmt.Sprintf("x%05d", s.rng.IntN(s.ids+1))
-			}
-		}
-	}
-
-	if raw, err = json.Marshal(row); err != nil {
-		return nil, fmt.Errorf("legacy row: %w", err)
-	}
-
-	out := &fleet.Rollout{}
-	if err = json.Unmarshal(raw, out); err != nil {
-		return nil, fmt.Errorf("a row of an earlier build cannot be read: %w", err)
-	}
-
-	return out, nil
 }
 
 // rollingImages lists the images that some agent is rolling right now.
@@ -1581,14 +1078,28 @@ func (s *sim) operatorAction() error {
 		}
 
 		return s.retry(r, hosts)
-	case n < 50:
+	case n < 47:
 		hosts := s.someHosts()
 		res, err := s.svc.Hold(ctx, simActor, HoldRequest{Hosts: hosts, Reason: "sim"})
-		s.noteHolds(hosts)
 
 		return s.act(fmt.Sprintf("hold %v", hosts), res, err)
-	case n < 60:
+	case n < 50:
+		// A host known offline for a while, or until a person lifts it.
+		hosts := s.someHosts()[:1]
+		req := OfflineRequest{Hosts: hosts, Reason: "sim"}
+
+		if s.rng.IntN(2) == 0 {
+			until := s.world.now.Add(time.Duration(1+s.rng.IntN(30)) * time.Minute)
+			req.Until = &until
+		}
+
+		res, err := s.svc.MarkOffline(ctx, simActor, req)
+
+		return s.act(fmt.Sprintf("mark offline %v", hosts), res, err)
+	case n < 57:
 		return s.unhold(s.someHosts())
+	case n < 60:
+		return s.unmarkOffline(s.someHosts())
 	case n < 80:
 		return s.manualAction()
 	case n < 94:
@@ -1599,78 +1110,33 @@ func (s *sim) operatorAction() error {
 		hosts := s.someHosts()[:1]
 		res, err := s.svc.Forget(ctx, simActor, HoldRequest{Hosts: hosts})
 
-		// The stored liveness rows of a forgotten host are gone, and so is
-		// what the person noted about it.
+		// The stored liveness rows of a forgotten host are gone.
 		if s.store.host(hosts[0]) == nil {
 			s.world.dropped[hosts[0]] = true
-			s.oracle.forget(hosts[0])
-
-			for _, byHost := range s.skipped {
-				delete(byHost, hosts[0])
-			}
 		}
 
 		return s.act(fmt.Sprintf("forget %v", hosts), res, err)
 	}
 }
 
-// unhold is the person who lifts the hold of hosts, at any time. By the
-// person's own record of the leases they ended, the action is refused, for
-// all its hosts, exactly while one of them holds such a lease that is still
-// open; otherwise it is not refused as invalid.
+// unhold is the person who lifts the hold of hosts, at any time.
 func (s *sim) unhold(hosts []string) error {
-	ctx := context.Background()
-
-	open, err := s.store.ListLeases(ctx, store.LeaseFilter{OpenOnly: true})
-	if err != nil {
-		return err
-	}
-
-	ending := ""
-
-	for _, l := range open {
-		if _, cancelled := s.cancelled[l.ID]; cancelled && slices.Contains(hosts, l.Host) {
-			ending = l.ID
-		}
-	}
-
-	held := make(map[string]bool, len(hosts))
-
-	for _, name := range hosts {
-		if h := s.store.host(name); h != nil {
-			held[name] = h.HoldWanted
-		}
-	}
-
-	res, err := s.svc.Unhold(ctx, simActor, HoldRequest{Hosts: hosts})
-	s.noteHolds(hosts)
-
-	switch {
-	case ending != "" && err == nil:
-		return fmt.Errorf("unhold %v was allowed while lease %s, which a person ended, is open", hosts, ending)
-	case ending != "" && !errors.Is(err, errWrite):
-		s.stats.UnholdsRefused++
-
-		for _, name := range hosts {
-			if h := s.store.host(name); h != nil && h.HoldWanted != held[name] {
-				return fmt.Errorf("unhold %v was refused for lease %s and changed the hold of %s", hosts, ending, name)
-			}
-		}
-	case ending == "" && errors.Is(err, ErrInvalidAction):
-		return fmt.Errorf("unhold %v was refused although none of the hosts holds a lease a person ended: %w",
-			hosts, err)
-	}
+	res, err := s.svc.Unhold(context.Background(), simActor, HoldRequest{Hosts: hosts})
 
 	return s.act(fmt.Sprintf("unhold %v", hosts), res, err)
 }
 
-// simHoldEnded is what the reason of a host's controller hold says once a
-// lease of the host was ended.
-const simHoldEnded = "lease ended by operator"
+// unmarkOffline is the person who lifts the known-offline mark of hosts.
+func (s *sim) unmarkOffline(hosts []string) error {
+	res, err := s.svc.UnmarkOffline(context.Background(), simActor, OfflineRequest{Hosts: hosts})
+
+	return s.act(fmt.Sprintf("unmark offline %v", hosts), res, err)
+}
 
 // endLease is the person who ends an open lease: any one, whatever it does,
-// started or not, ended before or not. Every open lease can be ended; the
-// lease stays open and the host is held from that moment on.
+// started or not, ended before or not. Every open lease can be ended, and
+// ending it does not move it: only its agent's report, its expiry or a
+// reconcile ends a lease.
 func (s *sim) endLease() error {
 	ctx := context.Background()
 
@@ -1686,13 +1152,6 @@ func (s *sim) endLease() error {
 	}
 
 	was := open[s.rng.IntN(len(open))]
-
-	// What the person saw of the host's hold before.
-	heldBefore, reasonBefore := false, ""
-	if h := s.store.host(was.Host); h != nil {
-		heldBefore, reasonBefore = h.HoldWanted, h.HoldReason
-	}
-
 	res, err := s.svc.EndLease(ctx, simActor, EndLeaseRequest{Lease: was.ID, Reason: "sim"})
 
 	switch {
@@ -1700,40 +1159,8 @@ func (s *sim) endLease() error {
 	case err != nil:
 		return fmt.Errorf("end lease %s of %s (%s) was refused: %w", was.ID, was.Host, was.State, err)
 	default:
-		_, again := s.cancelled[was.ID]
-		if !again {
-			s.cancelled[was.ID] = was.State
-			s.stats.Cancels[was.State]++
-
-			if a := s.world.byName[was.Host]; a != nil && a.oldBuild {
-				s.stats.CancelsOldBuild++
-			}
-
-			if a := s.world.byName[was.Host]; a != nil && a.op != nil && a.opEnd.Sub(a.op.StartedAt) > 5*time.Minute {
-				s.stats.CancelsLongOp++
-			}
-		}
-
-		// The person sees the host held afterwards, also when the lease had
-		// been ended before: the hold cannot have been lifted meanwhile.
-		s.noteHolds([]string{was.Host})
-
-		if h := s.store.host(was.Host); h != nil && !h.HoldWanted {
-			return fmt.Errorf("lease %s of %s was ended and the host is not held", was.ID, was.Host)
-		}
-
-		// The hold says that a lease was ended under it, also when somebody
-		// had held the host before, and it keeps what that person gave.
-		if h := s.store.host(was.Host); h != nil && !again {
-			if !strings.Contains(h.HoldReason, simHoldEnded) || (heldBefore && !strings.HasPrefix(h.HoldReason, reasonBefore)) {
-				return fmt.Errorf("lease %s of %s was ended; the host was held before: %v (%q), and the reason of its "+
-					"hold is now %q", was.ID, was.Host, heldBefore, reasonBefore, h.HoldReason)
-			}
-
-			if heldBefore && reasonBefore != "" && !strings.Contains(reasonBefore, simHoldEnded) {
-				s.stats.HoldsExtended++
-			}
-		}
+		s.cancelled[was.ID] = true
+		s.stats["leases ended by a person: "+string(was.State)]++
 
 		now, getErr := s.store.GetLease(ctx, was.ID)
 		if getErr != nil {
@@ -1741,8 +1168,7 @@ func (s *sim) endLease() error {
 		}
 
 		if now.State != was.State {
-			return fmt.Errorf("ending lease %s of %s moved it from %s to %s: only its agent's report, its expiry or "+
-				"a reconcile ends a lease", was.ID, was.Host, was.State, now.State)
+			return fmt.Errorf("ending lease %s of %s moved it from %s to %s", was.ID, was.Host, was.State, now.State)
 		}
 	}
 
@@ -1761,9 +1187,6 @@ func (s *sim) rolloutAction(n int) error {
 	switch n % 7 {
 	case 0:
 		res, err := s.svc.Pause(ctx, simActor, ScopeRequest{Rollout: r.ID})
-		if err == nil {
-			s.paused[r.ID] = true
-		}
 
 		return s.act("pause "+r.ID, res, err)
 	case 1, 2, 3:
@@ -1775,15 +1198,8 @@ func (s *sim) rolloutAction(n int) error {
 	default:
 		hosts := s.someHosts()
 		res, err := s.svc.Skip(ctx, simActor, RolloutHostsRequest{Rollout: r.ID, Hosts: hosts})
-		if err == nil && r.Kind != fleet.RolloutManual {
-			for _, name := range res.Hosts {
-				if s.skipped[r.Key] == nil {
-					s.skipped[r.Key] = make(map[string]bool, 2)
-				}
-
-				s.skipped[r.Key][name] = true
-				s.stats.Skips++
-			}
+		if err == nil {
+			s.stats["skipped hosts"] += len(res.Hosts)
 		}
 
 		return s.act(fmt.Sprintf("skip %s %v", r.ID, hosts), res, err)
@@ -1831,7 +1247,7 @@ func (s *sim) settingsAction() error {
 		return err
 	}
 
-	policies := []fleet.Policy{fleet.PolicyAuto, fleet.PolicyAuto, fleet.PolicyManual, fleet.PolicyPaused}
+	policies := []fleet.Policy{fleet.PolicyAuto, fleet.PolicyAuto, fleet.PolicyManual}
 	what := ""
 
 	switch s.rng.IntN(9) {
@@ -1865,7 +1281,7 @@ func (s *sim) settingsAction() error {
 		what = "maxUnavailablePercent=250 (invalid)"
 	}
 
-	err = s.svc.UpdateSettings(ctx, simActor, set)
+	err = replaceSettings(ctx, s.svc, simActor, set)
 
 	return s.act("settings "+what, &ActionResult{Message: "saved"}, err)
 }
@@ -1890,7 +1306,6 @@ func (s *sim) converge() error {
 		a.silentUntil, a.outageUntil, a.localHold, a.rebootSticks = time.Time{}, time.Time{}, false, false
 		a.syncingUntil, a.elOfflineUntil, a.elDownUntil = time.Time{}, time.Time{}, time.Time{}
 		a.peerCapUntil, a.elLag = time.Time{}, 0
-		a.peerMax = max(a.peerMax, simPeers)
 		a.dead, a.sloppy, a.blind = false, false, false
 	}
 
@@ -1907,7 +1322,7 @@ func (s *sim) converge() error {
 		set.MaxUnavailablePercent = 10
 	}
 
-	if err := s.svc.UpdateSettings(ctx, simActor, set); err != nil {
+	if err := replaceSettings(ctx, s.svc, simActor, set); err != nil {
 		return fmt.Errorf("converge: settings: %w", err)
 	}
 
@@ -1931,8 +1346,8 @@ func (s *sim) converge() error {
 			return err
 		}
 
-		s.stats.ConvergeTicks++
-		s.stats.MaxConvergeTicks = s.stats.ConvergeTicks
+		s.stats["convergence ticks"]++
+		s.stats[statMaxConverge]++
 
 		if problem = s.converged(); problem == nil {
 			return nil
@@ -1960,15 +1375,20 @@ func (s *sim) openRollouts() string {
 	return b.String()
 }
 
-// operate is the person of the convergence phase: lift holds and pauses,
-// retry what halted, and reopen aborted causes that hosts still report.
+// operate is the person of the convergence phase: lift holds and pauses
+// (those of an abort among them), retry what halted and take back the skips.
 func (s *sim) operate() error {
 	rollouts, _, _ := s.store.view()
-	open := make(map[string]bool, len(rollouts))
 
 	for _, a := range s.world.agents {
 		if h := s.store.host(a.name); h != nil && h.HoldWanted {
 			if err := s.unhold([]string{a.name}); err != nil {
+				return err
+			}
+		}
+
+		if h := s.store.host(a.name); h != nil && h.Offline != nil {
+			if err := s.unmarkOffline([]string{a.name}); err != nil {
 				return err
 			}
 		}
@@ -1978,8 +1398,6 @@ func (s *sim) operate() error {
 		if r.State.Terminal() {
 			continue
 		}
-
-		open[r.Key] = true
 
 		if r.Paused {
 			if err := s.resume(r.ID); err != nil {
@@ -2002,52 +1420,14 @@ func (s *sim) operate() error {
 		}
 	}
 
-	reported := s.reportedKeys()
-	latest := make(map[string]bool, len(rollouts))
-
-	for i := len(rollouts) - 1; i >= 0; i-- {
-		r := rollouts[i]
-		if latest[r.Key] {
-			continue
-		}
-
-		latest[r.Key] = true
-
-		// An aborted cause is reopened; the skips of a closed rollout whose
-		// hosts still report the need are lifted.
-		if !open[r.Key] && reported[r.Key] &&
-			(r.State == fleet.RolloutAborted || len(skippedMembers(r)) > 0) {
-			if err := s.retry(r, nil); err != nil {
-				return err
-			}
-		}
-	}
-
 	return nil
 }
 
-// resume is the person who resumes a rollout, and takes down that they did:
-// whatever paused the rollout, a person or the scheduler after its canary, it
-// is not paused any more.
+// resume is the person who resumes a rollout.
 func (s *sim) resume(id string) error {
 	res, err := s.svc.Resume(context.Background(), simActor, ScopeRequest{Rollout: id})
-	if err == nil {
-		s.resumed = append(s.resumed, id)
-		delete(s.paused, id)
-	}
 
 	return s.act("resume "+id, res, err)
-}
-
-// noteHolds takes down what a hold or unhold did to the named hosts, as the
-// person sees it afterwards (an action may fail half way). A host the
-// controller does not know keeps what was noted before.
-func (s *sim) noteHolds(hosts []string) {
-	for _, name := range hosts {
-		if h := s.store.host(name); h != nil {
-			s.holds[name] = h.HoldWanted
-		}
-	}
 }
 
 // skippedMembers names the members of a rollout that a person skipped.
@@ -2064,15 +1444,14 @@ func skippedMembers(r *fleet.Rollout) []string {
 }
 
 // retry retries a rollout as a person would, for all hosts or the named
-// ones. Every host the action names as retried is no longer skipped for the
-// rollout's key.
+// ones.
 //
 // A retry of the rollout lifts its halt. A retry of hosts lifts it only when
 // one of the hosts it retried had failed and no member is left failed; the
-// simulation does not take the scheduler's word
-// for that: it looks at the members itself, and tells the oracle that the
-// rollout was retried only when none is failed. A rollout that left its halt
-// with a failed member in it then fails the oracle's halt rule.
+// simulation does not take the scheduler's word for that: it looks at the
+// members itself, and tells the oracle that the rollout was retried only when
+// none is failed. A rollout that left its halt with a failed member in it
+// then fails the oracle's halt rule.
 func (s *sim) retry(r *fleet.Rollout, hosts []string) error {
 	res, err := s.svc.Retry(context.Background(), simActor, RolloutHostsRequest{Rollout: r.ID, Hosts: hosts})
 	if err == nil {
@@ -2091,60 +1470,9 @@ func (s *sim) retry(r *fleet.Rollout, hosts []string) error {
 		if len(hosts) == 0 || (wasFailed && !stillFailed) {
 			s.retried = append(s.retried, r.ID)
 		}
-
-		for _, name := range res.Hosts {
-			if s.skipped[r.Key][name] {
-				delete(s.skipped[r.Key], name)
-				s.stats.SkipsLifted++
-			}
-		}
 	}
 
 	return s.act(fmt.Sprintf("retry %s %v", r.ID, hosts), res, err)
-}
-
-// needsGone forgets the skips of a host for the needs it no longer reports:
-// a skip holds for as long as the host keeps reporting the need. A held host
-// reports nothing and keeps its skips.
-func (s *sim) needsGone(a *simAgent, req *protocol.SyncRequest) {
-	if h := s.store.host(a.name); h == nil || h.Held() {
-		return
-	}
-
-	for key, byHost := range s.skipped {
-		if byHost[a.name] && !slices.ContainsFunc(req.Needs, func(n protocol.Need) bool {
-			return needKey(&n) == key
-		}) {
-			delete(byHost, a.name)
-		}
-	}
-}
-
-// reportedKeys are the rollout keys of the observed needs the agents report.
-func (s *sim) reportedKeys() map[string]bool {
-	keys := make(map[string]bool, 8)
-
-	for _, a := range s.world.agents {
-		if a.lastSent == nil {
-			continue
-		}
-
-		for i := range a.lastSent.Needs {
-			n := &a.lastSent.Needs[i]
-
-			switch {
-			case n.DirectiveID != "":
-			case n.Kind == protocol.NeedImage:
-				keys[imageKey(n.Image.Image, n.Image.ToDigest)] = true
-			case n.Kind == protocol.NeedPackages:
-				keys[prefixPackages+protocol.PackagesKey(n.Packages.Packages)] = true
-			case n.Kind == protocol.NeedReboot:
-				keys[keyReboot] = true
-			}
-		}
-	}
-
-	return keys
 }
 
 // converged reports what is still missing: an open rollout or lease, or a
@@ -2175,29 +1503,29 @@ func (s *sim) converged() error {
 
 // run performs the random steps and the convergence of one seed. It returns
 // a failure report, or "".
-func runSim(seed uint64, steps int) (string, *simStats) {
+func runSim(seed uint64, steps int) (string, simStats) {
 	s, err := newSim(seed)
 	if err != nil {
 		if s == nil {
-			return fmt.Sprintf("seed %d: %v", seed, err), &simStats{}
+			return fmt.Sprintf("seed %d: %v", seed, err), simStats{}
 		}
 
-		return s.report(err), &s.stats
+		return s.report(err), s.stats
 	}
 
 	for s.step = 1; s.step <= steps; s.step++ {
 		if err := s.randomStep(); err != nil {
-			return s.report(err), &s.stats
+			return s.report(err), s.stats
 		}
 	}
 
 	if err := s.converge(); err != nil {
-		return s.report(err), &s.stats
+		return s.report(err), s.stats
 	}
 
 	s.count()
 
-	return "", &s.stats
+	return "", s.stats
 }
 
 // simSeeds is which seeds to run: one from UPGRADOOR_SIM_SEED, a count from
@@ -2230,30 +1558,8 @@ func simSeeds(t *testing.T) (first, n uint64) {
 	return 0, 300
 }
 
-// TestSimulationFoundSeeds replays the seeds on which the simulation has
-// found something, whatever range of seeds TestSimulation runs:
-//
-//   - 8303: a lease that was taken up again after a person had skipped its
-//     member is no success of the rollout; the others wait for a canary;
-//   - 9335, 10077: a lease that a person ended, taken up again after the hold
-//     had been lifted, holds its host again;
-//   - 1165: a rollout whose first success is a lease that was adopted, and
-//     carries no needs, pauses after it like any other.
-//
-// A seed says what it said only as long as the generator draws the same
-// history from it; the rules themselves are pinned by name elsewhere.
-func TestSimulationFoundSeeds(t *testing.T) {
-	for _, seed := range []uint64{8303, 9335, 10077, 1165} {
-		t.Run(strconv.FormatUint(seed, 10), func(t *testing.T) {
-			if report, _ := runSim(seed, 300); report != "" {
-				t.Error(report)
-			}
-		})
-	}
-}
-
 // TestSimulation drives random fleets through random histories and checks
-// the invariants of docs/scheduler.md after every step, then convergence. A
+// the oracle's invariants after every step, then convergence. A
 // failure names the seed, the fleet, the settings and the last steps; the
 // seed alone reproduces it.
 func TestSimulation(t *testing.T) {
@@ -2271,7 +1577,7 @@ func TestSimulation(t *testing.T) {
 		mu       sync.Mutex
 		failures = make(map[uint64]string, maxFailures)
 		seeds    = make(chan uint64)
-		total    simStats
+		total    = make(simStats, 64)
 	)
 
 	for range min(uint64(runtime.GOMAXPROCS(0)), n) {
@@ -2330,80 +1636,18 @@ func TestSimulation(t *testing.T) {
 
 	// A simulation that never grants, fails or waits proves nothing.
 	if len(failed) == 0 && n >= 50 {
-		for what, count := range map[string]int{
-			"grants": total.Grants, "released leases": total.Released, "failed leases": total.Failed,
-			"expired leases": total.Expired, "completed rollouts": total.Completed,
-			"superseded rollouts": total.Superseded, "halts": total.Halts, "forced grants": total.ForcedGrants,
-			"budget-exempt grants": total.ExemptGrants, "bundled leases": total.Bundled,
-			"restart comparisons": total.Shadows, "write failures": total.WriteFailures,
-			"adopted leases":                             total.Adopted,
-			"holds adopted from the agents":              total.HoldsAdopted,
-			"outages longer than leaseTtl":               total.Outages,
-			"open leases carried over an outage":         total.OutageLeases,
-			"runs without liveness":                      total.Unsupported,
-			"budgeted validator grants without liveness": total.ProbeGrants,
-			"skipped hosts":                              total.Skips,
-			"skips taken back":                           total.SkipsLifted,
-			"repairs through the closed gate":            total.Repairs,
-			"members in the repair stage":                total.BrokenMembers,
-			"broken hosts granted first":                 total.BrokenFirst,
-			"broken hosts repaired":                      total.Repaired,
-			"hosts held back by a lease in flight":       total.FlightHeld,
-			"leases ended by a person":                   total.EndedByOperator,
-			"granted leases a person ended":              total.Cancels[fleet.LeaseGranted],
-			"running leases a person ended":              total.Cancels[fleet.LeaseRunning],
-			"verifying leases a person ended":            total.Cancels[fleet.LeaseVerifying],
-			"steps that agents began":                    total.StepsBegun,
-			"runs with a slot phase out of bounds":       total.FuturePhases,
-			"failed leases with a step done":             total.MixedLeases,
-			"slot-duration forks":                        total.Forks,
-			"expired leases taken up again":              total.Reopened,
-			"leases that ended after their rollout":      total.SettledClosed,
-			"waits for a verb the agent lacks":           total.Waits["verb"],
-			"waits for the budget":                       total.Waits["budget"], "waits for the host limit": total.Waits["host"],
-			"waits for the gate": total.Waits["network"], "waits for the order": total.Waits["after"],
-			"seeds with a pause after the canary":                 total.PauseSeeds,
-			"seeds with the comparison with the fleet":            total.ShareSeeds,
-			"rollouts paused after their canary":                  total.CanaryPauses,
-			"rollouts resumed after the pause after their canary": total.CanaryResumes,
-			"leases held back for peers below the fleet":          total.PeerBlocks,
-			"leases released with their peers compared":           total.PeerPasses,
-			"leases released with too few reference hosts":        total.PeerSkips,
-			"seeds with a host that stays below the fleet":        total.StarvedSeeds,
+		for _, what := range []string{
+			"grants", "released leases", "failed leases", "expired leases", "completed rollouts",
+			"superseded rollouts", "halts", "forced grants", "budget-exempt grants", "bundled leases",
+			"restart comparisons", "write failures", "lost databases", "holds adopted from the agents",
+			"outages longer than leaseTtl", "open leases carried over an outage",
+			"skipped hosts", "grants through the closed gate", "steps that agents began",
+			"hosts seen working without a lease",
+			"slot-duration forks", "leases ended by a person: granted", "leases ended by a person: running",
+			"leases ended by a person: verifying", "waits: verb", "waits: budget", "waits: host",
+			"waits: network", "waits: after",
 		} {
-			if count == 0 {
-				t.Errorf("the simulation never produced any %s", what)
-			}
-		}
-	}
-
-	// What is rare shows in a long run only.
-	if len(failed) == 0 && n >= 1000 {
-		for what, count := range map[string]int{
-			"runs that begin before genesis":                                                          total.BeforeGenesis,
-			"skips carried over":                                                                      total.SkipsCarried,
-			"restarts on rows of an earlier build":                                                    total.PreviousBuilds,
-			"hosts held back by the lease of an aborted rollout":                                      total.FlightAborted,
-			"hosts held back by a lease that was taken up again":                                      total.FlightReopened,
-			"hosts held back in a rollout that a retry opened":                                        total.FlightRetried,
-			"hosts held back in a rollout that was open when the other closed":                        total.FlightNextToOpen,
-			"hosts broken by a lease that a person ended with its steps done":                         total.BrokenByOperator,
-			"unholds refused while a lease that a person ended was open":                              total.UnholdsRefused,
-			"holds that were there before a lease was ended, reason extended":                         total.HoldsExtended,
-			"silent leases expired when the agent said it never started them":                         total.NeverStarted,
-			"leases of an earlier agent build that failed after a cancel and spared what never began": total.SparedUntouched,
-			"leases a person ended that broke nobody":                                                 total.SparedByCancel,
-			"steps not begun because the lease was cancelled":                                         total.StepsCancelled,
-			"leases an agent declined to start":                                                       total.Declined,
-			"leases ended on agents that do not know the cancel mark":                                 total.CancelsOldBuild,
-			"leases ended during an operation of more than five minutes":                              total.CancelsLongOp,
-			"failed leases taken up again":                                                            total.ReopenedFailed,
-			"broken hosts that a person forgot":                                                       total.ForgottenBroken,
-			"hosts broken by a lease of a rollout that had been aborted":                              total.BrokenAfterAbort,
-			"leases that failed as not ready waiting for the fleet's share of peers":                  total.PeerTimeouts,
-			"leases that waited for the fleet's share over several reconciles and kept their run":     total.PeerHeld,
-		} {
-			if count == 0 {
+			if total[what] == 0 {
 				t.Errorf("the simulation never produced any %s", what)
 			}
 		}

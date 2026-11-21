@@ -7,16 +7,11 @@ package fleet
 import (
 	"errors"
 	"fmt"
-	"math"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
-
-// RoleBootnode is the certificate role that marks a bootnode. It is shown
-// with the host; the scheduler treats a bootnode like any other host.
-const RoleBootnode = "bootnode"
 
 // Host is one host known to the controller. A host exists once a valid
 // certificate has talked to the controller.
@@ -25,8 +20,18 @@ type Host struct {
 	// CertHash is the hash of the certificate last presented. A change is
 	// audited, not rejected.
 	CertHash string `json:"certHash"`
-	// Generation, Validators and Roles are copied from the certificate.
-	Generation uint64                   `json:"generation"`
+	// Generation and Roles are copied from the certificate.
+	Generation uint64 `json:"generation"`
+	// Validators is the range of validators the controller counts for the
+	// host: its weight, and the validators whose attestations are tracked
+	// for it. It comes from what the host reports (Status.Validators), not
+	// from the certificate, and differs from the report in two cases. While
+	// the host does not know its range (its marker file is missing or
+	// unreadable) the range counted last is kept. And no validator is
+	// counted for two hosts: where the reported range runs into validators
+	// that are counted for another host, only the part nobody else holds is
+	// counted (UnclaimedRange). The ranges of all hosts are therefore
+	// disjoint.
 	Validators *identity.ValidatorRange `json:"validators,omitempty"`
 	Roles      []string                 `json:"roles"`
 
@@ -37,6 +42,9 @@ type Host struct {
 
 	// Status is the last sync request, verbatim.
 	Status *protocol.SyncRequest `json:"status,omitempty"`
+	// StatusHash identifies Status without its clock fields (SentAt,
+	// UptimeSeconds); empty when the store keeps none.
+	StatusHash string `json:"-"`
 	// InventoryHash is the hash of the inventory stored for this host.
 	InventoryHash string `json:"inventoryHash,omitempty"`
 
@@ -45,22 +53,148 @@ type Host struct {
 	HoldWanted bool   `json:"holdWanted"`
 	HoldReason string `json:"holdReason,omitempty"`
 	// HoldBy says through what the hold was set: HoldByTeam when a person
-	// set it with a team feature, empty for every other hold (staff, the
-	// scheduler, the end of a lease, a build from before the field). A team
-	// feature lifts only a hold that was set through one.
+	// set it with a team feature, empty for every other hold. A team feature
+	// lifts only a hold that was set through one.
 	HoldBy string `json:"holdBy,omitempty"`
+
+	// Offline is a person's mark that the host is known offline, for example
+	// a client kept broken on purpose for debugging; nil while unmarked. While
+	// it is in force (KnownOffline) the host's validators are left out of the
+	// gate's participation and the budget, and the host gets no lease.
+	Offline *OfflineMark `json:"offline,omitempty"`
+
+	// Broken says what the host's last lease failed on: per group of rollouts
+	// (an image reference as "image:<reference>", or "packages") the ID of the
+	// lease that failed. A host that is broken for the group of a rollout goes
+	// first in it. The scheduler sets the mark where a lease fails and clears
+	// it where a lease is released with the group's steps done; it goes with
+	// the host when the host is forgotten.
+	Broken map[string]string `json:"broken,omitempty"`
+
+	// SyncInterval is the longest sync interval the controller asked of the
+	// host in its last answer. StaleAfter allows for it.
+	SyncInterval time.Duration `json:"syncInterval,omitempty"`
 }
 
 // HoldByTeam is Host.HoldBy for a hold set through a team feature.
 const HoldByTeam = "team"
 
-// Weight is the number of validators the host operates.
+// OfflineMark marks a host as known offline.
+type OfflineMark struct {
+	// Reason says why; it is required.
+	Reason string `json:"reason"`
+	// Until is when the mark ends by itself; nil keeps it until a person
+	// lifts it.
+	Until *time.Time `json:"until,omitempty"`
+	// By is HoldByTeam for a mark set through a team feature: a team feature
+	// lifts only such a mark.
+	By string `json:"by,omitempty"`
+}
+
+// KnownOffline reports whether the host's offline mark is in force at now.
+func (h *Host) KnownOffline(now time.Time) bool {
+	return h.Offline != nil && (h.Offline.Until == nil || now.Before(*h.Offline.Until))
+}
+
+// Weight is the number of validators counted for the host.
 func (h *Host) Weight() uint64 { return h.Validators.Count() }
 
+// ReportedValidators is the validator range the host's last sync stated, or
+// nil when it stated none or does not know it.
+func (h *Host) ReportedValidators() *identity.ValidatorRange {
+	if h.Status == nil || h.Status.Validators.Count() == 0 {
+		return nil
+	}
+
+	return &identity.ValidatorRange{
+		Start: h.Status.Validators.Start, End: h.Status.Validators.End,
+	}
+}
+
+// ReportedOverlaps names the hosts of all, other than h, whose reported
+// validator range shares validators with the one h reports, ordered as all
+// is. Two hosts say they run the same validators: for a moment while keys
+// are moved between them, or because one of them is wrong.
+func (h *Host) ReportedOverlaps(all []*Host) []string {
+	mine := h.ReportedValidators()
+	if mine == nil {
+		return nil
+	}
+
+	var out []string
+
+	for _, other := range all {
+		if other == nil || other.Name == h.Name {
+			continue
+		}
+
+		theirs := other.ReportedValidators()
+		if theirs != nil && theirs.Start < mine.End && mine.Start < theirs.End {
+			out = append(out, other.Name)
+		}
+	}
+
+	return out
+}
+
+// UnclaimedRange returns the largest part of want that none of taken covers,
+// the first one of several of that size; nil when all of want is taken or
+// want is empty. taken must be ordered by Start.
+//
+// It decides what is counted for a host whose reported range overlaps what
+// is counted for other hosts: whoever held a validator first keeps it, so a
+// host cannot take validators away from another by reporting them.
+func UnclaimedRange(
+	want identity.ValidatorRange, taken []identity.ValidatorRange,
+) *identity.ValidatorRange {
+	var best *identity.ValidatorRange
+
+	consider := func(start, end uint64) {
+		if end > start && (best == nil || end-start > best.End-best.Start) {
+			best = &identity.ValidatorRange{Start: start, End: end}
+		}
+	}
+
+	cursor := want.Start
+
+	for _, t := range taken {
+		if t.End <= cursor || t.End <= t.Start {
+			continue
+		}
+
+		if t.Start >= want.End {
+			break
+		}
+
+		consider(cursor, min(t.Start, want.End))
+
+		cursor = t.End
+		if cursor >= want.End {
+			return best
+		}
+	}
+
+	consider(cursor, want.End)
+
+	return best
+}
+
+// staleSlack is what StaleAfter adds to two asked sync intervals: one
+// request's way there and back with retries.
+const staleSlack = 15 * time.Second
+
+// StaleAfter is the silence after which the host counts as stale: the
+// configured staleAfter, or two of the sync intervals the controller asked of
+// the host when those are longer. A host the controller slowed down is not
+// stale for doing what it was told.
+func (h *Host) StaleAfter(staleAfter time.Duration) time.Duration {
+	return max(staleAfter, 2*h.SyncInterval+staleSlack)
+}
+
 // Stale reports whether the host's agent has been silent for longer than
-// staleAfter.
+// StaleAfter(staleAfter).
 func (h *Host) Stale(now time.Time, staleAfter time.Duration) bool {
-	return now.Sub(h.LastSeen) > staleAfter
+	return now.Sub(h.LastSeen) > h.StaleAfter(staleAfter)
 }
 
 // Held reports whether the agent reports any hold or a controller hold is
@@ -94,14 +228,12 @@ type NetworkHealth struct {
 	// ordered by epoch, the first one starting at genesis. A fork that
 	// changes the slot duration starts a new one. Every conversion between
 	// an epoch and a time goes through them (EpochStart, EpochAt, EpochSpan);
-	// while they are empty no epoch can be placed in time, and none in or
-	// after a phase that is invalid (ValidateTiming).
+	// while they are empty or invalid (ValidateTiming) no epoch can be placed
+	// in time.
 	Phases []SlotPhase `json:"phases,omitempty"`
-	// TimingError says why the current epoch cannot be placed by Phases: the
-	// phase it lies in, or one before it, is out of bounds. Empty while the
-	// timing is good for now (a phase that is out of bounds further on is
-	// logged by the beacon service and closes nothing yet). While it is set
-	// the network gate is closed with it as the reason.
+	// TimingError says why Phases is invalid (ValidateTiming); empty while it
+	// is good. While it is set the network gate is closed with it as the
+	// reason.
 	TimingError string `json:"timingError,omitempty"`
 
 	HeadSlot       uint64 `json:"headSlot"`
@@ -111,17 +243,15 @@ type NetworkHealth struct {
 	// sits at 2.
 	FinalityLagEpochs uint64 `json:"finalityLagEpochs"`
 
-	// LivenessEpoch is the newest epoch with stored liveness; LivenessKnown
-	// is false until the first one is stored or when the beacon node does not
-	// serve the liveness endpoint.
+	// LivenessEpoch is the newest settled epoch the beacon service summed
+	// from the per-slot participation; LivenessKnown is false until there is
+	// one. LivenessError says why the last count failed, if it did: the
+	// epochs it holds up are not published.
 	LivenessKnown bool   `json:"livenessKnown"`
 	LivenessEpoch uint64 `json:"livenessEpoch"`
-	// LivenessUnsupported is true while the beacon node is known not to serve
-	// the liveness endpoint (as opposed to liveness that is merely not there
-	// yet or failed to refresh). The scheduler then judges availability and
-	// readiness from the agents' probes and the gate from finality alone.
-	LivenessUnsupported bool `json:"livenessUnsupported"`
-	// Tracked and Live count the validators of all hosts in LivenessEpoch.
+	LivenessError string `json:"livenessError,omitempty"`
+	// Tracked counts the validators of all hosts with a duty in
+	// LivenessEpoch, Live the ones whose attestation a block carries.
 	Tracked uint64 `json:"tracked"`
 	Live    uint64 `json:"live"`
 }
@@ -140,235 +270,116 @@ func SinglePhase(genesis time.Time, slot time.Duration) []SlotPhase {
 	return []SlotPhase{{Epoch: 0, Start: genesis, SlotMs: uint64(slot / time.Millisecond)}}
 }
 
-// Bounds of a chain timing the controller works with. A slot phase outside
-// them is broken, and no epoch is placed by it or after it: every check that
-// needs the time of such an epoch fails safe. The epochs before it are placed
-// as if it were not there.
-const (
-	// MaxSlotMs is the longest slot: one hour.
-	MaxSlotMs = 3_600_000
-	// MaxSlotsPerEpoch is the largest number of slots in an epoch.
-	MaxSlotsPerEpoch = 1 << 16
-	// MaxEpochLength is the longest epoch: one day.
-	MaxEpochLength = 24 * time.Hour
-	// maxPhaseReach is how far past its start a phase is extrapolated: a
-	// hundred years. It keeps every time and duration far inside what
-	// time.Duration can hold.
-	maxPhaseReach = 100 * 365 * 24 * time.Hour
-)
-
 // Errors of ValidateTiming.
 var (
 	ErrNoTiming      = errors.New("no chain timing known")
 	ErrInvalidTiming = errors.New("invalid chain timing")
 )
 
-// ValidateTiming checks the slot phases of a chain: there is at least one,
-// every slot lasts between 1 ms and MaxSlotMs, an epoch has between 1 and
-// MaxSlotsPerEpoch slots and lasts at most MaxEpochLength, the phases are in
-// ascending order of epoch, and every phase starts exactly where the one
-// before it ends. The error names the first phase that fails this. Such a
-// timing is still good for the epochs before that phase: see TimingUsable.
+// ValidateTiming checks the slot phases of a chain: there is at least one, an
+// epoch has slots and every slot a duration, the phases are in ascending
+// order of epoch, and every phase starts exactly where the one before it
+// ends. The error names the first phase that fails this. A timing that fails
+// places no epoch at all.
 func ValidateTiming(slotsPerEpoch uint64, phases []SlotPhase) error {
-	_, _, err := usableTiming(slotsPerEpoch, phases)
-
-	return err
-}
-
-// TimingUsable reports whether a timing places the epoch: its phases are
-// valid at least up to and including the phase the epoch lies in. A phase
-// that is out of bounds further on, a fork scheduled for the future,
-// invalidates nothing before it.
-func TimingUsable(slotsPerEpoch uint64, phases []SlotPhase, epoch uint64) bool {
-	n := NetworkHealth{SlotsPerEpoch: slotsPerEpoch, Phases: phases}
-	_, ok := n.EpochStart(epoch)
-
-	return ok
-}
-
-// usableTiming validates the phases in order. usable is how many leading
-// phases place epochs; limit is the first epoch that none of them places
-// (the first epoch of the phase that is invalid, or that does not follow
-// from the one before it), and is meaningful only when err is not nil. With
-// a nil error every phase is usable and there is no limit.
-func usableTiming(slotsPerEpoch uint64, phases []SlotPhase) (usable int, limit uint64, err error) {
 	if slotsPerEpoch == 0 || len(phases) == 0 {
-		return 0, 0, ErrNoTiming
-	}
-
-	if slotsPerEpoch > MaxSlotsPerEpoch {
-		return 0, 0, fmt.Errorf("%w: %d slots per epoch, at most %d", ErrInvalidTiming,
-			slotsPerEpoch, uint64(MaxSlotsPerEpoch))
+		return ErrNoTiming
 	}
 
 	for i := range phases {
 		phase := &phases[i]
-
-		length, ok := epochLength(slotsPerEpoch, phase.SlotMs)
-		if !ok {
-			return i, phase.Epoch, fmt.Errorf("%w: phase %d (from epoch %d) has slots of %d ms and epochs of "+
-				"%d slots, a slot must last 1 to %d ms and an epoch at most %s", ErrInvalidTiming,
-				i, phase.Epoch, phase.SlotMs, slotsPerEpoch, MaxSlotMs, MaxEpochLength)
-		}
-
-		if i+1 == len(phases) {
-			break
-		}
-
-		next := &phases[i+1]
-		if next.Epoch <= phase.Epoch {
-			return i + 1, next.Epoch, fmt.Errorf("%w: phase %d begins at epoch %d, not after epoch %d of the "+
-				"phase before it", ErrInvalidTiming, i+1, next.Epoch, phase.Epoch)
-		}
-
-		// The whole length of a phase must fit a duration; how far the last
-		// one is extrapolated is bounded by maxPhaseReach.
-		epochs := next.Epoch - phase.Epoch
-		if epochs > uint64(math.MaxInt64/length) {
-			return i + 1, next.Epoch, fmt.Errorf("%w: phase %d (from epoch %d) is too long to place the next one",
+		if phase.SlotMs == 0 {
+			return fmt.Errorf("%w: phase %d (from epoch %d) has slots of no duration",
 				ErrInvalidTiming, i, phase.Epoch)
 		}
 
-		if end := phase.Start.Add(time.Duration(epochs) * length); !next.Start.Equal(end) {
-			return i + 1, next.Epoch, fmt.Errorf("%w: phase %d (from epoch %d) starts at %s, the phase before "+
-				"it ends at %s", ErrInvalidTiming, i+1, next.Epoch, next.Start.UTC().Format(time.RFC3339Nano),
+		if i == 0 {
+			continue
+		}
+
+		before := &phases[i-1]
+		if phase.Epoch <= before.Epoch {
+			return fmt.Errorf("%w: phase %d begins at epoch %d, not after epoch %d of the phase before it",
+				ErrInvalidTiming, i, phase.Epoch, before.Epoch)
+		}
+
+		end := before.Start.Add(time.Duration(phase.Epoch-before.Epoch) * epochLength(slotsPerEpoch, before.SlotMs))
+		if !phase.Start.Equal(end) {
+			return fmt.Errorf("%w: phase %d (from epoch %d) starts at %s, the phase before it ends at %s",
+				ErrInvalidTiming, i, phase.Epoch, phase.Start.UTC().Format(time.RFC3339Nano),
 				end.UTC().Format(time.RFC3339Nano))
 		}
 	}
 
-	return len(phases), 0, nil
+	return nil
 }
 
 // epochLength is the length of an epoch of slotsPerEpoch slots of slotMs
-// milliseconds; ok is false when it is outside the bounds.
-func epochLength(slotsPerEpoch, slotMs uint64) (length time.Duration, ok bool) {
-	if slotsPerEpoch == 0 || slotsPerEpoch > MaxSlotsPerEpoch || slotMs == 0 || slotMs > MaxSlotMs {
-		return 0, false
-	}
-
-	// At most 2^16 * 3.6e6 ms: no overflow.
-	length = time.Duration(slotsPerEpoch*slotMs) * time.Millisecond
-
-	return length, length <= MaxEpochLength
+// milliseconds.
+func epochLength(slotsPerEpoch, slotMs uint64) time.Duration {
+	return time.Duration(slotsPerEpoch*slotMs) * time.Millisecond
 }
 
-// timing is the part of a chain's slot phases that places epochs.
-type timing struct {
-	slotsPerEpoch uint64
-	// phases are the valid leading phases; never empty.
-	phases []SlotPhase
-	// limited says that a phase after them is invalid; limit is then the
-	// first epoch that cannot be placed.
-	limited bool
-	limit   uint64
-}
-
-// timing returns the usable part of the view's timing. ok is false when no
-// epoch at all can be placed: the timing is unknown, or invalid from its
-// first phase on.
-func (n *NetworkHealth) timing() (t timing, ok bool) {
-	usable, limit, err := usableTiming(n.SlotsPerEpoch, n.Phases)
-	if usable == 0 || (err != nil && limit <= n.Phases[0].Epoch) {
-		return timing{}, false
-	}
-
-	return timing{
-		slotsPerEpoch: n.SlotsPerEpoch,
-		phases:        n.Phases[:usable],
-		limited:       err != nil,
-		limit:         limit,
-	}, true
-}
-
-// places reports whether the epoch lies inside what the timing covers.
-func (t *timing) places(epoch uint64) bool {
-	return epoch >= t.phases[0].Epoch && (!t.limited || epoch < t.limit)
+// timed reports whether the view's timing places epochs: it is known and
+// valid.
+func (n *NetworkHealth) timed() bool {
+	return ValidateTiming(n.SlotsPerEpoch, n.Phases) == nil
 }
 
 // phaseOf returns the phase the epoch lies in and the length of its epochs.
-// The caller has checked places.
-func (t *timing) phaseOf(epoch uint64) (phase *SlotPhase, length time.Duration) {
-	phase = &t.phases[0]
+// The caller has checked timed, and that the epoch is not before the first
+// phase.
+func (n *NetworkHealth) phaseOf(epoch uint64) (phase *SlotPhase, length time.Duration) {
+	phase = &n.Phases[0]
 
-	for i := 1; i < len(t.phases) && t.phases[i].Epoch <= epoch; i++ {
-		phase = &t.phases[i]
+	for i := 1; i < len(n.Phases) && n.Phases[i].Epoch <= epoch; i++ {
+		phase = &n.Phases[i]
 	}
 
-	// Valid: checked by usableTiming.
-	length, _ = epochLength(t.slotsPerEpoch, phase.SlotMs)
-
-	return phase, length
+	return phase, epochLength(n.SlotsPerEpoch, phase.SlotMs)
 }
 
 // TimingStart returns the start of the first known phase: the earliest time
 // that lies in an epoch. On a chain whose timing is known from genesis on it
-// is the genesis time. ok is false when the timing is unknown or invalid
-// from its first phase on.
+// is the genesis time. ok is false when the timing is unknown or invalid.
 func (n *NetworkHealth) TimingStart() (start time.Time, ok bool) {
-	t, ok := n.timing()
-	if !ok {
+	if !n.timed() {
 		return time.Time{}, false
 	}
 
-	return t.phases[0].Start, true
+	return n.Phases[0].Start, true
 }
 
 // EpochStart returns the wall-clock start of an epoch. ok is false when it
-// cannot be placed: the timing is unknown, the epoch lies before the first
-// known phase, in or after a phase that is invalid (ValidateTiming), or more
-// than a hundred years after the start of its phase.
+// cannot be placed: the timing is unknown or invalid, or the epoch lies
+// before the first known phase.
 func (n *NetworkHealth) EpochStart(epoch uint64) (start time.Time, ok bool) {
-	t, ok := n.timing()
-	if !ok || !t.places(epoch) {
+	if !n.timed() || epoch < n.Phases[0].Epoch {
 		return time.Time{}, false
 	}
 
-	phase, length := t.phaseOf(epoch)
+	phase, length := n.phaseOf(epoch)
 
-	epochs := epoch - phase.Epoch
-	if epochs > uint64(maxPhaseReach/length) {
-		return time.Time{}, false
-	}
-
-	return phase.Start.Add(time.Duration(epochs) * length), true
+	return phase.Start.Add(time.Duration(epoch-phase.Epoch) * length), true
 }
 
 // EpochAt returns the epoch that contains t. ok is false when it cannot be
-// told: the timing is unknown, t lies before the first known phase, in or
-// after a phase that is invalid (ValidateTiming), or more than a hundred
-// years after the start of its phase.
+// told: the timing is unknown or invalid, or t lies before the first known
+// phase.
 func (n *NetworkHealth) EpochAt(at time.Time) (epoch uint64, ok bool) {
-	t, ok := n.timing()
-	if !ok || at.Before(t.phases[0].Start) {
+	if !n.timed() || at.Before(n.Phases[0].Start) {
 		return 0, false
 	}
 
-	phase := &t.phases[0]
+	phase := &n.Phases[0]
 
-	for i := 1; i < len(t.phases) && !at.Before(t.phases[i].Start); i++ {
-		phase = &t.phases[i]
+	for i := 1; i < len(n.Phases) && !at.Before(n.Phases[i].Start); i++ {
+		phase = &n.Phases[i]
 	}
 
-	// Valid: checked by usableTiming. Sub saturates far beyond maxPhaseReach.
-	length, _ := epochLength(t.slotsPerEpoch, phase.SlotMs)
+	length := epochLength(n.SlotsPerEpoch, phase.SlotMs)
 
-	since := at.Sub(phase.Start)
-	if since > maxPhaseReach {
-		return 0, false
-	}
-
-	epochs := uint64(since / length)
-	if epochs > math.MaxUint64-phase.Epoch {
-		return 0, false
-	}
-
-	// Counted on from the last valid phase, the time may lie where an invalid
-	// one begins.
-	if epoch = phase.Epoch + epochs; !t.places(epoch) {
-		return 0, false
-	}
-
-	return epoch, true
+	return phase.Epoch + uint64(at.Sub(phase.Start)/length), true
 }
 
 // EpochSpan returns how long the count epochs take that begin with the
@@ -383,57 +394,31 @@ func (n *NetworkHealth) EpochSpan(from time.Time, count uint64) (span time.Durat
 		return 0, false
 	}
 
-	if from.Before(first) {
-		from = first
-	}
-
-	epoch, ok := n.EpochAt(from)
-	if !ok || count > math.MaxUint64-epoch {
-		return 0, false
-	}
-
-	start, ok := n.EpochStart(epoch)
-	if !ok {
-		return 0, false
-	}
-
-	end, ok := n.EpochStart(epoch + count)
-	if !ok {
-		return 0, false
-	}
+	epoch, _ := n.EpochAt(later(from, first))
+	start, _ := n.EpochStart(epoch)
+	end, _ := n.EpochStart(epoch + count)
 
 	return end.Sub(start), true
+}
+
+// later returns the later of two times.
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+
+	return a
 }
 
 // EpochDuration returns the length of the current epoch, or 0 when it cannot
 // be placed. It is for display and for rough bounds; the time of a particular
 // epoch comes from EpochStart.
 func (n *NetworkHealth) EpochDuration() time.Duration {
-	t, ok := n.timing()
-	if !ok || !t.places(n.CurrentEpoch) {
+	if !n.timed() || n.CurrentEpoch < n.Phases[0].Epoch {
 		return 0
 	}
 
-	if _, placed := n.EpochStart(n.CurrentEpoch); !placed {
-		return 0
-	}
-
-	_, length := t.phaseOf(n.CurrentEpoch)
-
-	return length
-}
-
-// LastEpochDuration returns the length of an epoch of the last phase that
-// can be worked with, or 0 when there is none. It is a rough bound for a view
-// whose current epoch cannot be placed (EpochDuration is 0 then).
-func (n *NetworkHealth) LastEpochDuration() time.Duration {
-	t, ok := n.timing()
-	if !ok {
-		return 0
-	}
-
-	// Valid: checked by usableTiming.
-	length, _ := epochLength(t.slotsPerEpoch, t.phases[len(t.phases)-1].SlotMs)
+	_, length := n.phaseOf(n.CurrentEpoch)
 
 	return length
 }

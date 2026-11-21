@@ -4,7 +4,8 @@ import { describe, expect, it, vi } from 'vitest';
 
 import type { ActionResult } from '../api/types';
 import { buildHoldRequest, buildRolloutHostsRequest, buildScopeRequest } from '../lib/actionRequests';
-import { createHarness, renderWithApp, type Harness } from '../test/harness';
+import { createHarness, renderWithApp, type Harness, PRIMARY } from '../test/harness';
+import { offlineIntent } from '../lib/intents';
 import { ActionDialog, type ActionIntent } from './ActionDialog';
 
 async function open(intent: ActionIntent) {
@@ -35,7 +36,7 @@ describe('ActionDialog: roll', () => {
   it('sends the default staggered roll of a selection as scheduler.RollRequest', async () => {
     const { h, user, onDone } = await open(intent);
 
-    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    await user.click(screen.getByRole('button', PRIMARY));
     await waitFor(() => {
       expect(onDone).toHaveBeenCalledTimes(1);
     });
@@ -91,7 +92,7 @@ describe('ActionDialog: roll', () => {
     await user.click(within(dialog).getByRole('radio', { name: /^Now/ }));
     expect(within(dialog).getByRole('checkbox', { name: /^Force/ })).toBeDisabled();
 
-    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    await user.click(screen.getByRole('button', PRIMARY));
     await waitFor(() => {
       expect(onDone).toHaveBeenCalledTimes(1);
     });
@@ -102,7 +103,7 @@ describe('ActionDialog: roll', () => {
   it('defaults a single host to "now"', async () => {
     const single = await open({ kind: 'roll', hosts: ['rpc-1'], all: false, containerChoices: [] });
     expect(within(single.dialog).getByRole('radio', { name: /^Now/ })).toBeChecked();
-    await single.user.click(screen.getByRole('button', { name: 'Confirm' }));
+    await single.user.click(screen.getByRole('button', PRIMARY));
     await waitFor(() => {
       expect(single.onDone).toHaveBeenCalledTimes(1);
     });
@@ -123,7 +124,7 @@ describe('ActionDialog: roll', () => {
     expect(within(dialog).getByRole('radio', { name: /^Staggered/ })).toBeChecked();
     expect(within(dialog).getByLabelText('What will happen')).toHaveTextContent('every host of the fleet');
 
-    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    await user.click(screen.getByRole('button', PRIMARY));
     await waitFor(() => {
       expect(onDone).toHaveBeenCalledTimes(1);
     });
@@ -150,7 +151,7 @@ describe('ActionDialog: reboot', () => {
 
     expect(within(dialog).queryByText(/Containers/)).not.toBeInTheDocument();
     await user.type(within(dialog).getByRole('textbox'), 'kernel 6.12.57');
-    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    await user.click(screen.getByRole('button', PRIMARY));
     await waitFor(() => {
       expect(onDone).toHaveBeenCalledTimes(1);
     });
@@ -225,7 +226,7 @@ describe('ActionDialog: simple actions', () => {
     const { h, user, onDone } = await open(intent);
 
     await user.type(screen.getByRole('textbox'), 'because');
-    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    await user.click(screen.getByRole('button', PRIMARY));
     await waitFor(() => {
       expect(onDone).toHaveBeenCalledTimes(1);
     });
@@ -237,8 +238,8 @@ describe('ActionDialog: simple actions', () => {
 
   it('sends skip, retry and abort for a rollout', async () => {
     const probe = await createHarness({ mode: 'open' });
-    const rollouts = await probe.api.rollouts();
-    const halted = rollouts.open?.find(r => r.state === 'halted');
+    const rollouts = probe.controller.data.rollouts;
+    const halted = rollouts.find(r => r.state === 'halted');
     if (!halted) throw new Error('the fixture has no halted rollout');
 
     const cases: { intent: ActionIntent; path: string; body: unknown }[] = [
@@ -277,7 +278,7 @@ describe('ActionDialog: simple actions', () => {
 
     for (const c of cases) {
       const { h, user, onDone } = await open(c.intent);
-      await user.click(screen.getByRole('button', { name: 'Confirm' }));
+      await user.click(screen.getByRole('button', PRIMARY));
       await waitFor(() => {
         expect(onDone).toHaveBeenCalledTimes(1);
       });
@@ -299,15 +300,15 @@ describe('ActionDialog: behaviour', () => {
     });
 
     expect(within(dialog).getByLabelText('What will happen')).toHaveTextContent(
-      'Abort rollout ro-does-not-exist: it is closed'
+      'Abort rollout ro-does-not-exist. A manual rollout is closed'
     );
 
-    await user.click(screen.getByRole('button', { name: 'Confirm' }));
+    await user.click(screen.getByRole('button', PRIMARY));
 
     expect(await within(dialog).findByRole('alert')).toHaveTextContent('unknown rollout ro-does-not-exist (HTTP 404)');
     expect(onDone).not.toHaveBeenCalled();
     expect(posted(h).path).toBe('/api/v1/actions/abort');
-    expect(screen.getByRole('button', { name: 'Confirm' })).toBeEnabled();
+    expect(screen.getByRole('button', PRIMARY)).toBeEnabled();
   });
 
   it('warns about targets that the view hides, and only then', async () => {
@@ -319,7 +320,7 @@ describe('ActionDialog: behaviour', () => {
 
     const { dialog } = await open({ ...base, hiddenHosts: ['geth-1', 'geth-2'] });
     expect(within(dialog).getByRole('alert')).toHaveTextContent(
-      'Includes 2 selected hosts hidden by the current filter: geth-1, geth-2'
+      '2 of them are hidden by the current filter: geth-1, geth-2'
     );
   });
 
@@ -345,8 +346,30 @@ describe('ActionDialog: behaviour', () => {
     await user.tab();
     expect(screen.getByRole('button', { name: 'Cancel' })).toHaveFocus();
     await user.tab();
-    expect(screen.getByRole('button', { name: 'Confirm' })).toHaveFocus();
+    expect(screen.getByRole('button', PRIMARY)).toHaveFocus();
     await user.tab();
     expect(within(dialog).getByRole('textbox')).toHaveFocus();
+  });
+});
+
+describe('ActionDialog: mark offline', () => {
+  it('needs a reason and sends the end that was picked', async () => {
+    const { h, user, dialog } = await open(offlineIntent(true, ['teku-besu-1']));
+
+    expect(screen.getByRole('button', { name: 'Mark offline' })).toBeDisabled();
+    await user.type(within(dialog).getByRole('textbox'), 'client kept broken for debugging');
+    await user.click(within(dialog).getByRole('button', { name: '6h' }));
+    const before = Date.now();
+    await user.click(screen.getByRole('button', { name: 'Mark offline' }));
+
+    await waitFor(() => {
+      expect(h.calls.some(c => c.method === 'POST')).toBe(true);
+    });
+    const { path, body } = posted(h);
+    expect(path).toBe('/api/v1/actions/mark-offline');
+    const sent = body as { hosts: string[]; reason: string; until: string };
+    expect(sent.hosts).toEqual(['teku-besu-1']);
+    expect(sent.reason).toBe('client kept broken for debugging');
+    expect(Date.parse(sent.until) - before).toBeGreaterThan(6 * 3_600_000 - 60_000);
   });
 });

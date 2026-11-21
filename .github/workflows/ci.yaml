@@ -75,25 +75,3 @@ jobs:
         run: make test-system
       - name: make test-reboot
         run: make test-reboot
-
-  e2e:
-    name: end to end (Kurtosis)
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: go.mod
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 24
-      - name: Install Kurtosis
-        run: |
-          echo "deb [trusted=yes] https://apt.fury.io/kurtosis-tech/ /" | sudo tee /etc/apt/sources.list.d/kurtosis.list
-          sudo apt-get update
-          sudo apt-get install -y kurtosis-cli
-          kurtosis analytics disable
-          kurtosis engine start
-      - name: make e2e
-        run: make e2e

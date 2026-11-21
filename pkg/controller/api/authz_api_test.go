@@ -327,10 +327,10 @@ func TestOwnersFromAgentToViews(t *testing.T) {
 
 	reader := provider.grant(t, "")
 
-	owners := func(host HostSummary) map[string][]string {
+	owners := func(host HostListing) map[string][]string {
 		out := make(map[string][]string, len(host.Containers))
 		for _, c := range host.Containers {
-			out[c.Name] = c.Owners
+			out[string(c.Name)] = c.Owners
 		}
 
 		return out
@@ -359,7 +359,8 @@ func TestOwnersFromAgentToViews(t *testing.T) {
 		method: http.MethodGet, path: "/api/v1/hosts/" + hostMixed,
 	}.request(reader))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Equal(t, want, owners(decodeJSON[HostDetail](t, rec).HostSummary))
+	summary := decodeJSON[HostDetail](t, rec).HostSummary
+	assert.Equal(t, want, owners(hostListing(&summary)))
 
 	// The public views show the host and its images, and no owner.
 	for _, path := range []string{"/api/v1/public/hosts", "/api/v1/public/images"} {

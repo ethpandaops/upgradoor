@@ -6,6 +6,16 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
+func TestImpactHeavier(t *testing.T) {
+	assert.Equal(t, ImpactNode, ImpactIndependent.Heavier(ImpactNode))
+	assert.Equal(t, ImpactSlot, ImpactSlot.Heavier(ImpactIndependent))
+	assert.Equal(t, ImpactIndependent, ImpactIndependent.Heavier(ImpactIndependent))
+	assert.Equal(t, ImpactNode, ImpactSlot.Heavier(""), "no class counts as node")
+	assert.Equal(t, ImpactIndependent, DefaultImpact(KindOther))
+	assert.Equal(t, ImpactNode, DefaultImpact(KindVC))
+	assert.False(t, Impact("none").Valid())
+}
+
 func TestNodeHealthSynced(t *testing.T) {
 	el := func(mod func(*ELHealth)) *ELHealth {
 		h := &ELHealth{Reachable: true, Peers: 5}
@@ -74,5 +84,28 @@ func TestNodeHealthSynced(t *testing.T) {
 			assert.Equal(t, tt.missing, tt.node.Missing(tt.minPeers))
 			assert.Equal(t, tt.missing == "", tt.node.Synced(tt.minPeers))
 		})
+	}
+}
+
+func TestContainerShouldRun(t *testing.T) {
+	tests := []struct {
+		state string
+		code  int
+		want  bool
+	}{
+		{StateRunning, 0, true},
+		{StateRestarting, 0, true},
+		{StateExited, 1, true},
+		{StateDead, 2, true},
+		{StateExited, 0, false},
+		{StateExited, 137, false},
+		{StateExited, 143, false},
+		{"created", 0, false},
+		{"paused", 0, false},
+	}
+
+	for _, tt := range tests {
+		c := Container{State: tt.state, ExitCode: tt.code}
+		assert.Equal(t, tt.want, c.ShouldRun(), "%s exit %d", tt.state, tt.code)
 	}
 }

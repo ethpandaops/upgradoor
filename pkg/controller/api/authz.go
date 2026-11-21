@@ -38,7 +38,8 @@ const (
 	// FeatureReboot covers the action reboot. Twin: team_reboot, for hosts
 	// on which a team of the token owns a container.
 	FeatureReboot = "reboot"
-	// FeatureHold covers the actions hold and unhold. Twin: team_hold, for
+	// FeatureHold covers the actions hold, unhold, mark-offline and
+	// unmark-offline. Twin: team_hold, for
 	// hosts on which a team of the token owns a container, and only for
 	// holds that were set through the twin.
 	FeatureHold = "hold"
@@ -51,6 +52,17 @@ const (
 	// resume and abort with a rollout, retry without hosts, and every retry
 	// of an aborted rollout, which reopens its cause for all hosts. No twin.
 	FeatureSupervise = "supervise"
+	// FeatureImageOverride covers the action image-override: setting or
+	// taking away the image override of one container on one host. Twin:
+	// team_image_override, for a container a team of the token owns.
+	FeatureImageOverride = "image_override"
+	// FeatureFlagOverride covers the action flag-override: the same for the
+	// flags of a container. Twin: team_flag_override.
+	FeatureFlagOverride = "flag_override"
+	// FeatureClientPolicy covers the action client-policy: the image policy
+	// (auto or manual) of one client. Twin: team_client_policy, for a client
+	// whose reported containers are all owned by a team of the token.
+	FeatureClientPolicy = "client_policy"
 	// FeatureAdmin covers the action forget, pause and resume without a
 	// rollout (the global switch) and PUT /api/v1/settings, and it is needed
 	// on top of an action's own feature for the request flags force and
@@ -134,6 +146,11 @@ type targets struct {
 	// none is named.
 	perContainer bool
 	containers   []string
+	// client names a client instead of hosts: the target is every managed
+	// container that any host reports for that client, and the rule is that
+	// of a roll (every one of them owned by a team of the token). A client
+	// no host reports is owned by nobody.
+	client string
 	// hold says that the request sets or lifts the hold of its hosts. The
 	// twin does neither to a hold that was not set through the twin.
 	hold holdChange
@@ -234,7 +251,7 @@ func (s *Server) authorize(ctx context.Context, u *user, need *requirement) (str
 
 		switch {
 		case errors.Is(err, store.ErrNotFound):
-			// With the plain feature the scheduler answers, as before.
+			// With the plain feature the scheduler answers.
 			unknownRollout = true
 		case err != nil:
 			return "", fmt.Errorf("authorize: get rollout %s: %w", echo(need.reopens), err)
@@ -324,26 +341,16 @@ func (s *Server) uncovered(ctx context.Context, teams []string, t *targets) (str
 		return "", fmt.Errorf("authorize: list hosts: %w", err)
 	}
 
-	known := make(map[string]*hostOwnership, len(hosts))
+	known := ownershipOf(hosts)
 
-	for _, host := range hosts {
-		if t.all {
+	if t.all {
+		for _, host := range hosts {
 			names = append(names, host.Name)
 		}
+	}
 
-		own := &hostOwnership{held: host.HoldWanted, heldByTeam: host.HoldBy == fleet.HoldByTeam}
-
-		if host.Status != nil {
-			own.containers = make([]containerOwners, 0, len(host.Status.Containers))
-
-			for i := range host.Status.Containers {
-				if c := &host.Status.Containers[i]; c.Managed {
-					own.containers = append(own.containers, containerOwners{name: c.Name, owners: c.Owners})
-				}
-			}
-		}
-
-		known[host.Name] = own
+	if t.client != "" {
+		return uncoveredClient(teams, t.client, hosts), nil
 	}
 
 	if len(names) == 0 {
@@ -362,6 +369,29 @@ func (s *Server) uncovered(ctx context.Context, teams []string, t *targets) (str
 	}
 
 	return "", nil
+}
+
+// ownershipOf is what the team rule reads of each host, by host name.
+func ownershipOf(hosts []*fleet.Host) map[string]*hostOwnership {
+	known := make(map[string]*hostOwnership, len(hosts))
+
+	for _, host := range hosts {
+		own := &hostOwnership{held: host.HoldWanted, heldByTeam: host.HoldBy == fleet.HoldByTeam}
+
+		if host.Status != nil {
+			own.containers = make([]containerOwners, 0, len(host.Status.Containers))
+
+			for i := range host.Status.Containers {
+				if c := &host.Status.Containers[i]; c.Managed {
+					own.containers = append(own.containers, containerOwners{name: c.Name, owners: c.Owners})
+				}
+			}
+		}
+
+		known[host.Name] = own
+	}
+
+	return known
 }
 
 // hostOwnership is what the team rule reads of one host.
@@ -450,6 +480,39 @@ func uncoveredOn(teams []string, host string, own *hostOwnership, t *targets) st
 	return ""
 }
 
+// uncoveredClient applies the team rule to a client: every managed container
+// that a host reports for it is owned by a team of the token, and there is at
+// least one.
+func uncoveredClient(teams []string, client string, hosts []*fleet.Host) string {
+	found := false
+
+	for _, host := range hosts {
+		if host.Status == nil {
+			continue
+		}
+
+		for i := range host.Status.Containers {
+			c := &host.Status.Containers[i]
+			if !c.Managed || c.Client != client {
+				continue
+			}
+
+			found = true
+
+			if !ownedBy(teams, c.Owners) {
+				return fmt.Sprintf("does not cover client %s: container %s on host %s (owners: %s)",
+					echo(client), echo(c.Name), echo(host.Name), ownerList(c.Owners))
+			}
+		}
+	}
+
+	if !found {
+		return fmt.Sprintf("does not cover client %s (owners: none)", echo(client))
+	}
+
+	return ""
+}
+
 func uncoveredContainer(container, host string, owners []string) string {
 	return fmt.Sprintf("does not cover container %s on host %s (owners: %s)",
 		echo(container), echo(host), ownerList(owners))
@@ -462,6 +525,15 @@ func ownerList(owners []string) string {
 	}
 
 	return echo(strings.Join(owners, ", "))
+}
+
+// refuse answers a request the login may not make, and logs it at debug
+// level.
+func (s *Server) refuse(w http.ResponseWriter, r *http.Request, u *user, msg string) {
+	s.log.WithFields(logrus.Fields{
+		"path": r.URL.Path, "actor": u.actor, "reason": msg,
+	}).Debug("Refused user request")
+	s.writeError(w, http.StatusForbidden, msg)
 }
 
 // allow authorizes a request and answers a refusal. On success it returns
@@ -481,10 +553,7 @@ func (s *Server) allow(
 			By: by, Teams: u.teams,
 		}), true
 	case errors.As(err, &forbidden):
-		s.log.WithFields(logrus.Fields{
-			"path": r.URL.Path, "actor": u.actor, "reason": forbidden.msg,
-		}).Debug("Refused user request")
-		s.writeError(w, http.StatusForbidden, forbidden.msg)
+		s.refuse(w, r, u, forbidden.msg)
 	default:
 		s.internalError(w, r, err)
 	}

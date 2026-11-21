@@ -34,16 +34,6 @@ export function displayImage(ref: string): string {
   return base.slice(base.lastIndexOf('/') + 1);
 }
 
-/** splitImage splits "repo/name:tag" into repository and tag. */
-export function splitImage(ref: string): { repository: string; tag: string } {
-  const at = ref.indexOf('@');
-  const base = at >= 0 ? ref.slice(0, at) : ref;
-  const colon = base.lastIndexOf(':');
-  // A colon before the last slash is a registry port, not a tag.
-  if (colon < 0 || colon < base.lastIndexOf('/')) return { repository: base, tag: '' };
-  return { repository: base.slice(0, colon), tag: base.slice(colon + 1) };
-}
-
 /** formatDuration renders seconds with its two largest units: "3d 4h", "5m 2s". */
 export function formatDuration(totalSeconds: number): string {
   if (!Number.isFinite(totalSeconds) || totalSeconds < 0) return '–';
@@ -107,6 +97,18 @@ export function percentOf(part: number, total: number): string {
 /** plural renders "1 host" / "3 hosts". */
 export function plural(n: number, singular: string, pluralForm: string = `${singular}s`): string {
   return `${n} ${n === 1 ? singular : pluralForm}`;
+}
+
+/**
+ * pauseLabel says in a few words that a rollout is paused and why, from its
+ * pause reason: "paused" when a person paused it, "paused after the canary",
+ * or "paused (aborted: <reason>)" for a rollout of an observed cause that a
+ * person aborted. The reason's call to resume is left out.
+ */
+export function pauseLabel(pauseReason: string | null | undefined): string {
+  const why = (pauseReason ?? '').replace(/; resume to continue$/, '');
+  if (why === '') return 'paused';
+  return why.startsWith('paused') ? why : `paused (${why})`;
 }
 
 /** hostList renders host names for a sentence, truncated after `max` names. */

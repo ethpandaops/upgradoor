@@ -70,10 +70,10 @@ export function canViewPrivate(state: AuthState): boolean {
   return state.ready && (!state.enabled || state.loggedIn);
 }
 
-export type ScriptLoader = (src: string) => Promise<void>;
+type ScriptLoader = (src: string) => Promise<void>;
 
 /** loadScript appends a script tag and resolves once it has run. */
-export const loadScript: ScriptLoader = src =>
+const loadScript: ScriptLoader = src =>
   new Promise((resolve, reject) => {
     const script = document.createElement('script');
     script.src = src;

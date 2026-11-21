@@ -49,6 +49,7 @@ func TestWebFeaturesAreTheServers(t *testing.T) {
 
 	server := []string{
 		FeatureRoll, FeatureReboot, FeatureHold, FeatureRecover, FeatureSupervise, FeatureAdmin,
+		FeatureClientPolicy, FeatureImageOverride, FeatureFlagOverride,
 	}
 
 	slices.Sort(web)
@@ -63,7 +64,10 @@ func TestWebFeaturesAreTheServers(t *testing.T) {
 	}
 
 	slices.Sort(twinned)
-	assert.Equal(t, []string{FeatureHold, FeatureReboot, FeatureRecover, FeatureRoll}, twinned,
+	assert.Equal(t, []string{
+		FeatureClientPolicy, FeatureFlagOverride, FeatureHold, FeatureImageOverride,
+		FeatureReboot, FeatureRecover, FeatureRoll,
+	}, twinned,
 		"the features with a team twin")
 
 	assert.Contains(t, src, "export const TEAM_PREFIX = '"+teamFeaturePrefix+"';")

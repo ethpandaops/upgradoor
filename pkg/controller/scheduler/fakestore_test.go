@@ -48,7 +48,6 @@ type fakeStore struct {
 	failWrites bool
 	failNext   int
 	failSkip   int
-	writes     int
 
 	// reads names the rollout and directive listings since it was last
 	// cleared, e.g. "rollouts:open" or "directives:pending".
@@ -161,8 +160,6 @@ func (s *fakeStore) writable() error {
 		return errWrite
 	}
 
-	s.writes++
-
 	return nil
 }
 
@@ -173,21 +170,6 @@ func (s *fakeStore) putHost(h *fleet.Host) {
 
 	c := *h
 	s.hosts[h.Name] = &c
-}
-
-// put stores rollouts directly, whatever failures are injected: rows that
-// somebody else wrote (another build).
-func (s *fakeStore) put(rollouts ...*fleet.Rollout) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	for _, r := range rollouts {
-		if _, ok := s.rollouts[r.ID]; !ok {
-			s.rolloutSeq = append(s.rolloutSeq, r.ID)
-		}
-
-		s.rollouts[r.ID] = storedRollout(r)
-	}
 }
 
 // recordSync stores a sync as store.RecordSync does: the host is created or
@@ -205,6 +187,7 @@ func (s *fakeStore) recordSync(h *fleet.Host) (adopted bool) {
 		c.HoldWanted = old.HoldWanted
 		c.HoldReason = old.HoldReason
 		c.HoldBy = old.HoldBy
+		c.Broken = old.Broken
 	} else {
 		c.FirstSeen = h.LastSeen
 
@@ -236,14 +219,6 @@ func (s *fakeStore) failing() bool {
 	defer s.mu.Unlock()
 
 	return s.failWrites || s.failNext > 0
-}
-
-// writeCount is the number of writes that succeeded.
-func (s *fakeStore) writeCount() int {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	return s.writes
 }
 
 func (s *fakeStore) host(name string) *fleet.Host {
@@ -311,26 +286,6 @@ func (s *fakeStore) GetHost(_ context.Context, name string) (*fleet.Host, error)
 	return nil, store.ErrNotFound
 }
 
-func (s *fakeStore) SetHostHold(_ context.Context, name string, wanted bool, reason string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := s.writable(); err != nil {
-		return err
-	}
-
-	h := s.hosts[name]
-	if h == nil {
-		return store.ErrNotFound
-	}
-
-	h.HoldWanted = wanted
-	h.HoldReason = reason
-	h.HoldBy = ""
-
-	return nil
-}
-
 func (s *fakeStore) DeleteHost(_ context.Context, name string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -348,7 +303,8 @@ func (s *fakeStore) DeleteHost(_ context.Context, name string) error {
 	return nil
 }
 
-func (s *fakeStore) ListLiveness(_ context.Context, epochs int) ([]fleet.Liveness, error) {
+// listLiveness stands in for the beacon service's Liveness.
+func (s *fakeStore) listLiveness(epochs int) []fleet.Liveness {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -379,7 +335,7 @@ func (s *fakeStore) ListLiveness(_ context.Context, epochs int) ([]fleet.Livenes
 		}
 	}
 
-	return out, nil
+	return out
 }
 
 func (s *fakeStore) ListRollouts(_ context.Context, f store.RolloutFilter) ([]*fleet.Rollout, error) {
@@ -466,6 +422,8 @@ func (s *fakeStore) ListDirectives(_ context.Context, f store.DirectiveFilter) (
 
 	switch {
 	case f.Host != "":
+	case len(f.Rollouts) > 0:
+		s.reads = append(s.reads, "directives:rollouts")
 	case f.PendingOnly:
 		s.reads = append(s.reads, "directives:pending")
 	default:
@@ -476,7 +434,8 @@ func (s *fakeStore) ListDirectives(_ context.Context, f store.DirectiveFilter) (
 
 	for _, id := range s.dirSeq {
 		d := s.directives[id]
-		if (f.PendingOnly && d.State != fleet.DirectivePending) || (f.Host != "" && d.Host != f.Host) {
+		if (f.PendingOnly && d.State != fleet.DirectivePending) || (f.Host != "" && d.Host != f.Host) ||
+			(len(f.Rollouts) > 0 && !slices.Contains(f.Rollouts, d.RolloutID)) {
 			continue
 		}
 
@@ -509,6 +468,20 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 
 		if hold.Wanted {
 			s.hosts[hold.Host].HoldBy = hold.By
+		}
+	}
+
+	for _, off := range ch.Offline {
+		if s.hosts[off.Host] == nil {
+			return store.ErrNotFound
+		}
+
+		s.hosts[off.Host].Offline = off.Mark
+	}
+
+	for _, marks := range ch.Broken {
+		if h := s.hosts[marks.Host]; h != nil {
+			h.Broken = viaJSON(&marks).Marks
 		}
 	}
 
@@ -752,6 +725,21 @@ func (s *fakeStore) dump() string {
 
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// What the scheduler writes about the hosts.
+	names := make([]string, 0, len(s.hosts))
+	for name := range s.hosts {
+		names = append(names, name)
+	}
+
+	slices.Sort(names)
+
+	for _, name := range names {
+		if marks := s.hosts[name].Broken; len(marks) > 0 {
+			raw, _ := json.Marshal(marks)
+			fmt.Fprintf(&b, "%s broken %s\n", name, raw)
+		}
+	}
 
 	for _, e := range s.audit {
 		fmt.Fprintf(&b, "%s %s %s %s\n", e.Time.Format(time.RFC3339), e.Actor, e.Action, e.Target)

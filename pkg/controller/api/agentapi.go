@@ -26,9 +26,6 @@ import (
 const (
 	endpointSync      = "sync"
 	endpointInventory = "inventory"
-	// endpointUnknown labels requests below /api/agent/ that match no
-	// endpoint.
-	endpointUnknown = "unknown"
 
 	// Bodies are held in memory, twice when compressed. These bound how many
 	// are in flight. A slot is only taken by a request whose certificate and
@@ -46,9 +43,11 @@ const (
 	// auditWriteTimeout bounds the write of identity audit entries, which
 	// does not end with the request.
 	auditWriteTimeout = 5 * time.Second
-	// maxAuditBacklog bounds the identity audit entries kept for another
-	// attempt after a failed write.
-	maxAuditBacklog = 256
+
+	// validatorAuditInterval is the least time between two audit entries
+	// about the validator range of one host. A range is something a host
+	// says about itself, as often as it likes; every change is logged.
+	validatorAuditInterval = time.Minute
 
 	// generationAuditInterval is the least time between two audit entries
 	// for rejected certificates of one host: an agent that keeps trying with
@@ -124,6 +123,8 @@ type agentEndpoint struct {
 // Nothing is read and no slot is taken for a sender that cannot show a
 // certificate of this network and a fresh proof signed by its host key.
 func (s *Server) serveAgent(w http.ResponseWriter, r *http.Request, ep *agentEndpoint) {
+	start := time.Now()
+
 	pre, err := s.preAuthenticateAgent(r, ep.limit)
 	if err != nil {
 		s.agentFailure(w, r, ep.name, err)
@@ -142,7 +143,7 @@ func (s *Server) serveAgent(w http.ResponseWriter, r *http.Request, ep *agentEnd
 		return
 	}
 
-	cert, body, err := s.authenticateAgent(w, r, pre, ep)
+	cert, proofID, body, err := s.authenticateAgent(w, r, pre, ep)
 	if err != nil {
 		s.agentFailure(w, r, ep.name, err)
 
@@ -163,8 +164,43 @@ func (s *Server) serveAgent(w http.ResponseWriter, r *http.Request, ep *agentEnd
 		return
 	}
 
+	// Every answer is signed. Without a controller key (the development
+	// opt-out) it goes out as it is.
+	if s.opts.AnswerSigner != nil {
+		answer, err = s.signAnswer(cert.Subject, proofID, answer)
+		if err != nil {
+			s.agentFailure(w, r, ep.name, err)
+
+			return
+		}
+	}
+
 	s.metrics.agentRequest(ep.name, http.StatusOK)
 	s.writeJSON(w, http.StatusOK, answer)
+	s.metrics.agentAnswered(ep.name, time.Since(start))
+}
+
+// signAnswer wraps an answer into an identity.SignedAnswer for the host and
+// the request it answers. The signature is over the answer's bytes exactly as
+// they travel inside the wrapper, and names the host and the id of the
+// request's proof, so the answer is of no use to another host or for another
+// request.
+//
+// Only answers are signed, never errors: an agent acts on nothing of an
+// error whoever sent it, and most errors arise before there is a verified
+// request to bind a signature to.
+func (s *Server) signAnswer(host, proofID string, answer any) (json.RawMessage, error) {
+	body, err := json.Marshal(answer)
+	if err != nil {
+		return nil, fmt.Errorf("encode answer for %s: %w", host, err)
+	}
+
+	signed, err := s.opts.AnswerSigner.Sign(host, proofID, body)
+	if err != nil {
+		return nil, fmt.Errorf("sign answer for %s: %w", host, err)
+	}
+
+	return signed, nil
 }
 
 // agentFailure answers a failed agent request with a protocol.ErrorResponse.
@@ -225,7 +261,7 @@ func (s *Server) preAuthenticateAgent(r *http.Request, limit int64) (*agentPreAu
 	// succeed, so this call never records the proof's jti: the call with the
 	// body below is the one that counts. Everything but the expected
 	// mismatch is a failed identity check that needed no body.
-	_, err = s.opts.Verifier.Verify(pre.cert, pre.proof, identity.Request{Method: r.Method})
+	_, _, err = s.opts.Verifier.Verify(pre.cert, pre.proof, identity.Request{Method: r.Method})
 
 	switch {
 	case err == nil:
@@ -254,34 +290,34 @@ func (s *Server) identityFailure(r *http.Request, err error) error {
 // authenticateAgent reads the body under the endpoint's size and time limit,
 // verifies the certificate and the proof over the bytes as received, and only
 // then decompresses, again under the limit. Nothing of the body is parsed
-// before the sender is verified.
+// before the sender is verified. proofID is the id of the verified proof.
 func (s *Server) authenticateAgent(
 	w http.ResponseWriter, r *http.Request, pre *agentPreAuth, ep *agentEndpoint,
-) (*identity.Certificate, []byte, error) {
+) (cert *identity.Certificate, proofID string, body []byte, err error) {
 	wire, err := s.readAgentBody(w, r, ep)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 
-	cert, err := s.opts.Verifier.Verify(pre.cert, pre.proof, identity.Request{
+	cert, proofID, err = s.opts.Verifier.Verify(pre.cert, pre.proof, identity.Request{
 		Method: r.Method,
 		URLs:   pre.urls,
 		Body:   wire,
 	})
 	if err != nil {
-		return nil, nil, s.identityFailure(r, err)
+		return nil, "", nil, s.identityFailure(r, err)
 	}
 
 	if pre.encoding != "gzip" {
-		return cert, wire, nil
+		return cert, proofID, wire, nil
 	}
 
-	body, err := gunzip(wire, ep.limit)
+	body, err = gunzip(wire, ep.limit)
 	if err != nil {
-		return nil, nil, err
+		return nil, "", nil, err
 	}
 
-	return cert, body, nil
+	return cert, proofID, body, nil
 }
 
 // checkGeneration rejects a certificate of a generation lower than the
@@ -308,7 +344,7 @@ func (s *Server) checkGeneration(r *http.Request, cert *identity.Certificate) er
 	remote := s.remoteAddr(r)
 
 	s.log.WithFields(logrus.Fields{
-		labelHost:         cert.Subject,
+		keyHost:           cert.Subject,
 		"remote":          remote,
 		"generation":      cert.Generation,
 		"seen_generation": host.Generation,
@@ -466,21 +502,26 @@ func (s *Server) sync(r *http.Request, cert *identity.Certificate, body []byte) 
 	}
 
 	req.Containers = cleanContainers(req.Containers)
+	req.Validators = cleanValidators(req.Validators)
 
 	now := s.now().UTC()
 	remote := s.remoteAddr(r)
+	started := time.Now()
+	pc := s.pacer.current(now, float64(len(s.syncSlots))/float64(cap(s.syncSlots)))
 
 	result, err := s.opts.Store.RecordSync(ctx, &store.HostSync{
-		Cert:       cert,
-		RemoteAddr: remote,
-		Request:    &req,
-		At:         now,
+		Cert:         cert,
+		RemoteAddr:   remote,
+		Request:      &req,
+		At:           now,
+		SyncInterval: pc.bound(),
 	})
 	if err != nil {
 		return nil, fmt.Errorf("record sync of %s: %w", cert.Subject, err)
 	}
 
-	s.auditIdentity(ctx, s.identityAudit(cert, result, remote))
+	s.auditIdentity(ctx, append(s.identityAudit(cert, result, remote),
+		s.validatorAudit(cert, req.Validators, result, remote)...))
 
 	assignment, err := s.opts.Scheduler.Assignment(ctx, cert.Subject)
 	if err != nil {
@@ -496,6 +537,7 @@ func (s *Server) sync(r *http.Request, cert *identity.Certificate, body []byte) 
 	if assignment != nil {
 		resp.Directives = assignment.Directives
 		resp.Queue = assignment.Queue
+		resp.Ended = assignment.Ended
 
 		if assignment.Lease != nil {
 			// TTLSeconds is defined as the time left when the response is
@@ -509,9 +551,188 @@ func (s *Server) sync(r *http.Request, cert *identity.Certificate, body []byte) 
 		}
 	}
 
-	s.opts.Scheduler.Nudge()
+	busy := req.Operation != nil || (assignment != nil && (assignment.Lease != nil ||
+		len(assignment.Directives) > 0 ||
+		(assignment.Queue != nil && assignment.Queue.Position <= queueBusy)))
+	resp.NextSyncMillis = s.pacer.ask(cert.Subject, now, busy, pc).Milliseconds()
+
+	// A sync that only confirmed the row changes nothing a viewer or the
+	// scheduler sees, unless the host may have been stale before it: silent
+	// for longer than the shortest stale bound the settings allow. Such a
+	// sync waits for the scheduler's next tick; nudging it on every sync kept
+	// the scheduler reconciling back to back.
+	if result == nil || result.Host == nil || result.Changed ||
+		now.Sub(result.PreviousSeen) > result.Host.StaleAfter(fleet.MinHostStaleAfter) {
+		s.opts.Scheduler.Nudge()
+		s.Notify()
+	}
+
+	s.pacer.observe(time.Since(started))
 
 	return resp, nil
+}
+
+// cleanValidators checks the validator range a host reports before it is
+// stored and counted. A range that is out of bounds, or a state this build
+// does not know, is kept as a report of an invalid range with the reason:
+// the host then counts as one that does not know its range, never as one
+// with the range it claimed.
+func cleanValidators(in *protocol.Validators) *protocol.Validators {
+	if in == nil {
+		return nil
+	}
+
+	out := *in
+
+	if err := out.Validate(); err != nil {
+		out.State = protocol.ValidatorsInvalid
+		out.Error = "refused by the controller: " + err.Error()
+	}
+
+	if !out.Known() {
+		out.Start, out.End = 0, 0
+	}
+
+	if len(out.Error) > 256 {
+		out.Error = out.Error[:256]
+	}
+
+	if len(out.Source) > 32 {
+		out.Source = out.Source[:32]
+	}
+
+	return &out
+}
+
+// validatorAudit builds the audit entries about the validator range of a
+// sync: one when the range counted for the host changed, and one when the
+// host starts to report validators that are counted for other hosts (once
+// per episode: until the overlap is gone or is with other hosts). A range is
+// what a host says about itself, so neither is refused; both are logged and
+// audited, at most one entry of each kind per host and validatorAuditInterval.
+func (s *Server) validatorAudit(
+	cert *identity.Certificate, reported *protocol.Validators, result *store.SyncResult,
+	remote string,
+) []fleet.AuditEntry {
+	if result == nil || result.Host == nil {
+		return nil
+	}
+
+	entries := make([]fleet.AuditEntry, 0, 2)
+	before, after := result.ValidatorsBefore, result.Host.Validators
+	changed := !result.Created && (before.Count() != after.Count() ||
+		(before != nil && after != nil && *before != *after))
+
+	rangeDetail := func(r *identity.ValidatorRange) any {
+		if r == nil {
+			return nil
+		}
+
+		return map[string]any{"start": r.Start, "end": r.End}
+	}
+
+	detail := func() map[string]any {
+		d := map[string]any{
+			"counted":        rangeDetail(after),
+			detailRemoteAddr: remote,
+		}
+
+		if reported != nil {
+			d["reported"] = reported
+		}
+
+		return d
+	}
+
+	if changed {
+		s.log.WithFields(logrus.Fields{
+			keyHost: cert.Subject, "before": rangeDetail(before), keyAfter: rangeDetail(after),
+		}).Info("Validator range of a host changed")
+
+		if s.validatorAuditDue("changed:" + cert.Subject) {
+			d := detail()
+			d["before"] = rangeDetail(before)
+
+			entries = append(entries, fleet.AuditEntry{
+				Time:   s.now().UTC(),
+				Actor:  agentActorPrefix + cert.Subject,
+				Action: "host.validators-changed",
+				Target: cert.Subject,
+				Detail: d,
+			})
+		}
+	}
+
+	if s.overlapEpisodeBegins(cert.Subject, result.ValidatorOverlaps) {
+		s.log.WithFields(logrus.Fields{
+			keyHost: cert.Subject, "with": result.ValidatorOverlaps,
+			"counted": rangeDetail(after),
+		}).Warn("Host reports validators that are counted for other hosts; " +
+			"no validator is counted twice")
+
+		if s.validatorAuditDue("overlap:" + cert.Subject) {
+			d := detail()
+			d["with"] = result.ValidatorOverlaps
+
+			entries = append(entries, fleet.AuditEntry{
+				Time:   s.now().UTC(),
+				Actor:  agentActorPrefix + cert.Subject,
+				Action: "host.validators-overlap",
+				Target: cert.Subject,
+				Detail: d,
+			})
+		}
+	}
+
+	return entries
+}
+
+// overlapEpisodeBegins records the hosts a host's reported range overlaps
+// with and reports whether that is a new episode: there is an overlap and it
+// is not the one recorded.
+func (s *Server) overlapEpisodeBegins(host string, with []string) bool {
+	s.generationMu.Lock()
+	defer s.generationMu.Unlock()
+
+	key := strings.Join(with, ",")
+	if key == "" {
+		delete(s.overlapAudited, host)
+
+		return false
+	}
+
+	if s.overlapAudited[host] == key {
+		return false
+	}
+
+	if s.overlapAudited == nil {
+		s.overlapAudited = make(map[string]string, 4)
+	}
+
+	s.overlapAudited[host] = key
+
+	return true
+}
+
+// validatorAuditDue reports whether an audit entry of the kind and host in
+// key is to be written now: at most one per validatorAuditInterval.
+func (s *Server) validatorAuditDue(key string) bool {
+	s.generationMu.Lock()
+	defer s.generationMu.Unlock()
+
+	now := s.now()
+
+	if last, ok := s.validatorsAudited[key]; ok && now.Sub(last) < validatorAuditInterval {
+		return false
+	}
+
+	if s.validatorsAudited == nil {
+		s.validatorsAudited = make(map[string]time.Time, 4)
+	}
+
+	s.validatorsAudited[key] = now
+
+	return true
 }
 
 // cleanContainers makes what a host reports about its containers unambiguous
@@ -519,7 +740,8 @@ func (s *Server) sync(r *http.Request, cert *identity.Certificate, body []byte) 
 // name stands for one container: Docker has no two of a name, so of several
 // entries with one name the first is kept and the others are dropped. Owners
 // are kept only in the form a team name has, and only for the containers the
-// host manages.
+// host manages; a client only in the form a client name has, for a managed
+// execution, consensus or validator client.
 func cleanContainers(in []protocol.Container) []protocol.Container {
 	out := make([]protocol.Container, 0, len(in))
 	seen := make(map[string]struct{}, len(in))
@@ -536,6 +758,11 @@ func cleanContainers(in []protocol.Container) []protocol.Container {
 
 		if !c.Managed {
 			c.Owners = nil
+		}
+
+		// A client is a name the page lists and a setting is keyed by.
+		if !c.Managed || c.Kind == protocol.KindOther || !protocol.ValidClient(c.Client) {
+			c.Client = ""
 		}
 
 		out = append(out, c)
@@ -561,7 +788,7 @@ func (s *Server) identityAudit(
 			detailCertHash:   cert.Hash,
 			detailGeneration: cert.Generation,
 			"roles":          cert.Roles,
-			"validators":     cert.Validators.Count(),
+			"validators":     result.Host.Weight(),
 			detailRemoteAddr: remote,
 		}
 
@@ -600,49 +827,29 @@ func (s *Server) identityAudit(
 
 // auditIdentity writes identity audit entries. The sync that caused them is
 // already stored and is reported only once, so the write must not depend on
-// the request: it survives a client that went away, and entries that could
-// not be written are kept and written with the next sync of any host. A
-// failed write is logged loudly and does not fail the sync.
+// the request: it survives a client that went away. A failed write does not
+// fail the sync; the entries are logged in full, which is then their only
+// record.
 func (s *Server) auditIdentity(ctx context.Context, entries []fleet.AuditEntry) {
-	s.auditMu.Lock()
-	defer s.auditMu.Unlock()
-
-	if len(entries) == 0 && len(s.auditBacklog) == 0 {
+	if len(entries) == 0 {
 		return
 	}
-
-	pending := make([]fleet.AuditEntry, 0, len(s.auditBacklog)+len(entries))
-	pending = append(pending, s.auditBacklog...)
-	pending = append(pending, entries...)
 
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), auditWriteTimeout)
 	defer cancel()
 
-	err := s.opts.Store.AppendAudit(ctx, pending...)
+	err := s.opts.Store.AppendAudit(ctx, entries...)
 	if err == nil {
-		s.auditBacklog = nil
-
 		return
 	}
 
 	for i := range entries {
-		// Logged in full: if the process ends before the next attempt, the
-		// log is the only record.
 		s.log.WithError(err).WithFields(logrus.Fields{
 			"action": entries[i].Action,
 			"host":   entries[i].Target,
 			"detail": entries[i].Detail,
-		}).Error("Cannot write identity audit entry, keeping it for the next sync")
+		}).Error("Cannot write identity audit entry")
 	}
-
-	if dropped := len(pending) - maxAuditBacklog; dropped > 0 {
-		s.log.WithField("dropped", dropped).
-			Error("Identity audit backlog is full, dropping the oldest entries")
-
-		pending = pending[dropped:]
-	}
-
-	s.auditBacklog = pending
 }
 
 // inventory stores a host's inventory after checking its hash.
@@ -676,7 +883,7 @@ func (s *Server) inventory(r *http.Request, cert *identity.Certificate, body []b
 	if err := s.opts.Store.SaveInventory(ctx, cert.Subject, &inv); err != nil {
 		// The agent's fault, not the controller's: say so instead of a 500
 		// the agent would retry unchanged.
-		if errors.Is(err, store.ErrInventoryInvalid) || errors.Is(err, store.ErrInventoryHash) {
+		if errors.Is(err, store.ErrInventoryInvalid) {
 			return nil, agentErrorf(http.StatusBadRequest, "invalid inventory: %s", err.Error())
 		}
 
@@ -687,6 +894,8 @@ func (s *Server) inventory(r *http.Request, cert *identity.Certificate, body []b
 		"host":     cert.Subject,
 		"packages": strconv.Itoa(len(inv.Packages)),
 	}).Debug("Stored inventory")
+
+	s.Notify()
 
 	return &protocol.InventoryResponse{ServerTime: s.now().UTC(), Hash: hash}, nil
 }

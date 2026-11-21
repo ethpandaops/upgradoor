@@ -20,7 +20,7 @@ type State struct {
 	RebootRequired bool                  `json:"rebootRequired"`
 	Containers     []protocol.Container  `json:"containers"`
 	Registry       map[string]Tag        `json:"registry"`
-	Local          map[string]string     `json:"local"`
+	Local          map[string]Tag        `json:"local"`
 	Upgradable     []protocol.Upgradable `json:"upgradable"`
 	Calls          []string              `json:"calls"`
 }
@@ -37,7 +37,7 @@ func (h *Host) Snapshot() State {
 		RebootRequired: h.rebootRequired,
 		Containers:     make([]protocol.Container, 0, len(h.containers)),
 		Registry:       make(map[string]Tag, len(h.registry)),
-		Local:          make(map[string]string, len(h.local)),
+		Local:          make(map[string]Tag, len(h.local)),
 		Upgradable:     append([]protocol.Upgradable{}, h.upgradable...),
 		Calls:          append([]string{}, h.calls...),
 	}
@@ -50,8 +50,8 @@ func (h *Host) Snapshot() State {
 		st.Registry[ref] = tag
 	}
 
-	for ref, digest := range h.local {
-		st.Local[ref] = digest
+	for ref, tag := range h.local {
+		st.Local[ref] = tag
 	}
 
 	return st
@@ -62,9 +62,7 @@ func (h *Host) Snapshot() State {
 //
 //	GET  /state
 //	POST /registry         {"ref": "...", "digest": "sha256:...", "revision": "..."}
-//	POST /upgradable       [{"name": "...", "arch": "...", "current": "...", "candidate": "..."}]
 //	POST /reboot-required  {"required": true}
-//	POST /kernel           {"newest": "6.12.48-amd64"}
 //	POST /crash            {"container": "geth"}
 func (h *Host) ControlHandler() http.Handler {
 	mux := http.NewServeMux()
@@ -93,17 +91,6 @@ func (h *Host) ControlHandler() http.Handler {
 		writeJSON(w, http.StatusOK, h.Snapshot())
 	})
 
-	mux.HandleFunc("POST /upgradable", func(w http.ResponseWriter, r *http.Request) {
-		var in []protocol.Upgradable
-
-		if !readJSON(w, r, &in) {
-			return
-		}
-
-		h.SetUpgradable(in)
-		writeJSON(w, http.StatusOK, h.Snapshot())
-	})
-
 	mux.HandleFunc("POST /reboot-required", func(w http.ResponseWriter, r *http.Request) {
 		var in struct {
 			Required bool `json:"required"`
@@ -114,25 +101,6 @@ func (h *Host) ControlHandler() http.Handler {
 		}
 
 		h.SetRebootRequired(in.Required)
-		writeJSON(w, http.StatusOK, h.Snapshot())
-	})
-
-	mux.HandleFunc("POST /kernel", func(w http.ResponseWriter, r *http.Request) {
-		var in struct {
-			Newest string `json:"newest"`
-		}
-
-		if !readJSON(w, r, &in) {
-			return
-		}
-
-		if in.Newest == "" {
-			writeError(w, http.StatusBadRequest, errors.New("newest is required"))
-
-			return
-		}
-
-		h.SetNewestKernel(in.Newest)
 		writeJSON(w, http.StatusOK, h.Snapshot())
 	})
 

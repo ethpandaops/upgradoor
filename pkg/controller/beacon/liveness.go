@@ -1,13 +1,9 @@
 package beacon
 
 import (
-	"context"
-	"encoding/json"
-	"errors"
-	"fmt"
+	"cmp"
+	"slices"
 	"sort"
-	"strconv"
-	"time"
 
 	"github.com/sirupsen/logrus"
 
@@ -15,7 +11,7 @@ import (
 )
 
 // maxHostValidators bounds one host's validator range. A larger range is a
-// broken certificate, not a host, and would only produce huge requests.
+// broken certificate, not a host.
 const maxHostValidators = 1 << 20
 
 // trackedHost is a host with validators: the half-open index range from its
@@ -26,259 +22,152 @@ type trackedHost struct {
 	end   uint64
 }
 
-// livenessResponse is the answer of POST /eth/v1/validator/liveness/{epoch}.
-type livenessResponse struct {
-	Data []struct {
-		Index beaconUint `json:"index"`
-		//nolint:tagliatelle // field name of the standard Beacon API
-		IsLive bool `json:"is_live"`
-	} `json:"data"`
+// The per-epoch liveness the scheduler works with comes from the per-slot
+// counts of slots.go: for every host and epoch, "total" is the host's
+// validators with an attestation duty in the epoch and "live" the ones of them
+// whose attestation a canonical block carries.
+//
+// An epoch is settled, and published, once the slot tracker has stored every
+// one of its slots: the clock is slotSettleLag slots past its last slot, so
+// the block of the first slot of the next epoch, where the last votes are
+// normally included, has had its whole slot to arrive. Until it leaves the
+// tracker's window its counts are revised whenever a later block includes
+// more of it. An epoch the tracker could not count completely (committees not
+// served, slots before the tracker's start, a count that failed) is not
+// published: the scheduler then finds the liveness missing or stale and keeps
+// the gate closed, and no host becomes ready by its attestations.
+
+// livenessEpochs is how many settled epochs are kept in memory: enough for
+// the longest readiness run (fleet.MaxReadyEpochs) and the gate.
+const livenessEpochs = fleet.MaxReadyEpochs + 8
+
+// epochLiveness is the liveness of one settled epoch, by host.
+type epochLiveness struct {
+	epoch uint64
+	rows  []fleet.Liveness
 }
 
-// refreshLiveness stores liveness for the complete epochs that are still
-// missing and prunes old rows. A returned error that wraps errNotServed means
-// the node does not serve the liveness endpoint.
-func (s *service) refreshLiveness(ctx context.Context, now time.Time) error {
-	if err := s.loadStoredEpochs(ctx); err != nil {
-		return err
-	}
+// settledLiveness sums the per-slot duties of every epoch of [firstEpoch,
+// current] that is settled and was counted completely.
+func (t *slotTracker) settledLiveness(
+	firstEpoch, current, perSlot, horizon uint64,
+) []epochLiveness {
+	out := make([]epochLiveness, 0, current-firstEpoch+1)
 
-	var collectErr error
-
-	newest, settled := s.timing.newestSettledEpoch(now)
-	if settled && (!s.unsupported || !now.Before(s.reprobeAt)) {
-		collectErr = s.collect(ctx, now, newest)
-	}
-
-	if err := s.prune(ctx, now); err != nil && collectErr == nil {
-		return err
-	}
-
-	return collectErr
-}
-
-// loadStoredEpochs marks the epochs a previous run already stored, so they
-// are not queried again.
-func (s *service) loadStoredEpochs(ctx context.Context) error {
-	if s.storedLoaded {
-		return nil
-	}
-
-	rows, err := s.opts.Store.ListLiveness(ctx, backfillEpochs)
-	if err != nil {
-		return fmt.Errorf("reading stored liveness: %w", err)
-	}
-
-	for _, row := range rows {
-		s.handled[row.Epoch] = struct{}{}
-	}
-
-	s.storedLoaded = true
-
-	return nil
-}
-
-// collect queries and stores the missing epochs up to newest, newest first.
-func (s *service) collect(ctx context.Context, now time.Time, newest uint64) error {
-	pending := s.pendingEpochs(newest)
-	if len(pending) == 0 {
-		return nil
-	}
-
-	// Hosts are read again for every epoch: new hosts appear.
-	hosts, err := s.opts.Store.ListHosts(ctx)
-	if err != nil {
-		return fmt.Errorf("listing hosts: %w", err)
-	}
-
-	tracked := s.trackedHosts(hosts)
-
-	// Rows of an earlier epoch do not describe a fleet without validators.
-	s.noValidators = len(tracked) == 0
-
-	if len(tracked) == 0 {
-		// Nothing to ask for. The epoch stays pending in case a host with
-		// validators registers while the node still serves it.
-		return nil
-	}
-
-	indices := unionIndices(tracked)
-
-	for _, epoch := range pending {
-		err := s.collectEpoch(ctx, now, epoch, epoch == newest, tracked, indices)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
-}
-
-// pendingEpochs returns the unhandled epochs of the backfill window, newest
-// first, and forgets handled epochs that left the window.
-func (s *service) pendingEpochs(newest uint64) []uint64 {
-	var oldest uint64
-	if newest+1 > backfillEpochs {
-		oldest = newest + 1 - backfillEpochs
-	}
-
-	for epoch := range s.handled {
-		if epoch < oldest {
-			delete(s.handled, epoch)
-		}
-	}
-
-	pending := make([]uint64, 0, backfillEpochs)
-
-	for epoch := newest; ; epoch-- {
-		if _, done := s.handled[epoch]; !done {
-			pending = append(pending, epoch)
-		}
-
-		if epoch == oldest {
+	for epoch := firstEpoch; epoch <= current; epoch++ {
+		first, last := epoch*perSlot, (epoch+1)*perSlot-1
+		if last > horizon {
 			break
 		}
-	}
 
-	return pending
-}
+		if first < t.base {
+			continue
+		}
 
-// collectEpoch queries one epoch and stores a row per tracked host.
-func (s *service) collectEpoch(
-	ctx context.Context, now time.Time, epoch uint64, isNewest bool,
-	tracked []trackedHost, indices []uint64,
-) error {
-	log := s.log.WithField("epoch", epoch)
+		counts := make(map[string]*fleet.Liveness, len(t.hosts))
+		complete := true
 
-	live, err := s.queryLiveness(ctx, epoch, indices)
-	if err != nil {
-		return s.queryFailed(ctx, now, epoch, isNewest, err)
-	}
+		for slot := first; slot <= last && complete; slot++ {
+			duties, counted := t.duties[slot]
+			if _, pending := t.dirty[slot]; pending || !counted {
+				complete = false
 
-	rows := make([]fleet.Liveness, 0, len(tracked))
+				break
+			}
 
-	for _, host := range tracked {
-		row := fleet.Liveness{Host: host.name, Epoch: epoch, Total: host.end - host.start}
+			for _, duty := range duties {
+				row := counts[duty.Host]
+				if row == nil {
+					row = &fleet.Liveness{Host: duty.Host, Epoch: epoch}
+					counts[duty.Host] = row
+				}
 
-		for index := host.start; index < host.end; index++ {
-			if _, isLive := live[index]; isLive {
-				row.Live++
+				row.Total += duty.Assigned
+				row.Live += duty.Included
 			}
 		}
 
-		rows = append(rows, row)
-	}
-
-	if err := s.opts.Store.SaveLiveness(ctx, rows); err != nil {
-		return fmt.Errorf("saving liveness for epoch %d: %w", epoch, err)
-	}
-
-	s.handled[epoch] = struct{}{}
-
-	if s.unsupported {
-		s.unsupported = false
-		s.unsupportedNote = ""
-
-		log.Info("Beacon node serves validator liveness again")
-	}
-
-	log.WithFields(logrus.Fields{
-		"hosts":      len(rows),
-		"validators": len(indices),
-		"live":       len(live),
-	}).Debug("Stored validator liveness")
-
-	return nil
-}
-
-// queryFailed decides what a failed liveness query means: an old epoch the
-// node no longer serves (skipped for good), an endpoint the node does not
-// serve at all (liveness unknown), or a transient failure (retried).
-//
-// Older epochs are best effort. Nodes refuse them with 400, but some answer
-// an out-of-range epoch with another status (5xx included), so any HTTP
-// answer ends the backfill of that epoch; only a node that did not answer at
-// all (transport failure) is asked again.
-func (s *service) queryFailed(
-	ctx context.Context, now time.Time, epoch uint64, isNewest bool, err error,
-) error {
-	if ctx.Err() != nil {
-		return err
-	}
-
-	var status *statusError
-
-	notServed := errors.Is(err, errNotServed)
-	answered := errors.As(err, &status)
-
-	switch {
-	case !isNewest && (notServed || answered):
-		// Nodes serve the previous epoch only; an older one is asked for once.
-		s.handled[epoch] = struct{}{}
-
-		s.log.WithError(err).WithField("epoch", epoch).Debug(
-			"Beacon node does not serve liveness for this older epoch")
-
-		return nil
-	case notServed:
-		return s.markUnsupported(now, err)
-	default:
-		return fmt.Errorf("validator liveness for epoch %d: %w", epoch, err)
-	}
-}
-
-// markUnsupported records that the node does not serve the liveness
-// endpoint and schedules the next probe.
-func (s *service) markUnsupported(now time.Time, cause error) error {
-	err := fmt.Errorf("validator liveness unavailable: %w", cause)
-
-	if !s.unsupported {
-		s.log.WithError(cause).WithField("reprobe_in", reprobeInterval.String()).Warn(
-			"Beacon node does not serve validator liveness (Teku needs " +
-				"--beacon-liveness-tracking-enabled); liveness is unknown")
-	}
-
-	s.unsupported = true
-	s.unsupportedNote = err.Error()
-	s.reprobeAt = now.Add(reprobeInterval)
-
-	return err
-}
-
-// queryLiveness asks the node which of the indices attested in epoch. The
-// indices are sent in chunks; every chunk must succeed.
-func (s *service) queryLiveness(
-	ctx context.Context, epoch uint64, indices []uint64,
-) (map[uint64]struct{}, error) {
-	path := "/eth/v1/validator/liveness/" + strconv.FormatUint(epoch, 10)
-	live := make(map[uint64]struct{}, len(indices))
-
-	for offset := 0; offset < len(indices); offset += s.chunkSize {
-		chunk := indices[offset:min(offset+s.chunkSize, len(indices))]
-
-		request := make([]string, 0, len(chunk))
-		for _, index := range chunk {
-			request = append(request, strconv.FormatUint(index, 10))
+		if !complete {
+			continue
 		}
 
-		body, err := json.Marshal(request)
-		if err != nil {
-			return nil, fmt.Errorf("encoding liveness request: %w", err)
-		}
-
-		var answer livenessResponse
-		if err := s.client.post(ctx, path, body, &answer); err != nil {
-			return nil, err
-		}
-
-		for _, entry := range answer.Data {
-			if entry.IsLive {
-				live[uint64(entry.Index)] = struct{}{}
+		// Every tracked host has a row: one whose validators had no duty
+		// (not active yet, or exited) has nothing live.
+		rows := make([]fleet.Liveness, 0, len(t.hosts))
+		for _, host := range t.hosts {
+			row := fleet.Liveness{Host: host.name, Epoch: epoch}
+			if counted := counts[host.name]; counted != nil {
+				row = *counted
 			}
+
+			rows = append(rows, row)
+		}
+
+		out = append(out, epochLiveness{epoch: epoch, rows: rows})
+	}
+
+	return out
+}
+
+// publishLiveness merges the settled epochs into the kept ones and sums the
+// newest into the published view. problem is why this poll's count failed,
+// or "".
+func (s *service) publishLiveness(settled []epochLiveness, problem string) {
+	s.healthMu.Lock()
+	defer s.healthMu.Unlock()
+
+	for _, epoch := range settled {
+		i, found := slices.BinarySearchFunc(s.liveness, epoch.epoch,
+			func(e epochLiveness, target uint64) int { return cmp.Compare(e.epoch, target) })
+		if found {
+			s.liveness[i] = epoch
+		} else {
+			s.liveness = slices.Insert(s.liveness, i, epoch)
 		}
 	}
 
-	return live, nil
+	if drop := len(s.liveness) - livenessEpochs; drop > 0 {
+		s.liveness = slices.Delete(s.liveness, 0, drop)
+	}
+
+	h := &s.health
+	h.LivenessError = problem
+
+	if len(s.liveness) == 0 {
+		return
+	}
+
+	newest := &s.liveness[len(s.liveness)-1]
+
+	h.LivenessKnown = true
+	h.LivenessEpoch = newest.epoch
+	h.Tracked, h.Live = 0, 0
+
+	for _, row := range newest.rows {
+		h.Tracked += row.Total
+		h.Live += row.Live
+	}
+}
+
+// Liveness returns the rows of the newest settled epochs, at most epochs of
+// them, newest epoch first.
+func (s *service) Liveness(epochs int) []fleet.Liveness {
+	s.healthMu.RLock()
+	defer s.healthMu.RUnlock()
+
+	keep := s.liveness[len(s.liveness)-min(epochs, len(s.liveness)):]
+
+	size := 0
+	for _, epoch := range keep {
+		size += len(epoch.rows)
+	}
+
+	out := make([]fleet.Liveness, 0, size)
+	for i := len(keep) - 1; i >= 0; i-- {
+		out = append(out, keep[i].rows...)
+	}
+
+	return out
 }
 
 // trackedHosts returns the hosts with validators ordered by range start and
@@ -341,111 +230,4 @@ func (s *service) warnOnce(key string, fields logrus.Fields, msg string) {
 	s.warned[key] = struct{}{}
 
 	s.log.WithFields(fields).Warn(msg)
-}
-
-// unionIndices returns every validator index of the hosts once, ascending.
-// The hosts must be ordered by range start.
-func unionIndices(tracked []trackedHost) []uint64 {
-	var total uint64
-	for _, host := range tracked {
-		total += host.end - host.start
-	}
-
-	indices := make([]uint64, 0, total)
-
-	var next uint64
-
-	for _, host := range tracked {
-		for index := max(host.start, next); index < host.end; index++ {
-			indices = append(indices, index)
-		}
-
-		next = max(next, host.end)
-	}
-
-	return indices
-}
-
-// prune deletes liveness rows older than the retention, once per epoch.
-func (s *service) prune(ctx context.Context, now time.Time) error {
-	current := s.timing.epochAt(now)
-	if current <= s.retention {
-		return nil
-	}
-
-	before := current - s.retention
-	if before <= s.prunedBefore {
-		return nil
-	}
-
-	if err := s.opts.Store.PruneLiveness(ctx, before); err != nil {
-		return fmt.Errorf("pruning liveness: %w", err)
-	}
-
-	s.prunedBefore = before
-
-	return nil
-}
-
-// publishLiveness sums the newest stored epoch into the published view. note
-// is the problem of this poll, if any; it wins over a store read failure.
-// While no host has validators nothing is tracked and the view says so,
-// whatever older rows are still stored.
-func (s *service) publishLiveness(ctx context.Context, note string) error {
-	var (
-		rows []fleet.Liveness
-		err  error
-	)
-
-	if !s.noValidators {
-		rows, err = s.opts.Store.ListLiveness(ctx, 1)
-		if err != nil && note == "" {
-			note = "reading stored liveness: " + err.Error()
-		}
-	}
-
-	var epoch, tracked, live uint64
-
-	for i, row := range rows {
-		if i == 0 {
-			epoch = row.Epoch
-		}
-
-		if row.Epoch != epoch {
-			continue
-		}
-
-		tracked += row.Total
-		live += row.Live
-	}
-
-	unsupported := s.unsupported
-
-	s.setHealth(func(h *fleet.NetworkHealth) {
-		if note != "" {
-			h.Error = note
-		}
-
-		// Set and cleared with the detection itself, whatever the store says.
-		h.LivenessUnsupported = unsupported
-
-		if unsupported {
-			h.LivenessKnown = false
-		}
-
-		if err != nil {
-			return
-		}
-
-		h.LivenessKnown = len(rows) > 0 && !unsupported
-		h.LivenessEpoch = epoch
-		h.Tracked = tracked
-		h.Live = live
-	})
-
-	if err != nil {
-		return fmt.Errorf("reading stored liveness: %w", err)
-	}
-
-	return nil
 }

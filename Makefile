@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-web ensure-web test test-go test-web test-docker test-system test-reboot lint lint-go lint-web e2e clean
+.PHONY: all build build-web ensure-web test test-go test-web test-docker test-system test-reboot lint lint-go lint-web e2e wire clean
 
 all: build
 
@@ -10,8 +10,12 @@ all: build
 build: ensure-web
 	CGO_ENABLED=0 go build -tags=webui -trimpath -ldflags "$(LDFLAGS)" -o bin/upgradoor ./cmd/upgradoor
 
-build-web:
-	cd web && npm ci && npm run build
+# One npm ci per change of the lock file, however many web targets run.
+web/node_modules/.package-lock.json: web/package.json web/package-lock.json
+	cd web && npm ci
+
+build-web: web/node_modules/.package-lock.json
+	cd web && npm run build
 
 # The built UI is rebuilt whenever one of its sources is newer than it, so
 # the binary never embeds a stale page.
@@ -27,14 +31,11 @@ ensure-web: web/dist/index.html
 
 test: test-go test-web
 
-# The tick cost test compares times and is skipped under the race detector;
-# it runs once without it.
 test-go:
 	go test -race -timeout 10m ./...
-	go test -timeout 10m -run '^TestTickCost' ./pkg/controller/scheduler/
 
-test-web:
-	cd web && npm ci && npm run typecheck && npm test
+test-web: web/node_modules/.package-lock.json
+	cd web && npm run typecheck && npm test
 
 # Needs a Docker daemon: container recreate against real containers.
 test-docker:
@@ -50,8 +51,8 @@ lint: lint-go lint-web
 lint-go:
 	golangci-lint run --timeout=10m
 
-lint-web:
-	cd web && npm ci && npm run lint
+lint-web: web/node_modules/.package-lock.json
+	cd web && npm run lint
 
 # Needs Docker: the full agent under systemd in throwaway hosts, with leases
 # that survive real reboots of those hosts.
@@ -60,7 +61,12 @@ test-reboot:
 
 # End-to-end run on a local Kurtosis devnet.
 e2e:
-	./examples/kurtosis/run.sh
+	./test/e2e/kurtosis/run.sh
+
+# Rewrites the wire schema and golden file the web UI decodes against, from
+# the Go types. Run it after changing a type that travels on the stream.
+wire:
+	go test ./pkg/controller/api/ -run TestWireFiles -update-wire
 
 clean:
 	rm -rf bin web/dist

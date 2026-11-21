@@ -588,6 +588,145 @@ describe('can, what the review of the first version found', () => {
     }
   });
 
+  it('opens an override of a client on many hosts to a team that owns a container of it', () => {
+    const group = (client: string, part: 'image' | 'flags') =>
+      ({
+        action: 'client-override',
+        body: { client, kind: 'cl', hosts: [MIXED, TEKU], part, reason: '' },
+      }) satisfies ActionCall;
+    const ownership = {
+      ...OWNERSHIP,
+      clients: [
+        { name: 'lighthouse', hosts: 2, owners: ['lighthouse'] },
+        { name: 'teku', hosts: 2, owners: ['nimbus', 'teku'] },
+      ],
+    };
+
+    expect(can(login([FEATURE.image_override]), group('teku', 'image'), ownership)).toMatchObject({
+      allowed: true,
+      by: 'image_override',
+    });
+    expect(can(login([FEATURE.image_override]), group('teku', 'flags'), ownership).allowed).toBe(false);
+    // The controller judges each host and lists the ones the team does not cover.
+    expect(
+      can(login([TEAM_PREFIX + FEATURE.flag_override], ['teku']), group('teku', 'flags'), ownership)
+    ).toMatchObject({ allowed: true, by: 'team_flag_override' });
+    expect(
+      can(login([TEAM_PREFIX + FEATURE.flag_override], ['teku']), group('lighthouse', 'flags'), ownership)
+    ).toEqual(
+      expect.objectContaining({
+        allowed: false,
+        reason: 'upgradoor:team_flag_override does not cover any container of client lighthouse (owners: lighthouse)',
+      })
+    );
+  });
+
+  it('covers the policy of a client for a team that owns every container of it', () => {
+    const policy = (client: string) =>
+      ({ action: 'client-policy', body: { client, policy: 'manual', reason: '' } }) satisfies ActionCall;
+    // lighthouse owns its client throughout; on one host the teku container is nimbus's alone.
+    const clients = [
+      { name: 'lighthouse', hosts: 2, allOwned: ['lighthouse'] },
+      { name: 'teku', hosts: 2, allOwned: ['nimbus'] },
+      { name: 'geth', hosts: 3, allOwned: [] },
+      { name: 'retired', hosts: 0, allOwned: ['lighthouse'] },
+    ];
+    const ownership = { ...OWNERSHIP, clients };
+    const twin = TEAM_PREFIX + FEATURE.client_policy;
+
+    expect(TWINNED).toContain(FEATURE.client_policy);
+    expect(can(login([FEATURE.client_policy]), policy('geth'), OWNERSHIP)).toMatchObject({
+      allowed: true,
+      by: 'client_policy',
+    });
+    expect(can(login([twin], ['lighthouse']), policy('lighthouse'), ownership)).toMatchObject({
+      allowed: true,
+      by: 'team_client_policy',
+      staggered: false,
+    });
+    expect(can(login([twin], ['teku', 'nimbus']), policy('teku'), ownership).allowed).toBe(true);
+
+    expect(can(login([twin], ['teku']), policy('teku'), ownership).reason).toBe(
+      'upgradoor:team_client_policy does not cover client teku (owners of all of it: nimbus)'
+    );
+    for (const client of ['geth', 'retired', 'unknown']) {
+      expect(can(login([twin], ['lighthouse']), policy(client), ownership).reason, client).toBe(
+        `upgradoor:team_client_policy does not cover client ${client} (owners of all of it: none)`
+      );
+    }
+    // Without the client table nobody owns a client; without a team neither.
+    expect(can(login([twin], ['lighthouse']), policy('lighthouse'), OWNERSHIP).allowed).toBe(false);
+    expect(can(login([twin]), policy('lighthouse'), ownership).allowed).toBe(false);
+
+    expect(can(login(['admin', 'roll', 'supervise']), policy('geth'), ownership).reason).toBe(
+      'Needs upgradoor:client_policy or upgradoor:team_client_policy for a team that owns every container of this client'
+    );
+    expect(can(OPEN, policy('geth'), OWNERSHIP).allowed).toBe(true);
+  });
+
+  it('covers an override for a team that owns exactly that container on that host', () => {
+    const image = (host: string, container: string) =>
+      ({ action: 'image-override', body: { host, container, image: 'a/b:c', reason: '' } }) satisfies ActionCall;
+    const flags = (host: string, container: string) =>
+      ({
+        action: 'flag-override',
+        body: { host, container, addFlags: ['--x'], removeFlags: [], reason: '' },
+      }) satisfies ActionCall;
+    const lighthouse = ['lighthouse'];
+
+    for (const [feature, call] of [
+      [FEATURE.image_override, image],
+      [FEATURE.flag_override, flags],
+    ] as const) {
+      const twin = TEAM_PREFIX + feature;
+      expect(TWINNED).toContain(feature);
+
+      expect(can(login([feature]), call(MIXED, 'geth'), OWNERSHIP)).toMatchObject({ allowed: true, by: feature });
+      expect(can(login([twin], lighthouse), call(MIXED, 'lighthouse'), OWNERSHIP)).toMatchObject({
+        allowed: true,
+        by: twin,
+        staggered: false,
+      });
+      // The rule of a roll of one container: another team's, an unmanaged one and one the host does not have.
+      expect(can(login([twin], lighthouse), call(MIXED, 'geth'), OWNERSHIP).reason).toBe(
+        `upgradoor:${twin} does not cover container geth on host ${MIXED} (owners: geth)`
+      );
+      for (const container of ['debug', 'nope']) {
+        expect(can(login([twin], lighthouse), call(MIXED, container), OWNERSHIP).allowed, container).toBe(false);
+      }
+      expect(can(login([twin], lighthouse), call(GHOST, 'lighthouse'), OWNERSHIP).allowed).toBe(false);
+
+      // One feature does not give the other, and neither does roll or admin.
+      const others = [
+        FEATURE.roll,
+        FEATURE.admin,
+        feature === FEATURE.image_override ? FEATURE.flag_override : FEATURE.image_override,
+      ];
+      expect(can(login(others), call(MIXED, 'geth'), OWNERSHIP).reason).toBe(
+        `Needs upgradoor:${feature} or upgradoor:${twin} for a team that owns this container`
+      );
+    }
+  });
+
+  it('says that the controller decides when several teams of the login own parts of a client', () => {
+    const policy = {
+      action: 'client-policy',
+      body: { client: 'teku', policy: 'manual', reason: '' },
+    } satisfies ActionCall;
+    const clients = [{ name: 'teku', hosts: 2, allOwned: [], owners: ['nimbus', 'teku'] }];
+    const twin = TEAM_PREFIX + FEATURE.client_policy;
+
+    const both = can(login([twin], ['teku', 'nimbus']), policy, { ...OWNERSHIP, clients });
+    expect(both.allowed).toBe(false);
+    expect(both.reason).toMatch(
+      /owners of all of it: none\); your teams nimbus, teku own parts of it.*the controller decides/
+    );
+    // One team that owns a part does not cover it, and nothing is left open.
+    expect(can(login([twin], ['teku']), policy, { ...OWNERSHIP, clients }).reason).toBe(
+      'upgradoor:team_client_policy does not cover client teku (owners of all of it: none)'
+    );
+  });
+
   it('names admin for "now" through a team feature, and only then', () => {
     const lighthouse = ['lighthouse'];
     const now = roll([MIXED], ['lighthouse']);

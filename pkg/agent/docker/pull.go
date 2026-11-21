@@ -4,15 +4,13 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io/fs"
-	"os"
-	"path/filepath"
 	"strings"
 
 	"github.com/moby/moby/api/types/registry"
 	"github.com/moby/moby/client"
+
+	"github.com/ethpandaops/upgradoor/pkg/agent"
 )
 
 // pullDigestPrefix starts the status line with which the daemon reports the
@@ -20,23 +18,23 @@ import (
 const pullDigestPrefix = "Digest: "
 
 // Pull implements agent.ContainerRuntime.
-func (r *Runtime) Pull(ctx context.Context, ref string) (string, error) {
-	repo, err := repositoryOf(ref)
+func (r *Runtime) Pull(ctx context.Context, ref string) (digest, revision string, err error) {
+	parsed, err := agent.ParseReference(ref)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
+	repo := parsed.Repository()
 	log := r.log.WithField("image", ref)
 
-	auth, err := r.registryAuth(ref)
+	auth, err := r.registryAuth(parsed.Host)
 	if err != nil {
-		// Credentials are optional: a public image still pulls without.
-		log.WithError(err).Warn("Cannot use the registry credentials file, pulling anonymously")
+		return "", "", fmt.Errorf("pull %s: %w", ref, err)
 	}
 
 	resp, err := r.engine.ImagePull(ctx, ref, client.ImagePullOptions{RegistryAuth: auth})
 	if err != nil {
-		return "", fmt.Errorf("pull %s: %w", ref, err)
+		return "", "", fmt.Errorf("pull %s: %w", ref, err)
 	}
 
 	defer func() {
@@ -51,25 +49,25 @@ func (r *Runtime) Pull(ctx context.Context, ref string) (string, error) {
 
 	for msg, err := range resp.JSONMessages(ctx) {
 		if err != nil {
-			return "", fmt.Errorf("pull %s: read progress: %w", ref, err)
+			return "", "", fmt.Errorf("pull %s: read progress: %w", ref, err)
 		}
 
 		if msg.Error != nil {
-			return "", fmt.Errorf("pull %s: %w", ref, msg.Error)
+			return "", "", fmt.Errorf("pull %s: %w", ref, msg.Error)
 		}
 
-		if digest, ok := strings.CutPrefix(msg.Status, pullDigestPrefix); ok {
-			tagDigest = strings.TrimSpace(digest)
+		if seen, ok := strings.CutPrefix(msg.Status, pullDigestPrefix); ok {
+			tagDigest = strings.TrimSpace(seen)
 		}
 	}
 
 	img, err := r.inspectImage(ctx, ref)
 	if err != nil {
-		return "", err
+		return "", "", err
 	}
 
 	if img == nil {
-		return "", fmt.Errorf("pull %s: image is absent after the pull", ref)
+		return "", "", fmt.Errorf("pull %s: image is absent after the pull", ref)
 	}
 
 	if hasDigest(ref, img.RepoDigests, tagDigest) {
@@ -78,138 +76,33 @@ func (r *Runtime) Pull(ctx context.Context, ref string) (string, error) {
 		r.pulledMu.Unlock()
 	}
 
-	digest := r.digestOf(ref, img)
+	digest = r.digestOf(ref, img)
 
 	log.WithField("digest", digest).Info("Image pulled")
 
-	return digest, nil
+	return digest, revisionOf(img), nil
 }
 
-// dockerConfigFile is the part of a Docker config.json the runtime reads.
-type dockerConfigFile struct {
-	Auths map[string]dockerConfigAuth `json:"auths"`
-}
-
-// dockerConfigAuth is one entry of the "auths" section.
-type dockerConfigAuth struct {
-	// Auth is base64("username:password").
-	Auth          string `json:"auth"`
-	Username      string `json:"username"`
-	Password      string `json:"password"`
-	IdentityToken string `json:"identitytoken"`
-	RegistryToken string `json:"registrytoken"`
-}
-
-// defaultAuthFile is where the Docker CLI keeps its configuration.
-func defaultAuthFile() string {
-	if dir := os.Getenv("DOCKER_CONFIG"); dir != "" {
-		return filepath.Join(dir, "config.json")
-	}
-
-	home, err := os.UserHomeDir()
-	if err != nil {
-		return ""
-	}
-
-	return filepath.Join(home, ".docker", "config.json")
-}
-
-// registryAuth returns the X-Registry-Auth value for the registry of ref,
-// or "" when there are no credentials for it.
-func (r *Runtime) registryAuth(ref string) (string, error) {
-	if r.authFile == "" {
+// registryAuth returns the X-Registry-Auth value for a registry host, or ""
+// when there is no login for it.
+func (r *Runtime) registryAuth(host string) (string, error) {
+	if r.login == nil {
 		return "", nil
 	}
 
-	host, err := registryOf(ref)
-	if err != nil {
-		return "", err
-	}
-
-	raw, err := os.ReadFile(r.authFile)
-	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return "", nil
-		}
-
-		return "", fmt.Errorf("read %s: %w", r.authFile, err)
-	}
-
-	cfg, err := findRegistryAuth(raw, host)
-	if err != nil {
-		return "", fmt.Errorf("%s: %w", r.authFile, err)
-	}
-
-	if cfg == nil {
+	username, password, ok := r.login(host)
+	if !ok {
 		return "", nil
 	}
 
-	// The daemon takes the credentials as JSON in the X-Registry-Auth header.
-	encoded, err := json.Marshal(cfg) //nolint:gosec // G117: sending the password is the purpose
+	// The daemon takes the login as JSON in the X-Registry-Auth header.
+	//nolint:gosec // G117: sending the password is the purpose
+	encoded, err := json.Marshal(registry.AuthConfig{
+		Username: username, Password: password, ServerAddress: host,
+	})
 	if err != nil {
-		return "", fmt.Errorf("encode registry credentials: %w", err)
+		return "", fmt.Errorf("encode registry login: %w", err)
 	}
 
 	return base64.URLEncoding.EncodeToString(encoded), nil
-}
-
-// findRegistryAuth looks up the credentials for a (normalised) registry
-// host in the content of a Docker config.json. Keys are matched by host, so
-// "https://index.docker.io/v1/", "registry-1.docker.io" and "docker.io" all
-// serve Docker Hub; an exact key wins over an alias.
-func findRegistryAuth(configJSON []byte, host string) (*registry.AuthConfig, error) {
-	var file dockerConfigFile
-
-	if err := json.Unmarshal(configJSON, &file); err != nil {
-		return nil, fmt.Errorf("parse docker config: %w", err)
-	}
-
-	var (
-		entry dockerConfigAuth
-		key   string
-	)
-
-	for candidate, value := range file.Auths {
-		if normalizeRegistry(candidate) != host {
-			continue
-		}
-
-		// Prefer the exact host, then the smallest key, to be deterministic.
-		if key == "" || (key != host && (candidate == host || candidate < key)) {
-			entry, key = value, candidate
-		}
-	}
-
-	if key == "" {
-		return nil, nil //nolint:nilnil // no credentials for this registry is a regular answer
-	}
-
-	cfg := &registry.AuthConfig{
-		Username:      entry.Username,
-		Password:      entry.Password,
-		IdentityToken: entry.IdentityToken,
-		RegistryToken: entry.RegistryToken,
-		ServerAddress: key,
-	}
-
-	if entry.Auth != "" {
-		decoded, err := base64.StdEncoding.DecodeString(entry.Auth)
-		if err != nil {
-			return nil, fmt.Errorf("auths[%q]: invalid auth value: %w", key, err)
-		}
-
-		user, password, found := strings.Cut(string(decoded), ":")
-		if !found {
-			return nil, fmt.Errorf("auths[%q]: auth value is not user:password", key)
-		}
-
-		cfg.Username = user
-		cfg.Password = strings.TrimRight(password, "\x00")
-	}
-
-	if cfg.Username == "" && cfg.IdentityToken == "" && cfg.RegistryToken == "" {
-		return nil, nil //nolint:nilnil // an empty entry (credential helper stub) carries no credentials
-	}
-
-	return cfg, nil
 }

@@ -14,35 +14,16 @@
 // header. A GET of the tag happens only when a registry sends no such header
 // (or refuses HEAD), in which case the body is hashed.
 //
-// The revision label (org.opencontainers.image.revision) needs the platform
-// manifest and the image config. It is looked up once per repository and
-// digest, the first time that digest is seen, and cached for the life of the
-// Resolver. A failed lookup never fails Resolve: it yields an empty revision
-// and is tried again later, at most three times per digest and no more often
-// than every ten minutes, so an unchanged tag still costs one HEAD per poll.
-// A lookup interrupted by the caller's context does not count. The lookup
-// spends counted GETs; Options.SkipRevision turns it off altogether, which is
-// the right setting when the revision is read from the local image instead.
+// The registry is asked for nothing else: an unchanged tag costs one HEAD per
+// poll. The revision label of an image is read from the local image after
+// the pull (pkg/agent/docker).
 //
 // # Authentication
 //
-// Credentials come from the "auths" map of a Docker config.json (an "auth"
-// value or username/password; docker.io, index.docker.io and
-// registry-1.docker.io are the same registry; when several entries name one
-// registry the most specific key wins, deterministically). They are sent as HTTP Basic to
-// the registry, and to the token service when the registry answers with a
-// Bearer challenge. Tokens are requested with the scope
-// repository:<path>:pull, cached per repository, and fetched again once when
-// the registry rejects a cached one. Credential helpers ("credHelpers",
-// "credsStore") and identity tokens are NOT supported: a registry whose login
-// lives in a helper is accessed anonymously.
-//
-// # Provenance
-//
-// Adapted from rolloor's internal/registry (github.com/ethpandaops/rolloor):
-// reference parsing, the token flow and the auth file reader started there.
-// Changed here: HEAD-only resolution, the revision lookup decoupled from the
-// digest, reference validation, token expiry, logrus.
+// Logins (see LoadLogins) are sent as HTTP Basic to the registry, and to the
+// token service when the registry answers with a Bearer challenge. Tokens are
+// requested with the scope repository:<path>:pull, cached per repository, and
+// fetched again once when the registry rejects a cached one.
 package registry
 
 import (
@@ -56,8 +37,6 @@ import (
 	"io"
 	"net/http"
 	"os"
-	"runtime"
-	"strings"
 	"sync"
 	"time"
 
@@ -77,11 +56,11 @@ const (
 	headerContentDigest = "Docker-Content-Digest"
 	userAgent           = "upgradoor-agent"
 
-	defaultTimeout = 30 * time.Second
+	// requestTimeout bounds every single request, body included.
+	requestTimeout = 30 * time.Second
 	maxRedirects   = 10
 
 	maxManifestBytes = 4 << 20
-	maxConfigBytes   = 4 << 20
 	maxTokenBytes    = 1 << 20
 	// maxDrainBytes bounds what is read from a body that is thrown away, so
 	// that the connection can be reused.
@@ -91,8 +70,8 @@ const (
 // errBodyTooLarge is returned when a response exceeds its size cap.
 var errBodyTooLarge = errors.New("response body exceeds the size limit")
 
-// StatusError is a registry or token service answer other than 200.
-type StatusError struct {
+// statusError is a registry or token service answer other than 200.
+type statusError struct {
 	Method string
 	// URL is the request URL without query.
 	URL  string
@@ -100,111 +79,52 @@ type StatusError struct {
 }
 
 // Error implements error.
-func (e *StatusError) Error() string {
+func (e *statusError) Error() string {
 	return fmt.Sprintf("registry: %s %s: %d %s", e.Method, e.URL, e.Code, http.StatusText(e.Code))
 }
 
 // Options configure a Resolver.
 type Options struct {
-	// AuthFile is a Docker config.json whose "auths" map holds registry
-	// credentials. Empty or missing means anonymous access; a file that
-	// cannot be read or parsed is an error. credHelpers and credsStore are
-	// not supported.
-	AuthFile string
+	// Logins are the registry logins; a registry without one is accessed
+	// anonymously.
+	Logins Logins
 	// PlainHTTP lists registry hosts (as written in image references,
 	// host[:port]) that are spoken to over http instead of https.
 	PlainHTTP []string
 	// CAFile is a PEM bundle trusted in addition to the system roots, for
 	// registries behind a private certificate authority.
 	CAFile string
-	// Timeout bounds every single request, body included (default 30s).
-	Timeout time.Duration
-	// Platform ("os/arch" or "os/arch/variant") selects the manifest whose
-	// config carries the revision label when a tag is a multi-arch index.
-	// It defaults to linux/<GOARCH of the agent> and has no influence on the
-	// digest.
-	Platform string
-	// SkipRevision disables the revision lookup: Resolve then never sends
-	// more than its HEAD (or the fallback GET) and returns no revision.
-	//
-	// With the lookup on (the zero value), every digest seen for the first
-	// time costs up to two GETs that Docker Hub counts against the pull rate
-	// limit: the platform manifest of a multi-arch tag and the image config.
-	// A caller that reads the revision label from the local image after the
-	// pull (the upgradoor design, PLAN.md section 13) does not need the
-	// registry's answer and should set SkipRevision to stay at zero counted
-	// requests.
-	SkipRevision bool
 }
 
 // Resolver resolves tags against OCI distribution registries. It is safe for
 // concurrent use.
 type Resolver struct {
-	log          logrus.FieldLogger
-	client       *http.Client
-	creds        map[string]credentials // by Reference.Host
-	plainHTTP    map[string]struct{}
-	platform     platform
-	skipRevision bool
-	now          func() time.Time
+	log       logrus.FieldLogger
+	client    *http.Client
+	logins    Logins
+	plainHTTP map[string]struct{}
+	now       func() time.Time
 
-	mu            sync.Mutex
-	tokens        map[string]token          // by API host/path
-	revisions     map[string]*revisionEntry // by API host/path@digest
-	revisionOrder []string
+	mu     sync.Mutex
+	tokens map[string]token // by API host/path
 }
 
 var _ agent.Registry = (*Resolver)(nil)
 
-// systemRoots is x509.SystemCertPool, replaceable so its failure is testable.
-var systemRoots = x509.SystemCertPool
-
-// New builds a Resolver. It reads the auth file and the CA file once; it does
-// not touch the network. A nil log discards the package's log output.
-//
-//nolint:gocritic // hugeParam: Options by value is the agreed constructor signature; New runs once
+// New builds a Resolver. It reads the CA file once; it does not touch the
+// network.
 func New(log logrus.FieldLogger, opts Options) (*Resolver, error) {
-	plat, err := parsePlatform(opts.Platform)
-	if err != nil {
-		return nil, err
-	}
-
-	if isNilLogger(log) {
-		discard := logrus.New()
-		discard.SetOutput(io.Discard)
-
-		log = discard
-	}
-
 	r := &Resolver{
-		log:          log.WithField("package", "registry"),
-		creds:        map[string]credentials{},
-		plainHTTP:    make(map[string]struct{}, len(opts.PlainHTTP)),
-		platform:     plat,
-		skipRevision: opts.SkipRevision,
-		now:          time.Now,
-		tokens:       make(map[string]token, 8),
-		revisions:    make(map[string]*revisionEntry, 16),
+		log:       log.WithField("package", "registry"),
+		logins:    opts.Logins,
+		plainHTTP: make(map[string]struct{}, len(opts.PlainHTTP)),
+		now:       time.Now,
+		tokens:    make(map[string]token, 8),
 	}
 
 	for _, host := range opts.PlainHTTP {
-		if host = authHost(strings.TrimSpace(host)); host != "" {
+		if host = agent.RegistryHost(host); host != "" {
 			r.plainHTTP[host] = struct{}{}
-		}
-	}
-
-	if opts.AuthFile != "" {
-		creds, unsupported, err := loadCredentials(r.log, opts.AuthFile)
-		if err != nil {
-			return nil, err
-		}
-
-		r.creds = creds
-
-		if unsupported {
-			r.log.WithField("auth_file", opts.AuthFile).Warn(
-				"auth file names a credential helper or store, which is not supported; " +
-					"only its \"auths\" entries are used")
 		}
 	}
 
@@ -219,13 +139,8 @@ func New(log logrus.FieldLogger, opts Options) (*Resolver, error) {
 		tlsConfig.RootCAs = pool
 	}
 
-	timeout := opts.Timeout
-	if timeout <= 0 {
-		timeout = defaultTimeout
-	}
-
 	r.client = &http.Client{
-		Timeout: timeout,
+		Timeout: requestTimeout,
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
 			TLSClientConfig:       tlsConfig,
@@ -233,27 +148,12 @@ func New(log logrus.FieldLogger, opts Options) (*Resolver, error) {
 			MaxIdleConns:          16,
 			IdleConnTimeout:       90 * time.Second,
 			TLSHandshakeTimeout:   10 * time.Second,
-			ResponseHeaderTimeout: timeout,
+			ResponseHeaderTimeout: requestTimeout,
 		},
 		CheckRedirect: checkRedirect,
 	}
 
 	return r, nil
-}
-
-// isNilLogger reports whether log is nil or holds a nil logrus pointer, which
-// would panic on first use.
-func isNilLogger(log logrus.FieldLogger) bool {
-	switch l := log.(type) {
-	case nil:
-		return true
-	case *logrus.Logger:
-		return l == nil
-	case *logrus.Entry:
-		return l == nil
-	default:
-		return false
-	}
 }
 
 // loadRoots returns the system roots plus the certificates of a PEM file.
@@ -263,7 +163,7 @@ func loadRoots(path string) (*x509.CertPool, error) {
 		return nil, fmt.Errorf("registry: read CA file: %w", err)
 	}
 
-	pool, err := systemRoots()
+	pool, err := x509.SystemCertPool()
 	if err != nil || pool == nil {
 		pool = x509.NewCertPool()
 	}
@@ -275,8 +175,7 @@ func loadRoots(path string) (*x509.CertPool, error) {
 	return pool, nil
 }
 
-// checkRedirect follows redirects (blob downloads are redirected to object
-// storage) but never from https to anything else. net/http already drops the
+// checkRedirect follows redirects but never from https to anything else. net/http already drops the
 // Authorization header when a redirect leaves the host.
 func checkRedirect(req *http.Request, via []*http.Request) error {
 	if len(via) >= maxRedirects {
@@ -290,49 +189,29 @@ func checkRedirect(req *http.Request, via []*http.Request) error {
 	return nil
 }
 
-// Close releases idle connections. The Resolver stays usable.
-func (r *Resolver) Close() {
-	r.client.CloseIdleConnections()
-}
-
 // Resolve returns the digest of the manifest that ref ([host/]path[:tag])
-// points at, the index digest for a multi-arch tag, and the image's revision
-// label when it is known. A revision that cannot be determined is returned
-// empty; only a failure to determine the digest is an error. Registry answers
-// other than 200 are reported as *StatusError.
-func (r *Resolver) Resolve(ctx context.Context, ref string) (digest, revision string, err error) {
-	parsed, err := ParseReference(ref)
+// points at, the index digest for a multi-arch tag. Registry answers other
+// than 200 are reported as *statusError.
+func (r *Resolver) Resolve(ctx context.Context, ref string) (string, error) {
+	parsed, err := parseTagReference(ref)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 
-	digest, err = r.head(ctx, parsed)
-	if err != nil {
-		return "", "", err
+	digest, err := r.head(ctx, parsed)
+	if err != nil || digest != "" {
+		return digest, err
 	}
 
-	var body []byte
-
-	if digest == "" {
-		body, digest, err = r.tagManifest(ctx, parsed)
-		if err != nil {
-			return "", "", err
-		}
-	}
-
-	if r.skipRevision {
-		return digest, "", nil
-	}
-
-	return digest, r.revision(ctx, parsed, digest, body), nil
+	return r.tagManifest(ctx, parsed)
 }
 
 // head returns the tag's digest from a HEAD request, or "" when the registry
 // sends no digest header or does not serve HEAD.
-func (r *Resolver) head(ctx context.Context, ref Reference) (string, error) {
-	resp, err := r.do(ctx, ref, http.MethodHead, r.baseURL(ref)+"/manifests/"+ref.Tag, acceptManifests)
+func (r *Resolver) head(ctx context.Context, ref agent.Reference) (string, error) {
+	resp, err := r.do(ctx, ref, http.MethodHead, r.baseURL(ref)+"/manifests/"+ref.Tag)
 	if err != nil {
-		var status *StatusError
+		var status *statusError
 		if errors.As(err, &status) &&
 			(status.Code == http.StatusMethodNotAllowed || status.Code == http.StatusNotImplemented) {
 			return "", nil
@@ -345,54 +224,54 @@ func (r *Resolver) head(ctx context.Context, ref Reference) (string, error) {
 
 	digest := resp.Header.Get(headerContentDigest)
 	if digest != "" && !digestPattern.MatchString(digest) {
-		return "", fmt.Errorf("registry: %s sent an invalid %s header", ref.APIHost(), headerContentDigest)
+		return "", fmt.Errorf("registry: %s sent an invalid %s header", apiHost(ref), headerContentDigest)
 	}
 
 	return digest, nil
 }
 
-// tagManifest fetches the manifest of the tag with a GET. The digest is the
-// registry's digest header when it sends one and the hash of the body
-// otherwise.
-func (r *Resolver) tagManifest(ctx context.Context, ref Reference) (body []byte, digest string, err error) {
+// tagManifest fetches the manifest of the tag with a GET and returns its
+// digest: the registry's digest header when it sends one and the hash of the
+// body otherwise.
+func (r *Resolver) tagManifest(ctx context.Context, ref agent.Reference) (string, error) {
 	u := r.baseURL(ref) + "/manifests/" + ref.Tag
 
-	resp, err := r.do(ctx, ref, http.MethodGet, u, acceptManifests)
+	resp, err := r.do(ctx, ref, http.MethodGet, u)
 	if err != nil {
-		return nil, "", err
+		return "", err
 	}
 
 	defer closeBody(resp)
 
-	body, err = readCapped(resp.Body, maxManifestBytes)
+	body, err := readCapped(resp.Body, maxManifestBytes)
 	if err != nil {
-		return nil, "", fmt.Errorf("registry: read manifest of %s: %w", ref, err)
+		return "", fmt.Errorf("registry: read manifest of %s: %w", ref, err)
 	}
 
-	digest = resp.Header.Get(headerContentDigest)
+	digest := resp.Header.Get(headerContentDigest)
 
 	switch {
 	case digest == "":
 		digest = sha256Digest(body)
 	case !digestPattern.MatchString(digest):
-		return nil, "", fmt.Errorf("registry: %s sent an invalid %s header", ref.APIHost(), headerContentDigest)
+		return "", fmt.Errorf("registry: %s sent an invalid %s header", apiHost(ref), headerContentDigest)
 	}
 
-	return body, digest, nil
+	return digest, nil
 }
 
 // baseURL is the repository's /v2/ URL.
-func (r *Resolver) baseURL(ref Reference) string {
+func (r *Resolver) baseURL(ref agent.Reference) string {
 	scheme := schemeHTTPS
 	if r.isPlainHTTP(ref) {
 		scheme = schemeHTTP
 	}
 
-	return scheme + "://" + ref.APIHost() + "/v2/" + ref.Path
+	return scheme + "://" + apiHost(ref) + "/v2/" + ref.Path
 }
 
 // isPlainHTTP reports whether the registry of ref is configured as plain http.
-func (r *Resolver) isPlainHTTP(ref Reference) bool {
+func (r *Resolver) isPlainHTTP(ref agent.Reference) bool {
 	_, ok := r.plainHTTP[ref.Host]
 
 	return ok
@@ -401,12 +280,12 @@ func (r *Resolver) isPlainHTTP(ref Reference) bool {
 // do performs a request against a repository and returns its 200 response.
 // On 401 it drops the cached token, follows the Bearer challenge and retries
 // once; that covers both the first contact and an expired token. Every other
-// outcome is an error, a *StatusError when the registry answered.
-func (r *Resolver) do(ctx context.Context, ref Reference, method, u, accept string) (*http.Response, error) {
-	key := ref.APIHost() + "/" + ref.Path
+// outcome is an error, a *statusError when the registry answered.
+func (r *Resolver) do(ctx context.Context, ref agent.Reference, method, u string) (*http.Response, error) {
+	key := apiHost(ref) + "/" + ref.Path
 	bearer := r.cachedToken(key)
 
-	resp, err := r.send(ctx, ref, method, u, accept, bearer)
+	resp, err := r.send(ctx, ref, method, u, bearer)
 	if err != nil {
 		return nil, err
 	}
@@ -418,7 +297,7 @@ func (r *Resolver) do(ctx context.Context, ref Reference, method, u, accept stri
 		r.dropToken(key, bearer)
 
 		if challenge == nil {
-			return nil, &StatusError{Method: method, URL: u, Code: http.StatusUnauthorized}
+			return nil, &statusError{Method: method, URL: u, Code: http.StatusUnauthorized}
 		}
 
 		fresh, err := r.fetchToken(ctx, ref, challenge)
@@ -428,7 +307,7 @@ func (r *Resolver) do(ctx context.Context, ref Reference, method, u, accept stri
 
 		r.storeToken(key, fresh)
 
-		resp, err = r.send(ctx, ref, method, u, accept, fresh.value)
+		resp, err = r.send(ctx, ref, method, u, fresh.value)
 		if err != nil {
 			return nil, err
 		}
@@ -441,7 +320,7 @@ func (r *Resolver) do(ctx context.Context, ref Reference, method, u, accept stri
 	if resp.StatusCode != http.StatusOK {
 		closeBody(resp)
 
-		return nil, &StatusError{Method: method, URL: u, Code: resp.StatusCode}
+		return nil, &statusError{Method: method, URL: u, Code: resp.StatusCode}
 	}
 
 	return resp, nil
@@ -450,7 +329,7 @@ func (r *Resolver) do(ctx context.Context, ref Reference, method, u, accept stri
 // send performs one request, with the bearer token when there is one and the
 // registry's basic credentials otherwise.
 func (r *Resolver) send(
-	ctx context.Context, ref Reference, method, u, accept, bearer string,
+	ctx context.Context, ref agent.Reference, method, u, bearer string,
 ) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, u, http.NoBody)
 	if err != nil {
@@ -459,14 +338,12 @@ func (r *Resolver) send(
 
 	req.Header.Set("User-Agent", userAgent)
 
-	if accept != "" {
-		req.Header.Set("Accept", accept)
-	}
+	req.Header.Set("Accept", acceptManifests)
 
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
-	} else if creds, ok := r.creds[ref.Host]; ok {
-		req.Header.Set("Authorization", creds.basic())
+	} else if login, ok := r.logins[ref.Host]; ok {
+		req.Header.Set("Authorization", login.basic())
 	}
 
 	resp, err := r.client.Do(req)
@@ -503,35 +380,4 @@ func sha256Digest(data []byte) string {
 	sum := sha256.Sum256(data)
 
 	return "sha256:" + hex.EncodeToString(sum[:])
-}
-
-// platform is an os/arch[/variant] selector.
-type platform struct {
-	os, arch, variant string
-}
-
-// parsePlatform reads "os/arch" or "os/arch/variant"; empty means
-// linux/<GOARCH>.
-func parsePlatform(s string) (platform, error) {
-	if s == "" {
-		return platform{os: "linux", arch: runtime.GOARCH}, nil
-	}
-
-	parts := strings.Split(s, "/")
-	if len(parts) < 2 || len(parts) > 3 {
-		return platform{}, fmt.Errorf("registry: platform %q: want os/arch or os/arch/variant", s)
-	}
-
-	for _, part := range parts {
-		if part == "" {
-			return platform{}, fmt.Errorf("registry: platform %q: want os/arch or os/arch/variant", s)
-		}
-	}
-
-	p := platform{os: parts[0], arch: parts[1]}
-	if len(parts) == 3 {
-		p.variant = parts[2]
-	}
-
-	return p, nil
 }

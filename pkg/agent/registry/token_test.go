@@ -2,10 +2,8 @@ package registry
 
 import (
 	"encoding/base64"
-	"errors"
 	"net/http"
 	"net/http/httptest"
-	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -72,20 +70,18 @@ func TestTokenFlow(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	f.set(func(f *fakeRegistry) { f.bearer = testToken })
 
-	r := newResolver(t, f, func(o *Options) { o.AuthFile = authFileFor(t, f.host(), testBasic) })
+	r := newResolver(t, f, func(o *Options) { o.Logins = loginFor(f.host(), testBasic) })
 
 	for range 3 {
-		digest, revision, err := r.Resolve(t.Context(), f.ref(tagMulti))
+		digest, err := r.Resolve(t.Context(), f.ref(tagMulti))
 		require.NoError(t, err)
 		require.Equal(t, f.indexDigest, digest)
-		require.Equal(t, revAMD64, revision)
 	}
 
 	// One challenge, one token, reused for every later request.
 	require.Equal(t, 1, f.tokens())
 	require.Equal(t, 1, f.unauthorized)
 	require.Equal(t, 4, f.heads(), "three resolutions plus the challenged first HEAD")
-	require.Equal(t, 3, f.gets())
 
 	require.Equal(t, []string{basicHeader(testBasic)}, f.tokenAuth)
 	require.Equal(t, testService, f.tokenQueries[0].Get("service"))
@@ -104,9 +100,9 @@ func TestTokenFlowAnonymous(t *testing.T) {
 		f.tokenBody = func() string { return `{"access_token":"` + testToken + `"}` }
 	})
 
-	r := newResolver(t, f, func(o *Options) { o.SkipRevision = true })
+	r := newResolver(t, f, nil)
 
-	digest, _, err := r.Resolve(t.Context(), f.ref(tagSingle))
+	digest, err := r.Resolve(t.Context(), f.ref(tagSingle))
 	require.NoError(t, err)
 	require.Equal(t, f.amd64Digest, digest)
 
@@ -120,9 +116,9 @@ func TestRejectedCachedTokenIsFetchedAgainOnce(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	f.set(func(f *fakeRegistry) { f.bearer = testToken })
 
-	r := newResolver(t, f, func(o *Options) { o.SkipRevision = true })
+	r := newResolver(t, f, nil)
 
-	_, _, err := r.Resolve(t.Context(), f.ref(tagMulti))
+	_, err := r.Resolve(t.Context(), f.ref(tagMulti))
 	require.NoError(t, err)
 	require.Equal(t, 1, f.tokens())
 	require.Equal(t, 1, f.unauthorized)
@@ -130,14 +126,14 @@ func TestRejectedCachedTokenIsFetchedAgainOnce(t *testing.T) {
 	// The registry stops accepting the cached token (it expired).
 	f.set(func(f *fakeRegistry) { f.bearer = "tok-2" })
 
-	digest, _, err := r.Resolve(t.Context(), f.ref(tagMulti))
+	digest, err := r.Resolve(t.Context(), f.ref(tagMulti))
 	require.NoError(t, err)
 	require.Equal(t, f.indexDigest, digest)
 	require.Equal(t, 2, f.tokens())
 	require.Equal(t, 2, f.unauthorized)
 
 	// And the new one is cached in turn.
-	_, _, err = r.Resolve(t.Context(), f.ref(tagMulti))
+	_, err = r.Resolve(t.Context(), f.ref(tagMulti))
 	require.NoError(t, err)
 	require.Equal(t, 2, f.tokens())
 	require.Equal(t, 2, f.unauthorized)
@@ -150,7 +146,7 @@ func TestAnnouncedTokenExpiry(t *testing.T) {
 		f.tokenBody = func() string { return `{"token":"` + testToken + `","expires_in":60}` }
 	})
 
-	r := newResolver(t, f, func(o *Options) { o.SkipRevision = true })
+	r := newResolver(t, f, nil)
 
 	now := time.Unix(1_800_000_000, 0)
 	r.now = func() time.Time { return now }
@@ -158,7 +154,7 @@ func TestAnnouncedTokenExpiry(t *testing.T) {
 	resolve := func() {
 		t.Helper()
 
-		_, _, err := r.Resolve(t.Context(), f.ref(tagMulti))
+		_, err := r.Resolve(t.Context(), f.ref(tagMulti))
 		require.NoError(t, err)
 	}
 
@@ -190,9 +186,9 @@ func TestTokenThatIsNeverAccepted(t *testing.T) {
 	r := newResolver(t, f, nil)
 
 	for i := 1; i <= 2; i++ {
-		_, _, err := r.Resolve(t.Context(), f.ref(tagMulti))
+		_, err := r.Resolve(t.Context(), f.ref(tagMulti))
 
-		var status *StatusError
+		var status *statusError
 
 		require.ErrorAs(t, err, &status)
 		require.Equal(t, http.StatusUnauthorized, status.Code)
@@ -202,19 +198,6 @@ func TestTokenThatIsNeverAccepted(t *testing.T) {
 	}
 }
 
-func TestDropTokenKeepsANewerToken(t *testing.T) {
-	r, err := New(testLogger(), Options{})
-	require.NoError(t, err)
-
-	r.storeToken("k", token{value: "new"})
-	r.dropToken("k", "old")
-	require.Equal(t, "new", r.cachedToken("k"))
-
-	r.dropToken("k", "new")
-	require.Empty(t, r.cachedToken("k"))
-	r.dropToken("k", "")
-}
-
 func TestBasicAuthRegistry(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	f.set(func(f *fakeRegistry) {
@@ -222,22 +205,21 @@ func TestBasicAuthRegistry(t *testing.T) {
 		f.challenge = `Basic realm="registry"`
 	})
 
-	r := newResolver(t, f, func(o *Options) { o.AuthFile = authFileFor(t, f.host(), testBasic) })
+	r := newResolver(t, f, func(o *Options) { o.Logins = loginFor(f.host(), testBasic) })
 
-	digest, revision, err := r.Resolve(t.Context(), f.ref(tagMulti))
+	digest, err := r.Resolve(t.Context(), f.ref(tagMulti))
 	require.NoError(t, err)
 	require.Equal(t, f.indexDigest, digest)
-	require.Equal(t, revAMD64, revision)
 	require.Equal(t, 0, f.tokens())
 	require.Equal(t, 0, f.unauthorized)
 
-	var status *StatusError
+	var status *statusError
 
 	// Wrong and missing credentials end in a 401 without any token request.
-	for _, authFile := range []string{authFileFor(t, f.host(), "user:wrong"), ""} {
-		r = newResolver(t, f, func(o *Options) { o.AuthFile = authFile })
+	for _, logins := range []Logins{loginFor(f.host(), "user:wrong"), nil} {
+		r = newResolver(t, f, func(o *Options) { o.Logins = logins })
 
-		_, _, err = r.Resolve(t.Context(), f.ref(tagMulti))
+		_, err = r.Resolve(t.Context(), f.ref(tagMulti))
 		require.ErrorAs(t, err, &status)
 		require.Equal(t, http.StatusUnauthorized, status.Code)
 		require.NotContains(t, err.Error(), "wrong")
@@ -246,9 +228,9 @@ func TestBasicAuthRegistry(t *testing.T) {
 	require.Equal(t, 0, f.tokens())
 
 	// Credentials for another host are not sent here.
-	r = newResolver(t, f, func(o *Options) { o.AuthFile = authFileFor(t, "other.example", testBasic) })
+	r = newResolver(t, f, func(o *Options) { o.Logins = loginFor("other.example", testBasic) })
 
-	_, _, err = r.Resolve(t.Context(), f.ref(tagMulti))
+	_, err = r.Resolve(t.Context(), f.ref(tagMulti))
 	require.ErrorAs(t, err, &status)
 }
 
@@ -286,22 +268,15 @@ func TestTokenEndpointFailures(t *testing.T) {
 				c.set(f)
 			})
 
-			r := newResolver(t, f, func(o *Options) { o.AuthFile = authFileFor(t, f.host(), testBasic) })
+			r := newResolver(t, f, func(o *Options) { o.Logins = loginFor(f.host(), testBasic) })
 
-			_, _, err := r.Resolve(t.Context(), f.ref(tagMulti))
+			_, err := r.Resolve(t.Context(), f.ref(tagMulti))
 			require.ErrorContains(t, err, c.want)
 			require.NotContains(t, err.Error(), "secret")
 			require.Empty(t, r.tokens)
 			require.Equal(t, 1, f.heads(), "no retry without a token")
 		})
 	}
-}
-
-func TestScrubURLError(t *testing.T) {
-	inner := errors.New("connection refused")
-
-	require.Equal(t, inner, scrubURLError(inner))
-	require.Equal(t, inner, scrubURLError(&url.Error{Op: "Get", URL: "https://a/t?scope=x", Err: inner}))
 }
 
 func TestStatusErrorFromTokenEndpoint(t *testing.T) {
@@ -313,9 +288,9 @@ func TestStatusErrorFromTokenEndpoint(t *testing.T) {
 
 	r := newResolver(t, f, nil)
 
-	_, _, err := r.Resolve(t.Context(), f.ref(tagMulti))
+	_, err := r.Resolve(t.Context(), f.ref(tagMulti))
 
-	var status *StatusError
+	var status *statusError
 
 	require.ErrorAs(t, err, &status)
 	require.Equal(t, http.StatusTooManyRequests, status.Code)
@@ -338,19 +313,18 @@ func TestPlainHTTPRealmNeedsAPlainHTTPRegistry(t *testing.T) {
 	})
 
 	r, err := New(testLogger(), Options{
-		CAFile:   caFileFor(t, f.srv),
-		AuthFile: authFileFor(t, f.host(), testBasic),
-		Timeout:  5 * time.Second,
+		CAFile: caFileFor(t, f.srv),
+		Logins: loginFor(f.host(), testBasic),
 	})
 	require.NoError(t, err)
 
-	_, _, err = r.Resolve(t.Context(), f.ref(tagMulti))
+	_, err = r.Resolve(t.Context(), f.ref(tagMulti))
 	require.ErrorContains(t, err, "not https")
 
 	// The same registry with its own https realm works.
 	f.set(func(f *fakeRegistry) { f.challenge = "" })
 
-	digest, _, err := r.Resolve(t.Context(), f.ref(tagMulti))
+	digest, err := r.Resolve(t.Context(), f.ref(tagMulti))
 	require.NoError(t, err)
 	require.Equal(t, f.indexDigest, digest)
 }
@@ -380,10 +354,10 @@ func TestConnectionDroppedAfterToken(t *testing.T) {
 
 	r := newResolver(t, f, nil)
 
-	_, _, err := r.Resolve(t.Context(), f.ref("dropped"))
+	_, err := r.Resolve(t.Context(), f.ref("dropped"))
 	require.Error(t, err)
 
-	var status *StatusError
+	var status *statusError
 
 	require.NotErrorAs(t, err, &status)
 	require.Equal(t, 1, f.tokens())

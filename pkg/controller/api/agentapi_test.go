@@ -3,12 +3,13 @@ package api
 import (
 	"bytes"
 	"context"
+	"crypto/mldsa"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -26,9 +27,8 @@ func validatorAgent(t *testing.T) *testAgent {
 	t.Helper()
 
 	return newAgent(t, identity.CertificateSpec{
-		Hostname:   "lighthouse-geth-1",
-		Validators: &identity.ValidatorRange{Start: 0, End: 100},
-		Roles:      []string{"ethereum_node"},
+		Hostname: "lighthouse-geth-1",
+		Roles:    []string{"ethereum_node"},
 	})
 }
 
@@ -40,7 +40,6 @@ func validatorAgentGeneration(t *testing.T, generation uint64) *testAgent {
 	return newAgent(t, identity.CertificateSpec{
 		Hostname:   "lighthouse-geth-1",
 		Generation: generation,
-		Validators: &identity.ValidatorRange{Start: 0, End: 100},
 		Roles:      []string{"ethereum_node"},
 	})
 }
@@ -67,12 +66,15 @@ func TestSyncPlainAndGzip(t *testing.T) {
 			h := newHarness(t, nil)
 			agent := validatorAgent(t)
 
-			rec := h.agentPost(agent, protocol.PathSync, syncRequest(), agentCallOpts{Gzip: gz})
+			rec := h.agentPost(agent, protocol.PathSync, validatorSyncRequest(),
+				agentCallOpts{Gzip: gz})
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 			resp := decodeJSON[protocol.SyncResponse](t, rec)
 			assert.True(t, resp.ServerTime.Equal(testEpoch))
 			assert.False(t, resp.WantInventory, "no inventory on either side")
+			assert.InDelta(t, idleMinInterval.Milliseconds(), resp.NextSyncMillis,
+				float64(idleMinInterval.Milliseconds())*pacingJitter, "an idle host of a small fleet")
 			assert.Nil(t, resp.Lease)
 			assert.Empty(t, resp.Directives)
 			assert.Nil(t, resp.Queue)
@@ -484,48 +486,6 @@ func TestAgentRequestErrors(t *testing.T) {
 	}
 }
 
-func TestAgentMethodCheck(t *testing.T) {
-	h := newHarness(t, nil)
-
-	for _, path := range []string{protocol.PathSync, protocol.PathInventory} {
-		for _, method := range []string{http.MethodGet, http.MethodPut, http.MethodDelete} {
-			rec := h.serve(httptest.NewRequest(method, testBaseURL+path, http.NoBody))
-
-			// The agent protocol's error shape, with the controller time.
-			requireAgentError(t, rec, http.StatusMethodNotAllowed, "method not allowed")
-			assert.Equal(t, "POST", rec.Header().Get("Allow"), path)
-		}
-	}
-
-	metricsText := h.get("/metrics").Body.String()
-	assert.Contains(t, metricsText,
-		`upgradoor_agent_requests_total{code="405",endpoint="sync"} 3`)
-	assert.Contains(t, metricsText,
-		`upgradoor_agent_requests_total{code="405",endpoint="inventory"} 3`)
-}
-
-func TestAgentUnknownPath(t *testing.T) {
-	h := newHarness(t, nil)
-
-	for _, target := range []string{
-		"/api/agent/v1/nope", "/api/agent/v2/sync", "/api/agent/", "/api/agent/v1/sync/x",
-	} {
-		for _, method := range []string{http.MethodGet, http.MethodPost} {
-			rec := h.serve(httptest.NewRequest(method, testBaseURL+target, http.NoBody))
-			requireAgentError(t, rec, http.StatusNotFound, "not found")
-		}
-	}
-
-	// One label value for all of them: the path is client-supplied.
-	assert.Contains(t, h.get("/metrics").Body.String(),
-		`upgradoor_agent_requests_total{code="404",endpoint="unknown"} 8`)
-
-	// Other unknown API paths keep the plain error body.
-	rec := h.get("/api/v1/nope")
-	require.Equal(t, http.StatusNotFound, rec.Code)
-	assert.NotContains(t, rec.Body.String(), "serverTime")
-}
-
 // unreadBody fails the test when the handler reads the request body.
 type unreadBody struct {
 	t *testing.T
@@ -873,7 +833,6 @@ func TestSyncAuditsIdentity(t *testing.T) {
 	rotated := newAgent(t, identity.CertificateSpec{
 		Hostname:   "lighthouse-geth-1",
 		Generation: 1,
-		Validators: &identity.ValidatorRange{Start: 0, End: 100},
 		Roles:      []string{"ethereum_node"},
 	})
 
@@ -979,13 +938,12 @@ func TestGenerationFloorIsNotAPin(t *testing.T) {
 
 	first := h.store.host("lighthouse-geth-1").CertHash
 
-	// The same generation, another certificate (the host was reinstalled with
-	// another validator range): accepted, audited as changed.
+	// The same generation, another certificate (the host got another role):
+	// accepted, audited as changed.
 	reissued := newAgent(t, identity.CertificateSpec{
 		Hostname:   "lighthouse-geth-1",
 		Generation: 1,
-		Validators: &identity.ValidatorRange{Start: 100, End: 250},
-		Roles:      []string{"ethereum_node"},
+		Roles:      []string{"ethereum_node", "mev_relay"},
 	})
 
 	require.Equal(t, http.StatusOK,
@@ -994,7 +952,7 @@ func TestGenerationFloorIsNotAPin(t *testing.T) {
 	host := h.store.host("lighthouse-geth-1")
 	assert.NotEqual(t, first, host.CertHash)
 	assert.Equal(t, uint64(1), host.Generation)
-	assert.Equal(t, uint64(150), host.Weight())
+	assert.Equal(t, []string{"ethereum_node", "mev_relay"}, host.Roles)
 
 	// A jump over a generation is accepted too, and raises the floor.
 	require.Equal(t, http.StatusOK,
@@ -1114,31 +1072,16 @@ func TestSyncAdoptsControllerHoldOfANewHost(t *testing.T) {
 	assert.False(t, h.store.host("prysm-besu-1").HoldWanted)
 }
 
-// A failed audit write does not fail the sync, and the entries are not lost:
-// they are written with the next sync, of any host.
-func TestSyncKeepsAuditEntriesAfterFailure(t *testing.T) {
+// A failed audit write does not fail the sync. The entries are logged and
+// dropped: nothing is retried with a later sync.
+func TestSyncSurvivesAFailedAuditWrite(t *testing.T) {
 	h := newHarness(t, nil)
-	agent := validatorAgent(t)
 
 	h.store.mu.Lock()
 	h.store.auditErr = errors.New("disk full")
 	h.store.mu.Unlock()
 
-	rec := h.agentPost(agent, protocol.PathSync, syncRequest(), agentCallOpts{})
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	require.Empty(t, h.store.auditEntries())
-
-	// The key rotates while the store still fails.
-	rotated := newAgent(t, identity.CertificateSpec{
-		Hostname:   "lighthouse-geth-1",
-		Generation: 1,
-		Validators: &identity.ValidatorRange{Start: 0, End: 100},
-		Roles:      []string{"ethereum_node"},
-	})
-
-	h.clock.Advance(time.Minute)
-
-	rec = h.agentPost(rotated, protocol.PathSync, syncRequest(), agentCallOpts{})
+	rec := h.agentPost(validatorAgent(t), protocol.PathSync, syncRequest(), agentCallOpts{})
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Empty(t, h.store.auditEntries())
 
@@ -1146,60 +1089,14 @@ func TestSyncKeepsAuditEntriesAfterFailure(t *testing.T) {
 	h.store.auditErr = nil
 	h.store.mu.Unlock()
 
-	h.clock.Advance(time.Minute)
-
-	// The next sync has nothing to audit itself and comes from another host.
 	other := newAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1"})
 
 	rec = h.agentPost(other, protocol.PathSync, syncRequest(), agentCallOpts{})
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 	audit := h.store.auditEntries()
-	require.Len(t, audit, 3)
-
-	assert.Equal(t, "host.registered", audit[0].Action)
-	assert.Equal(t, "lighthouse-geth-1", audit[0].Target)
-	assert.True(t, audit[0].Time.Equal(testEpoch), "the time of the event, not of the write")
-
-	assert.Equal(t, "host.certificate-changed", audit[1].Action)
-	assert.Equal(t, "lighthouse-geth-1", audit[1].Target)
-	assert.True(t, audit[1].Time.Equal(testEpoch.Add(time.Minute)))
-	assert.Equal(t,
-		map[string]any{"certHash": identity.CertificateHash(agent.creds.Certificate())},
-		audit[1].Detail["before"])
-
-	assert.Equal(t, "host.registered", audit[2].Action)
-	assert.Equal(t, "prysm-besu-1", audit[2].Target)
-
-	// Written once.
-	rec = h.agentPost(other, protocol.PathSync, syncRequest(), agentCallOpts{})
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Len(t, h.store.auditEntries(), 3)
-}
-
-func TestAuditBacklogIsBounded(t *testing.T) {
-	h := newHarness(t, nil)
-
-	h.store.mu.Lock()
-	h.store.auditErr = errors.New("disk full")
-	h.store.mu.Unlock()
-
-	for i := range maxAuditBacklog + 10 {
-		h.srv.auditIdentity(t.Context(), []fleet.AuditEntry{{
-			Action: "host.registered", Target: "host-" + strconv.Itoa(i),
-		}})
-	}
-
-	h.store.mu.Lock()
-	h.store.auditErr = nil
-	h.store.mu.Unlock()
-
-	h.srv.auditIdentity(t.Context(), nil)
-
-	audit := h.store.auditEntries()
-	require.Len(t, audit, maxAuditBacklog)
-	assert.Equal(t, "host-10", audit[0].Target, "the oldest entries were dropped")
-	assert.Equal(t, "host-"+strconv.Itoa(maxAuditBacklog+9), audit[len(audit)-1].Target)
+	require.Len(t, audit, 1)
+	assert.Equal(t, "prysm-besu-1", audit[0].Target)
 }
 
 // The agent may be gone by the time the sync is stored; the audit entry of a
@@ -1214,7 +1111,6 @@ func TestSyncAuditsIdentityAfterClientWentAway(t *testing.T) {
 	rotated := newAgent(t, identity.CertificateSpec{
 		Hostname:   "lighthouse-geth-1",
 		Generation: 1,
-		Validators: &identity.ValidatorRange{Start: 0, End: 100},
 		Roles:      []string{"ethereum_node"},
 	})
 
@@ -1377,4 +1273,273 @@ func TestAgentConcurrencyLimit(t *testing.T) {
 
 	rec = h.agentPost(agent, protocol.PathInventory, inventoryFor(t), agentCallOpts{})
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+}
+
+// signedCall serves one agent request and returns the answer with the id of
+// the request's proof.
+func signedCall(
+	t *testing.T, h *harness, a *testAgent, path string, v any,
+) (rec *httptest.ResponseRecorder, proofID string) {
+	t.Helper()
+
+	body, err := json.Marshal(v)
+	require.NoError(t, err)
+
+	req := h.agentRequest(a, path, body, agentCallOpts{Gzip: true})
+
+	parts := strings.Split(req.Header.Get(identity.HeaderProof), ".")
+	require.Len(t, parts, 3)
+
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	require.NoError(t, err)
+
+	var claims identity.ProofClaims
+	require.NoError(t, json.Unmarshal(raw, &claims))
+
+	return h.serve(req), claims.ID
+}
+
+func TestAgentAnswersAreSigned(t *testing.T) {
+	key, err := identity.DeriveControllerKey([]byte("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"), testNetwork, 0)
+	require.NoError(t, err)
+
+	signer, err := identity.NewAnswerSigner(key, testNetwork)
+	require.NoError(t, err)
+
+	verifierFor := func(t *testing.T, host string) *identity.AnswerVerifier {
+		t.Helper()
+
+		v, verr := identity.NewAnswerVerifier(
+			[]*mldsa.PublicKey{identity.PublicKey(key)}, testNetwork, host)
+		require.NoError(t, verr)
+
+		return v
+	}
+
+	h := newHarness(t, func(o *Options) { o.AnswerSigner = signer })
+	agent := validatorAgent(t)
+	answers := verifierFor(t, agent.name)
+
+	t.Run("sync and inventory answers verify for the host and the request", func(t *testing.T) {
+		inv := inventoryFor(t, protocol.Package{Name: "openssl", Version: "3.5.1-1", Arch: "amd64"})
+
+		req := syncRequest()
+		req.InventoryHash = inv.Hash
+
+		rec, id := signedCall(t, h, agent, protocol.PathSync, req)
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+		body, err := answers.Verify(id, rec.Body.Bytes())
+		require.NoError(t, err)
+
+		var resp protocol.SyncResponse
+		require.NoError(t, json.Unmarshal(body, &resp))
+		assert.True(t, resp.ServerTime.Equal(testEpoch))
+		assert.True(t, resp.WantInventory)
+
+		// Bound to the host and to the request.
+		_, err = verifierFor(t, "prysm-besu-1").Verify(id, rec.Body.Bytes())
+		require.ErrorIs(t, err, identity.ErrBadAnswer)
+
+		invRec, invID := signedCall(t, h, agent, protocol.PathInventory, inv)
+		require.Equal(t, http.StatusOK, invRec.Code, invRec.Body.String())
+
+		_, err = answers.Verify(invID, rec.Body.Bytes())
+		require.ErrorIs(t, err, identity.ErrBadAnswer, "the sync answer answers no other request")
+
+		body, err = answers.Verify(invID, invRec.Body.Bytes())
+		require.NoError(t, err)
+
+		var invResp protocol.InventoryResponse
+		require.NoError(t, json.Unmarshal(body, &invResp))
+		assert.Equal(t, inv.Hash, invResp.Hash)
+	})
+
+	t.Run("errors are not signed", func(t *testing.T) {
+		req := syncRequest()
+		req.ProtocolVersion = protocol.Version + 1
+
+		rec, id := signedCall(t, h, agent, protocol.PathSync, req)
+		requireAgentError(t, rec, http.StatusBadRequest, "protocol version")
+
+		_, err := answers.Verify(id, rec.Body.Bytes())
+		require.ErrorIs(t, err, identity.ErrBadAnswer)
+	})
+}
+
+// The validators counted for a host follow what the host reports, sync by
+// sync, and nothing in its certificate.
+func TestSyncCountsTheReportedValidators(t *testing.T) {
+	h := newHarness(t, nil)
+	agent := validatorAgent(t)
+
+	sync := func(t *testing.T, a *testAgent, v *protocol.Validators) *fleet.Host {
+		t.Helper()
+
+		req := syncRequest()
+		req.Validators = v
+
+		rec := h.agentPost(a, protocol.PathSync, req, agentCallOpts{})
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+		// Past the limit on audit entries about one host's range.
+		h.clock.Advance(2 * validatorAuditInterval)
+
+		return h.store.host(a.name)
+	}
+
+	actions := func() []string {
+		out := make([]string, 0, 4)
+		for _, e := range h.store.auditEntries() {
+			out = append(out, e.Action)
+		}
+
+		return out
+	}
+
+	host := sync(t, agent, knownValidators(0, 100))
+	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 100}, host.Validators)
+	assert.Equal(t, []string{"host.registered"}, actions())
+	assert.Equal(t, uint64(100), h.store.auditEntries()[0].Detail["validators"])
+
+	// The range changes while the controller runs: keys were moved.
+	host = sync(t, agent, knownValidators(50, 250))
+	assert.Equal(t, uint64(200), host.Weight())
+	assert.Equal(t, []string{"host.registered", "host.validators-changed"}, actions())
+
+	changed := h.store.auditEntries()[1]
+	assert.Equal(t, map[string]any{"start": uint64(0), "end": uint64(100)}, changed.Detail["before"])
+	assert.Equal(t, map[string]any{"start": uint64(50), "end": uint64(250)}, changed.Detail["counted"])
+
+	// The same range again changes nothing and audits nothing.
+	sync(t, agent, knownValidators(50, 250))
+	assert.Len(t, actions(), 2)
+
+	// A host that does not know its range (its keys are being reshuffled, or
+	// the marker is damaged) keeps what was counted: it is not "none".
+	for _, unknown := range []*protocol.Validators{
+		{Source: protocol.ValidatorsFromMarker, State: protocol.ValidatorsMissing},
+		{Source: protocol.ValidatorsFromMarker, State: protocol.ValidatorsInvalid, Error: "garbage"},
+	} {
+		host = sync(t, agent, unknown)
+		assert.Equal(t, &identity.ValidatorRange{Start: 50, End: 250}, host.Validators)
+		assert.Equal(t, unknown.State, host.Status.Validators.State)
+	}
+
+	// A range out of bounds is not counted: it is stored as refused, and the
+	// host counts as one that does not know its range.
+	for _, bad := range []*protocol.Validators{
+		knownValidators(300, 200),
+		knownValidators(0, protocol.MaxHostValidators+1),
+		knownValidators(protocol.MaxValidatorIndex, protocol.MaxValidatorIndex+10),
+		{Start: 0, End: 10, Source: protocol.ValidatorsFromMarker, State: "certain"},
+	} {
+		host = sync(t, agent, bad)
+		assert.Equal(t, &identity.ValidatorRange{Start: 50, End: 250}, host.Validators)
+		assert.Equal(t, protocol.ValidatorsInvalid, host.Status.Validators.State)
+		assert.Contains(t, host.Status.Validators.Error, "refused by the controller")
+		assert.Zero(t, host.Status.Validators.End, "a refused range is not shown as one")
+	}
+
+	assert.Len(t, actions(), 2, "nothing changed meanwhile")
+
+	// An empty range, and no range at all (also an agent built before the
+	// field), say that the host has no validators.
+	host = sync(t, agent, knownValidators(0, 0))
+	assert.Nil(t, host.Validators)
+
+	host = sync(t, agent, knownValidators(50, 250))
+	assert.Equal(t, uint64(200), host.Weight())
+
+	host = sync(t, agent, nil)
+	assert.Nil(t, host.Validators)
+	assert.Zero(t, host.Weight())
+}
+
+// Two hosts that report the same validators: no validator is counted twice,
+// the one who held it first keeps it, and the overlap is shown and audited
+// once for as long as it lasts.
+func TestOverlappingValidatorRangesAreCountedOnce(t *testing.T) {
+	h := newHarness(t, nil)
+	first := validatorAgent(t)
+	second := newAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1"})
+
+	sync := func(t *testing.T, a *testAgent, start, end uint64) {
+		t.Helper()
+
+		req := syncRequest()
+		req.Validators = knownValidators(start, end)
+
+		rec := h.agentPost(a, protocol.PathSync, req, agentCallOpts{})
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+		h.clock.Advance(2 * validatorAuditInterval)
+	}
+
+	overlapAudits := func() []fleet.AuditEntry {
+		out := make([]fleet.AuditEntry, 0, 2)
+
+		for _, e := range h.store.auditEntries() {
+			if e.Action == "host.validators-overlap" {
+				out = append(out, e)
+			}
+		}
+
+		return out
+	}
+
+	total := func() uint64 {
+		return h.store.host(first.name).Weight() + h.store.host(second.name).Weight()
+	}
+
+	sync(t, first, 0, 100)
+	sync(t, second, 50, 150)
+
+	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 100}, h.store.host(first.name).Validators)
+	assert.Equal(t, &identity.ValidatorRange{Start: 100, End: 150}, h.store.host(second.name).Validators,
+		"the validators 50 to 99 stay with the host that had them")
+	assert.Equal(t, uint64(150), total(), "150 validators exist, not 200")
+
+	// Said once, however long both keep reporting it.
+	for range 3 {
+		sync(t, first, 0, 100)
+		sync(t, second, 50, 150)
+	}
+
+	// It is audited for the host that reports validators counted for
+	// another one; the host that holds them loses nothing.
+	audits := overlapAudits()
+	require.Len(t, audits, 1)
+	assert.Equal(t, second.name, audits[0].Target)
+	assert.Equal(t, []string{first.name}, audits[0].Detail["with"])
+	assert.Equal(t, map[string]any{"start": uint64(100), "end": uint64(150)}, audits[0].Detail["counted"])
+	assert.Equal(t, uint64(150), total())
+
+	// Both host views show what is reported, what is counted and with whom
+	// the report overlaps.
+	detail := decodeJSON[HostDetail](t, h.get("/api/v1/hosts/"+second.name))
+	assert.Equal(t, uint64(50), detail.Validators)
+	assert.Equal(t, knownValidators(50, 150), detail.ValidatorReport)
+	assert.Equal(t, uint64(100), *detail.ValidatorStart)
+	assert.Equal(t, uint64(150), *detail.ValidatorEnd)
+	assert.Equal(t, []string{first.name}, detail.ValidatorOverlaps)
+
+	detail = decodeJSON[HostDetail](t, h.get("/api/v1/hosts/"+first.name))
+	assert.Equal(t, []string{second.name}, detail.ValidatorOverlaps)
+
+	// The first host gives the validators up (the reshuffle is through): the
+	// second one now counts all it reports, and the episode is over.
+	sync(t, first, 0, 50)
+	sync(t, second, 50, 150)
+
+	assert.Equal(t, uint64(50), h.store.host(first.name).Weight())
+	assert.Equal(t, uint64(100), h.store.host(second.name).Weight())
+	assert.Len(t, overlapAudits(), 1)
+	assert.Empty(t, decodeJSON[HostDetail](t, h.get("/api/v1/hosts/"+second.name)).ValidatorOverlaps)
+
+	// A host cannot take validators from another by reporting them: a range
+	// over everything counts only what nobody holds.
+	sync(t, second, 0, 1000)
+	assert.Equal(t, uint64(50), h.store.host(first.name).Weight())
+	assert.Equal(t, &identity.ValidatorRange{Start: 50, End: 1000}, h.store.host(second.name).Validators)
+	assert.Len(t, overlapAudits(), 2, "a new overlap is a new episode")
 }

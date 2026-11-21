@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"crypto/rsa"
 	"encoding/json"
 	"net/http"
@@ -178,6 +179,8 @@ func userRoutes() []userRoute {
 		{method: http.MethodGet, path: "/api/v1/settings"},
 		{method: http.MethodPut, path: "/api/v1/settings", body: string(settings)},
 		{method: http.MethodGet, path: "/api/v1/audit"},
+		{method: http.MethodGet, path: pathEvents},
+		{method: http.MethodGet, path: "/api/v1/slots"},
 		{method: http.MethodPost, path: "/api/v1/actions/roll", body: `{"all":true}`},
 		{method: http.MethodPost, path: "/api/v1/actions/reboot", body: `{"hosts":["a"]}`},
 		{method: http.MethodPost, path: "/api/v1/actions/hold", body: `{"hosts":["a"]}`},
@@ -202,6 +205,15 @@ func (r userRoute) request(authorization string) *http.Request {
 
 	if authorization != "" {
 		req.Header.Set("Authorization", authorization)
+	}
+
+	// An event stream is answered until the client goes away: this one does
+	// soon, and what was recorded until then is the answer.
+	if strings.HasPrefix(r.path, pathEvents) {
+		ctx, cancel := context.WithTimeout(req.Context(), 50*time.Millisecond)
+		context.AfterFunc(ctx, cancel)
+
+		req = req.WithContext(ctx)
 	}
 
 	return req

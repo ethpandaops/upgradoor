@@ -2,9 +2,9 @@ package scheduler
 
 import (
 	"cmp"
+	"maps"
 	"reflect"
 	"slices"
-	"strings"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
@@ -13,24 +13,9 @@ import (
 )
 
 const (
-	// actorScheduler is the audit actor of the scheduler's own decisions.
+	// actorScheduler is the audit actor of the scheduler's own decisions. A
+	// person can never carry the name: actorName rewrites it.
 	actorScheduler = "scheduler"
-	// reservedActorPrefix starts every name the scheduler writes into actor
-	// fields for itself. A person can never carry such a name: actorName
-	// rewrites it.
-	reservedActorPrefix = actorScheduler + ":"
-	// grantedByAdoption marks a lease created from an operation the agent
-	// reported for a lease the controller did not know. It is a reserved
-	// name, so no manual lease can carry it.
-	grantedByAdoption = reservedActorPrefix + "adopted"
-	// skippedPrefix starts the note on a member a person skipped. The skip
-	// holds for the rollout's key while the note stands.
-	skippedPrefix = "skipped:"
-	// skipLiftedPrefix starts the note on a member of a closed rollout whose
-	// skip no longer holds.
-	skipLiftedPrefix = "skip lifted: "
-	// reasonNeedGone is why the scheduler lifts a skip by itself.
-	reasonNeedGone = "the host stopped reporting the need"
 	// leaseStartGrace is how long after a lease's expiry a sync without an
 	// operation is not yet taken as proof that the agent did not start. The
 	// agent may start until its own deadline, which lies up to one response
@@ -39,20 +24,21 @@ const (
 	leaseStartGrace = time.Minute
 )
 
-// operatorSkipped reports whether a person skipped the member and the skip
-// still holds.
+// operatorSkipped reports whether a person skipped the member.
 func operatorSkipped(m *fleet.RolloutHost) bool {
-	return m.State == fleet.HostSkipped && strings.HasPrefix(m.Error, skippedPrefix)
+	return m.State == fleet.HostSkipped && m.SkippedBy != ""
 }
 
 // needKey is the key of the rollout an observed need belongs to; empty for
 // the need of a manual directive.
 func needKey(n *protocol.Need) string {
 	switch {
-	case n.DirectiveID != "":
+	case n.DirectiveID != "", isLocal(n):
 		return ""
 	case n.Kind == protocol.NeedImage && n.Image != nil:
 		return imageKey(n.Image.Image, n.Image.ToDigest)
+	case n.Kind == protocol.NeedSpec && n.Spec != nil:
+		return specKey(n.Spec.Container, n.Spec.Key)
 	case n.Kind == protocol.NeedPackages && n.Packages != nil:
 		return prefixPackages + protocol.PackagesKey(n.Packages.Packages)
 	case n.Kind == protocol.NeedReboot:
@@ -79,51 +65,29 @@ type World struct {
 	Liveness []fleet.Liveness
 	// Hosts are all known hosts with their last sync.
 	Hosts []*fleet.Host
-	// Rollouts are the non-terminal rollouts.
+	// Rollouts are the non-terminal rollouts. No decision reads a rollout
+	// that is closed.
 	Rollouts []*fleet.Rollout
-	// Closed are terminal rollouts, newest first. It must hold at least the
-	// latest closed rollout of every key that hosts still report. The latest
-	// one of a key decides whether the cause stays closed (aborted) and which
-	// hosts stay skipped for it. Nothing else is read off a closed rollout.
-	Closed []*fleet.Rollout
 	// Leases are the non-terminal leases.
 	Leases []*fleet.Lease
 	// Directives are the pending directives plus every directive that
 	// belongs to a non-terminal rollout.
 	Directives []*fleet.Directive
-	// ClosedLeases holds the terminal leases among the lease IDs that hosts
-	// report an operation for. An operation for a lease that is neither
-	// open nor listed here is adopted; one for an expired lease reopens it
-	// when the agent did start after all.
-	ClosedLeases map[string]*fleet.Lease
-	// Ended are terminal leases. It must hold at least, for every host and
-	// every group (an image reference, the packages), the two most recent
-	// leases that failed the host for the group or repaired it (verdictOf);
-	// the whole lease table is right too. Which hosts are broken is derived
-	// from it and from the leases that end in the reconcile. (Two, because the
-	// most recent one may be taken up again by its agent: what the one before
-	// it said then holds again.)
-	Ended []*fleet.Lease
-	// LastLeaseEnd is, per host, when its most recent terminal lease ended.
-	// A host without an entry never held a lease this database knows of.
-	LastLeaseEnd map[string]time.Time
 	// NewID returns a new unique ID.
 	NewID func() string
 }
 
 // Outcome is the result of one reconcile: the rows to write and the plan.
 type Outcome struct {
-	// Rollouts, Leases and Directives are the new and changed rows. Rollouts
-	// may include a closed rollout in which a skip was lifted.
+	// Rollouts, Leases and Directives are the new and changed rows.
 	Rollouts   []*fleet.Rollout
 	Leases     []*fleet.Lease
 	Directives []*fleet.Directive
-	// Holds are the controller holds the pass puts on hosts: the hold of a
-	// lease that a person ended, put back when the lease is taken up again
-	// (reopen). The scheduler never lifts a hold.
-	Holds []store.HostHold
-	Audit []fleet.AuditEntry
-	Plan  *Plan
+	// Broken are the broken marks of the hosts on which a lease failed or
+	// was released in this pass, as they are from now on.
+	Broken []store.HostBroken
+	Audit  []fleet.AuditEntry
+	Plan   *Plan
 }
 
 // Changes returns the outcome as one store transaction.
@@ -132,7 +96,7 @@ func (o *Outcome) Changes() *store.Changes {
 		Rollouts:   o.Rollouts,
 		Leases:     o.Leases,
 		Directives: o.Directives,
-		Holds:      o.Holds,
+		Broken:     o.Broken,
 		Audit:      o.Audit,
 	}
 }
@@ -145,7 +109,6 @@ func Reconcile(w *World) *Outcome {
 
 	p.syncDirectives()
 	p.advanceLeases()
-	p.adoptOperations()
 	p.syncRollouts()
 
 	plan := p.grant()
@@ -161,12 +124,18 @@ type hostView struct {
 	// stored liveness epoch; the full weight when there is no row.
 	live      uint64
 	liveKnown bool
-	held      bool
+	// held: a hold, or a known-offline mark (offline), keeps the host from
+	// every lease.
+	held    bool
+	offline bool
 	// stale: no sync for hostStaleAfter, measured from World.Since at the
 	// earliest.
 	stale bool
 	// lease is the host's non-terminal lease.
 	lease *fleet.Lease
+	// broken are the host's broken marks as the pass leaves them
+	// (fleet.Host.Broken); never changed in place.
+	broken map[string]string
 }
 
 func (hv *hostView) allows(verb protocol.Verb) bool {
@@ -190,6 +159,27 @@ func (hv *hostView) operation() *protocol.Operation {
 	return hv.h.Status.Operation
 }
 
+// working reports whether the host works on an operation that no open lease
+// of it covers: its agent reports an operation that is not over, and the host
+// holds no lease. That is a host whose lease this controller closed without
+// the agent's word (it was silent for leaseTtl and is back), or never knew
+// (the database was lost). It is down, or about to be, all the same: it
+// counts as leased for the budget, the host limit and the gate, and is
+// granted nothing until the operation is over. A terminal state of a lease is
+// terminal: the lease is not opened again. A stale host reports nothing; what
+// it said last is not counted.
+func (hv *hostView) working() bool {
+	op := hv.operation()
+
+	return hv.lease == nil && !hv.stale && op != nil && !op.Phase.Terminal()
+}
+
+// occupied reports whether the host takes a slot: it holds a lease or is
+// working without one.
+func (hv *hostView) occupied() bool {
+	return hv.lease != nil || hv.working()
+}
+
 // pass is the working state of one reconcile.
 type pass struct {
 	w   *World
@@ -210,6 +200,12 @@ type pass struct {
 
 	directives     []*fleet.Directive
 	origDirectives map[string]*fleet.Directive
+	// byHost indexes the directives by host, and members the members of each
+	// rollout by host: a pass looks both up per host, and a fleet has many.
+	byHost  map[string][]*fleet.Directive
+	members map[*fleet.Rollout]*memberIndex
+	// peers is minPeers, once it was asked for.
+	peers int
 
 	audit []fleet.AuditEntry
 
@@ -221,38 +217,19 @@ type pass struct {
 
 	// needs holds the reported needs per rollout ID and host.
 	needs map[string]map[string][]protocol.Need
-	// ledger says which hosts are broken for which group: the digest of
-	// World.Ended, plus the leases that ended in this pass.
-	ledger ledger
-	// closedLatest is the latest closed rollout per key; closedDirty are the
-	// copies of those in which a skip was lifted in this pass.
-	closedLatest map[string]*fleet.Rollout
-	closedDirty  []*fleet.Rollout
-	// hostKeys are the rollout keys of the observed needs each host reports.
-	hostKeys map[string]map[string]bool
+	// marked names the hosts whose broken marks this pass changed.
+	marked map[string]bool
 	// before is the budget before this pass grants anything; see
 	// budgetBefore.
 	before *budgetState
-	// ended names the hosts whose lease ended in this pass.
-	ended map[string]bool
-	// holds are the controller holds this pass puts on hosts (holdEnded).
-	holds []store.HostHold
 	// first maps a rollout to the lease whose release in this pass was its
 	// first success (pauseAfterCanary).
 	first map[string]*fleet.Lease
 	// refs are the hosts that a host under a readiness check is compared with,
-	// as the pass found them (references).
-	refs []*hostView
-}
-
-// lastLeaseEnd is when the host's most recent lease ended, this pass
-// included; the zero time when it never held one.
-func (p *pass) lastLeaseEnd(host string) time.Time {
-	if p.ended[host] {
-		return p.now
-	}
-
-	return p.w.LastLeaseEnd[host]
+	// as the pass found them (references); medians their median peer count
+	// per client, -1 where too few of them probe it (fleetMedian).
+	refs    []*hostView
+	medians map[string]int
 }
 
 // budgetBefore is the budget as the leases and the liveness stand before
@@ -279,58 +256,36 @@ func newPass(w *World) *pass {
 		origLeases:     make(map[string]*fleet.Lease, len(w.Leases)),
 		directives:     make([]*fleet.Directive, 0, len(w.Directives)+2),
 		origDirectives: make(map[string]*fleet.Directive, len(w.Directives)),
+		byHost:         make(map[string][]*fleet.Directive, len(w.Directives)),
+		members:        make(map[*fleet.Rollout]*memberIndex, len(w.Rollouts)+2),
+		medians:        make(map[string]int, 2),
 		rows:           make(map[string]map[uint64]fleet.Liveness, len(w.Hosts)),
 		needs:          make(map[string]map[string][]protocol.Need, len(w.Rollouts)+2),
-		ledger:         make(ledger, len(w.Hosts)),
-		closedLatest:   make(map[string]*fleet.Rollout, len(w.Closed)),
-		hostKeys:       make(map[string]map[string]bool, len(w.Hosts)),
-		ended:          make(map[string]bool, 2),
+		marked:         make(map[string]bool, 2),
 		first:          make(map[string]*fleet.Lease, 1),
-	}
-
-	for _, r := range w.Closed {
-		if _, ok := p.closedLatest[r.Key]; !ok && r.State.Terminal() {
-			p.closedLatest[r.Key] = r
-		}
 	}
 
 	p.indexLiveness()
 
 	for _, h := range w.Hosts {
 		hv := &hostView{
-			h:      h,
-			weight: h.Weight(),
-			held:   h.Held(),
-			stale:  hostStale(h, w.Now, w.Since, w.Settings.HostStaleAfter.Std()),
+			h:       h,
+			weight:  h.Weight(),
+			broken:  h.Broken,
+			held:    h.Held() || h.KnownOffline(w.Now),
+			offline: h.KnownOffline(w.Now),
+			stale:   hostStale(h, w.Now, w.Since, w.Settings.HostStaleAfter.Std()),
 		}
 
-		if w.Health.LivenessUnsupported {
-			hv.live = probeLive(hv)
-		} else {
-			hv.live, hv.liveKnown = p.liveOf(h.Name, hv.weight)
-		}
+		hv.live, hv.liveKnown = p.liveOf(h.Name, hv.weight)
 
 		p.hosts[h.Name] = hv
 		p.names = append(p.names, h.Name)
-
-		keys := make(map[string]bool, len(hv.needs()))
-
-		for i := range hv.needs() {
-			if key := needKey(&hv.needs()[i]); key != "" {
-				keys[key] = true
-			}
-		}
-
-		p.hostKeys[h.Name] = keys
 	}
 
 	slices.Sort(p.names)
 
 	for _, r := range w.Rollouts {
-		if r.State.Terminal() {
-			continue
-		}
-
 		c := cloneRollout(r)
 		p.rollouts = append(p.rollouts, c)
 		p.rolloutByID[c.ID] = c
@@ -340,10 +295,6 @@ func newPass(w *World) *pass {
 	sortRollouts(p.rollouts)
 
 	for _, l := range w.Leases {
-		if l.State.Terminal() {
-			continue
-		}
-
 		c := cloneLease(l)
 		p.leases = append(p.leases, c)
 		p.origLeases[c.ID] = l
@@ -361,25 +312,45 @@ func newPass(w *World) *pass {
 
 	for _, d := range w.Directives {
 		c := *d
-		p.directives = append(p.directives, &c)
+		p.addDirective(&c)
 		p.origDirectives[c.ID] = d
 	}
 
-	// A host that was forgotten and returns under its name is a new host: what
-	// a lease said that ended before this database first saw the host (again)
-	// is not about it. Nor does an earlier end of a lease that is open again
-	// say anything.
-	for _, l := range w.Ended {
-		hv := p.hosts[l.Host]
-		if hv == nil || p.origLeases[l.ID] != nil ||
-			(l.EndedAt != nil && l.EndedAt.Before(hv.h.FirstSeen)) {
-			continue
+	return p
+}
+
+// addDirective takes a directive into the pass.
+func (p *pass) addDirective(d *fleet.Directive) {
+	p.directives = append(p.directives, d)
+	p.byHost[d.Host] = append(p.byHost[d.Host], d)
+}
+
+// memberIndex maps the hosts of a rollout to their place in its member list,
+// as long as the list has the length it was built for.
+type memberIndex struct {
+	size   int
+	byHost map[string]int
+}
+
+// member returns the member entry of a host in a rollout, or nil. It is
+// Rollout.Host without the scan of the member list.
+func (p *pass) member(r *fleet.Rollout, host string) *fleet.RolloutHost {
+	idx := p.members[r]
+	if idx == nil || idx.size != len(r.Hosts) {
+		idx = &memberIndex{size: len(r.Hosts), byHost: make(map[string]int, len(r.Hosts))}
+
+		for i := range r.Hosts {
+			idx.byHost[r.Hosts[i].Host] = i
 		}
 
-		p.ledger.note(l)
+		p.members[r] = idx
 	}
 
-	return p
+	if i, ok := idx.byHost[host]; ok {
+		return &r.Hosts[i]
+	}
+
+	return nil
 }
 
 func (p *pass) indexLiveness() {
@@ -414,22 +385,6 @@ func (p *pass) liveOf(host string, weight uint64) (live uint64, known bool) {
 	return min(row.Live, weight), true
 }
 
-// probeLivePeers is the number of peers a node needs to count as attesting
-// by its probes. One is enough to attest; the readiness check after an
-// operation asks for more (minPeers).
-const probeLivePeers = 1
-
-// probeLive is how many of the host's validators count as attesting when the
-// beacon node does not serve liveness: none when the host is stale or its
-// last sync's probes are configured and not synced, else all of them.
-func probeLive(hv *hostView) uint64 {
-	if hv.stale || (hv.h.Status != nil && !hv.h.Status.Node.Synced(probeLivePeers)) {
-		return 0
-	}
-
-	return hv.weight
-}
-
 // later returns the later of two times.
 func later(a, b time.Time) time.Time {
 	if b.After(a) {
@@ -440,9 +395,10 @@ func later(a, b time.Time) time.Time {
 }
 
 // hostStale reports whether the host's agent has been silent for longer than
-// staleAfter, as far as a scheduler that started at since can tell.
+// h.StaleAfter(staleAfter), as far as a scheduler that started at since can
+// tell.
 func hostStale(h *fleet.Host, now, since time.Time, staleAfter time.Duration) bool {
-	return now.Sub(later(h.LastSeen, since)) > staleAfter
+	return now.Sub(later(h.LastSeen, since)) > h.StaleAfter(staleAfter)
 }
 
 // sortRollouts orders rollouts oldest first.
@@ -471,6 +427,7 @@ func (p *pass) setMember(m *fleet.RolloutHost, state fleet.HostState) {
 
 	m.State = state
 	m.UpdatedAt = p.now
+	m.SkippedBy = ""
 
 	if state == fleet.HostDone || state == fleet.HostExpected {
 		m.Error = ""
@@ -479,7 +436,13 @@ func (p *pass) setMember(m *fleet.RolloutHost, state fleet.HostState) {
 
 // outcome collects what changed against the world.
 func (p *pass) outcome(plan *Plan) *Outcome {
-	out := &Outcome{Audit: p.audit, Holds: p.holds, Plan: plan}
+	out := &Outcome{Audit: p.audit, Plan: plan}
+
+	for _, name := range p.names {
+		if p.marked[name] && !maps.Equal(p.hosts[name].broken, p.hosts[name].h.Broken) {
+			out.Broken = append(out.Broken, store.HostBroken{Host: name, Marks: p.hosts[name].broken})
+		}
+	}
 
 	for _, r := range p.rollouts {
 		orig := p.origRollouts[r.ID]
@@ -487,11 +450,6 @@ func (p *pass) outcome(plan *Plan) *Outcome {
 			continue
 		}
 
-		r.UpdatedAt = p.now
-		out.Rollouts = append(out.Rollouts, r)
-	}
-
-	for _, r := range p.closedDirty {
 		r.UpdatedAt = p.now
 		out.Rollouts = append(out.Rollouts, r)
 	}

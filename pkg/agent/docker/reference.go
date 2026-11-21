@@ -1,71 +1,27 @@
 package docker
 
 import (
-	"fmt"
 	"slices"
-	"strings"
 
-	"github.com/distribution/reference"
+	"github.com/ethpandaops/upgradoor/pkg/agent"
 )
 
 const (
-	hubDomain          = "docker.io"
-	hubOfficialPrefix  = "library/"
 	labelImageRevision = "org.opencontainers.image.revision"
 	labelImageVersion  = "org.opencontainers.image.version"
 )
-
-// hubAliases are the registry hosts that all mean Docker Hub. The reference
-// parser already folds index.docker.io into docker.io; registry-1.docker.io
-// is the host the daemon really talks to and shows up in hand-written
-// references and credential files.
-var hubAliases = []string{"index.docker.io", "registry-1.docker.io", "registry.hub.docker.com"}
-
-// normalizeRegistry maps a registry host, or a credential file key such as
-// "https://index.docker.io/v1/", to the host name used for comparisons.
-func normalizeRegistry(host string) string {
-	host = strings.ToLower(strings.TrimSpace(host))
-	host = strings.TrimPrefix(host, "https://")
-	host = strings.TrimPrefix(host, "http://")
-	host, _, _ = strings.Cut(host, "/")
-
-	if slices.Contains(hubAliases, host) {
-		return hubDomain
-	}
-
-	return host
-}
 
 // repositoryOf returns the fully qualified repository an image reference
 // names, without tag and digest: "alpine", "alpine:3.21",
 // "docker.io/library/alpine@sha256:..." and "index.docker.io/library/alpine"
 // all give "docker.io/library/alpine".
 func repositoryOf(ref string) (string, error) {
-	named, err := reference.ParseNormalizedNamed(strings.TrimSpace(ref))
-	if err != nil {
-		return "", fmt.Errorf("parse image reference %q: %w", ref, err)
-	}
-
-	domain := normalizeRegistry(reference.Domain(named))
-	path := reference.Path(named)
-
-	if domain == hubDomain && !strings.Contains(path, "/") {
-		path = hubOfficialPrefix + path
-	}
-
-	return domain + "/" + path, nil
-}
-
-// registryOf returns the normalised registry host of an image reference.
-func registryOf(ref string) (string, error) {
-	repo, err := repositoryOf(ref)
+	parsed, err := agent.ParseReference(ref)
 	if err != nil {
 		return "", err
 	}
 
-	host, _, _ := strings.Cut(repo, "/")
-
-	return host, nil
+	return parsed.Repository(), nil
 }
 
 // repositoryDigests returns the digests ("sha256:...") of the entries of an
@@ -75,23 +31,13 @@ func repositoryDigests(repo string, repoDigests []string) []string {
 	var out []string
 
 	for _, entry := range repoDigests {
-		named, err := reference.ParseNormalizedNamed(entry)
-		if err != nil {
+		parsed, err := agent.ParseReference(entry)
+		if err != nil || parsed.Digest == "" || parsed.Repository() != repo {
 			continue
 		}
 
-		canonical, ok := named.(reference.Canonical)
-		if !ok {
-			continue
-		}
-
-		entryRepo, err := repositoryOf(named.Name())
-		if err != nil || entryRepo != repo {
-			continue
-		}
-
-		if dgst := canonical.Digest().String(); !slices.Contains(out, dgst) {
-			out = append(out, dgst)
+		if !slices.Contains(out, parsed.Digest) {
+			out = append(out, parsed.Digest)
 		}
 	}
 

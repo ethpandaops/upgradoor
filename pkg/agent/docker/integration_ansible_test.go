@@ -155,7 +155,7 @@ func (a *ansibleRun) play(t *testing.T) (changed int, output string) {
 	return changed, output
 }
 
-// TestIntegrationAnsibleSeesNoChange is the check of PLAN.md section 13: a
+// TestIntegrationAnsibleSeesNoChange checks the main claim of the package: a
 // container created by Ansible's docker_container and then rolled by
 // Recreate must still be what Ansible wants, or the next playbook run would
 // recreate it.
@@ -255,7 +255,7 @@ func TestIntegrationAnsibleSeesNoChange(t *testing.T) {
 			vars["c_image"] = ref
 
 			digest1 := env.publish(t, ref, variantOne)
-			pulled, err := r.Pull(ctx, ref)
+			pulled, _, err := r.Pull(ctx, ref)
 			require.NoError(t, err)
 			require.Equal(t, digest1, pulled)
 
@@ -275,7 +275,7 @@ func TestIntegrationAnsibleSeesNoChange(t *testing.T) {
 
 			// A new image is pushed under the same tag and rolled out.
 			digest2 := env.publish(t, ref, variantTwo)
-			pulled, err = r.Pull(ctx, ref)
+			pulled, _, err = r.Pull(ctx, ref)
 			require.NoError(t, err)
 			require.Equal(t, digest2, pulled)
 
@@ -301,7 +301,7 @@ func TestIntegrationAnsibleSeesNoChange(t *testing.T) {
 			// And once more after a second roll, back to the first image:
 			// a replacement of a replacement is no different.
 			env.publish(t, ref, variantOne)
-			pulled, err = r.Pull(ctx, ref)
+			pulled, _, err = r.Pull(ctx, ref)
 			require.NoError(t, err)
 			require.NoError(t, r.Recreate(ctx, name, pulled, 10*time.Second, true))
 

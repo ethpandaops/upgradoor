@@ -2,7 +2,8 @@
 //
 //   - an image rollout in progress (lighthouse): the canary and a host
 //     without validators are done, one host is verifying, the rest waits;
-//   - a halted image rollout (nethermind) with a failed host;
+//   - a halted image rollout (nethermind) with a failed host, which is
+//     broken for the image;
 //   - a reboot rollout that waits for approval (policy manual);
 //   - a stale host, a host on local hold and a host with a custom image.
 //
@@ -12,6 +13,7 @@
 import type {
   AuditEntry,
   Container,
+  ContainerOverride,
   ContainerKind,
   HostDetail,
   Lease,
@@ -49,7 +51,9 @@ export function hash(seed: string): number {
 const digest = (seed: string) => `sha256:${hex(`digest/${seed}`)}`;
 const revision = (seed: string) => hex(`revision/${seed}`, 40);
 
-export const VALIDATORS_PER_HOST = 128;
+const NETWORK = 'mock-devnet-0';
+
+const VALIDATORS_PER_HOST = 128;
 export const SECONDS_PER_SLOT = 12;
 export const SLOTS_PER_EPOCH = 32;
 export const EPOCH_MS = SECONDS_PER_SLOT * SLOTS_PER_EPOCH * 1000;
@@ -67,6 +71,7 @@ const EL: Record<string, ImageSpec> = {
   besu: { container: 'besu', image: 'hyperledger/besu:develop', kind: 'el' },
   reth: { container: 'reth', image: 'ghcr.io/paradigmxyz/reth:nightly', kind: 'el' },
   erigon: { container: 'erigon', image: 'erigontech/erigon:main', kind: 'el' },
+  ethrex: { container: 'ethrex', image: 'ghcr.io/lambdaclass/ethrex:main', kind: 'el' },
 };
 
 const CL: Record<string, ImageSpec> = {
@@ -82,9 +87,12 @@ const VC_IMAGE: Record<string, string> = {
   prysm: 'gcr.io/offchainlabs/prysm/validator:latest',
 };
 
+const CL_NAMES = Object.keys(CL);
+const EL_NAMES = Object.keys(EL);
+
 export const LIGHTHOUSE_IMAGE = (CL.lighthouse as ImageSpec).image;
-export const NETHERMIND_IMAGE = (EL.nethermind as ImageSpec).image;
-export const GRANDINE_IMAGE = (CL.grandine as ImageSpec).image;
+const NETHERMIND_IMAGE = (EL.nethermind as ImageSpec).image;
+const GRANDINE_IMAGE = (CL.grandine as ImageSpec).image;
 
 /** currentDigest is the digest a tag points at in the registry. */
 export const currentDigest = (image: string) => digest(`${image}/current`);
@@ -105,6 +113,10 @@ interface HostSpec {
   failedEL?: boolean;
   security?: boolean;
   oldDocker?: boolean;
+  /** overrides are entries of the host's overrides file, by container name; until is in seconds from now. */
+  overrides?: Record<string, Omit<ContainerOverride, 'until'> & { until?: number }>;
+  /** fixed: the agent configuration lets the controller override nothing on this host. */
+  fixed?: boolean;
 }
 
 function pair(cl: string, el: string, count: number): HostSpec[] {
@@ -155,11 +167,99 @@ function specs(): HostSpec[] {
   patch('teku-reth-1', { security: true });
   patch('prysm-erigon-1', { security: true });
 
+  // Overrides, as the hosts' overrides files state them: one that is applied
+  // and ends in a few hours, one whose entry is gone and that waits to be put
+  // back, and one the agent cannot apply as written.
+  patch('prysm-geth-1', {
+    overrides: {
+      prysm: {
+        addFlags: ['--verbosity=debug'],
+        by: 'alice@example.org',
+        reason: 'debugging attestation misses',
+        until: 4 * 3600 + 20 * 60,
+        applied: true,
+      },
+    },
+  });
+  patch('lodestar-reth-2', {
+    overrides: { reth: { removeFlags: ['--full'], by: 'bob@example.org', applied: true, restoring: true } },
+  });
+  patch('teku-besu-2', {
+    overrides: {
+      besu: {
+        image: 'ghcr.io/somebody/besu:pr-9321',
+        by: 'carol@example.org',
+        reason: 'try the fix for the trie log',
+        applied: false,
+        error: 'image ghcr.io/somebody/besu:pr-9321 is not allowed for this container (allowed: hyperledger/besu)',
+      },
+    },
+  });
+  patch('prysm-geth-2', { fixed: true });
+
   return all;
 }
 
 const KERNEL_OLD = '6.12.48+deb13-amd64';
 const KERNEL_NEW = '6.12.57+deb13-amd64';
+
+/**
+ * Libraries every host has, each in a few parts: enough packages for the
+ * Packages tab to need more than one page.
+ */
+const FILLER_LIBRARIES = [
+  'libacl1',
+  'libapt-pkg7.0',
+  'libattr1',
+  'libaudit1',
+  'libblkid1',
+  'libbz2-1.0',
+  'libcap2',
+  'libcom-err2',
+  'libcrypt1',
+  'libdb5.3',
+  'libdebconfclient0',
+  'libext2fs2',
+  'libffi8',
+  'libgcrypt20',
+  'libgmp10',
+  'libgnutls30',
+  'libgpg-error0',
+  'libhogweed6',
+  'libidn2-0',
+  'liblz4-1',
+  'liblzma5',
+  'libmd0',
+  'libmount1',
+  'libnettle8',
+  'libp11-kit0',
+  'libpam0g',
+  'libpcre2-8-0',
+  'libseccomp2',
+  'libselinux1',
+  'libsemanage2',
+  'libsepol2',
+  'libsmartcols1',
+  'libstdc++6',
+  'libsystemd0',
+  'libtasn1-6',
+  'libtinfo6',
+  'libudev1',
+  'libunistring5',
+  'libuuid1',
+  'libxxhash0',
+  'libzstd1',
+  'zlib1g',
+];
+
+const FILLER_PACKAGES: [string, string][] = FILLER_LIBRARIES.flatMap((name, i): [string, string][] => {
+  const version = `${1 + (i % 4)}.${i % 10}.${(i * 7) % 12}-${1 + (i % 3)}`;
+  return [
+    [name, version],
+    [`${name}-dbgsym`, version],
+    [`${name}-doc`, version],
+  ];
+});
 
 const BASE_PACKAGES: [string, string][] = [
   ['apt', '3.0.3'],
@@ -214,12 +314,17 @@ export interface MockData {
   settings: Settings;
   defaults: Settings;
   gateFailing: boolean;
+  /** quiet: every host attests, whatever its containers say. */
+  quiet: boolean;
+  /** offline are the times a host's validators do not attest without upgradoor having touched it, by host. */
+  offline: Map<string, [number, number][]>;
   seq: number;
 }
 
 export function defaultSettings(): Settings {
   return {
     maxUnavailablePercent: 10,
+    maxIndependentPercent: 10,
     minParticipationPercent: 90,
     maxFinalityLagEpochs: 3,
     readyEpochs: 1,
@@ -230,6 +335,7 @@ export function defaultSettings(): Settings {
     policyImage: 'auto',
     policyPackages: 'auto',
     policyReboot: 'manual',
+    policyClients: {},
     pauseAfterCanaryImage: false,
     pauseAfterCanaryPackages: false,
     pauseAfterCanaryReboot: false,
@@ -242,12 +348,15 @@ function container(
   host: string,
   spec: ImageSpec,
   at: (secondsAgo: number) => string,
-  o: { behind: boolean; name?: string; image?: string; kind?: ContainerKind }
+  o: { behind: boolean; name?: string; image?: string; kind?: ContainerKind; fixed?: boolean }
 ): Container {
   const image = o.image ?? spec.image;
   const cur = currentDigest(image);
   const running = o.behind ? previousDigest(image) : cur;
   const name = o.name ?? spec.container;
+  // A container's client is the client software it runs; a validator client
+  // carries the client of its consensus client.
+  const client = spec.kind === 'el' || spec.kind === 'cl' ? spec.container : undefined;
 
   return {
     name,
@@ -272,8 +381,45 @@ function container(
     },
     // A client's containers belong to the client's team (the validator
     // client to the consensus client's); the tooling belongs to nobody.
-    owners: spec.kind === 'el' || spec.kind === 'cl' ? [spec.container] : undefined,
+    owners: client ? [client] : undefined,
+    // What follows is in a host's details and in the rows of a client's host
+    // list; the rows of the host table do not carry it (MockController.summary).
+    client,
+    command: client ? baseCommand(o.kind ?? spec.kind, name) : undefined,
+    overridable: client && !o.fixed ? { images: [image.replace(/:[^:/]*$/, '')], flags: true } : undefined,
   };
+}
+
+/** baseCommand is the configured command line of a client container: what its kind usually takes. */
+function baseCommand(kind: string | undefined, name: string): string[] {
+  const common = [`--network=${NETWORK}`, '--datadir=/data'];
+  const metrics = `--metrics-port=${9000 + (hash(name) % 90)}`;
+  switch (kind) {
+    case 'el':
+      return [
+        ...common,
+        '--http',
+        '--http.addr=0.0.0.0',
+        '--http.api=eth,net,web3,debug,txpool',
+        '--authrpc.jwtsecret=/jwt/jwtsecret',
+        '--syncmode=snap',
+        '--metrics',
+        metrics,
+      ];
+    case 'cl':
+      return [
+        ...common,
+        '--execution-endpoint=http://execution:8551',
+        '--jwt-secret=/jwt/jwtsecret',
+        `--checkpoint-sync-url=https://checkpoint-sync.${NETWORK}.ethpandaops.io`,
+        '--http',
+        '--http-address=0.0.0.0',
+        '--metrics',
+        metrics,
+      ];
+    default:
+      return [...common, '--beacon-nodes=http://beacon:5052', '--graffiti=upgradoor', metrics];
+  }
 }
 
 function unmanaged(host: string, name: string, image: string, at: (s: number) => string): Container {
@@ -299,6 +445,18 @@ function imageNeed(c: Container): Need {
   };
 }
 
+/** specNeed moves a container that runs another image than agent.yaml names back onto it. */
+function specNeed(c: Container): Need {
+  const image = c.configuredImage ?? c.image;
+  const to = currentDigest(image);
+  const key = to.slice(7, 19);
+  return {
+    id: `spec/${c.name}/${key}`,
+    kind: 'spec',
+    spec: { container: c.name, key, image, fromImage: c.image, toDigest: to, toRevision: revision(to) },
+  };
+}
+
 function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s: number) => string): HostDetail {
   const behind = new Set(spec.behind ?? []);
   const containers: Container[] = [];
@@ -307,10 +465,9 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
   const cl = spec.cl ? CL[spec.cl] : undefined;
 
   if (el) {
-    const c = container(spec.name, el, at, { behind: behind.has(el.image) });
+    const c = container(spec.name, el, at, { behind: behind.has(el.image), fixed: spec.fixed });
     if (spec.customEL) {
       c.image = spec.customEL;
-      c.custom = true;
       c.digest = undefined;
       c.revision = undefined;
       c.registry = undefined;
@@ -327,7 +484,7 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
   }
 
   if (cl) {
-    containers.push(container(spec.name, cl, at, { behind: behind.has(cl.image) }));
+    containers.push(container(spec.name, cl, at, { behind: behind.has(cl.image), fixed: spec.fixed }));
     if (spec.validators) {
       const vcImage = VC_IMAGE[spec.cl as string] ?? cl.image;
       containers.push(
@@ -336,6 +493,7 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
           name: `${cl.container}-validator`,
           image: vcImage,
           kind: 'vc',
+          fixed: spec.fixed,
         })
       );
     }
@@ -352,25 +510,39 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
     );
   }
 
+  for (const c of containers) {
+    const override = spec.overrides?.[c.name];
+    if (override) {
+      c.override = {
+        ...override,
+        until: override.until === undefined ? undefined : at(-override.until),
+      };
+      // A container that runs its override has the added flags on its command line.
+      if (override.applied) c.command = [...(c.command ?? []), ...(override.addFlags ?? [])];
+    }
+  }
+
   containers.push(unmanaged(spec.name, 'node-exporter', 'prom/node-exporter:v1.9.1', at));
   if (index % 7 === 3) containers.push(unmanaged(spec.name, 'tcpdump-debug', 'nicolaka/netshoot:latest', at));
 
   const needs: Need[] = [];
   if (!spec.localHold) {
     for (const c of containers) {
-      if (c.managed && !c.custom && c.digest !== c.registry?.digest) needs.push(imageNeed(c));
+      if (c.managed && c.configuredImage && c.image !== c.configuredImage) needs.push(specNeed(c));
+      else if (c.managed && c.digest !== c.registry?.digest) needs.push(imageNeed(c));
     }
     if (spec.reboot) needs.push({ id: 'reboot', kind: 'reboot', reboot: { reasons: ['flag', 'kernel'] } });
   }
 
   const openssl = spec.security ? OPENSSL_OLD : (BASE_PACKAGES.find(p => p[0] === 'openssl') as [string, string])[1];
-  const packages: Package[] = BASE_PACKAGES.map(([name, version]) => {
+  const packages: Package[] = [...BASE_PACKAGES, ...FILLER_PACKAGES].map(([name, version]) => {
     let v = version;
     if (spec.security && (name === 'openssl' || name === 'libssl3t64')) v = OPENSSL_OLD;
     if (spec.security && name === 'libc6') v = LIBC_OLD;
     if (spec.oldDocker && (name === 'docker-ce' || name === 'docker-ce-cli')) v = DOCKER_OLD;
     return { name, version: v, arch: name === 'ca-certificates' || name === 'unattended-upgrades' ? 'all' : 'amd64' };
   });
+  packages.sort((a, b) => (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
 
   const upgradable: Upgradable[] = [];
   if (spec.security) {
@@ -485,6 +657,12 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
     generation: spec.name === 'prysm-geth-2' ? 1 : 0,
     firstSeen: at(19 * 86400 + (hash(`first/${spec.name}`) % 3600)),
     remoteAddr: `203.0.113.${10 + index}`,
+    // One host has lost its marker file: the controller keeps counting the range it last knew.
+    validatorReport: spec.validators
+      ? index === 5
+        ? { start: 0, end: 0, source: 'marker', state: 'missing' }
+        : { start: validatorStart, end: validatorStart + VALIDATORS_PER_HOST, source: 'marker', state: 'known' }
+      : undefined,
     validatorStart: spec.validators ? validatorStart : undefined,
     validatorEnd: spec.validators ? validatorStart + VALIDATORS_PER_HOST : undefined,
     inventory: {
@@ -505,7 +683,6 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
       packages,
       upgradable,
     },
-    liveness: [],
     leases: [],
     history: [],
   };
@@ -521,7 +698,10 @@ function member(
 }
 
 /** buildMockData creates the fixture, with every time relative to `now`. */
-export function buildMockData(now: number = Date.now()): MockData {
+/** The fleets of the mock: the fixture's two dozen hosts, the same with nothing going on, or three hundred in a rolling update. */
+export type MockFleet = 'small' | 'quiet' | 'large' | 'huge';
+
+export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'small'): MockData {
   const at = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
 
   const hosts = new Map<string, HostDetail>();
@@ -534,6 +714,10 @@ export function buildMockData(now: number = Date.now()): MockData {
     hosts.set(host.name, host);
     seenAgo.set(host.name, spec.stale ? 14 * 60 + 12 : hash(`seen/${spec.name}`) % 28);
   });
+
+  // One client kept broken on purpose: known offline, left out of the gate and the budget.
+  const offline = hosts.get('teku-reth-1');
+  if (offline) offline.offline = { reason: 'reth crash under investigation, keep as is', until: at(-3 * 86400) };
 
   const need = (host: string, prefix: string): string => {
     const n = hosts.get(host)?.needs?.find(x => x.id.startsWith(prefix));
@@ -592,6 +776,10 @@ export function buildMockData(now: number = Date.now()): MockData {
   const leaseRpc = `ls-${hex('lease/rpc-1', 16)}`;
   const leaseFailed = `ls-${hex('lease/nimbus-nethermind-1', 16)}`;
 
+  // The lease that failed on nimbus-nethermind-1 left its mark on the host.
+  const brokenHost = hosts.get('nimbus-nethermind-1');
+  if (brokenHost) brokenHost.broken = { [`image:${NETHERMIND_IMAGE}`]: leaseFailed };
+
   const withLease = (m: RolloutHost, leaseId: string, needId: string): RolloutHost => ({ ...m, leaseId, needId });
   const pending = (host: string, stage: RolloutHost['stage'], prefix: string, ago: number): RolloutHost => ({
     ...member(host, 'pending', stage, at(ago)),
@@ -605,6 +793,7 @@ export function buildMockData(now: number = Date.now()): MockData {
       key: `image:${LIGHTHOUSE_IMAGE}@${lhDigest}`,
       title: `${LIGHTHOUSE_IMAGE} → ${lhDigest.slice(7, 19)}`,
       image: LIGHTHOUSE_IMAGE,
+      client: 'lighthouse',
       digest: lhDigest,
       revision: revision(lhDigest),
       state: 'active',
@@ -632,6 +821,7 @@ export function buildMockData(now: number = Date.now()): MockData {
       key: `image:${NETHERMIND_IMAGE}@${nmDigest}`,
       title: `${NETHERMIND_IMAGE} → ${nmDigest.slice(7, 19)}`,
       image: NETHERMIND_IMAGE,
+      client: 'nethermind',
       digest: nmDigest,
       revision: revision(nmDigest),
       state: 'halted',
@@ -664,6 +854,7 @@ export function buildMockData(now: number = Date.now()): MockData {
       key: `image:${GRANDINE_IMAGE}@${grDigest}`,
       title: `${GRANDINE_IMAGE} → ${grDigest.slice(7, 19)}`,
       image: GRANDINE_IMAGE,
+      client: 'grandine',
       digest: grDigest,
       revision: revision(grDigest),
       state: 'active',
@@ -734,6 +925,7 @@ export function buildMockData(now: number = Date.now()): MockData {
       key: `image:${LIGHTHOUSE_IMAGE}@${previousDigest(LIGHTHOUSE_IMAGE)}x`,
       title: `${LIGHTHOUSE_IMAGE} → ${digest('lighthouse/older').slice(7, 19)}`,
       image: LIGHTHOUSE_IMAGE,
+      client: 'lighthouse',
       digest: digest('lighthouse/older'),
       state: 'superseded',
       reason: `the tag moved to ${previousDigest(LIGHTHOUSE_IMAGE).slice(7, 19)}`,
@@ -771,10 +963,11 @@ export function buildMockData(now: number = Date.now()): MockData {
       createdAt: at(5 * 86400),
       updatedAt: at(5 * 86400 - 240),
       endedAt: at(5 * 86400 - 240),
+      // Aborted before anybody was served: the members are as they were then.
       hosts: [
-        member('prysm-geth-1', 'skipped', 3, at(5 * 86400 - 240)),
-        member('prysm-geth-2', 'skipped', 3, at(5 * 86400 - 240)),
-        member('prysm-erigon-1', 'skipped', 3, at(5 * 86400 - 240)),
+        member('prysm-geth-1', 'pending', 3, at(5 * 86400 - 300)),
+        member('prysm-geth-2', 'pending', 3, at(5 * 86400 - 300)),
+        member('prysm-erigon-1', 'pending', 3, at(5 * 86400 - 300)),
       ],
     },
   ];
@@ -1025,18 +1218,120 @@ export function buildMockData(now: number = Date.now()): MockData {
   log(9 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-2', { lease: leaseVerifying, rollout: lighthouseRollout });
 
   return {
-    network: 'mock-devnet-0',
+    network: NETWORK,
     version: '0.3.2-mock',
     createdAt: now,
     genesis: now - 5656 * EPOCH_MS - 7 * SECONDS_PER_SLOT * 1000,
     hosts,
     seenAgo,
-    rollouts,
-    leases,
+    // A quiet fleet: nothing is rolling out and nobody is off.
+    rollouts: fleet === 'quiet' ? [] : rollouts,
+    leases: fleet === 'quiet' ? [] : leases,
+    quiet: fleet === 'quiet',
     audit,
-    settings: { ...defaults, pauseAfterCanaryImage: true, readyPeerShare: 0.25 },
+    // One client has an image policy of its own; no rollout of it is open.
+    settings: { ...defaults, pauseAfterCanaryImage: true, readyPeerShare: 0.25, policyClients: { besu: 'manual' } },
     defaults,
     gateFailing: false,
+    offline:
+      fleet === 'large' || fleet === 'huge'
+        ? largeFleet(
+            now,
+            hosts,
+            seenAgo,
+            leases,
+            validatorStart,
+            fleet === 'huge' ? HUGE_FLEET_HOSTS : LARGE_FLEET_HOSTS
+          )
+        : new Map<string, [number, number][]>(),
     seq: 1000,
   };
+}
+
+/** How many hosts the large fleet adds to the fixture's two dozen. */
+const LARGE_FLEET_HOSTS = 276;
+/** The huge fleet is the large one with more hosts after its waves: twelve hundred in all. */
+const HUGE_FLEET_HOSTS = 1176;
+
+/**
+ * largeFleet turns the fixture into a devnet of three hundred hosts in the
+ * middle of a rolling update: a new geth image went out in waves of thirty
+ * hosts over the last hours, two of the rolls failed, a wave is running. A
+ * few hosts have been offline all along and two were for a while, without
+ * upgradoor having touched them. It returns those times.
+ */
+function largeFleet(
+  now: number,
+  hosts: Map<string, HostDetail>,
+  seenAgo: Map<string, number>,
+  leases: Lease[],
+  validatorStart: number,
+  count: number
+): Map<string, [number, number][]> {
+  const at = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
+  const names: string[] = [];
+  const WAVE = 30;
+  const WAVES = 8;
+
+  for (let i = 0; i < count; i++) {
+    const name = `node-${String(i + 1).padStart(4, '0')}`;
+    // The hosts of the waves run lighthouse and geth; the ones after them are a mix of every client.
+    const mixed = i >= WAVE * WAVES;
+    const spec: HostSpec = {
+      name,
+      // Every consensus client paired with every execution client in turn.
+      cl: mixed ? CL_NAMES[i % CL_NAMES.length] : 'lighthouse',
+      el: mixed ? EL_NAMES[Math.floor(i / CL_NAMES.length) % EL_NAMES.length] : 'geth',
+      validators: true,
+      roles: ['ethereum_node'],
+    };
+    hosts.set(name, buildHost(spec, 100 + i, validatorStart + i * VALIDATORS_PER_HOST, at));
+    seenAgo.set(name, hash(`seen/${name}`) % 28);
+    names.push(name);
+  }
+
+  const rollout = `ro-${hex('rollout/large-geth', 16)}`;
+  const need: Need = {
+    id: 'image/geth/large',
+    kind: 'image',
+    image: { container: 'geth', image: 'ethpandaops/geth:master', fromDigest: 'sha256:0ld', toDigest: 'sha256:new' },
+  };
+  for (let wave = 0; wave < WAVES; wave++) {
+    // A wave every twenty minutes; the last one is running.
+    const granted = (WAVES - 1 - wave) * 20 * 60 + 4 * 60;
+    const running = wave === WAVES - 1;
+
+    for (let i = 0; i < WAVE; i++) {
+      const host = names[wave * WAVE + i];
+      if (!host) continue;
+      const took = 9 * 60 + (hash(`took/${host}`) % 300);
+      const failed = !running && hash(`fail/${host}`) % 60 === 0;
+      const id = `ls-${hex(`lease/${host}`, 16)}`;
+
+      leases.push({
+        id,
+        host,
+        state: running ? 'running' : failed ? 'failed' : 'released',
+        needs: [need],
+        rollouts: { [need.id]: rollout },
+        weight: VALIDATORS_PER_HOST,
+        charged: VALIDATORS_PER_HOST,
+        force: false,
+        grantedBy: 'scheduler',
+        grantedAt: at(granted),
+        expiresAt: at(granted - 30 * 60),
+        ...(running ? {} : { agentDoneAt: at(granted - took + 120), endedAt: at(granted - took) }),
+        ...(failed ? { error: 'container exited 137 after the roll' } : {}),
+      });
+    }
+  }
+
+  // Not rolled yet, and off: five for good, two for forty minutes.
+  const offline = new Map<string, [number, number][]>();
+  names.slice(-5).forEach(host => offline.set(host, [[now - 30 * 3600_000, now]]));
+  names
+    .slice(-7, -5)
+    .forEach((host, i) => offline.set(host, [[now - (95 - i * 12) * 60_000, now - (55 - i * 12) * 60_000]]));
+
+  return offline;
 }

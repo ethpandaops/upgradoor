@@ -15,12 +15,20 @@ const (
 	NeedImage    NeedKind = "image"
 	NeedPackages NeedKind = "packages"
 	NeedReboot   NeedKind = "reboot"
+	// NeedOverride brings a container in line with the host's overrides
+	// file: onto an override, or back off one.
+	NeedOverride NeedKind = "override"
+	// NeedSpec brings a container in line with what Ansible deployed it as
+	// (the image and command line in agent.yaml), overrides applied: the
+	// soft deploy. Hosts that move the same container to the same spec share
+	// one rollout.
+	NeedSpec NeedKind = "spec"
 )
 
 // Verb returns the verb that serves a need of this kind.
 func (k NeedKind) Verb() Verb {
 	switch k {
-	case NeedImage:
+	case NeedImage, NeedOverride, NeedSpec:
 		return VerbRoll
 	case NeedPackages:
 		return VerbPackages
@@ -42,8 +50,15 @@ type Need struct {
 	// DirectiveID is set for a need created by a manual roll or reboot
 	// directive.
 	DirectiveID string `json:"directiveId,omitempty"`
+	// Local is set for a need that was asked for on the host itself: every
+	// override need (the overrides file is the host's) and a roll requested
+	// with the local command line. The controller serves them in a rollout
+	// of the host's own, under the budget and the gate like any other.
+	Local bool `json:"local,omitempty"`
 
 	Image    *ImageNeed    `json:"image,omitempty"`
+	Override *OverrideNeed `json:"override,omitempty"`
+	Spec     *SpecNeed     `json:"spec,omitempty"`
 	Packages *PackagesNeed `json:"packages,omitempty"`
 	Reboot   *RebootNeed   `json:"reboot,omitempty"`
 }
@@ -59,6 +74,63 @@ type ImageNeed struct {
 	ToDigest   string `json:"toDigest"`
 	// ToRevision is the revision label of the target image, if known.
 	ToRevision string `json:"toRevision,omitempty"`
+}
+
+// OverrideNeed asks to recreate one managed container so that it runs what
+// the host's overrides file says: another image, a changed command line, or
+// the configured image and command again once the entry is gone. The need
+// names the target for people; the agent takes the image and the flags from
+// its own file when it serves the lease, never from the lease.
+type OverrideNeed struct {
+	Container string `json:"container"`
+	// Image is the reference the container is recreated from.
+	Image string `json:"image"`
+	// FromImage is the reference it runs now, when that is another one.
+	FromImage  string `json:"fromImage,omitempty"`
+	FromDigest string `json:"fromDigest,omitempty"`
+	ToDigest   string `json:"toDigest"`
+	ToRevision string `json:"toRevision,omitempty"`
+	// Flags is true when the command line changes.
+	Flags bool `json:"flags,omitempty"`
+	// Restore is true when the need takes an override away.
+	Restore bool `json:"restore,omitempty"`
+}
+
+// Container is the container the need is about; empty for packages and
+// reboots.
+func (n *Need) Container() string {
+	switch {
+	case n.Image != nil:
+		return n.Image.Container
+	case n.Override != nil:
+		return n.Override.Container
+	case n.Spec != nil:
+		return n.Spec.Container
+	default:
+		return ""
+	}
+}
+
+// SpecNeed asks to recreate one managed container with the image and the
+// command line its agent configuration names now, overrides applied: Ansible
+// changed them and left the restart to the agent. Like an override need it
+// names the target for people; the agent takes the image and the command
+// line from its own files when it serves the lease.
+type SpecNeed struct {
+	Container string `json:"container"`
+	// Key identifies the target across hosts: the image at its digest and
+	// the arguments the command line gains and loses. Hosts whose rendered
+	// command lines differ only in what stays the same share it.
+	Key string `json:"key"`
+	// Image is the reference the container is recreated from.
+	Image string `json:"image"`
+	// FromImage is the reference it runs now, when that is another one.
+	FromImage  string `json:"fromImage,omitempty"`
+	FromDigest string `json:"fromDigest,omitempty"`
+	ToDigest   string `json:"toDigest"`
+	ToRevision string `json:"toRevision,omitempty"`
+	// Flags is true when the command line changes.
+	Flags bool `json:"flags,omitempty"`
 }
 
 // PackagesNeed asks to upgrade blocked packages.
@@ -109,6 +181,23 @@ func PackagesKey(pkgs []PackageChange) string {
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 
 	return hex.EncodeToString(sum[:8])
+}
+
+// OverrideNeedID is the ID of an override need. target identifies what the
+// container is to run (image, digest and command line): the ID changes when
+// the overrides file asks for something else.
+func OverrideNeedID(container, target string) string {
+	return "override/" + container + "/" + target
+}
+
+// SpecNeedID is the ID of a spec need.
+func SpecNeedID(container, key string) string {
+	return "spec/" + container + "/" + key
+}
+
+// LocalNeedID is the ID of a roll requested on the host.
+func LocalNeedID(id string) string {
+	return "local/" + id
 }
 
 // RebootNeedID is the ID of the observed reboot need.

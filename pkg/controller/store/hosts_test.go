@@ -15,35 +15,6 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// storedNeeds reads the needs rows of a host: id -> first_seen.
-func storedNeeds(t *testing.T, s Store, host string) map[string]time.Time {
-	t.Helper()
-
-	rows, err := rawDB(t, s).Query(`SELECT id, kind, detail, first_seen FROM needs WHERE host = ?`, host)
-	require.NoError(t, err)
-
-	defer func() { require.NoError(t, rows.Close()) }()
-
-	needs := make(map[string]time.Time, 4)
-
-	for rows.Next() {
-		var (
-			id, kind, detail string
-			firstSeen        int64
-		)
-
-		require.NoError(t, rows.Scan(&id, &kind, &detail, &firstSeen))
-		assert.Equal(t, string(protocol.NeedImage), kind)
-		assert.Contains(t, detail, `"id":"`+id+`"`)
-
-		needs[id] = fromMillis(firstSeen)
-	}
-
-	require.NoError(t, rows.Err())
-
-	return needs
-}
-
 func TestRecordSync(t *testing.T) {
 	ctx := context.Background()
 
@@ -54,9 +25,9 @@ func TestRecordSync(t *testing.T) {
 			validators := &identity.ValidatorRange{Start: 100, End: 200}
 
 			res, err := s.RecordSync(ctx, &HostSync{
-				Cert:       testCert("node-1", validators, "bootnode", "rpc"),
+				Cert:       testCert("node-1", "bootnode", "rpc"),
 				RemoteAddr: "10.0.0.1:1234",
-				Request:    testRequest(imageNeed("a"), imageNeed("b")),
+				Request:    reporting(100, 200, imageNeed("a"), imageNeed("b")),
 				At:         at(0),
 			})
 			require.NoError(t, err)
@@ -72,22 +43,23 @@ func TestRecordSync(t *testing.T) {
 				FirstSeen:  at(0),
 				LastSeen:   at(0),
 				RemoteAddr: "10.0.0.1:1234",
-				Status:     testRequest(imageNeed("a"), imageNeed("b")),
+				Status:     reporting(100, 200, imageNeed("a"), imageNeed("b")),
 			}
+			assert.Len(t, res.Host.StatusHash, 32)
+			want.StatusHash = res.Host.StatusHash
 			assert.Equal(t, want, res.Host)
 			assert.Equal(t, uint64(100), res.Host.Weight())
-			assert.Contains(t, res.Host.Roles, fleet.RoleBootnode)
+			assert.Contains(t, res.Host.Roles, "bootnode")
 
 			got, err := s.GetHost(ctx, "node-1")
 			require.NoError(t, err)
 			assert.Equal(t, want, got)
-			assert.Equal(t, map[string]time.Time{"a": at(0), "b": at(0)}, storedNeeds(t, s, "node-1"))
 
 			// Same certificate again: first_seen kept, the rest follows the sync.
 			res, err = s.RecordSync(ctx, &HostSync{
-				Cert:       testCert("node-1", validators, "bootnode", "rpc"),
+				Cert:       testCert("node-1", "bootnode", "rpc"),
 				RemoteAddr: "10.0.0.2:999",
-				Request:    testRequest(imageNeed("b"), imageNeed("c"), imageNeed("c")),
+				Request:    reporting(100, 200, imageNeed("b"), imageNeed("c"), imageNeed("c")),
 				At:         at(60),
 			})
 			require.NoError(t, err)
@@ -97,11 +69,10 @@ func TestRecordSync(t *testing.T) {
 			assert.Equal(t, at(60), res.Host.LastSeen)
 			assert.Equal(t, "10.0.0.2:999", res.Host.RemoteAddr)
 			assert.Len(t, res.Host.Status.Needs, 3, "the status is stored verbatim")
-			assert.Equal(t, map[string]time.Time{"b": at(0), "c": at(60)}, storedNeeds(t, s, "node-1"),
-				"a persisting need keeps first_seen, a gone one is removed, a repeated ID is stored once")
 
-			// A re-issued certificate: new hash, generation, range and roles.
-			reissued := testCert("node-1", nil)
+			// A re-issued certificate: new hash, generation and roles. The
+			// sync reports no validators any more.
+			reissued := testCert("node-1")
 			reissued.Hash = "hash-2"
 			reissued.Generation = 2
 
@@ -115,15 +86,58 @@ func TestRecordSync(t *testing.T) {
 			assert.Equal(t, []string{}, res.Host.Roles)
 			assert.Empty(t, res.Host.RemoteAddr)
 			assert.Equal(t, at(0), res.Host.FirstSeen)
-			assert.Empty(t, storedNeeds(t, s, "node-1"), "no needs reported, none stored")
 
 			// And back to a range.
-			reissued.Validators = &identity.ValidatorRange{Start: 5, End: 6}
-
-			res, err = s.RecordSync(ctx, &HostSync{Cert: reissued, Request: testRequest(), At: at(180)})
+			res, err = s.RecordSync(ctx, &HostSync{Cert: reissued, Request: reporting(5, 6), At: at(180)})
 			require.NoError(t, err)
 			assert.Empty(t, res.PreviousCertHash)
 			assert.Equal(t, &identity.ValidatorRange{Start: 5, End: 6}, res.Host.Validators)
+		})
+	}
+}
+
+// A sync that restates the stored row writes only the time, the uptime and
+// the asked interval; any other difference goes the full way.
+func TestRecordSyncConfirms(t *testing.T) {
+	ctx := context.Background()
+
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			s := backend.open(t)
+
+			sync := func(sec int, req *protocol.SyncRequest) *SyncResult {
+				t.Helper()
+
+				req.SentAt = at(sec)
+				req.UptimeSeconds = int64(sec)
+
+				res, err := s.RecordSync(ctx, &HostSync{
+					Cert: testCert("node-1"), RemoteAddr: "10.0.0.1:1", Request: req,
+					At: at(sec), SyncInterval: time.Duration(sec+1) * time.Second,
+				})
+				require.NoError(t, err)
+
+				return res
+			}
+
+			res := sync(0, reporting(100, 200, imageNeed("a")))
+			assert.True(t, res.Changed)
+			assert.True(t, res.PreviousSeen.IsZero())
+
+			res = sync(30, reporting(100, 200, imageNeed("a")))
+			assert.False(t, res.Changed, "same status apart from its clock")
+			assert.Equal(t, at(0), res.PreviousSeen)
+			assert.Equal(t, at(30), res.Host.LastSeen)
+			assert.Equal(t, int64(30), res.Host.Status.UptimeSeconds)
+			assert.True(t, at(30).Equal(res.Host.Status.SentAt))
+			assert.Equal(t, 31*time.Second, res.Host.SyncInterval)
+
+			res = sync(60, reporting(100, 200, imageNeed("a"), imageNeed("b")))
+			assert.True(t, res.Changed, "a new need")
+
+			res = sync(90, reporting(100, 201, imageNeed("a"), imageNeed("b")))
+			assert.True(t, res.Changed, "another range")
+			assert.Equal(t, &identity.ValidatorRange{Start: 100, End: 201}, res.Host.Validators)
 		})
 	}
 }
@@ -139,7 +153,7 @@ func TestRecordSyncNeverLowersGeneration(t *testing.T) {
 			s := backend.open(t)
 
 			cert := func(generation uint64) *identity.Certificate {
-				c := testCert("node-1", nil)
+				c := testCert("node-1")
 				c.Generation = generation
 				c.Hash = fmt.Sprintf("hash-gen-%d", generation)
 
@@ -192,7 +206,7 @@ func TestRecordSyncAdoptsControllerHold(t *testing.T) {
 			s := backend.open(t)
 
 			res, err := s.RecordSync(ctx, &HostSync{
-				Cert: testCert("held", nil), Request: held(true, false), At: at(0),
+				Cert: testCert("held"), Request: held(true, false), At: at(0),
 			})
 			require.NoError(t, err)
 			assert.True(t, res.Created)
@@ -209,10 +223,10 @@ func TestRecordSyncAdoptsControllerHold(t *testing.T) {
 			// Only the first sight adopts: a person lifts the hold, the agent
 			// still reports it until it has the release, and the switch stays
 			// off.
-			require.NoError(t, s.SetHostHold(ctx, "held", false, ""))
+			require.NoError(t, setHold(ctx, s, "held", false, ""))
 
 			res, err = s.RecordSync(ctx, &HostSync{
-				Cert: testCert("held", nil), Request: held(true, false), At: at(10),
+				Cert: testCert("held"), Request: held(true, false), At: at(10),
 			})
 			require.NoError(t, err)
 			assert.False(t, res.Created)
@@ -222,7 +236,7 @@ func TestRecordSyncAdoptsControllerHold(t *testing.T) {
 
 			// A local hold file is not the controller's hold.
 			res, err = s.RecordSync(ctx, &HostSync{
-				Cert: testCert("local", nil), Request: held(false, true), At: at(0),
+				Cert: testCert("local"), Request: held(false, true), At: at(0),
 			})
 			require.NoError(t, err)
 			assert.True(t, res.Created)
@@ -231,7 +245,7 @@ func TestRecordSyncAdoptsControllerHold(t *testing.T) {
 			assert.Empty(t, res.Host.HoldReason)
 
 			// No request, no report of a hold.
-			res, err = s.RecordSync(ctx, &HostSync{Cert: testCert("bare", nil), At: at(0)})
+			res, err = s.RecordSync(ctx, &HostSync{Cert: testCert("bare"), At: at(0)})
 			require.NoError(t, err)
 			assert.False(t, res.HoldAdopted)
 			assert.False(t, res.Host.HoldWanted)
@@ -240,7 +254,7 @@ func TestRecordSyncAdoptsControllerHold(t *testing.T) {
 			require.NoError(t, s.DeleteHost(ctx, "held"))
 
 			res, err = s.RecordSync(ctx, &HostSync{
-				Cert: testCert("held", nil), Request: held(true, true), At: at(20),
+				Cert: testCert("held"), Request: held(true, true), At: at(20),
 			})
 			require.NoError(t, err)
 			assert.True(t, res.HoldAdopted)
@@ -253,7 +267,7 @@ func TestRecordSyncWithoutValidators(t *testing.T) {
 	ctx := context.Background()
 	s := newFileStore(t)
 
-	res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("bootnode-1", nil), Request: testRequest(), At: at(0)})
+	res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("bootnode-1"), Request: testRequest(), At: at(0)})
 	require.NoError(t, err)
 	assert.Nil(t, res.Host.Validators)
 	assert.Zero(t, res.Host.Weight())
@@ -272,8 +286,8 @@ func TestRecordSyncWithoutValidators(t *testing.T) {
 
 	// A range that starts at validator 0 is not confused with "none".
 	res, err = s.RecordSync(ctx, &HostSync{
-		Cert:    testCert("node-0", &identity.ValidatorRange{Start: 0, End: 1}),
-		Request: testRequest(),
+		Cert:    testCert("node-0"),
+		Request: reporting(0, 1),
 		At:      at(0),
 	})
 	require.NoError(t, err)
@@ -291,7 +305,7 @@ func TestRecordSyncEdgeCases(t *testing.T) {
 		}{
 			{"nil", nil},
 			{"no certificate", &HostSync{Request: testRequest()}},
-			{"no subject", &HostSync{Cert: testCert("", nil), Request: testRequest()}},
+			{"no subject", &HostSync{Cert: testCert(""), Request: testRequest()}},
 		}
 
 		for _, tt := range tests {
@@ -307,7 +321,7 @@ func TestRecordSyncEdgeCases(t *testing.T) {
 	t.Run("zero time means now", func(t *testing.T) {
 		before := time.Now().Add(-time.Second)
 
-		res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-now", nil), Request: testRequest()})
+		res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-now"), Request: testRequest()})
 		require.NoError(t, err)
 		assert.WithinRange(t, res.Host.LastSeen, before, time.Now().Add(time.Second))
 		assert.Equal(t, res.Host.FirstSeen, res.Host.LastSeen)
@@ -315,18 +329,17 @@ func TestRecordSyncEdgeCases(t *testing.T) {
 
 	t.Run("nil request keeps status and needs", func(t *testing.T) {
 		_, err := s.RecordSync(ctx, &HostSync{
-			Cert: testCert("node-keep", nil), Request: testRequest(imageNeed("a")), At: at(0),
+			Cert: testCert("node-keep"), Request: testRequest(imageNeed("a")), At: at(0),
 		})
 		require.NoError(t, err)
 
-		res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-keep", nil), At: at(30)})
+		res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-keep"), At: at(30)})
 		require.NoError(t, err)
 		assert.Equal(t, at(30), res.Host.LastSeen)
 		assert.Equal(t, testRequest(imageNeed("a")), res.Host.Status)
-		assert.Equal(t, map[string]time.Time{"a": at(0)}, storedNeeds(t, s, "node-keep"))
 
 		// A host first seen without a request has no status.
-		res, err = s.RecordSync(ctx, &HostSync{Cert: testCert("node-bare", nil), At: at(0)})
+		res, err = s.RecordSync(ctx, &HostSync{Cert: testCert("node-bare"), At: at(0)})
 		require.NoError(t, err)
 		assert.True(t, res.Created)
 		assert.Nil(t, res.Host.Status)
@@ -348,7 +361,7 @@ func TestRecordSyncEdgeCases(t *testing.T) {
 			})
 		}
 
-		res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-big", nil), Request: req, At: at(0)})
+		res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-big"), Request: req, At: at(0)})
 		require.NoError(t, err)
 		assert.Equal(t, req, res.Host.Status)
 
@@ -362,6 +375,28 @@ func TestRecordSyncEdgeCases(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, req, got.Status)
 	})
+}
+
+func TestStatusCache(t *testing.T) {
+	var c statusCache
+
+	first, err := c.decode("node-1", `{"uptimeSeconds":1}`)
+	require.NoError(t, err)
+
+	again, err := c.decode("node-1", `{"uptimeSeconds":1}`)
+	require.NoError(t, err)
+	assert.Equal(t, first, again)
+	assert.NotSame(t, first, again, "every reader gets a struct of its own")
+
+	changed, err := c.decode("node-1", `{"uptimeSeconds":2}`)
+	require.NoError(t, err)
+	assert.Equal(t, int64(2), changed.UptimeSeconds)
+
+	_, err = c.decode("node-2", `{`)
+	require.Error(t, err)
+
+	c.forget("node-1")
+	assert.Empty(t, c.byHost)
 }
 
 func TestGetAndListHosts(t *testing.T) {
@@ -402,16 +437,16 @@ func TestGetAndListHosts(t *testing.T) {
 	}
 }
 
-func TestSetHostHold(t *testing.T) {
+func TestCommitHoldsSwitch(t *testing.T) {
 	ctx := context.Background()
 	s := newFileStore(t)
 
-	require.ErrorIs(t, s.SetHostHold(ctx, "nope", true, "x"), ErrNotFound)
+	require.ErrorIs(t, setHold(ctx, s, "nope", true, "x"), ErrNotFound)
 
 	addHost(t, s, "node-1", nil)
 	addHost(t, s, "node-2", nil)
 
-	require.NoError(t, s.SetHostHold(ctx, "node-1", true, "disk swap"))
+	require.NoError(t, setHold(ctx, s, "node-1", true, "disk swap"))
 
 	host, err := s.GetHost(ctx, "node-1")
 	require.NoError(t, err)
@@ -424,14 +459,14 @@ func TestSetHostHold(t *testing.T) {
 	assert.False(t, other.HoldWanted)
 
 	// A sync does not touch the switch.
-	_, err = s.RecordSync(ctx, &HostSync{Cert: testCert("node-1", nil), Request: testRequest(), At: at(10)})
+	_, err = s.RecordSync(ctx, &HostSync{Cert: testCert("node-1"), Request: testRequest(), At: at(10)})
 	require.NoError(t, err)
 
 	host, err = s.GetHost(ctx, "node-1")
 	require.NoError(t, err)
 	assert.True(t, host.HoldWanted)
 
-	require.NoError(t, s.SetHostHold(ctx, "node-1", false, ""))
+	require.NoError(t, setHold(ctx, s, "node-1", false, ""))
 
 	host, err = s.GetHost(ctx, "node-1")
 	require.NoError(t, err)
@@ -448,13 +483,16 @@ func TestDeleteHost(t *testing.T) {
 
 			require.ErrorIs(t, s.DeleteHost(ctx, "nope"), ErrNotFound)
 
-			for _, name := range []string{"node-1", "node-2"} {
+			for i, name := range []string{"node-1", "node-2"} {
 				_, err := s.RecordSync(ctx, &HostSync{
-					Cert: testCert(name, nil), Request: testRequest(imageNeed("a")), At: at(0),
+					Cert: testCert(name), Request: testRequest(imageNeed("a")), At: at(0),
 				})
 				require.NoError(t, err)
 				require.NoError(t, s.SaveInventory(ctx, name, testInventory(10)))
-				require.NoError(t, s.SaveLiveness(ctx, []fleet.Liveness{{Host: name, Epoch: 1, Live: 1, Total: 1}}))
+				require.NoError(t, s.SaveSlotParticipation(ctx, []fleet.SlotParticipation{{
+					Slot: uint64(i), Proposed: true, Assigned: 1, Included: 1,
+					Hosts: []fleet.HostSlotParticipation{{Host: name, Assigned: 1}},
+				}}))
 				require.NoError(t, s.Commit(ctx, &Changes{
 					Rollouts:   []*fleet.Rollout{testRollout("r-"+name, fleet.RolloutCompleted, 0, name)},
 					Leases:     []*fleet.Lease{testLease("l-"+name, name, fleet.LeaseReleased, 0)},
@@ -472,7 +510,7 @@ func TestDeleteHost(t *testing.T) {
 			require.ErrorIs(t, s.DeleteHost(ctx, "node-1"), ErrNotFound)
 
 			for _, table := range []string{
-				"hosts", "inventories", "packages", "upgradable", "needs", "validator_liveness",
+				"hosts", "inventories", "packages", "upgradable", "slot_participation_hosts",
 			} {
 				var mine, others int
 
@@ -507,11 +545,218 @@ func TestDeleteHost(t *testing.T) {
 			assert.Len(t, audit, 1)
 
 			// The host can register again, as new.
-			res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-1", nil), Request: testRequest(), At: at(500)})
+			res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-1"), Request: testRequest(), At: at(500)})
 			require.NoError(t, err)
 			assert.True(t, res.Created)
 			assert.Equal(t, at(500), res.Host.FirstSeen)
 			assert.Empty(t, res.Host.InventoryHash)
 		})
 	}
+}
+
+// The range counted for a host follows what the host reports: a range, none,
+// or "I do not know", which keeps what was counted.
+func TestRecordSyncCountsTheReportedValidators(t *testing.T) {
+	ctx := context.Background()
+	s := newFileStore(t)
+
+	sync := func(t *testing.T, host string, req *protocol.SyncRequest, sec int) *SyncResult {
+		t.Helper()
+
+		res, err := s.RecordSync(ctx, &HostSync{Cert: testCert(host), Request: req, At: at(sec)})
+		require.NoError(t, err)
+
+		return res
+	}
+
+	unknown := func(state string) *protocol.SyncRequest {
+		req := testRequest()
+		req.Validators = &protocol.Validators{Source: protocol.ValidatorsFromMarker, State: state}
+
+		return req
+	}
+
+	res := sync(t, "node-1", reporting(0, 64), 0)
+	assert.Nil(t, res.ValidatorsBefore)
+	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 64}, res.Host.Validators)
+
+	// The range changes between two syncs.
+	res = sync(t, "node-1", reporting(32, 128), 30)
+	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 64}, res.ValidatorsBefore)
+	assert.Equal(t, &identity.ValidatorRange{Start: 32, End: 128}, res.Host.Validators)
+
+	// The marker is gone (keys are being reshuffled) or unreadable: the host
+	// keeps its weight. So does an update without a request.
+	for i, req := range []*protocol.SyncRequest{
+		unknown(protocol.ValidatorsMissing), unknown(protocol.ValidatorsInvalid), nil,
+	} {
+		res = sync(t, "node-1", req, 60+i)
+		assert.Equal(t, &identity.ValidatorRange{Start: 32, End: 128}, res.Host.Validators)
+		assert.Equal(t, uint64(96), res.Host.Weight())
+	}
+
+	// A range the store would not count is not counted either: the bounds
+	// are checked here too, whatever the caller checked.
+	bad := reporting(10, 5)
+	res = sync(t, "node-1", bad, 70)
+	assert.Equal(t, uint64(96), res.Host.Weight())
+
+	// "0-0", and no range at all, are statements: no validators.
+	res = sync(t, "node-1", reporting(0, 0), 90)
+	assert.Nil(t, res.Host.Validators)
+	assert.Equal(t, &identity.ValidatorRange{Start: 32, End: 128}, res.ValidatorsBefore)
+
+	sync(t, "node-1", reporting(32, 128), 100)
+	res = sync(t, "node-1", testRequest(), 120)
+	assert.Nil(t, res.Host.Validators)
+
+	// A host that never had a range and does not know one has none.
+	res = sync(t, "node-new", unknown(protocol.ValidatorsMissing), 120)
+	assert.True(t, res.Created)
+	assert.Nil(t, res.Host.Validators)
+}
+
+// No validator is counted for two hosts, whatever they report.
+func TestRecordSyncCountsOverlappingValidatorsOnce(t *testing.T) {
+	ctx := context.Background()
+	s := newFileStore(t)
+
+	sync := func(t *testing.T, host string, start, end uint64, sec int) *SyncResult {
+		t.Helper()
+
+		res, err := s.RecordSync(ctx, &HostSync{
+			Cert: testCert(host), Request: reporting(start, end), At: at(sec),
+		})
+		require.NoError(t, err)
+
+		return res
+	}
+
+	// counted checks that the ranges of all hosts are disjoint and returns
+	// their sum, which is then the number of distinct validators.
+	counted := func(t *testing.T) uint64 {
+		t.Helper()
+
+		hosts, err := s.ListHosts(ctx)
+		require.NoError(t, err)
+
+		var total uint64
+
+		for i, a := range hosts {
+			total += a.Weight()
+
+			for _, b := range hosts[i+1:] {
+				if a.Validators != nil && b.Validators != nil {
+					assert.False(t, a.Validators.Start < b.Validators.End &&
+						b.Validators.Start < a.Validators.End,
+						"%s %v and %s %v overlap", a.Name, a.Validators, b.Name, b.Validators)
+				}
+			}
+		}
+
+		return total
+	}
+
+	sync(t, "node-a", 0, 64, 0)
+
+	// node-b reports half of node-a's validators too.
+	res := sync(t, "node-b", 32, 96, 1)
+	assert.Equal(t, []string{"node-a"}, res.ValidatorOverlaps)
+	assert.Equal(t, &identity.ValidatorRange{Start: 64, End: 96}, res.Host.Validators)
+	assert.Equal(t, uint64(96), counted(t), "96 validators exist, not 128")
+
+	// node-a holds its validators; its own report runs into nothing that is
+	// counted for another host.
+	res = sync(t, "node-a", 0, 64, 2)
+	assert.Empty(t, res.ValidatorOverlaps)
+	assert.Equal(t, uint64(64), res.Host.Weight())
+
+	// A range inside another host's counts for nothing; one around it
+	// counts its larger free part.
+	res = sync(t, "node-c", 10, 20, 3)
+	assert.Nil(t, res.Host.Validators)
+	assert.Equal(t, []string{"node-a"}, res.ValidatorOverlaps)
+
+	res = sync(t, "node-c", 90, 1000, 4)
+	assert.Equal(t, &identity.ValidatorRange{Start: 96, End: 1000}, res.Host.Validators)
+	assert.Equal(t, []string{"node-b"}, res.ValidatorOverlaps)
+
+	res = sync(t, "node-c", 0, 200, 5)
+	assert.Equal(t, &identity.ValidatorRange{Start: 96, End: 200}, res.Host.Validators)
+	assert.Equal(t, []string{"node-a", "node-b"}, res.ValidatorOverlaps)
+	assert.Equal(t, uint64(200), counted(t))
+
+	// The reshuffle ends: node-a reports its new, smaller range, and node-b
+	// counts all of its own at its next sync.
+	sync(t, "node-a", 0, 32, 6)
+	res = sync(t, "node-b", 32, 96, 7)
+	assert.Empty(t, res.ValidatorOverlaps)
+	assert.Equal(t, &identity.ValidatorRange{Start: 32, End: 96}, res.Host.Validators)
+	assert.Equal(t, uint64(200), counted(t))
+
+	// A host that has been silent for longer than ValidatorClaimTTL gives up
+	// the validators another host reports: a host that is gone for good does
+	// not keep those of its successor uncounted.
+	late := 7 + int(ValidatorClaimTTL/time.Second) + 1
+
+	res = sync(t, "node-d", 0, 32, late)
+	assert.Equal(t, []string{"node-a"}, res.ValidatorOverlaps)
+	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 32}, res.Host.Validators)
+
+	gone, err := s.GetHost(ctx, "node-a")
+	require.NoError(t, err)
+	assert.Nil(t, gone.Validators)
+	counted(t)
+
+	// Should it come back, it gets what is left, which is nothing.
+	res = sync(t, "node-a", 0, 32, late+1)
+	assert.Nil(t, res.Host.Validators)
+	assert.Equal(t, []string{"node-d"}, res.ValidatorOverlaps)
+}
+
+// setHold sets the controller-side hold switch of one host, as staff does.
+func setHold(ctx context.Context, s Store, name string, wanted bool, reason string) error {
+	return s.Commit(ctx, &Changes{Holds: []HostHold{{Host: name, Wanted: wanted, Reason: reason}}})
+}
+
+// The broken marks are the host's: a commit replaces them, a sync leaves them
+// and they go with the host. A host that does not exist has none.
+func TestCommitBrokenMarks(t *testing.T) {
+	ctx := context.Background()
+	s := newFileStore(t)
+
+	addHost(t, s, "node-1", nil)
+
+	marks := func() map[string]string {
+		host, err := s.GetHost(ctx, "node-1")
+		require.NoError(t, err)
+
+		return host.Broken
+	}
+
+	assert.Nil(t, marks())
+
+	set := map[string]string{"image:sigp/lighthouse:unstable": "lease-1", "packages": "lease-1"}
+	require.NoError(t, s.Commit(ctx, &Changes{Broken: []HostBroken{
+		{Host: "node-1", Marks: set},
+		{Host: "nope", Marks: set},
+	}}))
+	assert.Equal(t, set, marks())
+
+	_, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-1"), Request: testRequest(), At: at(10)})
+	require.NoError(t, err)
+	assert.Equal(t, set, marks())
+
+	hosts, err := s.ListHosts(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, set, hosts[0].Broken)
+
+	require.NoError(t, s.Commit(ctx, &Changes{Broken: []HostBroken{{Host: "node-1"}}}))
+	assert.Nil(t, marks())
+
+	// A forgotten host that registers again is a new host.
+	require.NoError(t, s.Commit(ctx, &Changes{Broken: []HostBroken{{Host: "node-1", Marks: set}}}))
+	require.NoError(t, s.DeleteHost(ctx, "node-1"))
+	addHost(t, s, "node-1", nil)
+	assert.Nil(t, marks())
 }

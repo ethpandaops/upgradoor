@@ -6,7 +6,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -27,7 +26,7 @@ const (
 	testSlotsPerEpoch = 8
 	testEpoch         = testSlot * testSlotsPerEpoch
 
-	livenessPrefix = "/eth/v1/validator/liveness/"
+	blockPrefix = "/eth/v2/beacon/blocks/"
 )
 
 var testGenesis = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -64,12 +63,6 @@ func (c *fakeClock) Advance(d time.Duration) {
 	c.now = c.now.Add(d)
 }
 
-// livenessCall is one liveness request a fake node received.
-type livenessCall struct {
-	epoch   uint64
-	indices []uint64
-}
-
 // fakeNode is a beacon node on httptest with controllable answers.
 type fakeNode struct {
 	srv *httptest.Server
@@ -86,19 +79,29 @@ type fakeNode struct {
 	// block, when set, holds every request until it is closed or the client
 	// gives up.
 	block chan struct{}
-	// livenessStatus, when non-zero, is the status of every liveness answer.
-	livenessStatus  int
-	livenessMessage string
-	// minEpoch is the oldest epoch liveness is served for (400 below it).
-	minEpoch uint64
-	// oldEpochStatus is the status for epochs below minEpoch (400 when zero).
-	oldEpochStatus int
-	// isLive decides per epoch and validator index.
-	isLive func(epoch, index uint64) bool
+
+	// headRoot is the root of the head ("0x01" when empty). blocks are the
+	// blocks served by root; the head is served without one, as a block of
+	// headSlot that carries nothing and has no parent. committees are the
+	// attestation committees per slot, by committee index. syncing is what
+	// the node says about itself.
+	headRoot   string
+	blocks     map[string]fakeBlock
+	committees map[uint64][][]uint64
+	syncing    bool
+	// committeesStatus, when set, answers a committees request of an epoch
+	// with that status.
+	committeesStatus map[uint64]int
 
 	requests map[string]int
 	total    int
-	liveness []livenessCall
+}
+
+// fakeBlock is a block a fake node serves by root.
+type fakeBlock struct {
+	slot         uint64
+	parent       string
+	attestations []map[string]any
 }
 
 func newFakeNode(t *testing.T) *fakeNode {
@@ -113,7 +116,6 @@ func newFakeNode(t *testing.T) *fakeNode {
 			"DEPOSIT_CONTRACT_ADDRESS": "0x00000000219ab540356cbb839cbe05303d7705fa",
 			"BLOB_SCHEDULE":            []any{map[string]string{"EPOCH": "1"}},
 		},
-		isLive:   func(uint64, uint64) bool { return true },
 		requests: make(map[string]int, 8),
 	}
 
@@ -145,26 +147,6 @@ func (n *fakeNode) totalRequests() int {
 	defer n.mu.Unlock()
 
 	return n.total
-}
-
-// livenessCalls returns a copy of the liveness requests received.
-func (n *fakeNode) livenessCalls() []livenessCall {
-	n.mu.Lock()
-	defer n.mu.Unlock()
-
-	return append([]livenessCall(nil), n.liveness...)
-}
-
-// livenessEpochs returns the epochs of the liveness requests, in order.
-func (n *fakeNode) livenessEpochs() []uint64 {
-	calls := n.livenessCalls()
-	epochs := make([]uint64, 0, len(calls))
-
-	for _, call := range calls {
-		epochs = append(epochs, call.epoch)
-	}
-
-	return epochs
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -207,12 +189,6 @@ func (n *fakeNode) handle(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if strings.HasPrefix(r.URL.Path, livenessPrefix) {
-		n.handleLiveness(w, r)
-
-		return
-	}
-
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 
@@ -234,7 +210,7 @@ func (n *fakeNode) handle(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{
 			"execution_optimistic": false,
 			"data": map[string]any{
-				"root":      "0x01",
+				"root":      n.head(),
 				"canonical": true,
 				"header": map[string]any{
 					"message":   map[string]string{"slot": strconv.FormatUint(n.headSlot, 10)},
@@ -249,67 +225,94 @@ func (n *fakeNode) handle(w http.ResponseWriter, r *http.Request) {
 			"current_justified":  epoch,
 			"finalized":          epoch,
 		}})
+	case "/eth/v1/node/syncing":
+		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"is_syncing": n.syncing}})
+	case "/eth/v1/beacon/states/head/committees":
+		n.handleCommittees(w, r)
 	default:
-		writeError(w, http.StatusNotFound, "not found")
-	}
-}
-
-func (n *fakeNode) handleLiveness(w http.ResponseWriter, r *http.Request) {
-	epoch, err := strconv.ParseUint(strings.TrimPrefix(r.URL.Path, livenessPrefix), 10, 64)
-	if err != nil || r.Method != http.MethodPost {
-		writeError(w, http.StatusBadRequest, "bad liveness request")
-
-		return
-	}
-
-	var raw []string
-	if err := json.NewDecoder(r.Body).Decode(&raw); err != nil {
-		writeError(w, http.StatusBadRequest, "body is not a list of indices")
-
-		return
-	}
-
-	indices := make([]uint64, 0, len(raw))
-
-	for _, text := range raw {
-		index, parseErr := strconv.ParseUint(text, 10, 64)
-		if parseErr != nil {
-			writeError(w, http.StatusBadRequest, "index is not a decimal string")
+		if root, ok := strings.CutPrefix(r.URL.Path, blockPrefix); ok {
+			n.handleBlock(w, root)
 
 			return
 		}
 
-		indices = append(indices, index)
+		writeError(w, http.StatusNotFound, "not found")
+	}
+}
+
+// head returns the root of the head. The caller holds the lock.
+func (n *fakeNode) head() string {
+	if n.headRoot == "" {
+		return "0x01"
 	}
 
-	n.mu.Lock()
-	defer n.mu.Unlock()
+	return n.headRoot
+}
 
-	n.liveness = append(n.liveness, livenessCall{epoch: epoch, indices: indices})
+// handleBlock serves one block by root. The caller holds the lock.
+func (n *fakeNode) handleBlock(w http.ResponseWriter, root string) {
+	block, ok := n.blocks[root]
+	if !ok {
+		if root != n.head() {
+			writeError(w, http.StatusNotFound, "block not found")
 
-	if n.livenessStatus != 0 {
-		writeError(w, n.livenessStatus, n.livenessMessage)
-
-		return
-	}
-
-	if epoch < n.minEpoch {
-		status := http.StatusBadRequest
-		if n.oldEpochStatus != 0 {
-			status = n.oldEpochStatus
+			return
 		}
 
-		writeError(w, status, "epoch is too far in the past")
+		block = fakeBlock{slot: n.headSlot, parent: "0x00"}
+	}
+
+	attestations := block.attestations
+	if attestations == nil {
+		attestations = []map[string]any{}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"version": "fulu",
+		"data": map[string]any{
+			"message": map[string]any{
+				"slot":        strconv.FormatUint(block.slot, 10),
+				"parent_root": block.parent,
+				"body":        map[string]any{"attestations": attestations, "graffiti": "0x00"},
+			},
+			"signature": "0x02",
+		},
+	})
+}
+
+// handleCommittees serves the committees of an epoch. The caller holds the
+// lock.
+func (n *fakeNode) handleCommittees(w http.ResponseWriter, r *http.Request) {
+	epoch, err := strconv.ParseUint(r.URL.Query().Get("epoch"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad epoch")
 
 		return
 	}
 
-	data := make([]map[string]any, 0, len(indices))
-	for _, index := range indices {
-		data = append(data, map[string]any{
-			"index":   strconv.FormatUint(index, 10),
-			"is_live": n.isLive(epoch, index),
-		})
+	n.requests[r.URL.Path+"?epoch="+strconv.FormatUint(epoch, 10)]++
+
+	if status := n.committeesStatus[epoch]; status != 0 {
+		writeError(w, status, "epoch out of bounds")
+
+		return
+	}
+
+	data := make([]map[string]any, 0, testSlotsPerEpoch)
+
+	for slot := epoch * testSlotsPerEpoch; slot < (epoch+1)*testSlotsPerEpoch; slot++ {
+		for index, members := range n.committees[slot] {
+			validators := make([]string, 0, len(members))
+			for _, validator := range members {
+				validators = append(validators, strconv.FormatUint(validator, 10))
+			}
+
+			data = append(data, map[string]any{
+				"index":      strconv.Itoa(index),
+				"slot":       strconv.FormatUint(slot, 10),
+				"validators": validators,
+			})
+		}
 	}
 
 	writeJSON(w, http.StatusOK, map[string]any{"data": data})
@@ -319,21 +322,26 @@ func (n *fakeNode) handleLiveness(w http.ResponseWriter, r *http.Request) {
 type fakeStore struct {
 	mu    sync.Mutex
 	hosts []*fleet.Host
-	rows  map[string]fleet.Liveness
 
-	listHostsErr error
-	saveErr      error
-	listErr      error
-
+	listHostsErr   error
 	listHostsCalls int
-	saveCalls      int
-	pruneCalls     []uint64
+
+	// slots are the stored slot rows; slotSaves counts how often each slot
+	// was written, slotPrunes the prune boundaries applied.
+	slots       map[uint64]fleet.SlotParticipation
+	slotSaves   map[uint64]int
+	slotSaveErr error
+	slotPrunes  []uint64
 }
 
 var _ Store = (*fakeStore)(nil)
 
 func newFakeStore(hosts ...*fleet.Host) *fakeStore {
-	return &fakeStore{hosts: hosts, rows: make(map[string]fleet.Liveness, 16)}
+	return &fakeStore{
+		hosts:     hosts,
+		slots:     make(map[uint64]fleet.SlotParticipation, 16),
+		slotSaves: make(map[uint64]int, 16),
+	}
 }
 
 // host builds a host with the validator range [start, end); start == end
@@ -345,10 +353,6 @@ func host(name string, start, end uint64) *fleet.Host {
 	}
 
 	return h
-}
-
-func rowKey(name string, epoch uint64) string {
-	return name + "@" + strconv.FormatUint(epoch, 10)
 }
 
 func (s *fakeStore) set(change func(s *fakeStore)) {
@@ -371,102 +375,45 @@ func (s *fakeStore) ListHosts(context.Context) ([]*fleet.Host, error) {
 	return append([]*fleet.Host(nil), s.hosts...), nil
 }
 
-func (s *fakeStore) SaveLiveness(_ context.Context, rows []fleet.Liveness) error {
+func (s *fakeStore) SaveSlotParticipation(_ context.Context, rows []fleet.SlotParticipation) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	s.saveCalls++
-
-	if s.saveErr != nil {
-		return s.saveErr
+	if s.slotSaveErr != nil {
+		return s.slotSaveErr
 	}
 
-	for _, row := range rows {
-		s.rows[rowKey(row.Host, row.Epoch)] = row
+	for i := range rows {
+		s.slots[rows[i].Slot] = rows[i]
+		s.slotSaves[rows[i].Slot]++
 	}
 
 	return nil
 }
 
-func (s *fakeStore) ListLiveness(_ context.Context, epochs int) ([]fleet.Liveness, error) {
+func (s *fakeStore) PruneSlotParticipation(_ context.Context, beforeSlot uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	if s.listErr != nil {
-		return nil, s.listErr
-	}
+	s.slotPrunes = append(s.slotPrunes, beforeSlot)
 
-	rows := make([]fleet.Liveness, 0, len(s.rows))
-	for _, row := range s.rows {
-		rows = append(rows, row)
-	}
-
-	sort.Slice(rows, func(i, j int) bool {
-		if rows[i].Epoch != rows[j].Epoch {
-			return rows[i].Epoch > rows[j].Epoch
-		}
-
-		return rows[i].Host < rows[j].Host
-	})
-
-	distinct := 0
-
-	for i, row := range rows {
-		if i == 0 || row.Epoch != rows[i-1].Epoch {
-			distinct++
-		}
-
-		if distinct > epochs {
-			return rows[:i], nil
-		}
-	}
-
-	return rows, nil
-}
-
-func (s *fakeStore) PruneLiveness(_ context.Context, beforeEpoch uint64) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	s.pruneCalls = append(s.pruneCalls, beforeEpoch)
-
-	for key, row := range s.rows {
-		if row.Epoch < beforeEpoch {
-			delete(s.rows, key)
+	for slot := range s.slots {
+		if slot < beforeSlot {
+			delete(s.slots, slot)
 		}
 	}
 
 	return nil
 }
 
-// row returns the stored row of a host and epoch.
-func (s *fakeStore) row(name string, epoch uint64) (fleet.Liveness, bool) {
+// slot returns the stored row of a slot.
+func (s *fakeStore) slot(slot uint64) (fleet.SlotParticipation, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	row, ok := s.rows[rowKey(name, epoch)]
+	row, ok := s.slots[slot]
 
 	return row, ok
-}
-
-// epochs returns the distinct stored epochs, ascending.
-func (s *fakeStore) epochs() []uint64 {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	seen := make(map[uint64]struct{}, len(s.rows))
-	for _, row := range s.rows {
-		seen[row.Epoch] = struct{}{}
-	}
-
-	epochs := make([]uint64, 0, len(seen))
-	for epoch := range seen {
-		epochs = append(epochs, epoch)
-	}
-
-	sort.Slice(epochs, func(i, j int) bool { return epochs[i] < epochs[j] })
-
-	return epochs
 }
 
 // harness wires a service to fake nodes, a fake store and a fake clock.

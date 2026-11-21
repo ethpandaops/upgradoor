@@ -2,6 +2,7 @@ package api
 
 import (
 	"bytes"
+	"cmp"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -61,9 +62,9 @@ type fakeStore struct {
 	mu          sync.Mutex
 	hosts       map[string]*fleet.Host
 	inventories map[string]*protocol.Inventory
-	liveness    []fleet.Liveness
-	rollouts    []*fleet.Rollout // newest first
-	leases      []*fleet.Lease   // newest first
+	slots       []fleet.SlotParticipation // oldest first
+	rollouts    []*fleet.Rollout          // newest first
+	leases      []*fleet.Lease            // newest first
 	audit       []fleet.AuditEntry
 	packages    []store.PackageMatch
 
@@ -115,7 +116,8 @@ func (f *fakeStore) RecordSync(_ context.Context, sync *store.HostSync) (*store.
 
 	host.CertHash = sync.Cert.Hash
 	host.Generation = max(host.Generation, sync.Cert.Generation)
-	host.Validators = sync.Cert.Validators
+	res.ValidatorsBefore = host.Validators
+	host.Validators, res.ValidatorOverlaps = f.countedValidators(name, sync, host.Validators)
 	host.Roles = sync.Cert.Roles
 	host.LastSeen = sync.At
 	host.RemoteAddr = sync.RemoteAddr
@@ -125,6 +127,60 @@ func (f *fakeStore) RecordSync(_ context.Context, sync *store.HostSync) (*store.
 	res.Host = &cp
 
 	return res, nil
+}
+
+// countedValidators is the real store's rule: the reported range without the
+// validators counted for other hosts, and the range counted before while the
+// host does not know its own.
+func (f *fakeStore) countedValidators(
+	name string, sync *store.HostSync, before *identity.ValidatorRange,
+) (*identity.ValidatorRange, []string) {
+	if sync.Request == nil {
+		return before, nil
+	}
+
+	reported := sync.Request.Validators
+
+	switch {
+	case reported == nil:
+		return nil, nil
+	case !reported.Known():
+		return before, nil
+	case reported.Count() == 0:
+		return nil, nil
+	}
+
+	names := make([]string, 0, len(f.hosts))
+	for other := range f.hosts {
+		names = append(names, other)
+	}
+
+	sort.Slice(names, func(i, j int) bool {
+		return f.hosts[names[i]].Validators.Count() > 0 &&
+			(f.hosts[names[j]].Validators.Count() == 0 ||
+				f.hosts[names[i]].Validators.Start < f.hosts[names[j]].Validators.Start)
+	})
+
+	var (
+		taken    []identity.ValidatorRange
+		overlaps []string
+	)
+
+	for _, other := range names {
+		held := f.hosts[other].Validators
+		if other == name || held.Count() == 0 ||
+			held.Start >= reported.End || reported.Start >= held.End {
+			continue
+		}
+
+		taken = append(taken, *held)
+		overlaps = append(overlaps, other)
+	}
+
+	sort.Strings(overlaps)
+
+	return fleet.UnclaimedRange(
+		identity.ValidatorRange{Start: reported.Start, End: reported.End}, taken), overlaps
 }
 
 func (f *fakeStore) GetHost(_ context.Context, name string) (*fleet.Host, error) {
@@ -198,8 +254,10 @@ func (f *fakeStore) GetInventory(_ context.Context, host string) (*protocol.Inve
 	return inv, nil
 }
 
-func (f *fakeStore) SearchPackages(_ context.Context, query string, limit int) (
-	[]store.PackageMatch, error,
+// ListPackages pages through the fake's packages in their order; the cursor
+// is "2" and the name of the last entry of the page before.
+func (f *fakeStore) ListPackages(_ context.Context, filter store.PackageFilter) (
+	*store.PackagePage, error,
 ) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -208,20 +266,43 @@ func (f *fakeStore) SearchPackages(_ context.Context, query string, limit int) (
 		return nil, f.err
 	}
 
-	f.lastSearchQuery, f.lastSearchLimit = query, limit
+	f.lastSearchQuery, f.lastSearchLimit = filter.Query, filter.Limit
 
-	out := make([]store.PackageMatch, 0, len(f.packages))
+	if filter.After != "" && !strings.HasPrefix(filter.After, "2") {
+		return nil, store.ErrBadCursor
+	}
+
+	page := &store.PackagePage{Matches: make([]store.PackageMatch, 0, len(f.packages)), Total: -1}
+	skipping := filter.After != ""
+	total := 0
 
 	for _, m := range f.packages {
-		if strings.Contains(strings.ToLower(m.Name), strings.ToLower(query)) && len(out) < limit {
-			out = append(out, m)
+		if !strings.Contains(strings.ToLower(m.Name), strings.ToLower(filter.Query)) {
+			continue
+		}
+
+		total++
+
+		switch {
+		case skipping:
+			skipping = "2"+m.Name != filter.After
+		case len(page.Matches) == filter.Limit:
+			page.Next = "2" + page.Matches[len(page.Matches)-1].Name
+		default:
+			page.Matches = append(page.Matches, m)
 		}
 	}
 
-	return out, nil
+	if filter.After == "" {
+		page.Total = total
+	}
+
+	return page, nil
 }
 
-func (f *fakeStore) ListLiveness(_ context.Context, _ int) ([]fleet.Liveness, error) {
+func (f *fakeStore) ListSlotParticipation(
+	_ context.Context, fromSlot uint64,
+) ([]fleet.SlotParticipation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -229,7 +310,134 @@ func (f *fakeStore) ListLiveness(_ context.Context, _ int) ([]fleet.Liveness, er
 		return nil, f.err
 	}
 
-	return slices.Clone(f.liveness), nil
+	out := make([]fleet.SlotParticipation, 0, len(f.slots))
+
+	for i := range f.slots {
+		if row := f.slots[i]; row.Slot >= fromSlot {
+			row.Hosts = nil
+			out = append(out, row)
+		}
+	}
+
+	return out, nil
+}
+
+// SumHostSlotRuns joins the per-host rows into runs like the store.
+func (f *fakeStore) SumHostSlotRuns(
+	_ context.Context, fromSlot, toSlot, gap, minSlots uint64, perSlot []string,
+) ([]fleet.HostSlotRun, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	rows := make(map[string][]fleet.HostSlotRun, 8)
+	hosts := make([]string, 0, 8)
+
+	for i := range f.slots {
+		slot := f.slots[i].Slot
+		if slot < fromSlot || slot > toSlot {
+			continue
+		}
+
+		for _, part := range f.slots[i].Hosts {
+			if part.Included < part.Assigned {
+				if _, seen := rows[part.Host]; !seen {
+					hosts = append(hosts, part.Host)
+				}
+
+				rows[part.Host] = append(rows[part.Host], fleet.HostSlotRun{
+					Host: part.Host, First: slot, Last: slot, Slots: 1,
+					Assigned: part.Assigned, Included: part.Included,
+				})
+			}
+		}
+	}
+
+	slices.Sort(hosts)
+
+	out := make([]fleet.HostSlotRun, 0, len(hosts))
+
+	for _, host := range hosts {
+		list := rows[host]
+		slices.SortFunc(list, func(a, b fleet.HostSlotRun) int { return cmp.Compare(a.First, b.First) })
+
+		for _, row := range list {
+			last := len(out) - 1
+			if last >= 0 && out[last].Host == host && !slices.Contains(perSlot, host) && row.First-out[last].Last <= gap {
+				out[last].Last = row.First
+				out[last].Slots++
+				out[last].Assigned += row.Assigned
+				out[last].Included += row.Included
+
+				continue
+			}
+
+			out = append(out, row)
+		}
+	}
+
+	kept := out[:0]
+
+	for _, run := range out {
+		if run.Slots >= minSlots || slices.Contains(perSlot, run.Host) {
+			kept = append(kept, run)
+		}
+	}
+
+	return kept, nil
+}
+
+func (f *fakeStore) SumHostSlotParticipation(
+	_ context.Context, fromSlot, bucketSlots uint64,
+) ([]fleet.HostSlotBucket, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.err != nil {
+		return nil, f.err
+	}
+
+	type key struct {
+		bucket uint64
+		host   string
+	}
+
+	sums := make(map[key]fleet.HostSlotBucket, len(f.slots))
+
+	for i := range f.slots {
+		if f.slots[i].Slot < fromSlot {
+			continue
+		}
+
+		for _, part := range f.slots[i].Hosts {
+			if part.Included >= part.Assigned {
+				// Like the store: a host that missed nothing has no row.
+				continue
+			}
+
+			k := key{bucket: f.slots[i].Slot / bucketSlots, host: part.Host}
+
+			sum := sums[k]
+			sum.Bucket, sum.Host = k.bucket, k.host
+			sum.Assigned += part.Assigned
+			sum.Included += part.Included
+			sums[k] = sum
+		}
+	}
+
+	out := make([]fleet.HostSlotBucket, 0, len(sums))
+	for _, sum := range sums {
+		out = append(out, sum)
+	}
+
+	slices.SortFunc(out, func(a, b fleet.HostSlotBucket) int {
+		return cmp.Or(cmp.Compare(a.Bucket, b.Bucket), cmp.Compare(a.Host, b.Host))
+	})
+
+	return out, nil
 }
 
 func (f *fakeStore) ListRollouts(_ context.Context, filter store.RolloutFilter) (
@@ -486,23 +694,6 @@ func (f *fakeScheduler) Settings(context.Context) (fleet.Settings, error) {
 	return f.settings, f.settingsErr
 }
 
-func (f *fakeScheduler) UpdateSettings(ctx context.Context, actor string, s fleet.Settings) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.calls = append(f.calls, schedulerCall{Name: "settings", Actor: actor, Req: s, Auth: authOf(ctx)})
-
-	if f.actionErr != nil {
-		return f.actionErr
-	}
-
-	f.settings = s
-
-	return nil
-}
-
-// PatchSettings applies a patch to the fake's settings, like the scheduler:
-// nothing is recorded when nothing changes.
 func (f *fakeScheduler) PatchSettings(
 	ctx context.Context, actor string, apply func(*fleet.Settings) error,
 ) (fleet.Settings, bool, error) {
@@ -518,7 +709,7 @@ func (f *fakeScheduler) PatchSettings(
 		return f.settings, false, err
 	}
 
-	if next == f.settings {
+	if next.Equal(&f.settings) {
 		return f.settings, false, nil
 	}
 
@@ -564,10 +755,54 @@ func (f *fakeScheduler) Hold(ctx context.Context, actor string, req scheduler.Ho
 	return f.record(ctx, "hold", actor, req)
 }
 
+func (f *fakeScheduler) ImageOverride(
+	ctx context.Context, actor string, req scheduler.ImageOverrideRequest,
+) (*scheduler.ActionResult, error) {
+	return f.record(ctx, "image-override", actor, req)
+}
+
+func (f *fakeScheduler) FlagOverride(
+	ctx context.Context, actor string, req scheduler.FlagOverrideRequest,
+) (*scheduler.ActionResult, error) {
+	return f.record(ctx, "flag-override", actor, req)
+}
+
+func (f *fakeScheduler) ClientOverride(
+	ctx context.Context, actor string, req scheduler.ClientOverrideRequest,
+) (*scheduler.ActionResult, error) {
+	res, err := f.record(ctx, "client-override", actor, req)
+	if res == nil {
+		return res, err
+	}
+
+	out := *res
+	out.Hosts = req.Hosts
+
+	return &out, err
+}
+
+func (f *fakeScheduler) SetClientPolicy(
+	ctx context.Context, actor string, req scheduler.ClientPolicyRequest,
+) (*scheduler.ActionResult, error) {
+	return f.record(ctx, "client-policy", actor, req)
+}
+
 func (f *fakeScheduler) Unhold(ctx context.Context, actor string, req scheduler.HoldRequest) (
 	*scheduler.ActionResult, error,
 ) {
 	return f.record(ctx, "unhold", actor, req)
+}
+
+func (f *fakeScheduler) MarkOffline(ctx context.Context, actor string, req scheduler.OfflineRequest) (
+	*scheduler.ActionResult, error,
+) {
+	return f.record(ctx, "mark-offline", actor, req)
+}
+
+func (f *fakeScheduler) UnmarkOffline(ctx context.Context, actor string, req scheduler.OfflineRequest) (
+	*scheduler.ActionResult, error,
+) {
+	return f.record(ctx, "unmark-offline", actor, req)
 }
 
 func (f *fakeScheduler) Pause(ctx context.Context, actor string, req scheduler.ScopeRequest) (
@@ -815,7 +1050,7 @@ func (h *harness) agentRequest(a *testAgent, path string, body []byte, o agentCa
 		proofTime = h.clock.Now()
 	}
 
-	proof, err := a.creds.Proof(http.MethodPost, proofURL, wire, proofTime)
+	proof, _, err := a.creds.Proof(http.MethodPost, proofURL, wire, proofTime)
 	require.NoError(h.t, err)
 
 	req := httptest.NewRequest(http.MethodPost, testBaseURL+path, bytes.NewReader(wire))
@@ -854,6 +1089,24 @@ func syncRequest() *protocol.SyncRequest {
 		UptimeSeconds:   3600,
 		Verbs:           []protocol.Verb{protocol.VerbRoll, protocol.VerbReboot},
 	}
+}
+
+// knownValidators is a validator range as a host reports it from its marker
+// file.
+func knownValidators(start, end uint64) *protocol.Validators {
+	return &protocol.Validators{
+		Start: start, End: end,
+		Source: protocol.ValidatorsFromMarker, State: protocol.ValidatorsKnown,
+	}
+}
+
+// validatorSyncRequest is syncRequest of a host that reports the validators
+// 0 to 99.
+func validatorSyncRequest() *protocol.SyncRequest {
+	req := syncRequest()
+	req.Validators = knownValidators(0, 100)
+
+	return req
 }
 
 // inventoryFor returns an inventory with a correct hash.

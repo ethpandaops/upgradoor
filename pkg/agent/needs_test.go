@@ -1,11 +1,7 @@
 package agent
 
 import (
-	"context"
-	"errors"
-	"sync"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -30,10 +26,15 @@ var allVerbs = []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages, protoco
 // teku is up to date, docker-ce and an unblocked package can be upgraded
 // and both reboot reasons apply.
 func observed(cfg *Config) *observation {
+	return observedWith(cfg, nil)
+}
+
+// observedWith is observed on a host whose overrides file says set.
+func observedWith(cfg *Config, set *overrideSet) *observation {
 	containers := []protocol.Container{
-		{Name: "geth", Image: "ethpandaops/geth:master", Digest: "sha256:a", State: containerRunning},
-		{Name: "teku", Image: "consensys/teku:develop", Digest: "sha256:t", State: containerRunning},
-		{Name: "dora", Image: "ethpandaops/dora:latest", Digest: "sha256:d", State: containerRunning},
+		{Name: "geth", Image: "ethpandaops/geth:master", Digest: "sha256:a", State: protocol.StateRunning},
+		{Name: "teku", Image: "consensys/teku:develop", Digest: "sha256:t", State: protocol.StateRunning},
+		{Name: "dora", Image: "ethpandaops/dora:latest", Digest: "sha256:d", State: protocol.StateRunning},
 	}
 
 	checks := map[string]protocol.RegistryCheck{
@@ -42,15 +43,19 @@ func observed(cfg *Config) *observation {
 		"docker.io/ethpandaops/dora:latest": {Digest: "sha256:e", Pulled: true},
 	}
 
-	enrichContainers(cfg, containers, func(key string) (protocol.RegistryCheck, bool) {
+	check := func(key string) (protocol.RegistryCheck, bool) {
 		c, ok := checks[key]
 
 		return c, ok
-	})
+	}
+
+	_, targets := enrichContainers(cfg, containers, set, check)
 
 	return &observation{
 		containers:      containers,
 		containersFresh: true,
+		targets:         targets,
+		check:           check,
 		sys: &SystemStatus{
 			OS: protocol.OSSummary{
 				RunningKernel: "6.12.41", NewestKernel: "6.12.48", RebootRequired: true,
@@ -137,14 +142,6 @@ func TestComputeNeeds(t *testing.T) {
 			verbs:  []protocol.Verb{protocol.VerbRoll},
 			mutate: func(obs *observation) { obs.containers[0].Registry = nil },
 			want:   []string{},
-		},
-		{
-			name:  "custom container",
-			verbs: []protocol.Verb{protocol.VerbRoll},
-			mutate: func(obs *observation) {
-				obs.containers[0].Custom = true
-			},
-			want: []string{},
 		},
 		{
 			name:  "kernel only",
@@ -258,12 +255,6 @@ func TestReconcileManualNeeds(t *testing.T) {
 		reason string
 	}{
 		{
-			name:   "container became custom",
-			mutate: func(_ *Config, obs *observation) { obs.containers[0].Image = "local/geth:debug" },
-			need:   roll("geth", "ethpandaops/geth:master", "sha256:a"),
-			reason: "custom image",
-		},
-		{
 			name:   "container is gone",
 			mutate: func(_ *Config, obs *observation) { obs.containers = obs.containers[1:] },
 			need:   roll("geth", "ethpandaops/geth:master", "sha256:a"),
@@ -325,246 +316,21 @@ func TestReconcileManualNeeds(t *testing.T) {
 	})
 }
 
-// watchedHost is a registry and image store for the watcher tests.
-type watchedHost struct {
-	mu         sync.Mutex
-	registry   map[string]string
-	local      map[string]string
-	pulls      int
-	resolves   int
-	resolveErr error
-}
-
-func (h *watchedHost) Resolve(_ context.Context, ref string) (digest, revision string, err error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	h.resolves++
-
-	if h.resolveErr != nil {
-		return "", "", h.resolveErr
-	}
-
-	return h.registry[ref], "", nil
-}
-
-func (h *watchedHost) LocalDigest(_ context.Context, ref string) (string, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	return h.local[ref], nil
-}
-
-func (h *watchedHost) Pull(_ context.Context, ref string) (string, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	h.pulls++
-	h.local[ref] = h.registry[ref]
-
-	return h.local[ref], nil
-}
-
-func (h *watchedHost) Observe(context.Context) ([]protocol.Container, error) { return nil, nil }
-
-func (h *watchedHost) Recreate(context.Context, string, string, time.Duration, bool) error {
-	return errors.New("not used")
-}
-
-func (h *watchedHost) Stop(context.Context, string, time.Duration) error { return nil }
-
-func (h *watchedHost) Start(context.Context, string) error { return nil }
-
-func (h *watchedHost) counts() (pulls, resolves int) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	return h.pulls, h.resolves
-}
-
-func TestImageWatcher(t *testing.T) {
-	const key, ref = "docker.io/library/app:latest", "app"
-
-	host := &watchedHost{
-		registry: map[string]string{ref: "sha256:1"},
-		local:    map[string]string{ref: "sha256:1"},
-	}
-
-	w := newImageWatcher(quietLog(), host, host, time.Hour, time.Now, true)
-	ctx := t.Context()
-
-	_, ok := w.Check(key)
-	assert.False(t, ok, "nothing is known before the first check")
-
-	w.Track(map[string]trackedTag{key: {ref: ref, running: []string{"sha256:1"}}})
-
-	due, _ := w.nextDue()
-	require.Equal(t, key, due, "a new tag is due at once")
-
-	w.checkTag(ctx, key)
-
-	check, ok := w.Check(key)
-	require.True(t, ok)
-	assert.Equal(t, "sha256:1", check.Digest)
-	assert.True(t, check.Pulled)
-	assert.Empty(t, check.Error)
-
-	due, wait := w.nextDue()
-	assert.Empty(t, due, "after a check the tag rests for the poll interval")
-	assert.Equal(t, maxWatchIdle, wait)
-
-	// A container that is behind makes the watcher pull.
-	host.registry[ref] = "sha256:2"
-
-	w.RecheckAll()
-
-	due, _ = w.nextDue()
-	require.Equal(t, key, due, "recheck makes every tag due")
-
-	w.checkTag(ctx, key)
-
-	check, _ = w.Check(key)
-	assert.Equal(t, "sha256:2", check.Digest)
-	assert.True(t, check.Pulled)
-
-	pulls, _ := host.counts()
-	assert.Equal(t, 1, pulls)
-
-	// Nobody runs the old digest any more and the local tag was moved away
-	// by hand: without a container behind, the watcher leaves it alone.
-	w.Track(map[string]trackedTag{key: {ref: ref, running: []string{"sha256:2"}}})
-
-	host.local[ref] = "sha256:other"
-
-	w.RecheckAll()
-	w.checkTag(ctx, key)
-
-	check, _ = w.Check(key)
-	assert.False(t, check.Pulled)
-
-	pulls, _ = host.counts()
-	assert.Equal(t, 1, pulls, "no pull when no container is behind")
-
-	// A manual roll asks for the image all the same.
-	ticket := w.Request(key, ref)
-
-	_, done, gone := w.Result(key, ticket)
-	assert.False(t, done)
-	assert.False(t, gone)
-
-	w.checkTag(ctx, key)
-
-	check, done, gone = w.Result(key, ticket)
-	require.True(t, done)
-	assert.False(t, gone)
-	assert.True(t, check.Pulled)
-
-	pulls, _ = host.counts()
-	assert.Equal(t, 2, pulls)
-
-	// A registry error keeps the last good digest.
-	host.resolveErr = errors.New("registry unreachable")
-
-	w.RecheckAll()
-	w.checkTag(ctx, key)
-
-	check, _ = w.Check(key)
-	assert.Equal(t, "sha256:2", check.Digest)
-	assert.Contains(t, check.Error, "registry unreachable")
-
-	// A tag nobody is on any more is forgotten.
-	w.Track(map[string]trackedTag{})
-
-	_, ok = w.Check(key)
-	assert.False(t, ok)
-
-	_, _, gone = w.Result(key, ticket)
-	assert.True(t, gone)
-}
-
-func TestImageWatcherPollsWithJitter(t *testing.T) {
-	w := newImageWatcher(quietLog(), nil, nil, time.Minute, time.Now, true)
-
-	lowest, highest := time.Hour, time.Duration(0)
-
-	for range 2000 {
-		d := w.jittered()
-		require.GreaterOrEqual(t, d, time.Minute)
-		require.LessOrEqual(t, d, 72*time.Second, "at most 20% on top")
-
-		lowest, highest = min(lowest, d), max(highest, d)
-	}
-
-	assert.Greater(t, highest-lowest, 6*time.Second, "the interval is spread out")
-}
-
-func TestImageWatcherRunPolls(t *testing.T) {
-	const key, ref = "docker.io/library/app:latest", "app"
-
-	host := &watchedHost{
-		registry: map[string]string{ref: "sha256:1"},
-		local:    map[string]string{ref: "sha256:1"},
-	}
-
-	w := newImageWatcher(quietLog(), host, host, 5*time.Millisecond, time.Now, true)
-
-	ctx, cancel := context.WithCancel(t.Context())
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		w.run(ctx)
-	}()
-
-	w.Track(map[string]trackedTag{key: {ref: ref, running: []string{"sha256:1"}}})
-
-	require.Eventually(t, func() bool {
-		_, resolves := host.counts()
-
-		return resolves >= 4
-	}, 5*time.Second, time.Millisecond, "the watcher keeps polling at its interval")
-
-	cancel()
-
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		require.FailNow(t, "the watcher did not stop")
-	}
-}
-
-// On a host without the roll verb the watcher looks, for the report, and
-// pulls nothing, whoever asks.
-func TestImageWatcherDoesNotPullWhenTheHostNeverRolls(t *testing.T) {
-	const key, ref = "docker.io/library/app:latest", "app"
-
-	host := &watchedHost{
-		registry: map[string]string{ref: "sha256:2"},
-		local:    map[string]string{ref: "sha256:1"},
-	}
-
-	w := newImageWatcher(quietLog(), host, host, time.Hour, time.Now, false)
-	ctx := t.Context()
-
-	w.Track(map[string]trackedTag{key: {ref: ref, running: []string{"sha256:1"}}})
-	w.checkTag(ctx, key)
-
-	check, ok := w.Check(key)
-	require.True(t, ok)
-	assert.Equal(t, "sha256:2", check.Digest)
-	assert.False(t, check.Pulled)
-	assert.Empty(t, check.Error)
-
-	ticket := w.Request(key, ref)
-	w.checkTag(ctx, key)
-
-	check, done, _ := w.Result(key, ticket)
-	require.True(t, done)
-	assert.False(t, check.Pulled)
-
-	pulls, resolves := host.counts()
-	assert.Equal(t, 0, pulls)
-	assert.Equal(t, 2, resolves)
-	assert.Equal(t, "sha256:1", host.local[ref], "the local tag is left where it was")
+// A managed container that does not exist is reported, never created.
+func TestWithMissing(t *testing.T) {
+	cfg := &Config{Containers: []ManagedContainer{
+		{Name: "geth", Kind: protocol.KindEL, Image: "ethpandaops/geth:v1", Impact: protocol.ImpactNode},
+		{Name: "exporter", Kind: protocol.KindOther, Image: "org/exporter:1", Impact: protocol.ImpactIndependent},
+	}}
+	observed := []protocol.Container{{Name: "geth", Image: "ethpandaops/geth:v1", State: protocol.StateRunning}}
+
+	got := withMissing(cfg, observed)
+
+	require.Len(t, got, 2)
+	assert.Equal(t, observed[0], got[0])
+	assert.Equal(t, protocol.Container{
+		Name: "exporter", State: protocol.StateMissing, Managed: true, Kind: protocol.KindOther,
+		Impact: protocol.ImpactIndependent, ConfiguredImage: "org/exporter:1",
+	}, got[1])
+	assert.False(t, got[1].ShouldRun())
 }

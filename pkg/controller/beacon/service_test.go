@@ -39,6 +39,9 @@ func TestPollPublishesChainView(t *testing.T) {
 		CurrentEpoch:      10,
 		FinalizedEpoch:    8,
 		FinalityLagEpochs: 2,
+		// No host has validators: epoch 9 is settled with nothing tracked.
+		LivenessKnown: true,
+		LivenessEpoch: 9,
 	}, got)
 	assert.Equal(t, testEpoch, got.EpochDuration())
 
@@ -134,7 +137,7 @@ func TestPollTimingFromSpec(t *testing.T) {
 			assert.Equal(t, tt.wantEpoch, got.FinalityLagEpochs)
 
 			if tt.wantEpoch == 0 {
-				assert.Empty(t, h.node.livenessCalls(), "no complete epoch yet")
+				assert.False(t, got.LivenessKnown, "no complete epoch yet")
 			}
 		})
 	}
@@ -183,24 +186,14 @@ func TestPollUnusableSpec(t *testing.T) {
 	assert.True(t, got.UpdatedAt.IsZero())
 }
 
-// TestPollTimingOutOfBounds: a chain timing that is out of bounds is said so,
-// once, in the log and in the published view. Only what the clock has reached
-// counts: a slot phase out of bounds that is scheduled for the future is
-// logged and closes nothing, and the epochs before it are placed as ever.
-// Before, nothing validated the timing where it was read: the service logged
-// "Loaded chain timing" for a spec that the scheduler then rejected whole,
-// and the operator saw "beacon node unreachable" for a node that answered.
-func TestPollTimingOutOfBounds(t *testing.T) {
-	const twoHours = "7200000"
-
+// TestPollPublishesTheChainTiming: the timing the service reads is published
+// as slot phases that are valid as a whole (fleet.ValidateTiming), and the
+// view places every epoch where the service does, across forks that change
+// the slot duration.
+func TestPollPublishesTheChainTiming(t *testing.T) {
 	for _, tt := range []struct {
 		name string
 		spec map[string]any
-		// timingError is what the view carries, as a part of it; empty when
-		// the current epoch can be placed. warned says whether the warning
-		// is logged at all.
-		timingError string
-		warned      bool
 	}{
 		{
 			name: "mainnet", spec: map[string]any{"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32"},
@@ -240,29 +233,11 @@ func TestPollTimingOutOfBounds(t *testing.T) {
 			},
 		},
 		{
-			// The finding: one phase out of bounds, far in the future,
-			// invalidated the timing now.
-			name: "slots of two hours from epoch 1000000 on",
+			name: "long slots from a fork far out",
 			spec: map[string]any{
 				"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32",
-				"SLOT_DURATION_MS_GLOAS": twoHours, "GLOAS_FORK_EPOCH": "1000000",
+				"SLOT_DURATION_MS_GLOAS": "7200000", "GLOAS_FORK_EPOCH": "1000000",
 			},
-			warned: true,
-		},
-		{
-			name:        "epochs of more than a day from genesis on",
-			spec:        map[string]any{"SECONDS_PER_SLOT": "3600", "SLOTS_PER_EPOCH": "32"},
-			timingError: "phase 0 (from epoch 0) has slots of 3600000 ms and epochs of 32 slots",
-			warned:      true,
-		},
-		{
-			name: "slots of two hours from a fork that has passed",
-			spec: map[string]any{
-				"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "32",
-				"SLOT_DURATION_MS_GLOAS": twoHours, "GLOAS_FORK_EPOCH": "2",
-			},
-			timingError: "phase 1 (from epoch 2) has slots of 7200000 ms",
-			warned:      true,
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -281,82 +256,12 @@ func TestPollTimingOutOfBounds(t *testing.T) {
 			assert.Empty(t, got.Error, "the node answered")
 			assert.False(t, got.UpdatedAt.IsZero())
 
-			warnings := 0
-			if tt.warned {
-				warnings = 1
-			}
-
-			assert.Equal(t, warnings, h.warnings(timingWarning), "logged once, not on every poll")
-			assert.Equal(t, tt.warned, fleet.ValidateTiming(got.SlotsPerEpoch, got.Phases) != nil)
-
-			_, placed := got.EpochStart(got.CurrentEpoch)
-
-			if tt.timingError == "" {
-				assert.Empty(t, got.TimingError)
-				assert.True(t, placed, "the current epoch is placed")
-				assert.Positive(t, got.EpochDuration())
-
-				// What the view places, it places where the service does.
-				for epoch := range got.CurrentEpoch + 3 {
-					start, ok := got.EpochStart(epoch)
-					require.True(t, ok, "epoch %d", epoch)
-					assert.Equal(t, h.svc.timing.epochStart(epoch), start, "epoch %d", epoch)
-				}
-
-				return
-			}
-
-			assert.Contains(t, got.TimingError, tt.timingError)
-			assert.NotContains(t, got.TimingError, "invalid chain timing", "the reason, without the error's class")
-			assert.False(t, placed)
-			assert.Zero(t, got.EpochDuration())
-
-			for _, entry := range h.logs.AllEntries() {
-				if entry.Message == timingWarning {
-					assert.Equal(t, got.TimingError, entry.Data["reason"])
-					assert.Contains(t, entry.Data["effect"], "the network gate is closed")
-				}
-			}
+			assert.Zero(t, h.warnings(timingWarning))
+			require.NoError(t, fleet.ValidateTiming(got.SlotsPerEpoch, got.Phases))
+			assert.Empty(t, got.TimingError)
+			assert.Positive(t, got.EpochDuration())
 		})
 	}
-
-	// The warning comes again when what it says changes: the clock reaches
-	// the phase that is out of bounds.
-	t.Run("the clock reaches the phase", func(t *testing.T) {
-		h := newHarness(t, 1, newFakeStore(host("a", 0, 4)), nil)
-		h.node.set(func(n *fakeNode) {
-			n.spec = map[string]any{
-				"SECONDS_PER_SLOT": "12", "SLOTS_PER_EPOCH": "8",
-				"SLOT_DURATION_MS_GLOAS": twoHours, "GLOAS_FORK_EPOCH": "12",
-			}
-		})
-
-		h.svc.poll(t.Context())
-
-		got := h.svc.Health()
-		require.Equal(t, uint64(10), got.CurrentEpoch)
-		assert.Empty(t, got.TimingError, "two epochs before the phase")
-		assert.Equal(t, testEpoch, got.EpochDuration())
-		assert.Equal(t, 1, h.warnings(timingWarning))
-
-		_, placed := got.EpochStart(11)
-		assert.True(t, placed, "the last epoch before the phase")
-
-		_, placed = got.EpochStart(12)
-		assert.False(t, placed, "the first epoch of the phase")
-
-		_, placed = got.EpochSpan(h.clock.Now(), 2)
-		assert.False(t, placed, "a span that reaches into the phase")
-
-		h.clock.Set(at(12, time.Second))
-		h.svc.poll(t.Context())
-		h.svc.poll(t.Context())
-
-		got = h.svc.Health()
-		assert.Contains(t, got.TimingError, "phase 1 (from epoch 12) has slots of 7200000 ms")
-		assert.Zero(t, got.EpochDuration())
-		assert.Equal(t, 2, h.warnings(timingWarning), "said again, once, with what it means now")
-	})
 }
 
 func TestPollFailureKeepsLastView(t *testing.T) {
@@ -396,69 +301,6 @@ func TestPollFailureKeepsLastView(t *testing.T) {
 	assert.Equal(t, uint64(85), got.HeadSlot)
 }
 
-func TestRestartWithNodeDownShowsStoredLiveness(t *testing.T) {
-	store := newFakeStore(host("a", 0, 4), host("b", 4, 10))
-	h := newHarness(t, 1, store, nil)
-	h.node.set(func(n *fakeNode) {
-		n.isLive = func(_, index uint64) bool { return index != 0 }
-	})
-	h.svc.poll(t.Context())
-	require.Equal(t, uint64(9), h.svc.Health().LivenessEpoch)
-
-	// The controller restarts while the node is unreachable: not even the
-	// chain timing can be loaded.
-	h.node.set(func(n *fakeNode) { n.down = true })
-	h.clock.Advance(testSlot)
-
-	restarted := h.build(t)
-	restarted.poll(t.Context())
-
-	got := restarted.Health()
-	assert.Contains(t, got.Error, "reading genesis")
-	assert.True(t, got.UpdatedAt.IsZero(), "the chain view never succeeded")
-	assert.True(t, got.LivenessKnown, "the stored rows are published without the node")
-	assert.Equal(t, uint64(9), got.LivenessEpoch)
-	assert.Equal(t, uint64(10), got.Tracked)
-	assert.Equal(t, uint64(9), got.Live)
-
-	// A store failure on top does not hide the chain error or the summary.
-	store.set(func(s *fakeStore) { s.listErr = errStore })
-	restarted.poll(t.Context())
-
-	got = restarted.Health()
-	assert.Contains(t, got.Error, "reading genesis")
-	assert.True(t, got.LivenessKnown)
-	assert.Equal(t, uint64(10), got.Tracked)
-
-	// Head fails with the timing known: same thing.
-	store.set(func(s *fakeStore) { s.listErr = nil })
-	h.node.set(func(n *fakeNode) {
-		n.down = false
-		n.failPath = pathHead
-	})
-
-	second := h.build(t)
-	second.poll(t.Context())
-
-	got = second.Health()
-	assert.Contains(t, got.Error, "reading head")
-	assert.True(t, got.UpdatedAt.IsZero())
-	assert.Equal(t, uint64(12), got.SecondsPerSlot)
-	assert.True(t, got.LivenessKnown)
-	assert.Equal(t, uint64(9), got.LivenessEpoch)
-	assert.Equal(t, uint64(9), got.Live)
-
-	// A fresh store has nothing to publish.
-	empty := newHarness(t, 1, newFakeStore(host("a", 0, 4)), nil)
-	empty.node.set(func(n *fakeNode) { n.down = true })
-	empty.svc.poll(t.Context())
-
-	got = empty.svc.Health()
-	assert.NotEmpty(t, got.Error)
-	assert.False(t, got.LivenessKnown)
-	assert.Zero(t, got.Tracked)
-}
-
 func TestSlotDurationNotWholeSeconds(t *testing.T) {
 	h := newHarness(t, 1, newFakeStore(host("a", 0, 4)), nil)
 	h.node.set(func(n *fakeNode) {
@@ -487,175 +329,6 @@ func TestSlotDurationNotWholeSeconds(t *testing.T) {
 	whole.svc.poll(t.Context())
 
 	assert.Zero(t, whole.warnings(warning))
-}
-
-func TestLivenessPerHost(t *testing.T) {
-	store := newFakeStore(
-		host("validator-a", 0, 4),
-		host("bootnode", 0, 0),
-		host("validator-b", 4, 10),
-		host("validator-c", 100, 103),
-		nil,
-	)
-	h := newHarness(t, 1, store, nil)
-	h.node.set(func(n *fakeNode) {
-		n.minEpoch = 9
-		// Even indices attest; validator-c is down.
-		n.isLive = func(_, index uint64) bool { return index%2 == 0 && index < 100 }
-	})
-
-	h.svc.poll(t.Context())
-
-	wantRows := map[string]fleet.Liveness{
-		"validator-a": {Host: "validator-a", Epoch: 9, Live: 2, Total: 4},
-		"validator-b": {Host: "validator-b", Epoch: 9, Live: 3, Total: 6},
-		"validator-c": {Host: "validator-c", Epoch: 9, Live: 0, Total: 3},
-	}
-	for name, want := range wantRows {
-		got, ok := store.row(name, 9)
-		require.True(t, ok, name)
-		assert.Equal(t, want, got)
-	}
-
-	_, ok := store.row("bootnode", 9)
-	assert.False(t, ok, "hosts without validators get no row")
-	assert.Equal(t, []uint64{9}, store.epochs())
-
-	calls := h.node.livenessCalls()
-	require.NotEmpty(t, calls)
-	assert.Equal(t, uint64(9), calls[0].epoch)
-	assert.Equal(t, []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 100, 101, 102}, calls[0].indices)
-
-	got := h.svc.Health()
-	assert.Empty(t, got.Error)
-	assert.True(t, got.LivenessKnown)
-	assert.Equal(t, uint64(9), got.LivenessEpoch)
-	assert.Equal(t, uint64(13), got.Tracked)
-	assert.Equal(t, uint64(5), got.Live)
-	assert.InDelta(t, 5.0/13.0, got.Participation(), 1e-9)
-}
-
-func TestLivenessMissingIndicesAreNotLive(t *testing.T) {
-	// A node that leaves indices out of its answer must not make them live.
-	store := newFakeStore(host("a", 0, 4))
-	h := newHarness(t, 1, store, nil)
-
-	h.svc.timing = nil
-	require.NoError(t, h.svc.loadTiming(t.Context()))
-
-	live, err := h.svc.queryLiveness(t.Context(), 9, []uint64{0, 1})
-	require.NoError(t, err)
-	assert.Len(t, live, 2)
-
-	h.node.set(func(n *fakeNode) { n.isLive = func(_, index uint64) bool { return index == 1 } })
-
-	live, err = h.svc.queryLiveness(t.Context(), 9, []uint64{0, 1, 2})
-	require.NoError(t, err)
-	assert.Equal(t, map[uint64]struct{}{1: {}}, live)
-}
-
-func TestLivenessChunking(t *testing.T) {
-	store := newFakeStore(host("a", 0, 6), host("b", 6, 10))
-	h := newHarness(t, 1, store, func(o *Options) { o.LivenessChunkSize = 4 })
-	h.node.set(func(n *fakeNode) {
-		n.minEpoch = 9
-		n.isLive = func(_, index uint64) bool { return index != 5 }
-	})
-
-	h.svc.poll(t.Context())
-
-	calls := h.node.livenessCalls()
-	require.GreaterOrEqual(t, len(calls), 3)
-
-	sizes := make([]int, 0, 3)
-	seen := make(map[uint64]int, 10)
-
-	for _, call := range calls[:3] {
-		require.Equal(t, uint64(9), call.epoch)
-
-		sizes = append(sizes, len(call.indices))
-
-		for _, index := range call.indices {
-			seen[index]++
-		}
-	}
-
-	assert.Equal(t, []int{4, 4, 2}, sizes)
-	assert.Len(t, seen, 10)
-
-	for index, count := range seen {
-		assert.Equal(t, 1, count, "index %d", index)
-	}
-
-	a, _ := store.row("a", 9)
-	b, _ := store.row("b", 9)
-	assert.Equal(t, fleet.Liveness{Host: "a", Epoch: 9, Live: 5, Total: 6}, a)
-	assert.Equal(t, fleet.Liveness{Host: "b", Epoch: 9, Live: 4, Total: 4}, b)
-}
-
-func TestLivenessChunkFailureStoresNothing(t *testing.T) {
-	store := newFakeStore(host("a", 0, 10))
-	h := newHarness(t, 1, store, func(o *Options) { o.LivenessChunkSize = 4 })
-	h.node.set(func(n *fakeNode) {
-		n.livenessStatus = http.StatusInternalServerError
-		n.livenessMessage = "state unavailable"
-	})
-
-	h.svc.poll(t.Context())
-
-	assert.Empty(t, store.epochs(), "a partial answer is not stored")
-	assert.Len(t, h.node.livenessCalls(), 1, "the epoch is abandoned at the first failed chunk")
-}
-
-func TestLivenessOverlappingRanges(t *testing.T) {
-	store := newFakeStore(host("a", 0, 6), host("b", 4, 10), host("inside-a", 1, 3))
-	h := newHarness(t, 1, store, nil)
-	h.node.set(func(n *fakeNode) {
-		n.minEpoch = 9
-		n.isLive = func(_, index uint64) bool { return index >= 2 }
-	})
-
-	h.svc.poll(t.Context())
-
-	calls := h.node.livenessCalls()
-	require.NotEmpty(t, calls)
-	assert.Equal(t, []uint64{0, 1, 2, 3, 4, 5, 6, 7, 8, 9}, calls[0].indices,
-		"shared indices are asked for once")
-
-	a, _ := store.row("a", 9)
-	b, _ := store.row("b", 9)
-	inside, _ := store.row("inside-a", 9)
-	assert.Equal(t, fleet.Liveness{Host: "a", Epoch: 9, Live: 4, Total: 6}, a)
-	assert.Equal(t, fleet.Liveness{Host: "b", Epoch: 9, Live: 6, Total: 6}, b)
-	assert.Equal(t, fleet.Liveness{Host: "inside-a", Epoch: 9, Live: 1, Total: 2}, inside)
-
-	// Each host counts independently, so the sum counts shared validators twice.
-	assert.Equal(t, uint64(14), h.svc.Health().Tracked)
-
-	const warning = "Validator ranges of two hosts overlap"
-
-	assert.Equal(t, 2, h.warnings(warning), "one warning per overlapping pair")
-
-	h.clock.Advance(testEpoch)
-	h.node.set(func(n *fakeNode) { n.minEpoch = 10 })
-	h.svc.poll(t.Context())
-
-	assert.Equal(t, []uint64{9, 10}, store.epochs())
-	assert.Equal(t, 2, h.warnings(warning), "warned once, not every epoch")
-}
-
-func TestLivenessOversizedRangeIsSkipped(t *testing.T) {
-	store := newFakeStore(host("broken", 0, maxHostValidators+1), host("a", 0, 4))
-	h := newHarness(t, 1, store, nil)
-
-	h.svc.poll(t.Context())
-	h.clock.Advance(testEpoch)
-	h.svc.poll(t.Context())
-
-	_, ok := store.row("broken", 9)
-	assert.False(t, ok)
-	assert.Equal(t, uint64(4), h.svc.Health().Tracked)
-	assert.Equal(t, 1, h.warnings("implausibly large"))
 }
 
 func TestEndpointFailoverIsSticky(t *testing.T) {
@@ -715,539 +388,35 @@ func TestAllEndpointsDown(t *testing.T) {
 	assert.NotContains(t, got.Error, "Get \"", "request URLs are not echoed")
 }
 
-func TestLivenessUnsupportedThenRecovers(t *testing.T) {
-	tests := []struct {
-		name    string
-		status  int
-		message string
-	}{
-		{name: "route missing", status: http.StatusNotFound, message: "Not Found"},
-		{name: "method not allowed", status: http.StatusMethodNotAllowed},
-		{name: "not implemented", status: http.StatusNotImplemented, message: "unimplemented"},
-		{
-			name:   "teku tracking disabled",
-			status: http.StatusBadRequest,
-			message: "Validator liveness tracking is not enabled on this beacon node, " +
-				"cannot service request",
-		},
-		{
-			name:    "tracking disabled as server error",
-			status:  http.StatusServiceUnavailable,
-			message: "liveness tracking disabled",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			store := newFakeStore(host("a", 0, 4))
-			// Rows of an earlier run do not make liveness known.
-			require.NoError(t, store.SaveLiveness(t.Context(),
-				[]fleet.Liveness{{Host: "a", Epoch: 5, Live: 4, Total: 4}}))
-
-			h := newHarness(t, 1, store, nil)
-			h.node.set(func(n *fakeNode) {
-				n.livenessStatus = tt.status
-				n.livenessMessage = tt.message
-			})
-
-			h.svc.poll(t.Context())
-
-			got := h.svc.Health()
-			assert.False(t, got.LivenessKnown)
-			assert.True(t, got.LivenessUnsupported)
-			assert.Contains(t, got.Error, "validator liveness unavailable")
-			assert.Equal(t, h.clock.Now(), got.UpdatedAt, "the chain view itself is fresh")
-			assert.Equal(t, uint64(2), got.FinalityLagEpochs)
-			assert.Len(t, h.node.livenessCalls(), 1, "one probe, no backfill attempts")
-			assert.Equal(t, 1, h.warnings("does not serve validator liveness"))
-
-			// Not asked again before the re-probe interval, epoch change or not.
-			h.clock.Advance(reprobeInterval - time.Second)
-			h.svc.poll(t.Context())
-
-			got = h.svc.Health()
-			assert.False(t, got.LivenessKnown)
-			assert.True(t, got.LivenessUnsupported, "the detection stays in effect between probes")
-			assert.Contains(t, got.Error, "validator liveness unavailable")
-			assert.Equal(t, h.clock.Now(), got.UpdatedAt)
-			assert.Len(t, h.node.livenessCalls(), 1)
-
-			// Re-probed, still unsupported: one more request, one warning in total.
-			h.clock.Advance(time.Second)
-			h.svc.poll(t.Context())
-
-			assert.False(t, h.svc.Health().LivenessKnown)
-			assert.True(t, h.svc.Health().LivenessUnsupported)
-			assert.Len(t, h.node.livenessCalls(), 2)
-			assert.Equal(t, 1, h.warnings("does not serve validator liveness"))
-
-			// The operator enables tracking: the next probe recovers.
-			h.node.set(func(n *fakeNode) { n.livenessStatus = 0 })
-			h.clock.Advance(reprobeInterval)
-			h.svc.poll(t.Context())
-
-			got = h.svc.Health()
-			assert.True(t, got.LivenessKnown)
-			assert.False(t, got.LivenessUnsupported, "cleared when the endpoint answers")
-			assert.Empty(t, got.Error)
-			assert.Equal(t, got.CurrentEpoch-1, got.LivenessEpoch)
-			assert.Equal(t, uint64(4), got.Tracked)
-			assert.Equal(t, uint64(4), got.Live)
-		})
-	}
-}
-
-func TestLivenessTransientFailureIsRetried(t *testing.T) {
+func TestStoreFailuresHoldTheLivenessBack(t *testing.T) {
 	store := newFakeStore(host("a", 0, 4))
+	store.listHostsErr = errStore
 	h := newHarness(t, 1, store, nil)
-	h.node.set(func(n *fakeNode) {
-		n.livenessStatus = http.StatusInternalServerError
-		n.livenessMessage = "state unavailable"
-	})
 
 	h.svc.poll(t.Context())
 
 	got := h.svc.Health()
-	assert.False(t, got.LivenessKnown, "nothing stored yet")
-	assert.False(t, got.LivenessUnsupported, "a transient failure is not an unsupported endpoint")
-	assert.Contains(t, got.Error, "validator liveness for epoch 9")
-	assert.Contains(t, got.Error, "HTTP 500: state unavailable")
+	assert.Empty(t, got.Error, "the chain view does not need the store")
 	assert.Equal(t, h.clock.Now(), got.UpdatedAt)
-	assert.Zero(t, h.warnings("does not serve validator liveness"))
-
-	// Retried on the very next poll, no re-probe wait.
-	h.node.set(func(n *fakeNode) { n.livenessStatus = 0 })
-	h.clock.Advance(testSlot)
-	h.svc.poll(t.Context())
-
-	got = h.svc.Health()
-	assert.True(t, got.LivenessKnown)
-	assert.Empty(t, got.Error)
-	assert.Equal(t, uint64(9), got.LivenessEpoch)
-}
-
-func TestLivenessRejectedNewestEpochIsTransient(t *testing.T) {
-	// A 400 for the newest epoch (not a "disabled" message) is neither
-	// "unsupported" nor a reason to ask another endpoint the same thing.
-	h := newHarness(t, 2, newFakeStore(host("a", 0, 4)), nil)
-	h.nodes[0].set(func(n *fakeNode) {
-		n.livenessStatus = http.StatusBadRequest
-		n.livenessMessage = "validator index unknown"
-	})
-
-	h.svc.poll(t.Context())
-
-	got := h.svc.Health()
+	assert.Contains(t, got.LivenessError, "listing hosts: database is locked")
 	assert.False(t, got.LivenessKnown)
-	assert.False(t, got.LivenessUnsupported)
-	assert.Contains(t, got.Error, "HTTP 400: validator index unknown")
-	assert.NotContains(t, got.Error, "unavailable")
-	assert.Empty(t, h.nodes[1].livenessCalls())
-	assert.Len(t, h.nodes[0].livenessCalls(), 1)
 
-	h.clock.Advance(testSlot)
-	h.svc.poll(t.Context())
-
-	assert.Len(t, h.nodes[0].livenessCalls(), 2, "retried on the next poll")
-}
-
-func TestLivenessFailsOverToEndpointThatServesIt(t *testing.T) {
-	store := newFakeStore(host("a", 0, 4))
-	h := newHarness(t, 2, store, nil)
-	h.nodes[0].set(func(n *fakeNode) { n.livenessStatus = http.StatusNotFound })
-
-	h.svc.poll(t.Context())
-
-	got := h.svc.Health()
-	assert.True(t, got.LivenessKnown)
-	assert.Empty(t, got.Error)
-	assert.Equal(t, uint64(9), got.LivenessEpoch)
-	assert.Len(t, h.nodes[0].livenessCalls(), 1)
-	assert.NotEmpty(t, h.nodes[1].livenessCalls())
-}
-
-func TestLivenessBackfill(t *testing.T) {
-	t.Run("node serves older epochs", func(t *testing.T) {
-		store := newFakeStore(host("a", 0, 4))
-		h := newHarness(t, 1, store, nil)
-		h.node.set(func(n *fakeNode) {
-			n.isLive = func(epoch, index uint64) bool { return epoch != 8 || index == 0 }
-		})
-
-		h.svc.poll(t.Context())
-
-		assert.Equal(t, []uint64{9, 8, 7}, h.node.livenessEpochs(), "newest first")
-		assert.Equal(t, []uint64{7, 8, 9}, store.epochs())
-
-		old, _ := store.row("a", 8)
-		assert.Equal(t, fleet.Liveness{Host: "a", Epoch: 8, Live: 1, Total: 4}, old)
-
-		got := h.svc.Health()
-		assert.Equal(t, uint64(9), got.LivenessEpoch)
-		assert.Equal(t, uint64(4), got.Live)
+	store.set(func(s *fakeStore) {
+		s.listHostsErr = nil
+		s.slotSaveErr = errStore
 	})
-
-	t.Run("node serves the previous epoch only", func(t *testing.T) {
-		store := newFakeStore(host("a", 0, 4))
-		h := newHarness(t, 1, store, nil)
-		h.node.set(func(n *fakeNode) { n.minEpoch = 9 })
-
-		h.svc.poll(t.Context())
-
-		assert.Equal(t, []uint64{9, 8, 7}, h.node.livenessEpochs())
-		assert.Equal(t, []uint64{9}, store.epochs())
-
-		got := h.svc.Health()
-		assert.Empty(t, got.Error, "refused old epochs are not an error")
-		assert.True(t, got.LivenessKnown)
-		assert.Zero(t, h.warnings(""), "and are handled quietly")
-
-		// The refused epochs are not asked for again.
-		h.clock.Advance(testSlot)
-		h.svc.poll(t.Context())
-
-		assert.Len(t, h.node.livenessCalls(), 3)
-	})
-
-	// Not every client refuses an out-of-range epoch with 400.
-	for _, status := range []int{
-		http.StatusInternalServerError, http.StatusServiceUnavailable,
-		http.StatusUnprocessableEntity, http.StatusNotFound,
-	} {
-		t.Run("node answers older epochs with "+http.StatusText(status), func(t *testing.T) {
-			store := newFakeStore(host("a", 0, 4))
-			h := newHarness(t, 1, store, nil)
-			h.node.set(func(n *fakeNode) {
-				n.minEpoch = 9
-				n.oldEpochStatus = status
-			})
-
-			h.svc.poll(t.Context())
-
-			assert.Equal(t, []uint64{9, 8, 7}, h.node.livenessEpochs())
-			assert.Equal(t, []uint64{9}, store.epochs())
-
-			got := h.svc.Health()
-			assert.Empty(t, got.Error, "an unserved old epoch is not an error")
-			assert.True(t, got.LivenessKnown)
-			assert.Equal(t, uint64(9), got.LivenessEpoch)
-			assert.Zero(t, h.warnings(""), "and is handled quietly")
-
-			// The older epochs are not asked for again.
-			h.clock.Advance(testSlot)
-			h.svc.poll(t.Context())
-
-			assert.Len(t, h.node.livenessCalls(), 3)
-			assert.Empty(t, h.svc.Health().Error)
-			assert.Zero(t, h.warnings(""))
-		})
-	}
-
-	t.Run("early chain has fewer epochs than the window", func(t *testing.T) {
-		store := newFakeStore(host("a", 0, 4))
-		h := newHarness(t, 1, store, nil)
-		h.clock.Set(at(2, 30*time.Second))
-
-		h.svc.poll(t.Context())
-
-		assert.Equal(t, []uint64{1, 0}, h.node.livenessEpochs())
-		assert.Equal(t, []uint64{0, 1}, store.epochs())
-	})
-
-	t.Run("an epoch missed during an outage is fetched afterwards", func(t *testing.T) {
-		store := newFakeStore(host("a", 0, 4))
-		h := newHarness(t, 1, store, nil)
-		h.svc.poll(t.Context())
-		require.Equal(t, []uint64{7, 8, 9}, store.epochs())
-
-		h.node.set(func(n *fakeNode) { n.down = true })
-		h.clock.Advance(testEpoch)
-		h.svc.poll(t.Context())
-		require.NotEmpty(t, h.svc.Health().Error)
-
-		h.node.set(func(n *fakeNode) { n.down = false })
-		h.clock.Advance(testEpoch)
-		h.svc.poll(t.Context())
-
-		assert.Equal(t, []uint64{7, 8, 9, 10, 11}, store.epochs())
-		assert.Equal(t, []uint64{9, 8, 7, 11, 10}, h.node.livenessEpochs())
-	})
-}
-
-func TestLivenessWaitsForTheEpochToSettle(t *testing.T) {
-	store := newFakeStore(host("a", 0, 4))
-	h := newHarness(t, 1, store, nil)
-	h.node.set(func(n *fakeNode) { n.minEpoch = 8 })
-
-	// 5 s into epoch 10: epoch 9 ended less than a slot ago.
-	h.clock.Set(at(10, 5*time.Second))
-	h.svc.poll(t.Context())
-
-	assert.Equal(t, []uint64{8}, store.epochs())
-	assert.Equal(t, uint64(8), h.svc.Health().LivenessEpoch)
-
-	h.clock.Set(at(10, testSlot))
-	h.svc.poll(t.Context())
-
-	assert.Equal(t, []uint64{8, 9}, store.epochs())
-	assert.Equal(t, uint64(9), h.svc.Health().LivenessEpoch)
-}
-
-func TestLivenessStoredEpochIsNotQueriedAgain(t *testing.T) {
-	store := newFakeStore(host("a", 0, 4))
-	h := newHarness(t, 1, store, nil)
-	h.node.set(func(n *fakeNode) { n.minEpoch = 9 })
-
-	h.svc.poll(t.Context())
-	require.Equal(t, []uint64{9, 8, 7}, h.node.livenessEpochs())
-
-	hostReads := store.listHostsCalls
-
-	// More polls inside the same epoch ask for nothing and read no hosts.
-	for range 5 {
-		h.clock.Advance(testSlot)
-		h.svc.poll(t.Context())
-	}
-
-	assert.Len(t, h.node.livenessCalls(), 3)
-	assert.Equal(t, hostReads, store.listHostsCalls)
-	assert.Equal(t, 1, store.saveCalls)
-
-	// A restarted controller finds epoch 9 in the store and does not repeat
-	// it; the older ones are probed once by the new process.
-	restarted := h.build(t)
-	restarted.poll(t.Context())
-
-	assert.Equal(t, []uint64{9, 8, 7, 8, 7}, h.node.livenessEpochs())
-	assert.Equal(t, 1, store.saveCalls)
-	assert.True(t, restarted.Health().LivenessKnown)
-	assert.Equal(t, uint64(9), restarted.Health().LivenessEpoch)
-
-	// The next epoch is queried exactly once.
-	h.clock.Set(at(11, 30*time.Second))
-	h.node.set(func(n *fakeNode) { n.minEpoch = 10 })
-	restarted.poll(t.Context())
-	restarted.poll(t.Context())
-
-	assert.Equal(t, []uint64{9, 8, 7, 8, 7, 10}, h.node.livenessEpochs())
-	assert.Equal(t, []uint64{9, 10}, store.epochs())
-	assert.Equal(t, hostReads+2, store.listHostsCalls, "hosts are read once per epoch")
-}
-
-func TestLivenessHostsAreReadEveryEpoch(t *testing.T) {
-	store := newFakeStore(host("a", 0, 4))
-	h := newHarness(t, 1, store, nil)
-	h.node.set(func(n *fakeNode) { n.minEpoch = 9 })
-
-	h.svc.poll(t.Context())
-	require.Equal(t, uint64(4), h.svc.Health().Tracked)
-
-	store.set(func(s *fakeStore) { s.hosts = append(s.hosts, host("new", 4, 12)) })
-	h.clock.Advance(testEpoch)
-	h.node.set(func(n *fakeNode) { n.minEpoch = 10 })
-	h.svc.poll(t.Context())
-
-	added, ok := store.row("new", 10)
-	require.True(t, ok)
-	assert.Equal(t, fleet.Liveness{Host: "new", Epoch: 10, Live: 8, Total: 8}, added)
-
-	_, ok = store.row("new", 9)
-	assert.False(t, ok)
-
-	got := h.svc.Health()
-	assert.Equal(t, uint64(10), got.LivenessEpoch)
-	assert.Equal(t, uint64(12), got.Tracked)
-}
-
-func TestLivenessWithoutValidators(t *testing.T) {
-	store := newFakeStore(host("bootnode-1", 0, 0), host("rpc-1", 0, 0))
-	h := newHarness(t, 1, store, nil)
-	h.node.set(func(n *fakeNode) { n.minEpoch = 9 })
-
-	h.svc.poll(t.Context())
-
-	got := h.svc.Health()
-	assert.Empty(t, got.Error)
-	assert.False(t, got.LivenessKnown, "nothing is stored, so nothing is known")
-	assert.Zero(t, got.Tracked)
-	assert.InDelta(t, 1.0, got.Participation(), 1e-9)
-	assert.Empty(t, h.node.livenessCalls())
-
-	// The first validator host registers within the epoch.
-	store.set(func(s *fakeStore) { s.hosts = append(s.hosts, host("validator-1", 0, 8)) })
-	h.clock.Advance(testSlot)
 	h.svc.poll(t.Context())
 
 	got = h.svc.Health()
-	assert.True(t, got.LivenessKnown)
-	assert.Equal(t, uint64(9), got.LivenessEpoch)
-	assert.Equal(t, uint64(8), got.Tracked)
-}
+	assert.Contains(t, got.LivenessError, "saving slot participation: database is locked")
+	assert.False(t, got.LivenessKnown, "slots that were not stored settle no epoch")
 
-func TestLivenessValidatorsRemoved(t *testing.T) {
-	store := newFakeStore(host("a", 0, 4), host("rpc-1", 0, 0))
-	h := newHarness(t, 1, store, nil)
-	h.node.set(func(n *fakeNode) { n.minEpoch = 9 })
-
-	h.svc.poll(t.Context())
-
-	got := h.svc.Health()
-	require.True(t, got.LivenessKnown)
-	require.Equal(t, uint64(9), got.LivenessEpoch)
-	require.Equal(t, uint64(4), got.Tracked)
-
-	// The only validator host loses its validators. Epoch 9 is stored and
-	// still the newest complete epoch: its summary stands.
-	store.set(func(s *fakeStore) { s.hosts = []*fleet.Host{host("a", 0, 0), host("rpc-1", 0, 0)} })
-	h.clock.Advance(testSlot)
+	store.set(func(s *fakeStore) { s.slotSaveErr = nil })
 	h.svc.poll(t.Context())
 
 	got = h.svc.Health()
+	assert.Empty(t, got.LivenessError)
 	assert.True(t, got.LivenessKnown)
-	assert.Equal(t, uint64(4), got.Tracked)
-
-	// From the next epoch on nothing is tracked; the stored rows of epoch 9
-	// must not be reported as the fleet's liveness.
-	for range 3 {
-		h.clock.Advance(testEpoch)
-		h.svc.poll(t.Context())
-
-		got = h.svc.Health()
-		assert.Empty(t, got.Error)
-		assert.False(t, got.LivenessKnown, "nothing is tracked, so nothing is known")
-		assert.Zero(t, got.LivenessEpoch)
-		assert.Zero(t, got.Tracked)
-		assert.Zero(t, got.Live)
-		assert.InDelta(t, 1.0, got.Participation(), 1e-9)
-	}
-
-	assert.Equal(t, []uint64{9}, store.epochs(), "the old rows stay until they are pruned")
-	assert.Len(t, h.node.livenessCalls(), 3, "nothing was asked without validators")
-
-	// A validator host is back: its newest epoch is reported again.
-	store.set(func(s *fakeStore) { s.hosts = []*fleet.Host{host("b", 10, 16)} })
-	h.node.set(func(n *fakeNode) { n.minEpoch = 12 })
-	h.clock.Advance(testSlot)
-	h.svc.poll(t.Context())
-
-	got = h.svc.Health()
-	assert.True(t, got.LivenessKnown)
-	assert.Equal(t, uint64(12), got.LivenessEpoch)
-	assert.Equal(t, uint64(6), got.Tracked)
-	assert.Equal(t, uint64(6), got.Live)
-}
-
-func TestLivenessPruning(t *testing.T) {
-	store := newFakeStore(host("a", 0, 4))
-	for epoch := uint64(0); epoch < 9; epoch++ {
-		require.NoError(t, store.SaveLiveness(t.Context(),
-			[]fleet.Liveness{{Host: "a", Epoch: epoch, Live: 4, Total: 4}}))
-	}
-
-	h := newHarness(t, 1, store, func(o *Options) { o.Retention = 4 })
-	h.node.set(func(n *fakeNode) { n.minEpoch = 9 })
-
-	h.svc.poll(t.Context())
-
-	assert.Equal(t, []uint64{6, 7, 8, 9}, store.epochs())
-	assert.Equal(t, []uint64{6}, store.pruneCalls)
-
-	h.clock.Advance(testSlot)
-	h.svc.poll(t.Context())
-
-	assert.Equal(t, []uint64{6}, store.pruneCalls, "pruned once per epoch")
-
-	h.clock.Set(at(11, 30*time.Second))
-	h.node.set(func(n *fakeNode) { n.minEpoch = 10 })
-	h.svc.poll(t.Context())
-
-	assert.Equal(t, []uint64{7, 8, 9, 10}, store.epochs())
-	assert.Equal(t, []uint64{6, 7}, store.pruneCalls)
-}
-
-func TestLivenessPruningDefaultsAndYoungChain(t *testing.T) {
-	store := newFakeStore(host("a", 0, 4))
-	h := newHarness(t, 1, store, nil)
-
-	h.svc.poll(t.Context())
-	assert.Empty(t, store.pruneCalls, "younger than the retention: nothing to prune")
-
-	h.clock.Set(at(DefaultRetention+6, 30*time.Second))
-	h.svc.poll(t.Context())
-	assert.Equal(t, []uint64{6}, store.pruneCalls)
-}
-
-func TestStoreFailures(t *testing.T) {
-	t.Run("listing hosts", func(t *testing.T) {
-		store := newFakeStore(host("a", 0, 4))
-		store.listHostsErr = errStore
-		h := newHarness(t, 1, store, nil)
-
-		h.svc.poll(t.Context())
-
-		got := h.svc.Health()
-		assert.Contains(t, got.Error, "listing hosts: database is locked")
-		assert.Equal(t, h.clock.Now(), got.UpdatedAt)
-		assert.False(t, got.LivenessKnown)
-
-		store.set(func(s *fakeStore) { s.listHostsErr = nil })
-		h.svc.poll(t.Context())
-
-		assert.Empty(t, h.svc.Health().Error)
-		assert.True(t, h.svc.Health().LivenessKnown)
-	})
-
-	t.Run("saving rows", func(t *testing.T) {
-		store := newFakeStore(host("a", 0, 4))
-		store.saveErr = errStore
-		h := newHarness(t, 1, store, nil)
-		h.node.set(func(n *fakeNode) { n.minEpoch = 9 })
-
-		h.svc.poll(t.Context())
-
-		assert.Contains(t, h.svc.Health().Error, "saving liveness for epoch 9")
-		assert.False(t, h.svc.Health().LivenessKnown)
-
-		// The epoch was not marked as done: it is asked for and saved again.
-		store.set(func(s *fakeStore) { s.saveErr = nil })
-		h.svc.poll(t.Context())
-
-		assert.Empty(t, h.svc.Health().Error)
-		assert.Equal(t, []uint64{9}, store.epochs())
-	})
-
-	t.Run("reading rows", func(t *testing.T) {
-		store := newFakeStore(host("a", 0, 4))
-		h := newHarness(t, 1, store, nil)
-		h.svc.poll(t.Context())
-		require.True(t, h.svc.Health().LivenessKnown)
-
-		store.set(func(s *fakeStore) { s.listErr = errStore })
-		h.clock.Advance(testSlot)
-		h.svc.poll(t.Context())
-
-		got := h.svc.Health()
-		assert.Contains(t, got.Error, "reading stored liveness: database is locked")
-		assert.True(t, got.LivenessKnown, "the last known summary stays")
-		assert.Equal(t, uint64(4), got.Tracked)
-	})
-
-	t.Run("reading rows on the first poll", func(t *testing.T) {
-		store := newFakeStore(host("a", 0, 4))
-		store.listErr = errStore
-		h := newHarness(t, 1, store, nil)
-
-		h.svc.poll(t.Context())
-
-		assert.Contains(t, h.svc.Health().Error, "reading stored liveness")
-		assert.Empty(t, h.node.livenessCalls(), "nothing is queried before the store was read")
-
-		store.set(func(s *fakeStore) { s.listErr = nil })
-		h.svc.poll(t.Context())
-
-		assert.Empty(t, h.svc.Health().Error)
-		assert.True(t, h.svc.Health().LivenessKnown)
-	})
 }
 
 func TestMalformedAnswers(t *testing.T) {
@@ -1394,7 +563,11 @@ func TestStartStopLifecycle(t *testing.T) {
 	require.NoError(t, svc.Stop())
 	require.NoError(t, svc.Stop(), "Stop twice is harmless")
 
-	// Nothing polls after Stop.
+	// Nothing polls after Stop. A request the cancelled poll had already sent
+	// may still reach the node's handler after Stop returned: let it land
+	// before counting.
+	time.Sleep(20 * time.Millisecond)
+
 	before := h.node.totalRequests()
 
 	time.Sleep(30 * time.Millisecond)
@@ -1402,7 +575,7 @@ func TestStartStopLifecycle(t *testing.T) {
 
 	health := svc.Health()
 	assert.Equal(t, testGenesis, health.GenesisTime)
-	assert.Equal(t, uint64(4), health.Tracked)
+	assert.True(t, health.LivenessKnown)
 }
 
 func TestContextCancelStopsPolling(t *testing.T) {

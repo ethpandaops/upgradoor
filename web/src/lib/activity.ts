@@ -1,18 +1,10 @@
 // What the Overview says about the scheduler's state: which queued hosts will
 // be served by themselves, and what is stuck until somebody acts.
 
-import { list, type Gate, type HostSummary, type QueueEntry, type Rollout, type WaitKind } from '../api/types';
+import { list, type Gate, type HostListing, type QueueEntry, type Rollout, type WaitKind } from '../api/types';
+import { pauseLabel } from './format';
 
-export type AttentionKind =
-  | 'gate'
-  | 'paused'
-  | 'halted'
-  | 'approval'
-  | 'rollout-paused'
-  | 'policy-paused'
-  | 'held'
-  | 'silent'
-  | 'verb';
+type AttentionKind = 'gate' | 'paused' | 'halted' | 'approval' | 'rollout-paused' | 'held' | 'silent' | 'verb';
 
 export interface AttentionItem {
   /** Stable key for the list. */
@@ -27,7 +19,7 @@ export interface AttentionItem {
   rollout?: Rollout;
 }
 
-const ROLLOUT_WAITS: ReadonlySet<WaitKind> = new Set(['halted', 'approval', 'rollout-paused', 'policy-paused']);
+const ROLLOUT_WAITS: ReadonlySet<WaitKind> = new Set(['halted', 'approval', 'rollout-paused']);
 
 function waitingHosts(n: number): string {
   return n === 1 ? '1 host waits' : `${n} hosts wait`;
@@ -43,7 +35,7 @@ export function attentionItems(input: {
   paused: boolean;
   queue: readonly QueueEntry[];
   rollouts: readonly Rollout[];
-  hosts: readonly HostSummary[];
+  hosts: readonly HostListing[];
 }): AttentionItem[] {
   const { queue } = input;
   const items: AttentionItem[] = [];
@@ -78,14 +70,10 @@ export function attentionItems(input: {
   const groups = new Map<string, AttentionItem>();
 
   for (const q of queue) {
-    if (!q.wait || !ROLLOUT_WAITS.has(q.wait)) continue;
+    if (!ROLLOUT_WAITS.has(q.wait)) continue;
 
-    // The rollout the reason is about. The plan names it; an older
-    // controller does not, and then only a host in a single rollout is
-    // unambiguous.
-    const candidates = list(q.rollouts);
-    const about = q.rollout ?? (candidates.length === 1 ? candidates[0] : undefined);
-    const rollout = about === undefined ? undefined : byId.get(about);
+    // The rollout the reason is about: the plan names it.
+    const rollout = q.rollout === undefined ? undefined : byId.get(q.rollout);
     const id = `${q.wait}/${rollout?.id ?? ''}`;
 
     let item = groups.get(id);
@@ -100,11 +88,7 @@ export function attentionItems(input: {
             ? `${name} is halted`
             : q.wait === 'approval'
               ? `${name} waits for approval`
-              : q.wait === 'rollout-paused'
-                ? rollout?.pauseReason
-                  ? `${name} is paused after its canary`
-                  : `${name} is paused`
-                : `${name}: its policy is set to paused`,
+              : `${name} is ${pauseLabel(rollout?.pauseReason)}`,
         detail: q.wait === 'halted' ? (rollout?.reason ?? q.reason) : '',
         hosts: [],
         rollout,

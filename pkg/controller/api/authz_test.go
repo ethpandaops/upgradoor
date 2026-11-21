@@ -48,6 +48,13 @@ func owned(name string, owners ...string) protocol.Container {
 	return protocol.Container{Name: name, State: "running", Managed: true, Owners: owners}
 }
 
+// ofClient is a managed container of a client.
+func ofClient(c protocol.Container, kind protocol.ContainerKind, client string) protocol.Container {
+	c.Kind, c.Client = kind, client
+
+	return c
+}
+
 // ownershipFixture fills the fake store with the fleet above.
 func ownershipFixture(h *harness) {
 	status := func(containers ...protocol.Container) *protocol.SyncRequest {
@@ -62,13 +69,13 @@ func ownershipFixture(h *harness) {
 
 	h.store.hosts[hostMixed] = &fleet.Host{Name: hostMixed, LastSeen: testEpoch, Status: status(
 		owned("geth", "geth"),
-		owned("lighthouse", "lighthouse"),
-		owned("lighthouse-validator", "lighthouse"),
+		ofClient(owned("lighthouse", "lighthouse"), protocol.KindCL, "lighthouse"),
+		ofClient(owned("lighthouse-validator", "lighthouse"), protocol.KindVC, "lighthouse"),
 		protocol.Container{Name: "debug", State: "exited"},
 	)}
 	h.store.hosts[hostTeku] = &fleet.Host{Name: hostTeku, LastSeen: testEpoch, Status: status(
-		owned("geth", "geth"),
-		owned("teku", "nimbus", "teku"),
+		ofClient(owned("geth", "geth"), protocol.KindEL, "geth"),
+		ofClient(owned("teku", "nimbus", "teku"), protocol.KindCL, "teku"),
 	)}
 	h.store.hosts[hostUnowned] = &fleet.Host{Name: hostUnowned, LastSeen: testEpoch, Status: status(
 		owned("bootnode"),
@@ -202,11 +209,43 @@ func actionSamples(t *testing.T) []actionSample {
 		{action: "reboot", body: hosts, feature: FeatureReboot, twin: true},
 		{action: "hold", body: hosts, feature: FeatureHold, twin: true},
 		{action: "unhold", body: hosts, feature: FeatureHold, twin: true},
+		{
+			action:  "mark-offline",
+			body:    fmt.Sprintf(`{"hosts":[%q],"reason":"debugging a client"}`, hostMixed),
+			feature: FeatureHold, twin: true,
+		},
+		{action: "unmark-offline", body: hosts, feature: FeatureHold, twin: true},
 		{action: "skip", body: rolloutHosts, feature: FeatureRecover, twin: true},
 		{action: "retry", body: rolloutHosts, feature: FeatureRecover, twin: true},
 		{
 			action: "end-lease", body: fmt.Sprintf(`{"lease":%q}`, leaseMixed),
 			feature: FeatureRecover, twin: true,
+		},
+		{
+			action:  "image-override",
+			body:    fmt.Sprintf(`{"host":%q,"container":"lighthouse","image":"sigp/lighthouse:fix"}`, hostMixed),
+			feature: FeatureImageOverride, twin: true,
+		},
+		{
+			action:  "flag-override",
+			body:    fmt.Sprintf(`{"host":%q,"container":"lighthouse","addFlags":["--debug-level=debug"]}`, hostMixed),
+			feature: FeatureFlagOverride, twin: true,
+		},
+		{
+			action: "client-override",
+			body: fmt.Sprintf(`{"client":"lighthouse","kind":"cl","hosts":[%q],"part":"image","image":"sigp/lighthouse:fix"}`,
+				hostMixed),
+			feature: FeatureImageOverride, twin: true,
+		},
+		{
+			action: "client-override",
+			body: fmt.Sprintf(`{"client":"lighthouse","kind":"vc","hosts":[%q],"part":"flags","addFlags":["--debug"]}`,
+				hostMixed),
+			feature: FeatureFlagOverride, twin: true,
+		},
+		{
+			action: "client-policy", body: `{"client":"lighthouse","policy":"manual"}`,
+			feature: FeatureClientPolicy, twin: true,
 		},
 		{action: "pause", body: `{"rollout":"r-1"}`, feature: FeatureSupervise},
 		{action: "resume", body: `{"rollout":"r-1"}`, feature: FeatureSupervise},
@@ -465,7 +504,7 @@ func TestAuthorizeTargets(t *testing.T) {
 				"on host ghost-1 (owners: none)",
 		},
 		{
-			// The scheduler answers the unknown host, as before.
+			// The scheduler answers the unknown host.
 			name: "roll an unknown host, plain feature", action: "roll",
 			body: `{"hosts":` + hosts(hostGhost) + `}`, services: "+upgradoor:roll", by: "roll",
 		},
@@ -805,7 +844,7 @@ func TestAuthorizeStoreError(t *testing.T) {
 func TestFeatureNames(t *testing.T) {
 	features := []string{
 		FeatureRoll, FeatureReboot, FeatureHold, FeatureRecover, FeatureSupervise,
-		FeatureAdmin,
+		FeatureClientPolicy, FeatureImageOverride, FeatureFlagOverride, FeatureAdmin,
 	}
 
 	for _, f := range features {

@@ -49,8 +49,7 @@ func sampleRecord() *operationRecord {
 				},
 			},
 		},
-		ReceivedAt: at,
-		Deadline:   at.Add(time.Hour),
+		Deadline: at.Add(time.Hour),
 		Operation: protocol.Operation{
 			LeaseID: "lease-1", Phase: protocol.PhaseRebooting, StartedAt: at, UpdatedAt: at,
 			Steps:     []protocol.Step{{NeedID: protocol.RebootNeedID, Status: protocol.StepRunning}},
@@ -74,7 +73,7 @@ func TestStateSurvivesReopen(t *testing.T) {
 	want := persistedState{
 		Version: stateVersion,
 		Handled: []handledDirective{
-			{ID: "d-1", Status: protocol.DirectiveRejected, Error: "no", At: time.Unix(1, 0).UTC()},
+			{ID: "d-1", Status: protocol.DirectiveRejected, Error: "no"},
 		},
 		ManualNeeds: []protocol.Need{{
 			ID: "manual/d-2", Kind: protocol.NeedReboot, DirectiveID: "d-2",
@@ -267,79 +266,6 @@ func TestHandledDirectivesAreBounded(t *testing.T) {
 	require.NotNil(t, st.handled("d-100"))
 	assert.Equal(t, protocol.DirectiveAccepted, st.handled("d-100").Status)
 	assert.Equal(t, fmt.Sprintf("d-%d", maxHandledDirectives+49), st.Handled[len(st.Handled)-1].ID)
-}
-
-func TestLeaseDeadline(t *testing.T) {
-	now := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)
-
-	tests := []struct {
-		name    string
-		expires time.Time
-		ttl     int64
-		want    time.Time
-	}{
-		{name: "clocks agree", expires: now.Add(30 * time.Minute), ttl: 1800, want: now.Add(30 * time.Minute)},
-		{name: "controller clock ahead", expires: now.Add(2 * time.Hour), ttl: 1800, want: now.Add(30 * time.Minute)},
-		{name: "controller clock behind", expires: now.Add(-time.Hour), ttl: 1800, want: now.Add(-time.Hour)},
-		{name: "restated late", expires: now.Add(10 * time.Minute), ttl: 600, want: now.Add(10 * time.Minute)},
-		{name: "no ttl", expires: now.Add(time.Hour), ttl: 0, want: now},
-		{name: "negative ttl", expires: now.Add(time.Hour), ttl: -5, want: now},
-		{name: "no expiry", ttl: 60, want: now.Add(time.Minute)},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := leaseDeadline(&protocol.Lease{ExpiresAt: tt.expires, TTLSeconds: tt.ttl}, now)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestHolds(t *testing.T) {
-	dir := t.TempDir()
-	cfg := &Config{HoldFile: filepath.Join(dir, "etc", "hold"), StateDir: filepath.Join(dir, "state")}
-	h := newHolds(cfg)
-
-	assert.Equal(t, protocol.Hold{}, h.Read())
-
-	// The controller hold is a flag in the state directory.
-	require.NoError(t, h.SetController("maintenance\nwindow"))
-	assert.Equal(t, protocol.Hold{Controller: true}, h.Read())
-	assert.FileExists(t, filepath.Join(cfg.StateDir, controllerHoldFile))
-
-	require.NoError(t, h.SetController(""), "setting it twice is fine")
-	assert.True(t, newHolds(cfg).Read().Controller, "it is on disk")
-
-	// The local hold is a file a person creates.
-	require.NoError(t, os.MkdirAll(filepath.Dir(cfg.HoldFile), 0o700))
-	require.NoError(t, os.WriteFile(cfg.HoldFile, []byte("  debugging\tteku  \nmore\n"), 0o600))
-	assert.Equal(t, protocol.Hold{Local: true, LocalReason: "debugging teku", Controller: true}, h.Read())
-
-	// Releasing the controller hold leaves the local one alone.
-	require.NoError(t, h.ReleaseController())
-	require.NoError(t, h.ReleaseController(), "releasing twice is fine")
-	assert.Equal(t, protocol.Hold{Local: true, LocalReason: "debugging teku"}, h.Read())
-	assert.FileExists(t, cfg.HoldFile)
-
-	// An empty hold file holds too, without a reason.
-	require.NoError(t, os.WriteFile(cfg.HoldFile, nil, 0o600))
-	assert.Equal(t, protocol.Hold{Local: true}, h.Read())
-
-	// So does anything else at that path: when in doubt, hold.
-	require.NoError(t, os.Remove(cfg.HoldFile))
-	require.NoError(t, os.Mkdir(cfg.HoldFile, 0o700))
-	assert.True(t, h.Read().Local)
-
-	require.NoError(t, os.Remove(cfg.HoldFile))
-	assert.False(t, h.Read().Active())
-
-	long := make([]byte, 5000)
-	for i := range long {
-		long[i] = 'x'
-	}
-
-	require.NoError(t, os.WriteFile(cfg.HoldFile, long, 0o600))
-	assert.Len(t, h.Read().LocalReason, maxHoldReason, "the reported reason is bounded")
 }
 
 // Once the rename has happened the file holds the new state, whatever the

@@ -43,3 +43,7 @@ func CleanOwners(owners []string) []string {
 
 	return out
 }
+
+// ValidClient reports whether name is a client name in normal form: the same
+// form as a team name, so "geth" and "lighthouse" are and "Geth" is not.
+func ValidClient(name string) bool { return ownerPattern.MatchString(name) }

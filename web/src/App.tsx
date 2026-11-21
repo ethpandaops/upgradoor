@@ -3,26 +3,30 @@ import { useEffect, useMemo, useRef, useState, type KeyboardEvent, type ReactNod
 import { errorText, type ApiClient } from './api/client';
 import type { Config } from './api/types';
 import { AppContext, useAuthState, type AppServices } from './appContext';
-import { canViewPrivate, type AuthState, type AuthStore } from './auth/authStore';
+import { canViewPrivate, type AuthStore } from './auth/authStore';
 import { Header } from './components/Header';
-import { PermissionsProvider } from './components/Permissions';
+import { LiveIndicator, LiveProvider } from './components/Live';
+import { DEFAULT_SERVICE, PermissionsProvider } from './components/Permissions';
 import { NowProvider } from './components/RelTime';
-import { Badge, Button, Loading, cx } from './components/primitives';
+import { Button, Loading, cx } from './components/primitives';
 import { useHashTab } from './hooks/useHashTab';
 import { useTheme } from './hooks/useTheme';
+import { FEATURE } from './lib/permissions';
 import { AuditTab } from './tabs/AuditTab';
+import { ClientsTab } from './tabs/ClientsTab';
 import { HostsTab } from './tabs/HostsTab';
 import { OverviewTab } from './tabs/OverviewTab';
 import { PackagesTab } from './tabs/PackagesTab';
 import { RolloutsTab } from './tabs/RolloutsTab';
 import { SettingsTab } from './tabs/SettingsTab';
 
-const TABS = ['overview', 'hosts', 'rollouts', 'packages', 'settings', 'audit'] as const;
+export const TABS = ['overview', 'hosts', 'clients', 'rollouts', 'packages', 'settings', 'audit'] as const;
 type TabId = (typeof TABS)[number];
 
 const TAB_LABEL: Record<TabId, string> = {
   overview: 'Overview',
   hosts: 'Hosts',
+  clients: 'Clients',
   rollouts: 'Rollouts',
   packages: 'Packages',
   settings: 'Settings',
@@ -30,7 +34,19 @@ const TAB_LABEL: Record<TabId, string> = {
 };
 
 /** Overview and Hosts have a public view; the rest needs a login. */
-const PRIVATE_TABS: ReadonlySet<TabId> = new Set(['rollouts', 'packages', 'settings', 'audit']);
+const PRIVATE_TABS: ReadonlySet<TabId> = new Set(['clients', 'rollouts', 'packages', 'settings', 'audit']);
+
+/**
+ * visibleTabs are the tabs the login can use; the others are not in the menu.
+ * The rules are the controller's: without a login only the public views
+ * exist, and the settings can only be changed with the feature admin, so for
+ * every other login the Settings tab would be a page of controls it cannot
+ * use. Without an auth provider (open mode) everything is shown. This only
+ * decides what is offered: the controller decides what each request may do.
+ */
+export function visibleTabs(access: { priv: boolean; admin: boolean }): TabId[] {
+  return TABS.filter(id => (id === 'settings' ? access.admin : !PRIVATE_TABS.has(id) || access.priv));
+}
 
 /** MockControls lets the mock mode flip the network gate and, with a fake auth client, the login from the UI. */
 export interface MockControls {
@@ -107,7 +123,7 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
   const services = useMemo<AppServices>(() => ({ api, auth, config }), [api, auth, config]);
   const authState = useAuthState(auth);
   const { preference, setPreference } = useTheme();
-  const [tab, setTab] = useHashTab<TabId>(TABS, 'overview');
+  const [wanted, setTab] = useHashTab<TabId>(TABS, 'overview');
   const [gateFailing, setGateFailing] = useState(() => mock?.gateFailing() ?? false);
   const [mockLogin, setMockLogin] = useState(() => mock?.login?.current() ?? '');
   const tabRefs = useRef(new Map<TabId, HTMLButtonElement>());
@@ -117,15 +133,27 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
   }, [config.network]);
 
   const priv = canViewPrivate(authState);
+  const service = config.authService || DEFAULT_SERVICE;
+  // Open mode has no login and no features: everything may be done.
+  const admin = !authState.enabled || (priv && auth.hasFeature(service, FEATURE.admin));
+  const tabs = useMemo(() => visibleTabs({ priv, admin }), [priv, admin]);
+
+  // A tab that is not in the menu is not shown either: its URL, and the tab a
+  // login was on when it ended, lead to the overview. The panel is the
+  // overview's from the first render, so nothing of the hidden tab flashes.
+  const tab: TabId = tabs.includes(wanted) ? wanted : 'overview';
+  useEffect(() => {
+    if (wanted !== tab) setTab(tab);
+  }, [wanted, tab, setTab]);
 
   const onTabKey = (e: KeyboardEvent<HTMLDivElement>) => {
-    const index = TABS.indexOf(tab);
+    const index = tabs.indexOf(tab);
     let next: TabId | undefined;
 
-    if (e.key === 'ArrowRight') next = TABS[(index + 1) % TABS.length];
-    else if (e.key === 'ArrowLeft') next = TABS[(index - 1 + TABS.length) % TABS.length];
-    else if (e.key === 'Home') next = TABS[0];
-    else if (e.key === 'End') next = TABS[TABS.length - 1];
+    if (e.key === 'ArrowRight') next = tabs[(index + 1) % tabs.length];
+    else if (e.key === 'ArrowLeft') next = tabs[(index - 1 + tabs.length) % tabs.length];
+    else if (e.key === 'Home') next = tabs[0];
+    else if (e.key === 'End') next = tabs[tabs.length - 1];
 
     if (next) {
       e.preventDefault();
@@ -135,157 +163,127 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
   };
 
   let panel: ReactNode;
-  if (PRIVATE_TABS.has(tab) && !priv) {
-    panel = <LoginPrompt tab={TAB_LABEL[tab]} auth={auth} authState={authState} />;
-  } else {
-    switch (tab) {
-      case 'overview':
-        panel = <OverviewTab onOpenTab={setTab} />;
-        break;
-      case 'hosts':
-        panel = <HostsTab />;
-        break;
-      case 'rollouts':
-        panel = <RolloutsTab />;
-        break;
-      case 'packages':
-        panel = <PackagesTab />;
-        break;
-      case 'settings':
-        panel = <SettingsTab />;
-        break;
-      case 'audit':
-        panel = <AuditTab />;
-        break;
-    }
+  switch (tab) {
+    case 'overview':
+      panel = <OverviewTab onOpenTab={setTab} />;
+      break;
+    case 'hosts':
+      panel = <HostsTab />;
+      break;
+    case 'clients':
+      panel = <ClientsTab onOpenTab={setTab} />;
+      break;
+    case 'rollouts':
+      panel = <RolloutsTab />;
+      break;
+    case 'packages':
+      panel = <PackagesTab />;
+      break;
+    case 'settings':
+      panel = <SettingsTab />;
+      break;
+    case 'audit':
+      panel = <AuditTab />;
+      break;
   }
 
   return (
     <AppContext value={services}>
-      <NowProvider>
-        <div className="flex min-h-dvh flex-col bg-background text-foreground">
-          <Header
-            config={config}
-            auth={auth}
-            authState={authState}
-            theme={preference}
-            onTheme={setPreference}
-            mockLabel={mock?.label}
-            extra={
-              mock && (
+      <LiveProvider>
+        <NowProvider>
+          <div className="flex min-h-dvh flex-col bg-background text-foreground">
+            <Header
+              config={config}
+              auth={auth}
+              authState={authState}
+              theme={preference}
+              onTheme={setPreference}
+              mockLabel={mock?.label}
+              extra={
                 <>
-                  <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
-                    <input
-                      type="checkbox"
-                      checked={gateFailing}
-                      onChange={e => {
-                        mock.setGateFailing(e.target.checked);
-                        setGateFailing(e.target.checked);
-                      }}
-                      className="accent-accent"
-                    />
-                    failing gate
-                  </label>
-                  {mock.login && (
-                    <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
-                      login as
-                      <select
-                        value={mockLogin}
-                        onChange={e => {
-                          mock.login?.set(e.target.value);
-                          setMockLogin(e.target.value);
-                        }}
-                        className="rounded-sm border border-border-strong bg-surface px-1 text-foreground"
-                      >
-                        {mock.login.options.map(option => (
-                          <option key={option} value={option}>
-                            {option}
-                          </option>
-                        ))}
-                      </select>
-                    </label>
+                  <LiveIndicator />
+                  {mock && (
+                    <>
+                      <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
+                        <input
+                          type="checkbox"
+                          checked={gateFailing}
+                          onChange={e => {
+                            mock.setGateFailing(e.target.checked);
+                            setGateFailing(e.target.checked);
+                          }}
+                          className="accent-accent"
+                        />
+                        failing gate
+                      </label>
+                      {mock.login && (
+                        <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
+                          login as
+                          <select
+                            value={mockLogin}
+                            onChange={e => {
+                              mock.login?.set(e.target.value);
+                              setMockLogin(e.target.value);
+                            }}
+                            className="rounded-sm border border-border-strong bg-surface px-1 text-foreground"
+                          >
+                            {mock.login.options.map(option => (
+                              <option key={option} value={option}>
+                                {option}
+                              </option>
+                            ))}
+                          </select>
+                        </label>
+                      )}
+                    </>
                   )}
                 </>
-              )
-            }
-            nav={
-              <div
-                role="tablist"
-                aria-label="Views"
-                onKeyDown={onTabKey}
-                className="flex h-full min-h-10 items-stretch"
-              >
-                {TABS.map(id => {
-                  const locked = PRIVATE_TABS.has(id) && !priv;
-                  return (
-                    <button
-                      key={id}
-                      ref={el => {
-                        if (el) tabRefs.current.set(id, el);
-                        else tabRefs.current.delete(id);
-                      }}
-                      type="button"
-                      role="tab"
-                      id={`tab-${id}`}
-                      aria-selected={tab === id}
-                      aria-controls="tab-panel"
-                      tabIndex={tab === id ? 0 : -1}
-                      title={locked ? 'Needs a login' : undefined}
-                      onClick={() => {
-                        setTab(id);
-                      }}
-                      className={cx(
-                        'border-y-2 border-t-transparent px-3 text-sm/6 font-medium whitespace-nowrap',
-                        tab === id
-                          ? 'border-b-accent text-foreground'
-                          : 'border-b-transparent text-muted hover:text-foreground',
-                        locked && tab !== id && 'text-faint'
-                      )}
-                    >
-                      {TAB_LABEL[id]}
-                      {locked && (
-                        <span aria-hidden="true" className="text-faint">
-                          {' '}
-                          (login)
-                        </span>
-                      )}
-                    </button>
-                  );
-                })}
-              </div>
-            }
-          />
+              }
+              nav={
+                <div
+                  role="tablist"
+                  aria-label="Views"
+                  onKeyDown={onTabKey}
+                  className="flex h-full min-h-10 items-stretch"
+                >
+                  {tabs.map(id => {
+                    return (
+                      <button
+                        key={id}
+                        ref={el => {
+                          if (el) tabRefs.current.set(id, el);
+                          else tabRefs.current.delete(id);
+                        }}
+                        type="button"
+                        role="tab"
+                        id={`tab-${id}`}
+                        aria-selected={tab === id}
+                        aria-controls="tab-panel"
+                        tabIndex={tab === id ? 0 : -1}
+                        onClick={() => {
+                          setTab(id);
+                        }}
+                        className={cx(
+                          'border-y-2 border-t-transparent px-3 text-sm/6 font-medium whitespace-nowrap',
+                          tab === id
+                            ? 'border-b-accent text-foreground'
+                            : 'border-b-transparent text-muted hover:text-foreground'
+                        )}
+                      >
+                        {TAB_LABEL[id]}
+                      </button>
+                    );
+                  })}
+                </div>
+              }
+            />
 
-          <main id="tab-panel" role="tabpanel" aria-labelledby={`tab-${tab}`} className="grow p-4">
-            <PermissionsProvider>{panel}</PermissionsProvider>
-          </main>
-        </div>
-      </NowProvider>
+            <main id="tab-panel" role="tabpanel" aria-labelledby={`tab-${tab}`} className="grow p-4">
+              <PermissionsProvider>{panel}</PermissionsProvider>
+            </main>
+          </div>
+        </NowProvider>
+      </LiveProvider>
     </AppContext>
-  );
-}
-
-function LoginPrompt({ tab, auth, authState }: { tab: string; auth: AuthStore; authState: AuthState }) {
-  return (
-    <div className="mx-auto flex max-w-md flex-col items-center gap-3 rounded-sm border border-border bg-surface p-6 text-center text-sm/6">
-      <Badge>{tab}</Badge>
-      {authState.providerError ? (
-        <p role="alert" className="text-danger">
-          The auth provider is unreachable, so nobody can log in right now. Only the public host list is available.
-        </p>
-      ) : (
-        <>
-          <p>This view shows host details that are only served to logged-in users.</p>
-          <Button
-            variant="primary"
-            onClick={() => {
-              auth.login();
-            }}
-          >
-            Login
-          </Button>
-        </>
-      )}
-    </div>
   );
 }

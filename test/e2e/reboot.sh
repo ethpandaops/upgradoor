@@ -26,6 +26,8 @@ set -euo pipefail
 
 # shellcheck source-path=SCRIPTDIR source=../system/lib.sh
 source "$(dirname "${BASH_SOURCE[0]}")/../system/lib.sh"
+# shellcheck source-path=SCRIPTDIR source=lib.sh
+source "$(dirname "${BASH_SOURCE[0]}")/lib.sh"
 
 repo=$SYSBOX_REPO
 id=upgradoor-reboot-$$
@@ -36,12 +38,6 @@ hosts=(host-1 host-2)
 ctl_port=18111
 ctl=http://127.0.0.1:$ctl_port
 export TMPDIR=$repo/.tmp
-
-pass() { printf 'PASS: %s\n' "$*"; }
-die() {
-    printf 'FAIL: %s\n' "$*" >&2
-    exit 1
-}
 
 cleanup() {
     code=$?
@@ -72,30 +68,13 @@ trap cleanup EXIT
 
 api() { curl -fsS --max-time 10 "$ctl$1"; }
 post() { curl -fsS --max-time 10 -H 'Content-Type: application/json' -X POST -d "$2" "$ctl$1"; }
-jq_true() {
-    local path=$1
-    shift
-    api "$path" | jq -e "$@" >/dev/null
-}
 
-wait_until() {
-    local what=$1 secs=$2 deadline
-    shift 2
-    deadline=$(($(date +%s) + secs))
-
-    until "$@" >/dev/null 2>&1; do
-        if [ "$(date +%s)" -ge "$deadline" ]; then
-            printf 'state at timeout:\n'
-            api /api/v1/plan | jq -c '{gate: .gate.reasons, budget, queue}' || true
-            api /api/v1/rollouts |
-                jq -c '(.open[], .recent[]) | {id, title, state, reason, hosts: [.hosts[] | {host, state, error}]}' || true
-            api /api/v1/rollouts | jq -c '.leases[] | {id, host, state, phase: .operation.phase, readiness, error}' || true
-            die "timed out after ${secs}s: $what"
-        fi
-        sleep 2
-    done
-
-    pass "$what"
+wait_poll=2
+e2e_state() {
+    api /api/v1/plan | jq -c '{gate: .gate.reasons, budget, queue}'
+    api /api/v1/rollouts |
+        jq -c '(.open[], .recent[]) | {id, title, state, reason, hosts: [.hosts[] | {host, state, error}]}'
+    api /api/v1/rollouts | jq -c '.leases[] | {id, host, state, phase: .operation.phase, readiness, error}'
 }
 
 # --- build -------------------------------------------------------------------
@@ -117,12 +96,21 @@ docker run -d --name "$id-beacon" --network "$net" --label upgradoor.test=reboot
 seed=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 export UPGRADOOR_SEED=$seed
 signer=$("$work/upgradoor" keygen signer-pubkey --network "$network")
+# The controller signs its answers with a key it derives from the controller
+# seed, a secret of its own; the agents accept only that key. The file is
+# read by another user inside the container, and this is a test seed.
+head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$work/controller.seed"
+chmod 0444 "$work/controller.seed"
+controller_pub=$("$work/upgradoor" keygen controller-pubkey --network "$network" \
+    --controller-seed-file "$work/controller.seed")
 
 # Open API (no auth provider): this is a closed test network.
 docker run -d --name "$id-controller" --network "$net" --label upgradoor.test=reboot \
     -p "127.0.0.1:$ctl_port:8080" --tmpfs /data \
-    -v "$work/upgradoor:/upgradoor:ro" debian:13-slim /upgradoor controller \
+    -v "$work/upgradoor:/upgradoor:ro" -v "$work/controller.seed:/controller.seed:ro" \
+    debian:13-slim /upgradoor controller \
     --listen :8080 --data-dir /data --network "$network" --signer-public-key "$signer" \
+    --controller-seed-file /controller.seed \
     --allow-insecure-agent-http --beacon-endpoint "http://$id-beacon:5052" \
     --default-setting policyReboot=auto --default-setting policyPackages=auto \
     --default-setting hostStaleAfter=45s --default-setting leaseTtl=5m \
@@ -151,8 +139,10 @@ for h in "${hosts[@]}"; do
 controller:
   url: http://$id-controller:8080
   allowInsecure: true
+  publicKeys: ["$controller_pub"]
   syncInterval: 3s
   leaseSyncInterval: 1s
+  maxSyncInterval: 3s
 verbs: [roll, packages, reboot]
 containers:
   - {name: "$name-app", kind: other, image: "busybox:stable", stopTimeout: 5s}
@@ -162,7 +152,6 @@ registry:
   pollInterval: 1h
 packages:
   blocked: [upgradoor-dummy]
-  inventoryInterval: 5s
 verify:
   window: 5s
   timeout: 1m
@@ -196,8 +185,8 @@ done
 unset UPGRADOOR_SEED
 
 wait_until "both hosts registered" 60 jq_true /api/v1/hosts '.hosts | length == 2'
-wait_until "network gate open (finality only, liveness not served)" 60 jq_true /api/v1/plan '.gate.ok'
-jq_true /api/v1/plan '.gate.network.livenessKnown == false' || die "expected liveness to be unknown"
+wait_until "network gate open" 60 jq_true /api/v1/plan '.gate.ok'
+wait_until "an epoch settled from the per-slot data" 60 jq_true /api/v1/plan '.gate.network.livenessKnown'
 
 # --- 1: packages + reboot in one slot, lease survives the reboot ----------------
 
@@ -263,8 +252,10 @@ jq -e '.operation.phase == "done" and .operation.disrupted == true
     die "blocked package was not upgraded"
 sysbox_exec "$h1" test ! -e /var/run/reboot-required || die "reboot-required flag still there"
 [ "$(docker inspect -f '{{.State.Running}}' "$h1-app")" = true ] || die "managed container not running after the reboot"
-sysbox_exec "$h1" journalctl -u upgradoor-agent --no-pager | grep -qiE 'draining|stopp' ||
-    die "agent journal shows no drain before the reboot"
+# Read the journal first: grep -q stops early and, under pipefail, the
+# journalctl it cut off would fail the check.
+journal=$(sysbox_exec "$h1" journalctl -u upgradoor-agent --no-pager)
+grep -qiE 'draining|stopp' <<<"$journal" || die "agent journal shows no drain before the reboot"
 pass "package upgraded, flag gone, container back"
 
 wait_until "packages and reboot rollouts completed" 60 \

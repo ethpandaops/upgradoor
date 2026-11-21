@@ -16,7 +16,7 @@ import "time"
 //     containers back and reports the remaining steps as cancelled. A lease
 //     that it has not started is never started.
 //   - Validate every need locally (verb allowed, no hold, container managed
-//     and not custom, tag unchanged, pulled digest equals ToDigest, package in
+//     and existing, tag unchanged, pulled digest equals ToDigest, package in
 //     the configured blocked set). The lease grants a slot; it cannot widen
 //     what the agent is willing to do.
 type Lease struct {
@@ -28,8 +28,7 @@ type Lease struct {
 	// Needs are the granted needs: copies of needs the agent reported.
 	Needs []Need `json:"needs"`
 	// Cancel is set while a person has ended the lease and it is still open.
-	// It is restated with the lease on every sync. An agent that does not
-	// know the field finishes its operation.
+	// It is restated with the lease on every sync.
 	Cancel bool `json:"cancel,omitempty"`
 }
 
@@ -60,8 +59,8 @@ const (
 	StepDone    StepStatus = "done"
 	StepFailed  StepStatus = "failed"
 	// StepSuperseded: the need no longer applied when its turn came (the tag
-	// moved on, the package was already upgraded, the container was swapped
-	// for a custom image). Nothing was disrupted for it and it is not a
+	// moved on, the package was already upgraded, agent.yaml names another
+	// spec now). Nothing was disrupted for it and it is not a
 	// failure.
 	StepSuperseded StepStatus = "superseded"
 	// StepRefused: local policy forbids the need (verb not allowed, hold,
@@ -114,16 +113,61 @@ const (
 	// DirectiveRecheck asks the agent to check its registries and package
 	// state now instead of at the next poll. It has no other effect.
 	DirectiveRecheck DirectiveKind = "recheck"
+	// DirectiveOverride asks the agent to write (or take out) the image or
+	// the flags of Container's entry in the host's overrides file. Like a
+	// roll it only creates a need: the container follows under a lease. The
+	// agent accepts it only within what its own configuration allows the
+	// controller to override on that container.
+	DirectiveOverride DirectiveKind = "override"
 )
+
+// Parts of an override that an instruction can set.
+const (
+	OverrideImage = "image"
+	OverrideFlags = "flags"
+)
+
+// Actor is who asked for a directive, as the controller states it: the user
+// it authenticated, the teams of the login and the feature that allowed the
+// request. The agent has verified that the answer is the controller's; it
+// cannot verify the user. It writes the actor into the overrides file and
+// its audit log as what the controller said.
+type Actor struct {
+	User    string   `json:"user"`
+	Teams   []string `json:"teams,omitempty"`
+	Feature string   `json:"feature,omitempty"`
+}
+
+// OverrideInstruction is the content of an override directive: one part of
+// a container's override, as it is to be from now on.
+type OverrideInstruction struct {
+	// Part is OverrideImage or OverrideFlags. The other part of the entry
+	// stays as it is.
+	Part string `json:"part"`
+	// Image is the image reference to run; empty takes the image override
+	// away. For OverrideImage.
+	Image string `json:"image,omitempty"`
+	// AddFlags and RemoveFlags are the flags to add and to remove; both
+	// empty takes the flag override away. For OverrideFlags.
+	AddFlags    []string `json:"addFlags,omitempty"`
+	RemoveFlags []string `json:"removeFlags,omitempty"`
+	// Until is when the entry ends. Required when the instruction sets
+	// something; the agent refuses an end further away than it allows.
+	Until *time.Time `json:"until,omitempty"`
+}
 
 // Directive is one outstanding instruction. The controller repeats it in
 // every response until the agent acknowledges its ID.
 type Directive struct {
 	ID   string        `json:"id"`
 	Kind DirectiveKind `json:"kind"`
-	// Container is the target of a roll directive.
+	// Container is the target of a roll or override directive.
 	Container string `json:"container,omitempty"`
 	Reason    string `json:"reason,omitempty"`
+	// By is who asked, for a directive that a person's action created.
+	By *Actor `json:"by,omitempty"`
+	// Override is the content of an override directive.
+	Override *OverrideInstruction `json:"override,omitempty"`
 }
 
 // DirectiveStatus is the agent's answer to a directive.

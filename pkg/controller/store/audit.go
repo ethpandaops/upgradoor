@@ -15,7 +15,7 @@ const (
 	// filter has no limit.
 	DefaultAuditLimit = 100
 	// MaxAuditLimit caps the number of entries ListAudit returns.
-	MaxAuditLimit = 1000
+	MaxAuditLimit = 500
 )
 
 // AppendAudit appends entries in one transaction; IDs are assigned in

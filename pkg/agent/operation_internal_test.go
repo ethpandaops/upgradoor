@@ -53,7 +53,7 @@ func (r *tickingRuntime) Observe(context.Context) ([]protocol.Container, error) 
 	}
 
 	return []protocol.Container{
-		{Name: "geth", State: containerRunning, RestartCount: r.restarts},
+		{Name: "geth", State: protocol.StateRunning, RestartCount: r.restarts},
 	}, nil
 }
 
@@ -67,15 +67,21 @@ func (r *tickingRuntime) Start(context.Context, string) error {
 	return nil
 }
 
-func (r *tickingRuntime) LocalDigest(context.Context, string) (string, error) {
-	return "", errors.New("not used")
+func (r *tickingRuntime) LocalImage(context.Context, string) (digest, revision string, err error) {
+	return "", "", errors.New("not used")
 }
 
-func (r *tickingRuntime) Pull(context.Context, string) (string, error) {
-	return "", errors.New("not used")
+func (r *tickingRuntime) Pull(context.Context, string) (digest, revision string, err error) {
+	return "", "", errors.New("not used")
 }
 
 func (r *tickingRuntime) Recreate(context.Context, string, string, time.Duration, bool) error {
+	return errors.New("not used")
+}
+
+func (r *tickingRuntime) RecreateAs(
+	context.Context, string, string, time.Duration, bool, Recreation,
+) error {
 	return errors.New("not used")
 }
 
@@ -174,21 +180,19 @@ func TestVerifyWindowFollowsTheInjectedClock(t *testing.T) {
 // The test cannot be made to fail on the first iteration: the interleaving
 // that shows the fault lies between two lock acquisitions inside proceed,
 // where a test has no handle that a wrong proceed would still pass through.
-// What it does instead is race often enough: several stores at once for the
-// whole budget, each iteration with both sides released together. With the
-// mark read outside the lock about one iteration in a hundred shows it.
+// What it does instead is race a few hundred times: several stores at once,
+// each iteration with both sides released together. With the mark read
+// outside the lock about one iteration in a hundred shows it, so a run can
+// miss the fault; it costs about a second, and it runs on every change.
 func TestProceedAndCancelExcludeEachOther(t *testing.T) {
 	const (
-		workers       = 8
-		budget        = 4 * time.Second
-		minIterations = 300
+		workers = 8
+		races   = 50 // per worker
 	)
 
 	var (
-		deadline = time.Now().Add(budget)
-		total    atomic.Int64
-		first    atomic.Int64
-		wg       sync.WaitGroup
+		first atomic.Int64
+		wg    sync.WaitGroup
 	)
 
 	for range workers {
@@ -203,13 +207,11 @@ func TestProceedAndCancelExcludeEachOther(t *testing.T) {
 		go func() {
 			defer wg.Done()
 
-			for time.Now().Before(deadline) && !t.Failed() {
+			for range races {
 				proceeded, ok := raceProceedAndCancel(t, store)
 				if !ok {
 					return
 				}
-
-				total.Add(1)
 
 				if proceeded {
 					first.Add(1)
@@ -220,8 +222,7 @@ func TestProceedAndCancelExcludeEachOther(t *testing.T) {
 
 	wg.Wait()
 
-	t.Logf("%d races, proceed came first in %d", total.Load(), first.Load())
-	assert.GreaterOrEqual(t, total.Load(), int64(minIterations), "too few races in %s to say anything", budget)
+	t.Logf("%d races, proceed came first in %d", workers*races, first.Load())
 }
 
 // raceProceedAndCancel lets one proceed and one cancel loose on a fresh
@@ -299,13 +300,26 @@ func (h *recordingHost) note(call string) {
 }
 
 func (h *recordingHost) Observe(context.Context) ([]protocol.Container, error) {
-	return []protocol.Container{{Name: "geth", Image: "ethpandaops/geth:master", State: containerRunning}}, nil
+	return []protocol.Container{{Name: "geth", Image: "ethpandaops/geth:master", State: protocol.StateRunning}}, nil
 }
 
-func (h *recordingHost) LocalDigest(context.Context, string) (string, error) { return "", nil }
-func (h *recordingHost) Pull(context.Context, string) (string, error)        { return "", nil }
+func (h *recordingHost) LocalImage(context.Context, string) (digest, revision string, err error) {
+	return "", "", nil
+}
+
+func (h *recordingHost) Pull(context.Context, string) (digest, revision string, err error) {
+	return "", "", nil
+}
 
 func (h *recordingHost) Recreate(_ context.Context, name, _ string, _ time.Duration, _ bool) error {
+	h.note("recreate " + name)
+
+	return nil
+}
+
+func (h *recordingHost) RecreateAs(
+	_ context.Context, name, _ string, _ time.Duration, _ bool, _ Recreation,
+) error {
 	h.note("recreate " + name)
 
 	return nil
@@ -341,7 +355,7 @@ func (h *recordingHost) Reboot(context.Context) error {
 	return nil
 }
 
-// L4: nothing disruptive happens without the mark "disrupted" on disk. If the
+// Nothing disruptive happens without the mark "disrupted" on disk. If the
 // write that precedes the first disruptive call fails, the step fails before
 // anything is touched. Otherwise a process that died after the call would be
 // followed by one that reports "done, nothing disrupted", which the

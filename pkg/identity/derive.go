@@ -1,6 +1,13 @@
-// Package identity implements the upgradoor host identity scheme: key
-// derivation from a per-devnet seed, the deterministic host certificate and
-// the per-request proof of possession.
+// Package identity implements the upgradoor identity scheme: key derivation,
+// the deterministic host certificate, the per-request proof of possession
+// with which a host authenticates to the controller, and the answer
+// signature with which the controller authenticates to the host.
+//
+// There are two seeds, and they are different secrets. The devnet seed, one
+// per devnet, yields the signer key and the host keys of that devnet. The
+// controller seed, one per group of devnets (one devnet repository), yields
+// the controller key of each devnet of the group. A function takes the one
+// or the other, never both.
 //
 // Keys and signatures are ML-DSA-44 (FIPS 204), a post-quantum scheme.
 //
@@ -19,6 +26,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"os"
 	"regexp"
 	"strconv"
 	"strings"
@@ -36,6 +44,8 @@ const (
 )
 
 var (
+	// ErrNoSeed is returned when a seed file cannot be read.
+	ErrNoSeed = errors.New("identity: cannot read seed file")
 	// ErrSeedTooShort is returned when the seed is shorter than MinSeedLength.
 	ErrSeedTooShort = errors.New("identity: seed shorter than 32 bytes")
 	// ErrInvalidName is returned for network, host or role names outside the
@@ -57,6 +67,24 @@ func ValidateName(s string) error {
 	}
 
 	return nil
+}
+
+// ReadSeedFile reads a seed from a file: the devnet seed or the controller
+// seed. The content is the seed as raw bytes, exactly as stored, without
+// decoding; only one trailing newline (LF or CRLF), which editors and "echo"
+// add, is dropped. The error never carries the content.
+func ReadSeedFile(path string) ([]byte, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrNoSeed, err)
+	}
+
+	seed := strings.TrimSuffix(strings.TrimSuffix(string(raw), "\n"), "\r")
+	if len(seed) < MinSeedLength {
+		return nil, fmt.Errorf("%s: %w", path, ErrSeedTooShort)
+	}
+
+	return []byte(seed), nil
 }
 
 // DeriveSignerKey derives the per-network certificate signer key.
@@ -109,7 +137,8 @@ func derive(seed []byte, info string) (*mldsa.PrivateKey, error) {
 }
 
 // EncodePrivateKey encodes the 32-byte ML-DSA seed of key as unpadded
-// base64url. This is the content of /etc/upgradoor/host.key.
+// base64url. This is the content of /etc/upgradoor/host.key and of the
+// controller's key file.
 func EncodePrivateKey(key *mldsa.PrivateKey) string {
 	return base64.RawURLEncoding.EncodeToString(key.Bytes())
 }

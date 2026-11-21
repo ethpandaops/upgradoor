@@ -10,11 +10,12 @@ import {
   type RolloutHost,
   type Settings,
 } from '../api/types';
-import { useApp } from '../appContext';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { Digest, ShortId } from '../components/Digest';
 import { LeaseTable, PeerChecks } from '../components/LeaseTable';
-import { ActionButton } from '../components/Permissions';
+import { useLive } from '../components/Live';
+import { ActionIcon } from '../components/icons';
+import { IntentAction } from '../components/SelectionBar';
 import { RelTime } from '../components/RelTime';
 import {
   Badge,
@@ -22,7 +23,6 @@ import {
   Empty,
   ErrorBanner,
   Loading,
-  Meter,
   Section,
   Segmented,
   Table,
@@ -30,26 +30,55 @@ import {
   Th,
   cx,
 } from '../components/primitives';
-import { HostStateBadge, RolloutStateBadge, stageLabel } from '../components/status';
-import { usePoll } from '../hooks/usePoll';
-import { formatPercent, percentOf, plural, shortRevision } from '../lib/format';
+import { HostStateBadge, RolloutKindBadge, RolloutStateBadge, stageLabel } from '../components/status';
+import { pauseLabel, percentOf, plural, shortRevision } from '../lib/format';
 import { endLeaseIntent, hostsIntent, scopeIntent } from '../lib/intents';
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
-/** policyFor mirrors fleet.Settings.PolicyFor; manual rollouts have no policy. */
-function policyFor(settings: Settings | undefined, rollout: Rollout): Policy | undefined {
+/**
+ * policyFor mirrors the scheduler's rolloutPolicy: the policy of the kind,
+ * and for an image rollout that of its client where one is set. Manual
+ * rollouts have no policy.
+ */
+export function policyFor(settings: Settings | undefined, rollout: Rollout): Policy | undefined {
   if (!settings) return undefined;
   switch (rollout.kind) {
     case 'image':
-      return settings.policyImage;
+      return (rollout.client ? settings.policyClients[rollout.client] : undefined) ?? settings.policyImage;
     case 'packages':
       return settings.policyPackages;
     case 'reboot':
       return settings.policyReboot;
     case 'manual':
+    case 'local':
+      // Asked for by a person, or on the host itself: no policy, no approval.
       return undefined;
   }
+}
+
+/** waitsForApproval says whether a rollout waits for a person to approve it: its policy is manual. */
+export function waitsForApproval(rollout: Rollout, policy: Policy | undefined): boolean {
+  return policy === 'manual' && !rollout.approved;
+}
+
+/**
+ * useRolloutData is what a rollout card needs from the stream: the rollouts,
+ * the plan's queue by host, every lease the page knows by id, and the settings
+ * that say the policy of a rollout.
+ */
+export function useRolloutData() {
+  const rollouts = useLive('rollouts');
+  const plan = useLive('plan');
+  const settings = useLive('settings');
+
+  const queue = useMemo(() => new Map(list(plan.data?.queue).map(q => [q.host, q])), [plan.data]);
+  const leases = useMemo(
+    () => new Map([...list(rollouts.data?.leases), ...list(rollouts.data?.recentLeases)].map(l => [l.id, l])),
+    [rollouts.data]
+  );
+
+  return { rollouts, plan, settings: settings.data?.settings, queue, leases };
 }
 
 /**
@@ -58,25 +87,12 @@ function policyFor(settings: Settings | undefined, rollout: Rollout): Policy | u
  * The Overview tab has the summary: timeline, in progress, up next.
  */
 export function RolloutsTab() {
-  const { api } = useApp();
   const [leaseView, setLeaseView] = useState<'active' | 'recent'>('active');
 
-  const rollouts = usePoll(s => api.rollouts(50, s), { key: 'rollouts' });
-  const plan = usePoll(s => api.plan(s), { key: 'plan' });
-  const settings = usePoll(s => api.settings(s), { key: 'settings' });
+  const { rollouts, plan, settings, queue, leases } = useRolloutData();
+  const actions = useActions();
 
-  const actions = useActions(() => {
-    rollouts.refresh();
-    plan.refresh();
-  });
-
-  const queue = useMemo(() => new Map(list(plan.data?.queue).map(q => [q.host, q])), [plan.data]);
-  const leases = useMemo(
-    () => new Map([...list(rollouts.data?.leases), ...list(rollouts.data?.recentLeases)].map(l => [l.id, l])),
-    [rollouts.data]
-  );
-
-  if ((rollouts.loading && !rollouts.data) || (plan.loading && !plan.data)) return <Loading what="rollouts" />;
+  if (rollouts.loading || plan.loading) return <Loading what="rollouts" />;
 
   const open = list(rollouts.data?.open);
   const recent = list(rollouts.data?.recent);
@@ -85,13 +101,7 @@ export function RolloutsTab() {
 
   return (
     <div className="mx-auto flex w-full max-w-screen-2xl flex-col gap-6">
-      {rollouts.error !== undefined && (
-        <ErrorBanner error={rollouts.error} what="the rollouts" onRetry={rollouts.refresh} />
-      )}
-      {plan.error !== undefined && <ErrorBanner error={plan.error} what="the plan" onRetry={plan.refresh} />}
-      {settings.error !== undefined && (
-        <ErrorBanner error={settings.error} what="the policies" onRetry={settings.refresh} />
-      )}
+      {rollouts.error !== undefined && <ErrorBanner error={rollouts.error} what="the rollouts" />}
       {actions.notice}
 
       {plan.data && <PlanBar plan={plan.data} onAction={actions.request} />}
@@ -105,7 +115,7 @@ export function RolloutsTab() {
               <RolloutCard
                 key={r.id}
                 rollout={r}
-                policy={policyFor(settings.data?.settings, r)}
+                policy={policyFor(settings, r)}
                 queue={queue}
                 leases={leases}
                 onAction={actions.request}
@@ -152,7 +162,7 @@ export function RolloutsTab() {
         {recent.length === 0 ? (
           <Empty>No rollout has finished yet.</Empty>
         ) : (
-          <RecentRollouts rollouts={recent} onAction={actions.request} />
+          <RecentRollouts rollouts={recent} leases={leases} />
         )}
       </Section>
 
@@ -161,74 +171,36 @@ export function RolloutsTab() {
   );
 }
 
-/** PlanBar is the scheduler in one line: running or paused, the gate, and the budget in use. */
+/**
+ * PlanBar is the scheduler's state and its one control; the Overview has the
+ * gate, the budget and the queue in full.
+ */
 function PlanBar({ plan, onAction }: { plan: Plan; onAction: (intent: ActionIntent) => void }) {
-  const b = plan.budget;
-  const pct = (w: number) => formatPercent(b.totalWeight > 0 ? (w / b.totalWeight) * 100 : 0);
-
   return (
-    <div
-      role="group"
-      aria-label="Scheduler"
-      className={cx(
-        'flex flex-wrap items-center gap-x-6 gap-y-2 rounded-lg border bg-surface px-4 py-2.5 text-xs/5',
-        plan.paused || !plan.gate.ok ? 'border-warning' : 'border-border'
-      )}
-    >
+    <div role="group" aria-label="Scheduler" className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs/5">
       <span className="inline-flex items-center gap-2">
         <span className="text-sm/6 font-semibold">Scheduler</span>
         {plan.paused ? <Badge tone="warning">paused</Badge> : <Badge tone="success">running</Badge>}
       </span>
-
-      <span role="group" aria-label="Network gate" className="inline-flex items-center gap-2">
+      <span className="inline-flex items-center gap-2" title={list(plan.gate.reasons).join(' · ') || undefined}>
         <span className="text-muted">Network gate</span>
         {plan.gate.ok ? <Badge tone="success">open</Badge> : <Badge tone="danger">closed</Badge>}
-        {!plan.gate.ok && (
-          <span className="font-medium whitespace-normal text-danger">
-            {list(plan.gate.reasons).join(' · ') || 'no reason given'}
-          </span>
-        )}
       </span>
-
-      {b.totalWeight > 0 && (
-        <span
-          className="inline-flex items-center gap-2"
-          title={`${b.unavailableWeight} of ${b.totalWeight} validators are offline or on a host being updated; ${Math.round(b.allowedWeight * 10) / 10} may be`}
-        >
-          <span className="text-muted">Outage budget</span>
-          <span className="w-20">
-            <Meter value={b.unavailableWeight} max={b.allowedWeight} label="Validators offline against the allowance" />
-          </span>
-          <span className="tabular-nums">
-            {pct(b.unavailableWeight)} of {pct(b.allowedWeight)}
-          </span>
-        </span>
-      )}
-
-      <span className="inline-flex items-baseline gap-1.5">
-        <span className="text-muted">Hosts down</span>
-        <span className={cx('tabular-nums', b.leasedHosts >= b.maxLeasedHosts && 'font-medium text-warning')}>
-          {b.leasedHosts} of {b.maxLeasedHosts}
-        </span>
-      </span>
-
-      <span className="ml-auto inline-flex items-center gap-3">
-        <span className="text-faint">
-          planned <RelTime value={plan.computedAt} />
-        </span>
+      <span className="ml-auto">
         {plan.paused ? (
-          <ActionButton
-            dense
-            variant="primary"
+          <IntentAction
+            icon="resume"
+            label="Resume all…"
             onAction={onAction}
             intent={scopeIntent('resume', 'Resume everything', '')}
-          >
-            Resume all…
-          </ActionButton>
+          />
         ) : (
-          <ActionButton dense onAction={onAction} intent={scopeIntent('pause', 'Pause everything', '')}>
-            Pause all…
-          </ActionButton>
+          <IntentAction
+            icon="pause"
+            label="Pause all…"
+            onAction={onAction}
+            intent={scopeIntent('pause', 'Pause everything', '')}
+          />
         )}
       </span>
     </div>
@@ -269,17 +241,22 @@ function HostPips({ hosts }: { hosts: readonly RolloutHost[] }) {
   );
 }
 
+const LEASE_ENDED: ReadonlySet<Lease['state']> = new Set(['released', 'failed', 'expired']);
+
 /**
- * brokenNote is the scheduler's note on a waiting member whose host is
- * broken ("broken since lease <id> (rollout <id>)"), or undefined.
+ * memberState names the state of a member of a closed rollout. A member that
+ * held a lease when its rollout closed stays leased: it is named by how that
+ * lease ended, when the page knows the lease.
  */
-function brokenNote(h: RolloutHost): string | undefined {
-  return h.error?.startsWith('broken since ') ? h.error : undefined;
+function memberState(h: RolloutHost, leases: ReadonlyMap<string, Lease>): string {
+  if (h.state !== 'leased') return h.state;
+
+  const lease = h.leaseId ? leases.get(h.leaseId) : undefined;
+  if (!lease) return 'leased when the rollout closed';
+  return LEASE_ENDED.has(lease.state) ? `lease ${lease.state}` : 'leased';
 }
 
 function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, leases: ReadonlyMap<string, Lease>) {
-  const broken = brokenNote(h);
-
   switch (h.state) {
     case 'pending': {
       const q = queue.get(h.host);
@@ -287,7 +264,6 @@ function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, le
       return (
         <span>
           <span className="text-faint">#{q.position}</span> {q.reason}
-          {broken && <span className="text-muted"> — {broken}</span>}
         </span>
       );
     }
@@ -310,14 +286,19 @@ function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, le
     case 'failed':
       return <span className="text-danger">{h.error || 'failed'}</span>;
     case 'expected':
-      return <span className="text-muted">has not reported the need yet{broken && ` — ${broken}`}</span>;
-    case 'done':
+      return <span className="text-muted">has not reported the need yet</span>;
     case 'skipped':
+      // A person's skip names the person and the reason given; the scheduler's only its reason.
+      if (!h.skippedBy && !h.error) return <Dash />;
+      return (
+        <span className="text-muted">{[h.skippedBy && `by ${h.skippedBy}`, h.error].filter(Boolean).join(': ')}</span>
+      );
+    case 'done':
       return <Dash />;
   }
 }
 
-function RolloutCard({
+export function RolloutCard({
   rollout: r,
   policy,
   queue,
@@ -335,7 +316,7 @@ function RolloutCard({
     [r.hosts]
   );
   const failed = hosts.filter(h => h.state === 'failed');
-  const waitsForApproval = policy === 'manual' && !r.approved;
+  const waiting = waitsForApproval(r, policy);
 
   return (
     <article
@@ -346,59 +327,54 @@ function RolloutCard({
       )}
     >
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs/5">
-        <Badge>{r.kind}</Badge>
+        <RolloutKindBadge kind={r.kind} />
         <h3 className="text-sm/6 font-semibold">{r.title}</h3>
         <RolloutStateBadge state={r.state} />
-        {r.paused && <Badge tone="warning">{r.pauseReason ? 'paused after the canary' : 'paused'}</Badge>}
-        {waitsForApproval && <Badge tone="warning">waiting for approval</Badge>}
-        {policy === 'paused' && <Badge tone="warning">policy paused</Badge>}
+        {r.paused && <Badge tone="warning">{pauseLabel(r.pauseReason)}</Badge>}
+        {waiting && <Badge tone="warning">waiting for approval</Badge>}
         {r.force && <Badge tone="warning">force</Badge>}
         {r.ignoreBudget && <Badge tone="danger">ignores budget</Badge>}
         <HostPips hosts={hosts} />
 
         <span className="ml-auto inline-flex flex-wrap gap-1">
-          {waitsForApproval && !r.paused && (
-            <ActionButton
-              dense
-              variant="primary"
+          {waiting && !r.paused && (
+            <IntentAction
+              icon="check"
+              label="Approve…"
               onAction={onAction}
               intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id)}
-            >
-              Approve…
-            </ActionButton>
+            />
           )}
           {r.paused ? (
-            <ActionButton
-              dense
-              variant="primary"
+            <IntentAction
+              icon="resume"
+              label="Resume…"
               onAction={onAction}
               intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id)}
-            >
-              Resume…
-            </ActionButton>
+            />
           ) : (
-            <ActionButton dense onAction={onAction} intent={scopeIntent('pause', `Pause rollout: ${r.title}`, r.id)}>
-              Pause…
-            </ActionButton>
+            <IntentAction
+              icon="pause"
+              label="Pause…"
+              onAction={onAction}
+              intent={scopeIntent('pause', `Pause rollout: ${r.title}`, r.id)}
+            />
           )}
           {(r.state === 'halted' || failed.length > 0) && (
-            <ActionButton
-              dense
-              variant="primary"
+            <IntentAction
+              icon="retry"
+              label="Retry…"
               onAction={onAction}
               intent={hostsIntent('retry', `Retry rollout: ${r.title}`, r.id, [])}
-            >
-              Retry…
-            </ActionButton>
+            />
           )}
-          <ActionButton
-            dense
-            variant="danger"
+          <IntentAction
+            icon="abort"
+            label="Abort…"
+            tone="danger"
             onAction={onAction}
             intent={scopeIntent('abort', `Abort rollout: ${r.title}`, r.id)}
-          >
-            Abort…
-          </ActionButton>
+          />
         </span>
       </div>
 
@@ -434,7 +410,7 @@ function RolloutCard({
           </span>
         )}
         <span>
-          opened by {r.createdBy} <RelTime value={r.createdAt} />
+          opened by {r.createdBy} <RelTime fixed value={r.createdAt} />
         </span>
       </div>
 
@@ -472,35 +448,33 @@ function RolloutCard({
                   </>
                 )}
               </Td>
-              <Td>{stageLabel(h.stage)}</Td>
-              <Td>
+              {/* A host's own request is one host: there is no order to name. */}
+              <Td>{r.kind === 'local' ? <Dash /> : stageLabel(h.stage)}</Td>
+              {/* State and actions keep their width from one state to the next. */}
+              <Td className="min-w-24">
                 <HostStateBadge state={h.state} />
               </Td>
               <Td className="whitespace-normal">{hostProgress(h, queue, leases)}</Td>
               <Td>
-                <RelTime value={h.updatedAt} />
+                <RelTime fixed value={h.updatedAt} />
               </Td>
-              <Td>
+              <Td className="min-w-28">
                 <span className="inline-flex gap-1">
                   {(h.state === 'pending' || h.state === 'expected' || h.state === 'failed') && (
-                    <ActionButton
-                      dense
-                      aria-label={`Skip ${h.host} in ${r.title}`}
+                    <ActionIcon
+                      icon="skip"
+                      label={`Skip ${h.host} in ${r.title}`}
                       onAction={onAction}
                       intent={hostsIntent('skip', `Skip ${h.host}`, r.id, [h.host])}
-                    >
-                      Skip
-                    </ActionButton>
+                    />
                   )}
                   {h.state === 'failed' && (
-                    <ActionButton
-                      dense
-                      aria-label={`Retry ${h.host} in ${r.title}`}
+                    <ActionIcon
+                      icon="retry"
+                      label={`Retry ${h.host} in ${r.title}`}
                       onAction={onAction}
                       intent={hostsIntent('retry', `Retry ${h.host}`, r.id, [h.host], r.state)}
-                    >
-                      Retry
-                    </ActionButton>
+                    />
                   )}
                 </span>
               </Td>
@@ -512,15 +486,17 @@ function RolloutCard({
   );
 }
 
-function RecentRollouts({
+export function RecentRollouts({
   rollouts,
-  onAction,
+  leases,
+  label = 'Recent rollouts',
 }: {
   rollouts: readonly Rollout[];
-  onAction: (intent: ActionIntent) => void;
+  leases: ReadonlyMap<string, Lease>;
+  label?: string;
 }) {
   return (
-    <Table label="Recent rollouts">
+    <Table label={label}>
       <thead>
         <tr>
           <Th>Rollout</Th>
@@ -531,7 +507,6 @@ function RecentRollouts({
           <Th>Opened by</Th>
           <Th>Opened</Th>
           <Th>Ended</Th>
-          <Th>Actions</Th>
         </tr>
       </thead>
       <tbody>
@@ -542,11 +517,11 @@ function RecentRollouts({
           return (
             <tr key={r.id} className="hover:bg-surface-hover">
               <Td className="font-medium">{r.title}</Td>
-              <Td>{r.kind}</Td>
+              <Td>{r.kind === 'local' ? 'host request' : r.kind}</Td>
               <Td>
                 <RolloutStateBadge state={r.state} />
               </Td>
-              <Td title={hosts.map(h => `${h.host}: ${h.state}`).join('\n')}>
+              <Td title={hosts.map(h => `${h.host}: ${memberState(h, leases)}`).join('\n')}>
                 <span className="font-mono">
                   {done}/{hosts.length}
                 </span>{' '}
@@ -556,22 +531,10 @@ function RecentRollouts({
               <Td className="whitespace-normal text-muted">{r.reason || <Dash />}</Td>
               <Td>{r.createdBy}</Td>
               <Td>
-                <RelTime value={r.createdAt} />
+                <RelTime fixed value={r.createdAt} />
               </Td>
               <Td>
-                <RelTime value={r.endedAt} />
-              </Td>
-              <Td>
-                {r.state === 'aborted' && (
-                  <ActionButton
-                    dense
-                    aria-label={`Retry ${r.title}`}
-                    onAction={onAction}
-                    intent={hostsIntent('retry', `Retry rollout: ${r.title}`, r.id, [])}
-                  >
-                    Retry
-                  </ActionButton>
-                )}
+                <RelTime fixed value={r.endedAt} />
               </Td>
             </tr>
           );

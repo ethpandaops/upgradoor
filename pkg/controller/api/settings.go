@@ -198,6 +198,7 @@ func (s *Server) handlePutSettings(w http.ResponseWriter, r *http.Request, u *us
 		return
 	}
 
+	s.Notify()
 	s.writeJSON(w, http.StatusOK, SettingsBody{
 		Settings: stored,
 		Defaults: s.opts.DefaultSettings,

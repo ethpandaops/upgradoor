@@ -4,7 +4,7 @@ import { describe, expect, it, vi } from 'vitest';
 
 import { shortDigest } from '../lib/format';
 import { LIGHTHOUSE_IMAGE, currentDigest } from '../mock/fixture';
-import { createHarness, renderWithApp } from '../test/harness';
+import { createHarness, renderWithApp, PRIMARY } from '../test/harness';
 import { HostsTab } from './HostsTab';
 
 const PUBLIC_COLUMNS = ['Host', 'Execution', 'Consensus', 'State'];
@@ -35,7 +35,7 @@ describe('HostsTab, logged out (public data only)', () => {
 
     expect(columnNames(table)).toEqual(PUBLIC_COLUMNS);
     expect(within(table).getAllByRole('row')).toHaveLength(1 + 24);
-    expect(screen.queryByRole('group', { name: 'Bulk actions' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: 'Actions on the selected hosts' })).not.toBeInTheDocument();
     expect(screen.queryByRole('checkbox')).not.toBeInTheDocument();
     expect(screen.getByText(/Log in for host details/)).toBeInTheDocument();
 
@@ -45,10 +45,11 @@ describe('HostsTab, logged out (public data only)', () => {
 
     expect(h.userCalls()).toEqual([]);
     expect(h.calls.every(c => c.authorization === null)).toBe(true);
-    expect(new Set(h.calls.map(c => c.path))).toEqual(new Set(['/api/v1/public/hosts']));
+    // One request: the public event stream.
+    expect(h.calls.map(c => c.path)).toEqual(['/api/v1/public/events']);
   });
 
-  it('renders image, short digest, the custom badge and the update marker', async () => {
+  it('renders image, short digest and the update marker', async () => {
     const h = await createHarness({ mode: 'auth', loggedIn: false });
     renderWithApp(<HostsTab />, h);
     const table = await screen.findByRole('table', { name: 'Hosts' });
@@ -66,7 +67,7 @@ describe('HostsTab, logged out (public data only)', () => {
     expect(button).toHaveAttribute('title', expect.stringContaining(digest));
     expect(within(current).getByText('up to date')).toBeInTheDocument();
 
-    expect(within(rowOf(table, 'grandine-erigon-2')).getByText('custom')).toBeInTheDocument();
+    expect(within(rowOf(table, 'grandine-erigon-2')).getByText('pending')).toBeInTheDocument();
   });
 });
 
@@ -79,11 +80,10 @@ describe('HostsTab, logged in', () => {
     await within(table).findByRole('columnheader', { name: /Kernel/ });
 
     expect(columnNames(table)).toEqual([...LEADING_COLUMNS, ...PUBLIC_COLUMNS, ...PRIVATE_COLUMNS]);
-    expect(screen.getByRole('group', { name: 'Bulk actions' })).toBeInTheDocument();
+    expect(screen.getByRole('group', { name: 'Actions on the selected hosts' })).toBeInTheDocument();
 
-    const paths = new Set(h.calls.map(c => c.path));
-    expect(paths).toContain('/api/v1/hosts');
-    expect(paths).toContain('/api/v1/plan');
+    // Everything on the page came over the one authenticated event stream.
+    expect(h.calls.map(c => c.path)).toEqual(['/api/v1/events']);
     expect(h.userCalls().every(c => c.authorization === 'Bearer mock-token')).toBe(true);
   });
 
@@ -164,36 +164,37 @@ describe('HostsTab, logged in', () => {
     const table = await screen.findByRole('table', { name: 'Hosts' });
     await within(table).findByRole('columnheader', { name: /Kernel/ });
 
-    await user.click(within(table).getByRole('checkbox', { name: 'Select all shown hosts' }));
-    const bulk = screen.getByRole('group', { name: 'Bulk actions' });
-    expect(bulk).toHaveTextContent('24 selected:');
+    await user.click(within(table).getByRole('checkbox', { name: 'Select all hosts the filter shows, on every page' }));
+    const bulk = screen.getByRole('group', { name: 'Actions on the selected hosts' });
+    expect(bulk).toHaveTextContent('24 hosts selected');
     expect(bulk).not.toHaveTextContent('hidden by the filter');
 
     await user.type(screen.getByRole('searchbox', { name: 'Filter hosts' }), 'bootnode');
     expect(within(table).getAllByRole('row')).toHaveLength(2);
-    expect(bulk).toHaveTextContent('24 selected (23 hidden by the filter):');
+    expect(bulk).toHaveTextContent('24 hosts selected');
+    expect(bulk).toHaveTextContent('23 hidden by the filter');
 
     // The confirmation says that the action reaches hosts that are not on screen.
-    await user.click(within(bulk).getByRole('button', { name: 'Reboot…' }));
+    await user.click(within(bulk).getByRole('button', { name: 'Reboot' }));
     const dialog = screen.getByRole('dialog');
     const warning = within(dialog).getByRole('alert');
-    expect(warning).toHaveTextContent('Includes 23 selected hosts hidden by the current filter:');
+    expect(warning).toHaveTextContent('23 of them are hidden by the current filter:');
     expect(warning).not.toHaveTextContent('bootnode-1');
     await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
 
-    await user.click(within(bulk).getByRole('button', { name: 'Forget…' }));
-    expect(within(screen.getByRole('dialog')).getByRole('alert')).toHaveTextContent('Includes 23 selected hosts');
+    await user.click(within(bulk).getByRole('button', { name: 'Forget' }));
+    expect(within(screen.getByRole('dialog')).getByRole('alert')).toHaveTextContent('23 of them are hidden');
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'Cancel' }));
 
     // "Drop hidden" narrows the selection to what is on screen; the request then carries only that.
-    await user.click(within(bulk).getByRole('button', { name: 'Drop hidden' }));
-    expect(bulk).toHaveTextContent('1 selected:');
+    await user.click(within(bulk).getByRole('button', { name: 'Drop them' }));
+    expect(bulk).toHaveTextContent('1 host selected');
     expect(bulk).not.toHaveTextContent('hidden by the filter');
 
-    await user.click(within(bulk).getByRole('button', { name: 'Forget…' }));
+    await user.click(within(bulk).getByRole('button', { name: 'Forget' }));
     const confirm = screen.getByRole('dialog');
     expect(within(confirm).queryByRole('alert')).not.toBeInTheDocument();
-    await user.click(within(confirm).getByRole('button', { name: 'Confirm' }));
+    await user.click(within(confirm).getByRole('button', PRIMARY));
 
     await vi.waitFor(() => {
       expect(h.calls.filter(c => c.method === 'POST')).toHaveLength(1);
@@ -219,8 +220,14 @@ describe('HostsTab, logged in', () => {
 
     expect(screen.getByRole('table', { name: 'Leases of lighthouse-geth-2' })).toHaveTextContent('verifying');
     expect(screen.getByRole('table', { name: 'History of lighthouse-geth-2' })).toHaveTextContent('lease.granted');
-    expect(screen.getByRole('img', { name: /Attestation liveness/ })).toBeInTheDocument();
-    expect(h.calls.some(c => c.path === '/api/v1/hosts/lighthouse-geth-2')).toBe(true);
+    // The details come over the stream, which is reopened to ask for them.
+    expect(h.calls.at(-1)?.path).toBe('/api/v1/events?host=lighthouse-geth-2');
+    expect(h.calls.every(c => c.path.startsWith('/api/v1/events'))).toBe(true);
+
+    // The range the controller counts, and where the agent read it.
+    expect(screen.getByRole('group', { name: 'Actions for lighthouse-geth-2' }).parentElement).toHaveTextContent(
+      /\[128, 256\) = 128\s*from the marker file/
+    );
 
     await user.click(screen.getByRole('button', { name: 'Expand prysm-erigon-1' }));
     const upgradable = await screen.findByRole('table', { name: 'Upgradable packages' });
@@ -289,5 +296,33 @@ describe('HostsTab rows', () => {
     await user.clear(filter);
     await user.type(filter, 'stale');
     expect(screen.getByText(/No host matches/)).toBeInTheDocument();
+  });
+});
+
+describe('HostsTab, a large fleet', () => {
+  it('shows a page of hosts at a time, and selects every host the filter shows', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'auth', loggedIn: true, fleet: 'large' });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+
+    expect(within(table).getAllByRole('row')).toHaveLength(1 + 100);
+    const pages = screen.getByRole('group', { name: 'Pages' });
+    expect(pages).toHaveTextContent(/^1–100 of \d+/);
+
+    await user.click(within(pages).getByRole('button', { name: 'Next page' }));
+    expect(pages).toHaveTextContent(/^101–200 of/);
+
+    await user.click(within(table).getByRole('checkbox', { name: 'Select all hosts the filter shows, on every page' }));
+    const total = Number(/of (\d+)/.exec(pages.textContent)?.[1]);
+    expect(total).toBeGreaterThan(200);
+    expect(screen.getByRole('group', { name: 'Actions on the selected hosts' })).toHaveTextContent(
+      `${total} hosts selected`
+    );
+
+    // A new filter starts at the first page.
+    await user.type(screen.getByRole('searchbox', { name: 'Filter hosts' }), 'geth');
+    expect(screen.queryByRole('group', { name: 'Pages' })?.textContent ?? '1–').toMatch(/^1–/);
   });
 });

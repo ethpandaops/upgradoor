@@ -269,11 +269,9 @@ func TestActionRequestShape(t *testing.T) {
 	require.Equal(t, http.StatusNotFound, rec.Code)
 	assert.Equal(t, contentTypeJSON, rec.Header().Get("Content-Type"))
 
-	// Wrong method on a known action.
+	// Wrong method on a known action: no such route.
 	rec = h.get("/api/v1/actions/roll")
-	require.Equal(t, http.StatusMethodNotAllowed, rec.Code)
-	assert.Equal(t, "POST", rec.Header().Get("Allow"))
-	assert.Equal(t, ErrorBody{Error: "method not allowed"}, decodeJSON[ErrorBody](t, rec))
+	require.Equal(t, http.StatusNotFound, rec.Code)
 
 	// A body that is not declared as JSON (what an HTML form can send).
 	for _, contentType := range []string{"", "text/plain", "application/x-www-form-urlencoded"} {

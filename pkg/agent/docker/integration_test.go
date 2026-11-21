@@ -33,8 +33,8 @@ func observed(t *testing.T, r *Runtime, name string) protocol.Container {
 	return all[idx]
 }
 
-// TestIntegrationDigests covers digest reporting and that a pull moves the
-// tag without touching the running container.
+// TestIntegrationDigests covers digest and revision reporting and that a
+// pull moves the tag without touching the running container.
 func TestIntegrationDigests(t *testing.T) {
 	env.cleanup(t, "digests")
 
@@ -45,17 +45,19 @@ func TestIntegrationDigests(t *testing.T) {
 
 	digest1 := env.publish(t, ref, variantOne)
 
-	local, err := r.LocalDigest(ctx, ref)
+	local, _, err := r.LocalImage(ctx, ref)
 	require.NoError(t, err)
 	assert.Empty(t, local, "nothing pulled yet")
 
-	pulled, err := r.Pull(ctx, ref)
+	pulled, revision, err := r.Pull(ctx, ref)
 	require.NoError(t, err)
 	assert.Equal(t, digest1, pulled)
+	assert.Equal(t, "rev1", revision, "the revision label of the pulled image")
 
-	local, err = r.LocalDigest(ctx, ref)
+	local, revision, err = r.LocalImage(ctx, ref)
 	require.NoError(t, err)
 	assert.Equal(t, digest1, local)
+	assert.Equal(t, "rev1", revision)
 
 	created, err := env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Name:   name,
@@ -87,17 +89,19 @@ func TestIntegrationDigests(t *testing.T) {
 	digest2 := env.publish(t, ref, variantTwo)
 	require.NotEqual(t, digest1, digest2)
 
-	local, err = r.LocalDigest(ctx, ref)
+	local, _, err = r.LocalImage(ctx, ref)
 	require.NoError(t, err)
 	assert.Equal(t, digest1, local, "the registry moved, the local tag did not")
 
-	pulled, err = r.Pull(ctx, ref)
+	pulled, revision, err = r.Pull(ctx, ref)
 	require.NoError(t, err)
 	assert.Equal(t, digest2, pulled)
+	assert.Equal(t, "rev2", revision, "known before any container runs the image")
 
-	local, err = r.LocalDigest(ctx, ref)
+	local, revision, err = r.LocalImage(ctx, ref)
 	require.NoError(t, err)
 	assert.Equal(t, digest2, local)
+	assert.Equal(t, "rev2", revision)
 
 	after := observed(t, r, name)
 	assert.Equal(t, before.ID, after.ID, "the pull does not touch the container")
@@ -108,15 +112,15 @@ func TestIntegrationDigests(t *testing.T) {
 	assert.Equal(t, "rev1", after.Revision)
 
 	// Pulling again changes nothing.
-	pulled, err = r.Pull(ctx, ref)
+	pulled, _, err = r.Pull(ctx, ref)
 	require.NoError(t, err)
 	assert.Equal(t, digest2, pulled)
 
 	// Errors of the pull are reported.
-	_, err = r.Pull(ctx, env.repoRef("digests-absent"))
+	_, _, err = r.Pull(ctx, env.repoRef("digests-absent"))
 	require.Error(t, err)
 
-	local, err = r.LocalDigest(ctx, env.repoRef("digests-absent"))
+	local, _, err = r.LocalImage(ctx, env.repoRef("digests-absent"))
 	require.NoError(t, err)
 	assert.Empty(t, local)
 
@@ -170,7 +174,7 @@ func TestIntegrationRecreate(t *testing.T) {
 	markers := []string{"/anon/marker", "/imgvol/marker", "/named/marker", "/bind/marker"}
 
 	digest1 := env.publish(t, ref, variantOne)
-	_, err := r.Pull(ctx, ref)
+	_, _, err := r.Pull(ctx, ref)
 	require.NoError(t, err)
 
 	subnet := env.createNetwork(t, netA)
@@ -185,7 +189,6 @@ func TestIntegrationRecreate(t *testing.T) {
 	hostPort := freePort(t)
 	published := network.MustParsePort("7000/tcp")
 	staticIP := netip.MustParseAddr(subnet + ".10")
-	fixedMAC := network.HardwareAddr{0x02, 0xaa, 0xbb, 0xcc, 0xdd, 0x10}
 	stopTimeout := 7
 	pidsLimit := int64(200)
 	initProcess := true
@@ -250,7 +253,6 @@ func TestIntegrationRecreate(t *testing.T) {
 				netA: {
 					IPAMConfig: &network.EndpointIPAMConfig{IPv4Address: staticIP},
 					Aliases:    []string{"it-alias"},
-					MacAddress: fixedMAC,
 				},
 			},
 		},
@@ -290,7 +292,7 @@ func TestIntegrationRecreate(t *testing.T) {
 	require.ErrorIs(t, err, agent.ErrDigestMismatch)
 	assertUntouched("refused: the lease digest is not pulled")
 
-	pulled, err := r.Pull(ctx, ref)
+	pulled, _, err := r.Pull(ctx, ref)
 	require.NoError(t, err)
 	require.Equal(t, digest2, pulled)
 	assertUntouched("pull")
@@ -375,7 +377,7 @@ func TestIntegrationRecreate(t *testing.T) {
 			{Type: mount.TypeVolume, Source: mountAt(t, old, "/imgvol").Name, Target: "/imgvol"},
 		}, now.HostConfig.Mounts, "the anonymous volumes are re-attached by name")
 
-		// Networks: both, with alias, static address and fixed MAC.
+		// Networks: both, with alias and static address.
 		require.Len(t, now.NetworkSettings.Networks, 2)
 
 		first := now.NetworkSettings.Networks[netA]
@@ -397,7 +399,6 @@ func TestIntegrationRecreate(t *testing.T) {
 
 	// What only shows while the container runs.
 	assert.Equal(t, staticIP, now.NetworkSettings.Networks[netA].IPAddress)
-	assert.Equal(t, fixedMAC, now.NetworkSettings.Networks[netA].MacAddress)
 	assert.NotEqual(t,
 		old.NetworkSettings.Networks[netB].MacAddress, now.NetworkSettings.Networks[netB].MacAddress,
 		"a generated MAC address is not pinned")
@@ -438,7 +439,6 @@ func TestIntegrationRecreate(t *testing.T) {
 	// The full comparison needs a container that was started: until then
 	// the daemon reports some host settings (OomKillDisable) unresolved.
 	check(started)
-	assert.Equal(t, fixedMAC, started.NetworkSettings.Networks[netA].MacAddress)
 	assert.Equal(t, staticIP, started.NetworkSettings.Networks[netA].IPAddress)
 
 	// A stopped container is recreated just the same, and started.
@@ -461,7 +461,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		name := env.prefix + "rollback-start"
 
 		env.publish(t, ref, variantOne)
-		_, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref)
 		require.NoError(t, err)
 
 		_, err = env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -476,7 +476,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		// The container uses the image's command; the new image's does
 		// not exist, so the replacement is created but cannot start.
 		broken := env.publish(t, ref, variantBroken)
-		pulled, err := r.Pull(ctx, ref)
+		pulled, _, err := r.Pull(ctx, ref)
 		require.NoError(t, err)
 		require.Equal(t, broken, pulled)
 
@@ -518,7 +518,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		netName := name + "-net"
 
 		env.publish(t, ref, variantOne)
-		_, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref)
 		require.NoError(t, err)
 
 		_, err = env.cli.NetworkCreate(ctx, netName, client.NetworkCreateOptions{Driver: "bridge"})
@@ -541,7 +541,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		require.NoError(t, err)
 
 		digest2 := env.publish(t, ref, variantTwo)
-		_, err = r.Pull(ctx, ref)
+		_, _, err = r.Pull(ctx, ref)
 		require.NoError(t, err)
 
 		err = r.Recreate(ctx, name, digest2, 5*time.Second, true)
@@ -564,7 +564,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		name := env.prefix + "rollback-create"
 
 		env.publish(t, ref, variantOne)
-		_, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref)
 		require.NoError(t, err)
 
 		_, err = env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -579,7 +579,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		// The container runs the image's command and the new image has
 		// none: the daemon refuses to create a container without command.
 		digest := env.publish(t, ref, variantNoCommand)
-		_, err = r.Pull(ctx, ref)
+		_, _, err = r.Pull(ctx, ref)
 		require.NoError(t, err)
 
 		err = r.Recreate(ctx, name, digest, 5*time.Second, true)
@@ -602,7 +602,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		name := env.prefix + "interrupted"
 
 		digest1 := env.publish(t, ref, variantOne)
-		_, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref)
 		require.NoError(t, err)
 
 		created, err := env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -655,7 +655,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		name := env.prefix + "leftover"
 
 		digest1 := env.publish(t, ref, variantOne)
-		_, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref)
 		require.NoError(t, err)
 
 		create := func(containerName, marker string) string {
@@ -748,7 +748,7 @@ func TestIntegrationRecreateExplicitEntrypoint(t *testing.T) {
 	ref := env.repoRef("explicit-ep")
 
 	env.publish(t, ref, variantEntryOne)
-	_, err := r.Pull(ctx, ref)
+	_, _, err := r.Pull(ctx, ref)
 	require.NoError(t, err)
 
 	explicit := env.prefix + "explicit-ep-given"
@@ -774,7 +774,7 @@ func TestIntegrationRecreateExplicitEntrypoint(t *testing.T) {
 	require.Empty(t, before.Config.Cmd, "the daemon does not inherit the command next to an entrypoint")
 
 	digest2 := env.publish(t, ref, variantEntryTwo)
-	_, err = r.Pull(ctx, ref)
+	_, _, err = r.Pull(ctx, ref)
 	require.NoError(t, err)
 
 	require.NoError(t, r.Recreate(ctx, explicit, digest2, 5*time.Second, true))
@@ -802,7 +802,7 @@ func TestIntegrationRecreateEntrypoint(t *testing.T) {
 	ref := env.repoRef("entrypoint")
 
 	env.publish(t, ref, variantOne)
-	_, err := r.Pull(ctx, ref)
+	_, _, err := r.Pull(ctx, ref)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -842,7 +842,7 @@ func TestIntegrationRecreateEntrypoint(t *testing.T) {
 	}
 
 	digest2 := env.publish(t, ref, variantTwo)
-	_, err = r.Pull(ctx, ref)
+	_, _, err = r.Pull(ctx, ref)
 	require.NoError(t, err)
 
 	for _, tt := range tests {
@@ -857,4 +857,112 @@ func TestIntegrationRecreateEntrypoint(t *testing.T) {
 			assert.Equal(t, tt.wantCmd, now.Config.Cmd)
 		})
 	}
+}
+
+// TestIntegrationRecreateAs covers what an override does to a container: a
+// recreate onto another image reference and with another command line, the
+// labels that record what it was, and the way back.
+func TestIntegrationRecreateAs(t *testing.T) {
+	env.cleanup(t, "override")
+
+	ctx := t.Context()
+	r := env.newRuntime(t)
+	name := env.prefix + "override"
+	base, fix := env.repoRef("override-base"), env.repoRef("override-fix")
+
+	baseDigest := env.publish(t, base, variantEntryOne)
+	fixDigest := env.publish(t, fix, variantEntryTwo)
+
+	for _, ref := range []string{base, fix} {
+		_, _, err := r.Pull(ctx, ref)
+		require.NoError(t, err)
+	}
+
+	command := []string{"--http", "--maxpeers=50"}
+
+	_, err := env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Name: name,
+		Config: &container.Config{
+			Image: base, Cmd: command, Env: []string{"OWN=1"}, Labels: map[string]string{"own": "yes"},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.Start(ctx, name))
+
+	original := env.inspect(t, name)
+
+	seen := observed(t, r, name)
+	assert.Equal(t, command, seen.Command)
+	assert.Nil(t, seen.Base, "a container nobody overrode records nothing")
+
+	baseJSON, err := json.Marshal(command)
+	require.NoError(t, err)
+
+	baseLabel, imageLabel := string(baseJSON), base
+	changed := []string{"--http", "--pprof"}
+	onto := agent.Recreation{
+		Image: fix, Command: changed, SetCommand: true,
+		Labels: map[string]*string{
+			agent.LabelOverrideCommand: &baseLabel, agent.LabelOverrideImage: &imageLabel,
+		},
+	}
+
+	// The digest is that of the image the replacement is created from, and
+	// it is verified before anything is touched.
+	err = r.RecreateAs(ctx, name, baseDigest, 5*time.Second, true, onto)
+	require.ErrorIs(t, err, agent.ErrDigestMismatch)
+	assert.Equal(t, original.ID, env.inspect(t, name).ID, "a refused recreate changes nothing")
+
+	require.NoError(t, r.RecreateAs(ctx, name, fixDigest, 5*time.Second, true, onto))
+
+	now := env.inspect(t, name)
+	assert.NotEqual(t, original.ID, now.ID)
+	assert.True(t, now.State.Running)
+	assert.Equal(t, fix, now.Config.Image)
+	assert.NotEqual(t, original.Image, now.Image, "on the other image")
+	assert.Equal(t, changed, now.Config.Cmd)
+	assert.Equal(t, variantEntryTwo.Entrypoint, now.Config.Entrypoint, "the entrypoint follows the image")
+	assert.Contains(t, now.Config.Env, "OWN=1")
+	assert.Equal(t, "yes", now.Config.Labels["own"])
+	assert.Equal(t, base, now.Config.Labels[agent.LabelOverrideImage])
+	assert.False(t, env.exists(t, name+replacedSuffix), "no leftover")
+
+	seen = observed(t, r, name)
+	assert.Equal(t, fix, seen.Image)
+	assert.Equal(t, fixDigest, seen.Digest)
+	assert.Equal(t, changed, seen.Command)
+	assert.Equal(t, &protocol.OverrideBase{Image: base, Command: command, HasCommand: true}, seen.Base)
+
+	// Other flags on the same image: the image reference is the container's.
+	more := []string{"--http", "--pprof", "--verbosity=4"}
+	require.NoError(t, r.RecreateAs(ctx, name, fixDigest, 5*time.Second, true,
+		agent.Recreation{Command: more, SetCommand: true}))
+
+	now = env.inspect(t, name)
+	assert.Equal(t, fix, now.Config.Image)
+	assert.Equal(t, more, now.Config.Cmd)
+	assert.Equal(t, baseLabel, now.Config.Labels[agent.LabelOverrideCommand], "labels it does not name stay")
+
+	// A plain recreate keeps the override: image, command and labels.
+	require.NoError(t, r.Recreate(ctx, name, fixDigest, 5*time.Second, true))
+
+	now = env.inspect(t, name)
+	assert.Equal(t, fix, now.Config.Image)
+	assert.Equal(t, more, now.Config.Cmd)
+	assert.Equal(t, base, now.Config.Labels[agent.LabelOverrideImage])
+
+	// And back: the configured image, the recorded command, no labels.
+	require.NoError(t, r.RecreateAs(ctx, name, baseDigest, 5*time.Second, true, agent.Recreation{
+		Image: base, Command: command, SetCommand: true,
+		Labels: map[string]*string{agent.LabelOverrideCommand: nil, agent.LabelOverrideImage: nil},
+	}))
+
+	now = env.inspect(t, name)
+	assert.True(t, now.State.Running)
+	assert.Equal(t, base, now.Config.Image)
+	assert.Equal(t, original.Image, now.Image)
+	assert.Equal(t, command, now.Config.Cmd)
+	assert.Equal(t, original.Config.Labels, now.Config.Labels)
+	assert.Equal(t, original.Config.Entrypoint, now.Config.Entrypoint)
+	assert.Nil(t, observed(t, r, name).Base)
 }

@@ -14,10 +14,18 @@ import (
 func newControllerCmd(log *logrus.Logger) *cobra.Command {
 	cfg := controller.Config{Version: version}
 
+	var pprofListen string
+
 	cmd := &cobra.Command{
 		Use:   "controller",
 		Short: "Run the per-devnet controller",
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			if pprofListen != "" {
+				if err := startPprof(cmd.Context(), log, pprofListen); err != nil {
+					return err
+				}
+			}
+
 			dist, err := web.Dist()
 			if err != nil {
 				return fmt.Errorf("web ui: %w", err)
@@ -46,6 +54,13 @@ func newControllerCmd(log *logrus.Logger) *cobra.Command {
 	f.StringVar(&cfg.Network, "network", "", "network name; certificates must be issued for it")
 	f.StringVar(&cfg.SignerPublicKey, "signer-public-key", "",
 		"signer public key (output of the upgradoor_signer_pubkey filter or 'keygen signer-pubkey')")
+	f.StringVar(&cfg.ControllerSeedFile, "controller-seed-file", "",
+		"file holding the controller seed (never the devnet seed): "+
+			"the key that signs answers to agents is derived from it for --network")
+	f.Uint64Var(&cfg.ControllerGeneration, "controller-generation", 0,
+		"generation of the controller key to derive from the controller seed")
+	f.BoolVar(&cfg.AllowUnsignedAgentAnswers, "allow-unsigned-agent-answers", false,
+		"run without a controller seed: answers to agents are not signed (development only)")
 	f.StringArrayVar(&cfg.PublicURLs, "public-url", nil,
 		"base URL agents reach the controller under, e.g. https://upgradoor.<network> (repeatable)")
 	f.BoolVar(&cfg.AllowInsecureAgentHTTP, "allow-insecure-agent-http", false,
@@ -61,6 +76,8 @@ func newControllerCmd(log *logrus.Logger) *cobra.Command {
 		"beacon API base URL (repeatable; tried in order)")
 	f.StringArrayVar(&cfg.DefaultSettings, "default-setting", nil,
 		"default for a setting as key=value, e.g. maxUnavailablePercent=10 (repeatable)")
+	f.StringVar(&pprofListen, "pprof-listen", "",
+		"serve net/http/pprof on this loopback address, e.g. 127.0.0.1:6060 (off when empty)")
 
 	return cmd
 }

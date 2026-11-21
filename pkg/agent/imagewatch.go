@@ -281,7 +281,7 @@ func (w *imageWatcher) checkTag(ctx context.Context, key string) {
 
 	log := w.log.WithField("image", ref)
 
-	digest, revision, err := w.resolve(ctx, ref)
+	digest, err := w.resolve(ctx, ref)
 	if ctx.Err() != nil {
 		return
 	}
@@ -299,9 +299,8 @@ func (w *imageWatcher) checkTag(ctx context.Context, key string) {
 		log.WithFields(logrus.Fields{"digest": digest, "previous": result.Digest}).
 			Info("tag points at a new digest")
 
-		result.Digest, result.Revision = digest, revision
-	case revision != "":
-		result.Revision = revision
+		// The revision of the new image is known once the image is local.
+		result.Digest, result.Revision = digest, ""
 	}
 
 	if result.Digest != "" {
@@ -337,7 +336,8 @@ func (w *imageWatcher) checkTag(ctx context.Context, key string) {
 }
 
 // ensureLocal reports whether the image for result.Digest is local, pulling
-// it first when wanted. Errors are recorded in result.
+// it first when wanted. The revision label of the local image and errors
+// are recorded in result.
 func (w *imageWatcher) ensureLocal(
 	ctx context.Context,
 	log logrus.FieldLogger,
@@ -345,7 +345,7 @@ func (w *imageWatcher) ensureLocal(
 	result *protocol.RegistryCheck,
 	pull bool,
 ) bool {
-	local, err := w.runtime.LocalDigest(ctx, ref)
+	local, revision, err := w.runtime.LocalImage(ctx, ref)
 	if err != nil {
 		if result.Error == "" {
 			result.Error = "local image: " + err.Error()
@@ -355,6 +355,8 @@ func (w *imageWatcher) ensureLocal(
 	}
 
 	if local == result.Digest {
+		result.Revision = revision
+
 		return true
 	}
 
@@ -367,7 +369,7 @@ func (w *imageWatcher) ensureLocal(
 	pctx, cancel := context.WithTimeout(ctx, pullTimeout)
 	defer cancel()
 
-	got, err := w.runtime.Pull(pctx, ref)
+	got, revision, err := w.runtime.Pull(pctx, ref)
 	if err != nil {
 		result.Error = "pull: " + err.Error()
 
@@ -385,27 +387,27 @@ func (w *imageWatcher) ensureLocal(
 		return false
 	}
 
+	result.Revision = revision
+
 	log.WithField("digest", got).Info("image pulled")
 
 	return true
 }
 
-func (w *imageWatcher) resolve(
-	ctx context.Context, ref string,
-) (digest, revision string, err error) {
+func (w *imageWatcher) resolve(ctx context.Context, ref string) (string, error) {
 	rctx, cancel := context.WithTimeout(ctx, resolveTimeout)
 	defer cancel()
 
-	digest, revision, err = w.registry.Resolve(rctx, ref)
+	digest, err := w.registry.Resolve(rctx, ref)
 	if err != nil {
-		return "", "", err
+		return "", err
 	}
 
 	if digest == "" {
-		return "", "", fmt.Errorf("registry returned no digest for %s", ref)
+		return "", fmt.Errorf("registry returned no digest for %s", ref)
 	}
 
-	return digest, revision, nil
+	return digest, nil
 }
 
 // jittered returns the poll interval plus up to pollJitter of it.

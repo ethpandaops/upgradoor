@@ -62,6 +62,10 @@ type user struct {
 	// services is the token's "services" claim, the directive list the
 	// feature checks read.
 	services string
+	// expires is when the token stops being valid; zero in open mode. A
+	// request is over long before that, an event stream is not: it ends
+	// then, and is not opened for a token that does not say.
+	expires time.Time
 }
 
 // open reports whether no provider is configured.
@@ -172,7 +176,14 @@ func (a *userAuth) authenticate(r *http.Request) (*user, error) {
 			errUnauthenticated, len(claims.Teams), maxTokenTeams)
 	}
 
-	return &user{actor: actor, teams: claims.Teams, services: claims.Services}, nil
+	u := &user{actor: actor, teams: claims.Teams, services: claims.Services}
+
+	// The verifier refuses a token without an expiry.
+	if claims.ExpiresAt != nil {
+		u.expires = claims.ExpiresAt.Time
+	}
+
+	return u, nil
 }
 
 // userHandler is a handler for an authenticated route; u is who asks.

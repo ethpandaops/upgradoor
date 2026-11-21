@@ -3,8 +3,10 @@
 
 import type { ActionCall } from '../api/client';
 import type {
+  ClientPolicyRequest,
   EndLeaseRequest,
   HoldRequest,
+  OfflineRequest,
   RebootRequest,
   RollRequest,
   RolloutHostsRequest,
@@ -15,14 +17,14 @@ import { hostList, plural } from './format';
 /** "now": granted as fast as budget and gate allow; "staggered": a manual rollout through the normal rules. */
 export type Timing = 'now' | 'staggered';
 
-export interface HostSelection {
+interface HostSelection {
   /** hosts is ignored when all is set. */
   hosts: readonly string[];
   /** all selects the whole fleet. */
   all: boolean;
 }
 
-export interface DisruptiveOptions extends HostSelection {
+interface DisruptiveOptions extends HostSelection {
   timing: Timing;
   /** force only applies to a staggered action; "now" is forced by definition. */
   force: boolean;
@@ -30,8 +32,8 @@ export interface DisruptiveOptions extends HostSelection {
   reason: string;
 }
 
-export interface RollOptions extends DisruptiveOptions {
-  /** containers limits the roll; empty means every managed, non-custom container. */
+interface RollOptions extends DisruptiveOptions {
+  /** containers limits the roll; empty means every managed container. */
   containers: readonly string[];
 }
 
@@ -69,9 +71,23 @@ export function buildHoldRequest(hosts: readonly string[], reason: string): Hold
   return { hosts: [...new Set(hosts)].sort(), reason: reason.trim() };
 }
 
+/** buildOfflineRequest builds the body of mark-offline and unmark-offline. */
+export function buildOfflineRequest(hosts: readonly string[], reason: string, until?: string): OfflineRequest {
+  return { hosts: [...new Set(hosts)].sort(), reason: reason.trim(), ...(until ? { until } : {}) };
+}
+
 /** buildEndLeaseRequest builds the body of end-lease. */
 export function buildEndLeaseRequest(lease: string, reason: string): EndLeaseRequest {
   return { lease, reason: reason.trim() };
+}
+
+/** buildClientPolicyRequest builds the body of client-policy; an empty policy returns the client to the default. */
+export function buildClientPolicyRequest(
+  client: string,
+  policy: ClientPolicyRequest['policy'],
+  reason: string
+): ClientPolicyRequest {
+  return { client, policy, reason: reason.trim() };
 }
 
 /** buildScopeRequest builds the body of pause, resume and abort; an empty rollout is the global scope. */
@@ -134,12 +150,12 @@ export function describeRoll(o: RollOptions): string[] {
   const containers = [...new Set(o.containers)].sort();
   const what =
     containers.length === 0
-      ? 'every managed, non-custom container'
+      ? 'every managed container'
       : `${plural(containers.length, 'container')} (${containers.join(', ')})`;
 
   return [
     `Roll ${what} on ${selectionText(o)}: pull the tag the container already uses, stop it, ` +
-      'recreate it with identical configuration and start it. Custom and unmanaged containers are not touched.',
+      'recreate it with identical configuration and start it. Unmanaged containers are not touched.',
     ...timingText(o),
   ];
 }
@@ -151,6 +167,15 @@ export function describeReboot(o: DisruptiveOptions): string[] {
       'then reboots the host.',
     ...timingText(o),
   ];
+}
+
+const OVERRIDE_HOW: readonly string[] = [
+  'The controller passes this to the agent of the host, which may refuse it (its configuration says what may be overridden). ' +
+    'Nothing changes at once: the agent recreates the container under its next lease, through the budget and the network gate like any other update.',
+];
+
+function untilText(until: string | undefined): string {
+  return until ? `, until ${new Date(until).toLocaleString()}` : ', for 24 hours';
 }
 
 /** describeCall states what a simple (non roll / reboot) action will do. */
@@ -169,6 +194,16 @@ export function describeCall(call: ActionCall): string[] {
         `Lift the controller hold on ${selectionText({ hosts: call.body.hosts, all: false })}. ` +
           'A local hold file on the host stays in effect; only a person on the host can remove it.',
       ];
+    case 'mark-offline':
+      return [
+        `Mark ${selectionText({ hosts: call.body.hosts, all: false })} as known offline${call.body.until ? untilText(call.body.until) : ' until a person lifts it'}: ` +
+          'its validators are left out of the network gate and the budget, and it gets no lease. Everything else is still shown.',
+      ];
+    case 'unmark-offline':
+      return [
+        `Lift the known-offline mark on ${selectionText({ hosts: call.body.hosts, all: false })}: ` +
+          'its validators count for the gate and the budget again.',
+      ];
     case 'forget':
       return [
         `Forget ${selectionText({ hosts: call.body.hosts, all: false })}: delete the host with its inventory, ` +
@@ -179,12 +214,81 @@ export function describeCall(call: ActionCall): string[] {
       return [
         `End lease ${call.body.lease}. The agent begins no further step: it completes the step in progress ` +
           'and stops. A lease the agent has not started is not started.',
-        'The host is put on hold. The lease stays open and keeps its slot until the agent reports ' +
-          '(or the lease expires); then it ends, as "ended by operator" if the agent had started it.',
-        'A change of which the agent had applied a step by then counts against the host: it was never shown to ' +
-          'be back, so it goes first next time. A change of which nothing was begun does not.',
-        'Unhold the host when the lease has ended and it is in order; until the lease has ended, unhold is refused.',
+        'The lease stays open and keeps its slot until the agent reports (or goes silent, or the lease runs ' +
+          'out); then it ends as failed, "ended by operator".',
+        'A failed lease halts its rollouts and marks the host: nothing more is granted there until somebody ' +
+          'retries, and the host goes first next time. No hold is set: hold the host if it is to be left alone.',
       ];
+    case 'client-policy': {
+      const { client, policy } = call.body;
+      if (policy === '') {
+        return [
+          `Remove the image policy of ${client}: its image rollouts answer to the global image policy again.`,
+          'An open rollout that was approved stays approved.',
+        ];
+      }
+      return [
+        `Set the image policy of ${client} to ${policy}: ` +
+          (policy === 'manual'
+            ? 'a new image of the client is queued and waits for a person to approve the rollout.'
+            : 'a new image of the client rolls out by itself.'),
+        policy === 'manual'
+          ? 'An open image rollout of the client that nobody approved waits for approval from now on; one that was approved stays approved.'
+          : 'An open image rollout of the client that waits for approval starts.',
+        'The other clients, packages and reboots keep their policies.',
+      ];
+    }
+    case 'image-override': {
+      const { host, container, image, until } = call.body;
+      return image === ''
+        ? [
+            `Clear the image override of ${container} on ${host}: the container goes back to its configured image.`,
+            ...OVERRIDE_HOW,
+          ]
+        : [
+            `Run ${container} on ${host} from ${image} instead of its configured image${untilText(until)}.`,
+            ...OVERRIDE_HOW,
+            'While the override is in effect the container is not rolled with its configured tag. When it ends the host puts the configured image back, again under a lease.',
+          ];
+    }
+    case 'flag-override': {
+      const { host, container, addFlags, removeFlags, until } = call.body;
+      return addFlags.length + removeFlags.length === 0
+        ? [
+            `Clear the flag override of ${container} on ${host}: the container goes back to its configured command line.`,
+            ...OVERRIDE_HOW,
+          ]
+        : [
+            `Change the command line of ${container} on ${host}${untilText(until)}: ` +
+              [
+                removeFlags.length > 0 ? `remove ${removeFlags.join(', ')}` : '',
+                addFlags.length > 0 ? `add ${addFlags.join(', ')}` : '',
+              ]
+                .filter(Boolean)
+                .join('; ') +
+              '.',
+            ...OVERRIDE_HOW,
+            'When the override ends the host puts the configured command line back, again under a lease.',
+          ];
+    }
+    case 'client-override': {
+      const { client, kind, hosts, part, image, addFlags, removeFlags, until } = call.body;
+      const on = `${client} (${kind}) on ${hosts.length === 1 ? hosts[0] : `${hosts.length} hosts`}`;
+      const flags = [
+        (removeFlags ?? []).length > 0 ? `remove ${(removeFlags ?? []).join(', ')}` : '',
+        (addFlags ?? []).length > 0 ? `add ${(addFlags ?? []).join(', ')}` : '',
+      ]
+        .filter(Boolean)
+        .join('; ');
+      if (part === 'image') {
+        return image
+          ? [`Run ${on} from ${image} instead of the configured image${untilText(until)}.`, ...OVERRIDE_HOW]
+          : [`Clear the image override of ${on}: the containers go back to the configured image.`, ...OVERRIDE_HOW];
+      }
+      return flags
+        ? [`Change the command line of ${on}${untilText(until)}: ${flags}.`, ...OVERRIDE_HOW]
+        : [`Clear the flag override of ${on}: the containers go back to the configured command line.`, ...OVERRIDE_HOW];
+    }
     case 'pause':
       return call.body.rollout === ''
         ? ['Pause everything: no new lease is granted for any rollout. Open leases finish.']
@@ -198,21 +302,26 @@ export function describeCall(call: ActionCall): string[] {
           ];
     case 'abort':
       return [
-        `Abort rollout ${call.body.rollout}: it is closed and the same cause opens no new rollout ` +
-          'until someone retries it or the cause changes. Open leases finish.',
+        `Abort rollout ${call.body.rollout}. A manual rollout is closed, and what it has not started is cancelled.`,
+        'A rollout of an image, of packages or of a reboot stays open for as long as hosts report its cause: ' +
+          'it is paused instead, and nothing more is granted in it until someone resumes it or the cause changes.',
+        'Open leases finish.',
       ];
     case 'skip':
       return [
         `Skip ${selectionText({ hosts: call.body.hosts, all: false })} in rollout ${call.body.rollout}: ` +
-          'the host is not served for this rollout and nobody waits for it any more.',
+          'the host is not served for this rollout and nobody waits for it.',
+        'A rollout of an image, of packages or of a reboot stays open while a skipped host still has the need; ' +
+          'the host counts as done once it reports without it. In a manual rollout the skip is final.',
       ];
     case 'retry':
       return [
         call.body.hosts.length === 0
           ? `Retry rollout ${call.body.rollout}: every failed host returns to pending and the rollout becomes active again.`
           : `Retry ${selectionText({ hosts: call.body.hosts, all: false })} in rollout ${call.body.rollout}: ` +
-            'the host returns to pending and the rollout becomes active again.',
-        'For an image rollout this lifts the block on the digest.',
+            'a host that failed or was skipped returns to pending, and a halted rollout becomes active again ' +
+            'once none of its hosts is failed.',
+        'Only an open rollout can be retried.',
       ];
   }
 }

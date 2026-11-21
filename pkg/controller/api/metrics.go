@@ -17,28 +17,23 @@ import (
 // collectTimeout bounds the store reads of one scrape.
 const collectTimeout = 10 * time.Second
 
-const labelHost = "host"
-
 // metrics are the controller's Prometheus metrics. Fleet state is read from
 // the store and the last plan at scrape time, so the numbers are never stale
 // and nothing has to be kept in step by hand.
 //
-// /metrics is unauthenticated. Label values are host names, endpoint names,
-// status codes and rollout states only: never a package version, a kernel or
-// an address.
+// /metrics is unauthenticated. The series are fleet-wide; label values are
+// endpoint names, status codes and rollout states only: never a host name, a
+// package version, a kernel or an address.
 type metrics struct {
 	log    logrus.FieldLogger
 	server *Server
 
 	agentRequests *prometheus.CounterVec
+	agentDuration *prometheus.HistogramVec
 
 	hosts               *prometheus.Desc
 	hostsStale          *prometheus.Desc
 	hostsRebootRequired *prometheus.Desc
-	hostPendingSecurity *prometheus.Desc
-	hostLastSeen        *prometheus.Desc
-	hostValidatorsLive  *prometheus.Desc
-	hostValidatorsTotal *prometheus.Desc
 	leasesOpen          *prometheus.Desc
 	rollouts            *prometheus.Desc
 	gateOK              *prometheus.Desc
@@ -51,8 +46,6 @@ type metrics struct {
 var _ prometheus.Collector = (*metrics)(nil)
 
 func newMetrics(log logrus.FieldLogger, reg prometheus.Registerer, server *Server) (*metrics, error) {
-	host := []string{labelHost}
-
 	m := &metrics{
 		log:    log,
 		server: server,
@@ -60,6 +53,13 @@ func newMetrics(log logrus.FieldLogger, reg prometheus.Registerer, server *Serve
 			Name: "upgradoor_agent_requests_total",
 			Help: "Agent API requests by endpoint and HTTP status code.",
 		}, []string{"endpoint", "code"}),
+		agentDuration: prometheus.NewHistogramVec(prometheus.HistogramOpts{
+			Name: "upgradoor_agent_request_duration_seconds",
+			Help: "Time to answer an agent API request that succeeded, by endpoint.",
+			Buckets: []float64{
+				0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5,
+			},
+		}, []string{"endpoint"}),
 		hosts: prometheus.NewDesc("upgradoor_hosts",
 			"Number of hosts known to the controller.", nil, nil),
 		hostsStale: prometheus.NewDesc("upgradoor_hosts_stale",
@@ -67,17 +67,6 @@ func newMetrics(log logrus.FieldLogger, reg prometheus.Registerer, server *Serve
 			nil, nil),
 		hostsRebootRequired: prometheus.NewDesc("upgradoor_hosts_reboot_required",
 			"Number of hosts that report a required reboot.", nil, nil),
-		hostPendingSecurity: prometheus.NewDesc("upgradoor_host_pending_security_updates",
-			"Number of pending security updates of a host.", host, nil),
-		hostLastSeen: prometheus.NewDesc("upgradoor_host_last_seen_timestamp_seconds",
-			"Unix time of the last sync of a host.", host, nil),
-		hostValidatorsLive: prometheus.NewDesc("upgradoor_host_validators_live",
-			"Validators of a host that attested in the last complete epoch.", host, nil),
-		// A gauge with a counter's suffix: the name is the one the project's
-		// metric list fixes (chart and dashboards use it). It is the single
-		// promlint exception, pinned by TestMetricNames.
-		hostValidatorsTotal: prometheus.NewDesc("upgradoor_host_validators_total",
-			"Validators operated by a host.", host, nil),
 		leasesOpen: prometheus.NewDesc("upgradoor_leases_open",
 			"Number of open leases.", nil, nil),
 		rollouts: prometheus.NewDesc("upgradoor_rollouts",
@@ -98,6 +87,10 @@ func newMetrics(log logrus.FieldLogger, reg prometheus.Registerer, server *Serve
 		return nil, fmt.Errorf("api: register metrics: %w", err)
 	}
 
+	if err := reg.Register(m.agentDuration); err != nil {
+		return nil, fmt.Errorf("api: register metrics: %w", err)
+	}
+
 	if err := reg.Register(m); err != nil {
 		return nil, fmt.Errorf("api: register metrics: %w", err)
 	}
@@ -110,13 +103,16 @@ func (m *metrics) agentRequest(endpoint string, status int) {
 	m.agentRequests.WithLabelValues(endpoint, strconv.Itoa(status)).Inc()
 }
 
+// agentAnswered records the time a successful agent request took.
+func (m *metrics) agentAnswered(endpoint string, took time.Duration) {
+	m.agentDuration.WithLabelValues(endpoint).Observe(took.Seconds())
+}
+
 // Describe implements prometheus.Collector.
 func (m *metrics) Describe(ch chan<- *prometheus.Desc) {
 	for _, desc := range []*prometheus.Desc{
-		m.hosts, m.hostsStale, m.hostsRebootRequired, m.hostPendingSecurity,
-		m.hostLastSeen, m.hostValidatorsLive, m.hostValidatorsTotal, m.leasesOpen,
-		m.rollouts, m.gateOK, m.participation, m.finalityLag, m.budgetUnavailable,
-		m.budgetAllowed,
+		m.hosts, m.hostsStale, m.hostsRebootRequired, m.leasesOpen, m.rollouts,
+		m.gateOK, m.participation, m.finalityLag, m.budgetUnavailable, m.budgetAllowed,
 	} {
 		ch <- desc
 	}
@@ -132,7 +128,7 @@ func (m *metrics) Collect(ch chan<- prometheus.Metric) {
 
 	m.collectNetwork(ch, plan)
 
-	if err := m.collectHosts(ctx, ch, plan); err != nil {
+	if err := m.collectHosts(ctx, ch); err != nil {
 		m.log.WithError(err).Warn("Cannot collect host metrics")
 	}
 
@@ -163,9 +159,7 @@ func (m *metrics) collectNetwork(ch chan<- prometheus.Metric, plan *scheduler.Pl
 	}
 }
 
-func (m *metrics) collectHosts(
-	ctx context.Context, ch chan<- prometheus.Metric, plan *scheduler.Plan,
-) error {
+func (m *metrics) collectHosts(ctx context.Context, ch chan<- prometheus.Metric) error {
 	hosts, err := m.server.opts.Store.ListHosts(ctx)
 	if err != nil {
 		return fmt.Errorf("list hosts: %w", err)
@@ -184,23 +178,8 @@ func (m *metrics) collectHosts(
 			stale++
 		}
 
-		gauge(ch, m.hostLastSeen, float64(host.LastSeen.UnixNano())/1e9, host.Name)
-		gauge(ch, m.hostValidatorsTotal, float64(host.Weight()), host.Name)
-
-		if host.Status != nil {
-			if host.Status.OS.RebootRequired {
-				reboot++
-			}
-
-			gauge(ch, m.hostPendingSecurity, float64(host.Status.Pending.Security), host.Name)
-		}
-
-		// Live validators are only known once the plan has liveness data; a
-		// missing series means unknown, not zero.
-		if plan != nil {
-			if hp, ok := plan.Hosts[host.Name]; ok && hp.LiveKnown {
-				gauge(ch, m.hostValidatorsLive, float64(hp.Live), host.Name)
-			}
+		if host.Status != nil && host.Status.OS.RebootRequired {
+			reboot++
 		}
 	}
 

@@ -1,7 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
 
 import { AuthStore } from '../auth/authStore';
-import { ApiClient, ApiError, errorText, type FetchFn, type TokenSource } from './client';
+import { ApiClient, ApiError, errorText, type FetchFn, type StreamEvent, type TokenSource } from './client';
 
 function json(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), { status, headers: { 'Content-Type': 'application/json' } });
@@ -25,10 +25,10 @@ describe('ApiClient authentication', () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.resolve(json({ hosts: [] })));
     const api = new ApiClient({ fetch: fetchFn, tokens: tokens() });
 
-    await api.hosts();
+    await api.settings();
 
     expect(fetchFn).toHaveBeenCalledTimes(1);
-    expect(fetchFn.mock.calls[0]?.[0]).toBe('/api/v1/hosts');
+    expect(fetchFn.mock.calls[0]?.[0]).toBe('/api/v1/settings');
     expect(headersOf(fetchFn).get('Authorization')).toBe('Bearer tok-1');
   });
 
@@ -38,8 +38,8 @@ describe('ApiClient authentication', () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.resolve(json({})));
     const api = new ApiClient({ fetch: fetchFn, tokens: tokens({ getToken }) });
 
-    await api.plan();
-    await api.plan();
+    await api.settings();
+    await api.settings();
     await api.action({ action: 'pause', body: { rollout: '', reason: '' } });
 
     expect(getToken).toHaveBeenCalledTimes(3);
@@ -54,18 +54,11 @@ describe('ApiClient authentication', () => {
     const api = new ApiClient({ fetch: fetchFn, tokens: tokens({ getToken }) });
 
     await api.config();
-    await api.publicHosts();
-    await api.publicImages();
-    await api.publicNetwork();
+    await api.publicSlots(60);
 
     expect(getToken).not.toHaveBeenCalled();
-    expect(fetchFn.mock.calls.map(c => c[0])).toEqual([
-      '/api/v1/config',
-      '/api/v1/public/hosts',
-      '/api/v1/public/images',
-      '/api/v1/public/network',
-    ]);
-    for (let i = 0; i < 4; i++) expect(headersOf(fetchFn, i).has('Authorization')).toBe(false);
+    expect(fetchFn.mock.calls.map(c => c[0])).toEqual(['/api/v1/config', '/api/v1/public/slots?window=60']);
+    for (let i = 0; i < 2; i++) expect(headersOf(fetchFn, i).has('Authorization')).toBe(false);
   });
 
   it('sends no Authorization header in open mode', async () => {
@@ -73,7 +66,7 @@ describe('ApiClient authentication', () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.resolve(json({ hosts: [] })));
     const api = new ApiClient({ fetch: fetchFn, tokens: tokens({ required: () => false, getToken }) });
 
-    await api.hosts();
+    await api.settings();
 
     expect(getToken).not.toHaveBeenCalled();
     expect(headersOf(fetchFn).has('Authorization')).toBe(false);
@@ -83,7 +76,7 @@ describe('ApiClient authentication', () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.resolve(json({})));
     const api = new ApiClient({ fetch: fetchFn, tokens: tokens({ getToken: () => Promise.resolve(null) }) });
 
-    await expect(api.hosts()).rejects.toMatchObject({ name: 'ApiError', status: 401, message: 'login required' });
+    await expect(api.settings()).rejects.toMatchObject({ name: 'ApiError', status: 401, message: 'login required' });
     expect(fetchFn).not.toHaveBeenCalled();
   });
 
@@ -92,11 +85,11 @@ describe('ApiClient authentication', () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.resolve(json({})));
     const api = new ApiClient({ fetch: fetchFn, tokens: t });
 
-    await expect(api.hosts()).rejects.toMatchObject({ status: 401 });
+    await expect(api.settings()).rejects.toMatchObject({ status: 401 });
     expect(t.onUnauthorized).toHaveBeenCalledTimes(1);
 
     // Public routes need no token and report nothing.
-    await api.publicHosts();
+    await api.config();
     expect(t.onUnauthorized).toHaveBeenCalledTimes(1);
   });
 
@@ -126,7 +119,7 @@ describe('ApiClient authentication', () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.resolve(json({})));
     const api = new ApiClient({ fetch: fetchFn, tokens: store });
 
-    await expect(api.hosts()).rejects.toMatchObject({ status: 401, message: 'login required' });
+    await expect(api.settings()).rejects.toMatchObject({ status: 401, message: 'login required' });
     expect(fetchFn).not.toHaveBeenCalled();
     await vi.waitFor(() => {
       expect(store.getState().loggedIn).toBe(false);
@@ -139,7 +132,7 @@ describe('ApiClient authentication', () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.resolve(json({ error: 'token expired' }, 401)));
     const api = new ApiClient({ fetch: fetchFn, tokens: t });
 
-    const err = await api.hosts().catch((e: unknown) => e);
+    const err = await api.settings().catch((e: unknown) => e);
 
     expect(err).toBeInstanceOf(ApiError);
     expect(err).toMatchObject({ status: 401, message: 'token expired' });
@@ -151,7 +144,7 @@ describe('ApiClient authentication', () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.resolve(json({ error: 'unknown host x' }, 404)));
     const api = new ApiClient({ fetch: fetchFn, tokens: t });
 
-    await expect(api.host('x')).rejects.toMatchObject({ status: 404, message: 'unknown host x' });
+    await expect(api.clientHosts('x')).rejects.toMatchObject({ status: 404, message: 'unknown host x' });
     expect(t.onUnauthorized).not.toHaveBeenCalled();
   });
 });
@@ -161,16 +154,14 @@ describe('ApiClient requests', () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.resolve(json({})));
     const api = new ApiClient({ fetch: fetchFn });
 
-    await api.host('a/b c');
-    await api.packages('lib ssl', 50);
-    await api.rollouts(20);
+    await api.clientHosts('a/b c', { limit: 20 });
+    await api.packages({ q: 'lib ssl', limit: 50 });
     await api.audit({ target: 'geth-1', action: 'action.', before: 120, limit: 50 });
     await api.audit();
 
     expect(fetchFn.mock.calls.map(c => c[0])).toEqual([
-      '/api/v1/hosts/a%2Fb%20c',
+      '/api/v1/clients/a%2Fb%20c/hosts?limit=20',
       '/api/v1/packages?q=lib+ssl&limit=50',
-      '/api/v1/rollouts?limit=20',
       '/api/v1/audit?target=geth-1&action=action.&before=120&limit=50',
       '/api/v1/audit',
     ]);
@@ -196,14 +187,14 @@ describe('ApiClient requests', () => {
     );
     const api = new ApiClient({ fetch: fetchFn });
 
-    await expect(api.plan()).rejects.toMatchObject({ status: 502, message: '502 Bad Gateway' });
+    await expect(api.settings()).rejects.toMatchObject({ status: 502, message: '502 Bad Gateway' });
   });
 
   it('turns a network failure into an ApiError with status 0', async () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.reject(new TypeError('Failed to fetch')));
     const api = new ApiClient({ fetch: fetchFn });
 
-    const err = await api.plan().catch((e: unknown) => e);
+    const err = await api.settings().catch((e: unknown) => e);
 
     expect(err).toMatchObject({ status: 0 });
     expect(errorText(err)).toBe('controller unreachable: Failed to fetch');
@@ -213,12 +204,80 @@ describe('ApiClient requests', () => {
     const fetchFn = vi.fn<FetchFn>(() => Promise.reject(new DOMException('aborted', 'AbortError')));
     const api = new ApiClient({ fetch: fetchFn });
 
-    await expect(api.plan()).rejects.toMatchObject({ name: 'AbortError' });
+    await expect(api.settings()).rejects.toMatchObject({ name: 'AbortError' });
   });
 
   it('renders errors for display', () => {
     expect(errorText(new ApiError(409, 'rollout is completed'))).toBe('rollout is completed (HTTP 409)');
     expect(errorText(new Error('boom'))).toBe('boom');
     expect(errorText('text')).toBe('text');
+  });
+});
+
+/** sse answers with an event stream made of the given chunks, then ends. */
+function sse(chunks: string[], status = 200): Response {
+  const encoder = new TextEncoder();
+  const body = new ReadableStream<Uint8Array>({
+    start(controller) {
+      for (const chunk of chunks) controller.enqueue(encoder.encode(chunk));
+      controller.close();
+    },
+  });
+  return new Response(body, { status, headers: { 'Content-Type': 'text/event-stream' } });
+}
+
+describe('ApiClient event stream', () => {
+  it('reads events across chunk boundaries and reports heartbeats as activity only', async () => {
+    const fetchFn = vi.fn<FetchFn>(() =>
+      Promise.resolve(
+        sse(['event: public-ho', 'sts\ndata: {"hosts":[]}\n\n: ping\n\nevent: ready\r\ndata: {}\r\n', '\r\n'])
+      )
+    );
+    const api = new ApiClient({ fetch: fetchFn, tokens: tokens() });
+    const events: StreamEvent[] = [];
+    const onActivity = vi.fn();
+
+    await api.events({
+      user: false,
+      signal: new AbortController().signal,
+      onActivity,
+      onEvent: e => events.push(e),
+    });
+
+    expect(events).toEqual([
+      { event: 'public-hosts', data: { hosts: [] } },
+      { event: 'ready', data: {} },
+    ]);
+    expect(onActivity).toHaveBeenCalledTimes(3);
+    expect(fetchFn.mock.calls[0]?.[0]).toBe('/api/v1/public/events');
+    expect(headersOf(fetchFn).get('Authorization')).toBeNull();
+  });
+
+  it('sends the token in the header of the authenticated stream, never in the URL', async () => {
+    const fetchFn = vi.fn<FetchFn>(() => Promise.resolve(sse([])));
+    const api = new ApiClient({ fetch: fetchFn, tokens: tokens() });
+
+    await api.events({
+      user: true,
+      hosts: ['a', 'b c'],
+      signal: new AbortController().signal,
+      onEvent: () => undefined,
+    });
+
+    expect(fetchFn.mock.calls[0]?.[0]).toBe('/api/v1/events?host=a&host=b+c');
+    expect(headersOf(fetchFn).get('Authorization')).toBe('Bearer tok-1');
+  });
+
+  it('reports a refused stream like a refused request', async () => {
+    const t = tokens();
+    const api = new ApiClient({
+      fetch: () => Promise.resolve(json({ error: 'a valid bearer token is required' }, 401)),
+      tokens: t,
+    });
+
+    await expect(
+      api.events({ user: true, signal: new AbortController().signal, onEvent: () => undefined })
+    ).rejects.toMatchObject({ status: 401, message: 'a valid bearer token is required' });
+    expect(t.onUnauthorized).toHaveBeenCalledTimes(1);
   });
 });

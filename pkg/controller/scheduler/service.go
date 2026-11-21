@@ -8,8 +8,8 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"reflect"
 	"slices"
-	"strings"
 	"sync"
 	"time"
 
@@ -23,7 +23,7 @@ import (
 const (
 	// defaultTickInterval is the reconcile period.
 	defaultTickInterval = 2 * time.Second
-	// minLivenessEpochs is the least number of liveness epochs loaded.
+	// minLivenessEpochs is the least number of liveness epochs asked for.
 	minLivenessEpochs = 6
 )
 
@@ -31,9 +31,7 @@ const (
 type Store interface {
 	ListHosts(ctx context.Context) ([]*fleet.Host, error)
 	GetHost(ctx context.Context, name string) (*fleet.Host, error)
-	SetHostHold(ctx context.Context, name string, wanted bool, reason string) error
 	DeleteHost(ctx context.Context, name string) error
-	ListLiveness(ctx context.Context, epochs int) ([]fleet.Liveness, error)
 	ListRollouts(ctx context.Context, filter store.RolloutFilter) ([]*fleet.Rollout, error)
 	GetRollout(ctx context.Context, id string) (*fleet.Rollout, error)
 	ListLeases(ctx context.Context, filter store.LeaseFilter) ([]*fleet.Lease, error)
@@ -54,6 +52,10 @@ type Options struct {
 	// Health returns the beacon service's latest view. Without it the
 	// network gate fails ("beacon node unreachable").
 	Health func() fleet.NetworkHealth
+	// Liveness returns the beacon service's per-host liveness of the newest
+	// settled epochs, newest first. Without it no host's validators count as
+	// attesting, and the gate stays closed while any host has validators.
+	Liveness func(epochs int) []fleet.Liveness
 	// Defaults are the settings before the stored overrides.
 	Defaults fleet.Settings
 	// TickInterval is the reconcile period; 2s when zero.
@@ -62,6 +64,13 @@ type Options struct {
 	Now func() time.Time
 	// NewID returns a new unique ID; random when nil.
 	NewID func() string
+	// Changed, when set, is called after a commit, after an audit entry was
+	// appended (every action writes one) and after a reconcile whose plan
+	// differs from the one before it, the time it was computed at aside. It
+	// is how the API learns that the views it serves may have changed. It can
+	// be called under the scheduler's lock: it must not block and must not
+	// call back into the scheduler.
+	Changed func()
 }
 
 type service struct {
@@ -71,9 +80,8 @@ type service struct {
 	// is the World's Since: silence is never counted from before it.
 	since time.Time
 
-	// mu serialises reconciles and actions and guards hist.
-	mu   sync.Mutex
-	hist history
+	// mu serialises reconciles and actions.
+	mu sync.Mutex
 
 	planMu sync.RWMutex
 	plan   *Plan
@@ -103,6 +111,10 @@ func New(log logrus.FieldLogger, opts Options) Service { //nolint:gocritic // hu
 
 	if opts.Health == nil {
 		opts.Health = func() fleet.NetworkHealth { return fleet.NetworkHealth{} }
+	}
+
+	if opts.Liveness == nil {
+		opts.Liveness = func(int) []fleet.Liveness { return nil }
 	}
 
 	return &service{
@@ -177,9 +189,19 @@ func (s *service) run(ctx context.Context) {
 			return
 		case <-ticker.C:
 		case <-s.nudge:
+			// Nudges come in bursts (a rollout's syncs): they share one
+			// reconcile instead of running them back to back.
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(nudgeGap):
+			}
 		}
 	}
 }
+
+// nudgeGap is how long a nudged reconcile waits for more nudges.
+const nudgeGap = 250 * time.Millisecond
 
 // Nudge asks for a reconcile soon.
 func (s *service) Nudge() {
@@ -223,10 +245,36 @@ func (s *service) reconcile(ctx context.Context) error {
 	}
 
 	s.planMu.Lock()
+	same := samePlan(s.plan, out.Plan)
 	s.plan = out.Plan
 	s.planMu.Unlock()
 
+	if !same {
+		s.changed()
+	}
+
 	return nil
+}
+
+// samePlan reports whether two plans say the same. When they were computed
+// does not count: an idle scheduler computes the same plan on every tick.
+func samePlan(a, b *Plan) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	x, y := *a, *b
+	x.ComputedAt, y.ComputedAt = time.Time{}, time.Time{}
+
+	return reflect.DeepEqual(&x, &y)
+}
+
+// changed tells the listener, if there is one, that committed state or the
+// plan changed.
+func (s *service) changed() {
+	if s.opts.Changed != nil {
+		s.opts.Changed()
+	}
 }
 
 // loadWorld reads everything one reconcile depends on.
@@ -250,17 +298,10 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 		return nil, fmt.Errorf("scheduler: list hosts: %w", err)
 	}
 
-	epochs := max(int(settings.ReadyEpochs)+3, minLivenessEpochs)
-	if w.Liveness, err = st.ListLiveness(ctx, epochs); err != nil {
-		return nil, fmt.Errorf("scheduler: list liveness: %w", err)
-	}
+	w.Liveness = s.opts.Liveness(max(int(settings.ReadyEpochs)+3, minLivenessEpochs))
 
 	if w.Rollouts, err = st.ListRollouts(ctx, store.RolloutFilter{OpenOnly: true}); err != nil {
 		return nil, fmt.Errorf("scheduler: list open rollouts: %w", err)
-	}
-
-	if w.Closed, err = s.closedRollouts(ctx); err != nil {
-		return nil, err
 	}
 
 	if w.Leases, err = st.ListLeases(ctx, store.LeaseFilter{OpenOnly: true}); err != nil {
@@ -271,281 +312,58 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 		return nil, err
 	}
 
-	if err := s.loadClosedLeases(ctx, w); err != nil {
-		return nil, err
-	}
-
-	w.LastLeaseEnd = s.hist.ended
-	w.Ended = s.hist.ledger.leases()
-
 	return w, nil
 }
 
-// history is what the scheduler remembers of the rows that only it writes
-// and that it would otherwise read in full on every tick: the latest closed
-// rollout of every key, the answered directives of the open manual rollouts,
-// and of the lease table the end of every host's last lease and the leases
-// that say which hosts are broken. It is read from the store once (after a
-// start and after a failed write) and then follows every write. The caller
-// holds service.mu.
-type history struct {
-	loaded bool
-	// closed is the latest closed rollout per key. Manual rollouts are left
-	// out: nothing follows them.
-	closed map[string]*fleet.Rollout
-	// settled holds, per open manual rollout, its directives that are no
-	// longer pending, by ID. They never change again.
-	settled map[string]map[string]*fleet.Directive
-	// ended is, per host, when its most recent terminal lease ended.
-	ended map[string]time.Time
-	// ledger is the digest of the ended leases: per host and group the last
-	// one that broke or repaired the host.
-	ledger ledger
-}
-
-// noteLease takes in a lease that was read or written. The history keeps
-// the lease itself: nobody changes a lease after it has ended. A lease that
-// is open says nothing; if it had ended before (it was taken up again), what
-// that end said is taken back.
-func (h *history) noteLease(l *fleet.Lease) {
-	if !l.State.Terminal() {
-		h.ledger.retract(l)
-
-		return
-	}
-
-	if l.EndedAt != nil && l.EndedAt.After(h.ended[l.Host]) {
-		h.ended[l.Host] = *l.EndedAt
-	}
-
-	h.ledger.note(l)
-}
-
-// newerRollout orders rollouts by creation, then end, then ID.
-func newerRollout(a, b *fleet.Rollout) int {
-	var endA, endB time.Time
-
-	if a.EndedAt != nil {
-		endA = *a.EndedAt
-	}
-
-	if b.EndedAt != nil {
-		endB = *b.EndedAt
-	}
-
-	return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), endA.Compare(endB), cmp.Compare(a.ID, b.ID))
-}
-
-// closedRollouts returns the latest closed rollout of every key, newest
-// first. The caller holds mu.
-func (s *service) closedRollouts(ctx context.Context) ([]*fleet.Rollout, error) {
-	if err := s.loadHistory(ctx); err != nil {
-		return nil, err
-	}
-
-	out := make([]*fleet.Rollout, 0, len(s.hist.closed))
-	for _, r := range s.hist.closed {
-		out = append(out, r)
-	}
-
-	slices.SortFunc(out, func(a, b *fleet.Rollout) int { return newerRollout(b, a) })
-
-	return out, nil
-}
-
-// noteRollout takes in a rollout that was read or written.
-func (h *history) noteRollout(r *fleet.Rollout) {
-	if !r.State.Terminal() {
-		return
-	}
-
-	delete(h.settled, r.ID)
-
-	if r.Kind == fleet.RolloutManual {
-		return
-	}
-
-	if cur := h.closed[r.Key]; cur == nil || newerRollout(r, cur) >= 0 {
-		h.closed[r.Key] = cloneRollout(r)
-	}
-}
-
-// noteDirective takes in an answered directive of an open manual rollout.
-func (h *history) noteDirective(d *fleet.Directive) {
-	byID, ok := h.settled[d.RolloutID]
-	if !ok || d.State == fleet.DirectivePending {
-		return
-	}
-
-	c := *d
-	byID[d.ID] = &c
-}
-
-// follow takes in a committed write.
-func (h *history) follow(changes *store.Changes) {
-	if !h.loaded {
-		return
-	}
-
-	for _, r := range changes.Rollouts {
-		h.noteRollout(r)
-	}
-
-	for _, d := range changes.Directives {
-		h.noteDirective(d)
-	}
-
-	// A fresh map: the last world may still be read.
-	h.ended = maps.Clone(h.ended)
-
-	for _, l := range changes.Leases {
-		h.noteLease(l)
-	}
-}
-
-// write commits changes and keeps the history in step. After a failed write
-// the history is read again: the store may or may not have applied it.
+// write commits changes and tells the listener.
 func (s *service) write(ctx context.Context, changes *store.Changes) error {
 	stampAuthorization(ctx, changes.Audit)
 
 	if err := s.opts.Store.Commit(ctx, changes); err != nil {
-		s.hist = history{}
-
 		return fmt.Errorf("scheduler: commit: %w", err)
 	}
 
-	s.hist.follow(changes)
+	s.changed()
 
 	return nil
 }
 
-// loadHistory reads the closed rollouts and the lease table once. The caller
-// holds mu.
-func (s *service) loadHistory(ctx context.Context) error {
-	if s.hist.loaded {
-		return nil
-	}
-
-	all, err := s.opts.Store.ListRollouts(ctx, store.RolloutFilter{})
-	if err != nil {
-		return fmt.Errorf("scheduler: list rollouts: %w", err)
-	}
-
-	leases, err := s.opts.Store.ListLeases(ctx, store.LeaseFilter{})
-	if err != nil {
-		return fmt.Errorf("scheduler: list leases: %w", err)
-	}
-
-	s.hist = history{
-		loaded:  true,
-		closed:  make(map[string]*fleet.Rollout, len(all)),
-		settled: make(map[string]map[string]*fleet.Directive, 2),
-		ended:   make(map[string]time.Time, len(leases)),
-		ledger:  make(ledger, len(leases)),
-	}
-
-	for _, r := range all {
-		s.hist.noteRollout(r)
-	}
-
-	for _, l := range leases {
-		s.hist.noteLease(l)
-	}
-
-	return nil
-}
-
-// loadDirectives gives the world the pending directives and the answered
-// ones of the open manual rollouts, oldest first. Only the pending ones are
-// read on every tick; the answered ones of a manual rollout are read once,
-// when the rollout is first seen. The caller holds mu and has loaded the
-// history.
+// loadDirectives gives the world the pending directives and every directive
+// of the open manual rollouts, answered or not, oldest first.
 func (s *service) loadDirectives(ctx context.Context, w *World) error {
-	unread := false
-	open := make(map[string]bool, len(w.Rollouts))
+	st := s.opts.Store
+
+	found, err := st.ListDirectives(ctx, store.DirectiveFilter{PendingOnly: true})
+	if err != nil {
+		return fmt.Errorf("scheduler: list pending directives: %w", err)
+	}
+
+	manual := make([]string, 0, len(w.Rollouts))
 
 	for _, r := range w.Rollouts {
-		if r.Kind != fleet.RolloutManual || r.State.Terminal() {
-			continue
-		}
-
-		open[r.ID] = true
-
-		if _, ok := s.hist.settled[r.ID]; !ok {
-			s.hist.settled[r.ID] = make(map[string]*fleet.Directive, len(r.Hosts))
-			unread = true
+		if r.Kind == fleet.RolloutManual {
+			manual = append(manual, r.ID)
 		}
 	}
 
-	for id := range s.hist.settled {
-		if !open[id] {
-			delete(s.hist.settled, id)
+	if len(manual) > 0 {
+		theirs, err := st.ListDirectives(ctx, store.DirectiveFilter{Rollouts: manual})
+		if err != nil {
+			return fmt.Errorf("scheduler: list directives of the manual rollouts: %w", err)
+		}
+
+		for _, d := range theirs {
+			if d.State != fleet.DirectivePending {
+				found = append(found, d)
+			}
 		}
 	}
 
-	found, err := s.opts.Store.ListDirectives(ctx, store.DirectiveFilter{PendingOnly: !unread})
-	if err != nil {
-		s.hist = history{}
-
-		return fmt.Errorf("scheduler: list directives: %w", err)
-	}
-
-	for _, d := range found {
-		if d.State == fleet.DirectivePending {
-			w.Directives = append(w.Directives, d)
-
-			continue
-		}
-
-		s.hist.noteDirective(d)
-	}
-
-	for _, byID := range s.hist.settled {
-		for _, d := range byID {
-			c := *d
-			w.Directives = append(w.Directives, &c)
-		}
-	}
-
-	slices.SortFunc(w.Directives, func(a, b *fleet.Directive) int {
+	slices.SortFunc(found, func(a, b *fleet.Directive) int {
 		return cmp.Or(a.CreatedAt.Compare(b.CreatedAt), cmp.Compare(a.ID, b.ID))
 	})
 
-	return nil
-}
-
-// loadClosedLeases looks up the leases that hosts report an operation for
-// and that are not open: the known ones are closed, the others are adopted.
-func (s *service) loadClosedLeases(ctx context.Context, w *World) error {
-	open := make(map[string]bool, len(w.Leases))
-	for _, l := range w.Leases {
-		open[l.ID] = true
-	}
-
-	for _, h := range w.Hosts {
-		if h.Status == nil || h.Status.Operation == nil {
-			continue
-		}
-
-		id := h.Status.Operation.LeaseID
-		if id == "" || open[id] {
-			continue
-		}
-
-		l, err := s.opts.Store.GetLease(ctx, id)
-
-		switch {
-		case err == nil:
-			if w.ClosedLeases == nil {
-				w.ClosedLeases = make(map[string]*fleet.Lease, 2)
-			}
-
-			w.ClosedLeases[id] = l
-		case errors.Is(err, store.ErrNotFound):
-		default:
-			return fmt.Errorf("scheduler: get lease %s: %w", id, err)
-		}
-	}
+	w.Directives = found
 
 	return nil
 }
@@ -561,55 +379,10 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 		return nil, fmt.Errorf("scheduler: list leases of %s: %w", host, err)
 	}
 
-	now := s.opts.Now()
-	// withheld: the host holds a lease that is not offered.
-	withheld := false
-
-	for _, l := range leases {
-		if l.State.Terminal() || l.Host != host {
-			continue
+	if len(leases) > 0 {
+		if a.Lease, err = s.offer(ctx, leases[0]); err != nil {
+			return nil, err
 		}
-
-		// A lease that a person ended before the agent reported an operation
-		// for it is no longer offered: an agent that has not started it must
-		// not, and one that does not know the cancel mark would. The agent
-		// that holds it unstarted declines it when it is no longer offered.
-		// One that reports an operation for it has it, whatever the scheduler
-		// has made of that report so far: to it the lease is restated, with
-		// the mark, so that it keeps a finished operation until the scheduler
-		// has taken it in.
-		if l.Cancelled != nil && l.State == fleet.LeaseGranted {
-			reported, repErr := s.reportsOperation(ctx, host, l.ID)
-			if repErr != nil {
-				return nil, repErr
-			}
-
-			if !reported {
-				withheld = true
-
-				break
-			}
-		}
-
-		a.Lease = &protocol.Lease{
-			ID:         l.ID,
-			GrantedAt:  l.GrantedAt,
-			ExpiresAt:  l.ExpiresAt,
-			TTLSeconds: max(int64(l.ExpiresAt.Sub(now)/time.Second), 0),
-			Needs:      []protocol.Need{},
-			Cancel:     l.Cancelled != nil,
-		}
-
-		// An adopted lease is restated without needs. The agent that still
-		// works on it knows the lease and ignores the restatement; one that
-		// finished and forgot it (it saw a response without the lease after
-		// the database was lost) must not run the same needs a second time.
-		// The marker is a reserved name that no actor can carry (actorName).
-		if l.GrantedBy != grantedByAdoption {
-			a.Lease.Needs = append(a.Lease.Needs, l.Needs...)
-		}
-
-		break
 	}
 
 	directives, err := st.ListDirectives(ctx, store.DirectiveFilter{Host: host, PendingOnly: true})
@@ -618,12 +391,22 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 	}
 
 	for _, d := range directives {
-		if d.State == fleet.DirectivePending && d.Host == host {
-			a.Directives = append(a.Directives, d.Directive)
-		}
+		a.Directives = append(a.Directives, d.Directive)
 	}
 
-	if a.Lease == nil && !withheld {
+	if len(leases) == 0 {
+		// One row by the index on (host, granted_at): the newest lease.
+		last, err := st.ListLeases(ctx, store.LeaseFilter{Host: host, Limit: 1})
+		if err != nil {
+			return nil, fmt.Errorf("scheduler: newest lease of %s: %w", host, err)
+		}
+
+		if len(last) > 0 && last[0].State.Terminal() {
+			a.Ended = &protocol.EndedLease{
+				ID: last[0].ID, State: string(last[0].State), Reason: last[0].Error,
+			}
+		}
+
 		for _, q := range s.Plan().Queue {
 			if q.Host == host {
 				a.Queue = &protocol.Queue{Position: q.Position, Reason: q.Reason}
@@ -634,6 +417,35 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 	}
 
 	return a, nil
+}
+
+// offer is a lease as a sync response states it, or nil for a lease that is
+// not offered.
+//
+// A lease that a person ended before the agent reported an operation for it
+// is no longer offered: an agent that has not started it must not, and the
+// agent that holds it unstarted declines it when it is no longer offered. One
+// that reports an operation for it has it, whatever the scheduler has made of
+// that report so far: to it the lease is restated, with the mark, so that it
+// keeps a finished operation until the scheduler has taken it in.
+func (s *service) offer(ctx context.Context, l *fleet.Lease) (*protocol.Lease, error) {
+	if l.Cancelled != nil && l.State == fleet.LeaseGranted {
+		reported, err := s.reportsOperation(ctx, l.Host, l.ID)
+		if err != nil || !reported {
+			return nil, err
+		}
+	}
+
+	offer := &protocol.Lease{
+		ID:         l.ID,
+		GrantedAt:  l.GrantedAt,
+		ExpiresAt:  l.ExpiresAt,
+		TTLSeconds: max(int64(l.ExpiresAt.Sub(s.opts.Now())/time.Second), 0),
+		Needs:      append([]protocol.Need{}, l.Needs...),
+		Cancel:     l.Cancelled != nil,
+	}
+
+	return offer, nil
 }
 
 // reportsOperation reports whether the host's last sync carries an operation
@@ -661,24 +473,6 @@ func (s *service) Settings(ctx context.Context) (fleet.Settings, error) {
 	return settings, nil
 }
 
-// UpdateSettings validates, stores and audits new settings.
-func (s *service) UpdateSettings(ctx context.Context, actor string, settings fleet.Settings) error { //nolint:gocritic // hugeParam: the signature is the Service contract.
-	if err := settings.Validate(); err != nil {
-		return fmt.Errorf("%w: %w", ErrInvalidAction, err)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if err := s.saveSettings(ctx, actor, "settings.update", &settings, ""); err != nil {
-		return err
-	}
-
-	s.Nudge()
-
-	return nil
-}
-
 // PatchSettings changes the settings in one step under the lock.
 func (s *service) PatchSettings(
 	ctx context.Context, actor string, apply func(settings *fleet.Settings) error,
@@ -692,6 +486,7 @@ func (s *service) PatchSettings(
 	}
 
 	next := current
+	next.PolicyClients = maps.Clone(current.PolicyClients)
 
 	if err := apply(&next); err != nil {
 		return current, false, err
@@ -702,7 +497,11 @@ func (s *service) PatchSettings(
 	}
 
 	// Nothing named, or what is named is what is there: no write, no entry.
-	if next == current {
+	if len(next.PolicyClients) == 0 {
+		next.PolicyClients = nil
+	}
+
+	if next.Equal(&current) {
 		return current, false, nil
 	}
 
@@ -747,15 +546,15 @@ func (s *service) saveSettings(
 	return nil
 }
 
-// actorName is the name an actor is recorded under. The scheduler's own
-// names ("scheduler" and everything starting with "scheduler:") are
-// reserved: a person or token that carries one is recorded as "user:<name>",
-// so nothing a person does can pass for a decision of the scheduler.
+// actorName is the name an actor is recorded under. The scheduler's own name
+// is reserved: a person or token that carries it is recorded as
+// "user:scheduler", so nothing a person does can pass for a decision of the
+// scheduler.
 func actorName(actor string) string {
-	switch {
-	case actor == "":
+	switch actor {
+	case "":
 		return "anonymous"
-	case actor == actorScheduler || strings.HasPrefix(actor, reservedActorPrefix):
+	case actorScheduler:
 		return "user:" + actor
 	default:
 		return actor
@@ -775,6 +574,8 @@ func (s *service) appendAudit(ctx context.Context, entries ...fleet.AuditEntry) 
 	if err := s.opts.Store.AppendAudit(ctx, entries...); err != nil {
 		return fmt.Errorf("scheduler: append audit: %w", err)
 	}
+
+	s.changed()
 
 	return nil
 }

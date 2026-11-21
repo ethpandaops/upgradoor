@@ -15,7 +15,8 @@ const (
 )
 
 // Authorization says why the API let a person make a request. The scheduler
-// decides nothing with it; it writes it into the audit entries of the action.
+// writes it into the audit entries of the action, and asks it one question:
+// whether a hold or unhold came through a team feature (setHold).
 type Authorization struct {
 	// By names what allowed the request: a feature of the token ("roll"), its
 	// team twin ("team_roll"), several joined by a comma ("reboot,admin"), or

@@ -11,36 +11,25 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 )
 
-// renamedSettings maps the stored key of a setting that was renamed to the
-// key it has now. The value means the same under both names.
-var renamedSettings = map[string]string{"soakEpochs": "readyEpochs"}
-
-// LoadSettings returns defaults with every stored override applied. A value
-// stored under the former name of a setting is read under its new name,
-// unless one is stored there too; the next save writes only the new name. A
-// stored key that is not a field of fleet.Settings, or whose value no longer
-// decodes into its field, is skipped with a warning and the default stays.
+// LoadSettings returns defaults with every stored override applied. Every
+// row was written by SaveSettings: one that is not a field of fleet.Settings
+// or does not decode into its field is an error.
 //
 //nolint:gocritic // hugeParam: the by-value signature is fixed by the Store interface.
 func (s *sqliteStore) LoadSettings(
 	ctx context.Context, defaults fleet.Settings,
 ) (fleet.Settings, error) {
-	known, err := settingsFields(&defaults)
-	if err != nil {
-		return defaults, fmt.Errorf("store: load settings: %w", err)
-	}
+	overrides := make(map[string]json.RawMessage, 16)
 
-	overrides := make(map[string]string, len(known))
-
-	err = s.read(ctx, func(tx *sql.Tx) error {
-		return queryRows(ctx, tx, `SELECT key, value FROM settings ORDER BY key`, nil,
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		return queryRows(ctx, tx, `SELECT key, value FROM settings`, nil,
 			func(row rowScanner) error {
 				var key, value string
 				if scanErr := row.Scan(&key, &value); scanErr != nil {
 					return scanErr
 				}
 
-				overrides[key] = value
+				overrides[key] = json.RawMessage(value)
 
 				return nil
 			})
@@ -49,42 +38,18 @@ func (s *sqliteStore) LoadSettings(
 		return defaults, fmt.Errorf("store: load settings: %w", err)
 	}
 
-	for old, key := range renamedSettings {
-		value, ok := overrides[old]
-		if !ok {
-			continue
-		}
-
-		if _, stored := overrides[key]; !stored {
-			overrides[key] = value
-		}
-
-		delete(overrides, old)
+	stored, err := json.Marshal(overrides)
+	if err != nil {
+		return defaults, fmt.Errorf("store: load settings: %w", err)
 	}
 
 	settings := defaults
 
-	for key, value := range overrides {
-		if _, ok := known[key]; !ok {
-			s.log.WithField("key", key).Warn("ignoring stored setting: unknown key")
+	decoder := json.NewDecoder(bytes.NewReader(stored))
+	decoder.DisallowUnknownFields()
 
-			continue
-		}
-
-		field, err := json.Marshal(map[string]json.RawMessage{key: json.RawMessage(value)})
-		if err == nil {
-			// Decode into a copy: a failed decode must not leave a
-			// half-applied value behind.
-			next := settings
-			if err = json.Unmarshal(field, &next); err == nil {
-				settings = next
-
-				continue
-			}
-		}
-
-		s.log.WithField("key", key).WithError(err).
-			Warn("ignoring stored setting: invalid value, using the default")
+	if err := decoder.Decode(&settings); err != nil {
+		return defaults, fmt.Errorf("store: load settings: %w", err)
 	}
 
 	return settings, nil

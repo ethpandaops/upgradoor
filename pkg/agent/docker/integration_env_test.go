@@ -515,7 +515,7 @@ func (e *itEnv) newRuntime(t *testing.T) *Runtime {
 	log.SetOutput(testLogWriter{t})
 	log.SetLevel(logrus.DebugLevel)
 
-	r, err := New(log, e.host)
+	r, err := New(log, e.host, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, r.Close()) })
 

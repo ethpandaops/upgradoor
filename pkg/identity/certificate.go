@@ -35,7 +35,9 @@ var (
 )
 
 // ValidatorRange is the half-open range [Start, End) of beacon validator
-// indices operated by a host.
+// indices operated by a host. It is not part of the certificate: a host
+// reports its range itself (protocol.Validators), and the controller keeps
+// the range it counts for the host in this form.
 type ValidatorRange struct {
 	Start uint64 `json:"start"`
 	End   uint64 `json:"end"`
@@ -65,13 +67,12 @@ type Confirmation struct {
 // Claims are the claims of a host certificate. The field order is the
 // canonical member order of the encoded payload and must not change.
 type Claims struct {
-	Issuer     string          `json:"iss"`
-	Network    string          `json:"net"`
-	Subject    string          `json:"sub"`
-	Cnf        Confirmation    `json:"cnf"`
-	Generation uint64          `json:"gen"`
-	Validators *ValidatorRange `json:"val,omitempty"`
-	Roles      []string        `json:"roles"`
+	Issuer     string       `json:"iss"`
+	Network    string       `json:"net"`
+	Subject    string       `json:"sub"`
+	Cnf        Confirmation `json:"cnf"`
+	Generation uint64       `json:"gen"`
+	Roles      []string     `json:"roles"`
 }
 
 // HostKey returns the host public key the certificate is bound to.
@@ -88,18 +89,11 @@ func (c *Claims) HostKey() (*mldsa.PublicKey, error) {
 	return pub, nil
 }
 
-// HasRole reports whether the certificate carries role.
-func (c *Claims) HasRole(role string) bool {
-	return slices.Contains(c.Roles, role)
-}
-
 // CertificateSpec is the operator-side input of a host certificate.
 type CertificateSpec struct {
 	Network    string
 	Hostname   string
 	Generation uint64
-	// Validators is nil for hosts without validators.
-	Validators *ValidatorRange
 	// Roles are sorted and de-duplicated before encoding.
 	Roles []string
 }
@@ -146,10 +140,6 @@ func SignCertificate(
 	slices.Sort(roles)
 	roles = slices.Compact(roles)
 
-	if spec.Validators != nil && spec.Validators.End <= spec.Validators.Start {
-		return "", fmt.Errorf("%w: empty validator range", ErrBadCertificate)
-	}
-
 	claims := Claims{
 		Issuer:  Issuer,
 		Network: spec.Network,
@@ -160,7 +150,6 @@ func SignCertificate(
 			Pub: EncodePublicKey(hostKey),
 		}},
 		Generation: spec.Generation,
-		Validators: spec.Validators,
 		Roles:      roles,
 	}
 
@@ -209,10 +198,6 @@ func VerifyCertificate(
 
 	if _, err := claims.HostKey(); err != nil {
 		return nil, err
-	}
-
-	if claims.Validators != nil && claims.Validators.End <= claims.Validators.Start {
-		return nil, fmt.Errorf("%w: empty validator range", ErrBadCertificate)
 	}
 
 	if claims.Network != network {

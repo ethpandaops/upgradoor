@@ -12,7 +12,7 @@ import (
 )
 
 // TestLiveBeaconNode runs one poll against a real beacon node. It only reads
-// (a handful of GETs and liveness POSTs for 16 validators) and is skipped
+// (a handful of GETs: genesis, spec, head, finality, blocks and committees) and is skipped
 // unless UPGRADOOR_BEACON_URL is set:
 //
 //	UPGRADOOR_BEACON_URL=https://beacon.example.org go test -run TestLiveBeaconNode -v ./pkg/controller/beacon/
@@ -53,21 +53,20 @@ func TestLiveBeaconNode(t *testing.T) {
 	assert.InDelta(t, float64(clockSlot), float64(health.HeadSlot), float64(2*health.SlotsPerEpoch),
 		"wall-clock slot %d is far from head slot %d", clockSlot, health.HeadSlot)
 
+	// The first poll reads the previous epoch from its first slot on, so it
+	// is settled unless the clock is in the first slots of an epoch.
 	if !health.LivenessKnown {
-		t.Logf("liveness unknown on this node: %s", health.Error)
+		t.Logf("no settled epoch yet: %s", health.LivenessError)
 
 		return
 	}
 
-	assert.Empty(t, health.Error)
-	assert.Equal(t, uint64(16), health.Tracked)
+	assert.Empty(t, health.LivenessError)
+	assert.LessOrEqual(t, health.Tracked, uint64(16), "one duty per validator and epoch")
 	assert.LessOrEqual(t, health.Live, health.Tracked)
 	assert.GreaterOrEqual(t, health.LivenessEpoch+2, health.CurrentEpoch)
 
-	for _, name := range []string{"smoke-a", "smoke-b"} {
-		row, found := store.row(name, health.LivenessEpoch)
-		require.True(t, found, name)
-		assert.Equal(t, uint64(8), row.Total)
-		t.Logf("%s: %d/%d live in epoch %d", name, row.Live, row.Total, row.Epoch)
+	for _, row := range svc.Liveness(1) {
+		t.Logf("%s: %d/%d live in epoch %d", row.Host, row.Live, row.Total, row.Epoch)
 	}
 }

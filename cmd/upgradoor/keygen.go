@@ -13,7 +13,19 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 )
 
-const seedEnv = "UPGRADOOR_SEED"
+// The two seeds and where each is read from. They are different secrets and
+// are never read from the same place: the devnet seed yields the signer and
+// host keys of one devnet, the controller seed (one per group of devnets)
+// the controller key of each devnet of the group.
+const (
+	seedEnv            = "UPGRADOOR_SEED"
+	seedFlag           = "seed-file"
+	controllerSeedEnv  = "UPGRADOOR_CONTROLLER_SEED"
+	controllerSeedFlag = "controller-seed-file"
+)
+
+var errSameSeed = errors.New("the devnet seed and the controller seed are the same value: " +
+	"they must be two different secrets")
 
 // newKeygenCmd returns the operator-side key tool. Ansible derives keys with
 // the filter plugin; this command is the reference implementation, used for
@@ -24,42 +36,75 @@ func newKeygenCmd() *cobra.Command {
 		network    string
 		hostname   string
 		generation uint64
-		valStart   uint64
-		valEnd     uint64
 		roles      []string
 	)
 
 	cmd := &cobra.Command{
-		Use:   "keygen",
-		Short: "Derive signer and host keys and issue host certificates from the devnet seed",
-		Long: "Derive signer and host keys and issue host certificates from the devnet seed.\n\n" +
-			"The seed is read from --seed-file or the " + seedEnv + " environment variable,\n" +
-			"never from an argument. It is used as raw bytes, exactly as stored in sops\n" +
-			"(a single trailing newline of a seed file is dropped).",
+		Use: "keygen",
+		Short: "Derive signer and host keys and issue host certificates from the devnet " +
+			"seed, and controller keys from the controller seed",
+		Long: "Derive keys and issue host certificates. There are two seeds, and they are\n" +
+			"different secrets:\n\n" +
+			"  the devnet seed      one per devnet: signer-pubkey, host-key, host-cert\n" +
+			"                       --" + seedFlag + " or " + seedEnv + "\n" +
+			"  the controller seed  one per devnet group: controller-pubkey\n" +
+			"                       --" + controllerSeedFlag + " or " + controllerSeedEnv + "\n\n" +
+			"A command reads only its own seed and refuses the other one's flag. Neither\n" +
+			"seed is ever taken from an argument. Both are used as raw bytes, exactly as\n" +
+			"stored in sops (a single trailing newline of a seed file is dropped), and\n" +
+			"must be at least 32 bytes long.",
 	}
 
-	cmd.PersistentFlags().StringVar(&seedFile, "seed-file", "", "file holding the seed")
+	cmd.PersistentFlags().StringVar(&seedFile, seedFlag, "",
+		"file holding the devnet seed (signer-pubkey, host-key, host-cert)")
 	cmd.PersistentFlags().StringVar(&network, "network", "", "network name (required)")
 
+	// seed reads the devnet seed.
 	seed := func() ([]byte, error) {
 		if network == "" {
 			return nil, errors.New("--network is required")
 		}
 
+		s, err := readSeed(seedFile, seedEnv, seedFlag, "devnet seed")
+		if err != nil {
+			return nil, err
+		}
+
+		if string(s) == os.Getenv(controllerSeedEnv) {
+			return nil, errSameSeed
+		}
+
+		return s, nil
+	}
+
+	var (
+		controllerSeedFile   string
+		controllerGeneration uint64
+	)
+
+	// controllerSeed reads the controller seed, and never the devnet seed.
+	controllerSeed := func() ([]byte, error) {
+		if network == "" {
+			return nil, errors.New("--network is required")
+		}
+
 		if seedFile != "" {
-			raw, err := os.ReadFile(seedFile)
-			if err != nil {
-				return nil, fmt.Errorf("read seed: %w", err)
-			}
-
-			return []byte(strings.TrimSuffix(strings.TrimSuffix(string(raw), "\n"), "\r")), nil
+			return nil, errors.New("--" + seedFlag + " is the devnet seed: the controller key " +
+				"is derived from the controller seed (--" + controllerSeedFlag + " or " +
+				controllerSeedEnv + ")")
 		}
 
-		if v := os.Getenv(seedEnv); v != "" {
-			return []byte(v), nil
+		s, err := readSeed(controllerSeedFile, controllerSeedEnv, controllerSeedFlag,
+			"controller seed")
+		if err != nil {
+			return nil, err
 		}
 
-		return nil, errors.New("no seed: set --seed-file or " + seedEnv)
+		if string(s) == os.Getenv(seedEnv) {
+			return nil, errSameSeed
+		}
+
+		return s, nil
 	}
 
 	hostFlags := func(c *cobra.Command) {
@@ -87,6 +132,36 @@ func newKeygenCmd() *cobra.Command {
 		},
 	}
 
+	controllerFlags := func(c *cobra.Command) {
+		c.Flags().StringVar(&controllerSeedFile, controllerSeedFlag, "",
+			"file holding the controller seed (never the devnet seed)")
+		c.Flags().Uint64Var(&controllerGeneration, "controller-generation", 0,
+			"controller key generation (the controller's --controller-generation)")
+	}
+
+	controllerPub := &cobra.Command{
+		Use:   "controller-pubkey",
+		Short: "Print the controller public key (an entry of the agents' controller.publicKeys)",
+		Long: "Print the controller public key of a network, derived from the controller\n" +
+			"seed: what the agents of that network list under controller.publicKeys.",
+		RunE: func(c *cobra.Command, _ []string) error {
+			s, err := controllerSeed()
+			if err != nil {
+				return err
+			}
+
+			key, err := identity.DeriveControllerKey(s, network, controllerGeneration)
+			if err != nil {
+				return err
+			}
+
+			_, err = fmt.Fprintln(c.OutOrStdout(), identity.EncodePublicKey(identity.PublicKey(key)))
+
+			return err
+		},
+	}
+	controllerFlags(controllerPub)
+
 	hostKey := &cobra.Command{
 		Use:   "host-key",
 		Short: "Print a host's private key (the content of /etc/upgradoor/host.key)",
@@ -111,25 +186,19 @@ func newKeygenCmd() *cobra.Command {
 	hostCert := &cobra.Command{
 		Use:   "host-cert",
 		Short: "Print a host's certificate (the content of /etc/upgradoor/host.crt)",
+		Long: "Print a host's certificate (the content of /etc/upgradoor/host.crt).\n\n" +
+			"The certificate names the host, its key generation and its roles. It does not\n" +
+			"carry the host's validator range: the agent reads that on the host\n" +
+			"(validators.markerFile or validators.start/end in agent.yaml) and reports it.",
 		RunE: func(c *cobra.Command, _ []string) error {
 			s, err := seed()
 			if err != nil {
 				return err
 			}
 
-			spec := identity.CertificateSpec{
+			cert, err := identity.IssueCertificate(s, identity.CertificateSpec{
 				Network: network, Hostname: hostname, Generation: generation, Roles: roles,
-			}
-
-			if c.Flags().Changed("validator-start") || c.Flags().Changed("validator-end") {
-				if valEnd <= valStart {
-					return errors.New("--validator-start and --validator-end must form a non-empty range")
-				}
-
-				spec.Validators = &identity.ValidatorRange{Start: valStart, End: valEnd}
-			}
-
-			cert, err := identity.IssueCertificate(s, spec)
+			})
 			if err != nil {
 				return err
 			}
@@ -140,32 +209,7 @@ func newKeygenCmd() *cobra.Command {
 		},
 	}
 	hostFlags(hostCert)
-	hostCert.Flags().Uint64Var(&valStart, "validator-start", 0, "first validator index")
-	hostCert.Flags().Uint64Var(&valEnd, "validator-end", 0, "validator index after the last")
 	hostCert.Flags().StringSliceVar(&roles, "role", nil, "role (repeatable)")
-
-	vectors := &cobra.Command{
-		Use:   "vectors",
-		Short: "Print the fixed identity test vectors as JSON (no seed needed)",
-		RunE: func(c *cobra.Command, _ []string) error {
-			vs := identity.VectorInputs()
-			for i := range vs {
-				if err := vs[i].Compute(); err != nil {
-					return err
-				}
-
-				if vs[i].Roles == nil {
-					vs[i].Roles = []string{}
-				}
-			}
-
-			enc := json.NewEncoder(c.OutOrStdout())
-			enc.SetEscapeHTML(false)
-			enc.SetIndent("", "  ")
-
-			return enc.Encode(vs)
-		},
-	}
 
 	var signerKey string
 
@@ -204,7 +248,25 @@ func newKeygenCmd() *cobra.Command {
 	}
 	verify.Flags().StringVar(&signerKey, "signer-public-key", "", "signer public key (required)")
 
-	cmd.AddCommand(signer, hostKey, hostCert, verify, vectors)
+	cmd.AddCommand(signer, controllerPub, hostKey, hostCert, verify)
 
 	return cmd
+}
+
+// readSeed reads one seed from its file flag or its environment variable.
+func readSeed(file, env, flag, what string) ([]byte, error) {
+	if file != "" {
+		s, err := identity.ReadSeedFile(file)
+		if err != nil {
+			return nil, fmt.Errorf("%s (--%s): %w", what, flag, err)
+		}
+
+		return s, nil
+	}
+
+	if v := os.Getenv(env); v != "" {
+		return []byte(v), nil
+	}
+
+	return nil, fmt.Errorf("no %s: set --%s or %s", what, flag, env)
 }

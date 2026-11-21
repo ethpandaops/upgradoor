@@ -1,12 +1,13 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 
 import { errorText } from '../api/client';
 import { list, type Audit, type AuditEntry } from '../api/types';
 import { useApp } from '../appContext';
 import { AuditTable } from '../components/AuditTable';
+import { useLive } from '../components/Live';
 import { Button, Empty, ErrorBanner, INPUT_CLASS, Loading, cx } from '../components/primitives';
 import { useDebounced } from '../hooks/useDebounced';
-import { usePoll } from '../hooks/usePoll';
+import { useQuery } from '../hooks/useQuery';
 import { plural } from '../lib/format';
 
 const PAGE_SIZE = 50;
@@ -36,8 +37,9 @@ function merge(prev: Loaded, key: string, page: Audit, older: boolean): Loaded {
 
 /**
  * AuditTab shows the audit trail: who did what, when, to which target, with
- * the before / after of changes. The newest page refreshes by itself; older
- * pages are loaded on demand through nextBefore.
+ * the before / after of changes. The newest page is fetched again when the
+ * event stream reports a new entry; older pages are loaded on demand through
+ * nextBefore.
  */
 export function AuditTab() {
   const { api } = useApp();
@@ -52,7 +54,7 @@ export function AuditTab() {
   const [olderBusy, setOlderBusy] = useState(false);
   const [olderError, setOlderError] = useState<unknown>(undefined);
 
-  const newest = usePoll(
+  const newest = useQuery(
     async s => {
       const page = await api.audit({ target, action, limit: PAGE_SIZE }, s);
       setLoaded(prev => merge(prev, key, page, false));
@@ -60,6 +62,19 @@ export function AuditTab() {
     },
     { key }
   );
+
+  // The stream says when the log has a new entry; the newest page is then
+  // asked for again. Nothing is asked for while the log stands still.
+  const latestId = useLive('audit').data?.latestId;
+  const seenId = useRef(latestId);
+  const refreshNewest = newest.refresh;
+  useEffect(() => {
+    if (latestId === seenId.current) return;
+    const first = seenId.current === undefined;
+    seenId.current = latestId;
+    // The first value arrives with the page that is being loaded anyway.
+    if (!first) refreshNewest();
+  }, [latestId, refreshNewest]);
 
   const current = loaded.key === key;
   const entries = useMemo(

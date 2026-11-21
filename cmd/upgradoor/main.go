@@ -61,6 +61,7 @@ func newRootCmd(log *logrus.Logger) *cobra.Command {
 	root.AddCommand(newKeygenCmd())
 	root.AddCommand(newAgentCmd(log))
 	root.AddCommand(newControllerCmd(log))
+	root.AddCommand(newHostCmd())
 
 	return root
 }

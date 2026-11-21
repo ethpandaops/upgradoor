@@ -4,11 +4,14 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"slices"
 	"strings"
 	"unicode/utf8"
 
+	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 const (
@@ -34,8 +37,18 @@ func (s *Server) actions() map[string]userHandler {
 		"reboot": action(s, needReboot, validateReboot, sched.Reboot),
 		"hold":   action(s, needHold, validateHostsRequest, sched.Hold),
 		"unhold": action(s, needUnhold, validateHostsRequest, sched.Unhold),
-		"forget": action(s, needAdmin[scheduler.HoldRequest], validateHostsRequest, sched.Forget),
-		// Ask for the end of one open lease: it is marked, its host is held.
+		// A host known to be offline is left out of the gate and the budget.
+		"mark-offline":   action(s, needOffline, s.validateMarkOffline, sched.MarkOffline),
+		"unmark-offline": action(s, needOffline, validateUnmarkOffline, sched.UnmarkOffline),
+		// Instructions for a host's overrides file; its agent decides.
+		"image-override": action(s, needImageOverride, validateImageOverride, sched.ImageOverride),
+		"flag-override":  action(s, needFlagOverride, validateFlagOverride, sched.FlagOverride),
+		// Many hosts at once, each judged alone: see handleClientOverride.
+		"client-override": s.handleClientOverride,
+		// The image policy of one client.
+		"client-policy": action(s, needClientPolicy, validateClientPolicy, sched.SetClientPolicy),
+		"forget":        action(s, needAdmin[scheduler.HoldRequest], validateHostsRequest, sched.Forget),
+		// Ask for the end of one open lease: it is marked, and ends as failed.
 		"end-lease": action(s, needEndLease, validateEndLease, sched.EndLease),
 		"pause":     action(s, needScope, validateScope(false), sched.Pause),
 		"resume":    action(s, needScope, validateScope(false), sched.Resume),
@@ -94,6 +107,59 @@ func needHold(req *scheduler.HoldRequest) requirement {
 // hold that was set through it.
 func needUnhold(req *scheduler.HoldRequest) requirement {
 	return requirement{feature: FeatureHold, team: holdTargets(req.Hosts, holdLift)}
+}
+
+// needOffline: hold, or team_hold for hosts the team owns a container of.
+// The scheduler lets the twin change only a mark that was set through it.
+func needOffline(req *scheduler.OfflineRequest) requirement {
+	return requirement{feature: FeatureHold, team: holdTargets(req.Hosts, holdUntouched)}
+}
+
+// validateMarkOffline: hosts as for a hold, a reason, and an end, if any, in
+// the future.
+func (s *Server) validateMarkOffline(req *scheduler.OfflineRequest) error {
+	if err := validateUnmarkOffline(req); err != nil {
+		return err
+	}
+
+	if strings.TrimSpace(req.Reason) == "" {
+		return badRequestf("reason is required")
+	}
+
+	if req.Until != nil && !req.Until.After(s.now()) {
+		return badRequestf("until must be in the future")
+	}
+
+	return nil
+}
+
+// validateUnmarkOffline: hosts as for a hold.
+func validateUnmarkOffline(req *scheduler.OfflineRequest) error {
+	return validateHostsRequest(&scheduler.HoldRequest{Hosts: req.Hosts, Reason: req.Reason})
+}
+
+// needImageOverride: image_override, or team_image_override for that one
+// container of the host.
+func needImageOverride(req *scheduler.ImageOverrideRequest) requirement {
+	return requirement{
+		feature: FeatureImageOverride,
+		team:    containerTargets([]string{req.Host}, false, []string{req.Container}),
+	}
+}
+
+// needFlagOverride: flag_override, or team_flag_override for that one
+// container of the host.
+func needFlagOverride(req *scheduler.FlagOverrideRequest) requirement {
+	return requirement{
+		feature: FeatureFlagOverride,
+		team:    containerTargets([]string{req.Host}, false, []string{req.Container}),
+	}
+}
+
+// needClientPolicy: client_policy, or team_client_policy for a client whose
+// reported containers are all owned by a team of the token.
+func needClientPolicy(req *scheduler.ClientPolicyRequest) requirement {
+	return requirement{feature: FeatureClientPolicy, team: &targets{client: req.Client}}
 }
 
 // needAdmin: admin and nothing else (forget).
@@ -179,6 +245,7 @@ func action[T any](
 			result = &scheduler.ActionResult{Message: "ok"}
 		}
 
+		s.Notify()
 		s.writeJSON(w, http.StatusOK, result)
 	}
 }
@@ -267,6 +334,62 @@ func validateRoll(req *scheduler.RollRequest) error {
 		if name == "" || len(name) > maxNameLength {
 			return badRequestf("invalid container name %q", name)
 		}
+	}
+
+	return validateReason(req.Reason)
+}
+
+// Bounds of what an override action carries. The agent has its own.
+const (
+	maxOverrideImage   = 512
+	maxOverrideFlags   = 64
+	maxOverrideFlagLen = 2048
+)
+
+func validateOverrideTarget(host, container, reason string) error {
+	if err := validateHosts([]string{host}, true); err != nil {
+		return err
+	}
+
+	if container == "" || len(container) > maxNameLength {
+		return badRequestf("invalid container name %q", container)
+	}
+
+	return validateReason(reason)
+}
+
+func validateImageOverride(req *scheduler.ImageOverrideRequest) error {
+	if len(req.Image) > maxOverrideImage || strings.ContainsAny(req.Image, " \t\r\n") {
+		return badRequestf("image must be an image reference")
+	}
+
+	return validateOverrideTarget(req.Host, req.Container, req.Reason)
+}
+
+func validateFlagOverride(req *scheduler.FlagOverrideRequest) error {
+	if len(req.AddFlags)+len(req.RemoveFlags) > maxOverrideFlags {
+		return badRequestf("more than %d flags", maxOverrideFlags)
+	}
+
+	for _, flag := range slices.Concat(req.AddFlags, req.RemoveFlags) {
+		if flag == "" || len(flag) > maxOverrideFlagLen || strings.TrimSpace(flag) != flag ||
+			strings.ContainsAny(flag, "\x00\r\n") || strings.Count(flag, " ") > 1 {
+			return badRequestf("invalid flag %q", flag)
+		}
+	}
+
+	return validateOverrideTarget(req.Host, req.Container, req.Reason)
+}
+
+func validateClientPolicy(req *scheduler.ClientPolicyRequest) error {
+	if !protocol.ValidClient(req.Client) {
+		return badRequestf("invalid client name %q", req.Client)
+	}
+
+	switch req.Policy {
+	case "", fleet.PolicyAuto, fleet.PolicyManual:
+	default:
+		return badRequestf("policy must be auto, manual or empty (the default)")
 	}
 
 	return validateReason(req.Reason)

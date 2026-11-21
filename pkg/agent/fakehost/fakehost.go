@@ -21,18 +21,13 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// Docker states used by the fake.
-const (
-	StateRunning = "running"
-	StateExited  = "exited"
-	StateCreated = "created"
-)
+// stateCreated is the Docker state of a container that was never started.
+const stateCreated = "created"
 
 // Host is a fake host. It is safe for concurrent use.
 type Host struct {
 	mu sync.Mutex
 
-	now      func() time.Time
 	bootBase string
 	boots    int
 	bootedAt time.Time
@@ -46,10 +41,12 @@ type Host struct {
 
 	containers []*protocol.Container
 	created    int
-	// registry and local map a normalised tag reference to the digest the
+	// labels are the override labels of the containers, by container name.
+	labels map[string]map[string]string
+	// registry and local map a normalised tag reference to the image the
 	// registry and the local image store hold for it.
 	registry map[string]Tag
-	local    map[string]string
+	local    map[string]Tag
 
 	blocked    []string
 	installed  []protocol.Package
@@ -77,7 +74,6 @@ func New(sc *Scenario) (*Host, error) {
 	}
 
 	h := &Host{
-		now:            time.Now,
 		bootBase:       cmp.Or(sc.BootID, "boot"),
 		os:             sc.OS,
 		runningKernel:  sc.RunningKernel,
@@ -85,13 +81,13 @@ func New(sc *Scenario) (*Host, error) {
 		rebootRequired: sc.RebootRequired,
 		containers:     make([]*protocol.Container, 0, len(sc.Containers)),
 		registry:       make(map[string]Tag, len(sc.Registry)+len(sc.Containers)),
-		local:          make(map[string]string, len(sc.Containers)),
+		local:          make(map[string]Tag, len(sc.Containers)),
 		blocked:        slices.Clone(sc.Packages.Blocked),
 		installed:      slices.Clone(sc.Packages.Installed),
 		upgradable:     slices.Clone(sc.Packages.Upgradable),
 		failures:       make(map[string]error, 4),
 	}
-	h.bootedAt = h.now()
+	h.bootedAt = time.Now()
 
 	for _, c := range sc.Containers {
 		h.created++
@@ -105,15 +101,16 @@ func New(sc *Scenario) (*Host, error) {
 			ImageID:   imageID(c.Digest),
 			Digest:    c.Digest,
 			Revision:  c.Revision,
-			State:     cmp.Or(c.State, StateRunning),
+			State:     cmp.Or(c.State, protocol.StateRunning),
 			StartedAt: h.bootedAt,
+			Command:   slices.Clone(c.Command),
 		})
 
 		// The image a container runs is local and, unless the scenario says
 		// otherwise, what the registry has.
 		if _, ok := h.local[key]; !ok && c.Digest != "" {
-			h.local[key] = c.Digest
-			h.registry[key] = Tag{Digest: c.Digest, Revision: c.Revision}
+			h.local[key] = Tag{Digest: c.Digest, Revision: c.Revision}
+			h.registry[key] = h.local[key]
 		}
 	}
 
@@ -188,23 +185,25 @@ func (h *Host) Observe(ctx context.Context) ([]protocol.Container, error) {
 	return out, nil
 }
 
-// LocalDigest implements agent.ContainerRuntime.
-func (h *Host) LocalDigest(ctx context.Context, ref string) (string, error) {
+// LocalImage implements agent.ContainerRuntime.
+func (h *Host) LocalImage(ctx context.Context, ref string) (digest, revision string, err error) {
 	if err := h.begin(ctx, "local:"+ref, ""); err != nil {
-		return "", fmt.Errorf("fakehost: local digest of %s: %w", ref, err)
+		return "", "", fmt.Errorf("fakehost: local image of %s: %w", ref, err)
 	}
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	return h.local[agent.NormalizeReference(ref)], nil
+	local := h.local[agent.NormalizeReference(ref)]
+
+	return local.Digest, local.Revision, nil
 }
 
 // Pull implements agent.ContainerRuntime: the local image of ref becomes
-// what the registry has. Containers are not touched.
-func (h *Host) Pull(ctx context.Context, ref string) (string, error) {
+// what the registry has, revision included. Containers are not touched.
+func (h *Host) Pull(ctx context.Context, ref string) (digest, revision string, err error) {
 	if err := h.begin(ctx, "pull:"+ref, "pull "+ref); err != nil {
-		return "", fmt.Errorf("fakehost: pull %s: %w", ref, err)
+		return "", "", fmt.Errorf("fakehost: pull %s: %w", ref, err)
 	}
 
 	h.mu.Lock()
@@ -214,18 +213,26 @@ func (h *Host) Pull(ctx context.Context, ref string) (string, error) {
 
 	tag, ok := h.registry[key]
 	if !ok {
-		return "", fmt.Errorf("fakehost: pull %s: manifest unknown", ref)
+		return "", "", fmt.Errorf("fakehost: pull %s: manifest unknown", ref)
 	}
 
-	h.local[key] = tag.Digest
+	h.local[key] = tag
 
-	return tag.Digest, nil
+	return tag.Digest, tag.Revision, nil
 }
 
 // Recreate implements agent.ContainerRuntime. An injected failure leaves
 // the container stopped, as a recreate that broke half-way would.
 func (h *Host) Recreate(
-	ctx context.Context, name, digest string, _ time.Duration, start bool,
+	ctx context.Context, name, digest string, timeout time.Duration, start bool,
+) error {
+	return h.RecreateAs(ctx, name, digest, timeout, start, agent.Recreation{})
+}
+
+// RecreateAs implements agent.ContainerRuntime: Recreate onto another image
+// reference, command line or set of override labels.
+func (h *Host) RecreateAs(
+	ctx context.Context, name, digest string, _ time.Duration, start bool, change agent.Recreation,
 ) error {
 	h.mu.Lock()
 
@@ -236,19 +243,28 @@ func (h *Host) Recreate(
 		return fmt.Errorf("fakehost: recreate %s: no such container", name)
 	}
 
-	key := agent.NormalizeReference(c.Image)
+	image := cmp.Or(change.Image, c.Image)
+	key := agent.NormalizeReference(image)
 	local := h.local[key]
 
 	h.mu.Unlock()
 
 	// The digest check comes before anything is stopped, and before the
 	// call counts as a disruption.
-	if local != digest {
+	if local.Digest != digest {
 		return fmt.Errorf("fakehost: recreate %s: local image is %q, wanted %q: %w",
-			name, local, digest, agent.ErrDigestMismatch)
+			name, local.Digest, digest, agent.ErrDigestMismatch)
 	}
 
-	err := h.begin(ctx, "recreate:"+name, fmt.Sprintf("recreate %s %s start=%t", name, digest, start))
+	call := fmt.Sprintf("recreate %s %s start=%t", name, digest, start)
+	if !change.Zero() {
+		call += " image=" + image
+		if change.SetCommand {
+			call += " command=" + strings.Join(change.Command, " ")
+		}
+	}
+
+	err := h.begin(ctx, "recreate:"+name, call)
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -258,26 +274,60 @@ func (h *Host) Recreate(
 	}
 
 	if err != nil {
-		c.State = StateExited
+		c.State = protocol.StateExited
 
 		return fmt.Errorf("fakehost: recreate %s: %w", name, err)
 	}
 
 	h.created++
 	c.ID = fmt.Sprintf("%s-%d", name, h.created)
-	c.Digest = local
-	c.ImageID = imageID(local)
-	c.Revision = h.registry[key].Revision
+	c.Image = image
+
+	if change.SetCommand {
+		c.Command = slices.Clone(change.Command)
+	}
+
+	h.relabel(name, change.Labels)
+	c.Base = agent.BaseFromLabels(h.labels[name])
+	c.Digest = local.Digest
+	c.ImageID = imageID(local.Digest)
+	c.Revision = local.Revision
 	c.RestartCount = 0
-	c.State = StateCreated
+	c.State = stateCreated
 	c.StartedAt = time.Time{}
 
 	if start {
-		c.State = StateRunning
-		c.StartedAt = h.now()
+		c.State = protocol.StateRunning
+		c.StartedAt = time.Now()
 	}
 
 	return nil
+}
+
+// relabel applies a recreation's label changes to a container's override
+// labels.
+func (h *Host) relabel(name string, changes map[string]*string) {
+	if len(changes) == 0 {
+		return
+	}
+
+	if h.labels == nil {
+		h.labels = make(map[string]map[string]string, 2)
+	}
+
+	labels := h.labels[name]
+	if labels == nil {
+		labels = make(map[string]string, 2)
+		h.labels[name] = labels
+	}
+
+	for label, value := range changes {
+		if value == nil {
+			delete(labels, label)
+		} else {
+			labels[label] = *value
+		}
+	}
 }
 
 // Stop implements agent.ContainerRuntime.
@@ -294,8 +344,8 @@ func (h *Host) Stop(ctx context.Context, name string, _ time.Duration) error {
 		return fmt.Errorf("fakehost: stop %s: no such container", name)
 	}
 
-	if c.State == StateRunning {
-		c.State = StateExited
+	if c.State == protocol.StateRunning {
+		c.State = protocol.StateExited
 		// What "docker stop" leaves behind.
 		c.ExitCode = 143
 	}
@@ -317,19 +367,19 @@ func (h *Host) Start(ctx context.Context, name string) error {
 		return fmt.Errorf("fakehost: start %s: no such container", name)
 	}
 
-	if c.State != StateRunning {
-		c.State = StateRunning
+	if c.State != protocol.StateRunning {
+		c.State = protocol.StateRunning
 		c.ExitCode = 0
-		c.StartedAt = h.now()
+		c.StartedAt = time.Now()
 	}
 
 	return nil
 }
 
 // Resolve implements agent.Registry.
-func (h *Host) Resolve(ctx context.Context, ref string) (digest, revision string, err error) {
+func (h *Host) Resolve(ctx context.Context, ref string) (string, error) {
 	if err := h.begin(ctx, "resolve:"+ref, ""); err != nil {
-		return "", "", fmt.Errorf("fakehost: resolve %s: %w", ref, err)
+		return "", fmt.Errorf("fakehost: resolve %s: %w", ref, err)
 	}
 
 	h.mu.Lock()
@@ -337,10 +387,10 @@ func (h *Host) Resolve(ctx context.Context, ref string) (digest, revision string
 
 	tag, ok := h.registry[agent.NormalizeReference(ref)]
 	if !ok {
-		return "", "", fmt.Errorf("fakehost: resolve %s: manifest unknown", ref)
+		return "", fmt.Errorf("fakehost: resolve %s: manifest unknown", ref)
 	}
 
-	return tag.Digest, tag.Revision, nil
+	return tag.Digest, nil
 }
 
 // Status implements agent.System.
@@ -359,7 +409,7 @@ func (h *Host) Status(ctx context.Context) (*agent.SystemStatus, error) {
 
 	st := &agent.SystemStatus{
 		BootID: h.bootIDLocked(),
-		Uptime: h.now().Sub(h.bootedAt),
+		Uptime: time.Since(h.bootedAt),
 		OS: protocol.OSSummary{
 			ID:             h.os.ID,
 			VersionID:      h.os.VersionID,
@@ -404,7 +454,7 @@ func (h *Host) Inventory(ctx context.Context) (*protocol.Inventory, error) {
 
 func (h *Host) inventoryLocked() (*protocol.Inventory, error) {
 	inv := &protocol.Inventory{
-		CollectedAt: h.now().UTC(),
+		CollectedAt: time.Now().UTC(),
 		OS: protocol.OSInfo{
 			ID: h.os.ID, VersionID: h.os.VersionID, PrettyName: h.os.PrettyName, Arch: h.os.Arch,
 		},
@@ -490,12 +540,12 @@ func (h *Host) Reboot(ctx context.Context) error {
 	}
 
 	h.boots++
-	h.bootedAt = h.now()
+	h.bootedAt = time.Now()
 	h.runningKernel = h.newestKernel
 	h.rebootRequired = false
 
 	for _, c := range h.containers {
-		if c.State == StateRunning {
+		if c.State == protocol.StateRunning {
 			c.StartedAt = h.bootedAt
 		}
 	}
@@ -512,14 +562,6 @@ func (h *Host) bootIDLocked() string {
 }
 
 // The methods below steer the fake from a test or the control endpoint.
-
-// SetClock replaces the host's clock.
-func (h *Host) SetClock(now func() time.Time) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	h.now = now
-}
 
 // SetRegistry moves a tag in the fake registry.
 func (h *Host) SetRegistry(ref, digest, revision string) {
@@ -550,15 +592,6 @@ func (h *Host) SetRebootRequired(required bool) {
 	h.rebootRequired = required
 }
 
-// SetNewestKernel installs a kernel; the host wants a reboot while it
-// differs from the running one.
-func (h *Host) SetNewestKernel(release string) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	h.newestKernel = release
-}
-
 // SetContainerImage swaps the image reference of a container, as a person
 // debugging with a custom image would.
 func (h *Host) SetContainerImage(name, image, digest string) error {
@@ -586,7 +619,7 @@ func (h *Host) Crash(name string) error {
 	}
 
 	c.RestartCount++
-	c.StartedAt = h.now()
+	c.StartedAt = time.Now()
 
 	return nil
 }
@@ -601,7 +634,7 @@ func (h *Host) Exit(name string, code int) error {
 		return fmt.Errorf("fakehost: no such container %q", name)
 	}
 
-	c.State = StateExited
+	c.State = protocol.StateExited
 	c.ExitCode = code
 
 	return nil

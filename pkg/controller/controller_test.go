@@ -1,6 +1,8 @@
 package controller
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -8,6 +10,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
+	"github.com/ethpandaops/upgradoor/pkg/identity"
 )
 
 func TestParseDefaultSettings(t *testing.T) {
@@ -39,5 +42,89 @@ func TestParseDefaultSettings(t *testing.T) {
 	} {
 		_, err := ParseDefaultSettings([]string{bad})
 		require.Error(t, err, bad)
+	}
+}
+
+func TestLoadAnswerSigner(t *testing.T) {
+	const (
+		network        = "testnet-devnet-0"
+		controllerSeed = "fedcba9876543210fedcba9876543210"
+	)
+
+	dir := t.TempDir()
+	write := func(name, content string) string {
+		path := filepath.Join(dir, name)
+		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+		return path
+	}
+
+	publicKey := func(seed string, net string, generation uint64) string {
+		key, err := identity.DeriveControllerKey([]byte(seed), net, generation)
+		require.NoError(t, err)
+
+		return identity.EncodePublicKey(identity.PublicKey(key))
+	}
+
+	signerKey := func(t *testing.T, cfg *Config) string {
+		t.Helper()
+
+		signer, err := loadAnswerSigner(cfg)
+		require.NoError(t, err)
+		require.NotNil(t, signer)
+
+		return identity.EncodePublicKey(signer.PublicKey())
+	}
+
+	// The controller derives the key of its own network and generation, the
+	// one 'keygen controller-pubkey' gives the agents. A trailing newline of
+	// the file is not part of the seed.
+	good := write("controller.seed", controllerSeed+"\n")
+
+	assert.Equal(t, publicKey(controllerSeed, network, 0),
+		signerKey(t, &Config{Network: network, ControllerSeedFile: good}))
+	assert.Equal(t, publicKey(controllerSeed, network, 3),
+		signerKey(t, &Config{Network: network, ControllerSeedFile: good, ControllerGeneration: 3}))
+
+	// Every devnet of a group has a key of its own from the one seed, and a
+	// generation is another key.
+	other := signerKey(t, &Config{Network: "testnet-devnet-1", ControllerSeedFile: good})
+	assert.Equal(t, publicKey(controllerSeed, "testnet-devnet-1", 0), other)
+	assert.NotEqual(t, publicKey(controllerSeed, network, 0), other)
+	assert.NotEqual(t, publicKey(controllerSeed, network, 0), publicKey(controllerSeed, network, 3))
+
+	// The opt-out is the only way to run without a seed.
+	signer, err := loadAnswerSigner(&Config{Network: network, AllowUnsignedAgentAnswers: true})
+	require.NoError(t, err)
+	assert.Nil(t, signer)
+
+	_, err = loadAnswerSigner(&Config{Network: network})
+	require.ErrorContains(t, err, "--controller-seed-file is required")
+
+	_, err = loadAnswerSigner(&Config{
+		Network: network, ControllerSeedFile: good, AllowUnsignedAgentAnswers: true,
+	})
+	require.ErrorContains(t, err, "exclude each other")
+
+	_, err = loadAnswerSigner(&Config{
+		Network: network, AllowUnsignedAgentAnswers: true, ControllerGeneration: 1,
+	})
+	require.ErrorContains(t, err, "--controller-generation without")
+
+	_, err = loadAnswerSigner(&Config{
+		Network: network, ControllerSeedFile: filepath.Join(dir, "missing"),
+	})
+	require.ErrorIs(t, err, identity.ErrNoSeed)
+
+	// A seed that is too short is refused, and nothing of the file is in
+	// the error, which is logged.
+	const short = "too-short-to-be-a-seed"
+
+	for _, content := range []string{short, short + "\n", ""} {
+		_, err = loadAnswerSigner(&Config{
+			Network: network, ControllerSeedFile: write("short.seed", content),
+		})
+		require.ErrorIs(t, err, identity.ErrSeedTooShort)
+		assert.NotContains(t, err.Error(), short)
 	}
 }

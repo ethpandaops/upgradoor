@@ -72,10 +72,11 @@ type operation struct {
 	store    *stateStore
 	now      func() time.Time
 	// poll is the pause between looks while waiting for something.
-	poll        time.Duration
-	rebootGrace time.Duration
+	poll time.Duration
 	// notify tells the sync loop that the phase changed.
 	notify func()
+	// audit is the host's audit log; nil writes none.
+	audit *auditLog
 
 	// failed is true once a step failed; the remaining steps are skipped,
 	// the containers are still brought back.
@@ -109,6 +110,11 @@ type imageTask struct {
 	ids       []string
 	container string
 	digest    string
+	// override is the ID of the override need the recreate serves; empty
+	// for a recreate on the container's own image and command. What the
+	// container is recreated as is read from the overrides file when the
+	// recreate begins, never from the lease.
+	override string
 }
 
 func (p *operationPlan) empty() bool {
@@ -176,17 +182,17 @@ func (o *operation) begin(ctx context.Context, st *persistedState) error {
 	rec := st.Current
 
 	if reason := rec.revoked(); reason != "" {
-		return o.decline(protocol.PhaseDone, protocol.StepRefused, reason)
+		return o.decline(reason)
 	}
 
 	if !o.now().Before(rec.Deadline) {
-		return o.decline(protocol.PhaseDone, protocol.StepRefused, fmt.Sprintf(
+		return o.decline(fmt.Sprintf(
 			"lease deadline %s passed before the operation started",
 			rec.Deadline.UTC().Format(time.RFC3339)))
 	}
 
 	if hold := o.holds.Read(); hold.Active() {
-		return o.decline(protocol.PhaseDone, protocol.StepRefused, holdReason(hold))
+		return o.decline(holdReason(hold))
 	}
 
 	plan, err := o.planUntil(ctx, st, rec.Deadline)
@@ -198,18 +204,18 @@ func (o *operation) begin(ctx context.Context, st *persistedState) error {
 		// The host could not be looked at for as long as the lease was
 		// good. Nothing was touched, so this is a lease that never started,
 		// not a failed operation: a failure would halt the rollout.
-		return o.decline(protocol.PhaseDone, protocol.StepRefused, fmt.Sprintf(
+		return o.decline(fmt.Sprintf(
 			"lease deadline passed before the host could be examined: %v", err))
 	}
 
 	// Planning asked the runtime and the system; time has passed.
 	if !o.now().Before(rec.Deadline) {
-		return o.decline(protocol.PhaseDone, protocol.StepRefused,
+		return o.decline(
 			"lease deadline passed while the operation was prepared")
 	}
 
 	if hold := o.holds.Read(); hold.Active() {
-		return o.decline(protocol.PhaseDone, protocol.StepRefused, holdReason(hold))
+		return o.decline(holdReason(hold))
 	}
 
 	// Last exit: from the next write on the operation is started and runs
@@ -266,7 +272,7 @@ func (o *operation) begin(ctx context.Context, st *persistedState) error {
 	}
 
 	if revoked != "" {
-		return o.decline(protocol.PhaseDone, protocol.StepRefused, revoked)
+		return o.decline(revoked)
 	}
 
 	o.notify()
@@ -322,11 +328,9 @@ func (o *operation) planUntil(
 	}
 }
 
-// decline ends an operation that never started: every step gets the same
-// verdict and nothing is disrupted.
-func (o *operation) decline(
-	phase protocol.Phase, status protocol.StepStatus, reason string,
-) error {
+// decline ends an operation that never started: it is done, every step is
+// refused for the same reason and nothing is disrupted.
+func (o *operation) decline(reason string) error {
 	err := o.store.Update(func(st *persistedState) {
 		cur := st.Current
 		if cur == nil {
@@ -334,17 +338,13 @@ func (o *operation) decline(
 		}
 
 		now := o.now()
-		cur.Operation.Phase = phase
+		cur.Operation.Phase = protocol.PhaseDone
 		cur.Operation.StartedAt = now
 		cur.Operation.UpdatedAt = now
 		cur.Operation.Disrupted = false
 
-		if phase == protocol.PhaseFailed {
-			cur.Operation.Error = reason
-		}
-
 		for i := range cur.Operation.Steps {
-			cur.Operation.Steps[i].Status = status
+			cur.Operation.Steps[i].Status = protocol.StepRefused
 			cur.Operation.Steps[i].Error = reason
 		}
 	})
@@ -383,7 +383,7 @@ func (o *operation) plan(ctx context.Context, st *persistedState) (*operationPla
 		return nil, fmt.Errorf("cannot list containers: %w", err)
 	}
 
-	enrichContainers(o.cfg, containers, noRegistryCheck)
+	_, targets := enrichContainers(o.cfg, containers, o.overrides(), noRegistryCheck)
 
 	for i := range containers {
 		if containers[i].Managed && containers[i].ShouldRun() {
@@ -405,16 +405,26 @@ func (o *operation) plan(ctx context.Context, st *persistedState) (*operationPla
 	byContainer := make(map[string]int, len(needs))
 	packages := make(map[string]struct{}, 8)
 
+	// The override and spec needs come first: a recreate that brings a
+	// container in line with agent.yaml and the overrides file also serves a
+	// roll of that container.
+	for i := range needs {
+		if n := &needs[i]; recreates(n) && o.cfg.Allows(protocol.VerbRoll) {
+			o.planOverride(plan, n, containers, targets, byContainer)
+		}
+	}
+
 	for i := range needs {
 		n := &needs[i]
 
 		switch {
+		case recreates(n) && o.cfg.Allows(protocol.VerbRoll):
 		case n.Kind.Verb() == "":
 			plan.verdict(n.ID, protocol.StepRefused, fmt.Sprintf("unknown need kind %q", n.Kind))
 		case !o.cfg.Allows(n.Kind.Verb()):
 			plan.verdict(n.ID, protocol.StepRefused,
 				fmt.Sprintf("verb %s is not allowed on this host", n.Kind.Verb()))
-		case n.DirectiveID != "" && !manualNeedOpen(st.ManualNeeds, n):
+		case (n.DirectiveID != "" || n.Local) && !manualNeedOpen(st.ManualNeeds, n):
 			plan.verdict(n.ID, protocol.StepSuperseded, "the manual need is no longer open")
 		case n.Kind == protocol.NeedReboot:
 			o.planReboot(plan, n, sys)
@@ -519,6 +529,89 @@ func (o *operation) planPackages(
 	plan.packageIDs = append(plan.packageIDs, n.ID)
 }
 
+// overrides reads the overrides file as it is now. An entry whose end has
+// passed counts as gone, whether or not it has been taken out of the file.
+func (o *operation) overrides() *overrideSet {
+	return currentOverrides(o.cfg.OverridesFile, o.now())
+}
+
+// planOverride validates an override need: the container is still not what
+// the overrides file says, and the file still says what the need was
+// reported for.
+func (o *operation) planOverride(
+	plan *operationPlan, n *protocol.Need, containers []protocol.Container,
+	targets map[string]overrideTarget, byContainer map[string]int,
+) {
+	name, digest := recreateTarget(n)
+	if name == "" || digest == "" {
+		plan.verdict(n.ID, protocol.StepRefused, "malformed "+string(n.Kind)+" need")
+
+		return
+	}
+
+	if o.cfg.Managed(name) == nil {
+		plan.verdict(n.ID, protocol.StepRefused, "container "+name+" is not managed")
+
+		return
+	}
+
+	target, ok := targets[name]
+	if reason := overrideStale(findContainer(containers, name), &target, ok, n.ID, digest); reason != "" {
+		plan.verdict(n.ID, protocol.StepSuperseded, reason)
+
+		return
+	}
+
+	if _, dup := byContainer[name]; dup {
+		plan.verdict(n.ID, protocol.StepSuperseded, "another need of this lease recreates container "+name)
+
+		return
+	}
+
+	byContainer[name] = len(plan.images)
+	plan.images = append(plan.images, imageTask{
+		ids: []string{n.ID}, container: name, digest: digest, override: n.ID,
+	})
+}
+
+// recreateTarget is the container and target digest of an override or a
+// spec need; empty for a malformed one.
+func recreateTarget(n *protocol.Need) (container, digest string) {
+	switch {
+	case n.Kind == protocol.NeedOverride && n.Override != nil:
+		return n.Override.Container, n.Override.ToDigest
+	case n.Kind == protocol.NeedSpec && n.Spec != nil:
+		return n.Spec.Container, n.Spec.ToDigest
+	default:
+		return "", ""
+	}
+}
+
+// recreates reports whether a need recreates a container the way agent.yaml
+// and the overrides file say: an override or a spec need.
+func recreates(n *protocol.Need) bool {
+	return n.Kind == protocol.NeedOverride || n.Kind == protocol.NeedSpec
+}
+
+// overrideStale says why an override or spec need no longer applies; empty
+// when it does.
+func overrideStale(
+	c *protocol.Container, target *overrideTarget, known bool, needID, digest string,
+) string {
+	switch {
+	case c == nil || !known:
+		return "the container does not exist"
+	case target.err != "":
+		return target.err
+	case target.inSync:
+		return "container " + c.Name + " already runs what agent.yaml and the overrides file say"
+	case target.needID(c, digest) != needID:
+		return "agent.yaml or the overrides file asks for something else now"
+	default:
+		return ""
+	}
+}
+
 func (o *operation) planImage(
 	plan *operationPlan, n *protocol.Need, containers []protocol.Container, byContainer map[string]int,
 ) {
@@ -548,13 +641,16 @@ func (o *operation) planImage(
 			"container %s is on %s, the need was for %s", name, c.Image, n.Image.Image))
 
 		return
-	case n.DirectiveID == "" && c.Digest == n.Image.ToDigest:
+	case n.DirectiveID == "" && !n.Local && c.Digest == n.Image.ToDigest:
 		plan.verdict(n.ID, protocol.StepSuperseded,
 			"container "+name+" already runs the wanted digest")
 
 		return
 	}
 
+	// A lease holds at most one image need per container, because the agent
+	// reports at most one. This is a guard for a lease that breaks that rule:
+	// the container is still recreated once, not once per need.
 	if i, ok := byContainer[name]; ok {
 		if plan.images[i].digest == n.Image.ToDigest {
 			plan.images[i].ids = append(plan.images[i].ids, n.ID)
@@ -767,13 +863,32 @@ func (o *operation) recreate(ctx context.Context, plan *operationPlan, task *ima
 		return
 	}
 
-	enrichContainers(o.cfg, containers, noRegistryCheck)
+	_, targets := enrichContainers(o.cfg, containers, o.overrides(), noRegistryCheck)
+	c := findContainer(containers, name)
 
-	if reason, _ := rollable(o.cfg, findContainer(containers, name), name); reason != "" {
+	var change Recreation
+
+	if task.override != "" {
+		target, ok := targets[name]
+		if reason := overrideStale(c, &target, ok, task.override, task.digest); reason != "" {
+			o.setSteps(task.ids, protocol.StepSuperseded, reason)
+
+			return
+		}
+
+		change = Recreation{
+			Image: target.image, Command: target.command, SetCommand: target.flags,
+			Labels: target.labels,
+		}
+
+		log = log.WithFields(logrus.Fields{"image": target.image, "flags": target.flags})
+	} else if reason, _ := rollable(o.cfg, c, name); reason != "" {
 		o.setSteps(task.ids, protocol.StepSuperseded, reason)
 
 		return
 	}
+
+	ref := cmp.Or(change.Image, c.Image)
 
 	wasDisrupted := o.disrupted()
 	// After a drain the container stays stopped until the host is back; a
@@ -792,7 +907,7 @@ func (o *operation) recreate(ctx context.Context, plan *operationPlan, task *ima
 	log.WithField("start", start).Info("recreating container")
 
 	cctx, cancel := context.WithTimeout(ctx, timeout+recreateGrace)
-	err = o.runtime.Recreate(cctx, name, task.digest, timeout, start)
+	err = o.runtime.RecreateAs(cctx, name, task.digest, timeout, start, change)
 
 	cancel()
 
@@ -808,7 +923,7 @@ func (o *operation) recreate(ctx context.Context, plan *operationPlan, task *ima
 			o.clearDisrupted()
 		}
 
-		o.digestMismatch(ctx, log, task, findContainer(containers, name).Image)
+		o.digestMismatch(ctx, log, task, ref)
 	default:
 		msg := fmt.Sprintf("recreate container %s: %v", name, err)
 
@@ -825,7 +940,7 @@ func (o *operation) digestMismatch(
 	ctx context.Context, log logrus.FieldLogger, task *imageTask, ref string,
 ) {
 	rctx, cancel := context.WithTimeout(ctx, resolveTimeout)
-	current, _, err := o.registry.Resolve(rctx, ref)
+	current, err := o.registry.Resolve(rctx, ref)
 
 	cancel()
 
@@ -949,10 +1064,10 @@ func (o *operation) awaitReboot(ctx context.Context, ids []string) error {
 			return nil
 		}
 
-		if waited := o.now().Sub(rec.RebootIssuedAt); waited > o.rebootGrace {
+		if waited := o.now().Sub(rec.RebootIssuedAt); waited > defaultRebootGrace {
 			msg := fmt.Sprintf("the reboot was issued at %s but the host did not reboot "+
 				"within %s (boot id unchanged)",
-				rec.RebootIssuedAt.UTC().Format(time.RFC3339), o.rebootGrace)
+				rec.RebootIssuedAt.UTC().Format(time.RFC3339), defaultRebootGrace)
 
 			o.fail(msg)
 			o.setSteps(ids, protocol.StepFailed, msg)
@@ -1115,7 +1230,7 @@ func (o *operation) restartCounts(
 		switch {
 		case c == nil:
 			return nil, "container " + name + " does not exist", nil
-		case c.State != containerRunning:
+		case c.State != protocol.StateRunning:
 			return nil, "container " + name + " is " + c.State, nil
 		}
 
@@ -1180,6 +1295,8 @@ func (o *operation) finish() {
 		return
 	}
 
+	o.auditResults(rec)
+
 	log := o.log.WithFields(logrus.Fields{
 		"phase":     phase,
 		"disrupted": rec.Operation.Disrupted,
@@ -1196,6 +1313,68 @@ func (o *operation) finish() {
 	}
 
 	o.notify()
+}
+
+// auditResults writes into the host's audit log how the needs that somebody
+// asked for ended: the overrides, and the rolls and reboots of a user or a
+// local command. What the controller rolls out by itself is not in it.
+func (o *operation) auditResults(rec *operationRecord) {
+	if o.audit == nil {
+		return
+	}
+
+	for i := range rec.Lease.Needs {
+		n := &rec.Lease.Needs[i]
+
+		step := protocol.Step{NeedID: n.ID}
+		for _, s := range rec.Operation.Steps {
+			if s.NeedID == n.ID {
+				step = s
+			}
+		}
+
+		out := AuditRecord{
+			Source: auditAgent, Lease: rec.Lease.ID, Result: string(step.Status), Error: step.Error,
+		}
+
+		switch {
+		case n.Kind == protocol.NeedOverride && n.Override != nil:
+			out.Action = "override.apply"
+			if n.Override.Restore {
+				out.Action = "override.restore"
+			}
+
+			out.Container = n.Override.Container
+			out.Before = cmp.Or(n.Override.FromImage, n.Override.Image) + "@" + n.Override.FromDigest
+			out.After = n.Override.Image + "@" + n.Override.ToDigest
+
+			if n.Override.Flags {
+				out.After += ", command line changed"
+			}
+		case n.Kind == protocol.NeedSpec && n.Spec != nil:
+			out.Action = "spec.apply"
+			out.Container = n.Spec.Container
+			out.Before = cmp.Or(n.Spec.FromImage, n.Spec.Image) + "@" + n.Spec.FromDigest
+			out.After = n.Spec.Image + "@" + n.Spec.ToDigest
+
+			if n.Spec.Flags {
+				out.After += ", command line changed"
+			}
+		case n.Kind == protocol.NeedImage && n.Image != nil && (n.Local || n.DirectiveID != ""):
+			out.Action = "roll.result"
+			out.Container = n.Image.Container
+			out.Directive = n.DirectiveID
+			out.Before = n.Image.Image + "@" + n.Image.FromDigest
+			out.After = n.Image.Image + "@" + n.Image.ToDigest
+		case n.Kind == protocol.NeedReboot && n.DirectiveID != "":
+			out.Action = "reboot.result"
+			out.Directive = n.DirectiveID
+		default:
+			continue
+		}
+
+		o.audit.record(out)
+	}
 }
 
 // closeManualNeeds drops the manual needs a terminal operation served,

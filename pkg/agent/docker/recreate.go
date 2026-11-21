@@ -1,8 +1,8 @@
 package docker
 
 import (
+	"cmp"
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -12,7 +12,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/network"
 	"github.com/moby/moby/client"
-	"github.com/moby/moby/client/pkg/versions"
 	"github.com/sirupsen/logrus"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent"
@@ -74,6 +73,20 @@ func (r *Runtime) Recreate(
 	stopTimeout time.Duration,
 	start bool,
 ) error {
+	return r.RecreateAs(ctx, name, digest, stopTimeout, start, agent.Recreation{})
+}
+
+// RecreateAs implements agent.ContainerRuntime: a Recreate whose replacement
+// is created from another image reference, with another command line or
+// with other labels. Everything else is kept as Recreate keeps it, and the
+// digest is verified against the image the replacement is created from.
+func (r *Runtime) RecreateAs(
+	ctx context.Context,
+	name, digest string,
+	stopTimeout time.Duration,
+	start bool,
+	change agent.Recreation,
+) error {
 	r.recreateMu.Lock()
 	defer r.recreateMu.Unlock()
 
@@ -82,6 +95,10 @@ func (r *Runtime) Recreate(
 	ref, err := r.referenceOf(ctx, name)
 	if err != nil {
 		return fmt.Errorf("recreate container %s: %w", name, err)
+	}
+
+	if ref != "" && change.Image != "" {
+		ref = change.Image
 	}
 
 	if ref != "" {
@@ -94,7 +111,7 @@ func (r *Runtime) Recreate(
 		return fmt.Errorf("recreate container %s: %w", name, err)
 	}
 
-	plan, err := r.planRecreate(ctx, name, digest)
+	plan, err := r.planRecreate(ctx, name, digest, &change)
 	if err != nil {
 		return fmt.Errorf("recreate container %s: %w", name, err)
 	}
@@ -174,7 +191,9 @@ func (r *Runtime) verifyDigest(
 
 // planRecreate inspects the container and its images, verifies the digest
 // and derives the create request. It changes nothing.
-func (r *Runtime) planRecreate(ctx context.Context, name, digest string) (*recreatePlan, error) {
+func (r *Runtime) planRecreate(
+	ctx context.Context, name, digest string, change *agent.Recreation,
+) (*recreatePlan, error) {
 	res, err := r.engine.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
 	if err != nil {
 		return nil, fmt.Errorf("inspect: %w", err)
@@ -190,7 +209,7 @@ func (r *Runtime) planRecreate(ctx context.Context, name, digest string) (*recre
 		return nil, errors.New("incomplete container inspect data")
 	}
 
-	ref := old.Config.Image
+	ref := cmp.Or(change.Image, old.Config.Image)
 
 	newImage, err := r.verifyDigest(ctx, ref, digest)
 	if err != nil {
@@ -209,17 +228,19 @@ func (r *Runtime) planRecreate(ctx context.Context, name, digest string) (*recre
 			"its configuration cannot be separated from the image defaults", old.Image)
 	}
 
-	spec, err := buildCreateSpec(old, oldImage.Config, r.fixedMAC(ctx, old, res.Raw))
+	spec, err := buildCreateSpec(old, oldImage.Config)
 	if err != nil {
 		return nil, err
 	}
+
+	spec.apply(change)
 
 	return &recreatePlan{
 		name:       name,
 		old:        old,
 		spec:       spec,
 		imageID:    newImage.ID,
-		wasRunning: old.State != nil && (old.State.Running || old.State.Restarting),
+		wasRunning: isUp(old),
 	}, nil
 }
 
@@ -575,60 +596,4 @@ func (r *Runtime) recoverFor(ctx context.Context, name string) error {
 	}
 
 	return nil
-}
-
-// fixedMAC returns the MAC address the user fixed for the network the
-// container was created on, or "".
-//
-// The endpoint data only has the address in use, generated or not, and only
-// while the container runs. The user's choice is in Config.MacAddress, a
-// field the daemon serves up to API 1.51 (rawInspect has it when the
-// negotiated version is that old); newer daemons are asked again through
-// the legacy client.
-func (r *Runtime) fixedMAC(
-	ctx context.Context,
-	old *container.InspectResponse,
-	rawInspect json.RawMessage,
-) string {
-	mode := old.HostConfig.NetworkMode
-	if mode.IsHost() || mode.IsNone() || mode.IsContainer() {
-		return ""
-	}
-
-	if mac, present := configMAC(rawInspect); present {
-		return mac
-	}
-
-	if r.legacy == nil || !versions.GreaterThan(r.engine.ClientVersion(), legacyInspectVersion) {
-		return ""
-	}
-
-	log := r.log.WithField("container", strings.TrimPrefix(old.Name, "/"))
-
-	res, err := r.legacy.ContainerInspect(ctx, old.ID, client.ContainerInspectOptions{})
-	if err != nil {
-		log.WithError(err).Warn("Legacy inspect failed, a fixed MAC address would not be kept")
-
-		return ""
-	}
-
-	mac, _ := configMAC(res.Raw)
-
-	return mac
-}
-
-// configMAC extracts Config.MacAddress from raw container inspect output.
-func configMAC(rawInspect json.RawMessage) (mac string, present bool) {
-	//nolint:tagliatelle // the Engine API's field names
-	var doc struct {
-		Config struct {
-			MacAddress *string `json:"MacAddress"`
-		} `json:"Config"`
-	}
-
-	if err := json.Unmarshal(rawInspect, &doc); err != nil || doc.Config.MacAddress == nil {
-		return "", false
-	}
-
-	return *doc.Config.MacAddress, true
 }

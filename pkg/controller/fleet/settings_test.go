@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"encoding/json"
 	"math"
 	"testing"
 
@@ -41,6 +42,13 @@ func TestSettingsDefaultsAndValidation(t *testing.T) {
 	s.ReadyEpochs = 0
 	require.NoError(t, s.Validate(), "0: no waiting beyond one healthy sync")
 
+	s.ReadyEpochs = MaxReadyEpochs + 1
+	require.EqualError(t, s.Validate(), "readyEpochs must be at most 32",
+		"the beacon service keeps no longer a history")
+
+	s.ReadyEpochs = MaxReadyEpochs
+	require.NoError(t, s.Validate())
+
 	s.MinPeers = 0
 	require.EqualError(t, s.Validate(), "minPeers must be at least 1")
 
@@ -71,4 +79,35 @@ func TestSettingsCanaryPauseAndPeerShare(t *testing.T) {
 		s.ReadyPeerShare = share
 		require.EqualError(t, s.Validate(), "readyPeerShare must be between 0 and 1", "%v", share)
 	}
+}
+
+func TestSettingsClientPolicies(t *testing.T) {
+	s := DefaultSettings()
+	assert.Equal(t, PolicyAuto, s.ImagePolicy("geth"), "a client nobody set follows policyImage")
+
+	s.PolicyImage = PolicyManual
+	s.PolicyClients = ClientPolicies{"geth": PolicyAuto}
+	require.NoError(t, s.Validate())
+	assert.Equal(t, PolicyAuto, s.ImagePolicy("geth"))
+	assert.Equal(t, PolicyManual, s.ImagePolicy("lighthouse"))
+	assert.Equal(t, PolicyManual, s.ImagePolicy(""), "a container without a client")
+
+	raw, err := json.Marshal(DefaultSettings())
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"policyClients":{}`, "none is an object, never null")
+
+	var back Settings
+	require.NoError(t, json.Unmarshal(raw, &back))
+	assert.Nil(t, back.PolicyClients)
+
+	empty, same := DefaultSettings(), DefaultSettings()
+	empty.PolicyClients = ClientPolicies{}
+	assert.True(t, empty.Equal(&same))
+	assert.False(t, s.Equal(&same))
+
+	s.PolicyClients = ClientPolicies{"Geth": PolicyAuto}
+	require.ErrorContains(t, s.Validate(), "is not a client name")
+
+	s.PolicyClients = ClientPolicies{"geth": "sometimes"}
+	require.ErrorContains(t, s.Validate(), "invalid policy")
 }

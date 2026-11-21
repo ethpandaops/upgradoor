@@ -1,7 +1,8 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { act, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
+import { ApiError } from '../api/client';
 import { createHarness, renderWithApp } from '../test/harness';
 import { SettingsTab } from './SettingsTab';
 
@@ -12,47 +13,80 @@ async function openSettings() {
   return { h, form, user: userEvent.setup() };
 }
 
+/** rowOf is the line of a setting: its control and the note below it. */
 function rowOf(form: HTMLElement, label: string): HTMLElement {
-  const row = within(form).getByLabelText(label).closest('tr');
-  if (!row) throw new Error(`no row for ${label}`);
+  const row = within(form).getByLabelText(label).closest('div.border-b, div.border');
+  if (!(row instanceof HTMLElement)) throw new Error(`no row for ${label}`);
   return row;
 }
 
+const group = (name: string) => screen.getByRole('region', { name });
+const policy = (form: HTMLElement, label: string) =>
+  within(within(form).getByRole('group', { name: label })).getByRole('button', { pressed: true });
+
 describe('SettingsTab', () => {
-  it('shows the stored settings with their defaults', async () => {
+  it('shows the stored settings in groups, with the unit at the control', async () => {
     const { form, h } = await openSettings();
 
-    expect(within(form).getByLabelText('Max unavailable')).toHaveValue('10');
-    expect(within(form).getByLabelText('Min participation')).toHaveValue('90');
-    expect(within(form).getByLabelText('Max finality lag')).toHaveValue('3');
-    expect(within(form).getByLabelText('Ready epochs')).toHaveValue('1');
-    expect(within(form).getByLabelText('Min peers')).toHaveValue('3');
-    expect(within(form).getByLabelText('Lease TTL')).toHaveValue('30m');
-    expect(within(form).getByLabelText('Host stale after')).toHaveValue('2m');
-    expect(within(form).getByLabelText('Readiness timeout')).toHaveValue('30m');
-    expect(within(form).getByLabelText('Policy: images')).toHaveValue('auto');
-    expect(within(form).getByLabelText('Policy: reboots')).toHaveValue('manual');
-    // Off by default; the fixture has it on at a quarter.
-    expect(within(form).getByLabelText('Ready peer share')).toHaveValue('0.25');
-    expect(rowOf(form, 'Ready peer share')).toHaveTextContent('use default');
-    // One switch per kind; the fixture has the one for images on.
-    expect(within(form).getByLabelText('Pause after canary: images')).toBeChecked();
-    expect(within(form).getByLabelText('Pause after canary: packages')).not.toBeChecked();
-    expect(within(form).getByLabelText('Pause after canary: reboots')).not.toBeChecked();
-    expect(rowOf(form, 'Pause after canary: images')).toHaveTextContent('off');
-    expect(within(form).getByLabelText('Global pause')).not.toBeChecked();
+    expect(within(group('Budget and network gate')).getByLabelText('Max unavailable')).toHaveValue(10);
+    expect(group('Budget and network gate')).toHaveTextContent('%');
+    expect(within(group('Budget and network gate')).getByLabelText('Min participation')).toHaveValue(90);
+    expect(within(group('Budget and network gate')).getByLabelText('Max finality lag')).toHaveValue(3);
+    expect(rowOf(form, 'Max finality lag')).toHaveTextContent('epochs');
 
-    // The Default column.
-    expect(rowOf(form, 'Lease TTL')).toHaveTextContent('30m');
-    expect(rowOf(form, 'Policy: reboots')).toHaveTextContent('manual');
-    expect(rowOf(form, 'Global pause')).toHaveTextContent('off');
+    const readiness = group('Readiness after an operation');
+    expect(within(readiness).getByLabelText('Ready epochs')).toHaveValue(1);
+    expect(within(readiness).getByLabelText('Min peers')).toHaveValue(3);
+    expect(within(group('Timeouts')).getByLabelText('Readiness timeout')).toHaveValue('30m');
+    // Off by default; the fixture has it on at a quarter, which the line says.
+    expect(within(readiness).getByLabelText('Ready peer share')).toHaveValue(0.25);
+    expect(rowOf(form, 'Ready peer share')).toHaveTextContent('default 0');
+    expect(rowOf(form, 'Ready peer share')).toHaveTextContent('× median');
+    expect(rowOf(form, 'Ready epochs')).not.toHaveTextContent('default');
+
+    expect(within(group('Timeouts')).getByLabelText('Lease TTL')).toHaveValue('30m');
+    expect(within(group('Timeouts')).getByLabelText('Host stale after')).toHaveValue('2m');
+
+    // A kind of rollout is one line: its policy as a choice, the canary switch next to it.
+    const policies = group('Scheduler');
+    expect(policy(form, 'Policy: images')).toHaveTextContent('auto');
+    expect(policy(form, 'Policy: reboots')).toHaveTextContent('manual');
+    expect(within(policies).getByRole('switch', { name: 'Pause after canary: images' })).toBeChecked();
+    expect(within(policies).getByRole('switch', { name: 'Pause after canary: packages' })).not.toBeChecked();
+
+    expect(within(group('Scheduler')).getByRole('switch', { name: 'Global pause' })).not.toBeChecked();
 
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
     expect(screen.getByRole('status')).toHaveTextContent('No unsaved changes.');
+    expect(screen.queryByRole('list', { name: 'Changes to save' })).not.toBeInTheDocument();
     expect(h.calls.filter(c => c.method === 'PUT')).toEqual([]);
   });
 
-  it('round-trips an edit: dirty state, PUT body, stored answer', async () => {
+  it('keeps the long description behind the info icon', async () => {
+    const { form, user } = await openSettings();
+
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+
+    // A click (or a tap) opens it; it says what the setting does, its range and its default.
+    const info = within(form).getByRole('button', { name: 'About Max finality lag' });
+    await user.click(info);
+    const tip = screen.getByRole('tooltip');
+    expect(tip).toHaveTextContent('No new lease while finality lags more than this many epochs.');
+    expect(tip).toHaveTextContent('Valid: at least 2');
+    expect(tip).toHaveTextContent('Default: 3 epochs');
+    expect(info).toHaveAttribute('aria-expanded', 'true');
+
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('tooltip')).not.toBeInTheDocument();
+
+    // Keyboard focus opens it too.
+    act(() => {
+      within(form).getByRole('button', { name: 'About Lease TTL' }).focus();
+    });
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Time an agent has to start a granted lease');
+  });
+
+  it('saves only what changed, and says what will change before it does', async () => {
     const { form, h, user } = await openSettings();
 
     const maxUnavailable = within(form).getByLabelText('Max unavailable');
@@ -61,15 +95,26 @@ describe('SettingsTab', () => {
     const ttl = within(form).getByLabelText('Lease TTL');
     await user.clear(ttl);
     await user.type(ttl, '45m');
-    await user.selectOptions(within(form).getByLabelText('Policy: packages'), 'manual');
-    await user.click(within(form).getByLabelText('Global pause'));
+    await user.click(
+      within(within(form).getByRole('group', { name: 'Policy: packages' })).getByRole('button', { name: 'manual' })
+    );
+    await user.click(within(form).getByRole('switch', { name: 'Global pause' }));
 
     expect(within(rowOf(form, 'Max unavailable')).getByText('changed')).toBeInTheDocument();
-    expect(within(rowOf(form, 'Lease TTL')).getByText('changed')).toBeInTheDocument();
     expect(within(rowOf(form, 'Ready epochs')).queryByText('changed')).not.toBeInTheDocument();
     expect(screen.getByRole('status')).toHaveTextContent('4 unsaved changes');
 
-    await user.click(screen.getByRole('button', { name: 'Save' }));
+    const changes = within(screen.getByRole('list', { name: 'Changes to save' }))
+      .getAllByRole('listitem')
+      .map(li => li.textContent);
+    expect(changes).toEqual([
+      'Global pause off → on',
+      'Max unavailable 10 % → 12.5 %',
+      'Lease TTL 30m → 45m',
+      'Policy: packages auto → manual',
+    ]);
+
+    await user.click(screen.getByRole('button', { name: 'Save 4 changes' }));
 
     await waitFor(() => {
       expect(h.calls.filter(c => c.method === 'PUT')).toHaveLength(1);
@@ -78,22 +123,10 @@ describe('SettingsTab', () => {
     expect(put?.path).toBe('/api/v1/settings');
     expect(put?.authorization).toBe('Bearer mock-token');
     expect(put?.body).toStrictEqual({
-      maxUnavailablePercent: 12.5,
-      minParticipationPercent: 90,
-      maxFinalityLagEpochs: 3,
-      readyEpochs: 1,
-      minPeers: 3,
-      leaseTtl: '45m',
-      hostStaleAfter: '2m',
-      readinessTimeout: '30m',
-      policyImage: 'auto',
-      policyPackages: 'manual',
-      policyReboot: 'manual',
-      pauseAfterCanaryImage: true,
-      pauseAfterCanaryPackages: false,
-      pauseAfterCanaryReboot: false,
-      readyPeerShare: 0.25,
       paused: true,
+      maxUnavailablePercent: 12.5,
+      leaseTtl: '45m',
+      policyPackages: 'manual',
     });
 
     // The form now shows the stored answer and is clean again.
@@ -101,16 +134,17 @@ describe('SettingsTab', () => {
       expect(screen.getByRole('status')).toHaveTextContent('No unsaved changes.');
     });
     const saved = screen.getByRole('form', { name: 'Settings' });
-    expect(within(saved).getByLabelText('Max unavailable')).toHaveValue('12.5');
+    expect(within(saved).getByLabelText('Max unavailable')).toHaveValue(12.5);
     expect(within(saved).getByLabelText('Lease TTL')).toHaveValue('45m');
-    expect(within(saved).getByLabelText('Global pause')).toBeChecked();
+    expect(within(saved).getByRole('switch', { name: 'Global pause' })).toBeChecked();
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
 
-    // The controller stored it and audited the change.
+    // The controller stored it, kept what was not named, and audited the change.
     expect((await h.api.settings()).settings).toMatchObject({
       maxUnavailablePercent: 12.5,
       leaseTtl: '45m',
       paused: true,
+      readyPeerShare: 0.25,
     });
     const audit = await h.api.audit({ action: 'settings.' });
     expect(audit.entries?.[0]?.detail).toMatchObject({
@@ -118,9 +152,10 @@ describe('SettingsTab', () => {
       after: { maxUnavailablePercent: 12.5 },
     });
 
-    // A value that differs from its default can be reset to it.
+    // A value that differs from its default says so and can be reset to it.
+    expect(rowOf(saved, 'Max unavailable')).toHaveTextContent('default 10');
     await user.click(within(saved).getByRole('button', { name: 'Reset Max unavailable to its default' }));
-    expect(within(saved).getByLabelText('Max unavailable')).toHaveValue('10');
+    expect(within(saved).getByLabelText('Max unavailable')).toHaveValue(10);
     expect(screen.getByRole('status')).toHaveTextContent('1 unsaved change.');
   });
 
@@ -129,7 +164,6 @@ describe('SettingsTab', () => {
 
     const cases: [string, string, string][] = [
       ['Max unavailable', '150', 'must be between 0 and 100'],
-      ['Min participation', 'abc', 'must be a number between 0 and 100'],
       ['Max finality lag', '1', 'must be at least 2'],
       ['Ready epochs', '1.5', 'must be a whole number'],
       ['Min peers', '0', 'must be at least 1'],
@@ -147,11 +181,19 @@ describe('SettingsTab', () => {
       expect(input).toHaveAttribute('aria-invalid', 'true');
     }
 
-    expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
+    // The controls state their range themselves.
+    expect(within(form).getByLabelText('Max unavailable')).toHaveAttribute('max', '100');
+    expect(within(form).getByLabelText('Max finality lag')).toHaveAttribute('min', '2');
+
+    // An empty number is not a number.
+    await user.clear(within(form).getByLabelText('Min participation'));
+    expect(within(rowOf(form, 'Min participation')).getByRole('alert')).toHaveTextContent('must be a number');
+
+    expect(screen.getByRole('button', { name: /^Save/ })).toBeDisabled();
     expect(screen.getByRole('status')).toHaveTextContent('Fix the marked fields to save.');
 
     await user.click(screen.getByRole('button', { name: 'Discard changes' }));
-    expect(within(form).getByLabelText('Max unavailable')).toHaveValue('10');
+    expect(within(form).getByLabelText('Max unavailable')).toHaveValue(10);
     expect(within(form).queryByRole('alert')).not.toBeInTheDocument();
     expect(h.calls.filter(c => c.method === 'PUT')).toEqual([]);
   });
@@ -164,6 +206,28 @@ describe('SettingsTab', () => {
     await user.type(ttl, '1800s');
 
     expect(screen.getByRole('status')).toHaveTextContent('No unsaved changes.');
+  });
+
+  it('shows what the controller says about a field at that field', async () => {
+    const { form, h, user } = await openSettings();
+
+    const input = within(form).getByLabelText('Min peers');
+    await user.clear(input);
+    await user.type(input, '7');
+    vi.spyOn(h.api, 'putSettings').mockRejectedValue(new ApiError(400, 'minPeers must be at most 5 on this fleet'));
+
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+
+    expect(await within(rowOf(form, 'Min peers')).findByRole('alert')).toHaveTextContent(
+      'minPeers must be at most 5 on this fleet'
+    );
+    expect(input).toHaveAttribute('aria-invalid', 'true');
+    expect(within(rowOf(form, 'Ready epochs')).queryByRole('alert')).not.toBeInTheDocument();
+
+    // It was about the value that was sent: another value clears it.
+    await user.clear(input);
+    await user.type(input, '5');
+    expect(within(rowOf(form, 'Min peers')).queryByRole('alert')).not.toBeInTheDocument();
   });
 
   it('shows a failed save and keeps the edit', async () => {
@@ -180,7 +244,7 @@ describe('SettingsTab', () => {
 
     const alerts = await screen.findAllByRole('alert');
     expect(alerts.some(a => /Could not save the settings: .*HTTP 401/.test(a.textContent))).toBe(true);
-    expect(within(form).getByLabelText('Ready epochs')).toHaveValue('2');
+    expect(within(form).getByLabelText('Ready epochs')).toHaveValue(2);
     expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
   });
 });

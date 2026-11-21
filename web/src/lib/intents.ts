@@ -1,7 +1,15 @@
 // The confirm-dialog intents shared by several views.
 
 import type { ActionIntent } from '../components/ActionDialog';
-import { buildEndLeaseRequest, buildHoldRequest, buildRolloutHostsRequest, buildScopeRequest } from './actionRequests';
+import type { Policy } from '../api/types';
+import {
+  buildClientPolicyRequest,
+  buildEndLeaseRequest,
+  buildHoldRequest,
+  buildOfflineRequest,
+  buildRolloutHostsRequest,
+  buildScopeRequest,
+} from './actionRequests';
 import { plural } from './format';
 
 /** holdIntent builds the confirm dialog of hold / unhold / forget. */
@@ -14,9 +22,26 @@ export function holdIntent(
   return {
     kind: 'call',
     title: hosts.length === 1 ? `${verb} ${hosts[0] as string}` : `${verb} ${plural(hosts.length, 'host')}`,
+    verb,
     danger: action === 'forget',
     hiddenHosts,
     make: reason => ({ action, body: buildHoldRequest(hosts, reason) }),
+  };
+}
+
+/** offlineIntent marks hosts as known offline, or lifts the mark. */
+export function offlineIntent(mark: boolean, hosts: readonly string[]): ActionIntent {
+  const verb = mark ? 'Mark offline' : 'Lift offline mark';
+  return {
+    kind: 'call',
+    title: hosts.length === 1 ? `${verb}: ${hosts[0] as string}` : `${verb}: ${plural(hosts.length, 'host')}`,
+    verb,
+    reasonRequired: mark,
+    ends: mark,
+    make: (reason, until) => ({
+      action: mark ? 'mark-offline' : 'unmark-offline',
+      body: buildOfflineRequest(hosts, reason, until),
+    }),
   };
 }
 
@@ -25,6 +50,7 @@ export function scopeIntent(action: 'pause' | 'resume' | 'abort', title: string,
   return {
     kind: 'call',
     title,
+    verb: action === 'pause' ? 'Pause' : action === 'resume' ? 'Resume' : 'Abort',
     danger: action === 'abort',
     make: reason => ({ action, body: buildScopeRequest(rollout, reason) }),
   };
@@ -42,6 +68,7 @@ export function hostsIntent(
   return {
     kind: 'call',
     title,
+    verb: action === 'skip' ? 'Skip' : 'Retry',
     rolloutState,
     make: reason => ({ action, body: buildRolloutHostsRequest(rollout, hosts, reason) }),
   };
@@ -49,14 +76,25 @@ export function hostsIntent(
 
 /**
  * endLeaseIntent asks to end one open lease (granted, running or verifying):
- * the agent stops after the step in progress and the host is put on hold.
+ * the agent stops after the step in progress and the lease ends as failed.
  */
 export function endLeaseIntent(lease: string, host: string): ActionIntent {
   return {
     kind: 'call',
     title: `End the lease of ${host}`,
+    verb: 'End the lease',
     danger: true,
     leaseHost: host,
     make: reason => ({ action: 'end-lease', body: buildEndLeaseRequest(lease, reason) }),
+  };
+}
+
+/** clientPolicyIntent sets the image policy of one client; an empty policy returns it to the global default. */
+export function clientPolicyIntent(client: string, policy: Policy | ''): ActionIntent {
+  return {
+    kind: 'call',
+    title: policy === '' ? `Image policy of ${client}: back to the default` : `Image policy of ${client}: ${policy}`,
+    verb: 'Set the policy',
+    make: reason => ({ action: 'client-policy', body: buildClientPolicyRequest(client, policy, reason) }),
   };
 }

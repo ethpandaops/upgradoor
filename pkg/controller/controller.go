@@ -30,9 +30,10 @@ import (
 // DatabaseFile is the SQLite file name inside the data directory.
 const DatabaseFile = "upgradoor.db"
 
-// Config is the controller configuration. The controller holds no secret:
-// agents are verified against the signer public key, users against the
-// authenticatoor's public keys.
+// Config is the controller configuration. The controller holds one secret,
+// the controller seed, from which it derives the key it signs its answers to
+// agents with. Agents are verified against the signer public key, users
+// against the authenticatoor's public keys.
 type Config struct {
 	// Listen is the HTTP listen address.
 	Listen string
@@ -42,6 +43,20 @@ type Config struct {
 	Network string
 	// SignerPublicKey is the unpadded base64url ML-DSA-44 signer public key.
 	SignerPublicKey string
+	// ControllerSeedFile is the file holding the controller seed: the secret
+	// of the devnet group from which the controller derives the controller
+	// key of its own network at start. It is not the devnet seed.
+	// The seed is only ever read from a file: a flag or an environment
+	// variable would show it in the process listing or the pod
+	// specification.
+	ControllerSeedFile string
+	// ControllerGeneration is the generation of the controller key to derive
+	// (default 0). Raising it rotates this network's controller key.
+	ControllerGeneration uint64
+	// AllowUnsignedAgentAnswers runs the controller without a controller
+	// seed: its answers are not signed, and agents that pin a controller key
+	// refuse them (development only).
+	AllowUnsignedAgentAnswers bool
 	// PublicURLs are the base URLs agents reach the controller under.
 	PublicURLs []string
 	// AllowInsecureAgentHTTP accepts agent requests over plain http when no
@@ -100,6 +115,11 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		return nil, fmt.Errorf("controller: --signer-public-key: %w", err)
 	}
 
+	answers, err := loadAnswerSigner(cfg)
+	if err != nil {
+		return nil, err
+	}
+
 	if len(cfg.BeaconEndpoints) == 0 {
 		return nil, errors.New("controller: at least one --beacon-endpoint is required")
 	}
@@ -123,14 +143,18 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 	c.scheduler = scheduler.New(log, scheduler.Options{
 		Store:    c.store,
 		Health:   c.beacon.Health,
+		Liveness: c.beacon.Liveness,
 		Defaults: defaults,
 		NewID:    newID,
+		// The API is built after the scheduler, which is not running yet.
+		Changed: func() { c.api.Notify() },
 	})
 
 	c.api, err = api.New(log, api.Options{
 		Network:                cfg.Network,
 		Version:                cfg.Version,
 		Verifier:               identity.NewVerifier(signer, cfg.Network),
+		AnswerSigner:           answers,
 		PublicURLs:             cfg.PublicURLs,
 		AllowInsecureAgentHTTP: cfg.AllowInsecureAgentHTTP,
 		TrustForwardedHeaders:  cfg.TrustForwardedHeaders,
@@ -147,7 +171,62 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		return nil, fmt.Errorf("controller: %w", err)
 	}
 
+	if answers == nil {
+		c.log.Warn("INSECURE: --allow-unsigned-agent-answers is set and there is no " +
+			"controller seed. Answers to agents are NOT signed: agents that pin a " +
+			"controller key refuse them, and the others trust whoever answers under " +
+			"the controller's name. Development only.")
+	} else {
+		// The fingerprint names the public key; it is no secret. It is what
+		// the agents list under controller_keys_sha256.
+		c.log.WithFields(logrus.Fields{
+			"controller_key_sha256": identity.KeyFingerprint(answers.PublicKey()),
+			"controller_generation": cfg.ControllerGeneration,
+		}).Info("Signing answers to agents with the controller key derived " +
+			"from the controller seed")
+	}
+
 	return c, nil
+}
+
+// loadAnswerSigner reads the controller seed and derives the controller key
+// of this network and generation from it. Without a seed it returns nil,
+// which is only accepted with the explicit opt-out.
+func loadAnswerSigner(cfg *Config) (*identity.AnswerSigner, error) {
+	switch {
+	case cfg.ControllerSeedFile == "" && cfg.AllowUnsignedAgentAnswers:
+		if cfg.ControllerGeneration != 0 {
+			return nil, errors.New("controller: --controller-generation without " +
+				"--controller-seed-file")
+		}
+
+		return nil, nil //nolint:nilnil // no key and no error is the opt-out
+	case cfg.ControllerSeedFile == "":
+		return nil, errors.New("controller: --controller-seed-file is required: agents act " +
+			"only on signed answers (--allow-unsigned-agent-answers runs without, " +
+			"for development)")
+	case cfg.AllowUnsignedAgentAnswers:
+		return nil, errors.New("controller: --controller-seed-file and " +
+			"--allow-unsigned-agent-answers exclude each other")
+	}
+
+	// Neither error carries anything of the file's content.
+	seed, err := identity.ReadSeedFile(cfg.ControllerSeedFile)
+	if err != nil {
+		return nil, fmt.Errorf("controller: --controller-seed-file: %w", err)
+	}
+
+	key, err := identity.DeriveControllerKey(seed, cfg.Network, cfg.ControllerGeneration)
+	if err != nil {
+		return nil, fmt.Errorf("controller: derive the controller key: %w", err)
+	}
+
+	signer, err := identity.NewAnswerSigner(key, cfg.Network)
+	if err != nil {
+		return nil, fmt.Errorf("controller: controller key: %w", err)
+	}
+
+	return signer, nil
 }
 
 // Start opens the store and starts every part, then serves HTTP.
@@ -177,6 +256,8 @@ func (c *controller) Start(ctx context.Context) error {
 			c.api.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
 	}
 
+	// WriteTimeout is that of a request. An event stream sets its own
+	// deadline with every write.
 	c.server = &http.Server{
 		Handler:           c.api.Handler(),
 		ReadHeaderTimeout: 10 * time.Second,
@@ -213,6 +294,10 @@ func (c *controller) Stop() error {
 	var errs []error
 
 	if c.server != nil {
+		// An event stream stays open for as long as its page: the server
+		// would wait for it until the timeout.
+		c.api.CloseStreams()
+
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 

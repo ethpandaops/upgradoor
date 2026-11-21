@@ -11,7 +11,7 @@ import (
 )
 
 // TestHoldBy: a hold remembers that it was set through a team feature only
-// when the writer says so. Every writer that does not (SetHostHold, a
+// when the writer says so. Every writer that does not (a hold without By, a
 // Changes.Holds entry without By: the scheduler, the end of a lease) makes it
 // a hold of staff, also over a team's hold. A lifted hold remembers nothing.
 func TestHoldBy(t *testing.T) {
@@ -56,9 +56,9 @@ func TestHoldBy(t *testing.T) {
 			assert.Empty(t, who)
 
 			commit(HostHold{Host: "node-1", Wanted: true, Reason: "ours", By: fleet.HoldByTeam})
-			require.NoError(t, s.SetHostHold(ctx, "node-1", true, "staff"))
+			require.NoError(t, setHold(ctx, s, "node-1", true, "staff"))
 			_, _, who = by()
-			assert.Empty(t, who, "SetHostHold is not a team's")
+			assert.Empty(t, who, "a hold without a writer is not a team's")
 
 			// Lifted: nothing is remembered, whatever the writer says.
 			commit(HostHold{Host: "node-1", Wanted: false, By: fleet.HoldByTeam})

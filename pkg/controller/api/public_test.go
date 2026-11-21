@@ -161,7 +161,7 @@ func leakFixture(t *testing.T, h *harness) {
 	}
 	// A host that has never completed a sync body (defensive: no status).
 	h.store.hosts["bootnode-1"] = &fleet.Host{
-		Name: "bootnode-1", CertHash: secretCertHash, Roles: []string{fleet.RoleBootnode},
+		Name: "bootnode-1", CertHash: secretCertHash, Roles: []string{"bootnode"},
 		LastSeen: testEpoch, RemoteAddr: secretAddr,
 	}
 
@@ -197,12 +197,14 @@ func leakFixture(t *testing.T, h *harness) {
 		State: fleet.RolloutActive, Paused: true, PauseReason: secretPauseReason,
 		Hosts: []fleet.RolloutHost{{Host: "lighthouse-geth-1", State: fleet.HostPending}},
 	}}
-	// Per-host liveness: the public history may only show its sum.
-	h.store.liveness = []fleet.Liveness{
-		{Host: "lighthouse-geth-1", Epoch: 224, Live: 61, Total: 64},
-		{Host: "lighthouse-geth-2", Epoch: 224, Live: 13, Total: 64},
-		{Host: "lighthouse-geth-1", Epoch: 223, Live: 64, Total: 64},
-	}
+	// Per-host slot participation: public is the sum only, too.
+	h.store.slots = []fleet.SlotParticipation{{
+		Slot: 7190, Proposed: true, Assigned: 4, Included: 3,
+		Hosts: []fleet.HostSlotParticipation{
+			{Host: "lighthouse-geth-1", Assigned: 2, Included: 2},
+			{Host: "lighthouse-geth-2", Assigned: 2, Included: 1},
+		},
+	}}
 	h.store.audit = []fleet.AuditEntry{{
 		ID: 1, Time: testEpoch, Actor: secretAuditActor, Action: "action.hold",
 		Target: "lighthouse-geth-1", Detail: map[string]any{"reason": secretHoldReason},
@@ -258,7 +260,7 @@ func TestPublicEndpointsLeakNothing(t *testing.T) {
 		"ok", "reasons", "network",
 		"updatedAt", "error", "genesisTime", "secondsPerSlot", "slotsPerEpoch", "headSlot",
 		"currentEpoch", "finalizedEpoch", "finalityLagEpochs", "livenessKnown",
-		"livenessEpoch", "livenessUnsupported", "tracked", "live",
+		"livenessEpoch", "livenessError", "tracked", "live",
 		// The chain's slot phases: public chain data.
 		"phases", "epoch", "start", "slotMs",
 	}
@@ -271,7 +273,7 @@ func TestPublicEndpointsLeakNothing(t *testing.T) {
 			path: "/api/v1/public/hosts",
 			allowed: []string{
 				"hosts", "name", "el", "cl", "updatePending",
-				"image", "digest", "revision", "custom",
+				"image", "digest", "revision",
 			},
 		},
 		{
@@ -282,10 +284,12 @@ func TestPublicEndpointsLeakNothing(t *testing.T) {
 		},
 		{path: "/api/v1/public/network", allowed: networkKeys},
 		{
-			path: "/api/v1/public/history",
+			// No "hosts" and no "name": which host attested is not public.
+			path: "/api/v1/public/slots?window=600",
 			allowed: []string{
-				"epochs", "epoch", "time", "live", "total",
+				"firstSlot", "firstTime", "slotMs", "slotsPerEpoch", "bucketSlots",
 				"minParticipationPercent", "epochSeconds",
+				"recorded", "missed", "assigned", "included", "worstAssigned", "worstIncluded",
 			},
 		},
 		{path: "/api/v1/config", allowed: []string{"network", "version", "authProviderUrl", "authService"}},
@@ -410,7 +414,7 @@ func TestPublicImages(t *testing.T) {
 		Status: &protocol.SyncRequest{Containers: []protocol.Container{{
 			Name: "teku", Image: "someone/teku:debug", Digest: "sha256:d0d0",
 			Revision: "rev-debug", Managed: true, Kind: protocol.KindCL,
-			ConfiguredImage: "consensys/teku:develop", Custom: true,
+			ConfiguredImage: "consensys/teku:develop",
 		}}},
 	}
 
@@ -533,89 +537,6 @@ func TestPublicNetwork(t *testing.T) {
 	assert.Equal(t, []string{"the scheduler has not planned yet"}, gate.Reasons)
 	assert.Equal(t, uint64(225), gate.Network.CurrentEpoch)
 	assert.Equal(t, beaconErrorPublic, gate.Network.Error)
-}
-
-func TestPublicHistory(t *testing.T) {
-	h := newHarness(t, nil)
-	leakFixture(t, h)
-
-	h.store.liveness = []fleet.Liveness{
-		{Host: "b", Epoch: 224, Live: 60, Total: 64},
-		{Host: "a", Epoch: 224, Live: 100, Total: 128},
-		{Host: "a", Epoch: 223, Live: 128, Total: 128},
-	}
-
-	rec := h.get("/api/v1/public/history")
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-
-	got := decodeJSON[PublicHistory](t, rec)
-	genesis := testEpoch.Add(-24 * time.Hour)
-
-	assert.Equal(t, []ParticipationPoint{
-		{Epoch: 223, Time: genesis.Add(224 * 384 * time.Second), Live: 128, Total: 128},
-		{Epoch: 224, Time: genesis.Add(225 * 384 * time.Second), Live: 160, Total: 192},
-	}, got.Epochs, "summed per epoch, oldest first, stamped with the end of the epoch")
-	assert.InDelta(t, fleet.DefaultSettings().MinParticipationPercent, got.MinParticipationPercent, 0)
-	assert.InDelta(t, 384, got.EpochSeconds, 0)
-	assert.NotContains(t, rec.Body.String(), `"host"`, "which host attested is not public")
-
-	// A point is the sum and nothing else.
-	var raw struct {
-		Epochs []map[string]json.RawMessage `json:"epochs"`
-	}
-
-	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &raw))
-	require.Len(t, raw.Epochs, 2)
-
-	for _, point := range raw.Epochs {
-		keys := make([]string, 0, len(point))
-		for key := range point {
-			keys = append(keys, key)
-		}
-
-		assert.ElementsMatch(t, []string{"epoch", "time", "live", "total"}, keys)
-	}
-
-	assert.Equal(t, http.StatusBadRequest, h.get("/api/v1/public/history?limit=0").Code)
-
-	// No liveness yet: an empty list, not null.
-	h.store.liveness = nil
-	assert.JSONEq(t, `[]`, string(decodeJSON[map[string]json.RawMessage](t,
-		h.get("/api/v1/public/history"))["epochs"]))
-}
-
-// TestParticipationTimesAcrossASlotDurationFork: the history stamps every
-// epoch with its real end, also when the slot duration changed inside the
-// window; an epoch that cannot be placed carries no time.
-func TestParticipationTimesAcrossASlotDurationFork(t *testing.T) {
-	genesis := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	fork := genesis.Add(100 * 384 * time.Second)
-	health := &fleet.NetworkHealth{
-		SlotsPerEpoch: 32, CurrentEpoch: 103,
-		Phases: []fleet.SlotPhase{
-			{Epoch: 0, Start: genesis, SlotMs: 12000},
-			{Epoch: 100, Start: fork, SlotMs: 4500},
-		},
-	}
-	rows := []fleet.Liveness{
-		{Host: "a", Epoch: 98, Live: 1, Total: 1},
-		{Host: "a", Epoch: 99, Live: 1, Total: 1},
-		{Host: "a", Epoch: 100, Live: 1, Total: 1},
-		{Host: "a", Epoch: 102, Live: 1, Total: 1},
-	}
-
-	got := participation(rows, health)
-	require.Len(t, got, 4)
-	assert.Equal(t, fork.Add(-384*time.Second), got[0].Time, "the end of epoch 98")
-	assert.Equal(t, fork, got[1].Time, "epoch 99 ends where the fork begins")
-	assert.Equal(t, fork.Add(144*time.Second), got[2].Time, "4.5 s slots: 144 s epochs")
-	assert.Equal(t, fork.Add(3*144*time.Second), got[3].Time)
-	assert.InDelta(t, 144, health.EpochDuration().Seconds(), 0)
-
-	health.Phases = nil
-	for _, point := range participation(rows, health) {
-		assert.True(t, point.Time.IsZero())
-	}
 }
 
 // A scheduler may quote the beacon error in a gate reason. The public view

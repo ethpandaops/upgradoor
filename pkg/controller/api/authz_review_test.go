@@ -86,7 +86,7 @@ func TestRetryOfAnAbortedRolloutNeedsSupervise(t *testing.T) {
 		},
 
 		// A rollout nobody knows: nothing is owned in it. With the plain
-		// feature the scheduler answers, as before.
+		// feature the scheduler answers.
 		{
 			name: "unknown, the team twin", body: retry("r-ghost", hostMixed),
 			services: teamRecover, teams: lighthouse,
@@ -130,7 +130,7 @@ func TestTeamTwinDoesNotTouchStaffHolds(t *testing.T) {
 	ownershipFixture(h)
 
 	h.store.mu.Lock()
-	// Staff's: HoldBy is empty, as for every hold of an earlier build.
+	// Staff's: HoldBy is empty.
 	h.store.hosts[hostMixed].HoldWanted = true
 	h.store.hosts[hostMixed].HoldReason = "lease ended by operator"
 	// A team's.
@@ -625,7 +625,7 @@ func TestRetryAndHoldEndToEnd(t *testing.T) {
 		return `{"rollout":"` + id + `","hosts":["` + strings.Join(hosts, `","`) + `"]}`
 	}
 
-	// H1: a team member cannot reopen an aborted cause by naming a host.
+	// A team member cannot reopen an aborted cause by naming a host.
 	code, msg := send("retry", retry("r-aborted", hostMixed), lighthouse)
 	assert.Equal(t, http.StatusForbidden, code)
 	assert.Equal(t, "forbidden: this login lacks the feature upgradoor:supervise", msg)
@@ -633,16 +633,16 @@ func TestRetryAndHoldEndToEnd(t *testing.T) {
 	code, _ = send("retry", retry("r-aborted", hostTeku), teku)
 	assert.Equal(t, http.StatusForbidden, code)
 
-	// With the feature, hosts are still refused: the scheduler does not
-	// reopen a cause half.
+	// With the feature it is refused all the same: a rollout that is closed
+	// is not retried.
 	code, msg = send("retry", retry("r-aborted", hostMixed), supervisor)
 	assert.Equal(t, http.StatusConflict, code)
-	assert.Contains(t, msg, "is aborted; retrying it reopens its cause for every host")
+	assert.Contains(t, msg, "rollout r-aborted is aborted")
 
 	assert.Equal(t, 1, open(), "nothing was reopened")
 	assert.Zero(t, actions())
 
-	// H2: a covered host that did not fail lifts no halt.
+	// A covered host that did not fail lifts no halt.
 	code, msg = send("retry", retry("r-halted", hostUnowned), staff)
 	assert.Equal(t, http.StatusConflict, code)
 	assert.Contains(t, msg, "no host could be retried: bootnode-1 has neither failed nor been skipped")
@@ -800,11 +800,11 @@ func TestSchedulerRefusalIsForbidden(t *testing.T) {
 	}, decodeJSON[ErrorBody](t, rec))
 }
 
-// TestTeamHoldDoesNotSurviveEndLease is the sequence of the review, through
-// the real handlers, token verification, scheduler and store: a team member
-// holds the team's host with the reason the end of a lease writes, ends the
-// lease, and cannot lift the hold afterwards.
-func TestTeamHoldDoesNotSurviveEndLease(t *testing.T) {
+// TestEndLeaseLeavesATeamsHoldTheTeams goes through the real handlers, token
+// verification, scheduler and store: ending a lease writes no hold and takes
+// none over. A team member who holds the team's host and ends its lease can
+// lift that hold afterwards: it is still the team's.
+func TestEndLeaseLeavesATeamsHoldTheTeams(t *testing.T) {
 	h, provider, st := realHarness(t)
 	ctx := context.Background()
 
@@ -833,7 +833,7 @@ func TestTeamHoldDoesNotSurviveEndLease(t *testing.T) {
 	team := provider.grant(t, "-all,+upgradoor,+upgradoor:team_*", "lighthouse")
 	hosts := `{"hosts":["` + hostMixed + `"]}`
 
-	rec := send("hold", `{"hosts":["`+hostMixed+`"],"reason":"lease ended by operator"}`, team)
+	rec := send("hold", `{"hosts":["`+hostMixed+`"],"reason":"ours"}`, team)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Equal(t, fleet.HoldByTeam, host().HoldBy)
 
@@ -841,45 +841,19 @@ func TestTeamHoldDoesNotSurviveEndLease(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 	assert.True(t, host().HoldWanted)
-	assert.Empty(t, host().HoldBy, "the hold of an ended lease is staff's, whatever its reason")
+	assert.Equal(t, "ours", host().HoldReason)
+	assert.Equal(t, fleet.HoldByTeam, host().HoldBy, "ending a lease changes no hold")
 
 	entries, err := st.ListAudit(ctx, store.AuditFilter{ActionPrefix: "action.end-lease"})
 	require.NoError(t, err)
 	require.Len(t, entries, 1)
-
-	hold, ok := entries[0].Detail["hold"].(map[string]any)
-	require.True(t, ok, "the change of the hold is audited: %v", entries[0].Detail)
-	assert.Equal(t, map[string]any{
-		"holdWanted": true, "holdReason": "lease ended by operator", "holdBy": "team",
-	}, hold["before"])
-	assert.Equal(t, map[string]any{
-		"holdWanted": true, "holdReason": "lease ended by operator", "holdBy": "staff",
-	}, hold["after"])
-
-	// While the lease is open, and after it has ended: not the team's to lift.
-	for range 2 {
-		rec = send("unhold", hosts, team)
-		require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
-		assert.Equal(t, ErrorBody{
-			Error: "forbidden: upgradoor:team_hold does not lift the hold on host lighthouse-geth-1 (set by staff)",
-		}, decodeJSON[ErrorBody](t, rec))
-
-		lease, getErr := st.GetLease(ctx, "lease-1")
-		require.NoError(t, getErr)
-
-		ended := testEpoch
-		lease.State = fleet.LeaseFailed
-		lease.EndedAt = &ended
-		require.NoError(t, st.Commit(ctx, &store.Changes{Leases: []*fleet.Lease{lease}}))
-	}
-
-	assert.True(t, host().HoldWanted)
+	assert.NotContains(t, entries[0].Detail, "hold")
 
 	rec = h.serve(userRoute{method: http.MethodGet, path: "/api/v1/hosts/" + hostMixed}.request(team))
-	assert.Equal(t, "staff", decodeJSON[HostDetail](t, rec).HoldBy)
+	assert.Equal(t, fleet.HoldByTeam, decodeJSON[HostDetail](t, rec).HoldBy)
 
-	// Staff lifts it.
-	rec = send("unhold", hosts, provider.grant(t, "+upgradoor:hold"))
+	// The team lifts its hold, while the lease is still open.
+	rec = send("unhold", hosts, team)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	assert.False(t, host().HoldWanted)
 

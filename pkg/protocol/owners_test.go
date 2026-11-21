@@ -39,10 +39,8 @@ func TestCleanOwners(t *testing.T) {
 	assert.Equal(t, "i", many[0])
 }
 
-// TestOwnersOnTheWire: the field is additive. It is left out when a container
-// has no owners, so the sync of a build with the field and of one without it
-// are the same bytes for such a host; and a body without the field, as an
-// earlier agent sends it, decodes to no owners.
+// TestOwnersOnTheWire: the field is left out when a container has no owners,
+// and a body without it decodes to no owners.
 func TestOwnersOnTheWire(t *testing.T) {
 	raw, err := json.Marshal(Container{Name: "geth", Managed: true})
 	require.NoError(t, err)
@@ -56,15 +54,4 @@ func TestOwnersOnTheWire(t *testing.T) {
 
 	require.NoError(t, json.Unmarshal([]byte(`{"name":"geth","managed":true}`), &c))
 	assert.Nil(t, c.Owners)
-
-	// What an earlier controller does with the field: its Container type
-	// does not have it, and its decoder skips what it does not know.
-	var earlier struct {
-		Name    string `json:"name"`
-		Managed bool   `json:"managed"`
-	}
-
-	require.NoError(t, json.Unmarshal(raw, &earlier))
-	assert.Equal(t, "geth", earlier.Name)
-	assert.True(t, earlier.Managed)
 }

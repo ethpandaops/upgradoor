@@ -4,28 +4,34 @@
 
 import type { FetchFn } from '../api/client';
 import {
-  dict,
   list,
   type ActionResult,
   type Audit,
   type AuditEntry,
   type Budget,
+  type ClientPolicyRequest,
+  type Clients,
+  type Container,
+  type ClientOverrideRequest,
+  type FlagOverrideRequest,
+  type ImageOverrideRequest,
   type Config,
   type EndLeaseRequest,
   type Gate,
   type HoldRequest,
+  type OfflineRequest,
   type HostDetail,
   type HostPlan,
+  type HostListing,
   type HostSummary,
   type Hosts,
   type Lease,
-  type Liveness,
   type Need,
   type PackageMatch,
-  type ParticipationPoint,
   type Packages,
   type Plan,
-  type PublicHistory,
+  type SlotHistory,
+  type SlotRow,
   type PublicHost,
   type PublicHosts,
   type PublicImage,
@@ -43,14 +49,39 @@ import {
   type SettingsBody,
   type WaitKind,
 } from '../api/types';
+import { WIRE_VERSION, without } from '../api/wire';
+import { applyFlags, validateFlags } from '../lib/flags';
 import { formatPercent } from '../lib/format';
+import { imageAllowed, validateImageRef } from '../lib/imageRef';
 import { parseGoDuration } from '../lib/goDuration';
 import { TEAM_PREFIX, TWINNED, can, type Login, type PermissionCall } from '../lib/permissions';
 import { FIELDS, toForm, validateField } from '../lib/settingsForm';
-import { EPOCH_MS, SECONDS_PER_SLOT, SLOTS_PER_EPOCH, buildMockData, hash, hex, type MockData } from './fixture';
+import {
+  EPOCH_MS,
+  SECONDS_PER_SLOT,
+  SLOTS_PER_EPOCH,
+  buildMockData,
+  currentDigest,
+  hash,
+  hex,
+  type MockData,
+  type MockFleet,
+} from './fixture';
+import { ClientQueryError, clientHostsPage, clientIndex, imagePolicy, type ClientIndex } from './clients';
+import { OFF_SLOTS, capOutages, outageSpans, type Deviation } from './outages';
+import {
+  StringTable,
+  detailTables,
+  diffBody,
+  encodeDoc,
+  fullBody,
+  privateTables,
+  publicTables,
+  type DocState,
+} from './wireStream';
 
 /** The bearer token the mock auth client hands out to a staff login. */
-export const MOCK_TOKEN = 'mock-token';
+const MOCK_TOKEN = 'mock-token';
 /** The auth provider URL the mock reports in auth mode. */
 export const MOCK_AUTH_URL = 'https://auth.mock.invalid';
 /** The service name the mock reports. */
@@ -59,7 +90,7 @@ export const MOCK_AUTH_SERVICE = 'upgradoor';
 /** Who the fake auth client can be logged in as. */
 export type MockProfile = 'staff' | 'team' | 'reader';
 
-export interface MockLogin {
+interface MockLogin {
   token: string;
   /** features the token grants; "all" is a grant like upgradoor:all. */
   features: 'all' | readonly string[];
@@ -99,124 +130,80 @@ const ACTIONS: readonly string[] = [
   'abort',
   'skip',
   'retry',
+  'client-policy',
+  'image-override',
+  'flag-override',
+  'client-override',
 ];
 
-const LIVENESS_EPOCHS = 16;
-/** The controller's default and maximum history window, in epochs. */
-const HISTORY_DEFAULT = 128;
-const HISTORY_MAX = 512;
+/** How long the mock's agent takes to recreate a container under the lease of an override. */
+const OVERRIDE_APPLY_MS = 10_000;
+/** The longest an override may last, and how long it lasts when the request names no end. */
+const OVERRIDE_MAX_MS = 7 * 86_400_000;
+const OVERRIDE_DEFAULT_MS = 86_400_000;
 
-/** The pause reason of a rollout that the scheduler paused at its first success (docs/scheduler.md, Ordering, 4). */
-export const CANARY_PAUSE = 'paused after the canary; resume to continue';
+/** What a container ran before the mock applied an override to it: what it is put back to. */
+interface OverrideBase {
+  image: string;
+  imageId: string;
+  digest: string | undefined;
+  revision: string | undefined;
+  command: string[];
+}
+
+/** A client name in normal form (protocol.ValidClient): the form of a team name. */
+const CLIENT_NAME = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+
+/** The controller's slot history: its default, shortest and longest window in seconds, and its points per answer. */
+const SLOTS_WINDOW_DEFAULT = 3 * 3600;
+const SLOTS_WINDOW_MIN = 60;
+const SLOTS_WINDOW_MAX = 12 * 3600;
+const SLOTS_MAX_POINTS = 400;
+const SLOT_MS = SECONDS_PER_SLOT * 1000;
+
+/** mix returns a deterministic 32-bit number for two integers: cheap enough for every host and slot of 12 hours. */
+function mix(a: number, b: number): number {
+  let h = (a ^ Math.imul(b, 0x9e3779b1)) >>> 0;
+  h = Math.imul(h ^ (h >>> 16), 0x85ebca6b);
+  h = Math.imul(h ^ (h >>> 13), 0xc2b2ae35);
+  return (h ^ (h >>> 16)) >>> 0;
+}
+
+/**
+ * RESUME ends the pause reasons that say why a rollout is paused: after its
+ * canary, or because a person aborted a rollout of an observed cause.
+ */
+const RESUME = '; resume to continue';
 
 /** waitKind classifies a waiting reason the way the scheduler does. */
 function waitKind(reason: string): WaitKind {
   if (reason === 'held') return 'held';
   if (reason === 'agent silent') return 'silent';
   if (reason === 'paused') return 'paused';
-  if (reason === 'rollout paused' || reason === CANARY_PAUSE) return 'rollout-paused';
+  if (reason === 'rollout paused' || reason.endsWith(RESUME)) return 'rollout-paused';
   if (reason.startsWith('waiting for approval')) return 'approval';
-  if (reason === 'policy paused') return 'policy-paused';
   if (reason.startsWith('rollout halted')) return 'halted';
   if (reason.startsWith('network gate')) return 'gate';
   if (reason.startsWith('verb not allowed')) return 'verb';
   if (reason.startsWith('after ')) return 'order';
   if (reason.startsWith('budget ')) return 'budget';
-  if (reason.startsWith('host limit')) return 'host-limit';
-  return 'next';
+  return 'host-limit';
 }
 
-/** The stages of fleet.Stage. */
-const STAGE_REPAIR = 1;
-const STAGE_CANARY = 2;
+/** The stage of fleet.Stage that the mock gives every member it adds. */
 const STAGE_REST = 3;
 
-/** BROKEN_NOTE starts the note of a waiting member whose host is broken. */
-const BROKEN_NOTE = 'broken since lease ';
-
-/** needGroup names what a need is about, as far as a host can be broken for it: an image reference, or the packages. */
-function needGroup(n: Need): string {
-  if (n.directiveId) return '';
-  if (n.kind === 'image' && n.image) return `image:${n.image.image}`;
-  if (n.kind === 'packages') return 'packages';
-  return '';
-}
-
-/** rolloutGroup names the rollouts that are about the same thing; reboot and manual rollouts belong to none. */
-function rolloutGroup(r: Rollout): string {
-  if (r.kind === 'image') return `image:${r.image ?? ''}`;
-  if (r.kind === 'packages') return 'packages';
-  return '';
-}
-
-/** The failure reason of a lease that a person ended, and the reason of the hold that ending it sets. */
+/** The failure reason of a lease that a person ended. */
 const ENDED_BY_OPERATOR = 'ended by operator';
-const HOLD_REASON_ENDED = 'lease ended by operator';
 
-/** The mock agents sync every 30 s; a cancelled lease they hold ends with their next sync. */
-const SYNC_MS = 30_000;
-/** The mock scheduler reconciles every 5 s; a cancelled lease that is verifying ends with the next pass. */
+/** The mock scheduler grants the lease of a host's own request this long after the request. */
 const RECONCILE_MS = 5_000;
 
 const isOpen = (l: Lease) => !['released', 'failed', 'expired'].includes(l.state);
 
-/** stepFailed: the agent reported a step of the lease failed. */
-function stepFailed(l: Lease): boolean {
-  return list(l.operation?.steps).some(s => s.status === 'failed');
-}
-
-/** endedHoldReason: the reason of a host's controller hold once a lease of the host was ended. */
-function endedHoldReason(held: boolean, reason: string): string {
-  if (!held || reason === '') return HOLD_REASON_ENDED;
-  return reason.includes(HOLD_REASON_ENDED) ? reason : `${reason}; ${HOLD_REASON_ENDED}`;
-}
-
-/** stepsDone: the agent reported every step the lease carries for the rollout done. */
-function stepsDone(l: Lease, rollout: string): boolean {
-  const steps = list(l.operation?.steps);
-  const mine = Object.entries(dict(l.rollouts)).filter(([, id]) => id === rollout);
-  return mine.length > 0 && mine.every(([need]) => steps.find(s => s.needId === need)?.status === 'done');
-}
-
-/**
- * leaseVerdict is what the end of a lease says about its host for a group
- * (the table under "Broken hosts" in docs/scheduler.md): released with every
- * step of the group done repairs it; failed breaks it, unless the group's
- * steps were done and another step failed, or a person ended the lease and
- * by the agent's final report no step of the group is done (with one of
- * them done something was applied and the host never shown to be back:
- * broken, whenever the person clicked), or the lease was cancelled and no
- * step of the group was ever begun; anything else (expired, released
- * without the step) says nothing.
- */
-function leaseVerdict(l: Lease, group: string): 'repaired' | 'broke' | undefined {
-  const mine = list(l.needs).filter(n => needGroup(n) === group);
-  if (mine.length === 0) return undefined;
-
-  const steps = list(l.operation?.steps);
-  const status = (n: Need) => steps.find(s => s.needId === n.id)?.status;
-  const done = mine.every(n => status(n) === 'done');
-
-  if (l.state === 'released') return done ? 'repaired' : undefined;
-  if (l.state !== 'failed') return undefined;
-
-  if (done && stepFailed(l)) return undefined;
-  if (mine.some(n => status(n) === 'failed')) return 'broke';
-  if (l.error === ENDED_BY_OPERATOR && !mine.some(n => status(n) === 'done')) return undefined;
-  if (l.cancelled && mine.every(n => status(n) === 'cancelled')) return undefined;
-  return 'broke';
-}
-
 /** succeeded: the rollout has served a member successfully (one is done through a lease). */
 function succeeded(r: Rollout): boolean {
   return list(r.hosts).some(m => m.state === 'done' && Boolean(m.leaseId));
-}
-
-/** keepsCanary: the canary holds a lease, is done by one, or failed and the rollout is still halted by it. */
-function keepsCanary(r: Rollout, m: RolloutHost): boolean {
-  if (m.state === 'leased') return true;
-  if (m.state === 'done') return Boolean(m.leaseId);
-  return m.state === 'failed' && r.state === 'halted';
 }
 
 /** fits: the three grant conditions of the availability budget for a host that costs cost. */
@@ -237,34 +224,58 @@ class HttpError extends Error {
   }
 }
 
-export interface MockOptions {
+interface MockOptions {
   /** auth true makes the user routes require the mock bearer token. */
   auth?: boolean;
   /** latencyMs delays every answer; 0 answers on the next tick. */
   latencyMs?: number;
   /** now is the clock; tests pin it. */
   now?: () => number;
-  /** actor is recorded in the audit log for actions. */
-  actor?: () => string;
+  /** fleet: the two dozen hosts of the fixture, or three hundred with a rolling update. */
+  fleet?: MockFleet;
 }
 
-/** MockController holds the fixture and answers API requests. */
+/** One open event stream of the mock: who reads it and what it was sent last. */
+interface MockStream {
+  user: boolean;
+  hosts: string[];
+  controller: ReadableStreamDefaultController<Uint8Array>;
+  /** What the stream was sent last: its tables, its string table, their version, and the details of its hosts. */
+  doc: DocState;
+  strings: StringTable;
+  version: number;
+  details: Map<string, DocState | null>;
+}
+
+const PUBLIC_EVENTS_PATH = '/api/v1/public/events';
+const USER_EVENTS_PATH = '/api/v1/events';
+/** The windows of the history and rollout views on a stream (events.go). */
+const STREAM_ROLLOUT_LIMIT = 50;
+
+/**
+ * MockController holds the fixture and answers API requests. It also serves
+ * the two event streams, the way the controller does and in its encoding: a
+ * snapshot, then the rows and cells that changed, whenever publish() is called
+ * (after every action, and by whoever lets time pass).
+ */
 export class MockController {
   readonly data: MockData;
   private readonly auth: boolean;
   private readonly latencyMs: number;
   private readonly now: () => number;
   private readonly actor: () => string;
-  private livenessUnsupported = false;
   /** authorization is what allowed the request being served; its audit entries record it. */
   private authorization: { authorizedBy: string; teams: string[] } | undefined;
+  private readonly streams = new Set<MockStream>();
+  /** The overrides that were set or cleared through the mock, by "host/container"; the fixture's own stay as they are. */
+  private readonly overrides = new Map<string, { host: string; container: string; base?: OverrideBase }>();
 
   constructor(opts: MockOptions = {}) {
     this.now = opts.now ?? (() => Date.now());
-    this.data = buildMockData(this.now());
+    this.data = buildMockData(this.now(), opts.fleet ?? 'small');
     this.auth = opts.auth ?? false;
     this.latencyMs = opts.latencyMs ?? 0;
-    this.actor = opts.actor ?? (() => (this.auth ? 'mock-user@example.org' : 'anonymous'));
+    this.actor = () => (this.auth ? 'mock-user@example.org' : 'anonymous');
   }
 
   /** gateFailing reports whether the network gate is forced to fail. */
@@ -275,11 +286,7 @@ export class MockController {
   /** setGateFailing toggles a failing network gate (low participation, finality lag). */
   setGateFailing(failing: boolean): void {
     this.data.gateFailing = failing;
-  }
-
-  /** setLivenessUnsupported makes the beacon node one that does not serve liveness. */
-  setLivenessUnsupported(unsupported: boolean): void {
-    this.livenessUnsupported = unsupported;
+    this.publish();
   }
 
   /** fetch is a drop-in for the browser's fetch, limited to the API routes. */
@@ -287,18 +294,144 @@ export class MockController {
     if (this.latencyMs > 0) await new Promise(resolve => setTimeout(resolve, this.latencyMs));
     if (init?.signal?.aborted) throw new DOMException('aborted', 'AbortError');
 
+    const changes = (init?.method ?? 'GET').toUpperCase() !== 'GET';
+
     try {
+      const path = new URL(input, 'http://mock.invalid').pathname;
+      if (path === PUBLIC_EVENTS_PATH || path === USER_EVENTS_PATH) return this.openStream(input, init);
+
       const body = this.route(input, init);
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
     } catch (err) {
-      const status = err instanceof HttpError ? err.status : 500;
+      const status = err instanceof HttpError || err instanceof ClientQueryError ? err.status : 500;
       const message = err instanceof Error ? err.message : String(err);
       return new Response(JSON.stringify({ error: message }), {
         status,
         headers: { 'Content-Type': 'application/json' },
       });
+    } finally {
+      // What an action changed reaches every open stream.
+      if (changes) this.publish();
     }
   };
+
+  // ------------------------------------------------------- event streams
+
+  /** openStreams is the number of event streams that are open. */
+  get openStreams(): number {
+    return this.streams.size;
+  }
+
+  /**
+   * publish sends every open stream the views that changed since it was last
+   * sent them. The mock's views move with the clock (last seen, the chain's
+   * head), so letting time pass and publishing stands for the agents'
+   * syncs.
+   */
+  publish(): void {
+    for (const stream of this.streams) this.sendTo(stream, false);
+  }
+
+  /** closeStreams ends every open stream, like a controller that restarts. */
+  closeStreams(): void {
+    for (const stream of this.streams) stream.controller.close();
+    this.streams.clear();
+  }
+
+  private openStream(input: string, init?: RequestInit): Response {
+    const url = new URL(input, 'http://mock.invalid');
+    const user = url.pathname === USER_EVENTS_PATH;
+    if (user) this.login(init);
+
+    let stream: MockStream | undefined;
+    const close = () => {
+      if (!stream || !this.streams.delete(stream)) return;
+      try {
+        stream.controller.close();
+      } catch {
+        // The reader cancelled first.
+      }
+    };
+
+    const body = new ReadableStream<Uint8Array>({
+      start: controller => {
+        stream = {
+          user,
+          hosts: user ? url.searchParams.getAll('host') : [],
+          controller,
+          doc: new Map(),
+          strings: new StringTable(),
+          version: 0,
+          details: new Map(),
+        };
+        this.streams.add(stream);
+        this.sendTo(stream, true);
+      },
+      cancel: close,
+    });
+
+    init?.signal?.addEventListener('abort', close);
+
+    return new Response(body, { status: 200, headers: { 'Content-Type': 'text/event-stream' } });
+  }
+
+  private sendTo(stream: MockStream, snapshot: boolean): void {
+    const emit = (event: string, data: unknown) => {
+      stream.controller.enqueue(new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`));
+    };
+
+    this.settleOverrides();
+
+    const images = this.publicImages();
+    const slots = this.slotRows();
+    const tables = stream.user
+      ? privateTables({
+          now: this.now(),
+          publicGate: this.gate(),
+          plan: this.plan(),
+          hosts: this.hosts(),
+          clients: this.clients(),
+          images,
+          slots,
+          rollouts: this.rollouts(STREAM_ROLLOUT_LIMIT),
+          settings: this.settingsBody(),
+          latestAuditId: this.data.audit.reduce((max, e) => Math.max(max, e.id), 0),
+        })
+      : publicTables({ now: this.now(), gate: this.gate(), hosts: this.publicHosts(), images, slots });
+
+    const sent = stream.strings.list.length;
+    const doc = encodeDoc(stream.user ? '' : 'public', tables, stream.strings);
+    const body: Record<string, unknown> = snapshot ? fullBody(doc) : diffBody(doc, stream.doc);
+    const changed = snapshot || Object.keys(body).length > 0;
+    stream.doc = doc;
+
+    const details: Record<string, unknown> = {};
+    for (const name of stream.hosts) {
+      const before = stream.details.get(name);
+      const now = this.data.hosts.has(name) ? encodeDoc('d', detailTables(this.host(name))) : null;
+      stream.details.set(name, now);
+
+      if (now === null) {
+        if (before !== null) details[name] = 0;
+      } else if (!before) {
+        details[name] = fullBody(now);
+      } else {
+        const patch = diffBody(now, before);
+        if (Object.keys(patch).length > 0) details[name] = patch;
+      }
+    }
+
+    if (changed) {
+      stream.version += 1;
+      body.i = stream.version;
+      const fresh = snapshot ? stream.strings.list : stream.strings.list.slice(sent);
+      if (fresh.length > 0) body.s = [...fresh];
+    }
+    if (Object.keys(details).length > 0) body.d = details;
+
+    if (snapshot) emit('snap', { ...body, v: WIRE_VERSION, t: Math.floor(this.now() / 1000) });
+    else if (Object.keys(body).length > 0) emit('patch', body);
+  }
 
   // ------------------------------------------------------------ routing
 
@@ -311,47 +444,29 @@ export class MockController {
     if (!path.startsWith('/api/v1/')) throw new HttpError(404, `no such route: ${path}`);
     const route = path.slice('/api/v1/'.length);
 
-    this.settleCancelled();
+    this.settleOverrides();
 
     if (method === 'GET') {
       switch (route) {
         case 'config':
           return this.config();
-        case 'public/hosts':
-          return this.publicHosts();
-        case 'public/images':
-          return this.publicImages();
-        case 'public/network':
-          return this.gate();
-        case 'public/history':
-          return this.history(q.get('limit'));
+        case 'public/slots':
+          return this.slots(q.get('window'), false);
       }
     }
 
     // Everything below is a user route.
-    let login: Login = { open: true, service: MOCK_AUTH_SERVICE, hasFeature: () => true, teams: [] };
     this.authorization = undefined;
-
-    if (this.auth) {
-      const header = new Headers(init?.headers).get('Authorization');
-      const known = Object.values(MOCK_LOGINS).find(l => header === `Bearer ${l.token}`);
-      if (!known) throw new HttpError(401, 'missing or invalid bearer token');
-
-      login = {
-        open: false,
-        service: MOCK_AUTH_SERVICE,
-        hasFeature: feature => mockHasFeature(known, feature),
-        teams: known.teams,
-      };
-    }
+    const login = this.login(init);
 
     if (method === 'GET') {
-      if (route === 'hosts') return this.hosts();
-      if (route.startsWith('hosts/')) return this.host(decodeURIComponent(route.slice('hosts/'.length)));
-      if (route === 'packages') return this.packages(q.get('q') ?? '', Number(q.get('limit')) || 50);
-      if (route === 'rollouts') return this.rollouts(Number(q.get('limit')) || 20);
-      if (route === 'plan') return this.plan();
+      if (route === 'clients') return this.clients();
+      const clientHosts = /^clients\/([^/]+)\/hosts$/.exec(route);
+      if (clientHosts) return clientHostsPage(this.clientIndex(), decodeURIComponent(clientHosts[1] ?? ''), q);
+      if (route === 'packages')
+        return this.packages(q.get('q') ?? '', Number(q.get('limit')) || 50, q.get('after') ?? '');
       if (route === 'settings') return this.settingsBody();
+      if (route === 'slots') return this.slots(q.get('window'), true);
       if (route === 'audit') {
         return this.auditPage(
           q.get('target') ?? '',
@@ -373,11 +488,26 @@ export class MockController {
       const name = route.slice('actions/'.length);
       if (ACTIONS.includes(name)) this.authorize(login, { action: name, body } as PermissionCall);
 
-      const result = this.action(name, body);
-      return result;
+      return this.action(name, body);
     }
 
     throw new HttpError(404, `no such route: ${method} ${path}`);
+  }
+
+  /** login is who makes a request to a user route; without a known token it is refused. */
+  private login(init?: RequestInit): Login {
+    if (!this.auth) return { open: true, service: MOCK_AUTH_SERVICE, hasFeature: () => true, teams: [] };
+
+    const header = new Headers(init?.headers).get('Authorization');
+    const known = Object.values(MOCK_LOGINS).find(l => header === `Bearer ${l.token}`);
+    if (!known) throw new HttpError(401, 'missing or invalid bearer token');
+
+    return {
+      open: false,
+      service: MOCK_AUTH_SERVICE,
+      hasFeature: feature => mockHasFeature(known, feature),
+      teams: known.teams,
+    };
   }
 
   /**
@@ -387,6 +517,8 @@ export class MockController {
   private authorize(login: Login, call: PermissionCall): void {
     const verdict = can(login, call, {
       hosts: [...this.data.hosts.values()],
+      // The client table is only read for the policy of a client.
+      clients: call.action === 'client-policy' ? this.clientIndex().views : [],
       leaseHost: id => this.data.leases.find(l => l.id === id)?.host,
       rolloutState: id => this.data.rollouts.find(r => r.id === id)?.state,
     });
@@ -417,6 +549,7 @@ export class MockController {
     const weight = host.validators;
     if (weight === 0) return 0;
 
+    if (this.data.quiet) return hash(`live/${host.name}/${epoch}`) % 11 === 0 ? weight - 1 : weight;
     if (list(host.containers).some(c => c.kind === 'el' && c.state !== 'running')) return back < 27 ? 0 : weight;
     if (host.name === 'lighthouse-geth-2' && this.openLease(host.name))
       return back === 1 || back === 2 ? 0 : weight - 2;
@@ -425,52 +558,186 @@ export class MockController {
     return hash(`live/${host.name}/${epoch}`) % 11 === 0 ? weight - 1 : weight;
   }
 
-  private liveness(host: HostDetail): Liveness[] {
-    if (host.validators === 0) return [];
-    const newest = this.currentEpoch() - 1;
-    return Array.from({ length: LIVENESS_EPOCHS }, (_, back) => ({
-      host: host.name,
-      epoch: newest - back,
-      live: this.liveAt(host, back, newest - back),
-      total: host.validators,
-    }));
-  }
+  /**
+   * darkSpans are the times a host's validators do not attest: from shortly
+   * after a lease takes it down until its agent is done (or until now, while
+   * the lease has not got that far), and for as long as its execution client
+   * is not running.
+   */
+  private darkSpans(host: HostDetail): [number, number][] {
+    const now = this.now();
+    const spans: [number, number][] = [];
+    if (this.data.quiet) return spans;
 
-  /** history sums the hosts' liveness per epoch; a host is dark while it holds (or held) a lease. */
-  private history(raw: string | null): PublicHistory {
-    const limit = raw === null ? HISTORY_DEFAULT : Number(raw);
-    if (!Number.isInteger(limit) || limit < 1) throw new HttpError(400, 'limit must be a positive integer');
-
-    // No rows before genesis.
-    const newest = this.currentEpoch() - 1;
-    const epochs: ParticipationPoint[] = [];
-
-    for (let back = Math.min(limit, HISTORY_MAX, newest + 1) - 1; back >= 0; back--) {
-      const epoch = newest - back;
-      const start = this.data.genesis + epoch * EPOCH_MS;
-      const end = start + EPOCH_MS;
-      let live = 0;
-      let total = 0;
-
-      for (const host of this.data.hosts.values()) {
-        total += host.validators;
-        const dark = this.data.leases.some(l => {
-          if (l.host !== host.name || !l.endedAt) return false;
-          const from = Date.parse(l.grantedAt);
-          const to = Date.parse(l.agentDoneAt ?? l.endedAt);
-          return from < end && to > start;
-        });
-        if (!dark) live += this.liveAt(host, back, epoch);
-      }
-
-      epochs.push({ epoch, time: this.iso(end), live, total });
+    for (const l of this.data.leases) {
+      if (l.host !== host.name) continue;
+      const from = Date.parse(l.grantedAt) + 2 * SLOT_MS;
+      const to = Date.parse(l.agentDoneAt ?? l.endedAt ?? '');
+      spans.push([from, Number.isFinite(to) ? to : now]);
     }
 
+    if (list(host.containers).some(c => c.kind === 'el' && c.state !== 'running')) {
+      spans.push([now - 27 * EPOCH_MS, now]);
+    }
+    if (this.data.gateFailing && hash(`gate/${host.name}`) % 4 === 0) spans.push([now - 2 * EPOCH_MS, now]);
+    // Hosts that are off without anybody having touched them.
+    spans.push(...(this.data.offline.get(host.name) ?? []));
+
+    return spans;
+  }
+
+  /**
+   * slots is the slot history of the last `window` seconds, made the way the
+   * controller makes it: one point per slot, or per bucket of a power of two
+   * slots when the window has more slots than an answer carries points. A
+   * host attests with all the validators it has a duty for in a slot, except
+   * while it is dark (darkSpans) and for a rare single miss; a slot now and
+   * then has no block.
+   */
+  private slots(raw: string | null, perHost: boolean): SlotHistory {
+    const seconds = raw === null ? SLOTS_WINDOW_DEFAULT : Number(raw);
+    if (!Number.isInteger(seconds) || seconds < SLOTS_WINDOW_MIN) {
+      throw new HttpError(400, `window must be a number of seconds, at least ${SLOTS_WINDOW_MIN}`);
+    }
+
+    const from = Math.floor((this.now() - Math.min(seconds, SLOTS_WINDOW_MAX) * 1000 - this.data.genesis) / SLOT_MS);
+
+    const scan = this.slotsFrom(Math.max(0, from));
+    if (!perHost) return scan.history;
+
+    // The outages are worked out from the leases and the slots in which a
+    // host missed, as the controller does; there is no row per host.
+    const validators = (host: string) => this.data.hosts.get(host)?.validators ?? 0;
+    const spans = outageSpans({
+      first: scan.history.firstSlot,
+      last: Math.floor((this.now() - this.data.genesis) / SLOT_MS),
+      nowMs: this.now(),
+      slotsPerEpoch: SLOTS_PER_EPOCH,
+      slotMs: SLOT_MS,
+      slotTime: slot => this.data.genesis + slot * SLOT_MS,
+      deviations: scan.deviations,
+      leases: this.data.leases,
+      validators,
+    });
+
     return {
-      epochs,
+      ...scan.history,
+      outages: capOutages(spans, Math.min(seconds, SLOTS_WINDOW_MAX) * 1000),
+      outageHosts: new Set(spans.map(o => o.names?.[0])).size,
+      offSlots: OFF_SLOTS,
+    };
+  }
+
+  /**
+   * slotRows are the slots an event stream carries: the settled slots of the
+   * current epoch and the two before it, each with the hosts that missed
+   * attestations in it. That is normally none: a row is four numbers,
+   * however many hosts there are.
+   */
+  private slotRows(): SlotRow[] {
+    const last = Math.floor((this.now() - this.data.genesis) / SLOT_MS);
+    const first = Math.max(0, (Math.floor(last / SLOTS_PER_EPOCH) - 2) * SLOTS_PER_EPOCH);
+    const scan = this.slotsFrom(first);
+    const history = scan.history;
+    const hosts = new Map<number, { host: string; assigned: number; included: number }[]>();
+    for (const d of scan.deviations) {
+      hosts.set(d.slot, [...(hosts.get(d.slot) ?? []), { host: d.host, assigned: d.assigned, included: d.included }]);
+    }
+    const rows: SlotRow[] = [];
+
+    list(history.recorded).forEach((recorded, i) => {
+      if (recorded === 0) return;
+      const slot = history.firstSlot + i;
+      const deviating = hosts.get(slot);
+      rows.push({
+        slot,
+        proposed: list(history.missed)[i] === 0,
+        assigned: list(history.assigned)[i] ?? 0,
+        included: list(history.included)[i] ?? 0,
+        ...(deviating ? { hosts: deviating } : {}),
+      });
+    });
+
+    return rows;
+  }
+
+  /** slotsFrom is the slot history from a slot on to now, and the slots in which a host missed attestations. */
+  private slotsFrom(from: number): { history: SlotHistory; deviations: Deviation[] } {
+    const now = this.now();
+    const genesis = this.data.genesis;
+    const last = Math.floor((now - genesis) / SLOT_MS);
+
+    let bucket = 1;
+    while ((last - from) / bucket >= SLOTS_MAX_POINTS) bucket *= 2;
+    const first = from - (from % bucket);
+    const points = Math.floor((last - first) / bucket) + 1;
+    const zeros = () => new Array<number>(points).fill(0);
+
+    const recorded = zeros();
+    const missed = zeros();
+    const assigned = zeros();
+    const included = zeros();
+    const worstAssigned = zeros();
+    const worstIncluded = zeros();
+
+    const hosts = [...this.data.hosts.values()]
+      .filter(h => h.validators > 0)
+      .sort((a, b) => a.name.localeCompare(b.name))
+      .map(h => ({
+        name: h.name,
+        seed: hash(`slots/${h.name}`),
+        duty: Math.round(h.validators / SLOTS_PER_EPOCH),
+        dark: this.darkSpans(h),
+      }));
+    const deviations: Deviation[] = [];
+
+    // A slot is stored once the clock is two slots past it.
+    for (let slot = first; slot <= last - 2; slot++) {
+      const point = Math.floor((slot - first) / bucket);
+      const start = genesis + slot * SLOT_MS;
+      let slotAssigned = 0;
+      let slotIncluded = 0;
+
+      for (const h of hosts) {
+        // The shuffle gives a host a few more or fewer duties from slot to slot.
+        const a = Math.max(0, h.duty + (mix(h.seed, slot) % 3) - 1);
+        let inc = a;
+        if (h.dark.some(([darkFrom, darkTo]) => start >= darkFrom && start < darkTo)) inc = 0;
+        else if (a > 0 && mix(h.seed ^ 0x5bd1e995, slot) % 500 === 0) inc = a - 1;
+
+        if (inc < a) deviations.push({ slot, host: h.name, assigned: a, included: inc });
+        slotAssigned += a;
+        slotIncluded += inc;
+      }
+
+      recorded[point] = (recorded[point] ?? 0) + 1;
+      if (mix(0xb10c, slot) % 90 === 0) missed[point] = (missed[point] ?? 0) + 1;
+      assigned[point] = (assigned[point] ?? 0) + slotAssigned;
+      included[point] = (included[point] ?? 0) + slotIncluded;
+
+      const wa = worstAssigned[point] ?? 0;
+      if (slotAssigned > 0 && (wa === 0 || slotIncluded * wa < (worstIncluded[point] ?? 0) * slotAssigned)) {
+        worstAssigned[point] = slotAssigned;
+        worstIncluded[point] = slotIncluded;
+      }
+    }
+
+    const history: SlotHistory = {
+      firstSlot: first,
+      firstTime: this.iso(genesis + first * SLOT_MS),
+      slotMs: SLOT_MS,
+      slotsPerEpoch: SLOTS_PER_EPOCH,
+      bucketSlots: bucket,
       minParticipationPercent: this.data.settings.minParticipationPercent,
       epochSeconds: EPOCH_MS / 1000,
+      recorded,
+      missed,
+      assigned,
+      included,
+      ...(bucket > 1 ? { worstAssigned, worstIncluded } : {}),
     };
+
+    return { history, deviations };
   }
 
   private gate(): Gate {
@@ -486,15 +753,11 @@ export class MockController {
       const l = this.liveAt(host, 0, epoch - 1);
       tracked += host.validators;
       live += l;
-      // A lease takes out of the gate's share what it took offline: the
-      // validators that attested when it was granted. Those that were
-      // offline already stay in, as not live.
-      const lease = this.openLease(host.name);
-      if (!lease) {
+      // Participation is judged among the hosts that hold no lease: a host
+      // that holds one is down because of its operation.
+      if (!this.openLease(host.name)) {
         gateTracked += host.validators;
         gateLive += l;
-      } else {
-        gateTracked += host.validators - Math.min(lease.charged, host.validators);
       }
     }
 
@@ -502,7 +765,7 @@ export class MockController {
     const participation = gateTracked > 0 ? (gateLive / gateTracked) * 100 : 100;
     const reasons: string[] = [];
     if (lag > s.maxFinalityLagEpochs) reasons.push(`finality lag ${lag} epochs > ${s.maxFinalityLagEpochs}`);
-    if (!this.livenessUnsupported && participation < s.minParticipationPercent) {
+    if (participation < s.minParticipationPercent) {
       reasons.push(`participation ${formatPercent(participation)} < ${formatPercent(s.minParticipationPercent)}`);
     }
 
@@ -519,9 +782,8 @@ export class MockController {
         currentEpoch: epoch,
         finalizedEpoch: epoch - lag,
         finalityLagEpochs: lag,
-        livenessKnown: !this.livenessUnsupported,
+        livenessKnown: true,
         livenessEpoch: epoch - 1,
-        livenessUnsupported: this.livenessUnsupported,
         tracked,
         live,
       },
@@ -552,12 +814,16 @@ export class MockController {
     const s = this.data.settings;
     switch (r.kind) {
       case 'image':
-        return s.policyImage;
+      case 'spec':
+        // An image or spec rollout answers to the policy of its client where one is set.
+        return imagePolicy(s, r.client);
       case 'packages':
         return s.policyPackages;
       case 'reboot':
         return s.policyReboot;
       case 'manual':
+      case 'local':
+        // Asked for by a person, or on the host itself: no policy.
         return 'auto';
     }
   }
@@ -585,6 +851,8 @@ export class MockController {
       unavailableWeight: unavailable,
       leasedHosts: leased,
       maxLeasedHosts: Math.max(1, Math.floor(share * this.data.hosts.size)),
+      independentHosts: 0,
+      maxIndependent: Math.max(1, Math.floor((this.data.settings.maxIndependentPercent / 100) * this.data.hosts.size)),
     };
   }
 
@@ -594,183 +862,29 @@ export class MockController {
     return host ? this.liveAt(host, 0, this.currentEpoch() - 1) : 0;
   }
 
-  /** lastLeaseEnd is when the host's most recent lease ended, or 0. */
-  private lastLeaseEnd(name: string): number {
-    return this.data.leases
-      .filter(l => l.host === name && l.endedAt)
-      .reduce((latest, l) => Math.max(latest, Date.parse(l.endedAt as string)), 0);
-  }
-
-  /**
-   * offline: the host is established as offline. It has validators, holds no
-   * lease, and none of them attested in the two newest epochs, both of which
-   * began after its last lease ended and after the host was first seen.
-   */
-  private offline(host: HostDetail): boolean {
-    if (host.validators === 0 || this.openLease(host.name)) return false;
-
-    const newest = this.currentEpoch() - 1;
-    if (this.liveAt(host, 0, newest) !== 0 || this.liveAt(host, 1, newest) !== 0) return false;
-
-    const began = this.data.genesis + (newest - 1) * EPOCH_MS;
-    return began > Math.max(this.lastLeaseEnd(host.name), Date.parse(host.firstSeen));
-  }
-
-  /**
-   * repairs names the hosts whose repair the closed gate would let pass, in
-   * serving order: those that are established as offline, while the gate
-   * fails on data it has. One at a time: the first passes, unless a lease
-   * that was granted this way is open (then `open` names its host); the
-   * others wait for that repair.
-   */
-  private repairs(
-    order: readonly string[],
-    open: readonly Rollout[],
-    gate: Gate
-  ): { hosts: readonly string[]; open?: string } {
-    const reasons = list(gate.reasons);
-    if (gate.ok || reasons.includes('beacon node unreachable') || reasons.includes('liveness data stale')) {
-      return { hosts: [] };
-    }
-    if (this.data.settings.paused) return { hosts: [] };
-
-    const held = this.data.leases.find(l => l.repair && !['released', 'failed', 'expired'].includes(l.state));
-
-    // Only a host that one of its rollouts would grant but for the gate.
-    const grants = (r: Rollout, host: HostDetail) =>
-      r.state === 'active' &&
-      !r.paused &&
-      !r.ignoreBudget &&
-      this.policy(r) !== 'paused' &&
-      (this.policy(r) !== 'manual' || r.approved) &&
-      list(r.hosts).some(m => m.host === host.name && m.state === 'pending') &&
-      this.hasVerb(r, host);
-
-    const hosts = order.filter(name => {
-      const host = this.data.hosts.get(name);
-      const onHold = !host || host.holdWanted || host.hold.local || host.hold.controller;
-      return (
-        host !== undefined && !onHold && !this.isStale(name) && this.offline(host) && open.some(r => grants(r, host))
-      );
-    });
-
-    return { hosts, open: held?.host };
-  }
-
   /** hasVerb: the agent allows the verb of a need it reports for the rollout. */
   private hasVerb(r: Rollout, host: HostDetail): boolean {
-    const kinds = r.kind === 'manual' ? list(host.needs).map(n => n.kind) : [r.kind];
-    return kinds.some(kind => list(host.verbs).includes(kind === 'image' ? 'roll' : kind));
-  }
-
-  /**
-   * servable: the member can be served as far as its host goes. It waits
-   * with a need whose verb the agent allows and is neither held nor silent;
-   * or it is expected and still waited for: neither held nor silent, the
-   * rollout no older than hostStaleAfter, and, in an image rollout, the host
-   * allows the roll verb and still runs the image at another digest.
-   */
-  private servable(r: Rollout, m: RolloutHost): boolean {
-    const host = this.data.hosts.get(m.host);
-    if (!host || host.holdWanted || host.hold.local || host.hold.controller || this.isStale(m.host)) return false;
-
-    if (m.state === 'pending') return this.hasVerb(r, host);
-    if (m.state !== 'expected') return false;
-
-    const staleAfter = parseGoDuration(this.data.settings.hostStaleAfter) ?? 120_000;
-    if (this.now() - Date.parse(r.createdAt) > staleAfter) return false;
-    if (r.kind !== 'image') return r.kind === 'manual';
-
-    return (
-      list(host.verbs).includes('roll') &&
-      list(host.containers).some(c => c.managed && !c.custom && c.image === r.image && c.digest !== r.digest)
+    const kinds = r.kind === 'manual' || r.kind === 'local' ? list(host.needs).map(n => n.kind) : [r.kind];
+    return kinds.some(kind =>
+      list(host.verbs).includes(kind === 'image' || kind === 'override' || kind === 'spec' ? 'roll' : kind)
     );
   }
 
-  /** awaited: the member holds a lease or is servable; the members behind it wait for it. */
-  private awaited(r: Rollout, m: RolloutHost): boolean {
-    return m.state === 'leased' || this.servable(r, m);
-  }
-
   /**
-   * brokenSince is the lease that broke the host for what the rollout is
-   * about and that no later lease has repaired, read off the lease table as
-   * the scheduler does (docs/scheduler.md, Rollouts).
-   */
-  private brokenSince(r: Rollout, host: string): Lease | undefined {
-    const group = rolloutGroup(r);
-    if (group === '') return undefined;
-
-    let last: Lease | undefined;
-    for (const l of this.data.leases) {
-      if (l.host !== host || !l.endedAt || leaseVerdict(l, group) === undefined) continue;
-      if (!last?.endedAt || l.endedAt > last.endedAt) last = l;
-    }
-
-    return last && leaseVerdict(last, group) === 'broke' ? last : undefined;
-  }
-
-  private broken(r: Rollout, m: RolloutHost): boolean {
-    return this.brokenSince(r, m.host) !== undefined;
-  }
-
-  /** brokenAwaited is the first member whose host is broken and that is still to be served. */
-  private brokenAwaited(r: Rollout): RolloutHost | undefined {
-    return list(r.hosts).find(m => this.broken(r, m) && this.awaited(r, m));
-  }
-
-  /**
-   * inFlight is the host of an open lease that carries a step of what the
-   * rollout is about for another rollout that is closed by now: nobody who is
-   * not broken is granted until it has ended.
-   */
-  private inFlight(r: Rollout): string | undefined {
-    const group = rolloutGroup(r);
-    if (group === '') return undefined;
-
-    const open = new Set(this.openRollouts().map(o => o.id));
-
-    return this.data.leases
-      .filter(
-        l =>
-          !['released', 'failed', 'expired'].includes(l.state) &&
-          list(l.needs).some(n => {
-            const id = dict(l.rollouts)[n.id];
-            return needGroup(n) === group && id !== r.id && !(id !== undefined && open.has(id));
-          })
-      )
-      .map(l => l.host)
-      .sort()[0];
-  }
-
-  /**
-   * orderWait names the host that the order inside the rollout makes the
-   * host wait for, or undefined: every member whose host is broken and that
-   * is still to be served, a lease in flight and, until the rollout has its
-   * first success, the canary. A broken host waits for nobody.
+   * orderWait is the canary the fixture names, while the rollout has no
+   * success yet. The mock does not choose canaries or stages: the fixture's
+   * stay as they are.
    */
   private orderWait(r: Rollout, host: string): { reason: string; after: string } | undefined {
-    const me = list(r.hosts).find(m => m.host === host);
-    if (r.force || !me || this.broken(r, me)) return undefined;
-
-    const first = this.brokenAwaited(r);
-    if (first) return { reason: `after ${first.host}`, after: first.host };
-
-    const flying = this.inFlight(r);
-    if (flying !== undefined) return { reason: `after ${flying}`, after: flying };
-
-    if (!r.canary || r.canary === host || succeeded(r)) return undefined;
+    if (r.force || !r.canary || r.canary === host || succeeded(r)) return undefined;
     return { reason: `after canary ${r.canary}`, after: r.canary };
   }
 
-  /** waitingReason follows the order of docs/scheduler.md, "Waiting reasons". */
-  private waitingReason(
-    host: HostDetail,
-    memberOf: Rollout[],
-    gate: Gate,
-    budget: Budget,
-    repairs: { hosts: readonly string[]; open?: string }
-  ): string {
+  /**
+   * waitingReason is a short form of the scheduler's waiting reasons, enough
+   * for every kind the page shows. A host that waits for nothing has none.
+   */
+  private waitingReason(host: HostDetail, memberOf: Rollout[], gate: Gate, budget: Budget): string | undefined {
     if (host.holdWanted || host.hold.local || host.hold.controller) return 'held';
     if (this.isStale(host.name)) return 'agent silent';
     if (this.data.settings.paused) return 'paused';
@@ -782,32 +896,18 @@ export class MockController {
     const approved = usable.filter(r => this.policy(r) !== 'manual' || r.approved);
     if (usable.length > 0 && approved.length === 0) return 'waiting for approval (policy manual)';
 
-    const allowed = approved.filter(r => this.policy(r) !== 'paused');
-    if (approved.length > 0 && allowed.length === 0) return 'policy paused';
+    // Every member rollout is halted.
+    if (approved.length === 0) return `rollout halted: ${memberOf[0]?.reason ?? 'a host failed'}`;
 
-    if (allowed.length === 0) {
-      const halted = memberOf.find(r => r.state === 'halted');
-      return halted ? `rollout halted: ${halted.reason ?? 'a host failed'}` : 'next';
-    }
-
-    const able = allowed.filter(r => this.hasVerb(r, host));
+    const able = approved.filter(r => this.hasVerb(r, host));
     if (able.length === 0) return 'verb not allowed by the agent';
 
     const ignoresBudget = able.some(r => r.ignoreBudget);
     const throughGate = !gate.ok && !ignoresBudget;
-    if (throughGate) {
-      // One repair at a time: the first in serving order passes, the others
-      // wait for it, or for the repair that is open already.
-      const first = repairs.open ?? repairs.hosts[0];
-      if (!repairs.hosts.includes(host.name)) return `network gate: ${list(gate.reasons)[0] ?? 'failing'}`;
-      if (first !== host.name) return `after repair of ${first ?? ''}`;
-    }
+    if (throughGate) return `network gate: ${list(gate.reasons)[0] ?? 'failing'}`;
 
-    // The host is served for every rollout whose order lets it go: it waits
-    // for the order only when the order of each of them holds it back. A
-    // repair through the closed gate does not wait for its place.
     const waits = able.map(r => this.orderWait(r, host.name));
-    if (!throughGate && waits.every(w => w !== undefined)) return waits[0]?.reason ?? 'next';
+    if (waits[0] !== undefined && waits.every(w => w !== undefined)) return waits[0].reason;
 
     if (!ignoresBudget) {
       if (!fits(this.live(host.name), budget)) {
@@ -819,14 +919,11 @@ export class MockController {
       }
     }
 
-    return 'next';
+    return undefined;
   }
 
   /** orderAfter names the host that a host waiting for its place in the order waits for. */
-  private orderAfter(host: string, memberOf: Rollout[], reason: string): string | undefined {
-    const repair = 'after repair of ';
-    if (reason.startsWith(repair)) return reason.slice(repair.length);
-
+  private orderAfter(host: string, memberOf: Rollout[]): string | undefined {
     for (const r of memberOf) {
       const wait = r.state === 'active' ? this.orderWait(r, host) : undefined;
       if (wait) return wait.after;
@@ -844,8 +941,6 @@ export class MockController {
         return active.find(r => r.paused)?.id;
       case 'approval':
         return active.find(r => !r.paused && this.policy(r) === 'manual' && !r.approved)?.id;
-      case 'policy-paused':
-        return active.find(r => this.policy(r) === 'paused')?.id;
       case 'halted':
         return memberOf.find(r => r.state === 'halted')?.id;
       case 'order':
@@ -858,80 +953,17 @@ export class MockController {
     }
   }
 
-  /**
-   * settleStages mirrors the scheduler's order inside a rollout
-   * (docs/scheduler.md, Ordering): the canary is settled and every member
-   * gets its stage: the canary is in its own, a member whose host is broken
-   * in the repair stage, everybody else in the rest. A waiting member of a
-   * broken host carries the note of the lease that broke it. The canary is
-   * the first member that is not broken and can go, in this order: it fits
-   * the budget, it has live validators, it reports the need, it is the
-   * lightest, by name. There is none in a forced rollout, for a single
-   * member, after the first success, while a broken member is still to be
-   * served and while a lease is in flight for the rollout.
-   */
-  private settleStages(r: Rollout, budget: Budget): void {
-    const members = list(r.hosts);
-    const current = members.find(m => m.host === r.canary);
-
-    if (r.force || !current || !keepsCanary(r, current)) {
-      r.canary = undefined;
-
-      if (!r.force && !succeeded(r) && !this.brokenAwaited(r) && this.inFlight(r) === undefined) {
-        const weight = (m: RolloutHost) => this.data.hosts.get(m.host)?.validators ?? 0;
-        const best = members
-          .filter(m => !this.broken(r, m) && this.awaited(r, m) && !this.openLease(m.host)?.repair)
-          .sort(
-            (a, b) =>
-              Number(a.state !== 'leased') - Number(b.state !== 'leased') ||
-              Number(!fits(this.live(a.host), budget)) - Number(!fits(this.live(b.host), budget)) ||
-              Number(this.live(a.host) === 0) - Number(this.live(b.host) === 0) ||
-              Number(a.state === 'expected') - Number(b.state === 'expected') ||
-              weight(a) - weight(b) ||
-              a.host.localeCompare(b.host)
-          )[0];
-        const counted = members.filter(
-          m => m.state === 'pending' || m.state === 'leased' || m.state === 'failed' || this.servable(r, m)
-        ).length;
-
-        if (best && counted > 1) r.canary = best.host;
-      }
-    }
-
-    for (const m of members) {
-      const lease = this.brokenSince(r, m.host);
-      const waits = m.state === 'pending' || m.state === 'expected';
-      const noted = m.error?.startsWith(BROKEN_NOTE) ?? false;
-
-      if (lease && waits && (!m.error || noted)) {
-        const from = list(lease.needs)
-          .filter(n => needGroup(n) === rolloutGroup(r))
-          .map(n => dict(lease.rollouts)[n.id])
-          .find(id => id !== undefined);
-        m.error = `${BROKEN_NOTE}${lease.id}${from ? ` (rollout ${from})` : ''}`;
-      } else if (!lease && noted) {
-        m.error = undefined;
-      }
-
-      if (m.host === r.canary) m.stage = STAGE_CANARY;
-      else if (lease) m.stage = STAGE_REPAIR;
-      // A member that is done through the lease that repaired it keeps its stage.
-      else if (!(m.stage === STAGE_REPAIR && m.state === 'done' && m.leaseId)) m.stage = STAGE_REST;
-    }
-  }
-
   private plan(): Plan {
     const gate = this.gate();
     const budget = this.budget();
     const open = this.openRollouts();
-    for (const r of open) this.settleStages(r, budget);
     const epoch = this.currentEpoch() - 1;
 
     const hosts: Record<string, HostPlan> = {};
     const queue: QueueEntry[] = [];
 
-    // Queue order: oldest rollout first, inside a rollout by stage (broken
-    // members, the canary, the rest), then ascending weight and name.
+    // Queue order: oldest rollout first, inside a rollout by the fixture's
+    // stage, then ascending weight and name.
     const weight = (m: RolloutHost) => this.data.hosts.get(m.host)?.validators ?? 0;
     const order: string[] = [];
     for (const r of open) {
@@ -942,8 +974,6 @@ export class MockController {
         if (m.state === 'pending' && !order.includes(m.host)) order.push(m.host);
       }
     }
-
-    const repairs = this.repairs(order, open, gate);
 
     for (const host of this.data.hosts.values()) {
       const lease = this.openLease(host.name);
@@ -972,24 +1002,24 @@ export class MockController {
       }
 
       if (!lease && memberOf.length > 0) {
-        plan.reason = this.waitingReason(host, memberOf, gate, budget, repairs);
+        plan.reason = this.waitingReason(host, memberOf, gate, budget);
       }
 
       hosts[host.name] = plan;
     }
 
+    // The queue is the hosts that wait, with what they wait for.
     for (const name of order) {
-      const host = this.data.hosts.get(name);
       const plan = hosts[name];
-      if (!host || !plan || plan.leaseId) continue;
+      if (!plan || plan.leaseId || plan.reason === undefined) continue;
       const memberOf = open.filter(r => list(r.hosts).some(m => m.host === name && m.state === 'pending'));
-      const wait = waitKind(plan.reason ?? 'next');
+      const wait = waitKind(plan.reason);
       queue.push({
         host: name,
         position: queue.length + 1,
-        reason: plan.reason ?? 'next',
+        reason: plan.reason,
         wait,
-        after: wait === 'order' ? this.orderAfter(name, memberOf, plan.reason ?? '') : undefined,
+        after: wait === 'order' ? this.orderAfter(name, memberOf) : undefined,
         rollout: this.aboutRollout(name, memberOf, wait),
         rollouts: memberOf.map(r => r.id),
       });
@@ -1012,7 +1042,7 @@ export class MockController {
   private imageRef(host: HostDetail, kind: 'el' | 'cl'): PublicImageRef | undefined {
     const c = list(host.containers).find(x => x.managed && x.kind === kind);
     if (!c) return undefined;
-    return { image: c.image, digest: c.digest, revision: c.revision, custom: c.custom };
+    return { image: c.image, digest: c.digest, revision: c.revision };
   }
 
   private publicHosts(): PublicHosts {
@@ -1030,7 +1060,7 @@ export class MockController {
 
     for (const host of this.data.hosts.values()) {
       for (const c of list(host.containers)) {
-        if (!c.managed || c.custom || (c.kind !== 'el' && c.kind !== 'cl')) continue;
+        if (!c.managed || (c.kind !== 'el' && c.kind !== 'cl')) continue;
 
         const key = `${c.kind}/${c.image}`;
         const target = c.registry?.digest ?? c.digest;
@@ -1052,15 +1082,23 @@ export class MockController {
     return { images };
   }
 
-  private summary(host: HostDetail, plan: Plan): HostSummary {
+  /**
+   * summary is a host as the host table has it. Its containers come without
+   * what only the details and the client views carry (the client, the command
+   * line, an override and what may be overridden), unless whole is set.
+   */
+  private summary(host: HostDetail, plan: Plan, whole = false): HostSummary {
     return {
       name: host.name,
       roles: host.roles,
       validators: host.validators,
+      ...(host.validatorReport ? { validatorReport: host.validatorReport } : {}),
       lastSeen: this.iso(this.now() - this.seenAgo(host.name) * 1000),
       stale: this.isStale(host.name),
       agentVersion: host.agentVersion,
-      containers: host.containers,
+      containers: whole
+        ? host.containers
+        : list(host.containers).map(c => without(c, 'client', 'command', 'override', 'overridable')),
       node: host.node,
       os: host.os,
       pending: host.pending,
@@ -1069,6 +1107,8 @@ export class MockController {
       holdWanted: host.holdWanted,
       holdReason: host.holdWanted ? host.holdReason : undefined,
       holdBy: host.holdWanted ? (host.holdBy ?? 'staff') : undefined,
+      offline: host.offline,
+      broken: host.broken && Object.keys(host.broken).length > 0 ? host.broken : undefined,
       verbs: host.verbs,
       needs: host.needs,
       plan: plan.hosts?.[host.name] ?? host.plan,
@@ -1077,7 +1117,20 @@ export class MockController {
 
   private hosts(): Hosts {
     const plan = this.plan();
-    return { hosts: [...this.data.hosts.values()].map(h => this.summary(h, plan)) };
+    return { hosts: [...this.data.hosts.values()].map(h => hostListing(this.summary(h, plan))) };
+  }
+
+  /** clientIndex is every client with its hosts, from the hosts as the plan has them now. */
+  private clientIndex(): ClientIndex {
+    const plan = this.plan();
+    return clientIndex(
+      [...this.data.hosts.values()].map(h => this.summary(h, plan, true)),
+      this.data.settings
+    );
+  }
+
+  private clients(): Clients {
+    return { clients: this.clientIndex().views };
   }
 
   private host(name: string): HostDetail {
@@ -1086,44 +1139,55 @@ export class MockController {
 
     return {
       ...host,
-      ...this.summary(host, this.plan()),
-      liveness: this.liveness(host),
+      ...this.summary(host, this.plan(), true),
       leases: this.data.leases.filter(l => l.host === name).sort((a, b) => b.grantedAt.localeCompare(a.grantedAt)),
       history: this.data.audit.filter(e => e.target === name).sort((a, b) => b.id - a.id),
     };
   }
 
-  private packages(query: string, limit: number): Packages {
+  /**
+   * packages is one page of the fleet's packages, as the controller pages
+   * them: every name in alphabetical order, or the names that contain the
+   * query (the exact match, then those that start with it, then the rest).
+   * A page continues after the name the cursor holds.
+   */
+  private packages(query: string, limit: number, after: string): Packages {
     const needle = query.trim().toLowerCase();
     const byName = new Map<string, Map<string, string[]>>();
 
-    if (needle !== '') {
-      for (const host of this.data.hosts.values()) {
-        for (const p of list(host.inventory?.packages)) {
-          if (!p.name.toLowerCase().includes(needle)) continue;
-          const versions = byName.get(p.name) ?? new Map<string, string[]>();
-          versions.set(p.version, [...(versions.get(p.version) ?? []), host.name]);
-          byName.set(p.name, versions);
-        }
+    for (const host of this.data.hosts.values()) {
+      for (const p of list(host.inventory?.packages)) {
+        if (!p.name.toLowerCase().includes(needle)) continue;
+        const versions = byName.get(p.name) ?? new Map<string, string[]>();
+        versions.set(p.version, [...(versions.get(p.version) ?? []), host.name]);
+        byName.set(p.name, versions);
       }
     }
 
-    const matches: PackageMatch[] = [...byName.entries()]
-      .sort(([a], [b]) => Number(b === needle) - Number(a === needle) || a.localeCompare(b))
-      .slice(0, limit)
-      .map(([name, versions]) => ({
-        name,
-        versions: [...versions.entries()]
-          .sort(([a], [b]) => b.localeCompare(a, undefined, { numeric: true }))
-          .map(([version, hosts]) => ({ version, hosts: hosts.sort() })),
-      }));
+    const rank = (name: string) => (needle === '' ? 0 : name === needle ? 0 : name.startsWith(needle) ? 1 : 2);
+    const cursor = (name: string) => `${rank(name)}${name}`;
+    if (after !== '' && !/^[012]./.test(after)) throw new HttpError(400, 'after is not the next of a page');
 
-    return { query, matches };
+    const names = [...byName.keys()].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : 1));
+    const rest = names.filter(name => after === '' || cursor(name) > after);
+    const page = rest.slice(0, limit);
+
+    const matches: PackageMatch[] = page.map(name => ({
+      name,
+      versions: [...(byName.get(name) ?? new Map<string, string[]>()).entries()]
+        .sort(([a], [b]) => b.localeCompare(a, undefined, { numeric: true }))
+        .map(([version, hosts]) => ({ version, hosts: hosts.sort() })),
+    }));
+
+    return {
+      query: query.trim(),
+      matches,
+      ...(after === '' ? { total: names.length } : {}),
+      ...(rest.length > limit ? { next: cursor(page[page.length - 1] ?? '') } : {}),
+    };
   }
 
   private rollouts(limit: number): Rollouts {
-    const budget = this.budget();
-    for (const r of this.openRollouts()) this.settleStages(r, budget);
     const terminal = (l: Lease) => ['released', 'failed', 'expired'].includes(l.state);
     const newest = <T extends { createdAt?: string; grantedAt?: string }>(a: T, b: T) =>
       (b.createdAt ?? b.grantedAt ?? '').localeCompare(a.createdAt ?? a.grantedAt ?? '');
@@ -1160,6 +1224,17 @@ export class MockController {
     const specs = new Map<string, (typeof FIELDS)[number]>(FIELDS.map(f => [f.key, f]));
 
     for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
+      // The image policies per client are an object of client to policy, replaced as a whole.
+      if (key === 'policyClients') {
+        const ok =
+          typeof value === 'object' &&
+          value !== null &&
+          !Array.isArray(value) &&
+          Object.entries(value).every(([client, p]) => CLIENT_NAME.test(client) && (p === 'auto' || p === 'manual'));
+        if (!ok) throw new HttpError(400, 'policyClients must be an object of client to policy');
+        continue;
+      }
+
       const spec = specs.get(key);
       if (!spec) throw new HttpError(400, `unknown field "${key}"`);
       if (value === null) throw new HttpError(400, `${key} must not be null`);
@@ -1242,6 +1317,9 @@ export class MockController {
       case 'hold':
       case 'unhold':
         return this.hold(name, body as HoldRequest);
+      case 'mark-offline':
+      case 'unmark-offline':
+        return this.markOffline(name === 'mark-offline', body as OfflineRequest);
       case 'forget':
         return this.forget(body as HoldRequest);
       case 'end-lease':
@@ -1252,10 +1330,433 @@ export class MockController {
       case 'abort':
         return this.abort(body as ScopeRequest);
       case 'skip':
+        return this.skip(body as RolloutHostsRequest);
       case 'retry':
-        return this.skipOrRetry(name, body as RolloutHostsRequest);
+        return this.retry(body as RolloutHostsRequest);
+      case 'client-policy':
+        return this.clientPolicy(body as ClientPolicyRequest);
+      case 'image-override':
+        return this.imageOverride(body as ImageOverrideRequest);
+      case 'flag-override':
+        return this.flagOverride(body as FlagOverrideRequest);
+      case 'client-override':
+        return this.clientOverride(body as ClientOverrideRequest);
       default:
         throw new HttpError(404, `unknown action ${name}`);
+    }
+  }
+
+  /**
+   * clientPolicy sets or clears the image policy of one client. Open image
+   * rollouts of the client answer to it from then on; one that was approved
+   * stays approved.
+   */
+  private clientPolicy(req: ClientPolicyRequest): ActionResult {
+    if (!CLIENT_NAME.test(req.client)) throw new HttpError(400, `invalid client name "${req.client}"`);
+    // The body is whatever was sent.
+    const policy: string = req.policy;
+    if (!['', 'auto', 'manual'].includes(policy)) {
+      throw new HttpError(400, 'policy must be auto, manual or empty (the default)');
+    }
+
+    const before = this.data.settings;
+    const policyClients = { ...before.policyClients };
+    if (req.policy === '') Reflect.deleteProperty(policyClients, req.client);
+    else policyClients[req.client] = req.policy;
+
+    const next = { ...before, policyClients };
+    const message =
+      `image policy of ${req.client}: ${imagePolicy(next, req.client)}` + (req.policy === '' ? ' (the default)' : '');
+
+    // A request that changes nothing is no change and no entry in the audit log.
+    if (JSON.stringify(before.policyClients) === JSON.stringify(policyClients)) return { message };
+
+    this.data.settings = next;
+    this.log('action.client-policy', 'settings', {
+      before: { ...before },
+      after: { ...next },
+      ...(req.reason ? { reason: req.reason } : {}),
+    });
+
+    return { message };
+  }
+
+  // ---------------------------------------------------------- overrides
+  //
+  // An override is the host's: the controller passes the instruction on and
+  // shows what the agent reports. The mock plays the agent too. An override
+  // that is set stands in the container's report as not applied, with a need
+  // of the host and a rollout of the host's own; the mock grants that
+  // rollout a lease when the plan lets the host go and has the container
+  // recreated a little later. An override that is cleared, or whose end
+  // passed, is put back the same way.
+
+  /** overrideTarget finds the container an override is for, or refuses like the controller does. */
+  private overrideTarget(req: { host: string; container: string }, what: 'image' | 'flag'): Container {
+    const host = this.data.hosts.get(req.host);
+    if (!host) throw new HttpError(404, `unknown host ${req.host}`);
+    if (this.isStale(host.name)) throw new HttpError(409, `${host.name}: agent silent`);
+
+    const c = list(host.containers).find(x => x.name === req.container);
+    if (!c?.managed) throw new HttpError(409, `${host.name} does not manage a container ${req.container}`);
+
+    const allowed = what === 'image' ? list(c.overridable?.images).length > 0 : c.overridable?.flags === true;
+    if (!allowed) throw new HttpError(409, `${host.name} does not allow ${what} overrides of ${c.name}`);
+
+    return c;
+  }
+
+  /** overrideEnd is when an override ends: what the request says, at most seven days from now, a day by default. */
+  private overrideEnd(until: string | undefined): string {
+    if (until === undefined || until === '') return this.iso(this.now() + OVERRIDE_DEFAULT_MS);
+
+    const at = Date.parse(until);
+    if (Number.isNaN(at)) throw new HttpError(400, 'until must be a time (RFC 3339)');
+    if (at <= this.now()) throw new HttpError(400, 'until must be in the future');
+    if (at > this.now() + OVERRIDE_MAX_MS) throw new HttpError(400, 'until must be at most 7 days from now');
+
+    return this.iso(at);
+  }
+
+  /**
+   * clientOverride is the override of each named host's container of the
+   * client and kind: the single-host override per host, with the hosts that
+   * cannot take it listed instead of failing the request.
+   */
+  private clientOverride(req: ClientOverrideRequest): ActionResult {
+    const hosts = list(req.hosts);
+    if (hosts.length === 0) throw new HttpError(400, 'hosts must not be empty');
+    if (!['image', 'flags'].includes(req.part)) throw new HttpError(400, 'part must be image or flags');
+
+    const sent: string[] = [];
+    const rejected: Record<string, string> = {};
+
+    for (const name of hosts) {
+      const container = list(this.data.hosts.get(name)?.containers).find(
+        c => c.managed && c.client === req.client && c.kind === req.kind
+      );
+      if (!this.data.hosts.has(name)) {
+        rejected[name] = 'unknown host';
+        continue;
+      }
+      if (!container) {
+        rejected[name] = `host ${name} runs no ${req.kind} container of ${req.client}`;
+        continue;
+      }
+
+      try {
+        const target = { host: name, container: container.name, until: req.until, reason: req.reason };
+        if (req.part === 'image') this.imageOverride({ ...target, image: req.image ?? '' });
+        else
+          this.flagOverride({ ...target, addFlags: [...list(req.addFlags)], removeFlags: [...list(req.removeFlags)] });
+        sent.push(name);
+      } catch (err) {
+        if (!(err instanceof HttpError) || err.status === 400) throw err;
+        rejected[name] = err.message;
+      }
+    }
+
+    return {
+      message: `sent to ${sent.length} of ${hosts.length} hosts: each agent decides, and its container follows under the host's next lease`,
+      hosts: sent,
+      ...(Object.keys(rejected).length > 0 ? { rejected } : {}),
+    };
+  }
+
+  private imageOverride(req: ImageOverrideRequest): ActionResult {
+    const c = this.overrideTarget(req, 'image');
+
+    if (req.image !== '') {
+      const problem = validateImageRef(req.image);
+      if (problem) throw new HttpError(400, `image ${problem}`);
+      if (!imageAllowed(req.image, list(c.overridable?.images))) {
+        throw new HttpError(
+          409,
+          `image ${req.image} is not in a repository ${req.host} allows for ${c.name} (${list(c.overridable?.images).join(', ')})`
+        );
+      }
+    }
+
+    const until = req.image === '' ? undefined : this.overrideEnd(req.until);
+    this.setOverride(req.host, c, { image: req.image === '' ? undefined : req.image }, until, req.reason);
+    this.log('action.image-override', req.host, {
+      container: c.name,
+      image: req.image,
+      ...(until ? { until } : {}),
+      ...(req.reason ? { reason: req.reason } : {}),
+    });
+
+    return { message: `sent to ${req.host}; the agent applies it under its next lease`, hosts: [req.host] };
+  }
+
+  private flagOverride(req: FlagOverrideRequest): ActionResult {
+    const c = this.overrideTarget(req, 'flag');
+    const add = list(req.addFlags);
+    const remove = list(req.removeFlags);
+    const clears = add.length + remove.length === 0;
+
+    const problem = validateFlags(add, remove);
+    if (problem) throw new HttpError(400, problem);
+
+    const until = clears ? undefined : this.overrideEnd(req.until);
+    this.setOverride(
+      req.host,
+      c,
+      { addFlags: add.length > 0 ? [...add] : undefined, removeFlags: remove.length > 0 ? [...remove] : undefined },
+      until,
+      req.reason
+    );
+    this.log('action.flag-override', req.host, {
+      container: c.name,
+      addFlags: add,
+      removeFlags: remove,
+      ...(until ? { until } : {}),
+      ...(req.reason ? { reason: req.reason } : {}),
+    });
+
+    return { message: `sent to ${req.host}; the agent applies it under its next lease`, hosts: [req.host] };
+  }
+
+  /**
+   * setOverride writes one part of a container's override (the image, or the
+   * flags) the way the agent would into its file, and asks for the lease
+   * that brings the container in line. A part that is set to nothing is
+   * cleared; an entry without a part is gone.
+   */
+  private setOverride(
+    host: string,
+    c: Container,
+    part:
+      | Pick<NonNullable<Container['override']>, 'image'>
+      | Pick<NonNullable<Container['override']>, 'addFlags' | 'removeFlags'>,
+    until: string | undefined,
+    reason: string
+  ): void {
+    const key = `${host}/${c.name}`;
+    if (!this.overrides.has(key)) this.overrides.set(key, { host, container: c.name });
+
+    const before = c.override?.restoring ? undefined : c.override;
+    const next = { ...before, ...part };
+    const empty = !next.image && list(next.addFlags).length + list(next.removeFlags).length === 0;
+
+    if (empty) {
+      this.dropOverride(host, c);
+      return;
+    }
+
+    c.override = {
+      ...(next.image ? { image: next.image } : {}),
+      ...(next.addFlags ? { addFlags: next.addFlags } : {}),
+      ...(next.removeFlags ? { removeFlags: next.removeFlags } : {}),
+      by: this.actor(),
+      ...(reason ? { reason } : {}),
+      // One end for the image and the flags together: what was set last says it.
+      until: until ?? before?.until,
+      applied: false,
+    };
+    this.askLocal(host, c);
+  }
+
+  /** dropOverride takes the entry away: at once when the container never ran it, otherwise it is put back under a lease. */
+  private dropOverride(host: string, c: Container): void {
+    const o = c.override;
+    if (!o) return;
+
+    const ran = o.applied || o.restoring === true || this.overrides.get(`${host}/${c.name}`)?.base !== undefined;
+    if (ran) {
+      c.override = { ...o, applied: true, restoring: true, error: undefined };
+      this.askLocal(host, c);
+      return;
+    }
+
+    c.override = undefined;
+    this.overrides.delete(`${host}/${c.name}`);
+    this.closeLocal(host, c.name, 'the host no longer asks for it');
+    const h = this.data.hosts.get(host);
+    if (h) h.needs = list(h.needs).filter(n => n.override?.container !== c.name);
+  }
+
+  /** closeLocal supersedes the open rollout of a host's own request for a container, unless its lease runs. */
+  private closeLocal(host: string, container: string, reason: string): void {
+    const now = this.iso(this.now());
+    for (const r of this.openRollouts()) {
+      if (r.kind !== 'local' || !r.key.startsWith(`local:${host}:${container}:`)) continue;
+      if (list(r.hosts).some(m => m.state === 'leased')) continue;
+      Object.assign(r, { state: 'superseded', reason, updatedAt: now, endedAt: now });
+    }
+  }
+
+  /** askLocal reports the need that brings a container in line with its override, in a rollout of the host's own. */
+  private askLocal(host: string, c: Container): void {
+    const h = this.data.hosts.get(host);
+    const o = c.override;
+    if (!h || !o) return;
+
+    const restore = o.restoring === true;
+    const base = this.overrides.get(`${host}/${c.name}`)?.base;
+    const image = restore ? (base?.image ?? c.configuredImage ?? c.image) : (o.image ?? base?.image ?? c.image);
+    const flags = list(o.addFlags).length + list(o.removeFlags).length > 0;
+    const target = hex(JSON.stringify([image, restore, o.addFlags, o.removeFlags]), 12);
+    const need: Need = {
+      id: `override/${c.name}/${target}`,
+      kind: 'override',
+      local: true,
+      override: {
+        container: c.name,
+        image,
+        ...(c.image !== image ? { fromImage: c.image } : {}),
+        fromDigest: c.digest,
+        toDigest: currentDigest(image),
+        ...(flags ? { flags: true } : {}),
+        ...(restore ? { restore: true } : {}),
+      },
+    };
+
+    this.closeLocal(host, c.name, 'the host asks for something else now');
+    h.needs = [...list(h.needs).filter(n => n.override?.container !== c.name), need];
+
+    const now = this.iso(this.now());
+    this.data.rollouts.push({
+      id: this.newId('ro'),
+      kind: 'local',
+      key: `local:${host}:${c.name}:${target}`,
+      title: `${host}: ${restore ? 'restore' : 'override'} ${c.name}`,
+      state: 'active',
+      paused: false,
+      approved: true,
+      // One host: there is no order, and no canary.
+      force: true,
+      ignoreBudget: false,
+      createdBy: 'scheduler',
+      createdAt: now,
+      updatedAt: now,
+      hosts: [{ host, state: 'pending', stage: STAGE_REST, needId: need.id, updatedAt: now }],
+    });
+  }
+
+  /**
+   * settleOverrides lets time pass for the overrides the mock was asked for:
+   * one whose end passed is taken away; the rollout of a host's request gets
+   * its lease once the plan lets the host go; and a lease that has run long
+   * enough has recreated the container.
+   */
+  private settleOverrides(): void {
+    if (this.overrides.size === 0) return;
+    const now = this.now();
+
+    for (const { host, container } of [...this.overrides.values()]) {
+      const c = list(this.data.hosts.get(host)?.containers).find(x => x.name === container);
+      if (!c) {
+        this.overrides.delete(`${host}/${container}`);
+        continue;
+      }
+      const until = c.override?.until;
+      if (c.override && !c.override.restoring && until && Date.parse(until) <= now) this.dropOverride(host, c);
+    }
+
+    const waiting = this.openRollouts().filter(r => r.kind === 'local' && r.state === 'active');
+    if (waiting.length === 0) return;
+
+    let plan: Plan | undefined;
+
+    for (const r of waiting) {
+      const m = list(r.hosts)[0];
+      const host = m ? this.data.hosts.get(m.host) : undefined;
+      if (!m || !host) continue;
+      const need = list(host.needs).find(n => n.id === m.needId);
+
+      if (m.state === 'pending' && need && now - Date.parse(r.createdAt) >= RECONCILE_MS) {
+        plan ??= this.plan();
+        const slot = plan.hosts?.[host.name];
+        // The plan has no reason for the host to wait: it is granted.
+        if (slot?.slot !== 'queued' || slot.reason !== undefined) continue;
+
+        const lease: Lease = {
+          id: this.newId('ls'),
+          host: host.name,
+          state: 'running',
+          needs: [need],
+          rollouts: { [need.id]: r.id },
+          weight: host.validators,
+          charged: this.live(host.name),
+          force: true,
+          grantedBy: 'scheduler',
+          grantedAt: this.iso(now),
+          expiresAt: this.iso(now + (parseGoDuration(this.data.settings.leaseTtl) ?? 1_800_000)),
+        };
+        this.data.leases.push(lease);
+        Object.assign(m, { state: 'leased', leaseId: lease.id, updatedAt: this.iso(now) });
+        r.updatedAt = this.iso(now);
+        this.log('lease.granted', host.name, { lease: lease.id, rollout: r.id }, 'scheduler');
+        // One grant a pass: the next one sees the budget with this lease in it.
+        plan = undefined;
+        continue;
+      }
+
+      const lease = this.data.leases.find(l => l.id === m.leaseId);
+      if (m.state !== 'leased' || !lease || !isOpen(lease) || lease.cancelled) continue;
+      if (now - Date.parse(lease.grantedAt) < OVERRIDE_APPLY_MS) continue;
+
+      const container = need?.override?.container ?? '';
+      const c = list(host.containers).find(x => x.name === container);
+      if (c) this.recreate(host.name, c);
+
+      const at = this.iso(now);
+      Object.assign(lease, {
+        state: 'released',
+        agentDoneAt: at,
+        endedAt: at,
+        readiness: 'ready: node at head with peers',
+        operation: {
+          leaseId: lease.id,
+          phase: 'done',
+          startedAt: lease.grantedAt,
+          updatedAt: at,
+          steps: [{ needId: m.needId ?? '', status: 'done' }],
+          disrupted: true,
+        },
+      });
+      Object.assign(m, { state: 'done', updatedAt: at });
+      Object.assign(r, { state: 'completed', updatedAt: at, endedAt: at });
+      host.needs = list(host.needs).filter(n => n.id !== m.needId);
+      this.log('lease.released', host.name, { lease: lease.id, readiness: lease.readiness }, 'scheduler');
+    }
+  }
+
+  /** recreate is the agent's step under the lease: the container runs what its override says, or what it ran before. */
+  private recreate(host: string, c: Container): void {
+    const key = `${host}/${c.name}`;
+    const entry = this.overrides.get(key);
+    const o = c.override;
+    if (!entry || !o) return;
+
+    // Without a record of what the container ran before, that is what its override changed, taken back.
+    const base: OverrideBase = entry.base ?? {
+      image: o.applied && o.image ? (c.configuredImage ?? c.image) : c.image,
+      imageId: c.imageId,
+      digest: o.applied && o.image ? c.registry?.digest : c.digest,
+      revision: o.applied && o.image ? c.registry?.revision : c.revision,
+      command: o.applied ? list(c.command).filter(a => !list(o.addFlags).includes(a)) : [...list(c.command)],
+    };
+
+    const image = o.restoring ? base.image : (o.image ?? base.image);
+    const other = image !== base.image;
+
+    Object.assign(c, {
+      image,
+      imageId: other ? `sha256:${hex(`imageid/${image}`)}` : base.imageId,
+      digest: other ? currentDigest(image) : base.digest,
+      revision: other ? hex(`revision/${image}`, 40) : base.revision,
+      command: o.restoring ? base.command : applyFlags(base.command, list(o.addFlags), list(o.removeFlags)),
+      startedAt: this.iso(this.now()),
+    });
+
+    if (o.restoring) {
+      c.override = undefined;
+      this.overrides.delete(key);
+    } else {
+      c.override = { ...o, applied: true };
+      entry.base = base;
     }
   }
 
@@ -1289,10 +1790,10 @@ export class MockController {
       } else {
         const wanted = list(req.containers);
         const targets = list(host.containers).filter(
-          c => c.managed && !c.custom && (wanted.length === 0 || wanted.includes(c.name))
+          c => c.managed && (wanted.length === 0 || wanted.includes(c.name))
         );
         if (targets.length === 0) {
-          rejected[host.name] = 'no managed, non-custom container matches';
+          rejected[host.name] = 'no managed container matches';
           continue;
         }
         for (const c of targets) {
@@ -1355,21 +1856,6 @@ export class MockController {
     const rejected: Record<string, string> = {};
     const applied: string[] = [];
 
-    // The hold is part of a cancel: it cannot be lifted while the lease that
-    // a person ended is open. Nothing is changed then.
-    if (action === 'unhold') {
-      for (const host of hosts) {
-        const l = this.data.leases.find(x => x.host === host.name && isOpen(x) && x.cancelled);
-        if (l?.cancelled) {
-          throw new HttpError(
-            409,
-            `scheduler: invalid action: lease ${l.id} of ${host.name} was ended by ${l.cancelled.by} and is still ` +
-              `open (${l.state}); the hold can be lifted once the lease has ended`
-          );
-        }
-      }
-    }
-
     for (const host of hosts) {
       if (action === 'unhold' && host.hold.local && !host.hold.controller && !host.holdWanted) {
         rejected[host.name] = 'only the local hold file is set; it can only be removed on the host';
@@ -1401,6 +1887,28 @@ export class MockController {
     };
   }
 
+  private markOffline(mark: boolean, req: OfflineRequest): ActionResult {
+    const hosts = this.selectHosts({ hosts: req.hosts, all: false });
+    const applied: string[] = [];
+
+    for (const host of hosts) {
+      if (!mark && !host.offline) continue;
+      const viaTeam = this.authorization?.authorizedBy.startsWith(TEAM_PREFIX) === true;
+      host.offline = mark
+        ? { reason: req.reason, ...(req.until ? { until: req.until } : {}), ...(viaTeam ? { by: 'team' } : {}) }
+        : undefined;
+      applied.push(host.name);
+      this.log(mark ? 'action.mark-offline' : 'action.unmark-offline', host.name, { reason: req.reason });
+    }
+
+    return {
+      message: mark
+        ? `${applied.length} host(s) marked known offline`
+        : `offline mark lifted on ${applied.length} host(s)`,
+      hosts: applied,
+    };
+  }
+
   private forget(req: HoldRequest): ActionResult {
     const hosts = this.selectHosts({ hosts: req.hosts, all: false });
     const rejected: Record<string, string> = {};
@@ -1411,9 +1919,16 @@ export class MockController {
         rejected[host.name] = 'the host holds a lease';
         continue;
       }
+      // The host's mark goes with it; its members in open rollouts are left out.
       this.data.hosts.delete(host.name);
       for (const r of this.openRollouts()) {
-        r.hosts = list(r.hosts).filter(m => m.host !== host.name);
+        for (const m of list(r.hosts)) {
+          if (m.host !== host.name || m.state === 'done' || (m.state === 'skipped' && !m.skippedBy)) continue;
+          m.state = 'skipped';
+          m.skippedBy = undefined;
+          m.error = 'host forgotten';
+          m.updatedAt = this.iso(this.now());
+        }
       }
       applied.push(host.name);
       this.log('action.forget', host.name, { reason: req.reason });
@@ -1426,143 +1941,17 @@ export class MockController {
     };
   }
 
-  /**
-   * endLease is a request to end one open lease (granted, running or
-   * verifying). The lease is marked cancelled and stays open, counted against
-   * the budget and the host limit, until it ends by one of the ordinary ways
-   * (settleCancelled). In the same step the host is put on controller hold; a
-   * hold that is there already stays, and its reason is extended by the
-   * cancel. Ending a lease that is cancelled already changes nothing, unless
-   * its host is not held: then the hold is put back.
-   */
+  /** endLease ends one open lease at once, as failed: the mock plays no agent that reports first. */
   private endLease(req: EndLeaseRequest): ActionResult {
     if (!req.lease) throw new HttpError(400, 'scheduler: invalid action: no lease named');
 
     const l = this.data.leases.find(x => x.id === req.lease);
     if (!l) throw new HttpError(404, `scheduler: unknown lease: ${req.lease}`);
     if (!isOpen(l)) throw new HttpError(409, `scheduler: invalid action: lease ${l.id} is ${l.state}`);
-    const host = this.data.hosts.get(l.host);
 
-    if (l.cancelled && (!host || host.holdWanted)) {
-      return {
-        message: `lease ${l.id} of ${l.host} was already ended by ${l.cancelled.by}; it is open until the agent reports`,
-        hosts: [l.host],
-      };
-    }
-
-    const detail: Record<string, unknown> = { lease: l.id, state: l.state, reason: req.reason };
-    let message = `lease ${l.id} of ${l.host} is ending`;
-
-    if (l.cancelled) {
-      // Only the hold is missing: it is put back.
-      message = `lease ${l.id} of ${l.host} was already ended by ${l.cancelled.by}`;
-    } else {
-      l.cancelled = { at: this.iso(this.now()), by: this.actor(), state: l.state, reason: req.reason || undefined };
-    }
-
-    // A host that somebody holds already keeps that hold; its reason names
-    // the cancel as well.
-    if (host) {
-      const before = { holdWanted: host.holdWanted, holdReason: host.holdReason ?? '' };
-      const reason = endedHoldReason(before.holdWanted, before.holdReason);
-
-      if (!before.holdWanted || reason !== before.holdReason) {
-        host.holdWanted = true;
-        host.holdReason = reason;
-        // The end of a lease is staff's hold from here on.
-        host.holdBy = 'staff';
-        // The mock agent agrees at once: a held host reports no needs.
-        host.hold = { ...host.hold, controller: true };
-        host.needs = [];
-        detail.hold = { before, after: { holdWanted: true, holdReason: reason } };
-      }
-
-      message += before.holdWanted ? '; the host stays on hold' : '; the host is on hold';
-    }
-
-    this.log('action.end-lease', l.host, detail);
-
-    return { message, hosts: [l.host] };
-  }
-
-  /**
-   * settleCancelled is the part of the scheduler's pass and of the agents
-   * that the mock plays, before every request: it ends the open leases that a
-   * person has ended, the way the controller ends them.
-   *
-   *  - verifying: at the next pass (RECONCILE_MS after the cancel) the lease
-   *    fails as "ended by operator"; the host is broken, as by any lease that
-   *    fails while it is verified.
-   *  - granted: the agent is no longer offered the lease. With its next sync
-   *    (SYNC_MS after the cancel) it declines it; a silent agent says
-   *    nothing and the lease runs out. Either way it expires, the members
-   *    wait again and nothing halts.
-   *  - running: with its next sync the agent has completed the step in
-   *    progress and reports the operation ended, the steps it never began as
-   *    cancelled. The lease fails as "ended by operator" (or expires, when
-   *    nothing was disrupted). What that says about the host is read off the
-   *    report: a group of which a step is done breaks it, as when the lease
-   *    was verifying; a group of which nothing was done says nothing.
-   *
-   * A running lease of a silent agent stays open: the mock does not play the
-   * leaseTtl of a silent agent.
-   */
-  private settleCancelled(): void {
-    const now = this.now();
-
-    for (const l of this.data.leases) {
-      if (!l.cancelled || !isOpen(l)) continue;
-
-      const since = now - Date.parse(l.cancelled.at);
-      const synced = since >= SYNC_MS && !this.isStale(l.host);
-
-      switch (l.state) {
-        case 'verifying':
-          if (since >= RECONCILE_MS) this.failLease(l, ENDED_BY_OPERATOR);
-          break;
-        case 'granted':
-          if (synced) {
-            l.operation = {
-              leaseId: l.id,
-              phase: 'done',
-              startedAt: this.iso(now),
-              updatedAt: this.iso(now),
-              steps: list(l.needs).map(n => ({ needId: n.id, status: 'refused' })),
-              disrupted: false,
-            };
-            this.expireLease(l, 'nothing was disrupted: every step was superseded or refused');
-          } else if (now >= Date.parse(l.expiresAt)) {
-            this.expireLease(l, 'the agent did not start before the lease expired');
-          }
-          break;
-        case 'running': {
-          if (!synced) break;
-
-          const before = list(l.operation?.steps);
-          const steps = list(l.needs).map(n => {
-            const s = before.find(x => x.needId === n.id);
-            if (s?.status === 'running') return { ...s, status: 'done' as const };
-            if (!s || s.status === 'pending') return { needId: n.id, status: 'cancelled' as const };
-            return s;
-          });
-          const disrupted = (l.operation?.disrupted ?? false) || steps.some(s => s.status === 'done');
-
-          l.operation = {
-            leaseId: l.id,
-            startedAt: l.operation?.startedAt ?? l.grantedAt,
-            phase: 'done',
-            updatedAt: this.iso(now),
-            steps,
-            disrupted,
-          };
-          l.agentDoneAt = this.iso(now);
-
-          if (disrupted) this.failLease(l, ENDED_BY_OPERATOR);
-          else this.expireLease(l, 'nothing was disrupted: every step was superseded or refused');
-          break;
-        }
-      }
-    }
+    this.log('action.end-lease', l.host, { lease: l.id, state: l.state, reason: req.reason });
+    this.failLease(l, ENDED_BY_OPERATOR);
+    return { message: `lease ${l.id} of ${l.host} is ending`, hosts: [l.host] };
   }
 
   /** leaseMembers is the host's member, leased by the lease, in every open rollout the lease served. */
@@ -1575,29 +1964,7 @@ export class MockController {
     return out;
   }
 
-  /** expireLease ends a lease that cost no availability; its members wait again and nothing halts. */
-  private expireLease(l: Lease, reason: string): void {
-    const now = this.iso(this.now());
-    const members = this.leaseMembers(l);
-    l.state = 'expired';
-    l.endedAt = now;
-    l.readiness = undefined;
-
-    for (const { member } of members) {
-      member.state = 'pending';
-      member.leaseId = undefined;
-      member.updatedAt = now;
-    }
-
-    this.log('lease.expired', l.host, { lease: l.id, reason }, 'scheduler');
-  }
-
-  /**
-   * failLease ends a lease as failed and halts every open rollout it served,
-   * except rollouts whose own steps are all done while another step failed:
-   * there the member is done, but not through a lease, so it is no success of
-   * the rollout. A lease that a person ended spares none.
-   */
+  /** failLease ends a lease as failed and halts every open rollout it served. */
   private failLease(l: Lease, reason: string): void {
     const now = this.iso(this.now());
     const members = this.leaseMembers(l);
@@ -1605,18 +1972,10 @@ export class MockController {
     l.state = 'failed';
     l.endedAt = now;
 
-    const spared = stepFailed(l);
     const halted: string[] = [];
 
     for (const { rollout: r, member: m } of members) {
       m.updatedAt = now;
-
-      if (spared && stepsDone(l, r.id)) {
-        m.state = 'done';
-        m.leaseId = undefined;
-        continue;
-      }
-
       m.state = 'failed';
       m.error = reason;
       halted.push(r.id);
@@ -1640,11 +1999,10 @@ export class MockController {
       return { message: action === 'pause' ? 'Everything is paused.' : 'The global pause is lifted.' };
     }
 
-    const r = this.rollout(req.rollout);
-    if (r.state !== 'active' && r.state !== 'halted') throw new HttpError(409, `rollout ${r.id} is ${r.state}`);
+    const r = this.openRollout(req.rollout);
 
     r.paused = action === 'pause';
-    // A resume lifts the pause after the canary like any other, and takes its reason along.
+    // A resume lifts every pause, whoever set it, and takes its reason along.
     if (action === 'resume') {
       r.approved = true;
       r.pauseReason = undefined;
@@ -1658,103 +2016,203 @@ export class MockController {
     };
   }
 
-  private abort(req: ScopeRequest): ActionResult {
-    if (req.rollout === '') throw new HttpError(400, 'abort needs a rollout');
-
-    const r = this.rollout(req.rollout);
-    if (r.state !== 'active' && r.state !== 'halted') throw new HttpError(409, `rollout ${r.id} is already ${r.state}`);
-
-    const now = this.iso(this.now());
-    r.state = 'aborted';
-    r.reason = req.reason || 'aborted';
-    r.updatedAt = now;
-    r.endedAt = now;
-    this.log('action.abort', r.id, { reason: req.reason });
-
-    return { message: `Rollout aborted: ${r.title}`, rollout: r.id };
+  /** openRollout is a rollout that an action may still change: a closed one is refused. */
+  private openRollout(id: string): Rollout {
+    const r = this.rollout(id);
+    if (r.state !== 'active' && r.state !== 'halted') {
+      throw new HttpError(409, `scheduler: invalid action: rollout ${r.id} is ${r.state}`);
+    }
+    return r;
   }
 
-  private skipOrRetry(action: 'skip' | 'retry', req: RolloutHostsRequest): ActionResult {
-    const r = this.rollout(req.rollout);
+  /**
+   * abort closes a manual rollout. A rollout of an observed cause stays open
+   * while hosts report the cause, so aborting it pauses it instead, with a
+   * reason that says so; a resume lifts that.
+   */
+  private abort(req: ScopeRequest): ActionResult {
+    if (req.rollout === '') throw new HttpError(400, 'scheduler: invalid action: abort needs a rollout');
+
+    const r = this.openRollout(req.rollout);
+    const now = this.iso(this.now());
+    r.updatedAt = now;
+
+    if (r.kind !== 'manual') {
+      const before = { paused: r.paused };
+      r.paused = true;
+      r.pauseReason = `aborted${req.reason ? `: ${req.reason}` : ''}${RESUME}`;
+      this.log('action.abort', r.id, { before, after: { paused: true }, reason: req.reason });
+
+      return {
+        message: 'rollout paused: its cause is still reported, so it stays open; resume to continue',
+        rollout: r.id,
+      };
+    }
+
+    const before = { state: r.state };
+    r.state = 'aborted';
+    r.reason = req.reason || 'aborted';
+    r.endedAt = now;
+    this.log('action.abort', r.id, { before, after: { state: r.state }, reason: req.reason });
+
+    return { message: 'rollout aborted', rollout: r.id };
+  }
+
+  /**
+   * skip leaves hosts out of an open rollout: the member records who skipped
+   * it and the reason given. A host that holds a lease for the rollout, is
+   * done or is skipped already cannot be skipped.
+   */
+  private skip(req: RolloutHostsRequest): ActionResult {
+    const r = this.openRollout(req.rollout);
+    const wanted = list(req.hosts);
+    if (wanted.length === 0) throw new HttpError(400, 'scheduler: invalid action: no hosts named');
+
     const now = this.iso(this.now());
     const rejected: Record<string, string> = {};
     const applied: string[] = [];
-    const wanted = list(req.hosts);
-
-    if (action === 'skip' && wanted.length === 0) throw new HttpError(400, 'skip needs at least one host');
-
-    // Reopening an aborted cause is about every host that has it.
-    if (action === 'retry' && r.state === 'aborted' && wanted.length > 0) {
-      throw new HttpError(
-        409,
-        `scheduler: invalid action: rollout ${r.id} is aborted; retrying it reopens its cause for every host, ` +
-          'so it takes no hosts'
-      );
-    }
-
-    // A retry of hosts that retries none of them changes nothing.
-    if (action === 'retry' && wanted.length > 0) {
-      const members = list(r.hosts);
-      if (!wanted.some(name => members.some(m => m.host === name && m.state === 'failed'))) {
-        const why = wanted.map(name => `${name} has neither failed nor been skipped in the rollout`).join('; ');
-        throw new HttpError(409, `scheduler: invalid action: no host could be retried: ${why}`);
-      }
-    }
-
-    for (const m of list(r.hosts)) {
-      if (wanted.length > 0 && !wanted.includes(m.host)) continue;
-
-      if (action === 'skip') {
-        if (m.state === 'leased' || m.state === 'done') {
-          rejected[m.host] = `the host is ${m.state}`;
-          continue;
-        }
-        m.state = 'skipped';
-      } else {
-        if (m.state !== 'failed') {
-          if (wanted.length > 0) rejected[m.host] = `the host is ${m.state}, not failed`;
-          continue;
-        }
-        m.state = 'pending';
-        m.error = undefined;
-        m.leaseId = undefined;
-      }
-
-      m.updatedAt = now;
-      applied.push(m.host);
-    }
 
     for (const name of wanted) {
-      if (!list(r.hosts).some(m => m.host === name)) rejected[name] = 'not a member of the rollout';
+      const m = list(r.hosts).find(x => x.host === name);
+
+      if (!m) rejected[name] = 'not a member of the rollout';
+      else if (m.state === 'leased') rejected[name] = 'holds a lease for the rollout';
+      else if (m.state === 'done' || m.state === 'skipped') rejected[name] = `already ${m.state}`;
+      else {
+        m.state = 'skipped';
+        m.skippedBy = this.actor();
+        m.error = req.reason || undefined;
+        m.updatedAt = now;
+        applied.push(name);
+      }
     }
 
-    // A retry of the rollout lifts its halt. A retry of hosts lifts it only
-    // when no member is left failed.
-    const stillFailed = list(r.hosts)
-      .filter(m => m.state === 'failed')
-      .map(m => m.host);
-    // (The mock retries failed hosts only and takes back no skip, so every
-    // retry of hosts retried a failure.)
-    const staysHalted = action === 'retry' && wanted.length > 0 && r.state === 'halted' && stillFailed.length > 0;
+    if (applied.length === 0) throw new HttpError(409, 'scheduler: invalid action: no host could be skipped');
 
-    if (action === 'retry' && !staysHalted) {
-      r.state = 'active';
-      r.reason = undefined;
-      r.endedAt = undefined;
-    }
     r.updatedAt = now;
-    this.log(`action.${action}`, r.id, { hosts: applied, reason: req.reason });
+    this.log('action.skip', r.id, { hosts: applied, reason: req.reason });
 
     return {
-      message:
-        action === 'skip'
-          ? `Skipped ${applied.length} host(s) in: ${r.title}`
-          : staysHalted
-            ? `${applied.length} host(s) retried; the rollout stays halted: ${stillFailed.join(', ')} still failed`
-            : `Rollout active again, ${applied.length} host(s) back to pending: ${r.title}`,
+      message: `${applied.length} host(s) skipped`,
       rollout: r.id,
       hosts: applied,
       rejected: Object.keys(rejected).length > 0 ? rejected : undefined,
     };
   }
+
+  /**
+   * retry returns hosts of an open rollout to pending. Without hosts it is
+   * about the rollout: every failed member, and a halted rollout is active
+   * again. With hosts it is about those: the named members that failed or
+   * that a person skipped; the rollout leaves its halt only when one of them
+   * had failed and no member is failed after that.
+   */
+  private retry(req: RolloutHostsRequest): ActionResult {
+    const r = this.openRollout(req.rollout);
+    const wanted = list(req.hosts);
+    const now = this.iso(this.now());
+    const rejected: Record<string, string> = {};
+    const applied: string[] = [];
+    let retriedFailed = false;
+
+    for (const m of list(r.hosts)) {
+      const named = wanted.includes(m.host);
+      const failed = m.state === 'failed' && (wanted.length === 0 || named);
+      const skipped = m.state === 'skipped' && Boolean(m.skippedBy) && named;
+      if (!failed && !skipped) continue;
+
+      retriedFailed ||= failed;
+      m.state = 'pending';
+      m.error = undefined;
+      m.skippedBy = undefined;
+      m.leaseId = undefined;
+      m.updatedAt = now;
+      applied.push(m.host);
+    }
+
+    for (const name of wanted) {
+      if (!applied.includes(name)) rejected[name] = 'has neither failed nor been skipped in the rollout';
+    }
+
+    const before = { state: r.state, reason: r.reason ?? '' };
+    let message: string;
+
+    if (wanted.length > 0) {
+      if (applied.length === 0) {
+        const why = wanted.map(name => `${name} ${rejected[name] ?? ''}`).join('; ');
+        throw new HttpError(409, `scheduler: invalid action: no host could be retried: ${why}`);
+      }
+
+      const stillFailed = list(r.hosts)
+        .filter(m => m.state === 'failed')
+        .map(m => m.host);
+      message = `${applied.length} host(s) retried`;
+
+      if (r.state !== 'halted') {
+        // Nothing to lift.
+      } else if (stillFailed.length > 0) {
+        message += `; the rollout stays halted: ${stillFailed.join(', ')} still failed`;
+      } else if (!retriedFailed) {
+        message +=
+          '; the rollout stays halted: none of the retried hosts had failed (retry the rollout to lift its halt)';
+      } else {
+        r.state = 'active';
+        r.reason = undefined;
+      }
+    } else {
+      if (applied.length === 0 && r.state !== 'halted') {
+        throw new HttpError(
+          409,
+          `scheduler: invalid action: rollout ${r.id} is ${r.state} and has no failed host to retry`
+        );
+      }
+
+      r.state = 'active';
+      r.reason = undefined;
+      message = `rollout reopened, ${applied.length} host(s) retried`;
+    }
+
+    r.updatedAt = now;
+    this.log('action.retry', r.id, { hosts: applied, before, after: { state: r.state }, reason: req.reason });
+
+    return {
+      message,
+      rollout: r.id,
+      hosts: applied,
+      rejected: Object.keys(rejected).length > 0 ? rejected : undefined,
+    };
+  }
+}
+
+/** hostListing is a host's row of the host list (api.hostListing). */
+function hostListing(s: HostSummary): HostListing {
+  return {
+    name: s.name,
+    roles: s.roles,
+    validators: s.validators,
+    lastSeen: s.lastSeen,
+    stale: s.stale,
+    agentVersion: s.agentVersion,
+    containers: list(s.containers).map(c => ({
+      name: c.name,
+      image: c.image,
+      ...(c.digest ? { digest: c.digest } : {}),
+      ...(c.revision ? { revision: c.revision } : {}),
+      state: c.state,
+      managed: c.managed,
+      ...(c.kind ? { kind: c.kind } : {}),
+      ...(c.impact ? { impact: c.impact } : {}),
+      ...(list(c.owners).length > 0 ? { owners: c.owners } : {}),
+    })),
+    os: s.os,
+    pending: s.pending,
+    uptimeSeconds: s.uptimeSeconds,
+    hold: s.hold,
+    holdWanted: s.holdWanted,
+    ...(s.holdReason ? { holdReason: s.holdReason } : {}),
+    ...(s.holdBy ? { holdBy: s.holdBy } : {}),
+    verbs: s.verbs,
+    needs: list(s.needs).map(n => ({ kind: n.kind })),
+    plan: s.plan,
+  };
 }

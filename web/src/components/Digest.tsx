@@ -12,11 +12,8 @@ async function copyText(text: string): Promise<boolean> {
   }
 }
 
-/**
- * CopyValue shows a shortened identifier in monospace. The full value is the
- * tooltip; activating it copies the full value.
- */
-export function CopyValue({ value, short, label }: { value: string; short: string; label: string }) {
+/** useCopy copies a text and says, for a moment, how that went. */
+function useCopy(): ['idle' | 'copied' | 'failed', (text: string) => void] {
   const [state, setState] = useState<'idle' | 'copied' | 'failed'>('idle');
 
   useEffect(() => {
@@ -29,6 +26,22 @@ export function CopyValue({ value, short, label }: { value: string; short: strin
     };
   }, [state]);
 
+  const copy = (text: string) => {
+    void copyText(text).then(ok => {
+      setState(ok ? 'copied' : 'failed');
+    });
+  };
+
+  return [state, copy];
+}
+
+/**
+ * CopyValue shows a shortened identifier in monospace. The full value is the
+ * tooltip; activating it copies the full value.
+ */
+export function CopyValue({ value, short, label }: { value: string; short: string; label: string }) {
+  const [state, copy] = useCopy();
+
   return (
     <button
       type="button"
@@ -36,9 +49,7 @@ export function CopyValue({ value, short, label }: { value: string; short: strin
       aria-label={`${label} ${value}, click to copy`}
       onClick={e => {
         e.stopPropagation();
-        void copyText(value).then(ok => {
-          setState(ok ? 'copied' : 'failed');
-        });
+        copy(value);
       }}
       className={cx(
         'rounded-xs font-mono hover:bg-surface-hover hover:text-foreground',
@@ -46,6 +57,28 @@ export function CopyValue({ value, short, label }: { value: string; short: strin
       )}
     >
       {state === 'copied' ? 'copied' : state === 'failed' ? 'copy failed' : short}
+    </button>
+  );
+}
+
+/** CopyButton is a small button that copies a text, such as a whole list of flags; its width does not change. */
+export function CopyButton({ value, label }: { value: string; label: string }) {
+  const [state, copy] = useCopy();
+
+  return (
+    <button
+      type="button"
+      aria-label={label}
+      title={label}
+      onClick={() => {
+        copy(value);
+      }}
+      className={cx(
+        'min-w-16 rounded-xs px-1.5 text-xs/5 font-medium hover:bg-surface-hover',
+        state === 'copied' ? 'text-success' : state === 'failed' ? 'text-danger' : 'text-accent'
+      )}
+    >
+      {state === 'copied' ? 'Copied' : state === 'failed' ? 'Copy failed' : 'Copy'}
     </button>
   );
 }

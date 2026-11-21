@@ -1,7 +1,6 @@
 package docker
 
 import (
-	"encoding/base64"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -20,24 +19,12 @@ func TestRepositoryOf(t *testing.T) {
 		want    string
 		wantErr bool
 	}{
-		{ref: "alpine", want: "docker.io/library/alpine"},
 		{ref: "alpine:3.21", want: "docker.io/library/alpine"},
-		{ref: "library/alpine:latest", want: "docker.io/library/alpine"},
-		{ref: "docker.io/alpine", want: "docker.io/library/alpine"},
 		{ref: "docker.io/library/alpine@" + digestA, want: "docker.io/library/alpine"},
-		{ref: "index.docker.io/library/alpine:3", want: "docker.io/library/alpine"},
-		{ref: "registry-1.docker.io/library/alpine", want: "docker.io/library/alpine"},
 		{ref: "registry-1.docker.io/alpine", want: "docker.io/library/alpine"},
-		{ref: "ethpandaops/lighthouse:unstable", want: "docker.io/ethpandaops/lighthouse"},
 		{ref: "docker.io/ethpandaops/lighthouse:unstable@" + digestA, want: "docker.io/ethpandaops/lighthouse"},
-		{ref: "ghcr.io/ethpandaops/geth:master", want: "ghcr.io/ethpandaops/geth"},
 		{ref: "localhost:5000/app:latest", want: "localhost:5000/app"},
-		{ref: "localhost/app", want: "localhost/app"},
-		{ref: "127.0.0.1:5000/team/app:v1", want: "127.0.0.1:5000/team/app"},
-		{ref: " alpine:3.21 ", want: "docker.io/library/alpine"},
 		{ref: "", wantErr: true},
-		{ref: "Alpine:3", wantErr: true},
-		{ref: "alpine:", wantErr: true},
 		// A bare image ID is not a repository.
 		{ref: digestA[len("sha256:"):], wantErr: true},
 	}
@@ -54,43 +41,6 @@ func TestRepositoryOf(t *testing.T) {
 			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
-	}
-}
-
-func TestRegistryOf(t *testing.T) {
-	tests := []struct {
-		ref  string
-		want string
-	}{
-		{ref: "alpine", want: "docker.io"},
-		{ref: "index.docker.io/library/alpine", want: "docker.io"},
-		{ref: "registry-1.docker.io/ethpandaops/geth", want: "docker.io"},
-		{ref: "ghcr.io/ethpandaops/geth:master", want: "ghcr.io"},
-		{ref: "localhost:5000/app", want: "localhost:5000"},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.ref, func(t *testing.T) {
-			got, err := registryOf(tt.ref)
-			require.NoError(t, err)
-			assert.Equal(t, tt.want, got)
-		})
-	}
-}
-
-func TestNormalizeRegistry(t *testing.T) {
-	tests := map[string]string{
-		"https://index.docker.io/v1/": "docker.io",
-		"index.docker.io":             "docker.io",
-		"registry-1.docker.io":        "docker.io",
-		"docker.io":                   "docker.io",
-		"https://ghcr.io":             "ghcr.io",
-		"GHCR.io":                     "ghcr.io",
-		"http://localhost:5000/v2/":   "localhost:5000",
-	}
-
-	for in, want := range tests {
-		assert.Equal(t, want, normalizeRegistry(in), in)
 	}
 }
 
@@ -211,83 +161,4 @@ func TestHasDigest(t *testing.T) {
 	assert.False(t, hasDigest("app:latest", repoDigests, ""), "an empty digest never matches")
 	assert.False(t, hasDigest("app:latest", nil, digestA))
 	assert.False(t, hasDigest("APP", repoDigests, digestA), "invalid reference")
-}
-
-func TestFindRegistryAuth(t *testing.T) {
-	basic := func(user, password string) string {
-		return base64.StdEncoding.EncodeToString([]byte(user + ":" + password))
-	}
-
-	config := `{
-		"auths": {
-			"https://index.docker.io/v1/": {"auth": "` + basic("hubuser", "hub:pass") + `"},
-			"ghcr.io": {"username": "gh", "password": "token"},
-			"https://ghcr.io/v2/": {"username": "other", "password": "other"},
-			"registry.example.com": {"identitytoken": "idtoken"},
-			"helper.example.com": {},
-			"broken.example.com": {"auth": "!!!"},
-			"nocolon.example.com": {"auth": "` + base64.StdEncoding.EncodeToString([]byte("nocolon")) + `"}
-		},
-		"credsStore": "desktop"
-	}`
-
-	tests := []struct {
-		name       string
-		host       string
-		wantUser   string
-		wantPass   string
-		wantToken  string
-		wantServer string
-		wantNone   bool
-		wantErr    bool
-	}{
-		{
-			name: "docker hub through the legacy index key", host: "docker.io",
-			wantUser: "hubuser", wantPass: "hub:pass", wantServer: "https://index.docker.io/v1/",
-		},
-		{
-			name: "exact host wins over a URL key", host: "ghcr.io",
-			wantUser: "gh", wantPass: "token", wantServer: "ghcr.io",
-		},
-		{
-			name: "identity token", host: "registry.example.com",
-			wantToken: "idtoken", wantServer: "registry.example.com",
-		},
-		{name: "credential helper stub has no credentials", host: "helper.example.com", wantNone: true},
-		{name: "unknown registry", host: "quay.io", wantNone: true},
-		{name: "invalid base64", host: "broken.example.com", wantErr: true},
-		{name: "auth without colon", host: "nocolon.example.com", wantErr: true},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := findRegistryAuth([]byte(config), tt.host)
-			if tt.wantErr {
-				require.Error(t, err)
-
-				return
-			}
-
-			require.NoError(t, err)
-
-			if tt.wantNone {
-				assert.Nil(t, got)
-
-				return
-			}
-
-			require.NotNil(t, got)
-			assert.Equal(t, tt.wantUser, got.Username)
-			assert.Equal(t, tt.wantPass, got.Password)
-			assert.Equal(t, tt.wantToken, got.IdentityToken)
-			assert.Equal(t, tt.wantServer, got.ServerAddress)
-		})
-	}
-
-	_, err := findRegistryAuth([]byte("{not json"), "docker.io")
-	require.Error(t, err)
-
-	got, err := findRegistryAuth([]byte("{}"), "docker.io")
-	require.NoError(t, err)
-	assert.Nil(t, got)
 }

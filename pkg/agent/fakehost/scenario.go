@@ -69,9 +69,13 @@ type Container struct {
 	Revision string `yaml:"revision"`
 	// State is the Docker state (default "running").
 	State string `yaml:"state"`
+	// Command is the container's command line (the arguments after the
+	// entrypoint), which a flag override changes.
+	Command []string `yaml:"command"`
 }
 
-// Tag is the registry's answer for one tag.
+// Tag is the image the registry holds for one tag. Its revision is known to
+// the agent once the image is pulled, as on a real host.
 type Tag struct {
 	Digest   string `yaml:"digest" json:"digest"`
 	Revision string `yaml:"revision" json:"revision,omitempty"`
@@ -85,7 +89,7 @@ type Packages struct {
 	Upgradable []protocol.Upgradable `yaml:"upgradable"`
 }
 
-// LoadScenario reads a scenario file.
+// LoadScenario reads a scenario file. New checks its content.
 func LoadScenario(path string) (*Scenario, error) {
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -96,10 +100,6 @@ func LoadScenario(path string) (*Scenario, error) {
 
 	if err := yaml.Unmarshal(raw, &sc); err != nil {
 		return nil, fmt.Errorf("parse scenario %s: %w", path, err)
-	}
-
-	if err := sc.validate(); err != nil {
-		return nil, fmt.Errorf("scenario %s: %w", path, err)
 	}
 
 	return &sc, nil

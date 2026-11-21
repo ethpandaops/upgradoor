@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -35,7 +36,7 @@ func TestHosts(t *testing.T) {
 	boot, one, two := hosts[0], hosts[1], hosts[2]
 
 	assert.Equal(t, "bootnode-1", boot.Name)
-	assert.Equal(t, []string{fleet.RoleBootnode}, boot.Roles)
+	assert.Equal(t, []string{"bootnode"}, boot.Roles)
 	assert.Zero(t, boot.Validators)
 	assert.Equal(t, scheduler.HostPlan{Slot: scheduler.SlotIdle}, boot.Plan,
 		"a host the plan does not know is idle")
@@ -81,11 +82,6 @@ func TestHostDetail(t *testing.T) {
 	h := newHarness(t, nil)
 	leakFixture(t, h)
 
-	h.store.liveness = []fleet.Liveness{
-		{Host: "lighthouse-geth-1", Epoch: 224, Live: 90, Total: 100},
-		{Host: "lighthouse-geth-2", Epoch: 224, Live: 100, Total: 100},
-		{Host: "lighthouse-geth-1", Epoch: 223, Live: 100, Total: 100},
-	}
 	h.store.leases = append(h.store.leases, &fleet.Lease{
 		ID: "lease-other", Host: "lighthouse-geth-2", State: fleet.LeaseReleased,
 	})
@@ -109,10 +105,6 @@ func TestHostDetail(t *testing.T) {
 	assert.Equal(t, uint64(100), *detail.ValidatorEnd)
 	require.NotNil(t, detail.Inventory)
 	assert.Equal(t, secretPkgName, detail.Inventory.Packages[0].Name)
-	assert.Equal(t, []fleet.Liveness{
-		{Host: "lighthouse-geth-1", Epoch: 224, Live: 90, Total: 100},
-		{Host: "lighthouse-geth-1", Epoch: 223, Live: 100, Total: 100},
-	}, detail.Liveness)
 	require.Len(t, detail.Leases, 1)
 	assert.Equal(t, "lease-zz", detail.Leases[0].ID)
 	require.Len(t, detail.History, 1)
@@ -125,7 +117,7 @@ func TestHostDetail(t *testing.T) {
 	var raw map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &raw))
 
-	for _, key := range []string{"liveness", "leases", "history"} {
+	for _, key := range []string{"leases", "history"} {
 		assert.Equal(t, "[]", string(raw[key]), key)
 	}
 
@@ -173,7 +165,7 @@ func TestPackages(t *testing.T) {
 	}{
 		{
 			name: "match", query: "?q=openssl", status: http.StatusOK,
-			wantNames: []string{"openssl"}, wantQuery: "openssl", wantLimit: defaultPackageLimit,
+			wantNames: []string{"openssl"}, wantQuery: "openssl", wantLimit: store.DefaultPackageSearchLimit,
 		},
 		{
 			name: "substring, trimmed", query: "?q=%20ssl%20&limit=7", status: http.StatusOK,
@@ -182,14 +174,21 @@ func TestPackages(t *testing.T) {
 		{
 			name: "limit is capped", query: "?q=ssl&limit=100000", status: http.StatusOK,
 			wantNames: []string{"openssl", "libssl3t64"}, wantQuery: "ssl",
-			wantLimit: maxPackageLimit,
+			wantLimit: store.MaxPackageSearchLimit,
 		},
 		{
 			name: "no match is an empty list", query: "?q=nothing", status: http.StatusOK,
-			wantNames: []string{}, wantQuery: "nothing", wantLimit: defaultPackageLimit,
+			wantNames: []string{}, wantQuery: "nothing", wantLimit: store.DefaultPackageSearchLimit,
 		},
-		{name: "missing query", query: "", status: http.StatusBadRequest},
-		{name: "query too short", query: "?q=a", status: http.StatusBadRequest},
+		{
+			name: "no query lists everything", query: "", status: http.StatusOK,
+			wantNames: []string{"openssl", "libssl3t64"}, wantLimit: store.DefaultPackageSearchLimit,
+		},
+		{
+			name: "one character filters", query: "?q=o", status: http.StatusOK,
+			wantNames: []string{"openssl"}, wantQuery: "o", wantLimit: store.DefaultPackageSearchLimit,
+		},
+		{name: "not a cursor", query: "?after=x", status: http.StatusBadRequest},
 		{
 			name: "query too long", query: "?q=" + strings.Repeat("a", maxPackageQuery+1),
 			status: http.StatusBadRequest,
@@ -223,6 +222,45 @@ func TestPackages(t *testing.T) {
 			assert.NotContains(t, rec.Body.String(), "null")
 		})
 	}
+}
+
+// The list is paged: the first page says how many there are and where the
+// next one starts; the last page has no next.
+func TestPackagesPaging(t *testing.T) {
+	h := newHarness(t, nil)
+
+	for _, name := range []string{"acl", "adduser", "apt", "base-files", "bash"} {
+		h.store.packages = append(h.store.packages, store.PackageMatch{
+			Name: name, Versions: []store.PackageVersion{{Version: "1", Hosts: []string{"a"}}},
+		})
+	}
+
+	names := func(p Packages) []string {
+		out := make([]string, 0, len(p.Matches))
+		for _, m := range p.Matches {
+			out = append(out, m.Name)
+		}
+
+		return out
+	}
+
+	first := decodeJSON[Packages](t, h.get("/api/v1/packages?limit=2"))
+	assert.Equal(t, []string{"acl", "adduser"}, names(first))
+	require.NotNil(t, first.Total)
+	assert.Equal(t, 5, *first.Total)
+	require.NotEmpty(t, first.Next)
+
+	second := decodeJSON[Packages](t, h.get("/api/v1/packages?limit=2&after="+url.QueryEscape(first.Next)))
+	assert.Equal(t, []string{"apt", "base-files"}, names(second))
+	assert.Nil(t, second.Total, "counted once, for the first page")
+
+	last := decodeJSON[Packages](t, h.get("/api/v1/packages?limit=2&after="+url.QueryEscape(second.Next)))
+	assert.Equal(t, []string{"bash"}, names(last))
+	assert.Empty(t, last.Next)
+
+	filtered := decodeJSON[Packages](t, h.get("/api/v1/packages?q=a&limit=2"))
+	assert.Equal(t, 5, *filtered.Total)
+	assert.Equal(t, "a", filtered.Query)
 }
 
 func TestRollouts(t *testing.T) {
@@ -677,13 +715,13 @@ func TestAuditPaging(t *testing.T) {
 		h.get("/api/v1/audit?target=nobody").Body.String())
 
 	// The limit is capped.
-	for i := 26; i <= maxAuditLimit+50; i++ {
+	for i := 26; i <= store.MaxAuditLimit+50; i++ {
 		h.store.audit = append(h.store.audit, fleet.AuditEntry{ID: int64(i), Action: "x"})
 	}
 
 	capped := page("?limit=100000")
-	assert.Len(t, capped.Entries, maxAuditLimit)
-	assert.Equal(t, capped.Entries[maxAuditLimit-1].ID, capped.NextBefore)
+	assert.Len(t, capped.Entries, store.MaxAuditLimit)
+	assert.Equal(t, capped.Entries[store.MaxAuditLimit-1].ID, capped.NextBefore)
 
 	for _, bad := range []string{
 		"?limit=0", "?limit=x", "?before=x", "?before=-4",

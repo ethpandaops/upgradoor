@@ -1,7 +1,14 @@
 // Small building blocks shared by every view: buttons, badges, table cells
 // and the loading / error / empty states.
 
-import { type ButtonHTMLAttributes, type ReactNode, type TdHTMLAttributes, type ThHTMLAttributes } from 'react';
+import {
+  useId,
+  useState,
+  type ButtonHTMLAttributes,
+  type ReactNode,
+  type TdHTMLAttributes,
+  type ThHTMLAttributes,
+} from 'react';
 
 import { errorText } from '../api/client';
 
@@ -70,15 +77,28 @@ export function Button({ variant = 'default', dense = false, className, type, ..
 
 /**
  * Table is the table shell; it scrolls horizontally on narrow screens. roomy
- * is the main table of a view: taller rows, cells centred on the row.
+ * is the main table of a view: taller rows, cells centred on the row. fixed
+ * gives the columns the widths of the header cells.
  */
-export function Table({ children, label, roomy = false }: { children: ReactNode; label: string; roomy?: boolean }) {
+export function Table({
+  children,
+  label,
+  roomy = false,
+  fixed = false,
+}: {
+  children: ReactNode;
+  label: string;
+  roomy?: boolean;
+  /** fixed: the header's widths lay out the columns, whatever the rows hold. */
+  fixed?: boolean;
+}) {
   return (
     <div className="overflow-x-auto rounded-lg border border-border bg-surface">
       <table
         aria-label={label}
         className={cx(
           'w-full border-collapse text-left',
+          fixed && 'min-w-5xl table-fixed',
           'text-xs/5',
           roomy && '[&_td]:py-2 [&_td]:align-middle [&_th]:py-2'
         )}
@@ -218,15 +238,6 @@ export function Section({ title, aside, children }: { title: ReactNode; aside?: 
   );
 }
 
-/** Mono renders versions and identifiers in the monospace face. */
-export function Mono({ children, title }: { children: ReactNode; title?: string }) {
-  return (
-    <span title={title} className="font-mono">
-      {children}
-    </span>
-  );
-}
-
 /** Dash is the placeholder of an empty cell. */
 export function Dash() {
   return <span className="text-faint">–</span>;
@@ -271,17 +282,19 @@ export function Card({
   );
 }
 
-/** Segmented is a small one-of-n switch. */
+/** Segmented is a small one-of-n switch. An option's title says what choosing it means. */
 export function Segmented<T extends string>({
   label,
   options,
   value,
   onChange,
+  disabled = false,
 }: {
   label: string;
-  options: readonly { value: T; label: string }[];
+  options: readonly { value: T; label: string; title?: string }[];
   value: T;
   onChange: (value: T) => void;
+  disabled?: boolean;
 }) {
   return (
     <div role="group" aria-label={label} className="inline-flex rounded-sm border border-border-strong">
@@ -289,19 +302,120 @@ export function Segmented<T extends string>({
         <button
           key={o.value}
           type="button"
+          title={o.title}
           aria-pressed={o.value === value}
+          disabled={disabled}
           onClick={() => {
             onChange(o.value);
           }}
           className={cx(
-            'h-6 px-2 text-xs/5 font-medium first:rounded-l-xs last:rounded-r-xs',
-            o.value === value ? 'bg-surface-selected text-foreground' : 'text-muted hover:bg-surface-hover'
+            'h-6 px-2 text-xs/5 font-medium first:rounded-l-xs last:rounded-r-xs disabled:cursor-not-allowed',
+            o.value === value ? 'bg-surface-selected text-foreground' : 'text-muted hover:bg-surface-hover',
+            disabled && o.value !== value && 'opacity-50'
           )}
         >
           {o.label}
         </button>
       ))}
     </div>
+  );
+}
+
+/** Switch is an on/off control. */
+export function Switch({
+  checked,
+  onChange,
+  label,
+  disabled = false,
+  describedBy,
+}: {
+  checked: boolean;
+  onChange: (checked: boolean) => void;
+  /** label names the switch for assistive tech; the visible label stands next to it. */
+  label: string;
+  disabled?: boolean;
+  describedBy?: string;
+}) {
+  return (
+    <button
+      type="button"
+      role="switch"
+      aria-checked={checked}
+      aria-label={label}
+      aria-describedby={describedBy}
+      disabled={disabled}
+      onClick={() => {
+        onChange(!checked);
+      }}
+      className={cx(
+        'inline-flex h-5 w-9 shrink-0 items-center rounded-full border p-0.5 disabled:cursor-not-allowed disabled:opacity-50',
+        checked ? 'justify-end border-transparent bg-accent' : 'justify-start border-border-strong bg-surface-raised'
+      )}
+    >
+      <span aria-hidden="true" className={cx('size-3.5 rounded-full', checked ? 'bg-on-accent' : 'bg-muted')} />
+    </button>
+  );
+}
+
+/**
+ * InfoTip keeps a long explanation behind an "i": it opens on hover and on
+ * keyboard focus, and a click or a tap pins it open. It floats over the page,
+ * so opening it moves nothing.
+ */
+export function InfoTip({ label, children }: { label: string; children: ReactNode }) {
+  const id = useId();
+  const [hover, setHover] = useState(false);
+  const [pinned, setPinned] = useState(false);
+  const open = hover || pinned;
+
+  return (
+    <span
+      className="relative inline-flex"
+      onMouseEnter={() => {
+        setHover(true);
+      }}
+      onMouseLeave={() => {
+        setHover(false);
+      }}
+    >
+      <button
+        type="button"
+        aria-label={`About ${label}`}
+        aria-expanded={open}
+        aria-describedby={open ? id : undefined}
+        onClick={() => {
+          setPinned(v => !v);
+        }}
+        onFocus={() => {
+          setHover(true);
+        }}
+        onBlur={() => {
+          setHover(false);
+          setPinned(false);
+        }}
+        onKeyDown={e => {
+          if (e.key === 'Escape') {
+            setHover(false);
+            setPinned(false);
+          }
+        }}
+        className={cx(
+          'inline-flex size-4 items-center justify-center rounded-full border font-serif text-xs/4 italic',
+          open ? 'border-accent text-accent' : 'border-border-strong text-muted hover:text-foreground'
+        )}
+      >
+        i
+      </button>
+      {open && (
+        <span
+          role="tooltip"
+          id={id}
+          className="absolute top-full left-0 z-30 mt-1 w-72 rounded-sm border border-border-strong bg-surface-raised p-2 text-xs/5 font-normal whitespace-normal text-foreground shadow-md"
+        >
+          {children}
+        </span>
+      )}
+    </span>
   );
 }
 

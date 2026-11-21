@@ -4,12 +4,14 @@ import (
 	"context"
 	"crypto/rand"
 	"database/sql"
+	_ "embed" // the schema is embedded
 	"encoding/hex"
 	"errors"
 	"fmt"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -31,7 +33,20 @@ const (
 	// dbFileMode is the mode of the database files: they hold inventories
 	// that are served to authenticated users only.
 	dbFileMode os.FileMode = 0o600
+	// schemaVersion names the schema of schema.sql and is kept in the
+	// database's PRAGMA user_version. It changes with every change to the
+	// schema; there is no step from one version to another.
+	schemaVersion = 1
 )
+
+// schemaSQL creates every table of an empty database.
+//
+//go:embed schema.sql
+var schemaSQL string
+
+// ErrSchemaVersion is returned by Start when the database file holds anything
+// but the schema of this binary. Nothing is changed in that case.
+var ErrSchemaVersion = errors.New("store: database has another schema")
 
 // ErrNoWAL is returned by Start when the database file cannot be put into
 // write-ahead-log mode.
@@ -51,6 +66,8 @@ type sqliteStore struct {
 	mu     sync.RWMutex
 	writer *sql.DB
 	reader *sql.DB
+
+	statuses statusCache
 }
 
 var _ Store = (*sqliteStore)(nil)
@@ -72,7 +89,7 @@ func NewMemory(log logrus.FieldLogger) Store {
 	return New(log, MemoryPath)
 }
 
-// Start opens the database and applies migrations.
+// Start opens the database and creates the schema in an empty one.
 func (s *sqliteStore) Start(ctx context.Context) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -100,7 +117,7 @@ func (s *sqliteStore) Start(ctx context.Context) error {
 		}
 	}
 
-	version, err := migrate(ctx, s.log, writer)
+	err = s.ensureSchema(ctx, writer)
 	if err != nil {
 		return errors.Join(err, writer.Close())
 	}
@@ -112,7 +129,7 @@ func (s *sqliteStore) Start(ctx context.Context) error {
 
 	s.writer, s.reader = writer, reader
 
-	s.log.WithFields(logrus.Fields{"path": s.path, "schema": version}).Info("database open")
+	s.log.WithFields(logrus.Fields{"path": s.path, "schema": schemaVersion}).Info("database open")
 
 	return nil
 }
@@ -136,6 +153,45 @@ func (s *sqliteStore) Stop() error {
 	}
 
 	return nil
+}
+
+// ensureSchema creates the schema in an empty database and refuses every
+// other database that is not of schemaVersion: there is no upgrade path, the
+// file has to be deleted. The check and the creation are one write
+// transaction, so two processes starting on the same file cannot both create.
+func (s *sqliteStore) ensureSchema(ctx context.Context, db *sql.DB) error {
+	return inTx(ctx, db, func(tx *sql.Tx) error {
+		var version, objects int
+
+		if err := tx.QueryRowContext(ctx, `PRAGMA user_version`).Scan(&version); err != nil {
+			return fmt.Errorf("store: read schema version: %w", err)
+		}
+
+		if version == schemaVersion {
+			return nil
+		}
+
+		if err := tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master`).Scan(&objects); err != nil {
+			return fmt.Errorf("store: read schema: %w", err)
+		}
+
+		if version != 0 || objects != 0 {
+			return fmt.Errorf("%w: %s has schema version %d, this binary needs %d; "+
+				"delete the database file and start again",
+				ErrSchemaVersion, s.path, version, schemaVersion)
+		}
+
+		if _, err := tx.ExecContext(ctx, schemaSQL); err != nil {
+			return fmt.Errorf("store: create schema: %w", err)
+		}
+
+		// PRAGMA takes no bound parameters; the value is an int.
+		if _, err := tx.ExecContext(ctx, "PRAGMA user_version = "+strconv.Itoa(schemaVersion)); err != nil {
+			return fmt.Errorf("store: set schema version: %w", err)
+		}
+
+		return nil
+	})
 }
 
 // prepareDSN returns the connection string shared by the writer and the

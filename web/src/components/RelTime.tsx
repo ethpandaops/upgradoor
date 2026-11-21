@@ -2,6 +2,7 @@ import { createContext, useContext, type ReactNode } from 'react';
 
 import { useNow } from '../hooks/useNow';
 import { absoluteTime, isZeroTime, relativeTime } from '../lib/format';
+import { cx } from './primitives';
 
 const NowContext = createContext<number | null>(null);
 
@@ -16,14 +17,40 @@ export function useSharedNow(): number {
   return useContext(NowContext) ?? Date.now();
 }
 
-/** RelTime shows an instant relative to now, with the absolute time on hover. */
-export function RelTime({ value, className }: { value: string | null | undefined; className?: string }) {
+/**
+ * FIXED is the box of a relative time that must not move what is around it:
+ * wide enough for the longest text ("59m 59s ago", "364d 23h ago"), so the
+ * text can tick from "9s ago" to "1m 10s ago" without resizing a column or
+ * pushing a line into a wrap.
+ */
+const FIXED = 'inline-block min-w-20';
+
+/**
+ * RelTime shows an instant relative to now, with the absolute time on hover.
+ * The text is computed here from the timestamp and ticks with the shared
+ * clock; the controller never sends an elapsed time. fixed reserves the width
+ * of the longest text: use it in table cells and wherever the time ends a
+ * line that must not wrap.
+ */
+export function RelTime({
+  value,
+  className,
+  fixed = false,
+}: {
+  value: string | null | undefined;
+  className?: string;
+  fixed?: boolean;
+}) {
   const now = useSharedNow();
 
-  if (isZeroTime(value)) return <span className="text-faint">never</span>;
+  if (isZeroTime(value)) return <span className={cx('text-faint', fixed && FIXED)}>never</span>;
 
   return (
-    <time dateTime={value ?? undefined} title={absoluteTime(value)} className={className}>
+    <time
+      dateTime={value ?? undefined}
+      title={absoluteTime(value)}
+      className={cx('whitespace-nowrap tabular-nums', fixed && FIXED, className)}
+    >
       {relativeTime(value, now)}
     </time>
   );

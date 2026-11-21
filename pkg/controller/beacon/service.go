@@ -20,33 +20,20 @@ const (
 	// DefaultPollInterval is the poll interval until the slot duration is
 	// known; after that an unset PollInterval means one slot.
 	DefaultPollInterval = 12 * time.Second
-	// DefaultRetention is how many epochs of liveness rows are kept.
-	DefaultRetention uint64 = 256
-	// DefaultLivenessChunkSize is the number of validator indices per
-	// liveness request.
-	DefaultLivenessChunkSize = 5000
 
 	// minPollInterval keeps a derived poll interval sane on fast chains.
 	minPollInterval = time.Second
-	// backfillEpochs is how many complete epochs back liveness is asked for.
-	// Nodes usually serve the previous epoch only; older ones are tried once.
-	backfillEpochs = 3
-	// reprobeInterval is how often a node that does not serve the liveness
-	// endpoint is asked again.
-	reprobeInterval = 5 * time.Minute
 )
 
 // Store is what the beacon service needs from the controller's store.
 type Store interface {
 	// ListHosts returns all hosts.
 	ListHosts(ctx context.Context) ([]*fleet.Host, error)
-	// SaveLiveness upserts per-host liveness rows.
-	SaveLiveness(ctx context.Context, rows []fleet.Liveness) error
-	// ListLiveness returns the rows of the newest `epochs` epochs for which
-	// any row exists, newest epoch first.
-	ListLiveness(ctx context.Context, epochs int) ([]fleet.Liveness, error)
-	// PruneLiveness deletes rows older than beforeEpoch.
-	PruneLiveness(ctx context.Context, beforeEpoch uint64) error
+	// SaveSlotParticipation upserts slot rows and replaces their per-host
+	// rows.
+	SaveSlotParticipation(ctx context.Context, rows []fleet.SlotParticipation) error
+	// PruneSlotParticipation deletes the rows of slots older than beforeSlot.
+	PruneSlotParticipation(ctx context.Context, beforeSlot uint64) error
 }
 
 // Options configure the beacon service.
@@ -54,31 +41,28 @@ type Options struct {
 	// Endpoints are beacon API base URLs. They are tried in order; the one
 	// that answered last is tried first the next time.
 	Endpoints []string
-	// Store holds the hosts and the liveness rows.
+	// Store holds the hosts and the per-slot participation rows.
 	Store Store
 	// PollInterval is the time between polls. Zero means one slot (12s until
 	// the slot duration is known).
 	PollInterval time.Duration
-	// Retention is how many epochs of liveness rows are kept. Zero means
-	// DefaultRetention.
-	Retention uint64
 	// HTTPClient is the client used for the beacon API. Nil means a client
 	// with a timeout.
 	HTTPClient *http.Client
 	// Now is the clock. Nil means time.Now.
 	Now func() time.Time
-	// LivenessChunkSize is the number of validator indices per liveness
-	// request. Zero means DefaultLivenessChunkSize.
-	LivenessChunkSize int
+	// SlotRetention is how long the per-slot participation rows are kept.
+	// Zero means DefaultSlotRetention.
+	SlotRetention time.Duration
 }
 
 // service implements Service.
 type service struct {
-	log       logrus.FieldLogger
-	opts      Options
-	now       func() time.Time
-	retention uint64
-	chunkSize int
+	log  logrus.FieldLogger
+	opts Options
+	now  func() time.Time
+	// slotRetention is how long slot rows are kept.
+	slotRetention time.Duration
 
 	// lifecycle guards the fields below it.
 	lifecycle sync.Mutex
@@ -86,60 +70,46 @@ type service struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 
-	// healthMu guards health, the only state shared with Health callers.
+	// healthMu guards health and liveness, the state shared with Health and
+	// Liveness callers. liveness holds the settled epochs, ascending.
 	healthMu sync.RWMutex
 	health   fleet.NetworkHealth
+	liveness []epochLiveness
 
 	// Everything below belongs to the poll goroutine.
 	client *nodeClient
 	timing *chainTiming
-	// storedLoaded says the epochs already in the store were read.
-	storedLoaded bool
-	// handled holds the epochs that need no (further) liveness query: stored,
-	// or refused by the node as too old.
-	handled map[uint64]struct{}
-	// unsupported is set while the node does not serve the liveness
-	// endpoint; unsupportedNote says why and reprobeAt when to ask again.
-	unsupported     bool
-	unsupportedNote string
-	reprobeAt       time.Time
-	// noValidators is set while the host set last read has no validators.
-	noValidators bool
-	// prunedBefore is the last prune boundary applied.
-	prunedBefore uint64
 	// warned remembers warnings that are logged once.
 	warned map[string]struct{}
 	// timingWarned is the last warning about the chain timing that was
 	// logged: it is logged again when what it says changes.
 	timingWarned string
+	// head is the head the node reported in the last good poll; slots is the
+	// per-slot participation that follows it (slots.go).
+	head  headRef
+	slots *slotTracker
 }
 
 var _ Service = (*service)(nil)
 
 // New creates the beacon service. Nothing is contacted before Start.
-//
-//nolint:gocritic // hugeParam: Options by value is the agreed constructor shape; called once.
 func New(log logrus.FieldLogger, opts Options) Service {
 	svc := &service{
-		log:       log.WithField("package", "beacon"),
-		opts:      opts,
-		now:       opts.Now,
-		retention: opts.Retention,
-		chunkSize: opts.LivenessChunkSize,
-		handled:   make(map[uint64]struct{}, backfillEpochs+1),
-		warned:    make(map[string]struct{}, 4),
+		log:    log.WithField("package", "beacon"),
+		opts:   opts,
+		now:    opts.Now,
+		warned: make(map[string]struct{}, 4),
+
+		slotRetention: opts.SlotRetention,
+		slots:         newSlotTracker(),
+	}
+
+	if svc.slotRetention <= 0 {
+		svc.slotRetention = DefaultSlotRetention
 	}
 
 	if svc.now == nil {
 		svc.now = time.Now
-	}
-
-	if svc.retention == 0 {
-		svc.retention = DefaultRetention
-	}
-
-	if svc.chunkSize <= 0 {
-		svc.chunkSize = DefaultLivenessChunkSize
 	}
 
 	return svc
@@ -240,8 +210,8 @@ func (s *service) interval() time.Duration {
 	return max(s.timing.slotDuration(s.timing.epochAt(s.now())), minPollInterval)
 }
 
-// poll refreshes the chain view and, when that worked, the liveness rows.
-// The liveness summary is published from the stored rows either way.
+// poll refreshes the chain view and, when that worked, the per-slot
+// participation and the liveness summed from it.
 func (s *service) poll(ctx context.Context) {
 	now := s.now()
 
@@ -253,38 +223,10 @@ func (s *service) poll(ctx context.Context) {
 		s.log.WithError(err).Warn("Beacon node poll failed")
 		s.setHealth(func(h *fleet.NetworkHealth) { h.Error = err.Error() })
 
-		// The stored rows do not need the node: after a restart with the node
-		// down the view still shows the last stored epoch.
-		summaryErr := s.publishLiveness(ctx, err.Error())
-		if summaryErr != nil && ctx.Err() == nil {
-			s.log.WithError(summaryErr).Warn("Reading stored liveness failed")
-		}
-
 		return
 	}
 
-	err := s.refreshLiveness(ctx, now)
-
-	// While the endpoint is unsupported the note stays between probes.
-	note := s.unsupportedNote
-
-	if err != nil {
-		if ctx.Err() != nil {
-			return
-		}
-
-		note = err.Error()
-
-		// An unsupported endpoint was logged where it was detected.
-		if !errors.Is(err, errNotServed) {
-			s.log.WithError(err).Warn("Validator liveness refresh failed")
-		}
-	}
-
-	summaryErr := s.publishLiveness(ctx, note)
-	if summaryErr != nil && ctx.Err() == nil {
-		s.log.WithError(summaryErr).Warn("Reading stored liveness failed")
-	}
+	s.trackSlots(ctx, now)
 }
 
 // setHealth changes the published view under the lock.
@@ -331,6 +273,7 @@ type (
 
 	headResponse struct {
 		Data struct {
+			Root   string `json:"root"`
 			Header struct {
 				Message struct {
 					Slot *beaconUint `json:"slot"`
@@ -388,20 +331,14 @@ func (s *service) loadTiming(ctx context.Context) error {
 	return nil
 }
 
-// timingWarning is logged when the timing read from the node is out of
-// bounds.
-const timingWarning = "The chain timing of the beacon node is out of bounds"
+// timingWarning is logged when the timing read from the node is invalid.
+const timingWarning = "The chain timing of the beacon node is invalid: the network gate is closed " +
+	"and no host is found ready"
 
-// checkTiming validates the timing as it is published, on every poll: what
-// was read once is good or bad for the epoch the clock is in now. It returns
-// why the current epoch cannot be placed, or "" when it can.
-//
-// A phase that is out of bounds (fleet.ValidateTiming) is logged once, with
-// the reason and with what follows from it, and again when either changes:
-// while the phase lies in the future nothing is closed, the epochs before it
-// are placed as ever; once the clock is in it (or it is the first phase) no
-// epoch of now can be placed, and the scheduler closes the network gate with
-// the reason.
+// checkTiming validates the timing as it is published, on every poll. It
+// returns why the timing is invalid (fleet.ValidateTiming), or "" when it is
+// good. An invalid timing is logged once, and again when the reason changes;
+// the scheduler closes the network gate with the reason.
 func (s *service) checkTiming(current uint64, phases []fleet.SlotPhase) string {
 	err := fleet.ValidateTiming(s.timing.slotsPerEpoch, phases)
 	if err == nil {
@@ -411,25 +348,14 @@ func (s *service) checkTiming(current uint64, phases []fleet.SlotPhase) string {
 	}
 
 	reason := strings.TrimPrefix(err.Error(), fleet.ErrInvalidTiming.Error()+": ")
-	usable := fleet.TimingUsable(s.timing.slotsPerEpoch, phases, current)
 
-	effect := "the current epoch cannot be placed in time: the network gate is closed and no host is found ready"
-	if usable {
-		effect = "nothing is closed yet: the epochs before that phase are placed, the ones from it on are not"
-	}
-
-	if key := effect + "|" + reason; key != s.timingWarned {
-		s.timingWarned = key
+	if reason != s.timingWarned {
+		s.timingWarned = reason
 
 		s.log.WithFields(logrus.Fields{
 			"reason":        reason,
-			"effect":        effect,
 			"current_epoch": current,
 		}).Warn(timingWarning)
-	}
-
-	if usable {
-		return ""
 	}
 
 	return reason
@@ -448,7 +374,7 @@ func (s *service) refreshChain(ctx context.Context, now time.Time) error {
 
 	if slot%time.Second != 0 {
 		// NetworkHealth carries whole seconds only; the service itself keeps
-		// the exact duration for epochs and liveness timing.
+		// the exact duration for epochs and slots.
 		s.warnOnce("slot:"+slot.String(), logrus.Fields{
 			"slot_duration":    slot.String(),
 			"seconds_per_slot": slotSeconds,
@@ -490,6 +416,8 @@ func (s *service) refreshChain(ctx context.Context, now time.Time) error {
 
 	headSlot := uint64(*head.Data.Header.Message.Slot)
 	finalized := uint64(*finality.Data.Finalized.Epoch)
+
+	s.head = headRef{root: head.Data.Root, slot: headSlot}
 
 	var lag uint64
 	if current > finalized {

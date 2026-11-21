@@ -4,10 +4,15 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
+	"reflect"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
+
+// MinHostStaleAfter is the shortest HostStaleAfter the settings accept.
+const MinHostStaleAfter = 30 * time.Second
 
 // Policy says how needs of one kind are handled.
 type Policy string
@@ -18,8 +23,6 @@ const (
 	PolicyAuto Policy = "auto"
 	// PolicyManual queues the rollout and waits for a person to approve it.
 	PolicyManual Policy = "manual"
-	// PolicyPaused queues and grants nothing.
-	PolicyPaused Policy = "paused"
 )
 
 // Duration is a time.Duration that encodes as a Go duration string ("30m").
@@ -57,6 +60,10 @@ type Settings struct {
 	// MaxUnavailablePercent is the share of tracked validator weight that may
 	// be unavailable at once (0-100).
 	MaxUnavailablePercent float64 `json:"maxUnavailablePercent"`
+	// MaxIndependentPercent is the share of hosts (0-100) that may hold a
+	// lease for independent containers at once, at least one host. Those
+	// leases have no gate and no budget and count for no other limit.
+	MaxIndependentPercent float64 `json:"maxIndependentPercent"`
 	// MinParticipationPercent is the network gate's participation floor.
 	MinParticipationPercent float64 `json:"minParticipationPercent"`
 	// MaxFinalityLagEpochs is the network gate's finality lag ceiling.
@@ -65,7 +72,7 @@ type Settings struct {
 	// before its slot is released: the node at head with peers for this many
 	// epoch durations, and its validators attesting in this many consecutive
 	// complete epochs. 0 releases at the first healthy sync after the
-	// operation.
+	// operation. At most MaxReadyEpochs.
 	ReadyEpochs uint64 `json:"readyEpochs"`
 	// MinPeers is how many peers each of the execution and the consensus
 	// client must have for the node to count as back, at most. See
@@ -83,6 +90,11 @@ type Settings struct {
 	PolicyImage    Policy `json:"policyImage"`
 	PolicyPackages Policy `json:"policyPackages"`
 	PolicyReboot   Policy `json:"policyReboot"`
+	// PolicyClients is the image policy per client ("geth": "manual"). The
+	// image rollouts of a client that is listed answer to its entry; those
+	// of every other client, and of containers without a client, to
+	// PolicyImage.
+	PolicyClients ClientPolicies `json:"policyClients"`
 
 	// PauseAfterCanaryImage, PauseAfterCanaryPackages and
 	// PauseAfterCanaryReboot pause a rollout that serves needs of that kind
@@ -106,6 +118,7 @@ type Settings struct {
 func DefaultSettings() Settings {
 	return Settings{
 		MaxUnavailablePercent:   10,
+		MaxIndependentPercent:   10,
 		MinParticipationPercent: 90,
 		MaxFinalityLagEpochs:    3,
 		ReadyEpochs:             1,
@@ -119,25 +132,63 @@ func DefaultSettings() Settings {
 	}
 }
 
-// PolicyFor returns the policy for a need kind.
-func (s *Settings) PolicyFor(kind protocol.NeedKind) Policy {
-	switch kind {
-	case protocol.NeedImage:
-		return s.PolicyImage
-	case protocol.NeedPackages:
-		return s.PolicyPackages
-	case protocol.NeedReboot:
-		return s.PolicyReboot
-	default:
-		return PolicyPaused
+// ClientPolicies is an image policy per client. In JSON it is always an
+// object: none is {}, never null.
+type ClientPolicies map[string]Policy
+
+// MarshalJSON implements json.Marshaler.
+func (c ClientPolicies) MarshalJSON() ([]byte, error) {
+	if c == nil {
+		return []byte("{}"), nil
 	}
+
+	return json.Marshal(map[string]Policy(c))
+}
+
+// UnmarshalJSON implements json.Unmarshaler: the object replaces what was
+// there, and an empty one is no policies at all (nil).
+func (c *ClientPolicies) UnmarshalJSON(b []byte) error {
+	var m map[string]Policy
+	if err := json.Unmarshal(b, &m); err != nil {
+		return fmt.Errorf("policyClients must be an object of client to policy: %w", err)
+	}
+
+	if len(m) == 0 {
+		m = nil
+	}
+
+	*c = m
+
+	return nil
+}
+
+// MaxPolicyClients bounds PolicyClients.
+const MaxPolicyClients = 64
+
+// ImagePolicy is the policy the image rollouts of a client answer to: the
+// client's own when one is set, PolicyImage otherwise.
+func (s *Settings) ImagePolicy(client string) Policy {
+	if p, ok := s.PolicyClients[client]; ok && client != "" {
+		return p
+	}
+
+	return s.PolicyImage
+}
+
+// Equal reports whether two settings are the same; no client policies and an
+// empty set of them are.
+func (s *Settings) Equal(o *Settings) bool {
+	a, b := *s, *o
+	a.PolicyClients, b.PolicyClients = nil, nil
+
+	return reflect.DeepEqual(a, b) && maps.Equal(s.PolicyClients, o.PolicyClients)
 }
 
 // PauseAfterCanaryFor reports whether a rollout that serves needs of the kind
 // is paused when it has its first success.
 func (s *Settings) PauseAfterCanaryFor(kind protocol.NeedKind) bool {
 	switch kind {
-	case protocol.NeedImage:
+	case protocol.NeedImage, protocol.NeedSpec:
 		return s.PauseAfterCanaryImage
 	case protocol.NeedPackages:
 		return s.PauseAfterCanaryPackages
@@ -158,10 +209,18 @@ func (s *Settings) EffectiveMinPeers(nodes int) int {
 	return max(1, min(s.MinPeers, nodes/2))
 }
 
+// MaxReadyEpochs bounds Settings.ReadyEpochs: the beacon service keeps the
+// per-epoch liveness of this many epochs and a few more.
+const MaxReadyEpochs = 32
+
 // Validate checks value ranges.
 func (s *Settings) Validate() error {
 	if s.MaxUnavailablePercent < 0 || s.MaxUnavailablePercent > 100 {
 		return errors.New("maxUnavailablePercent must be between 0 and 100")
+	}
+
+	if !(s.MaxIndependentPercent >= 0 && s.MaxIndependentPercent <= 100) {
+		return errors.New("maxIndependentPercent must be between 0 and 100")
 	}
 
 	if s.MinParticipationPercent < 0 || s.MinParticipationPercent > 100 {
@@ -176,6 +235,10 @@ func (s *Settings) Validate() error {
 		return errors.New("minPeers must be at least 1")
 	}
 
+	if s.ReadyEpochs > MaxReadyEpochs {
+		return fmt.Errorf("readyEpochs must be at most %d", MaxReadyEpochs)
+	}
+
 	// Written so that NaN fails too.
 	if !(s.ReadyPeerShare >= 0 && s.ReadyPeerShare <= 1) {
 		return errors.New("readyPeerShare must be between 0 and 1")
@@ -185,7 +248,7 @@ func (s *Settings) Validate() error {
 		return errors.New("leaseTTL must be at least 1m")
 	}
 
-	if s.HostStaleAfter.Std() < 30*time.Second {
+	if s.HostStaleAfter.Std() < MinHostStaleAfter {
 		return errors.New("hostStaleAfter must be at least 30s")
 	}
 
@@ -194,8 +257,22 @@ func (s *Settings) Validate() error {
 	}
 
 	for _, p := range []Policy{s.PolicyImage, s.PolicyPackages, s.PolicyReboot} {
-		if p != PolicyAuto && p != PolicyManual && p != PolicyPaused {
+		if p != PolicyAuto && p != PolicyManual {
 			return fmt.Errorf("invalid policy %q", p)
+		}
+	}
+
+	if len(s.PolicyClients) > MaxPolicyClients {
+		return fmt.Errorf("policyClients lists more than %d clients", MaxPolicyClients)
+	}
+
+	for client, p := range s.PolicyClients {
+		if !protocol.ValidClient(client) {
+			return fmt.Errorf("policyClients: %q is not a client name", client)
+		}
+
+		if p != PolicyAuto && p != PolicyManual {
+			return fmt.Errorf("policyClients: invalid policy %q for %s", p, client)
 		}
 	}
 

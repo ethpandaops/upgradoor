@@ -11,11 +11,13 @@ import (
 	logrustest "github.com/sirupsen/logrus/hooks/test"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/upgradoor/pkg/agent"
 )
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
-func TestLoadCredentials(t *testing.T) {
+func TestLoadLogins(t *testing.T) {
 	path := writeAuthFile(t, `{
 		"auths": {
 			"https://index.docker.io/v1/": {"auth": "`+b64("hub:hub-pass")+`"},
@@ -23,57 +25,69 @@ func TestLoadCredentials(t *testing.T) {
 			"http://plain.example:5000/": {"username": "plain", "password": "p"},
 			"https://quay.io/v2/some/path": {"username": "quay", "password": ""},
 			"empty.example": {},
-			"identity.example": {"identitytoken": "ignored"},
+			"padded.example": {"auth": "`+b64("pad:secret\x00\x00")+`"},
 			"both.example": {"auth": "`+b64("from-auth:1")+`", "username": "from-fields", "password": "2"}
 		},
 		"HttpHeaders": {"User-Agent": "x"}
 	}`)
 
-	creds, unsupported, err := loadCredentials(testLogger(), path)
-	require.NoError(t, err)
-	require.False(t, unsupported)
-	require.Equal(t, map[string]credentials{
-		"docker.io":          {username: "hub", password: "hub-pass"},
-		"ghcr.io":            {username: "gh", password: "pa:ss:word"},
-		"plain.example:5000": {username: "plain", password: "p"},
-		"quay.io":            {username: "quay", password: ""},
-		"both.example":       {username: "from-auth", password: "1"},
-	}, creds)
+	log, hook := logrustest.NewNullLogger()
 
-	require.Equal(t, "Basic "+b64("gh:pa:ss:word"), creds["ghcr.io"].basic())
+	logins, err := LoadLogins(log, path)
+	require.NoError(t, err)
+	require.Empty(t, hook.AllEntries(), "nothing to warn about")
+	require.Equal(t, Logins{
+		"docker.io":          {Username: "hub", Password: "hub-pass"},
+		"ghcr.io":            {Username: "gh", Password: "pa:ss:word"},
+		"plain.example:5000": {Username: "plain", Password: "p"},
+		"quay.io":            {Username: "quay", Password: ""},
+		"padded.example":     {Username: "pad", Password: "secret"},
+		"both.example":       {Username: "from-auth", Password: "1"},
+	}, logins)
+
+	require.Equal(t, "Basic "+b64("gh:pa:ss:word"), logins["ghcr.io"].basic())
+
+	user, pass, ok := logins.Lookup("ghcr.io")
+	require.True(t, ok)
+	require.Equal(t, "gh", user)
+	require.Equal(t, "pa:ss:word", pass)
+
+	_, _, ok = logins.Lookup("other.example")
+	require.False(t, ok)
 }
 
-func TestAuthHost(t *testing.T) {
-	cases := map[string]string{
-		"https://index.docker.io/v1/": dockerHubHost,
-		"index.docker.io":             dockerHubHost,
-		"registry-1.docker.io":        dockerHubHost,
-		"docker.io":                   dockerHubHost,
-		"https://Docker.IO":           dockerHubHost,
-		"ghcr.io":                     "ghcr.io",
-		"http://localhost:5000/v2/":   "localhost:5000",
-		"":                            "",
+// What cannot be used is said once, at start, and the registry is then
+// accessed anonymously by the lookups and the pulls alike.
+func TestLoadLoginsWarnsAboutWhatItCannotUse(t *testing.T) {
+	for name, content := range map[string]string{
+		"credential store":  `{"credsStore":"desktop"}`,
+		"credential helper": `{"credHelpers":{"ghcr.io":"gh"},"auths":{"ghcr.io":{}}}`,
+		"identity token":    `{"auths":{"ghcr.io":{"identitytoken":"secret-token"}}}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			log, hook := logrustest.NewNullLogger()
+
+			logins, err := LoadLogins(log, writeAuthFile(t, content))
+			require.NoError(t, err)
+			require.Empty(t, logins)
+			require.Len(t, hook.AllEntries(), 1)
+			assert.Equal(t, logrus.WarnLevel, hook.LastEntry().Level)
+			assert.Contains(t, hook.LastEntry().Message, "not supported")
+
+			line, err := hook.LastEntry().String()
+			require.NoError(t, err)
+			assert.NotContains(t, line, "secret-token")
+		})
 	}
-
-	for in, want := range cases {
-		require.Equal(t, want, authHost(in), in)
-	}
 }
 
-func TestLoadCredentialsMissingFileIsAnonymous(t *testing.T) {
-	missing := filepath.Join(t.TempDir(), "nope", "config.json")
-
-	creds, unsupported, err := loadCredentials(testLogger(), missing)
+func TestLoadLoginsMissingFileIsAnonymous(t *testing.T) {
+	logins, err := LoadLogins(testLogger(), filepath.Join(t.TempDir(), "nope", "config.json"))
 	require.NoError(t, err)
-	require.False(t, unsupported)
-	require.Empty(t, creds)
-
-	r, err := New(testLogger(), Options{AuthFile: missing})
-	require.NoError(t, err)
-	require.Empty(t, r.creds)
+	require.Empty(t, logins)
 }
 
-func TestLoadCredentialsErrors(t *testing.T) {
+func TestLoadLoginsErrors(t *testing.T) {
 	const secret = "c2VjcmV0LXZhbHVl!"
 
 	cases := []struct {
@@ -90,25 +104,22 @@ func TestLoadCredentialsErrors(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			path := writeAuthFile(t, c.content)
 
-			_, _, err := loadCredentials(testLogger(), path)
+			_, err := LoadLogins(testLogger(), path)
 			require.ErrorContains(t, err, c.want)
 			require.NotContains(t, err.Error(), secret)
 			require.NotContains(t, err.Error(), "justuser")
-
-			_, err = New(testLogger(), Options{AuthFile: path})
-			require.ErrorContains(t, err, c.want)
 		})
 	}
 
 	// A path that exists but cannot be read as a file.
-	_, _, err := loadCredentials(testLogger(), t.TempDir())
+	_, err := LoadLogins(testLogger(), t.TempDir())
 	require.ErrorContains(t, err, "read auth file")
 }
 
-// TestLoadCredentialsAliasPrecedence covers auth files in which several keys
+// TestLoadLoginsAliasPrecedence covers auth files in which several keys
 // name one registry. Go randomizes map iteration, so every case is loaded
 // many times: the winner must never change.
-func TestLoadCredentialsAliasPrecedence(t *testing.T) {
+func TestLoadLoginsAliasPrecedence(t *testing.T) {
 	entry := func(key, user string) string {
 		return `"` + key + `": {"auth": "` + b64(user+":pw-"+user) + `"}`
 	}
@@ -124,7 +135,7 @@ func TestLoadCredentialsAliasPrecedence(t *testing.T) {
 		{
 			"exact host over the legacy index url",
 			[]string{entry("https://index.docker.io/v1/", "legacy"), entry("docker.io", "exact")},
-			dockerHubHost, "exact", "docker.io", []string{"https://index.docker.io/v1/"},
+			agent.DockerHubHost, "exact", "docker.io", []string{"https://index.docker.io/v1/"},
 		},
 		{
 			"exact host over a bare alias over a url",
@@ -133,17 +144,17 @@ func TestLoadCredentialsAliasPrecedence(t *testing.T) {
 				entry("registry-1.docker.io", "alias"),
 				entry("docker.io", "exact"),
 			},
-			dockerHubHost, "exact", "docker.io", []string{"registry-1.docker.io", "https://index.docker.io/v1/"},
+			agent.DockerHubHost, "exact", "docker.io", []string{"registry-1.docker.io", "https://index.docker.io/v1/"},
 		},
 		{
 			"bare alias over a url",
 			[]string{entry("https://index.docker.io/v1/", "legacy"), entry("registry-1.docker.io", "alias")},
-			dockerHubHost, "alias", "registry-1.docker.io", []string{"https://index.docker.io/v1/"},
+			agent.DockerHubHost, "alias", "registry-1.docker.io", []string{"https://index.docker.io/v1/"},
 		},
 		{
 			"equal rank: the key that sorts first",
 			[]string{entry("registry-1.docker.io", "api"), entry("index.docker.io", "index")},
-			dockerHubHost, "index", "index.docker.io", []string{"registry-1.docker.io"},
+			agent.DockerHubHost, "index", "index.docker.io", []string{"registry-1.docker.io"},
 		},
 		{
 			"urls of one host",
@@ -153,7 +164,7 @@ func TestLoadCredentialsAliasPrecedence(t *testing.T) {
 		{
 			"an entry without a login does not shadow one with",
 			[]string{`"docker.io": {}`, entry("https://index.docker.io/v1/", "legacy")},
-			dockerHubHost, "legacy", "", nil,
+			agent.DockerHubHost, "legacy", "", nil,
 		},
 	}
 
@@ -164,11 +175,9 @@ func TestLoadCredentialsAliasPrecedence(t *testing.T) {
 			for range 64 {
 				log, hook := logrustest.NewNullLogger()
 
-				creds, _, err := loadCredentials(log, path)
+				logins, err := LoadLogins(log, path)
 				require.NoError(t, err)
-				require.Equal(t, map[string]credentials{
-					c.host: {username: c.want, password: "pw-" + c.want},
-				}, creds)
+				require.Equal(t, Logins{c.host: {Username: c.want, Password: "pw-" + c.want}}, logins)
 
 				ignored := make([]string, 0, len(c.ignored))
 
@@ -192,23 +201,5 @@ func TestLoadCredentialsAliasPrecedence(t *testing.T) {
 				}
 			}
 		})
-	}
-}
-
-func TestAuthKeyRank(t *testing.T) {
-	cases := map[string]int{
-		"docker.io":                   0,
-		"ghcr.io":                     0,
-		"localhost:5000":              0,
-		"registry-1.docker.io":        1,
-		"index.docker.io":             1,
-		"GHCR.io":                     1,
-		"https://index.docker.io/v1/": 2,
-		"http://ghcr.io":              2,
-		"ghcr.io/v2/":                 2,
-	}
-
-	for key, want := range cases {
-		require.Equal(t, want, authKeyRank(key), key)
 	}
 }

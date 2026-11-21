@@ -8,6 +8,10 @@
 //
 // All bodies are JSON, optionally gzip-encoded (Content-Encoding: gzip). The
 // request proof (pkg/identity) covers the body bytes as sent on the wire.
+//
+// The agents and the controller of a devnet are always the same build.
+// Nothing here provides for a peer of another one: a field is what this build
+// writes and reads, and a peer that speaks another Version is refused.
 package protocol
 
 import (
@@ -57,6 +61,9 @@ type SyncRequest struct {
 	Hold Hold `json:"hold"`
 
 	Containers []Container `json:"containers"`
+	// Validators is the host's validator range, read locally. Absent: the
+	// host has no validators.
+	Validators *Validators `json:"validators,omitempty"`
 	Node       NodeHealth  `json:"node"`
 	OS         OSSummary   `json:"os"`
 	Pending    Pending     `json:"pending"`
@@ -99,12 +106,80 @@ const (
 	KindOther ContainerKind = "other"
 )
 
+// Impact says what restarting a managed container takes away, and so how
+// the controller schedules work on it.
+type Impact string
+
+// Impact classes, from the heaviest to the lightest.
+const (
+	// ImpactNode: the container is part of the node. Work on it counts the
+	// host's validators against the availability budget, takes a place in
+	// the host limit, waits for the network gate, and is ready when the node
+	// is back at head with peers and its validators attest.
+	ImpactNode Impact = "node"
+	// ImpactSlot: the container counts for the host limit and the network
+	// gate, not for the validator budget; it is ready when it ran through the
+	// verify window.
+	ImpactSlot Impact = "slot"
+	// ImpactIndependent: the container touches neither the node nor the
+	// network. Work on it has its own limit (Settings.MaxIndependentPercent),
+	// no gate and no budget; it is ready when it ran through the verify
+	// window.
+	ImpactIndependent Impact = "independent"
+)
+
+// DefaultImpact is the impact of a container of a kind that names none:
+// independent for KindOther, node for the node's own containers.
+func DefaultImpact(kind ContainerKind) Impact {
+	if kind == KindOther {
+		return ImpactIndependent
+	}
+
+	return ImpactNode
+}
+
+// Valid reports whether the impact is one of the classes.
+func (i Impact) Valid() bool {
+	return i == ImpactNode || i == ImpactSlot || i == ImpactIndependent
+}
+
+// rank orders the classes: a lease that serves several is as heavy as the
+// heaviest.
+func (i Impact) rank() int {
+	switch i {
+	case ImpactIndependent:
+		return 0
+	case ImpactSlot:
+		return 1
+	default:
+		return 2
+	}
+}
+
+// Heavier returns the heavier of two classes. The empty class counts as
+// node.
+func (i Impact) Heavier(o Impact) Impact {
+	if i == "" || o == "" {
+		return ImpactNode
+	}
+
+	if o.rank() > i.rank() {
+		return o
+	}
+
+	return i
+}
+
 // Docker container states.
 const (
 	StateRunning    = "running"
 	StateRestarting = "restarting"
-	StateExited     = "exited"
-	StateDead       = "dead"
+	// StateMissing is the state the agent reports for a managed container
+	// that does not exist. The agent never creates a container: the first
+	// deployment is Ansible's.
+	StateMissing = "missing"
+	StateExited  = "exited"
+	StateDead    = "dead"
 )
 
 // Container is one Docker container on the host.
@@ -136,23 +211,92 @@ type Container struct {
 	// Managed is true for containers listed in the agent configuration.
 	Managed bool          `json:"managed"`
 	Kind    ContainerKind `json:"kind,omitempty"`
+	// Impact is the container's impact class from the agent configuration;
+	// absent for unmanaged containers.
+	Impact Impact `json:"impact,omitempty"`
 	// ConfiguredImage is the image reference from the agent configuration.
 	ConfiguredImage string `json:"configuredImage,omitempty"`
-	// Custom is true for a managed container whose Image differs from
-	// ConfiguredImage. Custom containers are never rolled.
-	Custom bool `json:"custom,omitempty"`
 
-	// Registry is the last registry check for Image; nil for unmanaged and
-	// custom containers.
+	// Registry is the last registry check for Image; nil for unmanaged
+	// containers.
 	Registry *RegistryCheck `json:"registry,omitempty"`
 
 	// Owners are the teams that own a managed container, from the agent
 	// configuration: sorted, at most MaxOwners, each a team name (ValidOwner).
-	// Absent for unmanaged containers, for containers nobody owns and from
-	// agents built before the field existed. The controller authorizes the
-	// actions of team members with it and serves it to authenticated users
-	// only.
+	// Absent for unmanaged containers and for containers nobody owns. The
+	// controller authorizes the actions of team members with it and serves it
+	// to authenticated users only.
 	Owners []string `json:"owners,omitempty"`
+
+	// Client is the client software a managed container runs ("geth",
+	// "lighthouse"), from the agent configuration (ValidClient). A validator
+	// client container carries the client of its consensus client. Absent for
+	// containers that are not listed under a client.
+	Client string `json:"client,omitempty"`
+
+	// Command is the command line of a managed container (the arguments
+	// after the entrypoint), which is what a flag override changes. Like the
+	// owners it is served to authenticated users only.
+	Command []string `json:"command,omitempty"`
+	// Override is the entry of the host's overrides file for a managed
+	// container, or what is left to undo of one that is gone. Absent when
+	// the container runs what the agent configuration says.
+	Override *ContainerOverride `json:"override,omitempty"`
+	// Overridable says what the agent configuration lets the controller
+	// override on this container. Absent when nothing.
+	Overridable *Overridable `json:"overridable,omitempty"`
+
+	// Base is what the container's own labels say it was before an override
+	// changed it. It is not part of the wire format: the agent's container
+	// runtime fills it for the agent.
+	Base *OverrideBase `json:"-"`
+}
+
+// OverrideBase is a container's form before an override, as its labels
+// record it.
+type OverrideBase struct {
+	// Image is the configured image reference of a container that was put
+	// on an override image; empty when its image was not overridden.
+	Image string
+	// Command is the command line before a flag override, when HasCommand.
+	Command    []string
+	HasCommand bool
+}
+
+// ContainerOverride is the override of one managed container, as the host's
+// overrides file states it. The host is its only source: the controller
+// stores none and shows what the agents report.
+type ContainerOverride struct {
+	// Image is the image reference the container runs instead of the
+	// configured one; empty when the image is not overridden.
+	Image string `json:"image,omitempty"`
+	// AddFlags and RemoveFlags change the container's command line.
+	AddFlags    []string `json:"addFlags,omitempty"`
+	RemoveFlags []string `json:"removeFlags,omitempty"`
+	// By and Reason are who set the override and why, as the file says. For
+	// an override set through the controller By is the user the controller
+	// named; the host cannot verify it.
+	By     string `json:"by,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	// Until is when the override ends; absent for one without an end.
+	Until *time.Time `json:"until,omitempty"`
+	// Applied is true when the container runs what the override asks for.
+	Applied bool `json:"applied"`
+	// Restoring is true when the entry is gone (cleared or expired) and the
+	// container still runs it: it waits for a lease to be put back.
+	Restoring bool `json:"restoring,omitempty"`
+	// Error says why the override cannot be applied as written.
+	Error string `json:"error,omitempty"`
+}
+
+// Overridable is what the agent configuration lets the controller override
+// on a container.
+type Overridable struct {
+	// Images are the allowed image repository patterns; empty when image
+	// overrides are off.
+	Images []string `json:"images,omitempty"`
+	// Flags is true when flag overrides are on.
+	Flags bool `json:"flags,omitempty"`
 }
 
 // ShouldRun reports whether the container is meant to be running: it runs,
@@ -179,7 +323,9 @@ func (c *Container) ShouldRun() bool {
 type RegistryCheck struct {
 	// Digest is the manifest digest the tag points at (the index digest for
 	// multi-arch tags).
-	Digest    string    `json:"digest,omitempty"`
+	Digest string `json:"digest,omitempty"`
+	// Revision is the revision label of the image for Digest, read from the
+	// local image: it is empty until that image is pulled.
 	Revision  string    `json:"revision,omitempty"`
 	CheckedAt time.Time `json:"checkedAt"`
 	// Error is the last check error; Digest then holds the last good value.
@@ -284,8 +430,26 @@ type SyncResponse struct {
 	Lease *Lease `json:"lease,omitempty"`
 	// Directives are all outstanding directives for the host.
 	Directives []Directive `json:"directives,omitempty"`
-	// Queue explains why the host is waiting; for logs only.
+	// Queue explains why the host is waiting; for logs and the host's local
+	// status only.
 	Queue *Queue `json:"queue,omitempty"`
+	// Ended is the host's newest lease when it is over and the host holds
+	// none: how it ended, for the host's local status only. The agent acts
+	// on nothing of it.
+	Ended *EndedLease `json:"ended,omitempty"`
+	// NextSyncMillis is when the controller wants the next sync, in
+	// milliseconds from now: paced by fleet size and controller load, short
+	// while the host has something to do. The agent keeps it within its
+	// local bounds.
+	NextSyncMillis int64 `json:"nextSyncMillis"`
+}
+
+// EndedLease says how a lease ended.
+type EndedLease struct {
+	ID string `json:"id"`
+	// State is released, failed or expired.
+	State  string `json:"state"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // Queue is a queued host's position and one-line waiting reason.

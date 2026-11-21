@@ -22,25 +22,28 @@ const (
 	maxResponseBody = 4 << 20
 )
 
-// controllerClient posts authenticated requests to the controller.
+// controllerClient posts authenticated requests to the controller and hands
+// out only answers the controller has authenticated itself for.
 type controllerClient struct {
 	baseURL string
 	creds   *identity.Credentials
+	// answers verifies the controller's signature on every answer. Nil only
+	// with controller.allowUnsignedAnswers: answers are then taken as sent,
+	// and a signed one is refused, because nothing can check it.
+	answers *identity.AnswerVerifier
 	http    *http.Client
 	now     func() time.Time
 }
 
 func newControllerClient(
-	baseURL string, creds *identity.Credentials, client *http.Client, now func() time.Time,
+	baseURL string, creds *identity.Credentials, answers *identity.AnswerVerifier,
+	now func() time.Time,
 ) *controllerClient {
-	if client == nil {
-		client = &http.Client{Timeout: defaultRequestTimeout}
-	}
-
 	return &controllerClient{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		creds:   creds,
-		http:    client,
+		answers: answers,
+		http:    &http.Client{Timeout: defaultRequestTimeout},
 		now:     now,
 	}
 }
@@ -68,6 +71,13 @@ func (c *controllerClient) Inventory(ctx context.Context, inv *protocol.Inventor
 // post sends in as gzip-encoded JSON with the host certificate and a fresh
 // proof over the method, the full URL and the body bytes as sent, and
 // decodes the answer into out.
+//
+// out is filled only from an answer that carries a controller signature
+// naming this host and this very request (the id of its proof) over the
+// answer's bytes. Anything else is an identity.ErrBadAnswer and leaves out
+// untouched. An error answer (non-2xx) is never signed and never more than an
+// error to log. Without controller keys (controller.allowUnsignedAnswers,
+// development only) the answer is taken as sent.
 func (c *controllerClient) post(ctx context.Context, path string, in, out any) error {
 	raw, err := json.Marshal(in)
 	if err != nil {
@@ -88,7 +98,7 @@ func (c *controllerClient) post(ctx context.Context, path string, in, out any) e
 
 	target := c.baseURL + path
 
-	proof, err := c.creds.Proof(http.MethodPost, target, body.Bytes(), c.now())
+	proof, proofID, err := c.creds.Proof(http.MethodPost, target, body.Bytes(), c.now())
 	if err != nil {
 		return fmt.Errorf("sign request: %w", err)
 	}
@@ -123,6 +133,15 @@ func (c *controllerClient) post(ctx context.Context, path string, in, out any) e
 
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		return controllerError(path, resp.StatusCode, answer, c.now())
+	}
+
+	if c.answers != nil {
+		if answer, err = c.answers.Verify(proofID, answer); err != nil {
+			return fmt.Errorf("answer of %s: %w", path, err)
+		}
+	} else if identity.IsSignedAnswer(answer) {
+		return fmt.Errorf("answer of %s: the controller signs its answers and "+
+			"controller.allowUnsignedAnswers is set: configure controller.publicKeys", path)
 	}
 
 	if err := json.Unmarshal(answer, out); err != nil {

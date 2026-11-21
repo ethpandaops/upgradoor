@@ -46,16 +46,13 @@ type handledDirective struct {
 	ID     string                   `json:"id"`
 	Status protocol.DirectiveStatus `json:"status"`
 	Error  string                   `json:"error,omitempty"`
-	At     time.Time                `json:"at"`
 }
 
 // operationRecord is a lease with the agent's work on it.
 type operationRecord struct {
 	Lease protocol.Lease `json:"lease"`
-	// ReceivedAt is when the lease was first seen.
-	ReceivedAt time.Time `json:"receivedAt"`
-	// Deadline is the earlier of Lease.ExpiresAt and ReceivedAt plus
-	// Lease.TTLSeconds. An operation never starts after it.
+	// Deadline is the earlier of Lease.ExpiresAt and the time the lease was
+	// first seen plus Lease.TTLSeconds. An operation never starts after it.
 	Deadline  time.Time          `json:"deadline"`
 	Operation protocol.Operation `json:"operation"`
 

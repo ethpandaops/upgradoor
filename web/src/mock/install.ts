@@ -2,13 +2,16 @@
 // in-browser MockController instead of a controller.
 //
 //   VITE_MOCK=1 npm run dev        every page load is mocked (open mode)
-//   VITE_MOCK=1 npm run build      a build that is always mocked
 //   ?mock                          open mode: no login, everything visible
 //   ?mock=auth                     an auth provider is configured; a fake
 //                                  authenticatoor client provides Login / Logout
 //   ?mock=unreachable              an auth provider is configured but its
 //                                  client script cannot be loaded
 //   &gate=fail                     start with a failing network gate
+//   &fleet=large                   three hundred hosts in the middle of a
+//                                  rolling update, some of them offline
+//   &fleet=huge                    the same with twelve hundred hosts
+//   &fleet=quiet                   the small fleet with nothing going on
 //   ?mock=auth&as=team             who the fake client is logged in as:
 //                                  staff (every feature), team (the team
 //                                  features, member of lighthouse) or reader
@@ -22,13 +25,15 @@ import type { AuthTokenInfo, AuthenticatoorClient } from '../auth/authStore';
 import { MOCK_AUTH_SERVICE, MOCK_LOGINS, MockController, mockHasFeature, type MockProfile } from './mockController';
 import type { MockMode } from './mode';
 
-export interface MockHandle {
-  mode: MockMode;
+interface MockHandle {
   fetch: FetchFn;
   controller: MockController;
   /** client is the fake auth client of auth mode. */
   client?: FakeAuthenticatoor;
 }
+
+/** How often the mock publishes what the passing of time changed. */
+const MOCK_SYNC_MS = 5000;
 
 const LOGIN_KEY = 'upgradoor.mock.loggedIn';
 const PROFILE_KEY = 'upgradoor.mock.profile';
@@ -144,8 +149,13 @@ export function fakeAuthenticatoor(
 
 /** installMock creates the mock controller and, in auth mode, the fake auth client. */
 export function installMock(mode: MockMode, search: string): MockHandle {
-  const controller = new MockController({ auth: mode !== 'open', latencyMs: 120 });
   const params = new URLSearchParams(search);
+  const fleet = params.get('fleet');
+  const controller = new MockController({
+    auth: mode !== 'open',
+    latencyMs: 120,
+    fleet: fleet === 'large' || fleet === 'huge' || fleet === 'quiet' ? fleet : 'small',
+  });
   let client: FakeAuthenticatoor | undefined;
 
   if (params.get('gate') === 'fail') controller.setGateFailing(true);
@@ -156,5 +166,12 @@ export function installMock(mode: MockMode, search: string): MockHandle {
     window.ethpandaops = { ...window.ethpandaops, authenticatoor: client };
   }
 
-  return { mode, fetch: controller.fetch, controller, client };
+  // Nobody syncs with the mock, but its views move with the clock (last
+  // seen, the chain's head). Publishing now and then stands for the agents'
+  // syncs, so the page gets its updates over the stream as it would live.
+  window.setInterval(() => {
+    controller.publish();
+  }, MOCK_SYNC_MS);
+
+  return { fetch: controller.fetch, controller, client };
 }

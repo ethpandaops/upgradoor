@@ -2,7 +2,7 @@ import { list, type Lease, type Need, type PeerCheck } from '../api/types';
 import { formatDuration, secondsBetween } from '../lib/format';
 import { endLeaseIntent } from '../lib/intents';
 import { ShortId } from './Digest';
-import { ActionButton } from './Permissions';
+import { ActionIcon } from './icons';
 import { RelTime } from './RelTime';
 import { Badge, Dash, Table, Td, Th } from './primitives';
 import { LeaseStateBadge, StepBadge, needSummary } from './status';
@@ -11,6 +11,8 @@ function stepLabel(needs: readonly Need[], needId: string): string {
   const need = needs.find(n => n.id === needId);
   if (!need) return needId;
   if (need.kind === 'image') return need.image?.container ?? 'image';
+  if (need.kind === 'override') return need.override?.container ?? 'override';
+  if (need.kind === 'spec') return need.spec?.container ?? 'spec';
   return need.kind;
 }
 
@@ -88,15 +90,18 @@ export function LeaseTable({
                 <ShortId value={l.id} label="lease" />
               </Td>
               {showHost && <Td className="font-medium">{l.host}</Td>}
-              <Td>
+              <Td className="min-w-28">
                 <span className="inline-flex items-center gap-1">
                   <LeaseStateBadge state={l.state} />
                   {l.force && <Badge tone="warning">force</Badge>}
                   {ending && <span className="text-muted">ending (cancelled by {l.cancelled?.by})</span>}
                 </span>
               </Td>
-              <Td>{l.operation ? <span className="font-mono">{l.operation.phase}</span> : <Dash />}</Td>
-              <Td>
+              {/* The phase, the note and the times change while a lease runs: their columns keep their width. */}
+              <Td className="min-w-24">
+                {l.operation ? <span className="font-mono">{l.operation.phase}</span> : <Dash />}
+              </Td>
+              <Td className="min-w-48">
                 <span className="inline-flex flex-wrap gap-1">
                   {steps.length > 0
                     ? steps.map(s => {
@@ -118,7 +123,8 @@ export function LeaseTable({
                       ))}
                 </span>
               </Td>
-              <Td className="max-w-sm whitespace-normal">
+              {/* The one column that takes the room that is left: the others stay as wide as their content. */}
+              <Td className="w-full min-w-72 whitespace-normal">
                 {l.error ? (
                   <span className="text-danger">{l.error}</span>
                 ) : l.operation?.error ? (
@@ -135,30 +141,26 @@ export function LeaseTable({
               </Td>
               <Td>{l.grantedBy}</Td>
               <Td>
-                <RelTime value={l.grantedAt} />
+                <RelTime fixed value={l.grantedAt} />
               </Td>
               <Td>
-                <RelTime value={closed ? l.endedAt : l.expiresAt} />
+                <RelTime fixed value={closed ? l.endedAt : l.expiresAt} />
               </Td>
               {closed && <Td>{took === null ? <Dash /> : formatDuration(took)}</Td>}
               {onEnd && (
                 <Td>
-                  <ActionButton
-                    dense
-                    variant="danger"
-                    disabled={ending}
-                    title={
-                      ending
-                        ? 'This lease is ending: it stays open until the agent reports or the lease expires.'
-                        : 'End this lease: the agent stops after the step in progress and the host is put on hold'
+                  <ActionIcon
+                    icon="abort"
+                    tone="danger"
+                    label={`End the lease of ${l.host}`}
+                    blocked={
+                      ending ? 'This lease is ending: it stays open until the agent reports or the lease runs out' : ''
                     }
                     intent={endLeaseIntent(l.id, l.host)}
                     onAction={() => {
                       onEnd(l);
                     }}
-                  >
-                    End…
-                  </ActionButton>
+                  />
                 </Td>
               )}
             </tr>

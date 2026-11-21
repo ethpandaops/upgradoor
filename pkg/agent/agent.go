@@ -5,8 +5,9 @@
 // lease and only when the local configuration allows the verb and no hold is
 // in effect:
 //
-//  1. roll: recreate a managed, non-custom container on the digest its own
-//     tag points at, after verifying that the pulled digest equals the
+//  1. roll: recreate an existing managed container (it never creates one) on
+//     the digest its own tag points at, or with the image and command line
+//     agent.yaml and the overrides file say, after verifying that the pulled digest equals the
 //     digest in the lease;
 //  2. packages: apt-get install --only-upgrade for the configured blocked
 //     packages;
@@ -42,6 +43,7 @@ package agent
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -61,22 +63,31 @@ type Service interface {
 // ContainerRuntime is the agent's view of Docker (pkg/agent/docker).
 type ContainerRuntime interface {
 	// Observe lists all containers (running or not). It fills every field
-	// the daemon knows; Managed, Kind, ConfiguredImage, Custom and Registry
+	// the daemon knows; Managed, Kind, ConfiguredImage and Registry
 	// are left for the caller.
 	Observe(ctx context.Context) ([]protocol.Container, error)
-	// LocalDigest returns the registry manifest digest of the local image
-	// that ref (a tag reference) currently names, or "" when the image is
-	// absent or has no digest for that repository.
-	LocalDigest(ctx context.Context, ref string) (string, error)
-	// Pull pulls ref and returns its digest as LocalDigest would. Pulling
-	// does not touch running containers.
-	Pull(ctx context.Context, ref string) (string, error)
+	// LocalImage describes the local image that ref (a tag reference)
+	// currently names: its registry manifest digest, "" when the image is
+	// absent or has no digest for that repository, and its revision label
+	// (org.opencontainers.image.revision), "" when it carries none.
+	LocalImage(ctx context.Context, ref string) (digest, revision string, err error)
+	// Pull pulls ref and returns what LocalImage then would. Pulling does
+	// not touch running containers.
+	Pull(ctx context.Context, ref string) (digest, revision string, err error)
 	// Recreate replaces the container by one with identical configuration
 	// created from the local image its own image reference now names. It
-	// fails with ErrDigestMismatch, before stopping anything, unless
-	// LocalDigest(reference) equals digest. With start false the new
+	// fails with ErrDigestMismatch, before stopping anything, unless digest
+	// is a registry digest of that image. With start false the new
 	// container is created but not started.
 	Recreate(ctx context.Context, name, digest string, stopTimeout time.Duration, start bool) error
+	// RecreateAs is Recreate with a change: the replacement is created from
+	// another image reference, with another command line, or with other
+	// labels. The digest is then verified against the image the replacement
+	// is created from. The zero Recreation changes nothing.
+	RecreateAs(
+		ctx context.Context, name, digest string, stopTimeout time.Duration, start bool,
+		change Recreation,
+	) error
 	// Stop stops a container, waiting up to timeout before killing it. A
 	// container that is not running is not an error.
 	Stop(ctx context.Context, name string, timeout time.Duration) error
@@ -84,11 +95,56 @@ type ContainerRuntime interface {
 	Start(ctx context.Context, name string) error
 }
 
+// Recreation is what a recreate changes about a container. Everything it
+// does not name stays as the existing recreate keeps it.
+type Recreation struct {
+	// Image is the image reference of the replacement; empty keeps the
+	// container's own.
+	Image string
+	// Command replaces the command line (the arguments after the
+	// entrypoint) when SetCommand is true.
+	Command    []string
+	SetCommand bool
+	// Labels sets the labels with a value and removes those with nil.
+	Labels map[string]*string
+}
+
+// Zero reports whether the recreation changes nothing.
+func (r *Recreation) Zero() bool {
+	return r.Image == "" && !r.SetCommand && len(r.Labels) == 0
+}
+
+// BaseFromLabels reads what a container was before an override from its
+// labels; nil when it carries none of them.
+func BaseFromLabels(labels map[string]string) *protocol.OverrideBase {
+	image := labels[LabelOverrideImage]
+	raw, hasCommand := labels[LabelOverrideCommand]
+
+	if image == "" && !hasCommand {
+		return nil
+	}
+
+	base := &protocol.OverrideBase{Image: image}
+
+	if hasCommand {
+		// A label that does not read as a list of strings is no record.
+		if err := json.Unmarshal([]byte(raw), &base.Command); err == nil {
+			base.HasCommand = true
+		}
+	}
+
+	if base.Image == "" && !base.HasCommand {
+		return nil
+	}
+
+	return base
+}
+
 // Registry resolves tags (pkg/agent/registry).
 type Registry interface {
 	// Resolve returns the manifest digest ref points at (the index digest
-	// for multi-arch tags) and, when cheap to get, its revision label.
-	Resolve(ctx context.Context, ref string) (digest, revision string, err error)
+	// for multi-arch tags).
+	Resolve(ctx context.Context, ref string) (string, error)
 }
 
 // System is the agent's view of the OS (pkg/agent/system).
@@ -115,7 +171,7 @@ type SystemStatus struct {
 	// candidate version.
 	Blocked []protocol.PackageChange
 	// InventoryHash is the hash of the inventory Inventory would return
-	// now (cached; recomputed every packages.inventoryInterval).
+	// now (cached; recomputed every 15 minutes).
 	InventoryHash string
 }
 

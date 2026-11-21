@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"strings"
 
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -24,20 +25,16 @@ const (
 	MaxPackageSearchLimit = 500
 )
 
-// ErrInventoryHash is returned by SaveInventory when Inventory.Hash is not
-// the hash of the inventory's content.
-var ErrInventoryHash = errors.New("store: inventory hash does not match its content")
-
 // ErrInventoryInvalid is returned by SaveInventory when Packages or
 // Upgradable is not sorted by name then arch, as the protocol requires, or
-// lists the same (name, arch) twice. Like ErrInventoryHash it means the
-// payload is bad, not the database.
+// lists the same (name, arch) twice. It means the payload is bad, not the
+// database.
 var ErrInventoryInvalid = errors.New("store: inventory is not valid")
 
 // SaveInventory replaces the host's inventory, packages and upgradable rows
 // in one transaction and sets hosts.inventory_hash. It returns ErrNotFound
-// for an unknown host, ErrInventoryHash when inv.Hash is wrong and
-// ErrInventoryInvalid when a list is unsorted or has a duplicate entry.
+// for an unknown host and ErrInventoryInvalid when a list is unsorted or has a
+// duplicate entry. inv.Hash is stored as given: the caller checked it.
 //
 // The lists are stored as rows without a position, so only an inventory in
 // the protocol's order can be given back by GetInventory as it was sent;
@@ -50,16 +47,7 @@ func (s *sqliteStore) SaveInventory(
 		return errors.New("store: save inventory: inventory is required")
 	}
 
-	hash, err := inv.ComputeHash()
-	if err != nil {
-		return fmt.Errorf("store: save inventory of %s: %w", host, err)
-	}
-
-	if hash != inv.Hash {
-		return fmt.Errorf("store: save inventory of %s: %w", host, ErrInventoryHash)
-	}
-
-	err = validateInventory(inv)
+	err := validateInventory(inv)
 	if err != nil {
 		return fmt.Errorf("store: save inventory of %s: %w", host, err)
 	}
@@ -401,12 +389,89 @@ func restoreNilLists(inv *protocol.Inventory) error {
 func (s *sqliteStore) SearchPackages(
 	ctx context.Context, query string, limit int,
 ) ([]PackageMatch, error) {
-	query = strings.TrimSpace(query)
-	matches := make([]PackageMatch, 0, 16)
-
-	if query == "" {
-		return matches, nil
+	if strings.TrimSpace(query) == "" {
+		return []PackageMatch{}, nil
 	}
+
+	page, err := s.ListPackages(ctx, PackageFilter{Query: query, Limit: limit})
+	if err != nil {
+		return nil, err
+	}
+
+	return page.Matches, nil
+}
+
+// Ranks of a name in a search: see PackageFilter.
+const (
+	rankExact  = 0
+	rankPrefix = 1
+	rankOther  = 2
+)
+
+// packageCursor is where a page of names ends: the rank and the name of its
+// last entry. As a string it is the rank's digit and the name.
+type packageCursor struct {
+	rank int
+	name string
+}
+
+func (c packageCursor) String() string { return strconv.Itoa(c.rank) + c.name }
+
+func parsePackageCursor(after string) (packageCursor, error) {
+	if after == "" {
+		// Before every name.
+		return packageCursor{rank: -1}, nil
+	}
+
+	rank := int(after[0] - '0')
+	if rank < rankExact || rank > rankOther || len(after) < 2 {
+		return packageCursor{}, ErrBadCursor
+	}
+
+	return packageCursor{rank: rank, name: after[1:]}, nil
+}
+
+// packageNamesQuery returns the query for the names of one page, each with
+// its rank, and the query that counts all names the filter selects.
+//
+// Without a query the page is a range of the (name, version) index: it
+// starts at the cursor and stops after limit names, whatever the size of the
+// table. With one, a name is matched by a part of it, which no index can
+// look up: the index is walked instead of the table (it holds the name), and
+// only for the names, not once per row and host.
+func packageNamesQuery(query string, after packageCursor, limit int) (names string, args []any, count string, countArgs []any) {
+	if query == "" {
+		return `SELECT DISTINCT name, 0 FROM packages WHERE name > ? ORDER BY name LIMIT ?`,
+			[]any{after.name, limit},
+			`SELECT COUNT(DISTINCT name) FROM packages`, nil
+	}
+
+	escaped := escapeLike(query)
+	contains := "%" + escaped + "%"
+
+	// LIKE is case-insensitive for ASCII, which is all Debian package names
+	// contain.
+	return `
+		SELECT name, CASE
+			WHEN name = ? COLLATE NOCASE THEN 0
+			WHEN name LIKE ? ESCAPE '\' THEN 1
+			ELSE 2 END AS rank
+		FROM packages
+		WHERE name LIKE ? ESCAPE '\'
+		GROUP BY name
+		HAVING rank > ? OR (rank = ? AND name > ?)
+		ORDER BY rank, name
+		LIMIT ?`,
+		[]any{query, escaped + "%", contains, after.rank, after.rank, after.name, limit},
+		`SELECT COUNT(DISTINCT name) FROM packages WHERE name LIKE ? ESCAPE '\'`, []any{contains}
+}
+
+// ListPackages returns one page of package names with the versions installed
+// across the fleet and the hosts on each. Versions are sorted as strings,
+// hosts by name.
+func (s *sqliteStore) ListPackages(ctx context.Context, filter PackageFilter) (*PackagePage, error) {
+	query := strings.TrimSpace(filter.Query)
+	limit := filter.Limit
 
 	switch {
 	case limit <= 0:
@@ -415,40 +480,54 @@ func (s *sqliteStore) SearchPackages(
 		limit = MaxPackageSearchLimit
 	}
 
-	escaped := escapeLike(query)
+	after, err := parsePackageCursor(filter.After)
+	if err != nil {
+		return nil, fmt.Errorf("store: list packages: %w", err)
+	}
 
-	err := s.read(ctx, func(tx *sql.Tx) error {
+	page := &PackagePage{Matches: make([]PackageMatch, 0, limit), Total: -1}
+
+	err = s.read(ctx, func(tx *sql.Tx) error {
+		// One more than the page: whether another page follows.
+		namesQuery, args, countQuery, countArgs := packageNamesQuery(query, after, limit+1)
+
 		names := make([]any, 0, limit)
+		last := after
 
-		// LIKE is case-insensitive for ASCII, which is all Debian package
-		// names contain. The scan runs over the (name, version) index.
-		err := queryRows(ctx, tx, `
-			SELECT name FROM packages
-			WHERE name LIKE ? ESCAPE '\'
-			GROUP BY name
-			ORDER BY CASE
-				WHEN name = ? COLLATE NOCASE THEN 0
-				WHEN name LIKE ? ESCAPE '\' THEN 1
-				ELSE 2 END, name
-			LIMIT ?`,
-			[]any{"%" + escaped + "%", query, escaped + "%", limit},
-			func(row rowScanner) error {
-				var name string
-				if err := row.Scan(&name); err != nil {
-					return err
-				}
+		scanErr := queryRows(ctx, tx, namesQuery, args, func(row rowScanner) error {
+			var cur packageCursor
+			if rowErr := row.Scan(&cur.name, &cur.rank); rowErr != nil {
+				return rowErr
+			}
 
-				names = append(names, name)
+			if len(names) == limit {
+				page.Next = last.String()
 
 				return nil
-			})
-		if err != nil {
-			return err
+			}
+
+			names = append(names, cur.name)
+			last = cur
+
+			return nil
+		})
+		if scanErr != nil {
+			return scanErr
+		}
+
+		if filter.After == "" {
+			countErr := tx.QueryRowContext(ctx, countQuery, countArgs...).Scan(&page.Total)
+			if countErr != nil {
+				return countErr
+			}
 		}
 
 		if len(names) == 0 {
 			return nil
 		}
+
+		matches := page.Matches
+		defer func() { page.Matches = matches }()
 
 		index := make(map[string]int, len(names))
 
@@ -471,8 +550,8 @@ func (s *sqliteStore) SearchPackages(
 			names,
 			func(row rowScanner) error {
 				var name, version, host string
-				if err := row.Scan(&name, &version, &host); err != nil {
-					return err
+				if rowErr := row.Scan(&name, &version, &host); rowErr != nil {
+					return rowErr
 				}
 
 				match := &matches[index[name]]
@@ -490,8 +569,8 @@ func (s *sqliteStore) SearchPackages(
 			})
 	})
 	if err != nil {
-		return nil, fmt.Errorf("store: search packages: %w", err)
+		return nil, fmt.Errorf("store: list packages: %w", err)
 	}
 
-	return matches, nil
+	return page, nil
 }

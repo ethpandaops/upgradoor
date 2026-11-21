@@ -1,12 +1,32 @@
-import { screen, within } from '@testing-library/react';
+import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 
+import { list, type Gate, type LiveViews } from '../api/types';
+import type * as wireModule from '../api/wire';
 import { LIGHTHOUSE_IMAGE } from '../mock/fixture';
-import { createHarness, renderWithApp } from '../test/harness';
+import { createHarness, renderWithApp, PRIMARY } from '../test/harness';
 import { OverviewTab } from './OverviewTab';
 
 const noTab = () => undefined;
+
+/** rewrite.views, when set, changes the views the page assembled from the stream. */
+const rewrite: { views?: (views: Partial<LiveViews>) => Partial<LiveViews> } = {};
+
+vi.mock('../api/wire', async importOriginal => {
+  const wire = await importOriginal<typeof wireModule>();
+  return {
+    ...wire,
+    buildViews: (...args: Parameters<typeof wire.buildViews>) => {
+      const views = wire.buildViews(...args);
+      return rewrite.views ? rewrite.views(views) : views;
+    },
+  };
+});
+
+afterEach(() => {
+  rewrite.views = undefined;
+});
 
 describe('OverviewTab, logged out (public data only)', () => {
   it('shows the gate, the participation and the images, and requests no authenticated route', async () => {
@@ -18,7 +38,10 @@ describe('OverviewTab, logged out (public data only)', () => {
     expect(gate).toHaveTextContent('Finality lag 2 epochs');
 
     expect(await screen.findByRole('region', { name: 'Participation' })).toHaveTextContent(/[\d.]+%/);
-    expect(await screen.findByRole('img', { name: /^Participation [\d.]+% in epoch \d+$/ })).toBeInTheDocument();
+    // Per slot, and without a login without host rows.
+    expect(
+      await screen.findByRole('img', { name: /^Attestations: \d+ of \d+ included in slots \d+–\d+ \([\d.]+%\)$/ })
+    ).toBeInTheDocument();
 
     const images = await screen.findByRole('region', { name: 'Client images' });
     const lighthouse = (await within(images).findByText(LIGHTHOUSE_IMAGE)).closest('li');
@@ -31,12 +54,28 @@ describe('OverviewTab, logged out (public data only)', () => {
       expect(screen.queryByRole('region', { name })).not.toBeInTheDocument();
     }
     const legend = await screen.findByRole('list', { name: 'Legend' });
-    expect(legend).toHaveTextContent('Gate threshold 90%, not counting hosts being updated');
-    expect(legend).not.toHaveTextContent('Image roll');
+    expect(legend).toHaveTextContent('AttestedMissedGate threshold 90%');
+    expect(legend).not.toHaveTextContent('Update by upgradoor');
     expect(screen.getByText(/Log in to see which hosts are being updated/)).toBeInTheDocument();
 
     expect(h.userCalls()).toEqual([]);
     expect(h.calls.every(c => c.authorization === null)).toBe(true);
+  });
+
+  it('shows what the controller pushes without asking again', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: false });
+    renderWithApp(<OverviewTab onOpenTab={noTab} />, h);
+
+    const gate = await screen.findByRole('region', { name: 'Network gate' });
+    expect(gate).toHaveTextContent('Open');
+
+    h.controller.setGateFailing(true);
+
+    await waitFor(() => {
+      expect(gate).toHaveTextContent('Closed');
+    });
+    // The window of the graph was asked for once; everything after it came over the stream.
+    expect(h.calls.map(c => c.path).sort()).toEqual(['/api/v1/public/events', '/api/v1/public/slots?window=10800']);
   });
 
   it('shows a closed gate with its reasons', async () => {
@@ -48,16 +87,6 @@ describe('OverviewTab, logged out (public data only)', () => {
     expect(gate).toHaveTextContent('Closed');
     expect(gate).toHaveTextContent('finality lag 5 epochs > 3');
     expect(gate).toHaveTextContent(/participation [\d.]+% < 90%/);
-  });
-
-  it('says what is used instead when the beacon node does not serve liveness', async () => {
-    const h = await createHarness({ mode: 'auth', loggedIn: false });
-    h.controller.setLivenessUnsupported(true);
-    renderWithApp(<OverviewTab onOpenTab={noTab} />, h);
-
-    const tile = await screen.findByRole('region', { name: 'Participation' });
-    expect(tile).toHaveTextContent('Not served');
-    expect(tile).toHaveTextContent('readiness and the budget use the agents’ probes');
   });
 });
 
@@ -75,36 +104,42 @@ describe('OverviewTab, logged in', () => {
     expect(screen.getByRole('region', { name: 'Outage budget' })).toHaveTextContent(
       /[\d.]+% of 10% validators offline/
     );
-    expect(screen.getByRole('region', { name: 'Scheduler' })).toHaveTextContent('1 in progress · 4 up next · 7 stuck');
+    expect(screen.getByRole('region', { name: 'Scheduler' })).toHaveTextContent('1 in progress · 3 up next · 7 stuck');
 
-    // Up next holds only what starts by itself, in queue order, with an estimate.
+    // Up next holds only what waits and starts by itself, in queue order.
     const next = screen.getByRole('region', { name: 'Up next' });
     const hosts = within(next)
       .getAllByRole('listitem')
       .map(li => li.textContent);
-    expect(hosts).toHaveLength(4);
-    expect(hosts[0]).toMatch(/^1lighthouse-nethermind-1Image rollwaits: budget [\d.]+% of 10%(~\d+m|<1m)$/);
-    // A bootnode is a host like any other: the canary is done, and without
-    // validators it costs the budget nothing.
-    expect(hosts[1]).toMatch(/^2bootnode-1Image rollstarts with the next plan/);
+    expect(hosts).toHaveLength(3);
+    expect(hosts[0]).toMatch(/^1lighthouse-nethermind-1Image rollwaits: budget [\d.]+% of 10%$/);
+    // A bootnode costs the budget nothing and waits for nothing: the queue does not hold it.
+    expect(next).not.toHaveTextContent('bootnode-1');
     expect(next).not.toHaveTextContent('teku-besu-1');
-    // Every lane bar has a name of its own, not only a colour.
-    expect(document.querySelectorAll('svg[role="img"] rect > title').length).toBeGreaterThanOrEqual(5);
+    // What was off is drawn as blocks, each with a name of its own, not only a colour; no row per host.
+    const graph = screen.getByRole('region', { name: 'Participation and outages' });
+    expect(await within(graph).findByRole('button', { name: 'nimbus-nethermind-1: offline' })).toBeInTheDocument();
+    expect(within(graph).getAllByRole('button', { name: /: image roll/ }).length).toBeGreaterThanOrEqual(3);
 
     const attention = screen.getByRole('region', { name: 'Needs attention' });
     expect(attention).toHaveTextContent('waits for approval');
     expect(attention).toHaveTextContent('4 hosts wait.');
     expect(attention).toHaveTextContent('is halted');
-    expect(attention).toHaveTextContent('is paused after its canary');
+    expect(attention).toHaveTextContent('is paused after the canary');
     expect(attention).toHaveTextContent('prysm-geth-3 is silent');
 
-    // The timeline has a lane per host with work and a legend for the lanes.
-    expect(screen.getByRole('list', { name: 'Legend' })).toHaveTextContent('Planned (estimate)');
-    const chart = screen.getByRole('img', { name: /hosts with work in the window/ });
-    for (const host of ['lighthouse-geth-2', 'lighthouse-nethermind-1', 'bootnode-1']) {
-      expect(within(chart).getByText(host)).toBeInTheDocument();
-    }
-    expect(within(chart).queryByText('teku-besu-1')).not.toBeInTheDocument();
+    // The graph has a row per host: the one being updated, the one whose
+    // update failed, and one without validators that was updated.
+    const legend = screen.getByRole('list', { name: 'Legend' });
+    expect(legend).toHaveTextContent('Image roll');
+    expect(legend).toHaveTextContent('Offline');
+    const chart = screen.getByRole('img', { name: /^Attestations: \d+ of \d+ included in .*; \d+ outage blocks$/ });
+    // Two bands, whatever the number of hosts; a failed roll is a block of its own.
+    expect(within(chart).getByText('Updates')).toBeInTheDocument();
+    expect(within(chart).getByText('Offline')).toBeInTheDocument();
+    expect(within(chart).getByRole('button', { name: 'nimbus-nethermind-1: image roll, failed' })).toBeInTheDocument();
+    expect(within(chart).queryByText('bootnode-1')).not.toBeInTheDocument();
+    expect(screen.getByText(/One column is 4 slots \(48s\).* 5 hosts were off in this window/)).toBeInTheDocument();
 
     expect(h.userCalls().every(c => c.authorization === 'Bearer mock-token')).toBe(true);
   });
@@ -118,7 +153,7 @@ describe('OverviewTab, logged in', () => {
     await user.click(await within(attention).findByRole('button', { name: 'Approve…' }));
     const dialog = screen.getByRole('dialog');
     expect(dialog).toHaveTextContent('Approve rollout: Reboot');
-    await user.click(within(dialog).getByRole('button', { name: 'Confirm' }));
+    await user.click(within(dialog).getByRole('button', PRIMARY));
 
     await vi.waitFor(() => {
       expect(h.calls.filter(c => c.method === 'POST')).toHaveLength(1);
@@ -138,32 +173,41 @@ describe('OverviewTab, logged in', () => {
     const first = (await within(attention).findAllByRole('listitem'))[0];
     expect(first).toHaveTextContent('The network gate is closed');
 
-    // A closed gate lets one repair at a time pass, of a host whose validators
-    // have all been offline for two epochs: that host starts by itself, the
-    // next one that is down follows it, and nobody else does.
-    const next = screen.getByRole('region', { name: 'Up next' });
-    expect(next).toHaveTextContent('lighthouse-geth-3');
-    expect(next).toHaveTextContent('after repair of lighthouse-geth-3');
-    expect(next).not.toHaveTextContent('lighthouse-nethermind-1');
-    expect(next).not.toHaveTextContent('bootnode-1');
+    // A host holds a lease, so the closed gate lets nobody pass: every host
+    // that could be served waits for it.
+    expect(first).toHaveTextContent(/\d+ hosts wait for it to open/);
+    expect(screen.getByRole('region', { name: 'Up next' })).toHaveTextContent('Nothing will start by itself');
   });
 
   it('speaks of hosts, not validators, on a fleet without validators', async () => {
     const h = await createHarness({ mode: 'open' });
-    const gate = await h.api.publicNetwork();
-    const plan = await h.api.plan();
-    const empty = {
+    const empty = (gate: Gate): Gate => ({
       ...gate,
       ok: true,
       reasons: [],
-      network: { ...gate.network, livenessKnown: false, tracked: 0, live: 0 },
-    };
-    vi.spyOn(h.api, 'publicNetwork').mockResolvedValue(empty);
-    vi.spyOn(h.api, 'publicHistory').mockResolvedValue({ epochs: [], minParticipationPercent: 90, epochSeconds: 8 });
-    vi.spyOn(h.api, 'plan').mockResolvedValue({
-      ...plan,
-      gate: empty,
-      budget: { totalWeight: 0, allowedWeight: 0, unavailableWeight: 0, leasedHosts: 1, maxLeasedHosts: 2 },
+      network: { ...gate.network, livenessKnown: true, tracked: 0, live: 0 },
+    });
+
+    // The mock's fleet has validators: rewrite what the page reads from its stream.
+    rewrite.views = views => ({
+      ...views,
+      ...(views['public-network'] ? { 'public-network': empty(views['public-network']) } : {}),
+      slots: { rows: [] },
+      ...(views.plan
+        ? {
+            plan: {
+              ...views.plan,
+              gate: empty(views.plan.gate),
+              budget: { totalWeight: 0, allowedWeight: 0, unavailableWeight: 0, leasedHosts: 1, maxLeasedHosts: 2 },
+            },
+          }
+        : {}),
+    });
+    const slots = await h.api.slots(3 * 3600);
+    vi.spyOn(h.api, 'slots').mockResolvedValue({
+      ...slots,
+      assigned: list(slots.assigned).map(() => 0),
+      included: list(slots.included).map(() => 0),
     });
     renderWithApp(<OverviewTab onOpenTab={noTab} />, h);
 

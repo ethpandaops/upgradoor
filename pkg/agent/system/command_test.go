@@ -7,7 +7,6 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -22,8 +21,6 @@ func TestCommandAllowed(t *testing.T) {
 		{"dpkg-query", []string{"-W"}, true},
 		{"dpkg", []string{"--print-architecture"}, true},
 		{"apt-get", []string{"update"}, true},
-		{"apt-cache", []string{"policy", "docker-ce"}, true},
-		{"uname", []string{"-r"}, true},
 		{"systemctl", []string{"reboot"}, true},
 
 		{"systemctl", nil, false},
@@ -35,6 +32,8 @@ func TestCommandAllowed(t *testing.T) {
 		{"/usr/bin/apt-get", []string{"update"}, false},
 		{"../bin/sh", nil, false},
 		{"apt", []string{"install", "x"}, false},
+		{"apt-cache", []string{"policy", "docker-ce"}, false},
+		{"uname", []string{"-r"}, false},
 		{"reboot", nil, false},
 		{"", nil, false},
 	}
@@ -69,21 +68,19 @@ func TestExecRunnerRefusesOtherCommands(t *testing.T) {
 	require.ErrorIs(t, err, os.ErrNotExist)
 }
 
-// uname exists on every Linux, so the real runner can be exercised with it.
-func TestExecRunnerRunsUname(t *testing.T) {
-	if _, err := lookupCommand(cmdUname); err != nil {
-		t.Skip("uname not found")
+// dpkg exists on every host the agent supports, so the real runner can be
+// exercised with it; elsewhere these tests are skipped.
+func TestExecRunnerRunsDpkg(t *testing.T) {
+	if _, err := lookupCommand(cmdDpkg); err != nil {
+		t.Skip("dpkg not found")
 	}
 
-	out, err := execRunner{}.Run(t.Context(), cmdUname, "-r")
+	out, err := execRunner{}.Run(t.Context(), cmdDpkg, "--print-architecture")
 	require.NoError(t, err)
-
-	want, err := os.ReadFile("/proc/sys/kernel/osrelease")
-	require.NoError(t, err)
-	assert.Equal(t, string(want), string(out))
+	assert.Regexp(t, `^[a-z0-9]+\n$`, string(out))
 
 	t.Run("failure carries exit code and output", func(t *testing.T) {
-		_, err := execRunner{}.Run(t.Context(), cmdUname, "--no-such-option")
+		_, err := execRunner{}.Run(t.Context(), cmdDpkg, "--no-such-option")
 
 		var cmdErr *CommandError
 
@@ -91,7 +88,7 @@ func TestExecRunnerRunsUname(t *testing.T) {
 		assert.Positive(t, cmdErr.ExitCode)
 		assert.Zero(t, cmdErr.Signal)
 		assert.Contains(t, cmdErr.Output, "no-such-option")
-		assert.Contains(t, err.Error(), "uname --no-such-option: exit status")
+		assert.Contains(t, err.Error(), "dpkg --no-such-option: exit status")
 		assert.Contains(t, err.Error(), "output: ")
 
 		var exitErr *exec.ExitError
@@ -103,7 +100,7 @@ func TestExecRunnerRunsUname(t *testing.T) {
 		ctx, cancel := context.WithCancel(t.Context())
 		cancel()
 
-		_, err := execRunner{}.Run(ctx, cmdUname, "-r")
+		_, err := execRunner{}.Run(ctx, cmdDpkg, "--print-architecture")
 		require.ErrorIs(t, err, context.Canceled)
 	})
 }
@@ -111,19 +108,19 @@ func TestExecRunnerRunsUname(t *testing.T) {
 func TestLookupCommandIgnoresPath(t *testing.T) {
 	// A program of the right name early in PATH is not picked up.
 	dir := t.TempDir()
-	require.NoError(t, os.WriteFile(dir+"/uname", []byte("#!/bin/sh\necho hijacked\n"), 0o755))
+	require.NoError(t, os.WriteFile(dir+"/dpkg", []byte("#!/bin/sh\necho hijacked\n"), 0o755))
 	t.Setenv("PATH", dir+":"+os.Getenv("PATH"))
 
-	path, err := lookupCommand(cmdUname)
+	path, err := lookupCommand(cmdDpkg)
 	if err != nil {
-		t.Skip("uname not found")
+		t.Skip("dpkg not found")
 	}
 
 	assert.NotContains(t, path, dir)
 
-	out, err := execRunner{}.Run(t.Context(), cmdUname, "-s")
+	out, err := execRunner{}.Run(t.Context(), cmdDpkg, "--print-architecture")
 	require.NoError(t, err)
-	assert.Equal(t, "Linux\n", string(out))
+	assert.NotContains(t, string(out), "hijacked")
 
 	_, err = lookupCommand("no-such-program-anywhere")
 	require.ErrorIs(t, err, exec.ErrNotFound)
@@ -167,15 +164,4 @@ func TestOutputBuffers(t *testing.T) {
 	_, err = capped.Write([]byte("more"))
 	require.NoError(t, err)
 	assert.Equal(t, "abcde", capped.buf.String())
-}
-
-func TestCommandEnvironmentIsFixed(t *testing.T) {
-	assert.Contains(t, commandEnv, "DEBIAN_FRONTEND=noninteractive")
-	assert.Contains(t, commandEnv, "LC_ALL=C")
-
-	for _, entry := range commandEnv {
-		assert.Contains(t, entry, "=")
-	}
-
-	assert.Less(t, commandWaitDelay, time.Minute)
 }

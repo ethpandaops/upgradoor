@@ -2,7 +2,6 @@ package docker
 
 import (
 	"errors"
-	"fmt"
 	"maps"
 	"slices"
 	"sort"
@@ -12,6 +11,8 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
+
+	"github.com/ethpandaops/upgradoor/pkg/agent"
 )
 
 // shortIDLength is the length of the short container ID Docker uses as the
@@ -48,19 +49,18 @@ type networkAttachment struct {
 // new image's defaults apply, exactly as if the container had been created
 // from the new image with the original arguments.
 //
-// primaryMAC is the MAC address the user fixed for the primary network, or
-// empty.
+// old is complete inspect data: Config and HostConfig are set.
 func buildCreateSpec(
 	old *container.InspectResponse,
 	oldImage *dockerspec.DockerOCIImageConfig,
-	primaryMAC string,
 ) (*createSpec, error) {
-	if old == nil || old.Config == nil || old.HostConfig == nil {
-		return nil, errors.New("incomplete container inspect data")
-	}
-
 	if old.HostConfig.AutoRemove {
 		return nil, errors.New("container is created with auto-remove and cannot be recreated")
+	}
+
+	if hasLinks(old) {
+		return nil, errors.New("container has links (--link), which a recreate does not keep; " +
+			"it cannot be recreated")
 	}
 
 	spec := &createSpec{
@@ -73,14 +73,61 @@ func buildCreateSpec(
 		return nil, errors.New("container has no name")
 	}
 
-	spec.HostConfig.Links = legacyLinks(old.HostConfig.Links)
 	spec.HostConfig.Mounts = append(spec.HostConfig.Mounts, anonymousVolumeMounts(old)...)
-
-	if err := spec.setNetworks(old, primaryMAC); err != nil {
-		return nil, err
-	}
+	spec.setNetworks(old)
 
 	return spec, nil
+}
+
+// apply makes the changes of a recreation to the create request: the image
+// reference, the command line, the labels.
+func (s *createSpec) apply(change *agent.Recreation) {
+	if change.Image != "" {
+		s.Config.Image = change.Image
+	}
+
+	if change.SetCommand {
+		s.Config.Cmd = slices.Clone(change.Command)
+	}
+
+	if len(change.Labels) == 0 {
+		return
+	}
+
+	labels := make(map[string]string, len(s.Config.Labels)+len(change.Labels))
+	for name, value := range s.Config.Labels {
+		labels[name] = value
+	}
+
+	for name, value := range change.Labels {
+		if value == nil {
+			delete(labels, name)
+		} else {
+			labels[name] = *value
+		}
+	}
+
+	s.Config.Labels = labels
+}
+
+// hasLinks reports whether the container was created with links, to other
+// containers of the default bridge or on one of its networks.
+func hasLinks(old *container.InspectResponse) bool {
+	if len(old.HostConfig.Links) > 0 {
+		return true
+	}
+
+	if old.NetworkSettings == nil {
+		return false
+	}
+
+	for _, endpoint := range old.NetworkSettings.Networks {
+		if endpoint != nil && len(endpoint.Links) > 0 {
+			return true
+		}
+	}
+
+	return false
 }
 
 // ownConfig returns the container configuration without the values that
@@ -328,37 +375,9 @@ func cloneHostConfig(in *container.HostConfig) *container.HostConfig {
 	out := *in
 	out.Binds = slices.Clone(in.Binds)
 	out.Mounts = slices.Clone(in.Mounts)
-	out.Links = slices.Clone(in.Links)
 	out.PortBindings = maps.Clone(in.PortBindings)
 
 	return &out
-}
-
-// legacyLinks converts links from the inspect form "/target:/owner/alias"
-// back to the create form "target:alias".
-func legacyLinks(links []string) []string {
-	if len(links) == 0 {
-		return nil
-	}
-
-	out := make([]string, 0, len(links))
-
-	for _, link := range links {
-		target, alias, found := strings.Cut(link, ":")
-		if !found {
-			out = append(out, strings.TrimPrefix(link, "/"))
-
-			continue
-		}
-
-		if idx := strings.LastIndex(alias, "/"); idx >= 0 {
-			alias = alias[idx+1:]
-		}
-
-		out = append(out, strings.TrimPrefix(target, "/")+":"+alias)
-	}
-
-	return out
 }
 
 // anonymousVolumeMounts returns mounts that attach the old container's
@@ -448,14 +467,14 @@ func cleanPath(path string) string {
 
 // setNetworks fills the network part of the spec from the endpoints of the
 // old container.
-func (s *createSpec) setNetworks(old *container.InspectResponse, primaryMAC string) error {
+func (s *createSpec) setNetworks(old *container.InspectResponse) {
 	mode := old.HostConfig.NetworkMode
 	if mode.IsHost() || mode.IsNone() || mode.IsContainer() {
-		return nil
+		return
 	}
 
 	if old.NetworkSettings == nil || len(old.NetworkSettings.Networks) == 0 {
-		return nil
+		return
 	}
 
 	networks := old.NetworkSettings.Networks
@@ -478,21 +497,9 @@ func (s *createSpec) setNetworks(old *container.InspectResponse, primaryMAC stri
 			continue
 		}
 
-		if primaryMAC != "" {
-			var mac network.HardwareAddr
-
-			if err := mac.UnmarshalText([]byte(primaryMAC)); err != nil {
-				return fmt.Errorf("parse MAC address %q: %w", primaryMAC, err)
-			}
-
-			endpoint.MacAddress = mac
-		}
-
 		s.Primary = name
 		s.PrimaryEndpoint = endpoint
 	}
-
-	return nil
 }
 
 // primaryNetwork finds the endpoint that belongs to the network mode, which
@@ -521,8 +528,8 @@ func primaryNetwork(
 }
 
 // ownEndpoint returns the user-specified part of an endpoint: static
-// addresses, aliases, links, driver options. Operational data (assigned
-// addresses, IDs, generated MAC) is left out.
+// addresses, aliases, driver options. Operational data (assigned addresses,
+// IDs, the MAC address) is left out.
 func ownEndpoint(ep *network.EndpointSettings, containerID string) *network.EndpointSettings {
 	if ep == nil {
 		return &network.EndpointSettings{}
@@ -530,7 +537,6 @@ func ownEndpoint(ep *network.EndpointSettings, containerID string) *network.Endp
 
 	out := &network.EndpointSettings{
 		IPAMConfig: ep.IPAMConfig.Copy(),
-		Links:      slices.Clone(ep.Links),
 		DriverOpts: maps.Clone(ep.DriverOpts),
 		GwPriority: ep.GwPriority,
 	}

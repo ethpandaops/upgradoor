@@ -21,9 +21,9 @@ const (
 
 	// ProofLifetime is the validity window of a request proof.
 	ProofLifetime = 60 * time.Second
-	// DefaultClockSkew is the tolerated clock difference between an agent and
-	// the controller.
-	DefaultClockSkew = 30 * time.Second
+	// ClockSkew is the tolerated clock difference between an agent and the
+	// controller.
+	ClockSkew = 30 * time.Second
 )
 
 var (
@@ -98,22 +98,32 @@ func NewCredentials(key *mldsa.PrivateKey, cert string) (*Credentials, error) {
 // Certificate returns the compact host certificate.
 func (c *Credentials) Certificate() string { return c.cert }
 
-// Proof returns a fresh proof for one request. body is the body exactly as
-// sent on the wire.
-func (c *Credentials) Proof(method, url string, body []byte, now time.Time) (string, error) {
-	var id [16]byte
-	if _, err := rand.Read(id[:]); err != nil {
-		return "", fmt.Errorf("identity: jti: %w", err)
+// Proof returns a fresh proof for one request and the proof's jti, the id of
+// the request. body is the body exactly as sent on the wire. A signed answer
+// names the id, which binds the answer to this request.
+func (c *Credentials) Proof(
+	method, url string, body []byte, now time.Time,
+) (proof, id string, err error) {
+	var raw [16]byte
+	if _, err = rand.Read(raw[:]); err != nil {
+		return "", "", fmt.Errorf("identity: jti: %w", err)
 	}
 
-	return SignProof(c.key, &ProofClaims{
+	id = base64.RawURLEncoding.EncodeToString(raw[:])
+
+	proof, err = SignProof(c.key, &ProofClaims{
 		IssuedAt:  now.Unix(),
 		ExpiresAt: now.Add(ProofLifetime).Unix(),
-		ID:        base64.RawURLEncoding.EncodeToString(id[:]),
+		ID:        id,
 		Method:    method,
 		URL:       url,
 		BodyHash:  BodyHash(body),
 	})
+	if err != nil {
+		return "", "", err
+	}
+
+	return proof, id, nil
 }
 
 // UnverifiedClaims decodes a certificate's claims without checking its
@@ -153,12 +163,29 @@ type Request struct {
 type Verifier struct {
 	signer  *mldsa.PublicKey
 	network string
-	skew    time.Duration
 	now     func() time.Time
 
 	mu   sync.Mutex
 	seen map[string]int64 // host key + jti -> unix expiry
+
+	// certs are the certificates verified so far, by their hash. A
+	// certificate's validity depends on the signer and the network alone,
+	// both fixed for a verifier, so one that verified once always does; the
+	// proof is still verified on every request.
+	certMu sync.Mutex
+	certs  map[string]*verifiedCert
 }
+
+// verifiedCert is a certificate that passed VerifyCertificate and its host
+// key.
+type verifiedCert struct {
+	cert    Certificate
+	hostKey *mldsa.PublicKey
+}
+
+// maxVerifiedCerts bounds the certificate cache; it is emptied when full.
+// A fleet presents one certificate per host, a rotation briefly two.
+const maxVerifiedCerts = 8192
 
 // VerifierOption configures a Verifier.
 type VerifierOption func(*Verifier)
@@ -168,20 +195,15 @@ func WithClock(now func() time.Time) VerifierOption {
 	return func(v *Verifier) { v.now = now }
 }
 
-// WithClockSkew overrides DefaultClockSkew.
-func WithClockSkew(skew time.Duration) VerifierOption {
-	return func(v *Verifier) { v.skew = skew }
-}
-
 // NewVerifier returns a verifier that accepts certificates signed by signer
 // for network.
 func NewVerifier(signer *mldsa.PublicKey, network string, opts ...VerifierOption) *Verifier {
 	v := &Verifier{
 		signer:  signer,
 		network: network,
-		skew:    DefaultClockSkew,
 		now:     time.Now,
 		seen:    make(map[string]int64, 64),
+		certs:   make(map[string]*verifiedCert, 64),
 	}
 
 	for _, opt := range opts {
@@ -193,9 +215,48 @@ func NewVerifier(signer *mldsa.PublicKey, network string, opts ...VerifierOption
 
 // Verify authenticates one request: the certificate against the signer and
 // network, the proof against the certificate's host key, its time window, its
-// binding to the request and its jti against replay.
-func (v *Verifier) Verify(cert, proof string, req Request) (*Certificate, error) {
-	c, err := VerifyCertificate(v.signer, v.network, cert)
+// binding to the request and its jti against replay. It returns the
+// certificate and the proof's jti, the id of the request, which a signed
+// answer to it names.
+func (v *Verifier) Verify(cert, proof string, req Request) (*Certificate, string, error) {
+	vc, err := v.certificate(cert)
+	if err != nil {
+		return nil, "", err
+	}
+
+	c := new(Certificate)
+	*c = vc.cert
+
+	payload, err := verifyCompact(vc.hostKey, proofHeader, proof)
+	if err != nil {
+		return nil, "", fmt.Errorf("%w: %w", ErrBadProof, err)
+	}
+
+	var claims ProofClaims
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return nil, "", fmt.Errorf("%w: claims: %w", ErrBadProof, err)
+	}
+
+	if err := v.checkProof(c, &claims, req); err != nil {
+		return nil, "", err
+	}
+
+	return c, claims.ID, nil
+}
+
+// certificate verifies a certificate, or finds it verified before.
+func (v *Verifier) certificate(raw string) (*verifiedCert, error) {
+	hash := CertificateHash(raw)
+
+	v.certMu.Lock()
+	vc, ok := v.certs[hash]
+	v.certMu.Unlock()
+
+	if ok {
+		return vc, nil
+	}
+
+	c, err := VerifyCertificate(v.signer, v.network, raw)
 	if err != nil {
 		return nil, err
 	}
@@ -205,46 +266,52 @@ func (v *Verifier) Verify(cert, proof string, req Request) (*Certificate, error)
 		return nil, err
 	}
 
-	payload, err := verifyCompact(hostKey, proofHeader, proof)
-	if err != nil {
-		return nil, fmt.Errorf("%w: %w", ErrBadProof, err)
+	vc = &verifiedCert{cert: *c, hostKey: hostKey}
+
+	v.certMu.Lock()
+	defer v.certMu.Unlock()
+
+	if len(v.certs) >= maxVerifiedCerts {
+		clear(v.certs)
 	}
 
-	var claims ProofClaims
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		return nil, fmt.Errorf("%w: claims: %w", ErrBadProof, err)
-	}
+	v.certs[hash] = vc
 
+	return vc, nil
+}
+
+// checkProof checks the claims of a proof whose signature is verified.
+func (v *Verifier) checkProof(c *Certificate, claims *ProofClaims, req Request) error {
 	if claims.ID == "" {
-		return nil, fmt.Errorf("%w: missing jti", ErrBadProof)
+		return fmt.Errorf("%w: missing jti", ErrBadProof)
 	}
 
 	now := v.now()
-	skew := int64(v.skew / time.Second)
+	skew := int64(ClockSkew / time.Second)
 	lifetime := int64(ProofLifetime / time.Second)
 
 	if claims.ExpiresAt <= claims.IssuedAt || claims.ExpiresAt-claims.IssuedAt > lifetime {
-		return nil, fmt.Errorf("%w: invalid lifetime", ErrBadProof)
+		return fmt.Errorf("%w: invalid lifetime", ErrBadProof)
 	}
 
 	if now.Unix() < claims.IssuedAt-skew || now.Unix() > claims.ExpiresAt+skew {
-		return nil, fmt.Errorf("%w (controller time %s)", ErrProofExpired,
+		return fmt.Errorf("%w (controller time %s)", ErrProofExpired,
 			now.UTC().Format(time.RFC3339))
 	}
 
 	if claims.Method != req.Method || !slices.Contains(req.URLs, claims.URL) {
-		return nil, fmt.Errorf("%w: method or URL", ErrProofMismatch)
+		return fmt.Errorf("%w: method or URL", ErrProofMismatch)
 	}
 
 	if claims.BodyHash != BodyHash(req.Body) {
-		return nil, fmt.Errorf("%w: body hash", ErrProofMismatch)
+		return fmt.Errorf("%w: body hash", ErrProofMismatch)
 	}
 
 	if !v.remember(c.Hash+"/"+claims.ID, claims.ExpiresAt+skew, now.Unix()) {
-		return nil, ErrProofReplayed
+		return ErrProofReplayed
 	}
 
-	return c, nil
+	return nil
 }
 
 // remember records key until expiry and reports whether it was new.

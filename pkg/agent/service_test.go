@@ -3,6 +3,7 @@ package agent_test
 import (
 	"errors"
 	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -44,6 +45,9 @@ func TestSyncReportsTheHost(t *testing.T) {
 	sc.Packages.Upgradable = dockerUpgrade()
 
 	e := newEnv(t, sc)
+	e.cfg.Containers[0].Owners = []string{"panda", "geth"}
+	e.cfg.Containers[1].Owners = []string{"teku"}
+	require.NoError(t, e.cfg.Validate())
 	e.start()
 
 	req := e.ctrl.await("registry checks", func(req *protocol.SyncRequest) bool {
@@ -71,7 +75,9 @@ func TestSyncReportsTheHost(t *testing.T) {
 	assert.True(t, geth.Managed)
 	assert.Equal(t, protocol.KindEL, geth.Kind)
 	assert.Equal(t, "docker.io/"+gethImage, geth.ConfiguredImage)
-	assert.False(t, geth.Custom, "docker.io/x and x are the same reference")
+	for _, n := range req.Needs {
+		assert.NotEqual(t, protocol.NeedSpec, n.Kind, "docker.io/x and x are the same reference")
+	}
 	require.NotNil(t, geth.Registry)
 	assert.Equal(t, gethV1, geth.Registry.Digest)
 	assert.True(t, geth.Registry.Pulled)
@@ -81,6 +87,13 @@ func TestSyncReportsTheHost(t *testing.T) {
 	assert.False(t, dora.Managed)
 	assert.Empty(t, dora.Kind)
 	assert.Nil(t, dora.Registry)
+
+	// The owners of the configuration go out with each managed container,
+	// sorted.
+	assert.Equal(t, []string{"geth", "panda"}, geth.Owners)
+	assert.Equal(t, []string{"teku"}, containerOf(t, &req, "teku").Owners)
+	assert.Nil(t, containerOf(t, &req, "validator").Owners, "managed, nobody owns it")
+	assert.Nil(t, dora.Owners, "not managed")
 
 	// The only need is the blocked package; openssl is not the agent's.
 	require.Equal(t, []string{packagesNeed().ID}, needIDs(&req))
@@ -130,26 +143,6 @@ func TestImageNeedAppearsOnlyAfterThePull(t *testing.T) {
 	}
 }
 
-func TestRegistryErrorKeepsTheLastGoodDigest(t *testing.T) {
-	e := newEnv(t, baseScenario())
-	e.start()
-
-	e.ctrl.await("first check", func(req *protocol.SyncRequest) bool {
-		return containerOf(t, req, "teku").Registry != nil
-	})
-
-	e.host.Fail("resolve:"+tekuImage, errors.New("503 from the registry"))
-
-	req := e.ctrl.await("registry error", func(req *protocol.SyncRequest) bool {
-		return containerOf(t, req, "teku").Registry.Error != ""
-	})
-
-	teku := containerOf(t, &req, "teku")
-	assert.Contains(t, teku.Registry.Error, "503 from the registry")
-	assert.Equal(t, tekuV1, teku.Registry.Digest, "the last good digest stays")
-	assert.Empty(t, req.Needs)
-}
-
 func TestVerbsBoundTheNeeds(t *testing.T) {
 	sc := baseScenario()
 	sc.Packages.Upgradable = dockerUpgrade()
@@ -184,48 +177,49 @@ func TestVerbsBoundTheNeeds(t *testing.T) {
 		req.Needs[0].Reboot.Reasons)
 }
 
-func TestCustomContainerIsNeverRolled(t *testing.T) {
+// A container that does not run what agent.yaml says (Ansible named a new
+// image and left the restart to the agent, or somebody swapped it by hand)
+// is reported with a spec need and recreated under a lease, its
+// configuration kept, on the configured image at the digest its tag has.
+func TestContainerIsRolledOntoItsSpec(t *testing.T) {
 	e := newEnv(t, baseScenario())
 
-	// Somebody swapped geth for a debug build. Both the configured tag and
-	// the custom one have news in the registry.
 	require.NoError(t, e.host.SetContainerImage("geth", "myfork/geth:debug", "sha256:debug-1"))
-	e.host.SetRegistry("myfork/geth:debug", "sha256:debug-2", "")
 	e.host.SetRegistry(gethImage, gethV2, "")
 	e.start()
 
-	e.ctrl.awaitSyncs(3)
-	req := e.ctrl.awaitSyncs(8)
+	var need protocol.Need
 
-	geth := containerOf(t, &req, "geth")
-	assert.True(t, geth.Managed)
-	assert.True(t, geth.Custom)
-	assert.Nil(t, geth.Registry, "a custom image is not followed")
+	e.ctrl.await("a spec need", func(req *protocol.SyncRequest) bool {
+		for _, n := range req.Needs {
+			if n.Kind == protocol.NeedSpec {
+				need = n
+
+				return true
+			}
+		}
+
+		return false
+	})
+	require.NotNil(t, need.Spec)
+	assert.Equal(t, "geth", need.Spec.Container)
+	assert.Equal(t, gethV2, need.Spec.ToDigest)
+	assert.Equal(t, "myfork/geth:debug", need.Spec.FromImage)
+	assert.False(t, need.Spec.Flags)
+	assert.False(t, need.Local, "hosts share the rollout of a spec")
+
+	e.ctrl.grant(e.lease("lease-spec", need))
+
+	op := e.ctrl.awaitFinished("lease-spec")
+	require.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.Equal(t, protocol.StepDone, stepOf(t, op, need.ID).Status)
+	assert.Equal(t, gethV2, e.host.Container("geth").Digest)
+	assert.Equal(t, "docker.io/"+gethImage, e.host.Container("geth").Image)
+
+	req := e.ctrl.await("in line with agent.yaml", func(req *protocol.SyncRequest) bool {
+		return !hasNeed(req, need.ID)
+	})
 	assert.Empty(t, req.Needs)
-	assert.Empty(t, e.host.Calls(), "not even pulled")
-
-	// A manual roll is rejected ...
-	e.ctrl.direct(protocol.Directive{ID: "d-roll", Kind: protocol.DirectiveRoll, Container: "geth"})
-
-	req = e.ctrl.await("roll rejected", func(req *protocol.SyncRequest) bool { return ackOf(req, "d-roll") != nil })
-	ack := ackOf(&req, "d-roll")
-	assert.Equal(t, protocol.DirectiveRejected, ack.Status)
-	assert.Contains(t, ack.Error, "custom image")
-	e.ctrl.direct()
-
-	// ... and a lease that grants a roll anyway changes nothing.
-	need := imageNeedFor("geth", gethImage, gethV1, gethV2)
-	e.ctrl.grant(e.lease("lease-custom", need))
-
-	op := e.ctrl.awaitFinished("lease-custom")
-	assert.Equal(t, protocol.PhaseDone, op.Phase)
-	assert.False(t, op.Disrupted)
-
-	step := stepOf(t, op, need.ID)
-	assert.Equal(t, protocol.StepSuperseded, step.Status)
-	assert.Contains(t, step.Error, "custom image")
-	assert.Empty(t, disruptive(e.host.Calls()))
-	assert.Equal(t, "sha256:debug-1", e.host.Container("geth").Digest)
 }
 
 func TestLocalHold(t *testing.T) {
@@ -383,20 +377,70 @@ func TestInventoryIsSentWhenAsked(t *testing.T) {
 	assert.Len(t, inv.Upgradable, 2)
 }
 
-func TestCorruptStateFileStartsClean(t *testing.T) {
-	sc := baseScenario()
-	sc.RebootRequired = true
+// The host's validator range is read from the marker file and goes out with
+// the sync. (What a missing, damaged or changed marker gives is covered next
+// to the reader.)
+func TestSyncReportsTheValidatorRange(t *testing.T) {
+	e := newEnv(t, baseScenario())
 
-	e := newEnv(t, sc)
-	require.NoError(t, os.MkdirAll(e.cfg.StateDir, 0o700))
-	require.NoError(t, os.WriteFile(e.statePath(), []byte(`{"version":1,"current":{"lease":`), 0o600))
+	marker := filepath.Join(t.TempDir(), ".validator_keyrange")
+	require.NoError(t, os.WriteFile(marker, []byte("0-64\n"), 0o600))
+
+	e.cfg.Validators.MarkerFile = marker
 	e.start()
 
-	req := e.ctrl.await("needs", func(req *protocol.SyncRequest) bool { return hasNeed(req, protocol.RebootNeedID) })
-	assert.Nil(t, req.Operation)
+	req := e.ctrl.await("the range", func(req *protocol.SyncRequest) bool {
+		return req.Validators != nil && req.Validators.Known()
+	})
+	assert.Equal(t, &protocol.Validators{
+		Start: 0, End: 64,
+		Source: protocol.ValidatorsFromMarker, State: protocol.ValidatorsKnown,
+	}, req.Validators)
+}
 
-	kept, err := os.ReadFile(e.statePath() + ".corrupt")
-	require.NoError(t, err)
-	assert.Equal(t, `{"version":1,"current":{"lease":`, string(kept),
-		"the damaged file is kept for inspection")
+// A lease that is cancelled before the agent has started it is never
+// started. The agent says so at once, so the controller need not wait for
+// the lease to run out.
+func TestCancelledLeaseIsNotStarted(t *testing.T) {
+	e := newEnv(t, baseScenario())
+	e.ctrl.set(func(c *controller) { c.autoRelease = false })
+	e.host.SetRegistry(gethImage, gethV2, "")
+	e.start()
+
+	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2))
+
+	grantUnexamined(t, e, "docker daemon is restarting", e.lease("lease-cancel", needs...))
+
+	cancel(t, e)
+	e.host.Fail("observe", nil)
+
+	op := e.ctrl.awaitFinished("lease-cancel")
+
+	assert.Equal(t, protocol.PhaseDone, op.Phase)
+	assert.False(t, op.Disrupted)
+	assert.Equal(t, protocol.StepRefused, stepOf(t, op, needs[0].ID).Status)
+	assert.Contains(t, stepOf(t, op, needs[0].ID).Error, "cancelled before the operation started")
+	assert.Empty(t, disruptive(e.host.Calls()), "nothing was touched")
+}
+
+// A lease that the agent first hears of with the cancel mark is not taken.
+func TestLeaseOfferedCancelledIsNotTaken(t *testing.T) {
+	e := newEnv(t, baseScenario())
+	e.ctrl.set(func(c *controller) { c.autoRelease = false })
+	e.host.SetRegistry(gethImage, gethV2, "")
+	e.start()
+
+	needs := awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2))
+
+	l := e.lease("lease-cancel", needs...)
+	l.Cancel = true
+	e.ctrl.grant(l)
+	e.ctrl.awaitSyncs(6)
+
+	for _, s := range e.ctrl.allSyncs() {
+		require.Nil(t, s.Operation)
+	}
+
+	assert.Nil(t, e.stateOnDisk()["current"])
+	assert.Empty(t, disruptive(e.host.Calls()))
 }

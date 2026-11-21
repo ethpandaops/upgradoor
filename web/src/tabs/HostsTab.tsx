@@ -1,13 +1,15 @@
 import { Fragment, useMemo, useState } from 'react';
 
-import { list, type HostSummary } from '../api/types';
+import { list, type HostListing } from '../api/types';
 import { useApp, useAuthState, usePrivateAccess } from '../appContext';
-import { useActions } from '../components/ActionDialog';
-import { ActionButton } from '../components/Permissions';
-import { RelTime } from '../components/RelTime';
+import { useActions, type ActionIntent } from '../components/ActionDialog';
+import { useLive } from '../components/Live';
+import { BulkAction, SelectionBar } from '../components/SelectionBar';
+import { RelTime, useSharedNow } from '../components/RelTime';
+import { useKept } from '../hooks/useKept';
 import {
-  Badge,
   Button,
+  Badge,
   Dash,
   Empty,
   ErrorBanner,
@@ -21,9 +23,8 @@ import {
   type SortColumn,
   type SortDirection,
 } from '../components/primitives';
-import { ImageCell, needSummary } from '../components/status';
-import { usePoll } from '../hooks/usePoll';
-import { formatDuration, formatPercent, plural } from '../lib/format';
+import { ImageCell, OfflineBadge } from '../components/status';
+import { absoluteTime, formatDuration, formatPercent, isZeroTime, plural } from '../lib/format';
 import { holdIntent } from '../lib/intents';
 import { HostDetailPanel } from './HostDetailPanel';
 import {
@@ -38,6 +39,8 @@ import {
   type SortKey,
 } from './hostRows';
 
+/** HOST_PAGE_SIZE is how many hosts the table shows at a time. */
+const HOST_PAGE_SIZE = 100;
 /**
  * HostsTab is the fleet table. Logged out it shows only the public data
  * (name, EL / CL image, update marker); logged in the same table gains the
@@ -45,25 +48,22 @@ import {
  * several hosts go through the selection.
  */
 export function HostsTab() {
-  const { api, auth } = useApp();
+  const { auth } = useApp();
   const priv = usePrivateAccess();
   const authEnabled = useAuthState(auth).enabled;
 
-  const publicHosts = usePoll(s => api.publicHosts(s), { key: 'public-hosts' });
-  const hosts = usePoll(s => api.hosts(s), { key: 'hosts', enabled: priv });
-  const plan = usePoll(s => api.plan(s), { key: 'plan', enabled: priv });
+  const publicHosts = useLive('public-hosts');
+  const hosts = useLive('hosts', priv);
+  const plan = useLive('plan', priv);
 
-  const [filter, setFilter] = useState('');
+  // Kept across tabs: the graph on the Overview leads here with a host's name.
+  const [filter, setFilter] = useKept('hosts.filter', '');
   const [sort, setSort] = useState<{ key: SortKey; direction: SortDirection }>({ key: 'name', direction: 'asc' });
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
   const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
+  const [page, setPage] = useState(0);
 
-  const refreshAll = () => {
-    publicHosts.refresh();
-    hosts.refresh();
-    plan.refresh();
-  };
-  const actions = useActions(refreshAll);
+  const actions = useActions();
 
   const allRows = useMemo(
     () => mergeHostRows(list(publicHosts.data?.hosts), list(hosts.data?.hosts), list(plan.data?.queue)),
@@ -78,6 +78,12 @@ export function HostsTab() {
       ),
     [allRows, filter, sort]
   );
+
+  // One page of the table at a time: a fleet of a thousand hosts is not a
+  // thousand rows in the page. A new filter or sort starts at the first.
+  const pages = Math.max(1, Math.ceil(rows.length / HOST_PAGE_SIZE));
+  const current = Math.min(page, pages - 1);
+  const pageRows = rows.slice(current * HOST_PAGE_SIZE, (current + 1) * HOST_PAGE_SIZE);
 
   const known = useMemo(() => new Set(allRows.map(r => r.name)), [allRows]);
   // A selected host that was forgotten meanwhile drops out of the selection.
@@ -96,6 +102,7 @@ export function HostsTab() {
 
   const sortBy = (key: SortKey) => {
     setSort(prev => ({ key, direction: prev.key === key && prev.direction === 'asc' ? 'desc' : 'asc' }));
+    setPage(0);
   };
   const sortColumn = (key: SortKey, label: string, title?: string): SortColumn => ({
     label,
@@ -116,6 +123,13 @@ export function HostsTab() {
   }, [rows, selection]);
   const allVisibleSelected = visibleNames.length > 0 && visibleNames.every(n => selected.has(n));
   const columnCount = priv ? 11 : 4;
+  const rollSelection: ActionIntent = {
+    kind: 'roll',
+    hosts: selection,
+    all: false,
+    containerChoices: rollableContainers(selectedSummaries),
+    hiddenHosts: hiddenSelection,
+  };
 
   const loading = publicHosts.loading || (priv && hosts.loading);
 
@@ -129,6 +143,7 @@ export function HostsTab() {
           value={filter}
           onChange={e => {
             setFilter(e.target.value);
+            setPage(0);
           }}
           className={cx(INPUT_CLASS, 'w-72')}
         />
@@ -137,107 +152,62 @@ export function HostsTab() {
             ? plural(allRows.length, 'host')
             : `${rows.length} of ${plural(allRows.length, 'host')}`}
         </span>
+        {pages > 1 && (
+          <div role="group" aria-label="Pages" className="flex items-center gap-2 text-xs/5 text-muted">
+            <span className="min-w-24 text-right tabular-nums" aria-live="polite">
+              {current * HOST_PAGE_SIZE + 1}–{current * HOST_PAGE_SIZE + pageRows.length} of {rows.length}
+            </span>
+            <Button
+              dense
+              aria-label="Previous page"
+              disabled={current === 0}
+              onClick={() => {
+                setPage(current - 1);
+              }}
+            >
+              ‹ Previous
+            </Button>
+            <Button
+              dense
+              aria-label="Next page"
+              disabled={current >= pages - 1}
+              onClick={() => {
+                setPage(current + 1);
+              }}
+            >
+              Next ›
+            </Button>
+          </div>
+        )}
 
         {priv && (
-          <div role="group" aria-label="Bulk actions" className="ml-auto flex flex-wrap items-center gap-1.5">
-            {selection.length > 0 ? (
-              <>
-                <span className="text-xs/5 font-medium">
-                  {selection.length} selected
-                  {hiddenSelection.length > 0 && (
-                    <span className="text-warning" title={hiddenSelection.join(', ')}>
-                      {' '}
-                      ({hiddenSelection.length} hidden by the filter)
-                    </span>
-                  )}
-                  :
-                </span>
-                {hiddenSelection.length > 0 && (
-                  <Button
-                    dense
-                    variant="ghost"
-                    title="Deselect the hosts the filter hides"
-                    onClick={() => {
-                      const hidden = new Set(hiddenSelection);
-                      setSelected(prev => new Set([...prev].filter(n => !hidden.has(n))));
-                    }}
-                  >
-                    Drop hidden
-                  </Button>
-                )}
-                <ActionButton
-                  dense
-                  onAction={actions.request}
-                  intent={{
-                    kind: 'roll',
-                    hosts: selection,
-                    all: false,
-                    containerChoices: rollableContainers(selectedSummaries),
-                    hiddenHosts: hiddenSelection,
-                  }}
-                >
-                  Roll…
-                </ActionButton>
-                <ActionButton
-                  dense
-                  onAction={actions.request}
-                  intent={{ kind: 'reboot', hosts: selection, all: false, hiddenHosts: hiddenSelection }}
-                >
-                  Reboot…
-                </ActionButton>
-                <ActionButton dense onAction={actions.request} intent={holdIntent('hold', selection, hiddenSelection)}>
-                  Hold…
-                </ActionButton>
-                <ActionButton
-                  dense
-                  onAction={actions.request}
-                  intent={holdIntent('unhold', selection, hiddenSelection)}
-                >
-                  Unhold…
-                </ActionButton>
-                <ActionButton
-                  dense
-                  variant="danger"
-                  onAction={actions.request}
-                  intent={holdIntent('forget', selection, hiddenSelection)}
-                >
-                  Forget…
-                </ActionButton>
-                <Button
-                  dense
-                  variant="ghost"
-                  onClick={() => {
-                    setSelected(new Set());
-                  }}
-                >
-                  Clear
-                </Button>
-              </>
-            ) : (
-              <>
-                <ActionButton
-                  dense
-                  variant="ghost"
-                  onAction={actions.request}
-                  intent={{
-                    kind: 'roll',
-                    hosts: [],
-                    all: true,
-                    containerChoices: rollableContainers(list(hosts.data?.hosts)),
-                  }}
-                >
-                  Roll all hosts…
-                </ActionButton>
-                <ActionButton
-                  dense
-                  variant="ghost"
-                  onAction={actions.request}
-                  intent={{ kind: 'reboot', hosts: [], all: true }}
-                >
-                  Reboot all hosts…
-                </ActionButton>
-              </>
-            )}
+          <div role="group" aria-label="Fleet actions" className="ml-auto flex flex-wrap items-center gap-1">
+            <BulkAction
+              icon="roll"
+              label="Roll all hosts…"
+              check={{
+                kind: 'roll',
+                hosts: [],
+                all: true,
+                containerChoices: rollableContainers(list(hosts.data?.hosts)),
+              }}
+              run={() => {
+                actions.request({
+                  kind: 'roll',
+                  hosts: [],
+                  all: true,
+                  containerChoices: rollableContainers(list(hosts.data?.hosts)),
+                });
+              }}
+            />
+            <BulkAction
+              icon="reboot"
+              label="Reboot all hosts…"
+              check={{ kind: 'reboot', hosts: [], all: true }}
+              run={() => {
+                actions.request({ kind: 'reboot', hosts: [], all: true });
+              }}
+            />
           </div>
         )}
 
@@ -246,12 +216,56 @@ export function HostsTab() {
         )}
       </div>
 
-      {actions.notice}
-      {publicHosts.error !== undefined && (
-        <ErrorBanner error={publicHosts.error} what="the hosts" onRetry={publicHosts.refresh} />
+      {priv && (
+        <SelectionBar
+          count={selection.length}
+          onClear={() => {
+            setSelected(new Set());
+          }}
+          note={
+            hiddenSelection.length > 0 && (
+              <span className="flex items-center gap-2 text-xs/5 text-warning">
+                {hiddenSelection.length} hidden by the filter
+                <button
+                  type="button"
+                  className="font-medium text-accent hover:underline"
+                  onClick={() => {
+                    const hidden = new Set(hiddenSelection);
+                    setSelected(prev => new Set([...prev].filter(n => !hidden.has(n))));
+                  }}
+                >
+                  Drop them
+                </button>
+              </span>
+            )
+          }
+        >
+          {(
+            [
+              ['roll', 'Roll', rollSelection],
+              ['reboot', 'Reboot', { kind: 'reboot', hosts: selection, all: false, hiddenHosts: hiddenSelection }],
+              ['hold', 'Hold', holdIntent('hold', selection, hiddenSelection)],
+              ['unhold', 'Unhold', holdIntent('unhold', selection, hiddenSelection)],
+              ['forget', 'Forget', holdIntent('forget', selection, hiddenSelection)],
+            ] as const
+          ).map(([icon, label, intent]) => (
+            <BulkAction
+              key={icon}
+              icon={icon}
+              label={label}
+              tone={icon === 'forget' ? 'danger' : 'default'}
+              blocked={selection.length === 0 ? 'Select hosts first' : ''}
+              check={intent}
+              run={() => {
+                actions.request(intent);
+              }}
+            />
+          ))}
+        </SelectionBar>
       )}
-      {hosts.error !== undefined && <ErrorBanner error={hosts.error} what="the host details" onRetry={hosts.refresh} />}
-      {plan.error !== undefined && <ErrorBanner error={plan.error} what="the plan" onRetry={plan.refresh} />}
+
+      {actions.notice}
+      {publicHosts.error !== undefined && <ErrorBanner error={publicHosts.error} what="the hosts" />}
 
       {loading && allRows.length === 0 ? (
         <Loading what="hosts" />
@@ -268,7 +282,7 @@ export function HostsTab() {
                   <Th tight className="w-6 text-center">
                     <input
                       type="checkbox"
-                      aria-label="Select all shown hosts"
+                      aria-label="Select all hosts the filter shows, on every page"
                       checked={allVisibleSelected}
                       onChange={() => {
                         setSelected(allVisibleSelected ? new Set() : new Set(visibleNames));
@@ -311,7 +325,7 @@ export function HostsTab() {
                 </Td>
               </tr>
             )}
-            {rows.map(row => {
+            {pageRows.map(row => {
               const isOpen = expanded.has(row.name);
               return (
                 <Fragment key={row.name}>
@@ -442,6 +456,24 @@ function HostTableRow({
   );
 }
 
+/** Uptime ticks in the page from the time the host booted; the stream does not send it again with every sync. */
+function Uptime({ host }: { host: HostListing }) {
+  const now = useSharedNow();
+  const seconds =
+    host.bootTime && !isZeroTime(host.bootTime)
+      ? Math.max(0, Math.floor((now - Date.parse(host.bootTime)) / 1000))
+      : host.uptimeSeconds;
+
+  return (
+    <span
+      className="inline-block min-w-16 tabular-nums"
+      title={host.bootTime ? absoluteTime(host.bootTime) : undefined}
+    >
+      {formatDuration(seconds)}
+    </span>
+  );
+}
+
 function MissingCells() {
   return (
     <Td colSpan={6} className="text-faint">
@@ -450,7 +482,7 @@ function MissingCells() {
   );
 }
 
-function PrivateCells({ row, summary: s }: { row: HostRow; summary: HostSummary }) {
+function PrivateCells({ row, summary: s }: { row: HostRow; summary: HostListing }) {
   const share = attestingShare(s);
   const state = hostState(row);
   const needs = list(s.needs);
@@ -459,15 +491,20 @@ function PrivateCells({ row, summary: s }: { row: HostRow; summary: HostSummary 
   return (
     <>
       <Td>
-        <span className="flex items-center gap-2" title={needs.map(needSummary).join('\n') || undefined}>
+        {/* A fixed width: the waiting reason changes, the columns do not. */}
+        <span
+          className="flex w-60 items-center gap-2 2xl:w-96"
+          title={needs.length > 0 ? `Open needs: ${needs.map(n => n.kind).join(', ')}` : undefined}
+        >
           {state ? <Badge tone={state.tone}>{state.label}</Badge> : <span className="text-faint">up to date</span>}
+          <OfflineBadge mark={s.offline} />
           {s.hold.local && (
             <Badge tone="warning" title={`Local hold file${s.hold.localReason ? `: ${s.hold.localReason}` : ''}`}>
               local hold
             </Badge>
           )}
           {state?.detail && (
-            <span className="max-w-36 truncate text-muted 2xl:max-w-80" title={state.detail}>
+            <span className="min-w-0 truncate text-muted" title={state.detail}>
               {state.detail}
             </span>
           )}
@@ -494,10 +531,10 @@ function PrivateCells({ row, summary: s }: { row: HostRow; summary: HostSummary 
                 share >= 0.9 ? 'bg-success' : share > 0 ? 'bg-warning' : 'bg-danger-solid'
               )}
             />
-            <span className={cx(share < 0.9 && 'font-medium', share === 0 && 'text-danger')}>
+            <span className={cx('min-w-11', share < 0.9 && 'font-medium', share === 0 && 'text-danger')}>
               {formatPercent(share * 100)}
             </span>
-            <span className="hidden text-faint 2xl:inline">
+            <span className="hidden min-w-12 text-faint 2xl:inline">
               {s.plan.live}/{s.plan.weight}
             </span>
           </span>
@@ -517,9 +554,7 @@ function PrivateCells({ row, summary: s }: { row: HostRow; summary: HostSummary 
         </span>
       </Td>
       <Td className="hidden xl:table-cell">
-        <span className="tabular-nums" title={`${s.uptimeSeconds} s`}>
-          {formatDuration(s.uptimeSeconds)}
-        </span>
+        <Uptime host={s} />
       </Td>
       <Td title={`${s.pending.upgradable} upgradable, ${s.pending.security} security, ${s.pending.blocked} blocked`}>
         <span className="flex items-center gap-2">
@@ -539,9 +574,16 @@ function PrivateCells({ row, summary: s }: { row: HostRow; summary: HostSummary 
         </span>
       </Td>
       <Td className="hidden 2xl:table-cell">
-        <span className={cx(s.stale ? 'font-medium text-warning' : 'text-muted')}>
-          <RelTime value={s.lastSeen} />
-        </span>
+        {/* A host that syncs is "live": when exactly it last did is not sent. A silent one says since when. */}
+        {s.stale ? (
+          <span className="font-medium text-warning">
+            <RelTime fixed value={s.lastSeen} />
+          </span>
+        ) : (
+          <span className="inline-block min-w-20 text-muted" title="The agent syncs">
+            live
+          </span>
+        )}
       </Td>
     </>
   );

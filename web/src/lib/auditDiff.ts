@@ -1,6 +1,6 @@
 // Before / after diff of audit details (fleet.AuditEntry.Detail).
 
-export interface DiffRow {
+interface DiffRow {
   /** key is the dotted path of the changed value. */
   key: string;
   before: unknown;

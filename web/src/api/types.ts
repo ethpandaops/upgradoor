@@ -9,9 +9,9 @@
 //   - omitempty fields are optional.
 
 /** A Go slice without omitempty: an array, or null for a nil slice. */
-export type List<T> = T[] | null;
+type List<T> = T[] | null;
 /** A Go map without omitempty. */
-export type Dict<T> = Record<string, T> | null;
+type Dict<T> = Record<string, T> | null;
 
 const EMPTY: readonly never[] = Object.freeze([]);
 
@@ -28,7 +28,18 @@ export function dict<T>(v: Record<string, T> | null | undefined): Record<string,
 // ---------------------------------------------------------------- protocol
 
 /** protocol.Verb */
-export type Verb = 'roll' | 'packages' | 'reboot';
+type Verb = 'roll' | 'packages' | 'reboot';
+
+/** protocol.Validators: the validator range a host reports with its sync. */
+interface ValidatorReport {
+  start: number;
+  end: number;
+  /** Where the agent read the range: the marker file of the validator keys, or its configuration. */
+  source: 'marker' | 'config' | (string & {});
+  /** known: start and end are the range. missing: the marker file is not there. invalid: the range cannot be used. */
+  state: 'known' | 'missing' | 'invalid' | (string & {});
+  error?: string;
+}
 
 /** protocol.Hold */
 export interface Hold {
@@ -40,8 +51,15 @@ export interface Hold {
 /** protocol.ContainerKind */
 export type ContainerKind = 'el' | 'cl' | 'vc' | 'other';
 
+/**
+ * protocol.Impact: how the controller schedules work on a container. node: the
+ * validator budget, the host limit and the gate; slot: the host limit and the
+ * gate; independent: a limit of its own.
+ */
+export type Impact = 'node' | 'slot' | 'independent';
+
 /** protocol.RegistryCheck */
-export interface RegistryCheck {
+interface RegistryCheck {
   digest?: string;
   revision?: string;
   checkedAt: string;
@@ -65,11 +83,50 @@ export interface Container {
   startedAt: string;
   managed: boolean;
   kind?: ContainerKind;
+  impact?: Impact;
   configuredImage?: string;
-  custom?: boolean;
   registry?: RegistryCheck;
   /** owners are the teams that own a managed container; absent when nobody does. */
   owners?: string[];
+  /**
+   * client is the client software a managed container runs ("geth",
+   * "lighthouse"); a validator client carries the client of its consensus
+   * client. This and the three fields below are in a host's details and in
+   * the rows of a client's host list, never in the rows of the host table.
+   */
+  client?: string;
+  /** command is the command line of a managed container: what a flag override changes. */
+  command?: string[];
+  /** override is the entry of the host's overrides file for the container, or what is left to undo of one. */
+  override?: ContainerOverride;
+  /** overridable says what the agent configuration lets the controller override; absent when nothing. */
+  overridable?: Overridable;
+}
+
+/** protocol.ContainerOverride: the override of one managed container, as the host's overrides file states it. */
+export interface ContainerOverride {
+  /** The image reference the container runs instead of the configured one. */
+  image?: string;
+  addFlags?: string[];
+  removeFlags?: string[];
+  /** Who set the override and why, as the file says. */
+  by?: string;
+  reason?: string;
+  /** When the override ends; absent for one without an end. */
+  until?: string;
+  /** The container runs what the override asks for. */
+  applied: boolean;
+  /** The entry is gone and the container still runs it: it waits for a lease to be put back. */
+  restoring?: boolean;
+  /** Why the override cannot be applied as written. */
+  error?: string;
+}
+
+/** protocol.Overridable */
+interface Overridable {
+  /** The allowed image repository patterns; absent when image overrides are off. */
+  images?: string[];
+  flags?: boolean;
 }
 
 /** protocol.ELHealth */
@@ -94,13 +151,13 @@ export interface CLHealth {
 }
 
 /** protocol.NodeHealth */
-export interface NodeHealth {
+interface NodeHealth {
   el?: ELHealth;
   cl?: CLHealth;
 }
 
 /** protocol.OSSummary */
-export interface OSSummary {
+interface OSSummary {
   id: string;
   versionId: string;
   prettyName: string;
@@ -119,10 +176,10 @@ export interface Pending {
 }
 
 /** protocol.NeedKind */
-export type NeedKind = 'image' | 'packages' | 'reboot';
+export type NeedKind = 'image' | 'override' | 'spec' | 'packages' | 'reboot';
 
 /** protocol.ImageNeed */
-export interface ImageNeed {
+interface ImageNeed {
   container: string;
   image: string;
   fromDigest?: string;
@@ -130,20 +187,52 @@ export interface ImageNeed {
   toRevision?: string;
 }
 
+/** protocol.OverrideNeed: recreate one container so that it runs what the host's overrides file says. */
+interface OverrideNeed {
+  container: string;
+  /** The reference the container is recreated from. */
+  image: string;
+  fromImage?: string;
+  fromDigest?: string;
+  toDigest: string;
+  toRevision?: string;
+  /** The command line changes. */
+  flags?: boolean;
+  /** The need takes an override away. */
+  restore?: boolean;
+}
+
+/**
+ * protocol.SpecNeed: recreate one container with the image and command line
+ * agent.yaml names now (the soft deploy of an Ansible change), overrides
+ * applied. Hosts with the same key share one rollout.
+ */
+interface SpecNeed {
+  container: string;
+  key: string;
+  image: string;
+  fromImage?: string;
+  fromDigest?: string;
+  toDigest: string;
+  toRevision?: string;
+  /** The command line changes. */
+  flags?: boolean;
+}
+
 /** protocol.PackageChange */
-export interface PackageChange {
+interface PackageChange {
   name: string;
   from: string;
   to: string;
 }
 
 /** protocol.PackagesNeed */
-export interface PackagesNeed {
+interface PackagesNeed {
   packages: List<PackageChange>;
 }
 
 /** protocol.RebootNeed */
-export interface RebootNeed {
+interface RebootNeed {
   reasons: List<string>;
 }
 
@@ -152,7 +241,11 @@ export interface Need {
   id: string;
   kind: NeedKind;
   directiveId?: string;
+  /** local: the need was asked for on the host itself (every override need, a roll from the local command line). */
+  local?: boolean;
   image?: ImageNeed;
+  override?: OverrideNeed;
+  spec?: SpecNeed;
   packages?: PackagesNeed;
   reboot?: RebootNeed;
 }
@@ -174,7 +267,7 @@ export interface Step {
 }
 
 /** protocol.Operation */
-export interface Operation {
+interface Operation {
   leaseId: string;
   phase: Phase;
   startedAt: string;
@@ -185,7 +278,7 @@ export interface Operation {
 }
 
 /** protocol.OSInfo */
-export interface OSInfo {
+interface OSInfo {
   id: string;
   versionId: string;
   codename: string;
@@ -194,7 +287,7 @@ export interface OSInfo {
 }
 
 /** protocol.KernelInfo */
-export interface KernelInfo {
+interface KernelInfo {
   running: string;
   newest: string;
   installed: List<string>;
@@ -230,17 +323,9 @@ export interface Inventory {
 
 // ------------------------------------------------------------------- fleet
 
-/** fleet.Liveness */
-export interface Liveness {
-  host: string;
-  epoch: number;
-  live: number;
-  total: number;
-}
-
 /** fleet.NetworkHealth */
 /** fleet.SlotPhase: a stretch of the chain with one slot duration. */
-export interface SlotPhase {
+interface SlotPhase {
   /** The first epoch of the phase and its start. */
   epoch: number;
   start: string;
@@ -257,9 +342,8 @@ export interface NetworkHealth {
   /** The chain's slot durations; a fork that changes the duration starts a new phase. */
   phases?: List<SlotPhase>;
   /**
-   * Why the current epoch cannot be placed by phases: the beacon node's chain
-   * timing is out of bounds. The network gate is then closed with it as the
-   * reason ("chain timing out of bounds: ...").
+   * Why the beacon node's chain timing is invalid as a whole. The network gate
+   * is then closed with it as the reason ("invalid chain timing: ...").
    */
   timingError?: string;
   headSlot: number;
@@ -268,18 +352,19 @@ export interface NetworkHealth {
   finalityLagEpochs: number;
   livenessKnown: boolean;
   livenessEpoch: number;
-  /**
-   * True while the beacon node is known not to serve the liveness endpoint.
-   * The gate then judges finality only; readiness and the budget use the
-   * agents' probes.
-   */
-  livenessUnsupported: boolean;
+  /** Why the beacon service's last count of the per-slot data failed, if it did. */
+  livenessError?: string;
   tracked: number;
   live: number;
 }
 
 /** fleet.RolloutKind */
-export type RolloutKind = 'image' | 'packages' | 'reboot' | 'manual';
+/**
+ * fleet.RolloutKind. `local` is a rollout of one host for what was asked for
+ * on the host itself (an override, a roll from its command line): it has one
+ * member, answers to no policy and has no canary.
+ */
+export type RolloutKind = 'image' | 'spec' | 'packages' | 'reboot' | 'manual' | 'local';
 
 /** fleet.RolloutState */
 export type RolloutState = 'active' | 'halted' | 'completed' | 'superseded' | 'aborted';
@@ -288,11 +373,11 @@ export type RolloutState = 'active' | 'halted' | 'completed' | 'superseded' | 'a
 export type HostState = 'expected' | 'pending' | 'leased' | 'done' | 'failed' | 'skipped';
 
 /**
- * fleet.Stage, in serving order: 1 repair (a member whose host is broken:
- * its last lease for the same thing, the image or the packages, failed; it is
- * served first), 2 the canary (the one host that goes alone until the first
- * success), 3 the rest. The scheduler derives it from the lease table and
- * the rollout's canary in every reconcile.
+ * fleet.Stage, in serving order: 1 repair (a member whose host is broken for
+ * what the rollout is about, the image or the packages: HostSummary.broken;
+ * it is served first), 2 the canary (the one host that goes alone until the
+ * first success), 3 the rest. The scheduler derives it from the hosts' marks
+ * and the rollout's canary in every reconcile.
  */
 export type Stage = 1 | 2 | 3;
 
@@ -302,12 +387,15 @@ export interface RolloutHost {
   state: HostState;
   stage: Stage;
   needId?: string;
-  leaseId?: string;
   /**
-   * The failure reason, the note of a skip, or, on a waiting member in the
-   * repair stage, the lease that broke its host:
-   * "broken since lease <id> (rollout <id>)".
+   * The lease the member holds or was served by. A member that held a lease
+   * when its rollout closed stays leased with it: a closed rollout is not
+   * written again, and the lease says how it ended.
    */
+  leaseId?: string;
+  /** The person who skipped the member; absent on a member the scheduler skipped (its host was forgotten). */
+  skippedBy?: string;
+  /** The failure reason, or the reason given with a skip. */
   error?: string;
   updatedAt: string;
 }
@@ -321,13 +409,18 @@ export interface Rollout {
   image?: string;
   digest?: string;
   revision?: string;
+  /** The client whose image policy an image rollout answers to; absent when it answers to policyImage. */
+  client?: string;
   packages?: PackageChange[];
   state: RolloutState;
   reason?: string;
   paused: boolean;
   /**
-   * Why the scheduler paused the rollout by itself: "paused after the canary;
-   * resume to continue". Empty when a person paused it, and once it is resumed.
+   * Why the rollout is paused, when there is more to say than that a person
+   * paused it: the scheduler paused it at its first success ("paused after
+   * the canary; resume to continue"), or a person aborted a rollout of an
+   * observed cause, which stays open while hosts report the cause
+   * ("aborted: <reason>; resume to continue"). Empty once it is resumed.
    */
   pauseReason?: string;
   approved: boolean;
@@ -347,9 +440,9 @@ export type LeaseState = 'granted' | 'running' | 'verifying' | 'released' | 'fai
 /**
  * fleet.LeaseCancel: the mark of a lease that a person ended while it was
  * open (the end-lease action). The lease stays open and keeps its slot until
- * it ends by one of the ordinary ways.
+ * its agent reports or goes silent, and then ends as failed.
  */
-export interface LeaseCancel {
+interface LeaseCancel {
   at: string;
   /** The person, as recorded in the audit log. */
   by: string;
@@ -378,10 +471,11 @@ export interface Lease {
   needs: List<Need>;
   rollouts: Dict<string>;
   weight: number;
+  /** The validators that attested when the lease was granted: what it cost the budget. For display. */
   charged: number;
+  /** The class of the work: node, slot or independent. */
+  impact?: Impact;
   force: boolean;
-  /** Granted through the repair exception of a closed gate; one such lease is open at most. */
-  repair?: boolean;
   grantedBy: string;
   grantedAt: string;
   expiresAt: string;
@@ -410,11 +504,12 @@ export interface AuditEntry {
 }
 
 /** fleet.Policy */
-export type Policy = 'auto' | 'manual' | 'paused';
+export type Policy = 'auto' | 'manual';
 
 /** fleet.Settings; durations are Go duration strings ("30m0s"). */
 export interface Settings {
   maxUnavailablePercent: number;
+  maxIndependentPercent: number;
   minParticipationPercent: number;
   maxFinalityLagEpochs: number;
   readyEpochs: number;
@@ -425,6 +520,12 @@ export interface Settings {
   policyImage: Policy;
   policyPackages: Policy;
   policyReboot: Policy;
+  /**
+   * The image policy per client ("geth": "manual"); always an object. The
+   * image rollouts of a client that is listed answer to its entry, the
+   * others to policyImage. It is changed with the client-policy action.
+   */
+  policyClients: Record<string, Policy>;
   /** Pause a rollout of the kind when its first host is ready, until a person resumes it. */
   pauseAfterCanaryImage: boolean;
   pauseAfterCanaryPackages: boolean;
@@ -457,6 +558,22 @@ export interface RebootRequest {
   reason: string;
 }
 
+/** fleet.OfflineMark: a person's mark that a host is known offline. */
+export interface OfflineMark {
+  reason: string;
+  /** until is when the mark ends by itself; absent: until a person lifts it. */
+  until?: string;
+  /** by is "team" for a mark set through team_hold. */
+  by?: string;
+}
+
+/** scheduler.OfflineRequest: the body of mark-offline and unmark-offline. */
+export interface OfflineRequest {
+  hosts: string[];
+  reason: string;
+  until?: string;
+}
+
 /** scheduler.HoldRequest: the body of hold, unhold and forget. */
 export interface HoldRequest {
   hosts: string[];
@@ -467,12 +584,61 @@ export interface HoldRequest {
  * scheduler.EndLeaseRequest: the body of end-lease. The action is a request
  * to cancel an open lease (granted, running or verifying): the lease is
  * marked (Lease.cancelled) and stays open until the agent reports or the
- * lease runs out, and the host is put on controller hold. Ending a lease
+ * lease runs out, and then ends as failed. No hold is set. Ending a lease
  * that is already cancelled changes nothing and succeeds; a lease that has
  * ended is answered 409.
  */
 export interface EndLeaseRequest {
   lease: string;
+  reason: string;
+}
+
+/** scheduler.ClientPolicyRequest: the body of client-policy. An empty policy returns the client to policyImage. */
+export interface ClientPolicyRequest {
+  client: string;
+  policy: Policy | '';
+  reason: string;
+}
+
+/**
+ * scheduler.ImageOverrideRequest: the body of image-override. An empty image
+ * clears the image override. until is when the override ends (RFC 3339, at
+ * most 7 days from now; the controller's default is 24 hours); the entry has
+ * one end for image and flags together.
+ */
+export interface ImageOverrideRequest {
+  host: string;
+  container: string;
+  image: string;
+  until?: string;
+  reason: string;
+}
+
+/** scheduler.FlagOverrideRequest: the body of flag-override. Both lists empty clears the flag override. */
+export interface FlagOverrideRequest {
+  host: string;
+  container: string;
+  addFlags: string[];
+  removeFlags: string[];
+  until?: string;
+  reason: string;
+}
+
+/**
+ * scheduler.ClientOverrideRequest: the body of client-override. One part of an
+ * override for the container of one kind of a client on each named host; an
+ * empty image, or no flags, clears that part. Hosts the login may not act
+ * on, or that cannot take it, come back in ActionResult.rejected.
+ */
+export interface ClientOverrideRequest {
+  client: string;
+  kind: ContainerKind;
+  hosts: string[];
+  part: 'image' | 'flags';
+  image?: string;
+  addFlags?: string[];
+  removeFlags?: string[];
+  until?: string;
   reason: string;
 }
 
@@ -511,26 +677,32 @@ export interface Budget {
   unavailableWeight: number;
   leasedHosts: number;
   maxLeasedHosts: number;
+  /** Hosts whose lease is about independent containers alone, and their limit. */
+  independentHosts?: number;
+  maxIndependent?: number;
+  /** Hosts marked known offline and their validators: left out of the budget and the gate. */
+  offlineHosts?: number;
+  offlineWeight?: number;
 }
 
 /**
- * scheduler.WaitKind: the class of a waiting reason. next, budget, host-limit
- * and order clear by themselves; gate clears when the network recovers; the
- * rest needs somebody to act.
+ * scheduler.WaitKind: the class of a waiting reason. budget, host-limit and
+ * order clear by themselves; working clears when the operation the host
+ * works on without a lease is over; gate clears when the network recovers;
+ * the rest needs somebody to act.
  */
 export type WaitKind =
-  | 'next'
   | 'budget'
   | 'host-limit'
   | 'order'
   | 'gate'
   | 'verb'
   | 'halted'
-  | 'policy-paused'
   | 'approval'
   | 'rollout-paused'
   | 'paused'
   | 'silent'
+  | 'working'
   | 'held';
 
 /** scheduler.QueueEntry */
@@ -538,11 +710,10 @@ export interface QueueEntry {
   host: string;
   position: number;
   reason: string;
-  /** Absent in the answer of a controller older than the field. */
-  wait?: WaitKind;
+  wait: WaitKind;
   /**
-   * The host an order wait is for: a member whose host is broken, the host of a lease in flight, or the canary. It need
-   * not be in the queue: it may hold a lease, or be expected to report.
+   * The host an order wait is for: a member whose host is broken, or the canary. It need not be in the queue: it may
+   * hold a lease, or be expected to report.
    */
   after?: string;
   /**
@@ -555,7 +726,7 @@ export interface QueueEntry {
 }
 
 /** scheduler.SlotState */
-export type SlotState = 'idle' | 'queued' | 'leased' | 'verifying' | 'failed' | 'held' | 'stale';
+type SlotState = 'idle' | 'queued' | 'leased' | 'verifying' | 'failed' | 'held' | 'stale';
 
 /** scheduler.HostPlan */
 export interface HostPlan {
@@ -580,7 +751,7 @@ export interface Plan {
 // ------------------------------------------------------------------- store
 
 /** store.PackageVersion */
-export interface PackageVersion {
+interface PackageVersion {
   version: string;
   hosts: List<string>;
 }
@@ -612,7 +783,6 @@ export interface PublicImageRef {
   image: string;
   digest?: string;
   revision?: string;
-  custom?: boolean;
 }
 
 /** api.PublicHost */
@@ -643,35 +813,111 @@ export interface PublicImages {
   images: List<PublicImage>;
 }
 
-/** api.ParticipationPoint: the network's attestation participation in one epoch. */
-export interface ParticipationPoint {
-  epoch: number;
-  /** The end of the epoch. */
-  time: string;
-  live: number;
-  total: number;
-}
-
-/** api.PublicHistory */
-export interface PublicHistory {
-  epochs: List<ParticipationPoint>;
+/**
+ * api.SlotHistory: what the tracked validators did slot by slot over a window
+ * that ends now. Columnar: point i of every list covers the bucketSlots slots
+ * from firstSlot + i * bucketSlots on; the last point is the bucket the clock
+ * is in.
+ */
+export interface SlotHistory {
+  firstSlot: number;
+  /** When firstSlot began. */
+  firstTime: string;
+  /** The slot duration in milliseconds; 0 while the chain's timing is unknown. */
+  slotMs: number;
+  slotsPerEpoch: number;
+  /** Slots per point: 1 for a short window, a power of two for a long one. */
+  bucketSlots: number;
   minParticipationPercent: number;
   epochSeconds: number;
+  /** Stored slots per point; 0 means nothing is known about the point. */
+  recorded: List<number>;
+  /** Recorded slots without a block. */
+  missed: List<number>;
+  /** Tracked validators with an attestation duty, and those whose attestation a block carries. */
+  assigned: List<number>;
+  included: List<number>;
+  /** The counts of the point's slot with the lowest share included; absent when a point is one slot. */
+  worstAssigned?: List<number>;
+  worstIncluded?: List<number>;
+  /**
+   * The spans of the window during which hosts were off; absent without a
+   * login. Bounded: with many, spans of one kind that overlap stand as one
+   * span for several hosts.
+   */
+  outages?: List<Outage>;
+  /** How many different hosts were off in the window, whatever outages was merged to. */
+  outageHosts?: number;
+  /** In how many slots a host must have missed attestations, no further than an epoch apart, to count as off. */
+  offSlots?: number;
 }
 
-/** api.HostSummary */
-export interface HostSummary {
+/** api.Outage: a span during which a host was off, or several hosts when spans of a kind were merged. */
+export interface Outage {
+  /** How many hosts the span stands for, and up to eight of their names. */
+  hosts: number;
+  names: List<string>;
+  from: string;
+  to: string;
+  /** The host was already off when the window began. */
+  fromStart?: boolean;
+  /** It is still off: `to` is the last moment known of. */
+  open?: boolean;
+  /** The lease that explains the span, when it stands for one host. */
+  lease?: string;
+  /** What the lease does; absent for a span no lease explains. */
+  work?: 'image' | 'packages' | 'reboot' | 'mixed' | (string & {});
+  rollout?: string;
+  /** The lease failed or expired. */
+  failed?: boolean;
+  /** Attestations missed, and due, in the slots of the span in which the hosts missed some. */
+  missed: number;
+  assigned: number;
+  /** How many validators the hosts run. */
+  validators: number;
+}
+
+/** fleet.SlotParticipation: what the tracked validators did in one slot. */
+export interface SlotRow {
+  slot: number;
+  /** false when the slot has no canonical block. */
+  proposed: boolean;
+  assigned: number;
+  included: number;
+  /** The hosts that missed attestations in the slot, with their duties; absent when none did, and without a login. */
+  hosts?: { host: string; assigned: number; included: number }[];
+}
+
+/** The slots an event stream carries: the current epoch and the two before it, oldest first. */
+interface SlotRows {
+  rows: SlotRow[];
+}
+
+/** api.ContainerListing: a container as the host list shows it. */
+export type ContainerListing = Pick<
+  Container,
+  'name' | 'image' | 'digest' | 'revision' | 'state' | 'managed' | 'kind' | 'impact' | 'owners'
+>;
+
+/**
+ * api.HostListing: one row of the host list, what the overview, the host
+ * table and the selection need. The rest of a host is in its details
+ * (HostSummary, HostDetail).
+ */
+export interface HostListing {
   name: string;
   roles: List<string>;
+  /** The number of validators counted for the host. */
   validators: number;
   lastSeen: string;
   stale: boolean;
   agentVersion: string;
-  containers: List<Container>;
-  node: NodeHealth;
+  containers: List<ContainerListing>;
   os: OSSummary;
   pending: Pending;
   uptimeSeconds: number;
+  /** When the host booted. Only a stream sets it (the uptime then follows from the clock); the REST view has uptimeSeconds. */
+  bootTime?: string;
   hold: Hold;
   holdWanted: boolean;
   /** holdReason is the reason of the controller hold (holdWanted); left out when there is none. */
@@ -682,14 +928,35 @@ export interface HostSummary {
    * other hold. Left out when the host is not held.
    */
   holdBy?: 'team' | 'staff';
+  /** offline is the known-offline mark while it is in force. */
+  offline?: OfflineMark;
   verbs: List<Verb>;
-  needs: List<Need>;
+  /** The kinds of the host's open needs, one entry per need. */
+  needs: List<Pick<Need, 'kind'>>;
   plan: HostPlan;
+}
+
+/** api.HostSummary: a host in full, as its details carry it. */
+export interface HostSummary extends HostListing {
+  /** What the host's last sync said about its validator range; absent when it reports none. */
+  validatorReport?: ValidatorReport;
+  containers: List<Container>;
+  node: NodeHealth;
+  /**
+   * broken says what a lease of the host failed on: per group of rollouts
+   * ("image:<reference>", "packages") the ID of the lease that failed. The
+   * mark is set when a lease fails, for every group it carried a step of, and
+   * cleared for a group when a lease is released with that group's steps
+   * done. Such a host goes first in a rollout of the group. Left out when the
+   * host is in order.
+   */
+  broken?: Record<string, string>;
+  needs: List<Need>;
 }
 
 /** api.Hosts */
 export interface Hosts {
-  hosts: List<HostSummary>;
+  hosts: List<HostListing>;
 }
 
 /** api.HostDetail */
@@ -698,18 +965,114 @@ export interface HostDetail extends HostSummary {
   generation: number;
   firstSeen: string;
   remoteAddr: string;
+  /** The [start, end) range counted for the host. It follows validatorReport and differs while the host does not know its range. */
   validatorStart?: number;
   validatorEnd?: number;
+  /** The other hosts that report validators this host reports too. */
+  validatorOverlaps?: string[];
   inventory?: Inventory;
-  liveness: List<Liveness>;
   leases: List<Lease>;
   history: List<AuditEntry>;
+}
+
+/** api.ClientLayer: which row of the Clients tab a client belongs to. */
+export type ClientLayer = 'consensus' | 'execution';
+
+/** api.ClientHostState: the one state a host has on a client's page; where several apply, the first of this list. */
+export type ClientHostState = 'failed' | 'rolling' | 'held' | 'overridden' | 'pending' | 'current';
+
+/** CLIENT_HOST_STATES lists the states in their order of precedence. */
+export const CLIENT_HOST_STATES: readonly ClientHostState[] = [
+  'failed',
+  'rolling',
+  'held',
+  'overridden',
+  'pending',
+  'current',
+];
+
+/** api.ClientImage: one image reference the containers of a client follow. */
+export interface ClientImage {
+  kind: ContainerKind;
+  image: string;
+  /** What the tag points at, by the freshest registry check; absent when no host has looked yet. */
+  digest?: string;
+  revision?: string;
+  /** Hosts with a container on the reference, and how many of them run another digest. */
+  hosts: number;
+  behind: number;
+  /** The command line most of these containers report without a flag override, and how many hosts report exactly it. */
+  command?: List<string>;
+  commandHosts: number;
+}
+
+/** api.ClientView: one client, a row of GET /api/v1/clients and of the stream's client table. */
+export interface ClientView {
+  name: string;
+  layer: ClientLayer;
+  /** The image policy the client's rollouts answer to; policySet is false when that is policyImage. */
+  policy: Policy;
+  policySet: boolean;
+  /** owners own a container of the client on some host; allOwned own every one of them. */
+  owners: List<string>;
+  allOwned: List<string>;
+  images: List<ClientImage>;
+  /** The hosts that run the client; the counts below are those hosts by their state and add up to it. */
+  hosts: number;
+  current: number;
+  pending: number;
+  rolling: number;
+  overridden: number;
+  held: number;
+  failed: number;
+  /** Hosts on which a container of the client has an image override, a flag override, whatever their state. */
+  imageOverrides: number;
+  flagOverrides: number;
+  /** version changes whenever anything in the client's host list changes. */
+  version: string;
+}
+
+/** api.Clients */
+export interface Clients {
+  clients: List<ClientView>;
+}
+
+/** api.ClientHost: one host on a client's page. */
+export interface ClientHost {
+  host: string;
+  state: ClientHostState;
+  /** More about the state: why the host waits, what failed, why it is held. */
+  reason?: string;
+  /** The agent is silent; everything else is its last report. */
+  stale?: boolean;
+  slot: SlotState;
+  /** The host's containers of this client, with client, command, override and overridable. */
+  containers: List<Container>;
+}
+
+/** api.ClientHosts: one page of GET /api/v1/clients/{client}/hosts, ordered by host name. */
+export interface ClientHosts {
+  client: string;
+  /** ClientView.version of the list the page was cut from. */
+  version: string;
+  /** The hosts of the client, and how many of them the filter selects. */
+  total: number;
+  matched: number;
+  offset: number;
+  limit: number;
+  hosts: List<ClientHost>;
+  /** With names=true: the names of every matched host (at most 2000) instead of a page. */
+  names?: List<string>;
 }
 
 /** api.Packages */
 export interface Packages {
   query: string;
   matches: List<PackageMatch>;
+  /** The number of package names the query selects; on the first page only. */
+  total?: number;
+  /** Continues after this page (the `after` parameter); absent on the last page. */
+  next?: string;
 }
 
 /** api.Rollouts */
@@ -731,3 +1094,35 @@ export interface Audit {
   entries: List<AuditEntry>;
   nextBefore: number;
 }
+
+// ------------------------------------------------------------ event stream
+
+/** api.AuditHead: the newest entry of the audit log, as the stream reports it. */
+export interface AuditHead {
+  latestId: number;
+}
+
+/**
+ * The views the page reads from an event stream, by the name of the REST
+ * route each mirrors. The stream carries them as tables (api/wire.ts); the
+ * views are assembled from those.
+ */
+export interface LiveViews {
+  'public-hosts': PublicHosts;
+  'public-images': PublicImages;
+  'public-network': Gate;
+  /** The newest slots of the slot history, the ones that can still change (fleet.SlotParticipation). */
+  slots: SlotRows;
+  hosts: Hosts;
+  /** One row per client; the hosts of a client are asked for page by page (GET /api/v1/clients/{client}/hosts). */
+  clients: Clients;
+  plan: Plan;
+  rollouts: Rollouts;
+  settings: SettingsBody;
+  audit: AuditHead;
+}
+
+export type LiveView = keyof LiveViews;
+
+/** PRIVATE_VIEWS are the views only the authenticated stream carries. */
+export const PRIVATE_VIEWS: readonly LiveView[] = ['hosts', 'clients', 'plan', 'rollouts', 'settings', 'audit'];

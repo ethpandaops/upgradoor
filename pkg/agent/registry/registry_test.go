@@ -2,7 +2,6 @@ package registry
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
@@ -19,8 +18,6 @@ import (
 	"time"
 
 	"github.com/sirupsen/logrus"
-	logrustest "github.com/sirupsen/logrus/hooks/test"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,24 +25,21 @@ const (
 	repoPath    = "org/app"
 	tagMulti    = "multi"
 	tagSingle   = "single"
-	revAMD64    = "rev-amd64"
-	revARM64    = "rev-arm64"
 	testToken   = "tok-1"
 	testService = "fake-registry"
 	testBasic   = "user:secret"
-	plainAMD64  = "linux/amd64"
 	kindManifst = "/manifests/"
-	kindBlob    = "/blobs/"
 )
 
-// fakeRegistry is an OCI distribution registry with one repository, org/app.
+// fakeRegistry is an OCI distribution registry with one repository, org/app,
+// and two tags: "multi" points at an index, "single" at an image manifest.
 // Content is addressed by its real sha256 digest.
 type fakeRegistry struct {
 	srv *httptest.Server
 
 	mu       sync.Mutex
 	hits     map[string]int    // "METHOD path" -> count
-	content  map[string][]byte // digest -> body, manifests and blobs alike
+	content  map[string][]byte // digest -> manifest body
 	tags     map[string]string // tag -> digest
 	override map[string]func(w http.ResponseWriter, r *http.Request)
 
@@ -65,27 +59,7 @@ type fakeRegistry struct {
 	tokenQueries   []url.Values
 	unauthorized   int // 401 answers given by /v2/
 
-	indexDigest, amd64Digest, arm64Digest, amd64Config, arm64Config string
-}
-
-type fakePlatform struct {
-	OS           string `json:"os"`
-	Architecture string `json:"architecture"`
-	Variant      string `json:"variant,omitempty"`
-}
-
-type fakeDescriptor struct {
-	Digest   string        `json:"digest"`
-	Platform *fakePlatform `json:"platform,omitempty"`
-}
-
-func mustJSON(t *testing.T, v any) []byte {
-	t.Helper()
-
-	raw, err := json.Marshal(v)
-	require.NoError(t, err)
-
-	return raw
+	indexDigest, amd64Digest string
 }
 
 func newFakeRegistry(t *testing.T, tlsServer bool) *fakeRegistry {
@@ -99,18 +73,8 @@ func newFakeRegistry(t *testing.T, tlsServer bool) *fakeRegistry {
 		v2Agents: map[string]struct{}{},
 	}
 
-	f.amd64Config = f.add(configBody(t, revAMD64))
-	f.arm64Config = f.add(configBody(t, revARM64))
-	f.amd64Digest = f.add(mustJSON(t, map[string]any{"config": fakeDescriptor{Digest: f.amd64Config}}))
-	f.arm64Digest = f.add(mustJSON(t, map[string]any{"config": fakeDescriptor{Digest: f.arm64Config}}))
-	f.indexDigest = f.add(indexBody(t,
-		fakeDescriptor{Digest: f.arm64Digest, Platform: &fakePlatform{OS: "linux", Architecture: "arm64", Variant: "v8"}},
-		fakeDescriptor{Digest: f.amd64Digest, Platform: &fakePlatform{OS: "linux", Architecture: "amd64"}},
-		fakeDescriptor{
-			Digest:   "sha256:" + strings.Repeat("9", 64),
-			Platform: &fakePlatform{OS: platformUnknown, Architecture: platformUnknown},
-		},
-	))
+	f.amd64Digest = f.add([]byte(`{"config":{"digest":"sha256:c0ffee"}}`))
+	f.indexDigest = f.add([]byte(`{"manifests":[{"digest":"` + f.amd64Digest + `"}]}`))
 	f.tags[tagMulti] = f.indexDigest
 	f.tags[tagSingle] = f.amd64Digest
 
@@ -127,26 +91,6 @@ func newFakeRegistry(t *testing.T, tlsServer bool) *fakeRegistry {
 	t.Cleanup(f.srv.Close)
 
 	return f
-}
-
-func configBody(t *testing.T, revision string) []byte {
-	t.Helper()
-
-	labels := map[string]string{"other": "x"}
-	if revision != "" {
-		labels[RevisionLabel] = revision
-	}
-
-	return mustJSON(t, map[string]any{"config": map[string]any{"Labels": labels}})
-}
-
-func indexBody(t *testing.T, manifests ...fakeDescriptor) []byte {
-	t.Helper()
-
-	return mustJSON(t, map[string]any{
-		"mediaType": "application/vnd.oci.image.index.v1+json",
-		"manifests": manifests,
-	})
 }
 
 // add stores content and returns its digest.
@@ -181,7 +125,7 @@ func (f *fakeRegistry) set(fn func(f *fakeRegistry)) {
 }
 
 // handle replaces the answer for one "/v2/org/app/..." suffix, e.g.
-// "/blobs/sha256:…". The override runs after authentication.
+// "/manifests/slow". The override runs after authentication.
 func (f *fakeRegistry) handle(suffix string, fn func(w http.ResponseWriter, r *http.Request)) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -291,8 +235,6 @@ func (f *fakeRegistry) serveV2(w http.ResponseWriter, r *http.Request) {
 		override(w, r)
 	case strings.HasPrefix(suffix, kindManifst):
 		f.serveManifest(w, r, strings.TrimPrefix(suffix, kindManifst))
-	case strings.HasPrefix(suffix, kindBlob):
-		f.serveContent(w, r, strings.TrimPrefix(suffix, kindBlob), "")
 	default:
 		http.NotFound(w, r)
 	}
@@ -372,14 +314,13 @@ func testLogger() logrus.FieldLogger {
 func newResolver(t *testing.T, f *fakeRegistry, mod func(o *Options)) *Resolver {
 	t.Helper()
 
-	opts := Options{PlainHTTP: []string{f.host()}, Timeout: 5 * time.Second, Platform: plainAMD64}
+	opts := Options{PlainHTTP: []string{f.host()}}
 	if mod != nil {
 		mod(&opts)
 	}
 
 	r, err := New(testLogger(), opts)
 	require.NoError(t, err)
-	t.Cleanup(r.Close)
 
 	return r
 }
@@ -393,121 +334,36 @@ func writeAuthFile(t *testing.T, content string) string {
 	return path
 }
 
-func authFileFor(t *testing.T, host, userPass string) string {
-	t.Helper()
+// loginFor is the login of one registry, from "user:password".
+func loginFor(host, userPass string) Logins {
+	user, pass, _ := strings.Cut(userPass, ":")
 
-	return writeAuthFile(t, `{"auths":{"`+host+`":{"auth":"`+
-		base64.StdEncoding.EncodeToString([]byte(userPass))+`"}}}`)
+	return Logins{host: {Username: user, Password: pass}}
 }
 
-func TestResolveMultiArchHeadOnly(t *testing.T) {
+func TestResolveIsOneHead(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	r := newResolver(t, f, nil)
 
-	digest, revision, err := r.Resolve(t.Context(), f.ref(tagMulti))
-	require.NoError(t, err)
-	require.Equal(t, f.indexDigest, digest, "the index digest, not a platform manifest")
-	require.Equal(t, revAMD64, revision)
-
-	// First sight of the digest: one HEAD, then index, platform manifest and
-	// config, each once.
-	require.Equal(t, 1, f.heads())
-	require.Equal(t, 3, f.gets())
-	require.Equal(t, 0, f.count(http.MethodGet, kindManifst+tagMulti), "the tag itself is never fetched with GET")
-	require.Equal(t, 1, f.count(http.MethodGet, kindManifst+f.indexDigest))
-	require.Equal(t, 1, f.count(http.MethodGet, kindManifst+f.amd64Digest))
-	require.Equal(t, 1, f.count(http.MethodGet, kindBlob+f.amd64Config))
-
-	// Unchanged tag: exactly one HEAD per resolution, no GET at all.
-	for i := range 5 {
-		digest, revision, err = r.Resolve(t.Context(), f.ref(tagMulti))
+	for i := range 3 {
+		digest, err := r.Resolve(t.Context(), f.ref(tagMulti))
 		require.NoError(t, err)
-		require.Equal(t, f.indexDigest, digest)
-		require.Equal(t, revAMD64, revision)
-		require.Equal(t, 2+i, f.heads())
-		require.Equal(t, 3, f.gets())
+		require.Equal(t, f.indexDigest, digest, "the index digest, not a platform manifest")
+		require.Equal(t, 1+i, f.heads())
 	}
 
-	// The tag moves: the new digest is seen with the next HEAD and its
-	// revision is looked up once.
-	moved := f.tag(tagMulti, mustJSON(t, map[string]any{"config": fakeDescriptor{Digest: f.arm64Config}, "x": 1}))
-
-	digest, revision, err = r.Resolve(t.Context(), f.ref(tagMulti))
-	require.NoError(t, err)
-	require.Equal(t, moved, digest)
-	require.Equal(t, revARM64, revision)
-	require.Equal(t, 7, f.heads())
-	require.Equal(t, 5, f.gets())
-}
-
-func TestResolveSingleManifest(t *testing.T) {
-	f := newFakeRegistry(t, false)
-	r := newResolver(t, f, nil)
-
-	digest, revision, err := r.Resolve(t.Context(), f.ref(tagSingle))
+	digest, err := r.Resolve(t.Context(), f.ref(tagSingle))
 	require.NoError(t, err)
 	require.Equal(t, f.amd64Digest, digest)
-	require.Equal(t, revAMD64, revision)
-	require.Equal(t, 1, f.heads())
-	require.Equal(t, 2, f.gets())
-}
 
-func TestResolveSkipRevision(t *testing.T) {
-	f := newFakeRegistry(t, false)
-	r := newResolver(t, f, func(o *Options) { o.SkipRevision = true })
+	// The tag moves: the new digest is seen with the next HEAD.
+	moved := f.tag(tagMulti, []byte(`{"manifests":[]}`))
 
-	for range 3 {
-		digest, revision, err := r.Resolve(t.Context(), f.ref(tagMulti))
-		require.NoError(t, err)
-		require.Equal(t, f.indexDigest, digest)
-		require.Empty(t, revision)
-	}
-
-	require.Equal(t, 3, f.heads())
+	digest, err = r.Resolve(t.Context(), f.ref(tagMulti))
+	require.NoError(t, err)
+	require.Equal(t, moved, digest)
+	require.Equal(t, 5, f.heads())
 	require.Equal(t, 0, f.gets())
-}
-
-func TestResolvePlatformSelection(t *testing.T) {
-	cases := []struct {
-		name, platform, want string
-	}{
-		{"amd64", plainAMD64, revAMD64},
-		{"arm64", "linux/arm64", revARM64},
-		{"arm64 with variant", "linux/arm64/v8", revARM64},
-		{"variant mismatch falls back to the first image", "linux/arm64/v7", revARM64},
-		{"unknown platform falls back to the first image", "plan9/mips", revARM64},
-	}
-
-	for _, c := range cases {
-		t.Run(c.name, func(t *testing.T) {
-			f := newFakeRegistry(t, false)
-			r := newResolver(t, f, func(o *Options) { o.Platform = c.platform })
-
-			digest, revision, err := r.Resolve(t.Context(), f.ref(tagMulti))
-			require.NoError(t, err)
-			require.Equal(t, f.indexDigest, digest)
-			require.Equal(t, c.want, revision)
-		})
-	}
-}
-
-func TestParsePlatform(t *testing.T) {
-	p, err := parsePlatform("")
-	require.NoError(t, err)
-	require.Equal(t, "linux", p.os)
-	require.NotEmpty(t, p.arch)
-
-	p, err = parsePlatform("linux/arm/v7")
-	require.NoError(t, err)
-	require.Equal(t, platform{os: "linux", arch: "arm", variant: "v7"}, p)
-
-	for _, bad := range []string{"linux", "linux/", "/amd64", "a/b/c/d", "linux//v7"} {
-		_, err = parsePlatform(bad)
-		require.Error(t, err, bad)
-
-		_, err = New(testLogger(), Options{Platform: bad})
-		require.Error(t, err, bad)
-	}
 }
 
 func TestResolveWithoutDigestHeader(t *testing.T) {
@@ -516,33 +372,21 @@ func TestResolveWithoutDigestHeader(t *testing.T) {
 
 	r := newResolver(t, f, nil)
 
-	digest, revision, err := r.Resolve(t.Context(), f.ref(tagMulti))
+	digest, err := r.Resolve(t.Context(), f.ref(tagMulti))
 	require.NoError(t, err)
 	require.Equal(t, f.indexDigest, digest, "computed from the body")
-	require.Equal(t, revAMD64, revision)
-
-	// HEAD, GET of the tag (reused for the revision), platform manifest, config.
 	require.Equal(t, 1, f.heads())
 	require.Equal(t, 1, f.count(http.MethodGet, kindManifst+tagMulti))
-	require.Equal(t, 0, f.count(http.MethodGet, kindManifst+f.indexDigest))
-	require.Equal(t, 3, f.gets())
-
-	// Later resolutions need the GET for the digest but nothing else.
-	digest, revision, err = r.Resolve(t.Context(), f.ref(tagMulti))
-	require.NoError(t, err)
-	require.Equal(t, f.indexDigest, digest)
-	require.Equal(t, revAMD64, revision)
-	require.Equal(t, 2, f.heads())
-	require.Equal(t, 4, f.gets())
+	require.Equal(t, 1, f.gets())
 }
 
 func TestResolveWithoutHead(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	f.set(func(f *fakeRegistry) { f.noHead = true })
 
-	r := newResolver(t, f, func(o *Options) { o.SkipRevision = true })
+	r := newResolver(t, f, nil)
 
-	digest, _, err := r.Resolve(t.Context(), f.ref(tagSingle))
+	digest, err := r.Resolve(t.Context(), f.ref(tagSingle))
 	require.NoError(t, err)
 	require.Equal(t, f.amd64Digest, digest, "from the digest header of the GET")
 	require.Equal(t, 1, f.heads())
@@ -550,7 +394,7 @@ func TestResolveWithoutHead(t *testing.T) {
 
 	f.set(func(f *fakeRegistry) { f.getDigest = "not-a-digest" })
 
-	_, _, err = r.Resolve(t.Context(), f.ref(tagSingle))
+	_, err = r.Resolve(t.Context(), f.ref(tagSingle))
 	require.ErrorContains(t, err, "invalid "+headerContentDigest)
 }
 
@@ -561,7 +405,7 @@ func TestResolveInvalidDigestHeader(t *testing.T) {
 	for _, bad := range []string{"sha256:../../x", "sha256:abc", "nonsense", "sha256:" + strings.Repeat("G", 64)} {
 		f.set(func(f *fakeRegistry) { f.headDigest = bad })
 
-		_, _, err := r.Resolve(t.Context(), f.ref(tagMulti))
+		_, err := r.Resolve(t.Context(), f.ref(tagMulti))
 		require.ErrorContains(t, err, "invalid "+headerContentDigest, bad)
 	}
 
@@ -572,16 +416,16 @@ func TestResolveErrors(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	r := newResolver(t, f, nil)
 
-	_, _, err := r.Resolve(t.Context(), "")
+	_, err := r.Resolve(t.Context(), "")
 	require.Error(t, err)
 
-	_, _, err = r.Resolve(t.Context(), f.host()+"/org/app@sha256:"+strings.Repeat("a", 64))
-	require.ErrorIs(t, err, ErrDigestReference)
+	_, err = r.Resolve(t.Context(), f.host()+"/org/app@sha256:"+strings.Repeat("a", 64))
+	require.ErrorIs(t, err, errDigestReference)
 
 	// Unknown tag: a StatusError with the registry's code.
-	_, _, err = r.Resolve(t.Context(), f.ref("missing"))
+	_, err = r.Resolve(t.Context(), f.ref("missing"))
 
-	var status *StatusError
+	var status *statusError
 
 	require.ErrorAs(t, err, &status)
 	require.Equal(t, http.StatusNotFound, status.Code)
@@ -601,7 +445,7 @@ func TestResolveErrors(t *testing.T) {
 		w.WriteHeader(http.StatusBadGateway)
 	})
 
-	_, _, err = r.Resolve(t.Context(), f.ref("broken"))
+	_, err = r.Resolve(t.Context(), f.ref("broken"))
 	require.ErrorAs(t, err, &status)
 	require.Equal(t, http.StatusBadGateway, status.Code)
 	require.Equal(t, http.MethodGet, status.Method)
@@ -610,7 +454,7 @@ func TestResolveErrors(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	_, _, err = r.Resolve(ctx, f.ref(tagMulti))
+	_, err = r.Resolve(ctx, f.ref(tagMulti))
 	require.ErrorIs(t, err, context.Canceled)
 
 	// Unreachable registry.
@@ -618,10 +462,10 @@ func TestResolveErrors(t *testing.T) {
 	deadHost := strings.TrimPrefix(dead.URL, "http://")
 	dead.Close()
 
-	r2, err := New(testLogger(), Options{PlainHTTP: []string{deadHost}, Timeout: 2 * time.Second})
+	r2, err := New(testLogger(), Options{PlainHTTP: []string{deadHost}})
 	require.NoError(t, err)
 
-	_, _, err = r2.Resolve(t.Context(), deadHost+"/org/app:x")
+	_, err = r2.Resolve(t.Context(), deadHost+"/org/app:x")
 	require.Error(t, err)
 	require.False(t, errors.As(err, &status))
 }
@@ -653,38 +497,28 @@ func TestResolveOversizedOrBrokenTagManifest(t *testing.T) {
 
 	r := newResolver(t, f, nil)
 
-	_, _, err := r.Resolve(t.Context(), f.ref("huge"))
+	_, err := r.Resolve(t.Context(), f.ref("huge"))
 	require.ErrorIs(t, err, errBodyTooLarge)
 
-	_, _, err = r.Resolve(t.Context(), f.ref("short"))
+	_, err = r.Resolve(t.Context(), f.ref("short"))
 	require.ErrorContains(t, err, "read manifest")
 
-	// A body that is not a manifest still has a digest; only the revision is lost.
+	// The body is hashed, not read: one that is no manifest still has a digest.
 	garbage := f.tag("garbage", []byte("this is not json"))
 
-	digest, revision, err := r.Resolve(t.Context(), f.ref("garbage"))
+	digest, err := r.Resolve(t.Context(), f.ref("garbage"))
 	require.NoError(t, err)
 	require.Equal(t, garbage, digest)
-	require.Empty(t, revision)
-}
-
-func TestReadCapped(t *testing.T) {
-	data, err := readCapped(strings.NewReader("12345"), 5)
-	require.NoError(t, err)
-	require.Equal(t, "12345", string(data))
-
-	_, err = readCapped(strings.NewReader("123456"), 5)
-	require.ErrorIs(t, err, errBodyTooLarge)
 }
 
 func TestPlainHTTPIsPerHost(t *testing.T) {
 	f := newFakeRegistry(t, false)
 
 	// Without the plain-http entry the resolver speaks TLS to an http server.
-	r, err := New(testLogger(), Options{Timeout: 2 * time.Second})
+	r, err := New(testLogger(), Options{})
 	require.NoError(t, err)
 
-	_, _, err = r.Resolve(t.Context(), f.ref(tagMulti))
+	_, err = r.Resolve(t.Context(), f.ref(tagMulti))
 	require.Error(t, err)
 	require.Equal(t, 0, f.heads())
 
@@ -693,7 +527,7 @@ func TestPlainHTTPIsPerHost(t *testing.T) {
 		o.PlainHTTP = []string{"", "  http://" + strings.ToUpper(f.host()) + "/ "}
 	})
 
-	_, _, err = r.Resolve(t.Context(), f.ref(tagMulti))
+	_, err = r.Resolve(t.Context(), f.ref(tagMulti))
 	require.NoError(t, err)
 }
 
@@ -739,17 +573,18 @@ func TestResolveDockerHub(t *testing.T) {
 
 	for _, key := range []string{"https://index.docker.io/v1/", "docker.io", "registry-1.docker.io", "INDEX.docker.io"} {
 		t.Run(key, func(t *testing.T) {
-			r, err := New(testLogger(), Options{
-				AuthFile:     authFileFor(t, key, testBasic),
-				SkipRevision: true,
-			})
+			logins, err := LoadLogins(testLogger(), writeAuthFile(t,
+				`{"auths":{"`+key+`":{"auth":"`+base64.StdEncoding.EncodeToString([]byte(testBasic))+`"}}}`))
+			require.NoError(t, err)
+
+			r, err := New(testLogger(), Options{Logins: logins})
 			require.NoError(t, err)
 
 			transport := &hubTransport{target: strings.TrimPrefix(hub.URL, "http://"), base: http.DefaultTransport}
 			r.client.Transport = transport
 
 			for _, ref := range []string{"geth", "docker.io/library/geth:latest", "index.docker.io/geth"} {
-				digest, _, err := r.Resolve(t.Context(), ref)
+				digest, err := r.Resolve(t.Context(), ref)
 				require.NoError(t, err, ref)
 				require.Equal(t, f.indexDigest, digest)
 			}
@@ -759,22 +594,6 @@ func TestResolveDockerHub(t *testing.T) {
 			}
 		})
 	}
-}
-
-func TestNewDefaultsAndClose(t *testing.T) {
-	r, err := New(testLogger(), Options{})
-	require.NoError(t, err)
-	require.Equal(t, defaultTimeout, r.client.Timeout)
-	require.Empty(t, r.creds)
-
-	r, err = New(testLogger(), Options{Timeout: -time.Second})
-	require.NoError(t, err)
-	require.Equal(t, defaultTimeout, r.client.Timeout)
-
-	r, err = New(testLogger(), Options{Timeout: 3 * time.Second})
-	require.NoError(t, err)
-	require.Equal(t, 3*time.Second, r.client.Timeout)
-	r.Close()
 }
 
 func TestRequestTimeout(t *testing.T) {
@@ -790,10 +609,11 @@ func TestRequestTimeout(t *testing.T) {
 
 	t.Cleanup(func() { close(release) })
 
-	r := newResolver(t, f, func(o *Options) { o.Timeout = 100 * time.Millisecond })
+	r := newResolver(t, f, nil)
+	r.client.Timeout = 100 * time.Millisecond
 
 	start := time.Now()
-	_, _, err := r.Resolve(t.Context(), f.ref("slow"))
+	_, err := r.Resolve(t.Context(), f.ref("slow"))
 	require.Error(t, err)
 	require.Less(t, time.Since(start), 3*time.Second)
 }
@@ -812,21 +632,18 @@ func TestCAFile(t *testing.T) {
 	f := newFakeRegistry(t, true)
 
 	// Without the CA the certificate is not trusted.
-	r, err := New(testLogger(), Options{Timeout: 5 * time.Second, Platform: plainAMD64})
+	r, err := New(testLogger(), Options{})
 	require.NoError(t, err)
 
-	_, _, err = r.Resolve(t.Context(), f.ref(tagMulti))
+	_, err = r.Resolve(t.Context(), f.ref(tagMulti))
 	require.ErrorContains(t, err, "certificate")
-	r.Close()
 
-	r, err = New(testLogger(), Options{CAFile: caFileFor(t, f.srv), Timeout: 5 * time.Second, Platform: plainAMD64})
+	r, err = New(testLogger(), Options{CAFile: caFileFor(t, f.srv)})
 	require.NoError(t, err)
 
-	digest, revision, err := r.Resolve(t.Context(), f.ref(tagMulti))
+	digest, err := r.Resolve(t.Context(), f.ref(tagMulti))
 	require.NoError(t, err)
 	require.Equal(t, f.indexDigest, digest)
-	require.Equal(t, revAMD64, revision)
-	r.Close()
 }
 
 func TestCAFileErrors(t *testing.T) {
@@ -838,22 +655,6 @@ func TestCAFileErrors(t *testing.T) {
 
 	_, err = New(testLogger(), Options{CAFile: empty})
 	require.ErrorContains(t, err, "no PEM certificates")
-}
-
-func TestCAFileWithoutSystemRoots(t *testing.T) {
-	f := newFakeRegistry(t, true)
-
-	orig := systemRoots
-	systemRoots = func() (*x509.CertPool, error) { return nil, errors.New("no system roots") }
-
-	t.Cleanup(func() { systemRoots = orig })
-
-	r, err := New(testLogger(), Options{CAFile: caFileFor(t, f.srv), SkipRevision: true})
-	require.NoError(t, err)
-
-	digest, _, err := r.Resolve(t.Context(), f.ref(tagSingle))
-	require.NoError(t, err)
-	require.Equal(t, f.amd64Digest, digest)
 }
 
 func TestCheckRedirect(t *testing.T) {
@@ -877,94 +678,4 @@ func TestCheckRedirect(t *testing.T) {
 	}
 
 	require.ErrorContains(t, checkRedirect(secure, many), "redirects")
-}
-
-func TestBlobRedirectIsFollowed(t *testing.T) {
-	f := newFakeRegistry(t, false)
-
-	var seenAuth []string
-
-	storage := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		seenAuth = append(seenAuth, r.Header.Get("Authorization"))
-		_, _ = w.Write(configBody(t, revAMD64))
-	}))
-	t.Cleanup(storage.Close)
-
-	// The storage server answers on "localhost", a different host than the
-	// registry's 127.0.0.1, so credentials must not follow the redirect.
-	storageURL := strings.Replace(storage.URL, "127.0.0.1", "localhost", 1)
-
-	f.set(func(f *fakeRegistry) { f.basic = testBasic })
-	f.handle(kindBlob+f.amd64Config, func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, storageURL+"/blob", http.StatusTemporaryRedirect)
-	})
-
-	r := newResolver(t, f, func(o *Options) { o.AuthFile = authFileFor(t, f.host(), testBasic) })
-
-	digest, revision, err := r.Resolve(t.Context(), f.ref(tagSingle))
-	require.NoError(t, err)
-	require.Equal(t, f.amd64Digest, digest)
-	require.Equal(t, revAMD64, revision)
-	require.Equal(t, []string{""}, seenAuth, "credentials are not sent to the redirect target")
-}
-
-func TestStatusError(t *testing.T) {
-	err := error(&StatusError{Method: http.MethodHead, URL: "https://r.example/v2/a/manifests/t", Code: 429})
-	require.Equal(t, "registry: HEAD https://r.example/v2/a/manifests/t: 429 Too Many Requests", err.Error())
-}
-
-func TestCredentialHelperWarning(t *testing.T) {
-	log, hook := logrustest.NewNullLogger()
-
-	for _, content := range []string{
-		`{"credsStore":"desktop"}`,
-		`{"credHelpers":{"ghcr.io":"gh"},"auths":{"ghcr.io":{}}}`,
-	} {
-		hook.Reset()
-
-		r, err := New(log, Options{AuthFile: writeAuthFile(t, content)})
-		require.NoError(t, err)
-		require.Empty(t, r.creds)
-		require.Len(t, hook.AllEntries(), 1)
-		assert.Equal(t, logrus.WarnLevel, hook.LastEntry().Level)
-		assert.Contains(t, hook.LastEntry().Message, "not supported")
-		assert.Equal(t, "registry", hook.LastEntry().Data["package"])
-	}
-
-	hook.Reset()
-
-	_, err := New(log, Options{AuthFile: writeAuthFile(t, `{"auths":{}}`)})
-	require.NoError(t, err)
-	require.Empty(t, hook.AllEntries())
-}
-
-func TestNewWithoutLogger(t *testing.T) {
-	f := newFakeRegistry(t, false)
-
-	// Both the constructor (credential store warning) and Resolve (failed
-	// revision lookup) log.
-	f.tag("broken", []byte("<html>"))
-
-	r, err := New(nil, Options{
-		PlainHTTP: []string{f.host()},
-		AuthFile:  writeAuthFile(t, `{"credsStore":"desktop"}`),
-	})
-	require.NoError(t, err)
-	t.Cleanup(r.Close)
-
-	digest, revision, err := r.Resolve(t.Context(), f.ref("broken"))
-	require.NoError(t, err)
-	require.Equal(t, sha256Digest([]byte("<html>")), digest)
-	require.Empty(t, revision)
-
-	// Typed nil pointers in the interface are nil loggers too.
-	var (
-		nilLogger *logrus.Logger
-		nilEntry  *logrus.Entry
-	)
-
-	for _, log := range []logrus.FieldLogger{nilLogger, nilEntry} {
-		_, err = New(log, Options{AuthFile: writeAuthFile(t, `{"credsStore":"desktop"}`)})
-		require.NoError(t, err)
-	}
 }

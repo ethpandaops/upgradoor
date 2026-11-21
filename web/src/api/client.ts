@@ -1,22 +1,23 @@
 import type {
   ActionResult,
   Audit,
+  ClientHostState,
+  ClientHosts,
+  ClientPolicyRequest,
+  Clients,
   Config,
   ErrorBody,
-  Gate,
   EndLeaseRequest,
+  ClientOverrideRequest,
+  FlagOverrideRequest,
   HoldRequest,
-  HostDetail,
-  Hosts,
+  OfflineRequest,
+  ImageOverrideRequest,
   Packages,
-  Plan,
-  PublicHistory,
-  PublicHosts,
-  PublicImages,
+  SlotHistory,
   RebootRequest,
   RollRequest,
   RolloutHostsRequest,
-  Rollouts,
   ScopeRequest,
   Settings,
   SettingsBody,
@@ -47,7 +48,7 @@ export interface TokenSource {
 }
 
 /** openAccess is the token source of a controller that runs without an auth provider. */
-export const openAccess: TokenSource = {
+const openAccess: TokenSource = {
   required: () => false,
   getToken: () => Promise.resolve(null),
   onUnauthorized: () => undefined,
@@ -63,12 +64,84 @@ interface RequestOptions {
   signal?: AbortSignal;
 }
 
+/** One event of an event stream: its name and its decoded JSON data. */
+export interface StreamEvent {
+  event: string;
+  data: unknown;
+}
+
+interface StreamOptions {
+  /** user asks for the authenticated stream (every view); otherwise the public one. */
+  user: boolean;
+  /** hosts are the hosts whose details the stream should carry (authenticated stream only). */
+  hosts?: readonly string[];
+  /** signal ends the stream. */
+  signal: AbortSignal;
+  onEvent: (event: StreamEvent) => void;
+  /** onActivity is called for everything received, heartbeats included. */
+  onActivity?: () => void;
+}
+
+/**
+ * EventParser turns the text of a server-sent event stream into events. It is
+ * fed the chunks as they arrive; an event is complete at its blank line.
+ */
+class EventParser {
+  private buffer = '';
+  private event = '';
+  private data: string[] = [];
+
+  constructor(private readonly onEvent: (event: StreamEvent) => void) {}
+
+  push(chunk: string): void {
+    this.buffer += chunk;
+
+    for (;;) {
+      const end = this.buffer.indexOf('\n');
+      if (end < 0) return;
+
+      const line = this.buffer.slice(0, end).replace(/\r$/, '');
+      this.buffer = this.buffer.slice(end + 1);
+      this.line(line);
+    }
+  }
+
+  private line(line: string): void {
+    if (line === '') {
+      if (this.event !== '' && this.data.length > 0) {
+        let data: unknown;
+        try {
+          data = JSON.parse(this.data.join('\n'));
+        } catch {
+          throw new ApiError(0, `invalid JSON in the event "${this.event}"`);
+        }
+        this.onEvent({ event: this.event, data });
+      }
+      this.event = '';
+      this.data = [];
+      return;
+    }
+
+    // A line that starts with a colon is a comment: the heartbeat.
+    if (line.startsWith(':')) return;
+
+    const colon = line.indexOf(':');
+    const field = colon < 0 ? line : line.slice(0, colon);
+    const value = colon < 0 ? '' : line.slice(colon + 1).replace(/^ /, '');
+
+    if (field === 'event') this.event = value;
+    else if (field === 'data') this.data.push(value);
+  }
+}
+
 /** Every action route with its request body type (pkg/controller/api/schema.go). */
-export interface ActionBodies {
+interface ActionBodies {
   roll: RollRequest;
   reboot: RebootRequest;
   hold: HoldRequest;
   unhold: HoldRequest;
+  'mark-offline': OfflineRequest;
+  'unmark-offline': OfflineRequest;
   forget: HoldRequest;
   'end-lease': EndLeaseRequest;
   pause: ScopeRequest;
@@ -76,14 +149,30 @@ export interface ActionBodies {
   abort: ScopeRequest;
   skip: RolloutHostsRequest;
   retry: RolloutHostsRequest;
+  'client-policy': ClientPolicyRequest;
+  'image-override': ImageOverrideRequest;
+  'flag-override': FlagOverrideRequest;
+  'client-override': ClientOverrideRequest;
 }
 
-export type ActionName = keyof ActionBodies;
+type ActionName = keyof ActionBodies;
 
 /** An action name paired with its body. */
 export type ActionCall = { [K in ActionName]: { action: K; body: ActionBodies[K] } }[ActionName];
 
-export interface AuditQuery {
+/** ClientHostsQuery selects one page of a client's hosts. */
+export interface ClientHostsQuery {
+  /** states keeps the hosts in one of these states; empty keeps all. */
+  states?: readonly ClientHostState[];
+  /** q is a part of the host name. */
+  q?: string;
+  /** override keeps the hosts with that part of an override. */
+  override?: 'image' | 'flags';
+  offset?: number;
+  limit?: number;
+}
+
+interface AuditQuery {
   target?: string;
   action?: string;
   before?: number;
@@ -100,7 +189,8 @@ function query(params: Record<string, string | number | undefined>): string {
 }
 
 /**
- * ApiClient talks to the controller API. Public routes never carry a token.
+ * ApiClient talks to the controller API: requests, and the event stream.
+ * Public routes never carry a token.
  * User routes carry "Authorization: Bearer <token>" when an auth provider is
  * configured; the token is asked from the TokenSource on every request and a
  * request without one is refused locally instead of being sent.
@@ -108,17 +198,12 @@ function query(params: Record<string, string | number | undefined>): string {
 export class ApiClient {
   private readonly fetchFn: FetchFn;
   private readonly baseUrl: string;
-  private tokens: TokenSource;
+  private readonly tokens: TokenSource;
 
   constructor(opts: { fetch?: FetchFn; tokens?: TokenSource; baseUrl?: string } = {}) {
     this.fetchFn = opts.fetch ?? ((input, init) => globalThis.fetch(input, init));
     this.tokens = opts.tokens ?? openAccess;
     this.baseUrl = opts.baseUrl ?? '';
-  }
-
-  /** setTokenSource swaps the auth layer (used once the config is known). */
-  setTokenSource(tokens: TokenSource): void {
-    this.tokens = tokens;
   }
 
   // ------------------------------------------------------------ public
@@ -127,49 +212,55 @@ export class ApiClient {
     return this.request('/api/v1/config', { user: false, signal });
   }
 
-  publicHosts(signal?: AbortSignal): Promise<PublicHosts> {
-    return this.request('/api/v1/public/hosts', { user: false, signal });
-  }
-
-  publicImages(signal?: AbortSignal): Promise<PublicImages> {
-    return this.request('/api/v1/public/images', { user: false, signal });
-  }
-
-  publicNetwork(signal?: AbortSignal): Promise<Gate> {
-    return this.request('/api/v1/public/network', { user: false, signal });
-  }
-
-  publicHistory(limit?: number, signal?: AbortSignal): Promise<PublicHistory> {
-    return this.request(`/api/v1/public/history${query({ limit })}`, { user: false, signal });
+  /** publicSlots is the fleet-wide slot history of the last windowSeconds. */
+  publicSlots(windowSeconds: number, signal?: AbortSignal): Promise<SlotHistory> {
+    return this.request(`/api/v1/public/slots${query({ window: windowSeconds })}`, { user: false, signal });
   }
 
   // -------------------------------------------------------------- user
 
-  hosts(signal?: AbortSignal): Promise<Hosts> {
-    return this.request('/api/v1/hosts', { user: true, signal });
+  /** slots is publicSlots with the split per host. */
+  slots(windowSeconds: number, signal?: AbortSignal): Promise<SlotHistory> {
+    return this.request(`/api/v1/slots${query({ window: windowSeconds })}`, { user: true, signal });
   }
 
-  host(name: string, signal?: AbortSignal): Promise<HostDetail> {
-    return this.request(`/api/v1/hosts/${encodeURIComponent(name)}`, { user: true, signal });
+  clients(signal?: AbortSignal): Promise<Clients> {
+    return this.request('/api/v1/clients', { user: true, signal });
   }
 
-  packages(q: string, limit?: number, signal?: AbortSignal): Promise<Packages> {
-    return this.request(`/api/v1/packages${query({ q, limit })}`, { user: true, signal });
+  /** clientHosts asks for one page of the hosts that run a client, ordered by name. */
+  clientHosts(client: string, page: ClientHostsQuery = {}, signal?: AbortSignal): Promise<ClientHosts> {
+    const { states, ...rest } = page;
+    return this.request(
+      `/api/v1/clients/${encodeURIComponent(client)}/hosts${query({ state: states?.join(','), ...rest })}`,
+      { user: true, signal }
+    );
   }
 
-  rollouts(limit?: number, signal?: AbortSignal): Promise<Rollouts> {
-    return this.request(`/api/v1/rollouts${query({ limit })}`, { user: true, signal });
+  /** clientHostNames asks for the names of every host of a client the filter selects: what a selection of the whole filter acts on. */
+  async clientHostNames(client: string, filter: ClientHostsQuery, signal?: AbortSignal): Promise<string[]> {
+    const { states, q, override } = filter;
+    const page: ClientHosts = await this.request(
+      `/api/v1/clients/${encodeURIComponent(client)}/hosts${query({ state: states?.join(','), q, override, names: 'true' })}`,
+      { user: true, signal }
+    );
+    return [...(page.names ?? [])];
   }
 
-  plan(signal?: AbortSignal): Promise<Plan> {
-    return this.request('/api/v1/plan', { user: true, signal });
+  /**
+   * packages asks for one page of the fleet's packages: all of them, or those
+   * whose name contains q. after is the `next` of the page before.
+   */
+  packages(page: { q?: string; limit?: number; after?: string }, signal?: AbortSignal): Promise<Packages> {
+    return this.request(`/api/v1/packages${query({ ...page })}`, { user: true, signal });
   }
 
   settings(signal?: AbortSignal): Promise<SettingsBody> {
     return this.request('/api/v1/settings', { user: true, signal });
   }
 
-  putSettings(settings: Settings): Promise<SettingsBody> {
+  /** putSettings changes the settings the body names; the others stay as they are. */
+  putSettings(settings: Partial<Settings>): Promise<SettingsBody> {
     return this.request('/api/v1/settings', { user: true, method: 'PUT', body: settings });
   }
 
@@ -181,12 +272,70 @@ export class ApiClient {
     return this.request(`/api/v1/actions/${call.action}`, { user: true, method: 'POST', body: call.body });
   }
 
+  // ------------------------------------------------------------ stream
+
+  /**
+   * events reads an event stream until it ends. The promise resolves when
+   * the server closes the stream and rejects when the stream cannot be
+   * opened or breaks; an abort through the signal rejects with the abort.
+   *
+   * The stream is read with fetch, not with EventSource: an EventSource
+   * cannot send the Authorization header, and the token never goes into the
+   * URL.
+   */
+  async events(opts: StreamOptions): Promise<void> {
+    const headers = await this.headers(opts.user, 'text/event-stream');
+
+    let path = '/api/v1/public/events';
+    if (opts.user) {
+      const q = new URLSearchParams();
+      for (const host of opts.hosts ?? []) q.append('host', host);
+      path = `/api/v1/events${q.size > 0 ? `?${q.toString()}` : ''}`;
+    }
+
+    let res: Response;
+    try {
+      res = await this.fetchFn(this.baseUrl + path, { method: 'GET', headers, signal: opts.signal });
+    } catch (err) {
+      if (err instanceof DOMException && err.name === 'AbortError') throw err;
+      throw new ApiError(0, `controller unreachable: ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    if (!res.ok) {
+      if (res.status === 401 && opts.user) this.tokens.onUnauthorized();
+      throw new ApiError(res.status, await errorMessage(res));
+    }
+
+    if (!res.body) throw new ApiError(res.status, 'the event stream has no body');
+
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder();
+    const parser = new EventParser(opts.onEvent);
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) return;
+
+        opts.onActivity?.();
+        parser.push(decoder.decode(value, { stream: true }));
+      }
+    } catch (err) {
+      if (err instanceof ApiError || (err instanceof DOMException && err.name === 'AbortError')) throw err;
+      if (opts.signal.aborted) throw new DOMException('aborted', 'AbortError');
+      throw new ApiError(0, `the event stream broke: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      void reader.cancel().catch(() => undefined);
+    }
+  }
+
   // ---------------------------------------------------------- internal
 
-  private async request<T>(path: string, opts: RequestOptions): Promise<T> {
-    const headers: Record<string, string> = { Accept: 'application/json' };
+  /** headers builds the request headers; a user route gets the bearer token when auth is configured. */
+  private async headers(user: boolean, accept: string): Promise<Record<string, string>> {
+    const headers: Record<string, string> = { Accept: accept };
 
-    if (opts.user && this.tokens.required()) {
+    if (user && this.tokens.required()) {
       const token = await this.tokens.getToken();
       if (!token) {
         // Never send a user request without a token: it can only fail. The
@@ -197,6 +346,12 @@ export class ApiClient {
       }
       headers.Authorization = `Bearer ${token}`;
     }
+
+    return headers;
+  }
+
+  private async request<T>(path: string, opts: RequestOptions): Promise<T> {
+    const headers = await this.headers(opts.user, 'application/json');
 
     const init: RequestInit = { method: opts.method ?? 'GET', headers, signal: opts.signal };
     if (opts.body !== undefined) {

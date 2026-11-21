@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"maps"
 	"slices"
@@ -26,6 +27,7 @@ const (
 	digestOld     = "sha256:0000000000000000000000000000000000000000000000000000000000000000"
 	digestA       = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 	digestB       = "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+	digestC       = "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
 )
 
 var allVerbs = []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages, protocol.VerbReboot}
@@ -44,6 +46,10 @@ type worldBuilder struct {
 	liveOverride map[string]uint64
 	// healthMod changes the beacon view after every refresh.
 	healthMod func(n *fleet.NetworkHealth)
+	// ended are the leases that ended, in the order in which they did;
+	// closedRollouts the rollouts that closed, newest first.
+	ended          []*fleet.Lease
+	closedRollouts []*fleet.Rollout
 }
 
 func newWorldBuilder(t *testing.T) *worldBuilder {
@@ -54,9 +60,8 @@ func newWorldBuilder(t *testing.T) *worldBuilder {
 	settings.PolicyReboot = fleet.PolicyAuto
 
 	b.w = &World{
-		Now:          testGenesis.Add(100*testEpoch + 10*time.Second),
-		Settings:     settings,
-		ClosedLeases: map[string]*fleet.Lease{},
+		Now:      testGenesis.Add(100*testEpoch + 10*time.Second),
+		Settings: settings,
 		NewID: func() string {
 			b.ids++
 
@@ -172,6 +177,18 @@ func (b *worldBuilder) step() *Outcome {
 	out := Reconcile(b.w)
 	applyOutcome(b.w, out)
 
+	for _, l := range out.Leases {
+		if l.State.Terminal() {
+			b.ended = append(b.ended, l)
+		}
+	}
+
+	for _, r := range out.Rollouts {
+		if r.State.Terminal() {
+			b.closedRollouts = append([]*fleet.Rollout{r}, b.closedRollouts...)
+		}
+	}
+
 	return out
 }
 
@@ -202,66 +219,34 @@ func applyOutcome(w *World, out *Outcome) {
 	for _, r := range out.Rollouts {
 		w.Rollouts = slices.DeleteFunc(w.Rollouts, func(x *fleet.Rollout) bool { return x.ID == r.ID })
 
-		if r.State.Terminal() {
-			// A closed rollout that changed (a skip was lifted) keeps its place.
-			if i := slices.IndexFunc(w.Closed, func(x *fleet.Rollout) bool { return x.ID == r.ID }); i >= 0 {
-				w.Closed[i] = r
-
-				continue
-			}
-
-			w.Closed = append([]*fleet.Rollout{r}, w.Closed...)
-		} else {
+		if !r.State.Terminal() {
 			w.Rollouts = append(w.Rollouts, r)
 		}
 	}
 
 	for _, l := range out.Leases {
 		w.Leases = slices.DeleteFunc(w.Leases, func(x *fleet.Lease) bool { return x.ID == l.ID })
-		// The lease table, as far as it has ended: a lease that is taken up
-		// again leaves it.
-		w.Ended = slices.DeleteFunc(slices.Clone(w.Ended), func(x *fleet.Lease) bool { return x.ID == l.ID })
 
-		if l.State.Terminal() {
-			w.Ended = append(w.Ended, l)
-
-			if w.ClosedLeases == nil {
-				w.ClosedLeases = map[string]*fleet.Lease{}
-			}
-
-			w.ClosedLeases[l.ID] = l
-
-			// As the service does: remember when the host's last lease ended.
-			if l.EndedAt != nil && l.EndedAt.After(w.LastLeaseEnd[l.Host]) {
-				ended := maps.Clone(w.LastLeaseEnd)
-				if ended == nil {
-					ended = map[string]time.Time{}
-				}
-
-				ended[l.Host] = *l.EndedAt
-				w.LastLeaseEnd = ended
-			}
-		} else {
-			delete(w.ClosedLeases, l.ID)
+		if !l.State.Terminal() {
 			w.Leases = append(w.Leases, l)
-		}
-	}
-
-	// As the store does: a hold of the outcome sets the host's switch. The
-	// host is replaced, not changed: the pass may still read the old one.
-	for _, hold := range out.Holds {
-		for i, h := range w.Hosts {
-			if h.Name == hold.Host {
-				c := *h
-				c.HoldWanted, c.HoldReason = hold.Wanted, hold.Reason
-				w.Hosts[i] = &c
-			}
 		}
 	}
 
 	for _, d := range out.Directives {
 		w.Directives = slices.DeleteFunc(w.Directives, func(x *fleet.Directive) bool { return x.ID == d.ID })
 		w.Directives = append(w.Directives, d)
+	}
+
+	// As the store does: the broken marks of a host are replaced. The host is
+	// replaced, not changed: the pass may still read the old one.
+	for _, marks := range out.Broken {
+		for i, h := range w.Hosts {
+			if h.Name == marks.Host {
+				c := *h
+				c.Broken = marks.Marks
+				w.Hosts[i] = &c
+			}
+		}
 	}
 }
 
@@ -290,7 +275,7 @@ func (b *worldBuilder) mustRollout(key string) *fleet.Rollout {
 
 // closed returns the newest closed rollout with the key.
 func (b *worldBuilder) closed(key string) *fleet.Rollout {
-	for _, r := range b.w.Closed {
+	for _, r := range b.closedRollouts {
 		if r.Key == key {
 			return r
 		}
@@ -382,47 +367,33 @@ func (b *worldBuilder) serve(host string) {
 	require.Nil(b.t, b.lease(host), "lease of %s was not released", host)
 }
 
-// brokenBy returns the note of a waiting member whose host the lease broke
-// for the rollout with the ID.
-func brokenBy(lease, rollout string) string {
-	return brokenPrefix + lease + " (rollout " + rollout + ")"
-}
-
-// lastLease returns the lease of the host that ended last, by the order the
-// ledger uses.
+// lastLease returns the lease of the host that ended last.
 func (b *worldBuilder) lastLease(host string) *fleet.Lease {
 	b.t.Helper()
 
-	var last *fleet.Lease
-
-	for _, l := range b.w.Ended {
-		if l.Host == host && (last == nil || endedAfter(l, last)) {
-			last = l
+	for i := len(b.ended) - 1; i >= 0; i-- {
+		if b.ended[i].Host == host {
+			return b.ended[i]
 		}
 	}
 
-	require.NotNil(b.t, last, "no lease of %s has ended", host)
+	b.t.Fatalf("no lease of %s has ended", host)
 
-	return last
+	return nil
 }
 
-// broke puts a failed lease of the host for the need on record, granted for
-// a rollout that is long closed: the host is broken for the need's group.
-func (b *worldBuilder) broke(host string, need protocol.Need) *fleet.Lease {
-	ended := b.w.Now.Add(-time.Hour)
-	l := &fleet.Lease{
-		ID: "broke-" + host, Host: host, State: fleet.LeaseFailed, Error: "container did not start",
-		Needs: []protocol.Need{need}, Rollouts: map[string]string{need.ID: "id000"},
-		GrantedAt: ended.Add(-time.Minute), ExpiresAt: ended.Add(time.Hour), EndedAt: &ended,
-		Operation: &protocol.Operation{
-			LeaseID: "broke-" + host, Phase: protocol.PhaseFailed, Disrupted: true,
-			Steps: []protocol.Step{{NeedID: need.ID, Status: protocol.StepFailed}},
-		},
+// broke marks the host broken for the group of the need, as a lease that
+// failed on it long ago did.
+func (b *worldBuilder) broke(host string, need protocol.Need) {
+	h := b.get(host)
+	marks := maps.Clone(h.Broken)
+
+	if marks == nil {
+		marks = make(map[string]string, 1)
 	}
 
-	b.w.Ended = append(slices.Clone(b.w.Ended), l)
-
-	return l
+	marks[needGroup(&need)] = "broke-" + host
+	h.Broken = marks
 }
 
 // queue returns the waiting reason per host of a plan.
@@ -511,16 +482,63 @@ func auditActions(out *Outcome) []string {
 	return actions
 }
 
-// closedOrOpen returns the rollout with the key, open or closed.
-func (b *worldBuilder) closedOrOpen(key string) *fleet.Rollout {
-	b.t.Helper()
+// replaceSettings stores the settings as given, like a patch that names every
+// field.
+func replaceSettings(ctx context.Context, svc Service, actor string, settings fleet.Settings) error {
+	_, _, err := svc.PatchSettings(ctx, actor, func(s *fleet.Settings) error {
+		*s = settings
 
-	if r := b.rollout(key); r != nil {
-		return r
+		return nil
+	})
+
+	return err
+}
+
+// failedOnDigestA builds a fleet in which the host failing rolled to digest A
+// and failed, so that the rollout of digest A is halted with it.
+func failedOnDigestA(t *testing.T, failing string, hosts map[string]uint64) *worldBuilder {
+	t.Helper()
+
+	b := newWorldBuilder(t)
+
+	for _, name := range sortedKeys(hosts) {
+		b.host(name, hosts[name])
+		b.wantsImage(name, imgLighthouse, digestA)
+		b.get(name).HoldWanted = name != failing
 	}
 
-	r := b.closed(key)
-	require.NotNil(b.t, r, "no rollout %s", key)
+	b.step()
+	require.Equal(t, []string{failing}, b.leasedHosts())
+	b.report(failing, protocol.PhaseFailed, true)
 
-	return r
+	for name := range hosts {
+		b.get(name).HoldWanted = false
+	}
+
+	b.step()
+	require.Equal(t, fleet.RolloutHalted, b.mustRollout(imageKey(imgLighthouse, digestA)).State)
+	require.Empty(t, b.leasedHosts())
+
+	return b
+}
+
+// seesDigestB makes the hosts report the tag at digest B.
+func seesDigestB(b *worldBuilder, hosts ...string) {
+	for _, name := range hosts {
+		h := b.get(name)
+		h.Status.Containers = []protocol.Container{container("c", imgLighthouse, digestOld, digestB, b.w.Now)}
+		h.Status.Needs = []protocol.Need{imageNeed("c", imgLighthouse, digestB)}
+		h.Status.Operation = nil
+	}
+}
+
+// seesDigest makes the hosts report the tag at a digest while they still run
+// the old one.
+func seesDigest(b *worldBuilder, digest string, hosts ...string) {
+	for _, name := range hosts {
+		h := b.get(name)
+		h.Status.Containers = []protocol.Container{container("c", imgLighthouse, digestOld, digest, b.w.Now)}
+		h.Status.Needs = []protocol.Need{imageNeed("c", imgLighthouse, digest)}
+		h.Status.Operation = nil
+	}
 }

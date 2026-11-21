@@ -31,12 +31,15 @@ type slotPhase struct {
 	slot  time.Duration
 }
 
-// chainTiming converts between the wall clock and slots / epochs.
+// chainTiming is the timing read from the node. Between the wall clock and
+// slots / epochs it converts through clock, the fleet.NetworkHealth methods
+// the scheduler and the API use as well.
 type chainTiming struct {
 	genesis       time.Time
 	slotsPerEpoch uint64
 	// phases is ordered by epoch; phases[0].epoch is always 0.
 	phases []slotPhase
+	clock  fleet.NetworkHealth
 }
 
 // slotChange is a slot duration that takes effect at an epoch.
@@ -96,6 +99,8 @@ func newChainTiming(genesis time.Time, spec map[string]json.RawMessage) (*chainT
 			slot:  change.slot,
 		})
 	}
+
+	timing.clock = fleet.NetworkHealth{SlotsPerEpoch: slotsPerEpoch, Phases: timing.published()}
 
 	return timing, nil
 }
@@ -214,23 +219,21 @@ func specUint(spec map[string]json.RawMessage, key string) (value uint64, ok boo
 	return value, true, nil
 }
 
-// phaseAt returns the phase that covers t (the first one before genesis).
-func (c *chainTiming) phaseAt(t time.Time) slotPhase {
-	phase := c.phases[0]
+// slotAt returns the slot the wall clock is in; 0 before genesis or while
+// the timing is invalid (fleet.ValidateTiming).
+func (c *chainTiming) slotAt(t time.Time) uint64 {
+	slot, _ := c.clock.SlotAt(t)
 
-	for _, next := range c.phases[1:] {
-		if t.Before(next.start) {
-			break
-		}
-
-		phase = next
-	}
-
-	return phase
+	return slot
 }
 
-// phaseOf returns the phase that covers epoch.
-func (c *chainTiming) phaseOf(epoch uint64) slotPhase {
+// epochAt returns the epoch the wall clock is in; 0 as for slotAt.
+func (c *chainTiming) epochAt(t time.Time) uint64 {
+	return c.slotAt(t) / c.slotsPerEpoch
+}
+
+// slotDuration returns the slot duration in effect during epoch.
+func (c *chainTiming) slotDuration(epoch uint64) time.Duration {
 	phase := c.phases[0]
 
 	for _, next := range c.phases[1:] {
@@ -241,61 +244,7 @@ func (c *chainTiming) phaseOf(epoch uint64) slotPhase {
 		phase = next
 	}
 
-	return phase
-}
-
-// slotAt returns the slot the wall clock is in; 0 before genesis.
-func (c *chainTiming) slotAt(t time.Time) uint64 {
-	if t.Before(c.genesis) {
-		return 0
-	}
-
-	phase := c.phaseAt(t)
-
-	return phase.epoch*c.slotsPerEpoch + uint64(t.Sub(phase.start)/phase.slot)
-}
-
-// epochAt returns the epoch the wall clock is in; 0 before genesis.
-func (c *chainTiming) epochAt(t time.Time) uint64 {
-	return c.slotAt(t) / c.slotsPerEpoch
-}
-
-// epochStart returns the wall-clock start of epoch.
-func (c *chainTiming) epochStart(epoch uint64) time.Time {
-	phase := c.phaseOf(epoch)
-
-	span, fits := spanDuration(epoch-phase.epoch, c.slotsPerEpoch, phase.slot)
-	if !fits {
-		span = time.Duration(math.MaxInt64)
-	}
-
-	return phase.start.Add(span)
-}
-
-// slotDuration returns the slot duration in effect during epoch.
-func (c *chainTiming) slotDuration(epoch uint64) time.Duration {
-	return c.phaseOf(epoch).slot
-}
-
-// newestSettledEpoch returns the newest complete epoch whose liveness can be
-// asked for: it ended at least one slot ago, so the attestations of its last
-// slot have reached the node.
-func (c *chainTiming) newestSettledEpoch(now time.Time) (uint64, bool) {
-	current := c.epochAt(now)
-	if current == 0 || now.Before(c.genesis) {
-		return 0, false
-	}
-
-	settle := c.slotDuration(current)
-	if now.Before(c.epochStart(current).Add(settle)) {
-		if current == 1 {
-			return 0, false
-		}
-
-		return current - 2, true
-	}
-
-	return current - 1, true
+	return phase.slot
 }
 
 // wholeSeconds reports a slot duration in whole seconds (rounded, at least 1)

@@ -13,7 +13,7 @@ import (
 
 // rolloutHostsQuery reads the members of one rollout.
 const rolloutHostsQuery = `
-	SELECT host, state, stage, need_id, lease_id, error, updated_at
+	SELECT host, state, stage, need_id, lease_id, error, skipped_by, updated_at
 	FROM rollout_hosts WHERE rollout_id = ? ORDER BY host`
 
 // The queries below are read on every reconcile tick (the open rollouts, the
@@ -90,8 +90,17 @@ func directivesQuery(filter DirectiveFilter) (query string, args []any) {
 		cond.add(`state = ?`, string(fleet.DirectivePending))
 	}
 
+	if len(filter.Rollouts) > 0 {
+		args := make([]any, 0, len(filter.Rollouts))
+		for _, id := range filter.Rollouts {
+			args = append(args, id)
+		}
+
+		cond.add(`rollout_id IN (`+placeholders(len(filter.Rollouts))+`)`, args...)
+	}
+
 	query = `SELECT id, host, kind, container, reason, state, rollout_id, error, created_by,
-		created_at, updated_at FROM directives` + cond.where() + ` ORDER BY created_at, id`
+		created_at, updated_at, detail FROM directives` + cond.where() + ` ORDER BY created_at, id`
 
 	return query, cond.args
 }
@@ -199,7 +208,7 @@ func loadRolloutHosts(ctx context.Context, tx *sql.Tx, rollouts []*fleet.Rollout
 			)
 
 			err := rows.Scan(&host.Host, &state, &stage, &host.NeedID, &host.LeaseID,
-				&host.Error, &updatedAt)
+				&host.Error, &host.SkippedBy, &updatedAt)
 			if err != nil {
 				return errors.Join(err, rows.Close())
 			}
@@ -290,14 +299,23 @@ func (s *sqliteStore) ListDirectives(
 		return queryRows(ctx, tx, query, args, func(row rowScanner) error {
 			var (
 				d                    fleet.Directive
-				kind, state          string
+				kind, state, detail  string
 				createdAt, updatedAt int64
 			)
 
 			err := row.Scan(&d.ID, &d.Host, &kind, &d.Container, &d.Reason, &state,
-				&d.RolloutID, &d.Error, &d.CreatedBy, &createdAt, &updatedAt)
+				&d.RolloutID, &d.Error, &d.CreatedBy, &createdAt, &updatedAt, &detail)
 			if err != nil {
 				return err
+			}
+
+			if detail != "" {
+				var extra directiveDetail
+				if err := json.Unmarshal([]byte(detail), &extra); err != nil {
+					return fmt.Errorf("directive %s: detail: %w", d.ID, err)
+				}
+
+				d.By, d.Override = extra.By, extra.Override
 			}
 
 			d.Kind = protocol.DirectiveKind(kind)
@@ -357,6 +375,18 @@ func (s *sqliteStore) Commit(ctx context.Context, changes *Changes) error {
 			}
 		}
 
+		for _, off := range changes.Offline {
+			if err := setHostOffline(ctx, tx, off.Host, off.Mark); err != nil {
+				return fmt.Errorf("offline mark of %s: %w", off.Host, err)
+			}
+		}
+
+		for _, marks := range changes.Broken {
+			if err := setHostBroken(ctx, tx, marks.Host, marks.Marks); err != nil {
+				return fmt.Errorf("broken marks of %s: %w", marks.Host, err)
+			}
+		}
+
 		var err error
 
 		audit, err = insertAudit(ctx, tx, changes.Audit)
@@ -411,26 +441,98 @@ func upsertRollout(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) erro
 		return fmt.Errorf("store rollout %s: %w", rollout.ID, err)
 	}
 
-	_, err = tx.ExecContext(ctx, `DELETE FROM rollout_hosts WHERE rollout_id = ?`, rollout.ID)
-	if err != nil {
-		return fmt.Errorf("clear hosts of rollout %s: %w", rollout.ID, err)
-	}
-
-	err = insertBatched(ctx, tx, `
-		INSERT INTO rollout_hosts
-			(rollout_id, host, state, stage, need_id, lease_id, error, updated_at) VALUES `,
-		8, len(rollout.Hosts),
-		func(args []any, i int) []any {
-			h := &rollout.Hosts[i]
-
-			return append(args, rollout.ID, h.Host, string(h.State), int(h.Stage), h.NeedID,
-				h.LeaseID, h.Error, millis(h.UpdatedAt))
-		})
-	if err != nil {
+	if err := writeRolloutHosts(ctx, tx, rollout); err != nil {
 		return fmt.Errorf("store hosts of rollout %s: %w", rollout.ID, err)
 	}
 
 	return nil
+}
+
+// rolloutHostRow is a rollout_hosts row without its keys.
+type rolloutHostRow struct {
+	state, needID, leaseID, err, skippedBy string
+	stage                                  int
+	updatedAt                              int64
+}
+
+func newRolloutHostRow(h *fleet.RolloutHost) rolloutHostRow {
+	return rolloutHostRow{
+		state: string(h.State), needID: h.NeedID, leaseID: h.LeaseID, err: h.Error,
+		skippedBy: h.SkippedBy, stage: int(h.Stage), updatedAt: millis(h.UpdatedAt),
+	}
+}
+
+// writeRolloutHosts makes the member rows of a rollout what rollout.Hosts
+// says, writing only the rows that differ: a rollout over a large fleet is
+// stored on every change of one of its hosts.
+func writeRolloutHosts(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) error {
+	stored := make(map[string]rolloutHostRow, len(rollout.Hosts))
+
+	err := queryRows(ctx, tx, `
+		SELECT host, state, stage, need_id, lease_id, error, skipped_by, updated_at
+		FROM rollout_hosts WHERE rollout_id = ?`, []any{rollout.ID},
+		func(row rowScanner) error {
+			var (
+				host string
+				r    rolloutHostRow
+			)
+
+			if err := row.Scan(&host, &r.state, &r.stage, &r.needID, &r.leaseID, &r.err,
+				&r.skippedBy, &r.updatedAt); err != nil {
+				return err
+			}
+
+			stored[host] = r
+
+			return nil
+		})
+	if err != nil {
+		return err
+	}
+
+	// Rows to write, and stored rows that are replaced or gone.
+	changed := make([]int, 0, len(rollout.Hosts))
+	stale := make([]string, 0, len(stored))
+
+	for i := range rollout.Hosts {
+		h := &rollout.Hosts[i]
+
+		r, ok := stored[h.Host]
+		delete(stored, h.Host)
+
+		if ok && r == newRolloutHostRow(h) {
+			continue
+		}
+
+		if ok {
+			stale = append(stale, h.Host)
+		}
+
+		changed = append(changed, i)
+	}
+
+	for host := range stored {
+		stale = append(stale, host)
+	}
+
+	for _, host := range stale {
+		_, err = tx.ExecContext(ctx,
+			`DELETE FROM rollout_hosts WHERE rollout_id = ? AND host = ?`, rollout.ID, host)
+		if err != nil {
+			return err
+		}
+	}
+
+	return insertBatched(ctx, tx, `
+		INSERT INTO rollout_hosts
+			(rollout_id, host, state, stage, need_id, lease_id, error, skipped_by, updated_at) VALUES `,
+		9, len(changed),
+		func(args []any, i int) []any {
+			h := &rollout.Hosts[changed[i]]
+
+			return append(args, rollout.ID, h.Host, string(h.State), int(h.Stage), h.NeedID,
+				h.LeaseID, h.Error, h.SkippedBy, millis(h.UpdatedAt))
+		})
 }
 
 func upsertLease(ctx context.Context, tx *sql.Tx, lease *fleet.Lease) error {
@@ -488,6 +590,12 @@ func upsertLease(ctx context.Context, tx *sql.Tx, lease *fleet.Lease) error {
 	return nil
 }
 
+// directiveDetail is the detail column of a directive.
+type directiveDetail struct {
+	By       *protocol.Actor               `json:"by,omitempty"`
+	Override *protocol.OverrideInstruction `json:"override,omitempty"`
+}
+
 func upsertDirective(ctx context.Context, tx *sql.Tx, d *fleet.Directive) error {
 	if d == nil {
 		return errors.New("directive is nil")
@@ -497,11 +605,33 @@ func upsertDirective(ctx context.Context, tx *sql.Tx, d *fleet.Directive) error 
 		return errors.New("directive has no id")
 	}
 
+	detail := ""
+
+	if d.By != nil || d.Override != nil {
+		extra := directiveDetail{By: d.By, Override: d.Override}
+
+		// Times are stored as every other one: UTC, to the millisecond.
+		if d.Override != nil && d.Override.Until != nil {
+			inst := *d.Override
+			until := fromMillis(millis(*inst.Until))
+			inst.Until = &until
+			extra.Override = &inst
+		}
+
+		raw, err := json.Marshal(extra)
+		if err != nil {
+			return fmt.Errorf("store directive %s: %w", d.ID, err)
+		}
+
+		detail = string(raw)
+	}
+
 	_, err := tx.ExecContext(ctx, `
 		INSERT INTO directives (id, host, kind, container, reason, state, rollout_id, error,
-			created_by, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			created_by, created_at, updated_at, detail)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id) DO UPDATE SET
+			detail = excluded.detail,
 			host = excluded.host,
 			kind = excluded.kind,
 			container = excluded.container,
@@ -513,7 +643,7 @@ func upsertDirective(ctx context.Context, tx *sql.Tx, d *fleet.Directive) error 
 			created_at = excluded.created_at,
 			updated_at = excluded.updated_at`,
 		d.ID, d.Host, string(d.Kind), d.Container, d.Reason, string(d.State), d.RolloutID,
-		d.Error, d.CreatedBy, millis(d.CreatedAt), millis(d.UpdatedAt))
+		d.Error, d.CreatedBy, millis(d.CreatedAt), millis(d.UpdatedAt), detail)
 	if err != nil {
 		return fmt.Errorf("store directive %s: %w", d.ID, err)
 	}

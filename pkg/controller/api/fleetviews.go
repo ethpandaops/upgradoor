@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,22 +19,24 @@ import (
 )
 
 const (
-	// hostLivenessEpochs, hostLeases and hostHistory bound the host detail.
-	hostLivenessEpochs = 32
-	hostLeases         = 20
-	hostHistory        = 50
+	// hostLeases and hostHistory bound the host detail.
+	hostLeases  = 20
+	hostHistory = 50
 
-	minPackageQuery     = 2
-	maxPackageQuery     = 128
-	defaultPackageLimit = 50
-	maxPackageLimit     = 500
+	maxPackageQuery = 128
 
+	// The package and audit limits are the store's.
 	defaultRolloutLimit = 20
 	maxRolloutLimit     = 200
 
-	defaultAuditLimit = 100
-	maxAuditLimit     = 500
-	maxAuditFilter    = 256
+	maxAuditFilter = 256
+)
+
+// Names that several encodings share: a log field, a key of audit details, a
+// wire field and, for keyAfter, the paging parameter of the package list.
+const (
+	keyHost  = "host"
+	keyAfter = "after"
 )
 
 // errBadRequest marks request validation errors, answered 400.
@@ -129,10 +132,11 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request, _ *user) {
 
 	plan := s.opts.Scheduler.Plan()
 	now := s.now()
-	out := Hosts{Hosts: make([]HostSummary, 0, len(hosts))}
+	out := Hosts{Hosts: make([]HostListing, 0, len(hosts))}
 
 	for _, host := range hosts {
-		out.Hosts = append(out.Hosts, hostSummary(host, plan, now, settings.HostStaleAfter.Std()))
+		sum := hostSummary(host, plan, now, settings.HostStaleAfter.Std())
+		out.Hosts = append(out.Hosts, hostListing(&sum))
 	}
 
 	s.writeJSON(w, http.StatusOK, out)
@@ -140,30 +144,32 @@ func (s *Server) handleHosts(w http.ResponseWriter, r *http.Request, _ *user) {
 
 // handleHost serves GET /api/v1/hosts/{name}.
 func (s *Server) handleHost(w http.ResponseWriter, r *http.Request, _ *user) {
-	ctx := r.Context()
-	name := r.PathValue("name")
+	detail, err := s.hostDetail(r.Context(), r.PathValue("name"))
 
+	switch {
+	case err == nil:
+		s.writeJSON(w, http.StatusOK, detail)
+	case errors.Is(err, store.ErrNotFound):
+		s.writeError(w, http.StatusNotFound, "unknown host")
+	default:
+		s.internalError(w, r, err)
+	}
+}
+
+// hostDetail builds the detail view of one host. An unknown host is
+// store.ErrNotFound.
+func (s *Server) hostDetail(ctx context.Context, name string) (*HostDetail, error) {
 	host, err := s.opts.Store.GetHost(ctx, name)
 	if err != nil {
-		if errors.Is(err, store.ErrNotFound) {
-			s.writeError(w, http.StatusNotFound, "unknown host")
-
-			return
-		}
-
-		s.internalError(w, r, err)
-
-		return
+		return nil, err
 	}
 
 	settings, err := s.opts.Scheduler.Settings(ctx)
 	if err != nil {
-		s.internalError(w, r, err)
-
-		return
+		return nil, err
 	}
 
-	detail := HostDetail{
+	detail := &HostDetail{
 		HostSummary: hostSummary(host, s.opts.Scheduler.Plan(), s.now(),
 			settings.HostStaleAfter.Std()),
 		CertHash:   host.CertHash,
@@ -177,48 +183,36 @@ func (s *Server) handleHost(w http.ResponseWriter, r *http.Request, _ *user) {
 		detail.ValidatorStart, detail.ValidatorEnd = &start, &end
 	}
 
+	if host.ReportedValidators() != nil {
+		all, listErr := s.opts.Store.ListHosts(ctx)
+		if listErr != nil {
+			return nil, listErr
+		}
+
+		detail.ValidatorOverlaps = host.ReportedOverlaps(all)
+	}
+
 	inv, err := s.opts.Store.GetInventory(ctx, name)
 
 	switch {
 	case err == nil:
 		detail.Inventory = inv
 	case !errors.Is(err, store.ErrNotFound):
-		s.internalError(w, r, err)
-
-		return
-	}
-
-	liveness, err := s.opts.Store.ListLiveness(ctx, hostLivenessEpochs)
-	if err != nil {
-		s.internalError(w, r, err)
-
-		return
-	}
-
-	detail.Liveness = make([]fleet.Liveness, 0, hostLivenessEpochs)
-
-	for _, row := range liveness {
-		if row.Host == name {
-			detail.Liveness = append(detail.Liveness, row)
-		}
+		return nil, err
 	}
 
 	detail.Leases, err = s.opts.Store.ListLeases(ctx, store.LeaseFilter{
 		Host: name, Limit: hostLeases,
 	})
 	if err != nil {
-		s.internalError(w, r, err)
-
-		return
+		return nil, err
 	}
 
 	detail.History, err = s.opts.Store.ListAudit(ctx, store.AuditFilter{
 		Target: name, Limit: hostHistory,
 	})
 	if err != nil {
-		s.internalError(w, r, err)
-
-		return
+		return nil, err
 	}
 
 	if detail.Leases == nil {
@@ -229,7 +223,7 @@ func (s *Server) handleHost(w http.ResponseWriter, r *http.Request, _ *user) {
 		detail.History = []fleet.AuditEntry{}
 	}
 
-	s.writeJSON(w, http.StatusOK, detail)
+	return detail, nil
 }
 
 // hostSummary builds one row of the authenticated host table.
@@ -245,6 +239,8 @@ func hostSummary(
 		HoldWanted: host.HoldWanted,
 		HoldReason: host.HoldReason,
 		HoldBy:     holdBy(host),
+		Offline:    offlineMark(host, now),
+		Broken:     host.Broken,
 		Containers: []protocol.Container{},
 		Verbs:      []protocol.Verb{},
 		Needs:      []protocol.Need{},
@@ -252,6 +248,7 @@ func hostSummary(
 	}
 
 	if status := host.Status; status != nil {
+		sum.ValidatorReport = status.Validators
 		sum.AgentVersion = status.AgentVersion
 		sum.Containers = nonNil(status.Containers)
 		sum.Node = status.Node
@@ -270,6 +267,41 @@ func hostSummary(
 	}
 
 	return sum
+}
+
+// hostListing is the row of a host in the host list.
+func hostListing(sum *HostSummary) HostListing {
+	out := HostListing{
+		Name: sum.Name, Roles: sum.Roles, Validators: sum.Validators, LastSeen: sum.LastSeen,
+		Stale: sum.Stale, AgentVersion: sum.AgentVersion,
+		Containers: make([]ContainerListing, 0, len(sum.Containers)),
+		OS:         sum.OS, Pending: sum.Pending, UptimeSeconds: sum.UptimeSeconds, Hold: sum.Hold,
+		HoldWanted: sum.HoldWanted, HoldReason: sum.HoldReason, HoldBy: sum.HoldBy, Offline: sum.Offline, Verbs: sum.Verbs,
+		Needs: make([]NeedListing, 0, len(sum.Needs)), Plan: sum.Plan,
+	}
+
+	for i := range sum.Containers {
+		c := &sum.Containers[i]
+		out.Containers = append(out.Containers, ContainerListing{
+			Name: ContainerName(c.Name), Image: c.Image, Digest: c.Digest, Revision: c.Revision,
+			State: c.State, Managed: c.Managed, Kind: c.Kind, Impact: c.Impact, Owners: c.Owners,
+		})
+	}
+
+	for i := range sum.Needs {
+		out.Needs = append(out.Needs, NeedListing{Kind: sum.Needs[i].Kind})
+	}
+
+	return out
+}
+
+// offlineMark is the host's known-offline mark while it is in force.
+func offlineMark(host *fleet.Host, now time.Time) *fleet.OfflineMark {
+	if !host.KnownOffline(now) {
+		return nil
+	}
+
+	return host.Offline
 }
 
 // holdBy says for the host views who set the controller hold: "team" for a
@@ -295,37 +327,54 @@ func nonNil[T any](in []T) []T {
 	return in
 }
 
-// handlePackages serves GET /api/v1/packages.
+// handlePackages serves GET /api/v1/packages?q=<part of a name>&limit=&after=:
+// one page of the packages installed across the fleet, one entry per name
+// with its versions and the hosts on each. Without q it lists every package
+// in alphabetical order; with q the names that contain it, the best match
+// first. "after" is the "next" of the page before.
 func (s *Server) handlePackages(w http.ResponseWriter, r *http.Request, _ *user) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
-	if len(query) < minPackageQuery || len(query) > maxPackageQuery {
+	after := r.URL.Query().Get(keyAfter)
+
+	if len(query) > maxPackageQuery || len(after) > maxPackageQuery+1 {
 		s.writeError(w, http.StatusBadRequest, fmt.Sprintf(
-			"q must be between %d and %d characters", minPackageQuery, maxPackageQuery))
+			"q must be at most %d characters", maxPackageQuery))
 
 		return
 	}
 
-	limit, err := queryLimit(r, defaultPackageLimit, maxPackageLimit)
+	limit, err := queryLimit(r, store.DefaultPackageSearchLimit, store.MaxPackageSearchLimit)
 	if err != nil {
 		s.writeBadRequest(w, err)
 
 		return
 	}
 
-	matches, err := s.opts.Store.SearchPackages(r.Context(), query, limit)
-	if err != nil {
+	page, err := s.opts.Store.ListPackages(r.Context(), store.PackageFilter{
+		Query: query, After: after, Limit: limit,
+	})
+
+	switch {
+	case errors.Is(err, store.ErrBadCursor):
+		s.writeError(w, http.StatusBadRequest, "after is not the next of a page")
+
+		return
+	case err != nil:
 		s.internalError(w, r, err)
 
 		return
 	}
 
-	s.writeJSON(w, http.StatusOK, Packages{Query: query, Matches: nonNil(matches)})
+	out := Packages{Query: query, Matches: nonNil(page.Matches), Next: page.Next}
+	if page.Total >= 0 {
+		out.Total = &page.Total
+	}
+
+	s.writeJSON(w, http.StatusOK, out)
 }
 
 // handleRollouts serves GET /api/v1/rollouts.
 func (s *Server) handleRollouts(w http.ResponseWriter, r *http.Request, _ *user) {
-	ctx := r.Context()
-
 	limit, err := queryLimit(r, defaultRolloutLimit, maxRolloutLimit)
 	if err != nil {
 		s.writeBadRequest(w, err)
@@ -333,39 +382,44 @@ func (s *Server) handleRollouts(w http.ResponseWriter, r *http.Request, _ *user)
 		return
 	}
 
-	open, err := s.opts.Store.ListRollouts(ctx, store.RolloutFilter{OpenOnly: true})
+	out, err := s.rollouts(r.Context(), limit)
 	if err != nil {
 		s.internalError(w, r, err)
 
 		return
+	}
+
+	s.writeJSON(w, http.StatusOK, out)
+}
+
+// rollouts builds the rollout view: everything open, and the newest limit
+// closed rollouts and leases.
+func (s *Server) rollouts(ctx context.Context, limit int) (*Rollouts, error) {
+	open, err := s.opts.Store.ListRollouts(ctx, store.RolloutFilter{OpenOnly: true})
+	if err != nil {
+		return nil, err
 	}
 
 	// The store filters open or all. The newest limit+len(open) rollouts
 	// hold at least the newest `limit` closed ones.
 	newest, err := s.opts.Store.ListRollouts(ctx, store.RolloutFilter{Limit: limit + len(open)})
 	if err != nil {
-		s.internalError(w, r, err)
-
-		return
+		return nil, err
 	}
 
 	openLeases, err := s.opts.Store.ListLeases(ctx, store.LeaseFilter{OpenOnly: true})
 	if err != nil {
-		s.internalError(w, r, err)
-
-		return
+		return nil, err
 	}
 
 	newestLeases, err := s.opts.Store.ListLeases(ctx, store.LeaseFilter{
 		Limit: limit + len(openLeases),
 	})
 	if err != nil {
-		s.internalError(w, r, err)
-
-		return
+		return nil, err
 	}
 
-	out := Rollouts{
+	out := &Rollouts{
 		Open:         nonNil(open),
 		Recent:       make([]*fleet.Rollout, 0, limit),
 		Leases:       nonNil(openLeases),
@@ -384,20 +438,24 @@ func (s *Server) handleRollouts(w http.ResponseWriter, r *http.Request, _ *user)
 		}
 	}
 
-	s.writeJSON(w, http.StatusOK, out)
+	return out, nil
 }
 
 // handlePlan serves GET /api/v1/plan.
 func (s *Server) handlePlan(w http.ResponseWriter, _ *http.Request, _ *user) {
+	s.writeJSON(w, http.StatusOK, s.plan())
+}
+
+// plan returns the last plan in the form the API serves it, or an empty one
+// around the current gate before the first reconcile.
+func (s *Server) plan() scheduler.Plan {
 	plan := s.opts.Scheduler.Plan()
 	if plan == nil {
-		s.writeJSON(w, http.StatusOK, scheduler.Plan{
+		return scheduler.Plan{
 			Gate:  s.gate(),
 			Queue: []scheduler.QueueEntry{},
 			Hosts: map[string]scheduler.HostPlan{},
-		})
-
-		return
+		}
 	}
 
 	out := *plan
@@ -408,7 +466,7 @@ func (s *Server) handlePlan(w http.ResponseWriter, _ *http.Request, _ *user) {
 		out.Hosts = map[string]scheduler.HostPlan{}
 	}
 
-	s.writeJSON(w, http.StatusOK, out)
+	return out
 }
 
 // handleGetSettings serves GET /api/v1/settings.
@@ -430,7 +488,7 @@ func (s *Server) handleGetSettings(w http.ResponseWriter, r *http.Request, _ *us
 func (s *Server) handleAudit(w http.ResponseWriter, r *http.Request, _ *user) {
 	q := r.URL.Query()
 
-	limit, err := queryLimit(r, defaultAuditLimit, maxAuditLimit)
+	limit, err := queryLimit(r, store.DefaultAuditLimit, store.MaxAuditLimit)
 	if err != nil {
 		s.writeBadRequest(w, err)
 

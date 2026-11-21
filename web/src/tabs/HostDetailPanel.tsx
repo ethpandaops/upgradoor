@@ -1,19 +1,18 @@
 import type { ReactNode } from 'react';
 
 import { list, type CLHealth, type Container, type ELHealth, type HostDetail } from '../api/types';
-import { useApp } from '../appContext';
 import type { ActionIntent } from '../components/ActionDialog';
 import { AuditTable } from '../components/AuditTable';
 import { Digest, ShortId } from '../components/Digest';
 import { LeaseTable } from '../components/LeaseTable';
-import { LivenessSparkline } from '../components/LivenessSparkline';
-import { ActionButton } from '../components/Permissions';
+import { useLiveHost } from '../components/Live';
+import { OverrideButtons, OverrideSummary } from '../components/Overrides';
+import { IntentAction } from '../components/SelectionBar';
 import { RelTime } from '../components/RelTime';
-import { Badge, Dash, Empty, ErrorBanner, Loading, Section, Table, Td, Th } from '../components/primitives';
-import { NeedLine } from '../components/status';
-import { usePoll } from '../hooks/usePoll';
+import { Badge, Dash, Empty, ErrorBanner, Loading, Section, Table, Td, Th, cx } from '../components/primitives';
+import { ImpactBadge, NeedLine } from '../components/status';
 import { percentOf, shortRevision } from '../lib/format';
-import { holdIntent } from '../lib/intents';
+import { holdIntent, offlineIntent } from '../lib/intents';
 import { hostOwners, rollableContainers } from './hostRows';
 
 /**
@@ -21,16 +20,18 @@ import { hostOwners, rollableContainers } from './hostRows';
  * open needs, pending packages, liveness, leases and history of one host.
  */
 export function HostDetailPanel({ name, onAction }: { name: string; onAction: (intent: ActionIntent) => void }) {
-  const { api } = useApp();
-  const detail = usePoll(s => api.host(name, s), { key: `host/${name}` });
+  const detail = useLiveHost(name);
 
-  if (detail.loading && !detail.data) return <Loading what={name} />;
-  if (!detail.data) return <ErrorBanner error={detail.error} what={name} onRetry={detail.refresh} />;
+  if (detail.loading) return <Loading what={name} />;
+  if (detail.gone) return <Empty>The controller does not know {name} any more.</Empty>;
+  if (detail.crowded) {
+    return <Empty>Too many host details are open at once. Close another host to load {name}.</Empty>;
+  }
+  if (!detail.data) return <ErrorBanner error={detail.error} what={name} />;
 
   const h = detail.data;
   const containers = list(h.containers);
   const needs = list(h.needs);
-  const liveness = list(h.liveness);
   const leases = list(h.leases);
   const history = list(h.history);
   const verbs = list(h.verbs);
@@ -39,32 +40,41 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
 
   return (
     <div className="flex flex-col gap-3">
-      {detail.error !== undefined && <ErrorBanner error={detail.error} what={name} onRetry={detail.refresh} />}
-
       <div role="group" aria-label={`Actions for ${name}`} className="flex flex-wrap items-center gap-1.5">
         <span className="text-sm/6 font-semibold">{name}</span>
-        <ActionButton
-          dense
-          disabled={!verbs.includes('roll')}
+        <IntentAction
+          icon="roll"
+          label="Roll…"
+          blocked={verbs.includes('roll') ? '' : 'The agent does not allow the verb roll'}
           onAction={onAction}
           intent={{ kind: 'roll', hosts: [name], all: false, containerChoices: rollableContainers([h]) }}
-        >
-          Roll…
-        </ActionButton>
-        <ActionButton
-          dense
-          disabled={!verbs.includes('reboot')}
+        />
+        <IntentAction
+          icon="reboot"
+          label="Reboot…"
+          blocked={verbs.includes('reboot') ? '' : 'The agent does not allow the verb reboot'}
           onAction={onAction}
           intent={{ kind: 'reboot', hosts: [name], all: false }}
-        >
-          Reboot…
-        </ActionButton>
-        <ActionButton dense onAction={onAction} intent={holdIntent(held ? 'unhold' : 'hold', [name])}>
-          {held ? 'Unhold…' : 'Hold…'}
-        </ActionButton>
-        <ActionButton dense variant="danger" onAction={onAction} intent={holdIntent('forget', [name])}>
-          Forget…
-        </ActionButton>
+        />
+        <IntentAction
+          icon={held ? 'unhold' : 'hold'}
+          label={held ? 'Unhold…' : 'Hold…'}
+          onAction={onAction}
+          intent={holdIntent(held ? 'unhold' : 'hold', [name])}
+        />
+        <IntentAction
+          icon="offline"
+          label={h.offline ? 'Lift offline mark…' : 'Mark offline…'}
+          onAction={onAction}
+          intent={offlineIntent(!h.offline, [name])}
+        />
+        <IntentAction
+          icon="forget"
+          label="Forget…"
+          tone="danger"
+          onAction={onAction}
+          intent={holdIntent('forget', [name])}
+        />
         {owners.length > 0 && (
           <span className="text-xs/5 text-muted" title="The teams that own a container of this host">
             owners: {owners.join(', ')}
@@ -77,13 +87,7 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
           <Facts>
             <Fact label="roles">{list(h.roles).join(', ') || <Dash />}</Fact>
             <Fact label="validators">
-              {h.validatorStart !== undefined && h.validatorEnd !== undefined ? (
-                <span className="font-mono">
-                  [{h.validatorStart}, {h.validatorEnd}) = {h.validators}
-                </span>
-              ) : (
-                'none'
-              )}
+              <ValidatorRange host={h} />
             </Fact>
             <Fact label="certificate">
               <ShortId value={h.certHash} label="certificate hash" />{' '}
@@ -112,7 +116,7 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
                     h.holdBy === 'team'
                       ? 'Set through a team feature: a member of a team that owns a container of this host can lift it'
                       : h.holdWanted
-                        ? 'Set by staff, the scheduler or the end of a lease: a team feature does not lift it'
+                        ? 'Set by staff: a team feature does not lift it'
                         : undefined
                   }
                 >
@@ -127,6 +131,21 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
                 </span>
               )}
             </Fact>
+            {h.broken && Object.keys(h.broken).length > 0 && (
+              <Fact label="broken">
+                <span className="flex flex-wrap gap-1">
+                  {Object.entries(h.broken).map(([group, lease]) => (
+                    <Badge
+                      key={group}
+                      tone="danger"
+                      title={`Lease ${lease} failed on it: the host goes first in the next rollout of it`}
+                    >
+                      {group.replace(/^image:/, '')}
+                    </Badge>
+                  ))}
+                </span>
+              </Fact>
+            )}
           </Facts>
         </Section>
 
@@ -190,9 +209,6 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
                   ? `${percentOf(h.plan.live, h.plan.weight)} (${h.plan.live}/${h.plan.weight})`
                   : 'unknown'}
             </Fact>
-            <Fact label="per epoch">
-              <LivenessSparkline rows={liveness} />
-            </Fact>
           </Facts>
         </Section>
       </div>
@@ -204,6 +220,18 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
           <ContainerTable containers={containers} />
         )}
       </Section>
+
+      {containers.some(c => c.managed && c.client) && (
+        <Section title="Clients, overrides and command lines">
+          <ul className="flex flex-col rounded-sm border border-border bg-surface text-xs/5">
+            {containers
+              .filter(c => c.managed && c.client)
+              .map(c => (
+                <ClientContainer key={c.name} host={name} container={c} stale={h.stale} onAction={onAction} />
+              ))}
+          </ul>
+        </Section>
+      )}
 
       <div className="grid grid-cols-1 gap-3 xl:grid-cols-2">
         <Section title={`Open needs (${needs.length})`}>
@@ -244,6 +272,61 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
   );
 }
 
+/**
+ * ValidatorRange shows the range the controller counts for the host and
+ * where the host's agent read it. A host that does not know its range
+ * (missing, invalid) and a range that another host reports too are warnings:
+ * the budget is then computed from a range that may be wrong.
+ */
+function ValidatorRange({ host: h }: { host: HostDetail }) {
+  const report = h.validatorReport;
+  const overlaps = list(h.validatorOverlaps);
+  const counted = h.validatorStart !== undefined && h.validatorEnd !== undefined;
+
+  return (
+    <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
+      {counted ? (
+        <span className="font-mono" title="The range the controller counts for this host">
+          [{h.validatorStart}, {h.validatorEnd}) = {h.validators}
+        </span>
+      ) : (
+        'none'
+      )}
+      {report && report.state === 'known' && (
+        <span className="text-muted" title="Where the agent read the range it reports">
+          from the{' '}
+          {report.source === 'marker'
+            ? 'marker file'
+            : report.source === 'config'
+              ? 'agent configuration'
+              : report.source}
+        </span>
+      )}
+      {report && report.state !== 'known' && (
+        <Badge
+          tone="warning"
+          title={
+            report.state === 'missing'
+              ? 'The marker file of the validator keys is not on the host. The controller keeps counting the last range it knew.'
+              : `The host reports a range that cannot be used${report.error ? `: ${report.error}` : ''}. The controller keeps counting the last range it knew.`
+          }
+        >
+          range {report.state}
+          {report.error ? `: ${report.error}` : ''}
+        </Badge>
+      )}
+      {overlaps.length > 0 && (
+        <Badge
+          tone="danger"
+          title="These hosts report validators this host reports too: keys are being moved, or one of them is wrong"
+        >
+          overlaps with {overlaps.join(', ')}
+        </Badge>
+      )}
+    </span>
+  );
+}
+
 function Facts({ children }: { children: ReactNode }) {
   return (
     <dl className="grid grid-cols-[max-content_1fr] gap-x-3 gap-y-0.5 rounded-sm border border-border bg-surface px-2 py-1 text-xs/5">
@@ -266,7 +349,7 @@ function ELLine({ el }: { el: ELHealth }) {
   return (
     <span>
       {el.syncing ? <Badge tone="warning">syncing</Badge> : <Badge tone="success">synced</Badge>}{' '}
-      <span className={el.peers === 0 ? 'text-danger' : undefined}>{el.peers} peers</span>, head{' '}
+      <span className={cx('tabular-nums', el.peers === 0 && 'text-danger')}>{el.peers} peers</span>, head{' '}
       <span className="font-mono">{el.head}</span>
     </span>
   );
@@ -283,9 +366,62 @@ function CLLine({ cl }: { cl: CLHealth }) {
       )}{' '}
       {cl.optimistic && <Badge tone="warning">optimistic</Badge>}{' '}
       {cl.elOffline && <Badge tone="danger">EL offline</Badge>}{' '}
-      <span className={cl.peers === 0 ? 'text-danger' : undefined}>{cl.peers} peers</span>, head slot{' '}
+      <span className={cx('tabular-nums', cl.peers === 0 && 'text-danger')}>{cl.peers} peers</span>, head slot{' '}
       <span className="font-mono">{cl.headSlot}</span>
     </span>
+  );
+}
+
+/**
+ * ClientContainer is one managed container of a client: the client, the
+ * override the host reports for it, the two override actions and, on demand,
+ * its command line.
+ */
+function ClientContainer({
+  host,
+  container: c,
+  stale,
+  onAction,
+}: {
+  host: string;
+  container: Container;
+  stale: boolean;
+  onAction: (intent: ActionIntent) => void;
+}) {
+  const command = list(c.command);
+
+  return (
+    <li className="flex flex-col gap-1 border-b border-border px-2 py-1.5 last:border-b-0">
+      {/* The actions stand at the left edge: the panel can be wider than the window. */}
+      <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
+        <span className="font-medium">{c.name}</span>
+        <span className="text-muted" title="The client software the container runs">
+          {c.client}
+          {c.kind ? ` · ${c.kind.toUpperCase()}` : ''}
+        </span>
+        {c.impact && <ImpactBadge impact={c.impact} />}
+        <span role="group" aria-label={`Overrides of ${c.name}`} className="flex shrink-0 items-center gap-1.5">
+          <OverrideButtons host={host} containers={[c]} stale={stale} onAction={onAction} />
+        </span>
+      </div>
+      {c.override ? <OverrideSummary override={c.override} /> : <span className="text-faint">no override</span>}
+      <details>
+        <summary className="cursor-pointer text-muted hover:text-foreground">
+          command line ({command.length} {command.length === 1 ? 'argument' : 'arguments'})
+        </summary>
+        {command.length === 0 ? (
+          <span className="text-muted">The agent reports no arguments.</span>
+        ) : (
+          <ul aria-label={`Command line of ${c.name}`} className="pt-1 pl-4 font-mono">
+            {command.map((arg, i) => (
+              <li key={`${i} ${arg}`} className="break-all whitespace-normal">
+                {arg}
+              </li>
+            ))}
+          </ul>
+        )}
+      </details>
+    </li>
   );
 }
 
@@ -314,12 +450,19 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
           return (
             <tr key={c.id || c.name} className="hover:bg-surface-hover">
               <Td className="font-medium">{c.name}</Td>
-              <Td>{c.kind ? c.kind.toUpperCase() : <Dash />}</Td>
+              <Td>
+                {c.kind ? c.kind.toUpperCase() : <Dash />}
+                {c.impact && (
+                  <span className="ml-1.5">
+                    <ImpactBadge impact={c.impact} />
+                  </span>
+                )}
+              </Td>
               <Td>{list(c.owners).length > 0 ? list(c.owners).join(', ') : <Dash />}</Td>
               <Td>
                 <span className="font-mono">{c.image}</span>
-                {c.custom && c.configuredImage && (
-                  <span className="text-muted">
+                {c.managed && c.configuredImage && c.configuredImage !== c.image && !c.override && (
+                  <span className="text-muted" title="agent.yaml names another image: the container is rolled onto it">
                     {' '}
                     (configured: <span className="font-mono">{c.configuredImage}</span>)
                   </span>
@@ -341,7 +484,7 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
               </Td>
               <Td className={c.restartCount > 0 ? 'font-medium text-warning' : 'text-faint'}>{c.restartCount}</Td>
               <Td>
-                <RelTime value={c.startedAt} />
+                <RelTime fixed value={c.startedAt} />
               </Td>
               <Td>
                 <Digest value={c.digest} />
@@ -357,7 +500,7 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
                       </Badge>
                     )}
                     <span className="text-faint">
-                      <RelTime value={c.registry.checkedAt} />
+                      <RelTime fixed value={c.registry.checkedAt} />
                     </span>
                   </span>
                 ) : (
@@ -368,15 +511,7 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
                 {shortRevision(c.revision) || c.version || <Dash />}
               </Td>
               <Td>
-                {c.custom ? (
-                  <Badge tone="warning" title="Image swapped by hand; never rolled">
-                    custom
-                  </Badge>
-                ) : c.managed ? (
-                  <Badge tone="accent">managed</Badge>
-                ) : (
-                  <span className="text-faint">unmanaged</span>
-                )}
+                {c.managed ? <Badge tone="accent">managed</Badge> : <span className="text-faint">unmanaged</span>}
               </Td>
             </tr>
           );

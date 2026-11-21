@@ -7,7 +7,9 @@ import type { ReactNode } from 'react';
 import { ApiClient, type FetchFn } from '../api/client';
 import { AppContext } from '../appContext';
 import { AuthStore } from '../auth/authStore';
+import { LiveProvider } from '../components/Live';
 import { PermissionsProvider } from '../components/Permissions';
+import type { MockFleet } from '../mock/fixture';
 import { fakeAuthenticatoor, type FakeAuthenticatoor } from '../mock/install';
 import { MOCK_AUTH_SERVICE, MOCK_AUTH_URL, MockController, type MockProfile } from '../mock/mockController';
 
@@ -30,13 +32,7 @@ export interface Harness {
   userCalls: () => RecordedCall[];
 }
 
-export const PUBLIC_PATHS = [
-  '/api/v1/config',
-  '/api/v1/public/hosts',
-  '/api/v1/public/images',
-  '/api/v1/public/network',
-  '/api/v1/public/history',
-];
+export const PUBLIC_PATHS = ['/api/v1/config', '/api/v1/public/events', '/api/v1/public/slots'];
 
 /** recordingFetch wraps a fetch and notes every call. */
 export function recordingFetch(inner: FetchFn, calls: RecordedCall[]): FetchFn {
@@ -57,10 +53,10 @@ export function recordingFetch(inner: FetchFn, calls: RecordedCall[]): FetchFn {
  * logged in or out.
  */
 export async function createHarness(
-  opts: { mode?: 'open' | 'auth'; loggedIn?: boolean; profile?: MockProfile } = {}
+  opts: { mode?: 'open' | 'auth'; loggedIn?: boolean; profile?: MockProfile; fleet?: MockFleet } = {}
 ): Promise<Harness> {
   const mode = opts.mode ?? 'open';
-  const controller = new MockController({ auth: mode === 'auth' });
+  const controller = new MockController({ auth: mode === 'auth', fleet: opts.fleet });
   const calls: RecordedCall[] = [];
   const auth = new AuthStore(() => Promise.reject(new Error('no script loading in tests')));
   const api = new ApiClient({ fetch: recordingFetch(controller.fetch, calls), tokens: auth });
@@ -93,7 +89,14 @@ export function renderWithApp(ui: ReactNode, h: Harness): RenderResult {
   };
   return render(
     <AppContext value={{ api: h.api, auth: h.auth, config }}>
-      <PermissionsProvider>{ui}</PermissionsProvider>
+      <LiveProvider>
+        <PermissionsProvider>{ui}</PermissionsProvider>
+      </LiveProvider>
     </AppContext>
   );
 }
+
+/** PRIMARY is the query of the primary button of an action dialog: it names what the action does. */
+export const PRIMARY = {
+  name: /^(Confirm|Roll|Reboot|Hold|Unhold|Forget|Pause|Resume|Abort|Skip|Retry|End the lease|Set the policy|Override image|Override flags|Clear)$/,
+};

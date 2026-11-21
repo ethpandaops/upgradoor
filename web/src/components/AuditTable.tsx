@@ -6,7 +6,7 @@ import { RelTime } from './RelTime';
 import { Dash, Table, Td, Th } from './primitives';
 
 /** AuditDetail renders an entry's detail: a before / after diff when it is a change, JSON otherwise. */
-export function AuditDetail({ detail }: { detail: Record<string, unknown> }) {
+function AuditDetail({ detail }: { detail: Record<string, unknown> }) {
   const change = changeOf(detail);
   const rest = Object.fromEntries(Object.entries(detail).filter(([k]) => !change || (k !== 'before' && k !== 'after')));
   const rows = change ? diffValues(change.before, change.after) : [];
@@ -123,7 +123,7 @@ export function AuditTable({
                   )}
                 </Td>
                 <Td>
-                  <RelTime value={e.time} />
+                  <RelTime fixed value={e.time} />
                 </Td>
                 <Td>{e.actor}</Td>
                 <Td className="font-mono">{e.action}</Td>

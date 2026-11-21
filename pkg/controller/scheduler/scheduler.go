@@ -51,8 +51,6 @@ type Service interface {
 
 	// Settings returns the effective settings.
 	Settings(ctx context.Context) (fleet.Settings, error)
-	// UpdateSettings validates, stores and audits new settings.
-	UpdateSettings(ctx context.Context, actor string, settings fleet.Settings) error
 	// PatchSettings changes the settings in one step under the scheduler's
 	// lock: apply is given a copy of the effective settings and changes what
 	// the caller names; the result is validated, stored and audited with the
@@ -71,22 +69,37 @@ type Service interface {
 	// Hold puts hosts on controller hold; Unhold lifts it.
 	Hold(ctx context.Context, actor string, req HoldRequest) (*ActionResult, error)
 	Unhold(ctx context.Context, actor string, req HoldRequest) (*ActionResult, error)
+	// MarkOffline marks hosts as known offline; UnmarkOffline lifts the mark.
+	MarkOffline(ctx context.Context, actor string, req OfflineRequest) (*ActionResult, error)
+	UnmarkOffline(ctx context.Context, actor string, req OfflineRequest) (*ActionResult, error)
+	// ImageOverride and FlagOverride send a host the instruction to set or
+	// take away the image, or the flags, of one container's override. The
+	// host's agent decides whether it takes it; the container follows under
+	// a lease of the host's own rollout.
+	ImageOverride(ctx context.Context, actor string, req ImageOverrideRequest) (*ActionResult, error)
+	FlagOverride(ctx context.Context, actor string, req FlagOverrideRequest) (*ActionResult, error)
+	ClientOverride(ctx context.Context, actor string, req ClientOverrideRequest) (*ActionResult, error)
+	// SetClientPolicy sets the image policy of one client, or returns the
+	// client to the global default (policyImage).
+	SetClientPolicy(ctx context.Context, actor string, req ClientPolicyRequest) (*ActionResult, error)
 	// Pause pauses everything (no Rollout) or one rollout; Resume lifts the
 	// pause and approves a rollout that waits on a manual policy.
 	Pause(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
 	Resume(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
-	// Skip marks hosts as skipped in a rollout.
+	// Skip marks hosts as skipped in a rollout. In a rollout of an observed
+	// cause the rollout stays open while a skipped host still has the need.
 	Skip(ctx context.Context, actor string, req RolloutHostsRequest) (*ActionResult, error)
-	// Retry reopens a halted or aborted rollout (all failed hosts, or the
-	// listed ones) and so lifts the digest block. It also takes back skips
-	// of the hosts it applies to.
+	// Retry returns the failed hosts of an open rollout (all, or the listed
+	// ones) to pending and so lifts its halt. It also takes back skips of the
+	// hosts it names.
 	Retry(ctx context.Context, actor string, req RolloutHostsRequest) (*ActionResult, error)
-	// Abort closes a rollout. Open leases finish.
+	// Abort closes a manual rollout. A rollout of an observed cause cannot be
+	// closed while hosts report the cause: it is paused instead, until a
+	// person resumes it or the cause changes. Open leases finish.
 	Abort(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
 	// EndLease asks for the end of one open lease: the lease is marked
-	// cancelled and its host put on hold in one transaction. The lease stays
-	// open, with its place in the budget, until the agent reports that it has
-	// stopped (or the lease ends by one of the ordinary ways).
+	// cancelled. It stays open, with its place in the budget, until the agent
+	// reports that it has stopped or goes silent, and then ends as failed.
 	EndLease(ctx context.Context, actor string, req EndLeaseRequest) (*ActionResult, error)
 	// Forget deletes hosts that are gone. Refused while a host holds a lease.
 	Forget(ctx context.Context, actor string, req HoldRequest) (*ActionResult, error)
@@ -97,6 +110,9 @@ type Assignment struct {
 	Lease      *protocol.Lease
 	Directives []protocol.Directive
 	Queue      *protocol.Queue
+	// Ended is the host's newest lease when it is over and the host holds
+	// none: how it ended, for the host's own status.
+	Ended *protocol.EndedLease
 }
 
 // RollRequest is the body of POST /api/v1/actions/roll.
@@ -105,7 +121,7 @@ type RollRequest struct {
 	Hosts []string `json:"hosts"`
 	All   bool     `json:"all"`
 	// Containers limits the roll to these container names; empty means
-	// every managed, non-custom container of each host.
+	// every managed container of each host.
 	Containers []string `json:"containers"`
 	// Staggered runs the selection as a manual rollout through the normal
 	// order, budget, gate and readiness check. Not staggered means "now":
@@ -133,6 +149,107 @@ type RebootRequest struct {
 type HoldRequest struct {
 	Hosts  []string `json:"hosts"`
 	Reason string   `json:"reason"`
+}
+
+// OfflineRequest is the body of the mark-offline and unmark-offline actions.
+// Reason is required to mark; Until, when set, ends the mark by itself.
+type OfflineRequest struct {
+	Hosts  []string   `json:"hosts"`
+	Reason string     `json:"reason"`
+	Until  *time.Time `json:"until"`
+}
+
+// ImageOverrideRequest is the body of POST /api/v1/actions/image-override.
+type ImageOverrideRequest struct {
+	Host      string `json:"host"`
+	Container string `json:"container"`
+	// Image is the image reference to run; empty takes the image override
+	// away.
+	Image string `json:"image"`
+	// Until is when the override ends: by default DefaultOverrideDuration
+	// from now, at most MaxOverrideDuration. Not read when Image is empty.
+	Until  *time.Time `json:"until"`
+	Reason string     `json:"reason"`
+}
+
+// FlagOverrideRequest is the body of POST /api/v1/actions/flag-override.
+type FlagOverrideRequest struct {
+	Host      string `json:"host"`
+	Container string `json:"container"`
+	// AddFlags and RemoveFlags are the flags to add and to remove; both
+	// empty takes the flag override away.
+	AddFlags    []string   `json:"addFlags"`
+	RemoveFlags []string   `json:"removeFlags"`
+	Until       *time.Time `json:"until"`
+	Reason      string     `json:"reason"`
+}
+
+// ClientOverrideRequest is the body of POST /api/v1/actions/client-override:
+// one part of an override for the container of one kind of a client, on
+// each of the named hosts. Every host gets a directive of its own, as if it
+// had been asked for alone; a host that cannot take it is refused with the
+// reason and the others go ahead.
+type ClientOverrideRequest struct {
+	// Client is the client name, as the agents report it; Kind the kind of
+	// its container (a consensus client has a beacon and a validator).
+	Client string                 `json:"client"`
+	Kind   protocol.ContainerKind `json:"kind"`
+	Hosts  []string               `json:"hosts"`
+	// Part is protocol.OverrideImage or protocol.OverrideFlags. An empty
+	// Image, or no flags, takes that part of the override away.
+	Part        string     `json:"part"`
+	Image       string     `json:"image"`
+	AddFlags    []string   `json:"addFlags"`
+	RemoveFlags []string   `json:"removeFlags"`
+	Until       *time.Time `json:"until"`
+	Reason      string     `json:"reason"`
+}
+
+// Sets reports whether the request sets its part of the override; false
+// takes it away.
+func (r *ClientOverrideRequest) Sets() bool {
+	if r.Part == protocol.OverrideImage {
+		return r.Image != ""
+	}
+
+	return len(r.AddFlags)+len(r.RemoveFlags) > 0
+}
+
+// ClientContainer names the managed container of the client and kind on the
+// host, by what its agent last reported; empty when there is none.
+func ClientContainer(h *fleet.Host, client string, kind protocol.ContainerKind) string {
+	if h.Status == nil {
+		return ""
+	}
+
+	for i := range h.Status.Containers {
+		if c := &h.Status.Containers[i]; c.Managed && c.Client == client && c.Kind == kind {
+			return c.Name
+		}
+	}
+
+	return ""
+}
+
+// Bounds of an override that is set through the controller: it always has
+// an end. The agent enforces the maximum as well.
+const (
+	DefaultOverrideDuration = 24 * time.Hour
+	MaxOverrideDuration     = 7 * 24 * time.Hour
+	// overrideAnswerTimeout is how long an override directive waits for the
+	// agent's answer before it is withdrawn: an instruction that was not
+	// delivered soon is not delivered late.
+	overrideAnswerTimeout = 15 * time.Minute
+)
+
+// ClientPolicyRequest is the body of POST /api/v1/actions/client-policy.
+type ClientPolicyRequest struct {
+	// Client is the client name, as the agents report it.
+	Client string `json:"client"`
+	// Policy is "auto" or "manual"; empty returns the client to the global
+	// default (policyImage).
+	Policy fleet.Policy `json:"policy"`
+	Reason string       `json:"reason"`
 }
 
 // ScopeRequest is the body of pause, resume and abort. An empty Rollout
@@ -182,8 +299,9 @@ type Plan struct {
 	Hosts map[string]HostPlan `json:"hosts"`
 }
 
-// Gate is the network gate. No new lease is granted while it fails; open
-// leases finish.
+// Gate is the network gate. No new lease is granted while it fails, with one
+// exception (a host none of whose validators attests, while nothing else is
+// leased); open leases finish.
 type Gate struct {
 	OK bool `json:"ok"`
 	// Reasons lists every failing condition, e.g.
@@ -197,13 +315,26 @@ type Budget struct {
 	TotalWeight uint64 `json:"totalWeight"`
 	// AllowedWeight is maxUnavailable applied to TotalWeight.
 	AllowedWeight float64 `json:"allowedWeight"`
-	// UnavailableWeight is the full weight of every host holding a lease
-	// plus the validators not attesting on every other host.
+	// UnavailableWeight is the full weight of every host that holds a lease
+	// or works on an operation without one, plus the validators not attesting
+	// on every other host.
 	UnavailableWeight uint64 `json:"unavailableWeight"`
 	// LeasedHosts and MaxLeasedHosts are the host-count dimension:
-	// max(1, floor(maxUnavailable * hosts)) hosts may hold a lease at once.
+	// max(1, floor(maxUnavailable * hosts)) hosts may hold a lease (or work
+	// on an operation without one) at once.
 	LeasedHosts    int `json:"leasedHosts"`
 	MaxLeasedHosts int `json:"maxLeasedHosts"`
+	// IndependentHosts and MaxIndependent are the independent limit: hosts
+	// whose lease is about independent containers alone, and
+	// max(1, floor(maxIndependentPercent * hosts)). They count for nothing
+	// above.
+	IndependentHosts int `json:"independentHosts"`
+	MaxIndependent   int `json:"maxIndependent"`
+	// OfflineHosts are the hosts marked known offline that are not at work;
+	// their OfflineWeight is left out of TotalWeight and UnavailableWeight,
+	// and out of both sides of the gate's participation.
+	OfflineHosts  int    `json:"offlineHosts,omitempty"`
+	OfflineWeight uint64 `json:"offlineWeight,omitempty"`
 }
 
 // QueueEntry is one waiting host.
@@ -218,9 +349,9 @@ type QueueEntry struct {
 	// by itself from one that waits for a person.
 	Wait WaitKind `json:"wait"`
 	// After names the host that a host waiting for its place in the order
-	// of a rollout waits for: a member whose host is broken, the host of a
-	// lease in flight, or the canary. That host may not be in the queue
-	// itself: it holds a lease, or it is expected to report its need.
+	// of a rollout waits for: a member whose host is broken, or the canary.
+	// That host may not be in the queue itself: it holds a lease, or it is
+	// expected to report its need.
 	After string `json:"after,omitempty"`
 	// Rollout is the ID of the rollout the reason is about: the one that is
 	// paused, halted, unapproved or whose order the host waits in. Empty when
@@ -233,22 +364,22 @@ type QueueEntry struct {
 // WaitKind is the class of a queued host's waiting reason.
 type WaitKind string
 
-// Wait kinds. Budget, host limit, order and next clear by themselves as the
-// rollout proceeds; gate clears when the network recovers; the others need
-// somebody to act.
+// Wait kinds. Budget, host limit and order clear by themselves as the
+// rollout proceeds; working clears when the operation the host works on
+// without a lease is over; gate clears when the network recovers; the others
+// need somebody to act.
 const (
-	WaitNext          WaitKind = "next"
 	WaitBudget        WaitKind = "budget"
 	WaitHostLimit     WaitKind = "host-limit"
 	WaitOrder         WaitKind = "order"
 	WaitGate          WaitKind = "gate"
 	WaitVerb          WaitKind = "verb"
 	WaitHalted        WaitKind = "halted"
-	WaitPolicyPaused  WaitKind = "policy-paused"
 	WaitApproval      WaitKind = "approval"
 	WaitRolloutPaused WaitKind = "rollout-paused"
 	WaitPaused        WaitKind = "paused"
 	WaitSilent        WaitKind = "silent"
+	WaitWorking       WaitKind = "working"
 	WaitHeld          WaitKind = "held"
 )
 
@@ -274,7 +405,8 @@ type HostPlan struct {
 	Weight    uint64 `json:"weight"`
 	Live      uint64 `json:"live"`
 	LiveKnown bool   `json:"liveKnown"`
-	// LeaseID is the open lease, if any.
+	// LeaseID is the open lease, if any. A host that works on an operation
+	// without a lease has the slot leased and no lease ID.
 	LeaseID string `json:"leaseId,omitempty"`
 	// Reason is the waiting reason when queued.
 	Reason string `json:"reason,omitempty"`

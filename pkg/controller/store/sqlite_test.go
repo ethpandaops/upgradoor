@@ -8,7 +8,6 @@ import (
 	"path/filepath"
 	"sync"
 	"testing"
-	"testing/fstest"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -87,14 +86,13 @@ func countRows(t *testing.T, s Store, table string) int {
 	return n
 }
 
-func testCert(name string, validators *identity.ValidatorRange, roles ...string) *identity.Certificate {
+func testCert(name string, roles ...string) *identity.Certificate {
 	return &identity.Certificate{
 		Claims: identity.Claims{
 			Issuer:     identity.Issuer,
 			Network:    "testnet-0",
 			Subject:    name,
 			Generation: 1,
-			Validators: validators,
 			Roles:      roles,
 		},
 		Raw:  "raw-" + name,
@@ -138,6 +136,18 @@ func testRequest(needs ...protocol.Need) *protocol.SyncRequest {
 	}
 }
 
+// reporting is testRequest of a host that reports the validator range
+// [start, end) from its marker file.
+func reporting(start, end uint64, needs ...protocol.Need) *protocol.SyncRequest {
+	req := testRequest(needs...)
+	req.Validators = &protocol.Validators{
+		Start: start, End: end,
+		Source: protocol.ValidatorsFromMarker, State: protocol.ValidatorsKnown,
+	}
+
+	return req
+}
+
 func imageNeed(id string) protocol.Need {
 	return protocol.Need{
 		ID:   id,
@@ -149,14 +159,20 @@ func imageNeed(id string) protocol.Need {
 	}
 }
 
-// addHost registers a host through RecordSync.
+// addHost registers a host through RecordSync; validators is the range it
+// reports, nil for none.
 func addHost(t *testing.T, s Store, name string, validators *identity.ValidatorRange) *fleet.Host {
 	t.Helper()
 
+	req := testRequest()
+	if validators != nil {
+		req = reporting(validators.Start, validators.End)
+	}
+
 	res, err := s.RecordSync(context.Background(), &HostSync{
-		Cert:       testCert(name, validators),
+		Cert:       testCert(name),
 		RemoteAddr: "10.0.0.1:1234",
-		Request:    testRequest(),
+		Request:    req,
 		At:         at(0),
 	})
 	require.NoError(t, err)
@@ -329,60 +345,37 @@ func TestRestartPersistence(t *testing.T) {
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "upgradoor.db")
 
-	log, hook := logrustest.NewNullLogger()
-	applied := func() int {
-		n := 0
-
-		for _, entry := range hook.AllEntries() {
-			if entry.Message == "applied database migration" {
-				n++
-			}
-		}
-
-		return n
-	}
-
-	first := New(log, path)
+	first := New(quietLog(), path)
 	require.NoError(t, first.Start(ctx))
-	assert.Equal(t, 5, applied())
 
 	addHost(t, first, "node-1", &identity.ValidatorRange{Start: 0, End: 100})
 	inv := testInventory(20)
 	require.NoError(t, first.SaveInventory(ctx, "node-1", inv))
-	require.NoError(t, first.SetHostHold(ctx, "node-1", true, "investigating"))
+	require.NoError(t, setHold(ctx, first, "node-1", true, "investigating"))
 	require.NoError(t, first.Commit(ctx, &Changes{
 		Rollouts:   []*fleet.Rollout{testRollout("r1", fleet.RolloutActive, 0, "node-1")},
 		Leases:     []*fleet.Lease{testLease("l1", "node-1", fleet.LeaseRunning, 0)},
 		Directives: []*fleet.Directive{testDirective("d1", "node-1", fleet.DirectivePending, 0)},
 		Audit:      []fleet.AuditEntry{{Actor: "scheduler", Action: "lease.granted", Target: "node-1"}},
 	}))
-	require.NoError(t, first.SaveLiveness(ctx, []fleet.Liveness{{Host: "node-1", Epoch: 7, Live: 99, Total: 100}}))
 
 	settings := fleet.DefaultSettings()
 	settings.Paused = true
 	require.NoError(t, first.SaveSettings(ctx, fleet.DefaultSettings(), settings))
 	require.NoError(t, first.Stop())
 
-	hook.Reset()
-
-	second := New(log, path)
+	second := New(quietLog(), path)
 	require.NoError(t, second.Start(ctx))
 
 	defer func() { require.NoError(t, second.Stop()) }()
-
-	assert.Zero(t, applied(), "migrations are not applied again")
-
-	var version int
-
-	require.NoError(t, rawDB(t, second).QueryRow(`PRAGMA user_version`).Scan(&version))
-	assert.Equal(t, 5, version)
 
 	host, err := second.GetHost(ctx, "node-1")
 	require.NoError(t, err)
 	assert.True(t, host.HoldWanted)
 	assert.Equal(t, "investigating", host.HoldReason)
 	assert.Equal(t, inv.Hash, host.InventoryHash)
-	assert.Equal(t, testRequest(), host.Status)
+	assert.Equal(t, reporting(0, 100), host.Status)
+	assert.Equal(t, uint64(100), host.Weight())
 
 	gotInv, err := second.GetInventory(ctx, "node-1")
 	require.NoError(t, err)
@@ -405,210 +398,49 @@ func TestRestartPersistence(t *testing.T) {
 	require.Len(t, audit, 1)
 	assert.Equal(t, "lease.granted", audit[0].Action)
 
-	liveness, err := second.ListLiveness(ctx, 1)
-	require.NoError(t, err)
-	assert.Equal(t, []fleet.Liveness{{Host: "node-1", Epoch: 7, Live: 99, Total: 100}}, liveness)
-
 	loaded, err := second.LoadSettings(ctx, fleet.DefaultSettings())
 	require.NoError(t, err)
 	assert.Equal(t, settings, loaded)
 }
 
-func TestSchemaNewerThanBinary(t *testing.T) {
-	ctx := context.Background()
-	path := filepath.Join(t.TempDir(), "upgradoor.db")
-
-	s := New(quietLog(), path)
-	require.NoError(t, s.Start(ctx))
-	addHost(t, s, "node-1", nil)
-
-	_, err := rawDB(t, s).Exec(`PRAGMA user_version = 99`)
-	require.NoError(t, err)
-	require.NoError(t, s.Stop())
-
-	newer := New(quietLog(), path)
-	require.ErrorIs(t, newer.Start(ctx), ErrSchemaTooNew)
-
-	_, err = newer.ListHosts(ctx)
-	require.ErrorIs(t, err, ErrClosed, "a refused database is not left open")
-
-	// The refused start changed nothing.
-	db, err := sql.Open(driverName, "file:"+escapeURIPath(path))
-	require.NoError(t, err)
-
-	defer func() { require.NoError(t, db.Close()) }()
-
-	var version, hosts int
-
-	require.NoError(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM hosts`).Scan(&hosts))
-	assert.Equal(t, 99, version)
-	assert.Equal(t, 1, hosts)
-}
-
-func TestApplyMigrations(t *testing.T) {
+func TestSchemaVersion(t *testing.T) {
 	ctx := context.Background()
 
-	open := func(t *testing.T) *sql.DB {
-		t.Helper()
+	for _, changed := range []int{0, schemaVersion + 1} {
+		t.Run(fmt.Sprintf("version %d", changed), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "upgradoor.db")
 
-		db, err := openPool(ctx, "file:"+escapeURIPath(filepath.Join(t.TempDir(), "m.db"))+
-			"?_txlock=immediate", 1)
-		require.NoError(t, err)
-		t.Cleanup(func() { assert.NoError(t, db.Close()) })
+			s := New(quietLog(), path)
+			require.NoError(t, s.Start(ctx))
+			addHost(t, s, "node-1", nil)
+			require.NoError(t, s.Stop())
 
-		return db
-	}
-
-	version := func(t *testing.T, db *sql.DB) int {
-		t.Helper()
-
-		var v int
-
-		require.NoError(t, db.QueryRow(`PRAGMA user_version`).Scan(&v))
-
-		return v
-	}
-
-	tableExists := func(t *testing.T, db *sql.DB, name string) bool {
-		t.Helper()
-
-		var n int
-
-		require.NoError(t, db.QueryRow(
-			`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, name).Scan(&n))
-
-		return n == 1
-	}
-
-	one := migration{version: 1, name: "0001_a.sql", sql: `CREATE TABLE a (x INTEGER); INSERT INTO a VALUES (1);`}
-	two := migration{version: 2, name: "0002_b.sql", sql: `CREATE TABLE b (y INTEGER); INSERT INTO b VALUES (2);`}
-	bad := migration{version: 2, name: "0002_bad.sql", sql: `CREATE TABLE c (z INTEGER); INSERT INTO missing VALUES (1);`}
-
-	t.Run("applies in order and only once", func(t *testing.T) {
-		db := open(t)
-
-		v, err := applyMigrations(ctx, quietLog(), db, []migration{one})
-		require.NoError(t, err)
-		assert.Equal(t, 1, v)
-
-		// Re-running would fail with "table a already exists" if it were
-		// applied again.
-		v, err = applyMigrations(ctx, quietLog(), db, []migration{one, two})
-		require.NoError(t, err)
-		assert.Equal(t, 2, v)
-		assert.Equal(t, 2, version(t, db))
-
-		v, err = applyMigrations(ctx, quietLog(), db, []migration{one, two})
-		require.NoError(t, err)
-		assert.Equal(t, 2, v)
-
-		var rows int
-
-		require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM a`).Scan(&rows))
-		assert.Equal(t, 1, rows)
-	})
-
-	t.Run("a failing step is rolled back whole", func(t *testing.T) {
-		db := open(t)
-
-		v, err := applyMigrations(ctx, quietLog(), db, []migration{one, bad})
-		require.Error(t, err)
-		assert.Equal(t, 1, v)
-		assert.Equal(t, 1, version(t, db))
-		assert.True(t, tableExists(t, db, "a"))
-		assert.False(t, tableExists(t, db, "c"), "the half-applied step left nothing behind")
-
-		// A fixed binary continues from version 1.
-		v, err = applyMigrations(ctx, quietLog(), db, []migration{one, two})
-		require.NoError(t, err)
-		assert.Equal(t, 2, v)
-	})
-
-	t.Run("newer database is refused untouched", func(t *testing.T) {
-		db := open(t)
-
-		_, err := applyMigrations(ctx, quietLog(), db, []migration{one, two})
-		require.NoError(t, err)
-
-		v, err := applyMigrations(ctx, quietLog(), db, []migration{one})
-		require.ErrorIs(t, err, ErrSchemaTooNew)
-		assert.Equal(t, 2, v)
-		assert.Equal(t, 2, version(t, db))
-	})
-}
-
-func TestLoadMigrations(t *testing.T) {
-	file := func(sql string) *fstest.MapFile { return &fstest.MapFile{Data: []byte(sql)} }
-
-	tests := []struct {
-		name    string
-		files   fstest.MapFS
-		want    []int
-		wantErr string
-	}{
-		{
-			name: "sorted by version",
-			files: fstest.MapFS{
-				"migrations/0002_b.sql": file("b"),
-				"migrations/0001_a.sql": file("a"),
-				"migrations/0010_c.txt": file("ignored"),
-			},
-			want: []int{1, 2},
-		},
-		{
-			name:    "gap",
-			files:   fstest.MapFS{"migrations/0001_a.sql": file("a"), "migrations/0003_c.sql": file("c")},
-			wantErr: "contiguous",
-		},
-		{
-			name:    "duplicate version",
-			files:   fstest.MapFS{"migrations/0001_a.sql": file("a"), "migrations/1_b.sql": file("b")},
-			wantErr: "contiguous",
-		},
-		{
-			name:    "no separator",
-			files:   fstest.MapFS{"migrations/0001.sql": file("a")},
-			wantErr: "<version>_<name>.sql",
-		},
-		{
-			name:    "bad version",
-			files:   fstest.MapFS{"migrations/abc_a.sql": file("a")},
-			wantErr: "bad version",
-		},
-		{
-			name:    "version zero",
-			files:   fstest.MapFS{"migrations/0000_a.sql": file("a")},
-			wantErr: "bad version",
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got, err := loadMigrations(tt.files)
-			if tt.wantErr != "" {
-				require.ErrorContains(t, err, tt.wantErr)
-
-				return
-			}
-
+			db, err := sql.Open(driverName, "file:"+escapeURIPath(path))
 			require.NoError(t, err)
 
-			versions := make([]int, 0, len(got))
-			for _, m := range got {
-				versions = append(versions, m.version)
-			}
+			defer func() { require.NoError(t, db.Close()) }()
 
-			assert.Equal(t, tt.want, versions)
+			_, err = db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, changed))
+			require.NoError(t, err)
+
+			other := New(quietLog(), path)
+			err = other.Start(ctx)
+			require.ErrorIs(t, err, ErrSchemaVersion)
+			require.ErrorContains(t, err, "delete the database file")
+			require.ErrorContains(t, err, path)
+
+			_, err = other.ListHosts(ctx)
+			require.ErrorIs(t, err, ErrClosed, "a refused database is not left open")
+
+			// The refused start changed nothing.
+			var version, hosts int
+
+			require.NoError(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
+			require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM hosts`).Scan(&hosts))
+			assert.Equal(t, changed, version)
+			assert.Equal(t, 1, hosts)
 		})
 	}
-
-	t.Run("embedded migrations are valid", func(t *testing.T) {
-		got, err := loadMigrations(migrationFiles)
-		require.NoError(t, err)
-		require.NotEmpty(t, got)
-		assert.Equal(t, "0001_init.sql", got[0].name)
-	})
 }
 
 func TestEscapeLike(t *testing.T) {
@@ -666,7 +498,7 @@ func TestConcurrentUse(t *testing.T) {
 
 					for i := range rounds {
 						_, err := s.RecordSync(ctx, &HostSync{
-							Cert:    testCert(host, nil),
+							Cert:    testCert(host),
 							Request: testRequest(imageNeed(fmt.Sprintf("need-%d", i%3))),
 							At:      at(i),
 						})
@@ -682,10 +514,7 @@ func TestConcurrentUse(t *testing.T) {
 							Audit: []fleet.AuditEntry{{Actor: "scheduler", Action: "lease.granted", Target: host}},
 						}))
 						report(s.AppendAudit(ctx, fleet.AuditEntry{Actor: "agent:" + host, Action: "sync"}))
-						report(s.SaveLiveness(ctx, []fleet.Liveness{
-							{Host: host, Epoch: uint64(i), Live: 1, Total: 1},
-						}))
-						report(s.SetHostHold(ctx, host, i%2 == 0, "round"))
+						report(setHold(ctx, s, host, i%2 == 0, "round"))
 					}
 				}()
 			}
@@ -715,8 +544,6 @@ func TestConcurrentUse(t *testing.T) {
 						report(err)
 						_, err = s.SearchPackages(ctx, "pkg-00", 10)
 						report(err)
-						_, err = s.ListLiveness(ctx, 3)
-						report(err)
 
 						got, err := s.GetInventory(ctx, "node-0")
 						if err == nil && len(got.Packages) != len(inv.Packages) {
@@ -738,7 +565,6 @@ func TestConcurrentUse(t *testing.T) {
 			assert.Equal(t, writers*rounds, countRows(t, s, "rollout_hosts"))
 			assert.Equal(t, writers*rounds, countRows(t, s, "leases"))
 			assert.Equal(t, writers*rounds*2, countRows(t, s, "audit"))
-			assert.Equal(t, writers*rounds, countRows(t, s, "validator_liveness"))
 			assert.Equal(t, writers*len(inv.Packages), countRows(t, s, "packages"))
 		})
 	}

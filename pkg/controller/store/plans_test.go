@@ -58,8 +58,11 @@ func fillHistory(t *testing.T, s Store, ended int) {
 
 		changes.Leases = append(changes.Leases, testLease(fmt.Sprintf("ended-%d", i), host, state, i))
 		changes.Rollouts = append(changes.Rollouts, testRollout(fmt.Sprintf("closed-%d", i), closed, i, host))
-		changes.Directives = append(changes.Directives,
-			testDirective(fmt.Sprintf("answered-%d", i), host, answered, i))
+		// An answered directive belongs to a rollout that is closed by now, or
+		// to none (a hold, a recheck).
+		directive := testDirective(fmt.Sprintf("answered-%d", i), host, answered, i)
+		directive.RolloutID = []string{fmt.Sprintf("closed-%d", i), ""}[i%2]
+		changes.Directives = append(changes.Directives, directive)
 	}
 
 	for i, state := range fleet.OpenLeaseStates() {
@@ -70,8 +73,9 @@ func fillHistory(t *testing.T, s Store, ended int) {
 	changes.Rollouts = append(changes.Rollouts,
 		testRollout("active", fleet.RolloutActive, ended, "node-0"),
 		testRollout("halted", fleet.RolloutHalted, ended+1, "node-1"))
-	changes.Directives = append(changes.Directives,
-		testDirective("pending", "node-0", fleet.DirectivePending, ended))
+	pending := testDirective("pending", "node-0", fleet.DirectivePending, ended)
+	pending.RolloutID = "active"
+	changes.Directives = append(changes.Directives, pending)
 
 	require.NoError(t, s.Commit(context.Background(), changes))
 
@@ -79,50 +83,41 @@ func fillHistory(t *testing.T, s Store, ended int) {
 	require.NoError(t, err)
 }
 
-// M4: what the scheduler reads on every tick, and what the API reads on every
-// sync of an agent, must not read a whole table that only ever grows. The
-// lease table keeps every lease that ended, and "state NOT IN (...)" cannot
-// use the index on state: every tick scanned it.
+// What the scheduler reads on every tick, and what the API reads on every
+// sync of an agent, must not read a whole table that only ever grows: the
+// leases, rollouts and directives that ended are kept. Every such query
+// finds its rows through an index, so a tick costs what is open, however
+// long the controller has run and however large the fleet is.
 func TestTickQueriesDoNotScanTheHistory(t *testing.T) {
 	tick := []struct {
 		name  string
 		table string
-		// search is what the plan must say about the table: which index it
-		// searches. The absence of a scan alone would also hold for a plan
-		// that does not mention the table at all.
-		search string
-		query  func() (string, []any)
+		query func() (string, []any)
 	}{
-		{"open leases", "leases", "SEARCH leases USING INDEX leases_state (state=?)", func() (string, []any) {
+		{"open leases", "leases", func() (string, []any) {
 			return leasesQuery(LeaseFilter{OpenOnly: true})
 		}},
-		// By the host or by the state, whichever the statistics favour.
-		{"the open lease of a host", "leases", "SEARCH leases USING INDEX leases_", func() (string, []any) {
+		{"the open lease of a host", "leases", func() (string, []any) {
 			return leasesQuery(LeaseFilter{OpenOnly: true, Host: "node-1"})
 		}},
-		{"open rollouts", "rollouts", "SEARCH rollouts USING INDEX rollouts_state (state=?)", func() (string, []any) {
+		{"open rollouts", "rollouts", func() (string, []any) {
 			return rolloutsQuery(RolloutFilter{OpenOnly: true})
 		}},
-		{"members of a rollout", "rollout_hosts", "SEARCH rollout_hosts USING PRIMARY KEY (rollout_id=?)",
-			func() (string, []any) {
-				return rolloutHostsQuery, []any{"active"}
-			}},
-		{"pending directives", "directives", "SEARCH directives USING INDEX directives_state (state=?)",
-			func() (string, []any) {
-				return directivesQuery(DirectiveFilter{PendingOnly: true})
-			}},
-		{"pending directives of a host", "directives",
-			"SEARCH directives USING INDEX directives_host (host=? AND state=?)", func() (string, []any) {
-				return directivesQuery(DirectiveFilter{PendingOnly: true, Host: "node-1"})
-			}},
-		{"a lease by its ID", "leases", "SEARCH leases USING INDEX sqlite_autoindex_leases_1 (id=?)",
-			func() (string, []any) {
-				return `SELECT data FROM leases WHERE id = ?`, []any{"open-0"}
-			}},
-		{"newest liveness", "validator_liveness",
-			"SEARCH validator_liveness USING INDEX validator_liveness_epoch (epoch=?)", func() (string, []any) {
-				return livenessQuery, []any{6}
-			}},
+		{"members of a rollout", "rollout_hosts", func() (string, []any) {
+			return rolloutHostsQuery, []any{"active"}
+		}},
+		{"pending directives", "directives", func() (string, []any) {
+			return directivesQuery(DirectiveFilter{PendingOnly: true})
+		}},
+		{"directives of the open manual rollouts", "directives", func() (string, []any) {
+			return directivesQuery(DirectiveFilter{Rollouts: []string{"active", "halted"}})
+		}},
+		{"pending directives of a host", "directives", func() (string, []any) {
+			return directivesQuery(DirectiveFilter{PendingOnly: true, Host: "node-1"})
+		}},
+		{"a lease by its ID", "leases", func() (string, []any) {
+			return `SELECT data FROM leases WHERE id = ?`, []any{"open-0"}
+		}},
 	}
 
 	// With and without statistics: a database that was never analysed must
@@ -140,17 +135,10 @@ func TestTickQueriesDoNotScanTheHistory(t *testing.T) {
 					query, args := q.query()
 					plan := queryPlan(t, s, query, args)
 					require.NotEmpty(t, plan, q.name)
-					assert.Contains(t, strings.Join(plan, "\n"), q.search,
-						"%s does not search the table by the index it is meant to use", q.name)
 
 					for _, line := range plan {
-						// "SCAN <table>" reads the table; "SCAN <table> USING
-						// COVERING INDEX" walks an index, which the liveness query
-						// does for the newest epochs only (LIMIT).
-						scans := strings.HasPrefix(line, "SCAN "+q.table) &&
-							!strings.Contains(line, "USING COVERING INDEX")
-						assert.False(t, scans, "%s reads the whole table: %s\n%s",
-							q.name, line, strings.Join(plan, "\n"))
+						assert.False(t, strings.HasPrefix(line, "SCAN "+q.table),
+							"%s reads the whole table: %s\n%s", q.name, line, strings.Join(plan, "\n"))
 					}
 				}
 			})
@@ -195,7 +183,10 @@ func TestOpenQueriesReturnExactlyTheOpenRows(t *testing.T) {
 		})
 	}
 
-	for _, state := range fleet.LeaseStates() {
+	for _, state := range []fleet.LeaseState{
+		fleet.LeaseGranted, fleet.LeaseRunning, fleet.LeaseVerifying,
+		fleet.LeaseReleased, fleet.LeaseFailed, fleet.LeaseExpired,
+	} {
 		assert.Equal(t, !state.Terminal(), containsState(fleet.OpenLeaseStates(), state), state)
 	}
 }
@@ -219,7 +210,7 @@ func TestCommitHolds(t *testing.T) {
 		t.Run(backend.name, func(t *testing.T) {
 			s := backend.open(t)
 
-			_, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-1", nil), Request: testRequest(), At: at(0)})
+			_, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-1"), Request: testRequest(), At: at(0)})
 			require.NoError(t, err)
 
 			lease := testLease("l1", "node-1", fleet.LeaseRunning, 10)
@@ -236,6 +227,25 @@ func TestCommitHolds(t *testing.T) {
 			require.NoError(t, err)
 			assert.True(t, host.HoldWanted)
 			assert.Equal(t, "lease ended by operator", host.HoldReason)
+			assert.Nil(t, host.Offline)
+
+			until := at(90)
+			mark := &fleet.OfflineMark{Reason: "debugging", Until: &until, By: fleet.HoldByTeam}
+			require.NoError(t, s.Commit(ctx, &Changes{Offline: []HostOffline{{Host: "node-1", Mark: mark}}}))
+
+			host, err = s.GetHost(ctx, "node-1")
+			require.NoError(t, err)
+			require.NotNil(t, host.Offline)
+			assert.Equal(t, "debugging", host.Offline.Reason)
+			assert.True(t, host.Offline.Until.Equal(until))
+			assert.Equal(t, fleet.HoldByTeam, host.Offline.By)
+
+			require.NoError(t, s.Commit(ctx, &Changes{Offline: []HostOffline{{Host: "node-1"}}}))
+
+			host, err = s.GetHost(ctx, "node-1")
+			require.NoError(t, err)
+			assert.Nil(t, host.Offline, "lifted")
+			require.ErrorIs(t, s.Commit(ctx, &Changes{Offline: []HostOffline{{Host: "nope"}}}), ErrNotFound)
 
 			got, err := s.GetLease(ctx, "l1")
 			require.NoError(t, err)

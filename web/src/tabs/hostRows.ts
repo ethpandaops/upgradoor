@@ -3,9 +3,9 @@
 
 import {
   list,
-  type Container,
+  type ContainerListing,
   type ContainerKind,
-  type HostSummary,
+  type HostListing,
   type PublicHost,
   type PublicImageRef,
   type QueueEntry,
@@ -18,15 +18,15 @@ export interface HostRow {
   cl?: PublicImageRef;
   updatePending: boolean;
   /** summary is present for logged-in users only. */
-  summary?: HostSummary;
+  summary?: HostListing;
   /** queuePosition is the host's place in the plan queue, if it waits. */
   queuePosition?: number;
 }
 
-function imageOf(containers: readonly Container[], kind: ContainerKind): PublicImageRef | undefined {
+function imageOf(containers: readonly ContainerListing[], kind: ContainerKind): PublicImageRef | undefined {
   const c = containers.find(x => x.managed && x.kind === kind);
   if (!c) return undefined;
-  return { image: c.image, digest: c.digest, revision: c.revision, custom: c.custom };
+  return { image: c.image, digest: c.digest, revision: c.revision };
 }
 
 /**
@@ -35,7 +35,7 @@ function imageOf(containers: readonly Container[], kind: ContainerKind): PublicI
  */
 export function mergeHostRows(
   publicHosts: readonly PublicHost[],
-  summaries: readonly HostSummary[],
+  summaries: readonly HostListing[],
   queue: readonly QueueEntry[]
 ): HostRow[] {
   const rows = new Map<string, HostRow>();
@@ -111,7 +111,6 @@ export function matchesFilter(row: HostRow, filter: string): boolean {
     row.summary ? (hostState(row)?.label ?? 'up to date') : undefined,
     row.summary?.plan.reason,
     row.summary?.hold.local ? 'local hold' : undefined,
-    row.el?.custom || row.cl?.custom ? 'custom' : undefined,
     row.updatePending ? 'pending' : undefined,
   ]
     .filter(Boolean)
@@ -127,16 +126,14 @@ export type SortKey =
   | 'cl'
   | 'pending'
   | 'kernel'
-  | 'os'
   | 'uptime'
-  | 'reboot'
   | 'security'
   | 'attesting'
   | 'lastSeen'
   | 'slot';
 
 /** attestingShare is live / weight, or undefined without validators or data. */
-export function attestingShare(s: HostSummary | undefined): number | undefined {
+export function attestingShare(s: HostListing | undefined): number | undefined {
   if (!s || s.plan.weight === 0 || !s.plan.liveKnown) return undefined;
   return s.plan.live / s.plan.weight;
 }
@@ -154,12 +151,8 @@ function sortValue(row: HostRow, key: SortKey): string | number | undefined {
       return row.updatePending ? 1 : 0;
     case 'kernel':
       return s?.os.runningKernel;
-    case 'os':
-      return s ? `${s.os.id} ${s.os.versionId}` : undefined;
     case 'uptime':
       return s?.uptimeSeconds;
-    case 'reboot':
-      return s ? (s.os.rebootRequired ? 1 : 0) : undefined;
     case 'security':
       return s?.pending.security;
     case 'attesting':
@@ -193,7 +186,7 @@ export function sortHostRows(rows: readonly HostRow[], key: SortKey, direction: 
 }
 
 /** hostOwners lists the teams that own a managed container of the host, sorted. */
-export function hostOwners(summary: Pick<HostSummary, 'containers'>): string[] {
+export function hostOwners(summary: Pick<HostListing, 'containers'>): string[] {
   const owners = new Set<string>();
   for (const c of list(summary.containers)) {
     if (c.managed) for (const owner of list(c.owners)) owners.add(owner);
@@ -201,12 +194,12 @@ export function hostOwners(summary: Pick<HostSummary, 'containers'>): string[] {
   return [...owners].sort();
 }
 
-/** rollableContainers lists the managed, non-custom container names of the given hosts. */
-export function rollableContainers(summaries: readonly HostSummary[]): string[] {
+/** rollableContainers lists the managed container names of the given hosts. */
+export function rollableContainers(summaries: readonly HostListing[]): string[] {
   const names = new Set<string>();
   for (const s of summaries) {
     for (const c of list(s.containers)) {
-      if (c.managed && !c.custom) names.add(c.name);
+      if (c.managed) names.add(c.name);
     }
   }
   return [...names].sort();

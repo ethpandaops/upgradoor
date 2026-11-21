@@ -30,8 +30,8 @@ describe('attentionItems', () => {
       paused: true,
       queue: [
         entry('g', 1, 'gate'),
-        entry('a1', 2, 'approval', ['r1']),
-        entry('a2', 3, 'approval', ['r1']),
+        entry('a1', 2, 'approval', ['r1'], 'r1'),
+        entry('a2', 3, 'approval', ['r1'], 'r1'),
         entry('h1', 4, 'halted', ['r1', 'r2'], 'r2'),
         entry('held', 5, 'held'),
         entry('quiet', 6, 'silent'),
@@ -69,34 +69,27 @@ describe('attentionItems', () => {
     expect(item?.rollout?.id).toBe('B');
   });
 
-  it('says of a rollout that the scheduler paused after its canary that it is so', () => {
+  it('says why a rollout is paused: after its canary, by an abort, or by a person', () => {
     const items = attentionItems({
       gate: gate(true),
       paused: false,
-      queue: [entry('h1', 1, 'rollout-paused', ['A'], 'A'), entry('h2', 2, 'rollout-paused', ['B'], 'B')],
+      queue: [
+        entry('h1', 1, 'rollout-paused', ['A'], 'A'),
+        entry('h2', 2, 'rollout-paused', ['B'], 'B'),
+        entry('h3', 3, 'rollout-paused', ['C'], 'C'),
+      ],
       rollouts: [
         rollout('A', { paused: true, pauseReason: 'paused after the canary; resume to continue' }),
         rollout('B', { paused: true }),
+        rollout('C', { paused: true, pauseReason: 'aborted: wrong digest; resume to continue' }),
       ],
       hosts: [],
     });
 
     expect(items.map(i => [i.kind, i.title, i.rollout?.id])).toEqual([
-      ['rollout-paused', 'Rollout A is paused after its canary', 'A'],
+      ['rollout-paused', 'Rollout A is paused after the canary', 'A'],
       ['rollout-paused', 'Rollout B is paused', 'B'],
+      ['rollout-paused', 'Rollout C is paused (aborted: wrong digest)', 'C'],
     ]);
-  });
-
-  it('offers no rollout when an old controller leaves the choice open', () => {
-    const [item] = attentionItems({
-      gate: gate(true),
-      paused: false,
-      queue: [entry('h', 1, 'approval', ['A', 'B'])],
-      rollouts: [rollout('A'), rollout('B')],
-      hosts: [],
-    });
-
-    expect(item?.title).toBe('A rollout waits for approval');
-    expect(item?.rollout).toBeUndefined();
   });
 });

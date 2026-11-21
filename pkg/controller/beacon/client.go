@@ -1,7 +1,6 @@
 package beacon
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -46,27 +45,21 @@ func (e *statusError) Error() string {
 }
 
 // notServed reports whether the answer means the node does not offer the
-// route at all: unknown route, or liveness tracking switched off (Teku
-// without --beacon-liveness-tracking-enabled says so in the message).
+// route at all.
 func (e *statusError) notServed() bool {
 	switch e.Status {
 	case http.StatusNotFound, http.StatusMethodNotAllowed, http.StatusNotImplemented:
 		return true
-	}
-
-	msg := strings.ToLower(e.Message)
-	if !strings.Contains(msg, "liveness") {
+	default:
 		return false
 	}
-
-	return strings.Contains(msg, "not enabled") || strings.Contains(msg, "disabled")
 }
 
 // rejected reports whether the node understood the route and refused this
 // particular request (for example an epoch it no longer serves). Another
 // endpoint would say the same, so there is no failover.
 func (e *statusError) rejected() bool {
-	return e.Status == http.StatusBadRequest && !e.notServed()
+	return e.Status == http.StatusBadRequest
 }
 
 // endpoint is one beacon API base URL.
@@ -117,19 +110,12 @@ func newNodeClient(log logrus.FieldLogger, client *http.Client, urls []string) (
 	return &nodeClient{log: log, http: client, endpoints: endpoints}, nil
 }
 
-// get performs a GET and decodes the JSON answer into out.
+// get performs a GET and decodes the JSON answer into out. It tries the
+// endpoints in order, starting with the active one, and makes the first that
+// answers the active one.
 func (c *nodeClient) get(ctx context.Context, path string, out any) error {
-	return c.do(ctx, http.MethodGet, path, nil, out)
-}
+	const method = http.MethodGet
 
-// post performs a POST with a JSON body and decodes the answer into out.
-func (c *nodeClient) post(ctx context.Context, path string, body []byte, out any) error {
-	return c.do(ctx, http.MethodPost, path, body, out)
-}
-
-// do tries the endpoints in order, starting with the active one, and makes
-// the first that answers the active one.
-func (c *nodeClient) do(ctx context.Context, method, path string, body []byte, out any) error {
 	var (
 		errs      = make([]error, 0, len(c.endpoints))
 		notServed = 0
@@ -139,7 +125,7 @@ func (c *nodeClient) do(ctx context.Context, method, path string, body []byte, o
 		idx := (c.active + i) % len(c.endpoints)
 		target := c.endpoints[idx]
 
-		err := c.request(ctx, target, method, path, body, out)
+		err := c.request(ctx, target, path, out)
 		if err == nil {
 			if idx != c.active {
 				c.log.WithField("endpoint", target.label).Info("Switched beacon endpoint")
@@ -177,27 +163,16 @@ func (c *nodeClient) do(ctx context.Context, method, path string, body []byte, o
 }
 
 // request performs one request against one endpoint.
-func (c *nodeClient) request(
-	ctx context.Context, target endpoint, method, path string, body []byte, out any,
-) error {
+func (c *nodeClient) request(ctx context.Context, target endpoint, path string, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, requestTimeout)
 	defer cancel()
 
-	var reader io.Reader
-	if body != nil {
-		reader = bytes.NewReader(body)
-	}
-
-	req, err := http.NewRequestWithContext(ctx, method, target.base+path, reader)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target.base+path, http.NoBody)
 	if err != nil {
 		return errors.New("cannot build request")
 	}
 
 	req.Header.Set("Accept", "application/json")
-
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
 
 	resp, err := c.http.Do(req)
 	if err != nil {

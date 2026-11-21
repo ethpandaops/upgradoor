@@ -56,88 +56,16 @@ func (s *Server) handlePublicImages(w http.ResponseWriter, r *http.Request) {
 
 // handlePublicNetwork serves GET /api/v1/public/network.
 func (s *Server) handlePublicNetwork(w http.ResponseWriter, _ *http.Request) {
+	s.writeJSON(w, http.StatusOK, s.publicGate())
+}
+
+// publicGate is the network gate as everybody may see it.
+func (s *Server) publicGate() scheduler.Gate {
 	// gate() hands out a copy, reasons included.
 	gate := s.gate()
 	scrubGate(&gate)
 
-	s.writeJSON(w, http.StatusOK, gate)
-}
-
-// History window of GET /api/v1/public/history, in epochs.
-const (
-	defaultHistoryEpochs = 128
-	maxHistoryEpochs     = 512
-)
-
-// handlePublicHistory serves GET /api/v1/public/history?limit=<epochs>. It
-// sums the per-host liveness rows per epoch: which host attested is not
-// public, how much of the network did is.
-func (s *Server) handlePublicHistory(w http.ResponseWriter, r *http.Request) {
-	ctx := r.Context()
-
-	limit, err := queryLimit(r, defaultHistoryEpochs, maxHistoryEpochs)
-	if err != nil {
-		s.writeBadRequest(w, err)
-
-		return
-	}
-
-	rows, err := s.opts.Store.ListLiveness(ctx, limit)
-	if err != nil {
-		s.internalError(w, r, err)
-
-		return
-	}
-
-	settings, err := s.opts.Scheduler.Settings(ctx)
-	if err != nil {
-		s.internalError(w, r, err)
-
-		return
-	}
-
-	health := s.opts.Beacon.Health()
-
-	s.writeJSON(w, http.StatusOK, PublicHistory{
-		Epochs:                  participation(rows, &health),
-		MinParticipationPercent: settings.MinParticipationPercent,
-		EpochSeconds:            health.EpochDuration().Seconds(),
-	})
-}
-
-// participation sums liveness rows per epoch, oldest epoch first. Each point
-// carries the time its epoch ended, placed by the chain's slot phases; a
-// point whose epoch cannot be placed carries the zero time.
-func participation(rows []fleet.Liveness, health *fleet.NetworkHealth) []ParticipationPoint {
-	byEpoch := make(map[uint64]*ParticipationPoint, 64)
-
-	for i := range rows {
-		row := &rows[i]
-
-		point, ok := byEpoch[row.Epoch]
-		if !ok {
-			point = &ParticipationPoint{Epoch: row.Epoch}
-			byEpoch[row.Epoch] = point
-		}
-
-		point.Live += row.Live
-		point.Total += row.Total
-	}
-
-	out := make([]ParticipationPoint, 0, len(byEpoch))
-
-	for _, point := range byEpoch {
-		// The point stands at the end of its epoch.
-		if end, ok := health.EpochStart(point.Epoch + 1); ok {
-			point.Time = end.UTC()
-		}
-
-		out = append(out, *point)
-	}
-
-	slices.SortFunc(out, func(a, b ParticipationPoint) int { return cmp.Compare(a.Epoch, b.Epoch) })
-
-	return out
+	return gate
 }
 
 // scrubGate removes the beacon service's error text from a gate, both from
@@ -242,7 +170,6 @@ func publicImageRef(c *protocol.Container) *PublicImageRef {
 		Image:    c.Image,
 		Digest:   c.Digest,
 		Revision: c.Revision,
-		Custom:   c.Custom,
 	}
 }
 
@@ -332,7 +259,7 @@ func publicImages(hosts []*fleet.Host) PublicImages {
 // targetDigest picks the digest an image reference points at: the newest
 // successful registry check of any host; failing that the newest check that
 // failed but still holds its last good digest; and when no agent has checked
-// the registry at all (custom images), the digest most hosts run.
+// the registry at all (images built locally), the digest most hosts run.
 func targetDigest(uses []imageUse) (digest, revision string) {
 	for _, withErrors := range []bool{false, true} {
 		var newest time.Time

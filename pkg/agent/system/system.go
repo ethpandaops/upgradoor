@@ -3,9 +3,9 @@
 // things the agent may do to the OS under a lease: upgrade the configured
 // blocked packages and reboot.
 //
-// It runs a closed set of programs (dpkg-query, dpkg, apt-get, apt-cache,
-// uname and "systemctl reboot"), always with argument vectors and never
-// through a shell. It never runs "apt-get update" outside UpgradePackages;
+// It runs a closed set of programs (dpkg-query, dpkg, apt-get and
+// "systemctl reboot"), always with argument vectors and never through a
+// shell. It never runs "apt-get update" outside UpgradePackages;
 // refreshing the package lists is left to the system's apt timers.
 package system
 
@@ -25,7 +25,9 @@ import (
 )
 
 const (
-	defaultInventoryInterval = 15 * time.Minute
+	// inventoryInterval is how long a collected inventory is served before
+	// it is collected again.
+	inventoryInterval = 15 * time.Minute
 	// inventoryTimeout bounds one collection of the inventory.
 	inventoryTimeout = 5 * time.Minute
 	// inventoryRetryInterval is the pause after a failed refresh during
@@ -39,9 +41,6 @@ type Options struct {
 	// in the inventory. Entries that are not plain package names are
 	// dropped with a warning.
 	Blocked []string
-	// InventoryInterval is how long a collected inventory is served before
-	// it is collected again (default 15m).
-	InventoryInterval time.Duration
 	// Root is the filesystem root for the files this package reads
 	// (default "/"). Tests point it at a fake tree.
 	Root string
@@ -52,12 +51,11 @@ type Options struct {
 
 // System implements agent.System on a Debian-like host.
 type System struct {
-	log      logrus.FieldLogger
-	root     string
-	runner   CommandRunner
-	interval time.Duration
-	blocked  map[string]struct{}
-	now      func() time.Time
+	log     logrus.FieldLogger
+	root    string
+	runner  CommandRunner
+	blocked map[string]struct{}
+	now     func() time.Time
 	// listsLockRetry is the pause between attempts of apt-get update while
 	// the package lists are locked.
 	listsLockRetry time.Duration
@@ -93,12 +91,11 @@ func New(log logrus.FieldLogger, opts Options) *System {
 	log = log.WithField("package", "system")
 
 	s := &System{
-		log:      log,
-		root:     opts.Root,
-		runner:   opts.Runner,
-		interval: opts.InventoryInterval,
-		blocked:  make(map[string]struct{}, len(opts.Blocked)),
-		now:      time.Now,
+		log:     log,
+		root:    opts.Root,
+		runner:  opts.Runner,
+		blocked: make(map[string]struct{}, len(opts.Blocked)),
+		now:     time.Now,
 
 		listsLockRetry: aptListsLockRetryInterval,
 	}
@@ -109,10 +106,6 @@ func New(log logrus.FieldLogger, opts Options) *System {
 
 	if s.runner == nil {
 		s.runner = execRunner{}
-	}
-
-	if s.interval <= 0 {
-		s.interval = defaultInventoryInterval
 	}
 
 	for _, name := range opts.Blocked {
@@ -131,46 +124,55 @@ func New(log logrus.FieldLogger, opts Options) *System {
 // Status returns the cheap, frequently read part of the OS state. Package
 // counts, blocked packages and the inventory hash come from the cached
 // inventory, which is collected on the first call and again once it is older
-// than the inventory interval; everything else is read on every call.
+// than inventoryInterval; everything else is read on every call.
 func (s *System) Status(ctx context.Context) (*agent.SystemStatus, error) {
-	bootID, err := s.readBootID()
+	status, err := s.status(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("system status: %w", err)
+	}
+
+	return status, nil
+}
+
+func (s *System) status(ctx context.Context) (*agent.SystemStatus, error) {
+	bootID, err := s.readBootID()
+	if err != nil {
+		return nil, err
 	}
 
 	uptime, err := s.readUptime()
 	if err != nil {
-		return nil, fmt.Errorf("system status: %w", err)
+		return nil, err
 	}
 
 	osInfo, err := s.readOSRelease()
 	if err != nil {
-		return nil, fmt.Errorf("system status: %w", err)
+		return nil, err
 	}
 
 	arch, err := s.architecture(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("system status: %w", err)
+		return nil, err
 	}
 
-	running, err := s.runningKernel(ctx)
+	running, err := s.runningKernel()
 	if err != nil {
-		return nil, fmt.Errorf("system status: %w", err)
+		return nil, err
 	}
 
 	rebootRequired, rebootPackages, err := s.readRebootRequired()
 	if err != nil {
-		return nil, fmt.Errorf("system status: %w", err)
+		return nil, err
 	}
 
 	snap, err := s.current(ctx)
 	if err != nil {
-		return nil, fmt.Errorf("system status: %w", err)
+		return nil, err
 	}
 
 	bootKernels, err := s.bootKernelReleases()
 	if err != nil {
-		return nil, fmt.Errorf("system status: %w", err)
+		return nil, err
 	}
 
 	installed := sortKernelReleases(bootKernels, snap.kernelPackages)
@@ -293,7 +295,7 @@ func (s *System) refreshLocked(ctx context.Context) (*snapshot, error) {
 	defer s.mu.Unlock()
 
 	if err != nil {
-		s.nextRefresh = s.now().Add(min(s.interval, inventoryRetryInterval))
+		s.nextRefresh = s.now().Add(inventoryRetryInterval)
 
 		return nil, err
 	}
@@ -309,7 +311,7 @@ func (s *System) refreshLocked(ctx context.Context) (*snapshot, error) {
 	}
 
 	s.snap = snap
-	s.nextRefresh = s.now().Add(s.interval)
+	s.nextRefresh = s.now().Add(inventoryInterval)
 
 	return snap, nil
 }
@@ -331,7 +333,7 @@ func (s *System) collect(ctx context.Context) (*snapshot, error) {
 		return nil, err
 	}
 
-	running, err := s.runningKernel(ctx)
+	running, err := s.runningKernel()
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +343,7 @@ func (s *System) collect(ctx context.Context) (*snapshot, error) {
 		return nil, err
 	}
 
-	upgradable, err := s.collectUpgradable(ctx, installed)
+	upgradable, err := s.collectUpgradable(ctx)
 	if err != nil {
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return nil, fmt.Errorf("collect inventory: %w", ctxErr)
@@ -368,12 +370,8 @@ func (s *System) collect(ctx context.Context) (*snapshot, error) {
 			Newest:    newestKernel(kernels, running),
 			Installed: kernels,
 		},
-		Packages:   make([]protocol.Package, 0, len(installed)),
+		Packages:   installed,
 		Upgradable: make([]protocol.Upgradable, 0, len(upgradable)),
-	}
-
-	for i := range installed {
-		inv.Packages = append(inv.Packages, installed[i].Package)
 	}
 
 	for i := range upgradable {

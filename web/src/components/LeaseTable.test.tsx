@@ -3,8 +3,6 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Lease, LeaseState, StepStatus } from '../api/types';
-import { describeCall } from '../lib/actionRequests';
-import { endLeaseIntent } from '../lib/intents';
 import { createHarness, renderWithApp } from '../test/harness';
 import { LeaseTable } from './LeaseTable';
 
@@ -46,14 +44,14 @@ describe('LeaseTable', () => {
     );
 
     for (const host of ['host-granted', 'host-running', 'host-verifying']) {
-      expect(within(row(host)).getByRole('button', { name: 'End…' })).toBeEnabled();
+      expect(within(row(host)).getByRole('button', { name: /^End the lease of/ })).toBeEnabled();
       expect(within(row(host)).queryByText(/ending/)).toBeNull();
     }
 
     expect(within(row('host-ending')).getByText('ending (cancelled by alice@example.org)')).toBeInTheDocument();
-    expect(within(row('host-ending')).getByRole('button', { name: 'End…' })).toBeDisabled();
+    expect(within(row('host-ending')).getByRole('button', { name: /^End the lease of/ })).toBeDisabled();
 
-    await userEvent.setup().click(within(row('host-granted')).getByRole('button', { name: 'End…' }));
+    await userEvent.setup().click(within(row('host-granted')).getByRole('button', { name: /^End the lease of/ }));
     expect(onEnd).toHaveBeenCalledTimes(1);
     expect(onEnd.mock.calls[0]?.[0].host).toBe('host-granted');
   });
@@ -116,24 +114,5 @@ describe('LeaseTable, the comparison with the fleet', () => {
     expect(within(checks).getByText(/EL 28 peers/)).not.toHaveClass('text-danger');
 
     expect(within(row('host-plain')).queryByLabelText('Peers compared with the fleet')).toBeNull();
-  });
-});
-
-describe('endLeaseIntent', () => {
-  it('describes the end of a lease as a request, without a broken host', () => {
-    const intent = endLeaseIntent('ls-1', 'host-a');
-    if (intent.kind !== 'call') throw new Error('not a call intent');
-    expect(intent.title).toBe('End the lease of host-a');
-
-    const call = intent.make('why');
-    expect(call).toStrictEqual({ action: 'end-lease', body: { lease: 'ls-1', reason: 'why' } });
-
-    const text = describeCall(call).join(' ');
-    expect(text).toContain('completes the step in progress');
-    expect(text).toContain('The host is put on hold');
-    expect(text).toContain('stays open');
-    expect(text).toContain('Unhold the host when the lease has ended and it is in order');
-    expect(text).toContain('unhold is refused');
-    expect(text).not.toMatch(/broken|as failed \(/);
   });
 });

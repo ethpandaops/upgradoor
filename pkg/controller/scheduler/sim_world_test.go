@@ -42,6 +42,9 @@ type simContainer struct {
 	image   string
 	managed bool
 	custom  bool
+	// impact is the class of a managed container. Only work on node
+	// containers takes the node down.
+	impact protocol.Impact
 	// running is the running digest, seen what the agent's last registry
 	// poll saw.
 	running   string
@@ -59,11 +62,10 @@ type simManual struct {
 // simAgent is one simulated host with its agent. It speaks the protocol the
 // way pkg/protocol describes it.
 type simAgent struct {
-	name     string
-	val      *identity.ValidatorRange
-	weight   uint64
-	bootnode bool
-	probes   bool
+	name   string
+	val    *identity.ValidatorRange
+	weight uint64
+	probes bool
 	// peerMax is how many peers the host's clients have once they found them
 	// all again. It follows from the host's number, so that no seed draws a
 	// different history for it.
@@ -130,16 +132,6 @@ type simAgent struct {
 	// stepFail is the index of the step of the running operation that fails
 	// while the others succeed; -1 for none.
 	stepFail int
-	// oldBuild: the agent is of a build that knows neither the cancel mark of
-	// a lease nor that a lease it is no longer offered must not be started. It
-	// starts what it holds and finishes what it started.
-	oldBuild bool
-	// prevBuild: the agent knows the cancel mark, but is of the build that
-	// reported the steps it never began as cancelled also when the operation
-	// failed. Agents of the current build report them as after any failure
-	// (pending, not attempted) then. Which agents these are follows from the
-	// host's number, so that no seed draws a different history for it.
-	prevBuild bool
 	// beginAt is, per step of the running operation, when the step begins;
 	// the zero time for a step that is not executed. The steps of an operation
 	// begin one after the other.
@@ -156,10 +148,6 @@ type simAgent struct {
 	peerCap        int
 	elLag          time.Duration
 
-	// World truth per lease ID, for the oracle: whether the agent stopped
-	// anything, and when it finished successfully.
-	disrupted map[string]bool
-	doneAt    map[string]time.Time
 	// late names the leases the agent started with a slow clock: possibly
 	// after the controller had expired them.
 	late map[string]bool
@@ -215,11 +203,7 @@ type simWorld struct {
 	pkgVersion int
 
 	// calm switches the random failures off (convergence).
-	calm bool
-	// livenessUnsupported: the beacon node does not serve the liveness
-	// endpoint, for the whole run. Nothing is ever published.
-	livenessUnsupported bool
-
+	calm               bool
 	beaconDownUntil    time.Time
 	finalityStallUntil time.Time
 	finalityStallSince time.Time
@@ -234,10 +218,6 @@ type simWorld struct {
 	// phases are the chain's slot durations: the first from genesis on, one
 	// more for every fork that changes the duration.
 	phases []simPhase
-	// bogus is a slot phase that the beacon node announces for an epoch far
-	// beyond the run and that is out of bounds, or nil. The chain itself knows
-	// nothing of it: every epoch of the run is placed as without it.
-	bogus *fleet.SlotPhase
 
 	// epoch is the epoch of now; epochMin the fewest validators each host
 	// attested with at any moment of it.
@@ -249,6 +229,29 @@ type simWorld struct {
 	publishedEpoch uint64
 	havePublished  bool
 	dropped        map[string]bool
+}
+
+// simImpacts are the classes a managed container is drawn from: mostly the
+// node's own containers.
+var simImpacts = []protocol.Impact{
+	protocol.ImpactNode, protocol.ImpactNode, protocol.ImpactNode, protocol.ImpactSlot, protocol.ImpactIndependent,
+}
+
+// simLeaseImpact is the world's own class of the work of a lease: node when
+// any need is about the node or a node container.
+func simLeaseImpact(a *simAgent, needs []protocol.Need) protocol.Impact {
+	impact := protocol.ImpactIndependent
+
+	for i := range needs {
+		c := a.container(needs[i].Container())
+		if c == nil || !c.managed {
+			return protocol.ImpactNode
+		}
+
+		impact = impact.Heavier(c.impact)
+	}
+
+	return impact
 }
 
 func simDigest(n int) string { return fmt.Sprintf("sha256:%064x", n) }
@@ -287,26 +290,20 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 		hosts = 3 + rng.IntN(28)
 	}
 
-	bootnodes := rng.IntN(3)
 	next := uint64(0)
 
 	for i := range hosts {
 		a := &simAgent{
 			name:         fmt.Sprintf("host-%02d", i),
-			bootnode:     i < bootnodes,
 			probes:       rng.IntN(10) < 7,
 			peerMax:      simPeers + i%simPeerSpread,
 			verbs:        slices.Clone(allVerbs),
 			pkgInstalled: 1,
 			pkgSeen:      1,
 			handled:      make(map[string]protocol.DirectiveAck, 8),
-			disrupted:    make(map[string]bool, 8),
 			late:         make(map[string]bool, 2),
-			doneAt:       make(map[string]time.Time, 8),
 			reported:     make(map[string]*protocol.Operation, 8),
 			cancelSeen:   make(map[string]time.Time, 2),
-			oldBuild:     rng.IntN(4) == 0,
-			prevBuild:    i%3 == 1,
 			localHold:    rng.IntN(25) == 0,
 			dead:         rng.IntN(20) == 0,
 			sloppy:       rng.IntN(5) == 0,
@@ -318,12 +315,7 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 			a.verbs = slices.DeleteFunc(a.verbs, func(protocol.Verb) bool { return rng.IntN(2) == 0 })
 		}
 
-		hasValidators := rng.IntN(10) < 7
-		if a.bootnode {
-			hasValidators = rng.IntN(4) == 0
-		}
-
-		if hasValidators {
+		if rng.IntN(10) < 7 {
 			a.weight = uint64(1 + rng.IntN(60))
 			if rng.IntN(8) == 0 {
 				a.weight = uint64(100 + rng.IntN(400))
@@ -336,10 +328,13 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 		for c := range 1 + rng.IntN(3) {
 			image := w.images[rng.IntN(len(w.images))]
 			a.containers = append(a.containers, &simContainer{
-				name:      fmt.Sprintf("c%d", c),
-				image:     image,
-				managed:   true,
-				custom:    rng.IntN(12) == 0,
+				name:    fmt.Sprintf("c%d", c),
+				image:   image,
+				managed: true,
+				custom:  rng.IntN(12) == 0,
+				// From the host and the container, not from the random
+				// stream, so that the seeds keep their histories.
+				impact:    simImpacts[(i+2*c)%len(simImpacts)],
 				running:   w.registry[image],
 				seen:      w.registry[image],
 				checkedAt: w.now,
@@ -359,31 +354,6 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 	}
 
 	return w
-}
-
-// simPeersStarved is how many peers the clients of a starved host find: as
-// many as a node is ever required to have (minPeers is 5 at most), and fewer
-// than half of what any other host finds.
-const simPeersStarved = 5
-
-// starve makes one of the hosts that probe their node find no more than
-// simPeersStarved peers, the n-th of them, and reports whether there is one.
-func (w *simWorld) starve(n int) bool {
-	probed := make([]*simAgent, 0, len(w.agents))
-
-	for _, a := range w.agents {
-		if a.probes {
-			probed = append(probed, a)
-		}
-	}
-
-	if len(probed) == 0 {
-		return false
-	}
-
-	probed[n%len(probed)].peerMax = simPeersStarved
-
-	return true
 }
 
 func (w *simWorld) newDigest(kind int) string {
@@ -457,8 +427,8 @@ func (w *simWorld) describe() string {
 	var b strings.Builder
 
 	for _, a := range w.agents {
-		fmt.Fprintf(&b, "  %s weight=%d bootnode=%v probes=%v peers=%d verbs=%v localHold=%v dead=%v sloppy=%v blind=%v oldBuild=%v prevBuild=%v:",
-			a.name, a.weight, a.bootnode, a.probes, a.peerMax, a.verbs, a.localHold, a.dead, a.sloppy, a.blind, a.oldBuild, a.prevBuild)
+		fmt.Fprintf(&b, "  %s weight=%d probes=%v peers=%d verbs=%v localHold=%v dead=%v sloppy=%v blind=%v:",
+			a.name, a.weight, a.probes, a.peerMax, a.verbs, a.localHold, a.dead, a.sloppy, a.blind)
 
 		for _, c := range a.containers {
 			fmt.Fprintf(&b, " %s=%s(managed=%v custom=%v)", c.name, c.image, c.managed, c.custom)
@@ -536,7 +506,7 @@ func (w *simWorld) synced(a *simAgent) bool {
 	}
 
 	for _, c := range a.containers {
-		if c.managed && !c.custom && w.digestKind[c.running] != digestGood {
+		if c.managed && !c.custom && c.impact == protocol.ImpactNode && w.digestKind[c.running] != digestGood {
 			return false
 		}
 	}
@@ -631,9 +601,6 @@ func (w *simWorld) sample() {
 // service cannot get them.
 func (w *simWorld) publish(epoch uint64, st *fakeStore) {
 	end := w.epochStart(epoch + 1)
-	if w.livenessUnsupported {
-		return
-	}
 
 	if end.Before(w.beaconDownUntil) || end.Before(w.livenessStallUntil) || end.Before(w.livenessUnknownUntil) {
 		return
@@ -724,10 +691,6 @@ func (w *simWorld) health() fleet.NetworkHealth {
 		phases = append(phases, fleet.SlotPhase{Epoch: p.epoch, Start: p.start, SlotMs: uint64(p.slot / time.Millisecond)})
 	}
 
-	if w.bogus != nil {
-		phases = append(phases, *w.bogus)
-	}
-
 	n := fleet.NetworkHealth{
 		UpdatedAt:         w.healthAt,
 		GenesisTime:       testGenesis,
@@ -740,8 +703,6 @@ func (w *simWorld) health() fleet.NetworkHealth {
 		FinalityLagEpochs: lag,
 		LivenessKnown:     w.havePublished && !w.now.Before(w.livenessUnknownUntil),
 		LivenessEpoch:     w.publishedEpoch,
-
-		LivenessUnsupported: w.livenessUnsupported,
 	}
 
 	if w.now.Before(w.beaconDownUntil) {
@@ -846,10 +807,13 @@ func (w *simWorld) stepFor(a *simAgent, n *protocol.Need) protocol.StepStatus {
 		if a.pkgInstalled >= w.pkgVersion || protocol.PackagesNeedID(want) != n.ID {
 			return protocol.StepSuperseded
 		}
-	case protocol.NeedReboot:
+	case protocol.NeedReboot, protocol.NeedOverride:
 		if n.DirectiveID == "" && !a.rebootRequired {
 			return protocol.StepSuperseded
 		}
+	case protocol.NeedSpec:
+		// The simulated agents have no agent.yaml that changes.
+		return protocol.StepRefused
 	}
 
 	if n.DirectiveID != "" && !slices.ContainsFunc(a.manual, func(m simManual) bool {
@@ -905,8 +869,8 @@ func (w *simWorld) startOperation(a *simAgent) {
 		op.Phase = protocol.PhaseDraining
 	}
 
-	a.down = true
-	a.disrupted[op.LeaseID] = true
+	// Work on slot and independent containers leaves the node up.
+	a.down = simLeaseImpact(a, a.lease.Needs) == protocol.ImpactNode
 
 	if a.overrun {
 		a.late[op.LeaseID] = true
@@ -996,8 +960,11 @@ func (w *simWorld) cancel(a *simAgent) {
 func (w *simWorld) finishOperation(a *simAgent) {
 	op := a.op
 	op.UpdatedAt = w.now
-	a.down = false
-	w.comeBack(a)
+
+	if a.down {
+		a.down = false
+		w.comeBack(a)
+	}
 
 	// A step that had not begun when the agent took in the cancel never
 	// began. How it is reported is settled when the operation's end is known.
@@ -1054,6 +1021,9 @@ func (w *simWorld) finishOperation(a *simAgent) {
 			a.pkgInstalled = w.pkgVersion
 			a.pkgSeen = w.pkgVersion
 			a.rebootRequired = a.rebootRequired || w.rng.IntN(4) == 0
+		case protocol.NeedOverride, protocol.NeedSpec:
+			// The simulated agents have no overrides file and no agent.yaml
+			// that changes.
 		case protocol.NeedReboot:
 			rebooted = true
 			a.boot++
@@ -1071,17 +1041,12 @@ func (w *simWorld) finishOperation(a *simAgent) {
 	if rebooted {
 		a.rebootRequired = a.rebootSticks
 	}
-
-	if op.Phase == protocol.PhaseDone {
-		a.doneAt[op.LeaseID] = w.now
-	}
 }
 
 // reportUnbegun gives the steps that never began (the agent had taken in the
-// cancel of its lease) their final status, as the agent's build reports it:
-// cancelled when the cancel is what ended the operation; after a failure, as
-// after any failure (pending, not attempted). The build before that one said
-// cancelled in both cases.
+// cancel of its lease) their final status: cancelled when the cancel is what
+// ended the operation; after a failure, as after any failure (pending, not
+// attempted).
 func (w *simWorld) reportUnbegun(a *simAgent, op *protocol.Operation) {
 	failed := op.Phase == protocol.PhaseFailed
 
@@ -1091,7 +1056,7 @@ func (w *simWorld) reportUnbegun(a *simAgent, op *protocol.Operation) {
 			continue
 		}
 
-		if failed && !a.prevBuild {
+		if failed {
 			step.Error = "not attempted: " + op.Error
 
 			continue
@@ -1203,10 +1168,10 @@ func (w *simWorld) request(a *simAgent) *protocol.SyncRequest {
 
 		if c.managed {
 			pc.ConfiguredImage = c.image
+			pc.Impact = c.impact
 		}
 
 		if c.custom {
-			pc.Custom = true
 			pc.Image = "debug/" + c.image
 			pc.Digest = ""
 		}
@@ -1245,8 +1210,6 @@ func (w *simWorld) respond(a *simAgent, resp *Assignment) {
 	switch {
 	case resp.Lease == nil && busy:
 		// Once started, the agent finishes.
-	case resp.Lease == nil && a.lease != nil && a.op == nil && a.oldBuild:
-		// An old build keeps the lease it holds and starts it in its time.
 	case resp.Lease == nil && a.lease != nil && a.op == nil:
 		// The controller no longer offers the lease and nothing was done for
 		// it: it is not started any more, and the agent says so.
@@ -1258,11 +1221,11 @@ func (w *simWorld) respond(a *simAgent, resp *Assignment) {
 		a.lease = nil
 		a.cancelled = false
 	case a.lease != nil && a.lease.ID == resp.Lease.ID:
-		if resp.Lease.Cancel && !a.oldBuild {
+		if resp.Lease.Cancel {
 			w.cancel(a)
 		}
 	case busy:
-	case resp.Lease.Cancel && !a.oldBuild:
+	case resp.Lease.Cancel:
 		// A lease that is offered cancelled is not taken.
 	default:
 		l := *resp.Lease
@@ -1331,6 +1294,8 @@ func (w *simWorld) apply(a *simAgent, d protocol.Directive) protocol.DirectiveAc
 		a.ctrlHold = false
 	case protocol.DirectiveRecheck:
 		w.poll(a)
+	case protocol.DirectiveOverride:
+		return reject("the simulated agents have no overrides file")
 	case protocol.DirectiveRoll:
 		c := a.container(d.Container)
 

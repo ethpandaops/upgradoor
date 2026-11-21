@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"net/http"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -26,9 +25,6 @@ type Deps struct {
 	Prober Prober
 	// Now is the clock (default time.Now).
 	Now func() time.Time
-	// HTTPClient talks to the controller (default: a client with a 30s
-	// timeout).
-	HTTPClient *http.Client
 	// Version is the agent version reported to the controller (default
 	// "dev").
 	Version string
@@ -43,9 +39,25 @@ type service struct {
 	now     func() time.Time
 	version string
 
+	// host and network are the names of the certificate.
+	host    string
+	network string
+
 	client  *controllerClient
 	holds   *holds
 	watcher *imageWatcher
+	// audit is the host's audit log.
+	audit *auditLog
+	// overridesFile is the host's overrides file; overrideMu serializes its
+	// readers and writers (the loop, the local socket). seenOverrides and
+	// overridesErr are what the loop last saw of it.
+	overridesFile *overridesFile
+	overrideMu    sync.Mutex
+	seenOverrides map[string]Override
+	overridesErr  string
+	// local is the local socket; localState what it serves.
+	local      *localServer
+	localState localState
 	// store is opened by Start.
 	store *stateStore
 
@@ -53,6 +65,10 @@ type service struct {
 	started bool
 	cancel  context.CancelFunc
 	wg      sync.WaitGroup
+
+	// asked is the interval the controller's last answer asked for; zero
+	// after a failed sync. Only the loop touches it.
+	asked time.Duration
 
 	// kick asks the loop for a sync now (an operation changed phase).
 	kick chan struct{}
@@ -73,6 +89,11 @@ type service struct {
 	lastQueue    protocol.Queue
 	ignoredLease string
 	syncFailing  bool
+	// answerRefused is true while the controller's answers fail
+	// verification; it keeps that to one log line per episode.
+	answerRefused bool
+	// lastValidators is the validator range last reported, to log changes.
+	lastValidators *protocol.Validators
 }
 
 var _ Service = (*service)(nil)
@@ -100,7 +121,8 @@ func New(
 	}
 
 	if cfg.StateDir == "" || cfg.Controller.SyncInterval <= 0 ||
-		cfg.Controller.LeaseSyncInterval <= 0 || cfg.Registry.PollInterval <= 0 ||
+		cfg.Controller.LeaseSyncInterval <= 0 || cfg.Controller.MinSyncInterval <= 0 ||
+		cfg.Controller.MaxSyncInterval < cfg.Controller.MinSyncInterval || cfg.Registry.PollInterval <= 0 ||
 		cfg.Verify.Window <= 0 || cfg.Verify.Timeout <= 0 {
 		return nil, errors.New("agent: configuration without defaults (call ApplyDefaults)")
 	}
@@ -115,18 +137,30 @@ func New(
 
 	log = log.WithField("package", "agent")
 
-	if claims, err := identity.UnverifiedClaims(creds.Certificate()); err == nil {
-		log = log.WithFields(logrus.Fields{"host": claims.Subject, "network": claims.Network})
+	claims, err := identity.UnverifiedClaims(creds.Certificate())
+	if err != nil {
+		return nil, fmt.Errorf("agent: host certificate: %w", err)
+	}
+
+	log = log.WithFields(logrus.Fields{"host": claims.Subject, "network": claims.Network})
+
+	answers, err := newAnswerVerifier(log, cfg, claims)
+	if err != nil {
+		return nil, err
 	}
 
 	return &service{
-		log:     log,
-		cfg:     cfg,
-		deps:    deps,
-		now:     deps.Now,
-		version: deps.Version,
-		client:  newControllerClient(cfg.Controller.URL, creds, deps.HTTPClient, deps.Now),
-		holds:   newHolds(cfg),
+		log:           log,
+		cfg:           cfg,
+		deps:          deps,
+		now:           deps.Now,
+		version:       deps.Version,
+		host:          claims.Subject,
+		network:       claims.Network,
+		client:        newControllerClient(cfg.Controller.URL, creds, answers, deps.Now),
+		holds:         newHolds(cfg),
+		audit:         newAuditLog(log, cfg, deps.Now),
+		overridesFile: &overridesFile{path: cfg.OverridesFile},
 		// Without the roll verb the tags are still looked up, for the report,
 		// but nothing is pulled: this host never rolls, and a pulled image
 		// would be picked up by whoever recreates the container next.
@@ -137,6 +171,42 @@ func New(
 		inventoryTimeout: inventoryTimeout,
 		pendingRolls:     make(map[string]pendingRoll, 4),
 	}, nil
+}
+
+// newAnswerVerifier builds the check of the controller's answers from the
+// configured controller keys, for the host and network of the certificate.
+// Without keys (controller.allowUnsignedAnswers) there is none, and it says
+// so loudly.
+func newAnswerVerifier(
+	log logrus.FieldLogger, cfg *Config, claims *identity.Claims,
+) (*identity.AnswerVerifier, error) {
+	keys, err := cfg.Controller.ControllerKeys()
+	if err != nil {
+		return nil, fmt.Errorf("agent: configuration: %w", err)
+	}
+
+	if len(keys) == 0 {
+		log.Warn("INSECURE: controller.allowUnsignedAnswers is set and no controller " +
+			"public key is configured. The controller's answers are NOT verified: this " +
+			"host acts on whatever answers under controller.url. Development only.")
+
+		return nil, nil //nolint:nilnil // no verifier and no error is the opt-out
+	}
+
+	answers, err := identity.NewAnswerVerifier(keys, claims.Network, claims.Subject)
+	if err != nil {
+		return nil, fmt.Errorf("agent: controller keys: %w", err)
+	}
+
+	prints := make([]string, 0, len(keys))
+	for _, key := range keys {
+		prints = append(prints, identity.KeyFingerprint(key))
+	}
+
+	log.WithField("controller_keys_sha256", prints).
+		Info("acting only on answers signed by one of the configured controller keys")
+
+	return answers, nil
 }
 
 // Start opens the state file and starts the sync loop and the image
@@ -168,6 +238,8 @@ func (s *service) Start(ctx context.Context) error {
 		"containers": len(s.cfg.Containers),
 		"version":    s.version,
 	}).Info("agent started")
+
+	s.startLocal(runCtx)
 
 	s.wg.Go(func() { s.watcher.run(runCtx) })
 	s.wg.Go(func() { s.loop(runCtx) })
@@ -210,9 +282,11 @@ func (s *service) Stop() error {
 	return nil
 }
 
-// loop syncs until ctx ends: every SyncInterval when idle, every
-// LeaseSyncInterval while a lease is open, and at once when the operation
-// changes phase or a response brought something to answer.
+// loop syncs until ctx ends: when the controller's last answer asked, kept
+// within MinSyncInterval and MaxSyncInterval; without such an answer every
+// SyncInterval when idle and every LeaseSyncInterval while a lease is open;
+// and at once when the operation changes phase or a response brought
+// something to answer.
 func (s *service) loop(ctx context.Context) {
 	for ctx.Err() == nil {
 		s.ensureOperation(ctx)
@@ -238,7 +312,11 @@ func (s *service) loop(ctx context.Context) {
 
 // interval is the time to the next regular sync.
 func (s *service) interval() time.Duration {
-	if s.store.Snapshot().Current != nil || len(s.pendingRolls) > 0 {
+	if s.asked > 0 {
+		return min(max(s.asked, s.cfg.Controller.MinSyncInterval), s.cfg.Controller.MaxSyncInterval)
+	}
+
+	if s.store.Snapshot().Current != nil || len(s.pendingRolls) > 0 || s.localRollsOpen() {
 		return s.cfg.Controller.LeaseSyncInterval
 	}
 
@@ -253,6 +331,7 @@ func (s *service) cycle(ctx context.Context) bool {
 		return false
 	}
 
+	s.takeLocalRolls(obs)
 	s.resolvePendingRolls(obs)
 	s.reconcileManual(obs)
 
@@ -261,18 +340,35 @@ func (s *service) cycle(ctx context.Context) bool {
 
 	resp, err := s.client.Sync(ctx, req)
 	if err != nil {
+		s.asked = 0
+		s.followLocalRolls(&st, nil)
+		s.publishLocal(obs, req, &st)
+
 		if ctx.Err() != nil {
 			return false
 		}
 
+		// An answer that is not the controller's is no answer: nothing of
+		// it is acted on, and for everything else it is a controller that
+		// cannot be reached. It is said once per episode, and louder than an
+		// outage, because it is either a misconfigured key or somebody else
+		// answering under the controller's name.
+		refused := errors.Is(err, identity.ErrBadAnswer)
+
 		// The controller being away is normal; the next tick tries again.
-		if !s.syncFailing {
+		switch {
+		case refused && !s.answerRefused:
+			s.log.WithError(err).Error("refused the controller's answer: it does not carry " +
+				"a valid signature of a configured controller key. Acting on nothing of " +
+				"it; retrying on every tick")
+		case !refused && !s.syncFailing:
 			s.log.WithError(err).Warn("sync failed; retrying on every tick")
-		} else {
+		default:
 			s.log.WithError(err).Debug("sync failed")
 		}
 
 		s.syncFailing = true
+		s.answerRefused = refused
 
 		return false
 	}
@@ -281,9 +377,14 @@ func (s *service) cycle(ctx context.Context) bool {
 		s.log.Info("sync works again")
 
 		s.syncFailing = false
+		s.answerRefused = false
 	}
 
+	s.asked = time.Duration(resp.NextSyncMillis) * time.Millisecond
+
 	s.logQueue(resp.Queue)
+	s.followLocalRolls(&st, resp)
+	s.publishLocal(obs, req, &st)
 
 	soon := s.handleDirectives(resp.Directives, obs)
 
@@ -301,6 +402,8 @@ func (s *service) cycle(ctx context.Context) bool {
 // observe looks at the host. A part that cannot be read is logged and the
 // last good value is reported instead.
 func (s *service) observe(ctx context.Context) *observation {
+	s.cfg.Reload(s.log)
+
 	obs := &observation{hold: s.holds.Read()}
 
 	cctx, cancel := context.WithTimeout(ctx, observeTimeout)
@@ -317,8 +420,10 @@ func (s *service) observe(ctx context.Context) *observation {
 		s.lastContainers = slices.Clone(containers)
 	}
 
-	tags := enrichContainers(s.cfg, containers, s.watcher.Check)
+	tags, targets := enrichContainers(s.cfg, containers, s.refreshOverrides(), s.watcher.Check)
 	obs.containers = containers
+	obs.targets = targets
+	obs.check = s.watcher.Check
 
 	if obs.containersFresh {
 		s.watcher.Track(tags)
@@ -397,10 +502,11 @@ func (s *service) buildRequest(obs *observation, st *persistedState) *protocol.S
 		SentAt:          s.now().UTC(),
 		Verbs:           append([]protocol.Verb{}, s.cfg.Verbs...),
 		Hold:            obs.hold,
-		Containers:      append([]protocol.Container{}, obs.containers...),
+		Containers:      withMissing(s.cfg, obs.containers),
 		Node:            obs.node,
 		Needs:           computeNeeds(s.cfg, obs, st.ManualNeeds),
 		DirectiveAcks:   s.directiveAcks(st),
+		Validators:      s.validators(),
 	}
 
 	if sys := obs.sys; sys != nil {
@@ -418,6 +524,33 @@ func (s *service) buildRequest(obs *observation, st *persistedState) *protocol.S
 	}
 
 	return req
+}
+
+// validators reads the host's validator range for a sync and logs it when it
+// differs from the one reported last.
+func (s *service) validators() *protocol.Validators {
+	v := s.cfg.Validators.report()
+
+	switch {
+	case v == nil && s.lastValidators == nil:
+	case v != nil && s.lastValidators != nil && *v == *s.lastValidators:
+	case v == nil:
+		s.log.Info("no validator range configured any more; reporting no validators")
+	case v.State == protocol.ValidatorsInvalid:
+		s.log.WithFields(logrus.Fields{"source": v.Source, "error": v.Error}).
+			Error("cannot read the validator range; reporting it as unknown, not as none")
+	case v.State == protocol.ValidatorsMissing:
+		s.log.WithField("marker", s.cfg.Validators.MarkerFile).
+			Warn("the validator key range marker is missing (keys being reshuffled?); " +
+				"reporting the range as unknown, not as none")
+	default:
+		s.log.WithFields(logrus.Fields{"source": v.Source, "start": v.Start, "end": v.End}).
+			Info("validator range")
+	}
+
+	s.lastValidators = v
+
+	return v
 }
 
 // handleLease reacts to the lease of a sync response (or its absence).
@@ -562,11 +695,9 @@ func (s *service) acceptLease(ctx context.Context, lease *protocol.Lease) bool {
 		return false
 	}
 
-	now := s.now()
 	rec := &operationRecord{
-		Lease:      *lease,
-		ReceivedAt: now,
-		Deadline:   leaseDeadline(lease, now),
+		Lease:    *lease,
+		Deadline: leaseDeadline(lease, s.now()),
 		Operation: protocol.Operation{
 			LeaseID: lease.ID,
 			Steps:   make([]protocol.Step, 0, len(lease.Needs)),
@@ -623,17 +754,17 @@ func (s *service) ensureOperation(ctx context.Context) {
 	}
 
 	op := &operation{
-		log:         s.log.WithField("component", "operation"),
-		cfg:         s.cfg,
-		runtime:     s.deps.Runtime,
-		registry:    s.deps.Registry,
-		system:      s.deps.System,
-		holds:       s.holds,
-		store:       s.store,
-		now:         s.now,
-		poll:        s.pollInterval(),
-		rebootGrace: defaultRebootGrace,
-		notify:      s.requestSync,
+		log:      s.log.WithField("component", "operation"),
+		cfg:      s.cfg,
+		runtime:  s.deps.Runtime,
+		registry: s.deps.Registry,
+		system:   s.deps.System,
+		holds:    s.holds,
+		store:    s.store,
+		now:      s.now,
+		poll:     s.pollInterval(),
+		notify:   s.requestSync,
+		audit:    s.audit,
 	}
 
 	s.wg.Go(func() {
@@ -664,13 +795,8 @@ func (s *service) sendInventory(ctx context.Context) {
 
 	cancel()
 
-	switch {
-	case err != nil:
+	if err != nil {
 		s.log.WithError(err).Warn("cannot collect the inventory")
-
-		return
-	case inv == nil:
-		s.log.Warn("the system returned no inventory; nothing uploaded")
 
 		return
 	}

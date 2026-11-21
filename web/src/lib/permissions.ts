@@ -19,17 +19,31 @@ export const FEATURE = {
   recover: 'recover',
   /** supervise: pause, resume and abort of one rollout, retry without hosts, every retry of an aborted rollout. No twin. */
   supervise: 'supervise',
+  /** client_policy: the image policy of one client. Twin team_client_policy: a client whose containers a team of the login all owns. */
+  client_policy: 'client_policy',
+  /** image_override: the action image-override. Twin team_image_override: a container a team of the login owns. */
+  image_override: 'image_override',
+  /** flag_override: the action flag-override. Twin team_flag_override: a container a team of the login owns. */
+  flag_override: 'flag_override',
   /** admin: forget, the global pause, the settings, the flags force and ignoreBudget, the selector all. No twin. */
   admin: 'admin',
 } as const;
 
-export type Feature = (typeof FEATURE)[keyof typeof FEATURE];
+type Feature = (typeof FEATURE)[keyof typeof FEATURE];
 
 /** TEAM_PREFIX turns a feature into its team twin. */
 export const TEAM_PREFIX = 'team_';
 
 /** TWINNED are the features that have a team twin. */
-export const TWINNED: readonly Feature[] = [FEATURE.roll, FEATURE.reboot, FEATURE.hold, FEATURE.recover];
+export const TWINNED: readonly Feature[] = [
+  FEATURE.roll,
+  FEATURE.reboot,
+  FEATURE.hold,
+  FEATURE.recover,
+  FEATURE.client_policy,
+  FEATURE.image_override,
+  FEATURE.flag_override,
+];
 
 /** Login is what the page knows about who is logged in. */
 export interface Login {
@@ -48,13 +62,13 @@ export interface Login {
 }
 
 /** OwnedContainer is the part of a container the rule reads. */
-export interface OwnedContainer {
+interface OwnedContainer {
   name: string;
   managed: boolean;
   owners?: readonly string[] | null;
 }
 
-/** OwnedHost is the part of a host the rule reads; a HostSummary is one. */
+/** OwnedHost is the part of a host the rule reads; a HostListing is one. */
 export interface OwnedHost {
   name: string;
   containers?: readonly OwnedContainer[] | null;
@@ -63,10 +77,23 @@ export interface OwnedHost {
   holdBy?: string;
 }
 
+/** OwnedClient is the part of a client the rule reads; a ClientView is one. */
+export interface OwnedClient {
+  name: string;
+  /** hosts is how many hosts run the client: a client nobody runs has no container and no owner. */
+  hosts: number;
+  /** allOwned are the teams that own every container of the client. */
+  allOwned?: readonly string[] | null;
+  /** owners are the teams that own a container of the client. */
+  owners?: readonly string[] | null;
+}
+
 /** Ownership is what the page knows about who owns what. */
 export interface Ownership {
   /** hosts are all hosts the controller knows. */
   hosts: readonly OwnedHost[];
+  /** clients are the clients of the fleet, for the image policy of one. */
+  clients?: readonly OwnedClient[];
   /** leaseHost names the host of a lease; a lease it does not know has no owner. */
   leaseHost?: (lease: string) => string | undefined;
   /**
@@ -98,8 +125,18 @@ export interface Verdict {
 /** Targets is what a request acts on, for the team twin of its feature. */
 type Targets =
   | { rule: 'host'; hosts: readonly string[]; all: boolean; hold?: 'set' | 'lift' }
-  | { rule: 'container'; hosts: readonly string[]; all: boolean; containers: readonly string[] }
-  | { rule: 'lease'; lease: string };
+  | {
+      rule: 'container';
+      hosts: readonly string[];
+      all: boolean;
+      containers: readonly string[];
+      /** one: the request is about exactly one container (an override). */
+      one?: boolean;
+    }
+  | { rule: 'lease'; lease: string }
+  | { rule: 'client'; client: string }
+  /** someOf: a request on many hosts of a client, judged host by host; a team that owns a container of the client opens it. */
+  | { rule: 'someOf'; client: string };
 
 interface Requirement {
   feature: Feature;
@@ -155,6 +192,10 @@ function requirement(call: PermissionCall, ownership: Ownership): Requirement {
         team: { rule: 'host', hosts: call.body.hosts, all: false, hold: 'lift' },
         admin: '',
       };
+    case 'mark-offline':
+    case 'unmark-offline':
+      // The controller lets team_hold change only a mark set through it.
+      return { feature: FEATURE.hold, team: { rule: 'host', hosts: call.body.hosts, all: false }, admin: '' };
     case 'forget':
       return { feature: FEATURE.admin, admin: '' };
     case 'end-lease':
@@ -174,6 +215,30 @@ function requirement(call: PermissionCall, ownership: Ownership): Requirement {
       return call.body.hosts.length === 0 || ownership.rolloutState?.(call.body.rollout) === 'aborted'
         ? { feature: FEATURE.supervise, admin: '' }
         : { feature: FEATURE.recover, team: { rule: 'host', hosts: call.body.hosts, all: false }, admin: '' };
+    case 'client-policy':
+      // The policy of a client is its team's when the team owns every container of it.
+      return { feature: FEATURE.client_policy, team: { rule: 'client', client: call.body.client }, admin: '' };
+    case 'image-override':
+    case 'flag-override':
+      // The rule of a roll of exactly that container on that host.
+      return {
+        feature: call.action === 'image-override' ? FEATURE.image_override : FEATURE.flag_override,
+        team: {
+          rule: 'container',
+          hosts: [call.body.host],
+          all: false,
+          containers: [call.body.container],
+          one: true,
+        },
+        admin: '',
+      };
+    case 'client-override':
+      // Each host alone, by the rule of the single-host override: the controller lists the hosts the teams do not cover.
+      return {
+        feature: call.body.part === 'image' ? FEATURE.image_override : FEATURE.flag_override,
+        team: { rule: 'someOf', client: call.body.client },
+        admin: '',
+      };
     case 'settings':
       // The settings carry the global pause, the budget, the gate and the policies.
       return { feature: FEATURE.admin, admin: '' };
@@ -238,9 +303,39 @@ function uncoveredOn(teams: readonly string[], name: string, host: OwnedHost | u
   return '';
 }
 
+/**
+ * uncoveredClient applies the rule of a client: a team of the login owns
+ * every container of it. The page reads that off the client's row (allOwned)
+ * and cannot name the container that is somebody else's; the controller does.
+ */
+function uncoveredClient(teams: readonly string[], name: string, ownership: Ownership): string {
+  const client = ownership.clients?.find(c => c.name === name);
+  const all = client && client.hosts > 0 ? [...(client.allOwned ?? [])].sort() : [];
+  if (ownedBy(teams, all)) return '';
+
+  const reason = `does not cover client ${echo(name)} (owners of all of it: ${ownerList(all)})`;
+
+  // The controller asks whether every container is owned by a team of the
+  // login. Several teams that each own a part satisfy that, and a client's
+  // row does not say whether they do: the page offers nothing it cannot
+  // show to be allowed, and says who decides.
+  const parts = (client?.owners ?? []).filter(o => teams.includes(o));
+  return parts.length > 1
+    ? `${reason}; your teams ${echo(parts.join(', '))} own parts of it, which the page cannot add up: the controller decides, ask it through the API`
+    : reason;
+}
+
 /** uncovered names the first target no team of the login owns; empty when all are covered. */
 function uncovered(teams: readonly string[], t: Targets, ownership: Ownership): string {
   let names: string[];
+
+  if (t.rule === 'client') return uncoveredClient(teams, t.client, ownership);
+  if (t.rule === 'someOf') {
+    const owners = [...(ownership.clients?.find(c => c.name === t.client)?.owners ?? [])].sort();
+    return ownedBy(teams, owners)
+      ? ''
+      : `does not cover any container of client ${echo(t.client)} (owners: ${ownerList(owners)})`;
+  }
 
   if (t.rule === 'lease') {
     const host = ownership.leaseHost?.(t.lease);
@@ -266,7 +361,12 @@ function targetWords(t: Targets): string {
   switch (t.rule) {
     case 'lease':
       return 'the host of this lease';
+    case 'client':
+      return 'every container of this client';
+    case 'someOf':
+      return 'the containers of this client on the hosts';
     case 'container':
+      if (t.one) return 'this container';
       return t.containers.length === 0 ? 'every managed container of the host' : 'these containers';
     case 'host':
       return t.hosts.length === 1 ? 'this host' : 'these hosts';
