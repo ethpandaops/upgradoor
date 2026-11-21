@@ -286,12 +286,21 @@ kill $watch 2>/dev/null || true
 [ "$(sysbox_boot_count "$id-host-1")" -gt "$b1" ] || die "host-1 did not reboot in the fleet reboot"
 [ "$(sysbox_boot_count "$id-host-2")" -gt "$b2" ] || die "host-2 did not reboot in the fleet reboot"
 [ ! -e "$work/overlap" ] || die "two leases were open at once during the fleet reboot"
-api "/api/v1/audit?limit=500" |
-    jq -e --arg id "$fleet" '
-        [.entries[] | select(.action == "lease.granted" or .action == "lease.released")] | reverse
-        | map(select(.detail | tostring | contains($id)) // .) as $e
-        | [range(1; $e | length) | select($e[.].action == "lease.granted") | $e[. - 1].action == "lease.released"] | all' \
-    >/dev/null || die "fleet reboot leases overlapped according to the audit log"
+# A lease ends released, expired (a lease that disrupted nothing, such as
+# host-2's package upgrade) or failed. Entries come newest first.
+api "/api/v1/audit?limit=500" >"$work/audit.json"
+jq -e '
+    [.entries[] | select(.action | IN("lease.granted", "lease.released", "lease.expired", "lease.failed"))]
+    | reverse
+    | reduce .[] as $e ({open: [], ok: true};
+        if $e.action == "lease.granted"
+        then .ok = (.ok and (.open | length) == 0) | .open += [$e.detail.lease]
+        else .open -= [$e.detail.lease] end)
+    | .ok' "$work/audit.json" >/dev/null ||
+    die "leases overlapped according to the audit log"
+jq -e --arg id "$fleet" \
+    '[.entries[] | select(.action == "lease.granted" and (.detail.rollouts | index($id)))] | length == 2' \
+    "$work/audit.json" >/dev/null || die "the fleet reboot did not take exactly two leases"
 for h in "${hosts[@]}"; do
     [ "$(docker inspect -f '{{.State.Running}}' "$id-$h-app")" = true ] || die "$h: container not running"
 done

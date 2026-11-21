@@ -72,8 +72,12 @@ jobs:
       run: make lint
 
   test_docker:
-    name: Test container recreate (real Docker)
+    name: Test container recreate (real Docker, ${{ matrix.store }} store)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        store: [containerd, classic]
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -81,6 +85,18 @@ jobs:
       uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
       with:
         go-version-file: go.mod
+
+    - name: Select the Docker image store
+      env:
+        CONTAINERD_STORE: ${{ matrix.store == 'containerd' }}
+      run: |
+        sudo mkdir -p /etc/docker
+        [ -s /etc/docker/daemon.json ] || echo '{}' | sudo tee /etc/docker/daemon.json >/dev/null
+        sudo jq --argjson on "$CONTAINERD_STORE" '.features["containerd-snapshotter"] = $on' \
+          /etc/docker/daemon.json > daemon.json
+        sudo mv daemon.json /etc/docker/daemon.json
+        sudo systemctl restart docker
+        docker info --format '{{ .ServerVersion }} {{ .Driver }} {{ json .DriverStatus }}'
 
     - name: Run docker tests
       run: make test-docker

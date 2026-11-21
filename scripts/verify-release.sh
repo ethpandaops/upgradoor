@@ -8,7 +8,7 @@
 # release's binaries (upgradoor-linux-<arch> for hosts, upgradoor-controller-linux-<arch> for
 # the image). Checks, in this order:
 # 1. the signature: ssh-keygen -Y verify against deploy/allowed_signers, principal and
-#    namespace upgradoor-release (a restodian signature, namespace restodian-client, fails);
+#    namespace upgradoor-release (a signature of the same key under another namespace fails);
 # 2. the manifest is canonical for vX.Y.Z: every binary, the image's line, the tag's seq;
 # 3. --min-seq N: the release's seq is not below N (the highest a host ever installed);
 # 4. every binary present in DIR matches its line; with --require-all every binary of the

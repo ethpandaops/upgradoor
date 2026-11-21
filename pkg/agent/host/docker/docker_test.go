@@ -462,6 +462,20 @@ func TestLocalImage(t *testing.T) {
 	got, _, err = r.LocalImage(t.Context(), fakeRef)
 	require.NoError(t, err)
 	assert.Equal(t, digestB, got)
+
+	// A nameless image (containerd store, tag moved on) has only its descriptor.
+	f.images[fakeRef].RepoDigests = nil
+
+	got, _, err = r.LocalImage(t.Context(), fakeRef)
+	require.NoError(t, err)
+	assert.Equal(t, digestB, got)
+
+	// A named image without registry digest was never pulled.
+	f.images[fakeRef].RepoTags = []string{fakeRef}
+
+	got, _, err = r.LocalImage(t.Context(), fakeRef)
+	require.NoError(t, err)
+	assert.Empty(t, got)
 }
 
 func TestStartStop(t *testing.T) {

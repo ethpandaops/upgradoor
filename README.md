@@ -126,6 +126,30 @@ one place to see which host runs what.
   agent configuration says. The audit log records the teams of the login and
   the feature that allowed each action.
 
+## Releases and signing
+
+Hosts install only releases whose `upgradoor-manifest.txt` is signed by a key
+in `deploy/allowed_signers`. The manifest lists the sha256 of every binary and
+the controller image digest. Ansible checks the signature against its own
+pinned copy of that file, then installs a binary only if its hash matches.
+CI builds, but never signs.
+
+1. Run the `Build release` workflow with version `X.Y.Z`. CI builds
+   reproducible binaries, pushes the controller image by digest, writes the
+   manifest and opens a draft release.
+2. A signer runs `scripts/sign-release.sh vX.Y.Z` with a FIDO security key
+   plugged in. The script downloads the draft, rebuilds the binaries from the
+   tag, checks they are identical, and checks the image. It then prints the
+   manifest, signs it with one touch of the key and uploads the signature.
+3. Publish the draft. CI verifies the signature and only then tags the
+   signed image `vX.Y.Z` and `latest`.
+
+To become a signer, run `scripts/enroll-signer.sh "<your name>" --add`. It
+creates a key on your security key (`~/.ssh/upgradoor-release`), checks that
+it signs, and adds your line to `deploy/allowed_signers`. The same line must
+also go into `roles/upgradoor_agent/files/allowed_signers` of
+ansible-collection-general, through review in both repositories.
+
 ## Build, test, lint
 
 Needs Go 1.27 or newer (`crypto/mldsa`). The web UI needs Node 24.

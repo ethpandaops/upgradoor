@@ -365,7 +365,14 @@ func (r *dockerRuntime) digestOf(ref string, img *client.ImageInspectResult) str
 	pulled := r.pulled[pulledKey(repo, img.ID)]
 	r.pulledMu.Unlock()
 
-	return selectDigest(ref, img.RepoDigests, pulled, descriptor)
+	digest := selectDigest(ref, img.RepoDigests, pulled, descriptor)
+	if digest == "" && len(img.RepoTags) == 0 {
+		// The containerd image store drops all names of an image whose tag
+		// moved on; its descriptor is still the manifest it was pulled as.
+		return descriptor
+	}
+
+	return digest
 }
 
 func pulledKey(repo, imageID string) string { return repo + "\x00" + imageID }

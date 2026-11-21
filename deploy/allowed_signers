@@ -1,9 +1,8 @@
-# Release signing key for upgradoor, in ssh-keygen's allowed_signers format: the key that signs
-# upgradoor-manifest.txt (scripts/sign-release.sh). It is the same security key as restodian's
-# release key, under its own namespace: a restodian signature (namespace restodian-client) never
-# verifies as an upgradoor one. CI checks a release against this file before it tags the image;
-# Ansible checks against its own pinned copy, never one downloaded with the release.
-# The private key stays offline with the maintainer; CI never signs.
+# Keys that may sign upgradoor releases (ssh-keygen allowed_signers format). A release is valid
+# when upgradoor-manifest.txt carries a signature of any key listed here. CI checks against this
+# file before it tags the image; Ansible checks against its own pinned copy
+# (ansible-collection-general: roles/upgradoor_agent/files/allowed_signers), never one downloaded
+# with the release. Add a key with scripts/enroll-signer.sh and change both files by review.
 #
-# Each line: upgradoor-release namespaces="upgradoor-release" <key type> <key> [comment]
+# Each line: upgradoor-release namespaces="upgradoor-release" <key type> <key> <owner>
 upgradoor-release namespaces="upgradoor-release" sk-ssh-ed25519@openssh.com AAAAGnNrLXNzaC1lZDI1NTE5QG9wZW5zc2guY29tAAAAIMJRCy1En57mO15CjLFsiqy6cbUMF5ir0jADOpPXjKaqAAAAFXNzaDpyZXN0b2RpYW4tcmVsZWFzZQ== upgradoor release signing (pk910)

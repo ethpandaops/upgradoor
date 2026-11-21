@@ -19,8 +19,8 @@
 # 6. checks the signature against deploy/allowed_signers and uploads upgradoor-manifest.txt.sig.
 # Publishing the release then verifies the signature in CI and tags the signed image.
 #
-# RELEASE_KEY      the key handle of the security key (default ~/.ssh/restodian-release: the
-#                  same key signs restodian, under another namespace)
+# RELEASE_KEY      the key handle of your security key (default ~/.ssh/upgradoor-release; create
+#                  one with scripts/enroll-signer.sh)
 # ALLOWED_SIGNERS  the file the signature must verify against (default deploy/allowed_signers)
 # For tests, without GitHub or the tag:
 # UPGRADOOR_RELEASE_DIR  a local directory stands in for the draft: assets are read from it and
@@ -42,7 +42,7 @@ for arg in "$@"; do
     *) echo "$usage" >&2; exit 1 ;;
   esac
 done
-KEY=${RELEASE_KEY:-$HOME/.ssh/restodian-release}
+KEY=${RELEASE_KEY:-$HOME/.ssh/upgradoor-release}
 HERE=$(cd "$(dirname "$0")/.." && pwd)
 SIGNERS=${ALLOWED_SIGNERS:-$HERE/deploy/allowed_signers}
 LOCAL=${UPGRADOOR_RELEASE_DIR:-}
