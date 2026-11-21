@@ -271,19 +271,25 @@ func (s *service) setHold(
 	}
 
 	// A request that was allowed through the team feature does not touch a
-	// hold that was not set through it. The API refuses that before it gets
+	// hold that none of its teams set. The API refuses that before it gets
 	// here; this is the same question asked again under the lock, against
 	// the holds as they are now. Nothing is changed when one host is refused.
 	if twin, ok := teamFeatureOf(ctx); ok {
+		a, _ := AuthorizationFrom(ctx)
+
 		for _, h := range hosts {
-			if h.HoldWanted && h.HoldBy != fleet.HoldByTeam {
+			if !h.HoldWanted {
+				continue
+			}
+
+			if by := HoldSetBy(h.HoldBy, a.Teams); by != "" {
 				verb := "lift"
 				if wanted {
 					verb = "change"
 				}
 
-				return nil, fmt.Errorf("%w: %s does not %s the hold on host %s (set by staff)",
-					ErrForbidden, twin, verb, h.Name)
+				return nil, fmt.Errorf("%w: %s does not %s the hold on host %s (set by %s)",
+					ErrForbidden, twin, verb, h.Name, by)
 			}
 		}
 	}
@@ -342,15 +348,18 @@ func (s *service) setHold(
 // transaction.
 //
 // A hold set by a request that was allowed through the team feature is
-// recorded as a team's (fleet.HoldByTeam), which is what lets a team feature
+// recorded as the hold of the request's teams that own a container of the
+// host (fleet.TeamHold), which is what lets a team feature of one of them
 // lift it again. A hold that is there already and is not a team's stays
 // staff's: a team cannot make a hold its own by setting it again.
 func (s *service) setHostHold(
 	ctx context.Context, actor, action string, h *fleet.Host, wanted bool, reason, given string,
 ) error {
+	_, teamHold := fleet.HoldTeams(h.HoldBy)
+
 	by := ""
-	if wanted && throughTeamFeature(ctx) && (!h.HoldWanted || h.HoldBy == fleet.HoldByTeam) {
-		by = fleet.HoldByTeam
+	if a, ok := AuthorizationFrom(ctx); ok && wanted && throughTeamFeature(ctx) && (!h.HoldWanted || teamHold) {
+		by = fleet.TeamHold(owningTeams(h, a.Teams))
 	}
 
 	return s.write(ctx, &store.Changes{
@@ -361,6 +370,50 @@ func (s *service) setHostHold(
 			keyReason: given,
 		})},
 	})
+}
+
+// HoldSetBy says who set a hold that none of the teams set: "staff", or
+// "team <teams>"; empty when one of the teams set it.
+func HoldSetBy(holdBy string, teams []string) string {
+	holders, team := fleet.HoldTeams(holdBy)
+
+	switch {
+	case !team:
+		return holdByStaff
+	case slices.ContainsFunc(holders, func(t string) bool { return slices.Contains(teams, t) }):
+		return ""
+	default:
+		return "team " + strings.Join(holders, ", ")
+	}
+}
+
+// owningTeams are the teams that own a managed container of the host, or
+// all of them when none does.
+func owningTeams(h *fleet.Host, teams []string) []string {
+	out := make([]string, 0, len(teams))
+
+	if h.Status != nil {
+		for i := range h.Status.Containers {
+			c := &h.Status.Containers[i]
+			if !c.Managed {
+				continue
+			}
+
+			for _, t := range c.Owners {
+				if slices.Contains(teams, t) && !slices.Contains(out, t) {
+					out = append(out, t)
+				}
+			}
+		}
+	}
+
+	if len(out) == 0 {
+		out = append(out, teams...)
+	}
+
+	slices.Sort(out)
+
+	return out
 }
 
 // holdDetail is the hold switch of a host in the before or after of an audit
@@ -925,7 +978,10 @@ func (s *service) openRollout(ctx context.Context, id string) (*fleet.Rollout, e
 		return nil, err
 	}
 
-	if r.State.Terminal() {
+	switch {
+	case r.State == fleet.RolloutAborted:
+		return nil, fmt.Errorf("%w: rollout %s is aborted, which is final", ErrInvalidAction, id)
+	case r.State.Terminal():
 		return nil, fmt.Errorf("%w: rollout %s is %s", ErrInvalidAction, id, r.State)
 	}
 
@@ -1027,7 +1083,10 @@ func (s *service) Skip(
 // could be retried nothing changes and the action is refused, with the reason
 // for each host.
 //
-// A rollout that is closed cannot be retried.
+// A failed host whose lease did its steps and whose need is gone is not
+// done by that: it gets a recheck lease, which repeats the readiness check.
+//
+// A rollout that is closed cannot be retried; an abort is final.
 func (s *service) Retry(
 	ctx context.Context, actor string, req RolloutHostsRequest,
 ) (*ActionResult, error) {
@@ -1042,6 +1101,7 @@ func (s *service) Retry(
 	now := s.opts.Now()
 	retriedFailed := false
 	res := &ActionResult{Rollout: r.ID, Rejected: make(map[string]string, len(req.Hosts))}
+	failedLeases := make(map[string]string, len(r.Hosts))
 
 	for i := range r.Hosts {
 		m := &r.Hosts[i]
@@ -1055,6 +1115,10 @@ func (s *service) Retry(
 		}
 
 		retriedFailed = retriedFailed || m.State == fleet.HostFailed
+
+		if m.State == fleet.HostFailed && m.LeaseID != "" {
+			failedLeases[m.Host] = m.LeaseID
+		}
 
 		m.State = fleet.HostPending
 		m.Error = ""
@@ -1114,10 +1178,101 @@ func (s *service) Retry(
 		res.Message = fmt.Sprintf("rollout reopened, %d host(s) retried", len(res.Hosts))
 	}
 
-	return res, s.commitRollout(ctx, actor, "action.retry", r, map[string]any{
-		keyHosts: res.Hosts, keyBefore: before,
-		keyAfter: map[string]any{keyState: r.State}, keyReason: req.Reason,
-	})
+	r.UpdatedAt = now
+	changes := &store.Changes{
+		Rollouts: []*fleet.Rollout{r},
+		Audit: []fleet.AuditEntry{s.entry(actor, "action.retry", r.ID, map[string]any{
+			keyHosts: res.Hosts, keyBefore: before,
+			keyAfter: map[string]any{keyState: r.State}, keyReason: req.Reason,
+		})},
+	}
+
+	for _, host := range sortedKeys(failedLeases) {
+		l, err := s.recheck(ctx, actor, r, host, failedLeases[host], now)
+		if err != nil {
+			return nil, err
+		}
+
+		if l != nil {
+			changes.Leases = append(changes.Leases, l)
+			changes.Audit = append(changes.Audit, s.entry(actor, "lease.granted", host, map[string]any{
+				keyLease: l.ID, keyRollouts: []string{r.ID}, "recheck": true,
+			}))
+		}
+	}
+
+	if err := s.commit(ctx, changes); err != nil {
+		return nil, err
+	}
+
+	return res, nil
+}
+
+// recheck returns the recheck lease of a retried member whose failed lease
+// did the rollout's steps and whose host no longer reports their needs, and
+// moves the member to it; nil when the member waits for a lease as usual.
+func (s *service) recheck(
+	ctx context.Context, actor string, r *fleet.Rollout, host, leaseID string, now time.Time,
+) (*fleet.Lease, error) {
+	failed, err := s.opts.Store.GetLease(ctx, leaseID)
+
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil, nil //nolint:nilnil // no lease to recheck.
+	case err != nil:
+		return nil, fmt.Errorf("scheduler: get lease %s: %w", leaseID, err)
+	case failed.State != fleet.LeaseFailed || !stepsDone(failed, r.ID):
+		return nil, nil //nolint:nilnil // nothing was done to recheck.
+	}
+
+	open, err := s.opts.Store.ListLeases(ctx, store.LeaseFilter{OpenOnly: true, Host: host})
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: list leases of %s: %w", host, err)
+	}
+
+	h, err := s.opts.Store.GetHost(ctx, host)
+	if errors.Is(err, store.ErrNotFound) || len(open) > 0 {
+		return nil, nil //nolint:nilnil // the reconcile settles the member.
+	}
+
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: get host %s: %w", host, err)
+	}
+
+	l := &fleet.Lease{
+		ID: s.opts.NewID(), Host: host, State: fleet.LeaseVerifying,
+		Rollouts: make(map[string]string, 2), Weight: failed.Weight, Charged: failed.Charged,
+		GrantedBy: actorName(actor), GrantedAt: now,
+		ExpiresAt: now.Add(failed.ExpiresAt.Sub(failed.GrantedAt)), AgentDoneAt: &now,
+		Operation: cloneOperation(failed.Operation), Recheck: true,
+	}
+
+	for i := range failed.Needs {
+		n := &failed.Needs[i]
+		if failed.Rollouts[n.ID] != r.ID {
+			continue
+		}
+
+		if h.Status != nil && slices.ContainsFunc(h.Status.Needs, func(o protocol.Need) bool { return o.ID == n.ID }) {
+			return nil, nil //nolint:nilnil // still reported: served again by a lease.
+		}
+
+		l.Needs = append(l.Needs, *n)
+		l.Rollouts[n.ID] = r.ID
+	}
+
+	// Its class is that of the needs it repeats the check of.
+	l.Impact = needsImpact(h, l.Needs)
+	if l.Impact != protocol.ImpactNode {
+		l.Charged = 0
+	}
+
+	m := r.Host(host)
+	m.State = fleet.HostLeased
+	m.LeaseID = l.ID
+	m.NeedID = l.Needs[0].ID
+
+	return l, nil
 }
 
 // failedMembers names the members of a rollout that are failed.
@@ -1146,14 +1301,16 @@ func rejectedList(hosts []string, rejected map[string]string) string {
 	return strings.Join(parts, "; ")
 }
 
-// Abort closes a manual rollout: its unanswered directives are cancelled and
-// its open leases finish.
+// Abort closes a rollout for good: its unanswered directives are cancelled,
+// its members that wait are aborted and its open leases finish, each member
+// with the outcome of its lease. The target of an aborted group or packages
+// rollout is not rolled again (open skips its key) until it changes or
+// someone rolls it by hand; the manual needs a host took from it are
+// withdrawn (syncWithdrawals).
 //
-// A rollout of an observed cause cannot be closed while hosts report the
-// cause: the next sync would open it again. Aborting it pauses it instead,
-// with a reason that says so. Nothing more is granted in it, open leases
-// finish, and hosts that report the cause later join it and wait, until a
-// person resumes it or the cause changes (a newer digest supersedes it).
+// The reboot rollout and the rollout of what a host asks for itself have a
+// key that does not change with their target: aborting one pauses it, with
+// a reason that says so, until a person resumes it.
 func (s *service) Abort(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1167,7 +1324,7 @@ func (s *service) Abort(ctx context.Context, actor string, req ScopeRequest) (*A
 		return nil, err
 	}
 
-	if r.Kind != fleet.RolloutManual {
+	if r.Kind == fleet.RolloutReboot || r.Kind == fleet.RolloutLocal {
 		before := map[string]any{keyPaused: r.Paused}
 		r.Paused = true
 		r.PauseReason = abortedReason(req.Reason)
@@ -1196,6 +1353,13 @@ func (s *service) Abort(ctx context.Context, actor string, req ScopeRequest) (*A
 	r.EndedAt = &now
 	r.UpdatedAt = now
 
+	for i := range r.Hosts {
+		if m := &r.Hosts[i]; !m.State.Settled() && m.State != fleet.HostLeased && m.State != fleet.HostFailed {
+			m.State = fleet.HostAborted
+			m.UpdatedAt = now
+		}
+	}
+
 	changes := &store.Changes{
 		Rollouts: []*fleet.Rollout{r},
 		Audit: []fleet.AuditEntry{s.entry(actor, "action.abort", r.ID, map[string]any{
@@ -1214,10 +1378,15 @@ func (s *service) Abort(ctx context.Context, actor string, req ScopeRequest) (*A
 		return nil, err
 	}
 
-	return &ActionResult{Rollout: r.ID, Message: "rollout aborted"}, nil
+	msg := "rollout aborted"
+	if r.Kind != fleet.RolloutManual {
+		msg += ": its target is not rolled again until it changes or someone rolls it by hand"
+	}
+
+	return &ActionResult{Rollout: r.ID, Message: msg}, nil
 }
 
-// abortedReason is the pause reason of a rollout of an observed cause that a
+// abortedReason is the pause reason of a reboot or local rollout that a
 // person aborted.
 func abortedReason(reason string) string {
 	if reason == "" {

@@ -57,7 +57,7 @@ func TestRebootOrder(t *testing.T) {
 		assert.Equal(t, protocol.StateRunning, e.host.Container(name).State, name)
 	}
 
-	e.assertPhases("lease-reboot", protocol.PhaseDraining, protocol.PhaseApplying,
+	e.assertPhases("lease-reboot", protocol.PhasePulling, protocol.PhaseDraining, protocol.PhaseApplying,
 		protocol.PhaseRebooting, protocol.PhaseStarting, protocol.PhaseVerifying, protocol.PhaseDone)
 }
 

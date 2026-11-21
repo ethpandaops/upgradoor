@@ -499,6 +499,34 @@ func TestKilledOperationIsResumedAsFailed(t *testing.T) {
 	assert.NotContains(t, strings.Join(calls, "\n"), "recreate teku")
 }
 
+// An agent that died while it pulled has stopped nothing: the lease is not begun.
+func TestKilledPullDefersTheLease(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.host.SetRegistry(agenttest.GethImage, agenttest.GethV2, "")
+
+	entered, _ := e.block("pull " + agenttest.GethImage)
+
+	e.start(t.Context())
+
+	need := gethNeed(agenttest.GethV2)
+	e.grant("lease-cut", need)
+
+	agenttest.AwaitParked(t, entered, "pull")
+	assert.Equal(t, "pulling", field(t, e.onDisk(), "current", "operation", "phase"))
+
+	// The first runner stays parked in the call: as dead as it gets.
+	e.start(t.Context())
+
+	op := e.awaitFinished("lease-cut")
+	assert.Equal(t, protocol.PhaseDone, op.Phase)
+	assert.False(t, op.Disrupted)
+	assert.Equal(t, protocol.StepDeferred, stepOf(t, op, need.ID).Status)
+	assert.Equal(t, reasonPullInterrupted, stepOf(t, op, need.ID).Error)
+	assert.Empty(t, e.disruptive())
+}
+
 // A stop carries the disruptive steps through; the next process only waits.
 func TestStopFinishesTheDisruptiveSteps(t *testing.T) {
 	t.Parallel()
@@ -1472,4 +1500,59 @@ func TestFollowRows(t *testing.T) {
 
 	assert.False(t, r.Follow(nil, op))
 	assert.Nil(t, r.Current())
+}
+
+// A lease the agent gives itself runs like any other and makes way for the
+// controller's once it is finished.
+func TestGrantedLeaseOfTheAgentsOwn(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.pull(agenttest.GethImage, agenttest.GethV2)
+	e.pull(agenttest.TekuImage, agenttest.TekuV2)
+
+	r := e.start(t.Context())
+
+	assert.False(t, r.Grant(nil), "nothing to serve")
+	require.True(t, r.Grant([]protocol.Need{gethNeed(agenttest.GethV2)}))
+
+	rec := r.Current()
+	require.NotNil(t, rec)
+	assert.True(t, strings.HasPrefix(rec.Lease.ID, ownLeasePrefix))
+	assert.Equal(t, int64(ownLeaseTTL/time.Second), rec.Lease.TTLSeconds)
+
+	op := e.awaitFinished(rec.Lease.ID)
+	assert.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.Equal(t, agenttest.GethV2, e.host.Container("geth").Digest)
+
+	// Still silent: the finished one is replaced by the next.
+	e.offset.Add(int64(time.Second))
+	require.True(t, r.Grant([]protocol.Need{tekuNeed()}))
+
+	next := r.Current().Lease.ID
+	assert.NotEqual(t, rec.Lease.ID, next)
+
+	op = e.awaitFinished(next)
+	assert.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.Equal(t, agenttest.TekuV2, e.host.Container("teku").Digest)
+
+	// The controller answers again: reported, then forgotten.
+	assert.False(t, r.Follow(nil, nil))
+	require.NotNil(t, r.Current())
+	assert.False(t, r.Follow(nil, r.Current().Reported()))
+	assert.Nil(t, r.Current())
+}
+
+func TestGrantWaitsForAnOpenLease(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.pull(agenttest.GethImage, agenttest.GethV2)
+	e.host.Fail("observe", errors.New("docker daemon is restarting"))
+
+	r := e.start(t.Context())
+	e.grant("lease-open", gethNeed(agenttest.GethV2))
+
+	assert.False(t, r.Grant([]protocol.Need{tekuNeed()}))
+	assert.Equal(t, "lease-open", r.Current().Lease.ID)
 }

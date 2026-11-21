@@ -20,8 +20,7 @@ import (
 const (
 	upgradeTimeout = 30 * time.Minute
 	// recreateGrace is added to the container's stop timeout.
-	recreateGrace  = 10 * time.Minute
-	resolveTimeout = time.Minute
+	recreateGrace = 10 * time.Minute
 )
 
 // applyPackages upgrades the granted blocked packages.
@@ -33,7 +32,15 @@ func (o *operation) applyPackages(ctx context.Context) {
 
 	o.setPhase(protocol.PhaseApplying)
 
-	// Upgrading Docker restarts the daemon and with it every container.
+	var touched []string
+	if rec := o.r.st.current(); rec != nil {
+		touched = slices.Clone(rec.Touched)
+	}
+
+	wasDisrupted := o.disrupted()
+	before, beforeErr := o.containers(ctx)
+
+	// Upgrading Docker may restart the daemon and with it every container.
 	if !o.markDisrupted(ctx, ids) {
 		return
 	}
@@ -56,7 +63,36 @@ func (o *operation) applyPackages(ctx context.Context) {
 		return
 	}
 
+	if !wasDisrupted && beforeErr == nil {
+		if after, err := o.containers(ctx); err == nil && !restartedAny(before, after) {
+			o.log.Info("the package upgrade restarted no container")
+			o.apply(func(c *content) {
+				c.Current.Operation.Disrupted = false
+				c.Current.Touched = touched
+			})
+		}
+	}
+
 	o.setSteps(ids, protocol.StepDone, "")
+}
+
+// restartedAny reports whether a container running in before is not
+// running in after, or was started again.
+func restartedAny(before, after []protocol.Container) bool {
+	for i := range before {
+		b := &before[i]
+		if b.State != protocol.StateRunning {
+			continue
+		}
+
+		j := slices.IndexFunc(after, func(c protocol.Container) bool { return c.ID == b.ID })
+		if j < 0 || after[j].State != protocol.StateRunning || !after[j].StartedAt.Equal(b.StartedAt) ||
+			after[j].RestartCount != b.RestartCount {
+			return true
+		}
+	}
+
+	return false
 }
 
 // applyImages recreates the granted containers in start order.
@@ -79,8 +115,8 @@ func (o *operation) applyImages(ctx context.Context) {
 }
 
 // recreate serves one recreate. What the container becomes is read from the
-// host's files (plan.Recheck) right before; host checks the digest before it
-// stops anything.
+// host's files (plan.Recheck) right before; host checks the digest, which
+// the pulling phase made local, before it stops anything.
 func (o *operation) recreate(ctx context.Context, task *plan.Recreate) {
 	name := task.Container
 	log := o.log.WithFields(logrus.Fields{"container": name, "digest": task.Digest})
@@ -105,7 +141,7 @@ func (o *operation) recreate(ctx context.Context, task *plan.Recreate) {
 	}
 
 	if task.Target != "" {
-		log = log.WithFields(logrus.Fields{"image": rec.Image, "flags": rec.SetCommand})
+		log = log.WithFields(logrus.Fields{keyImage: rec.Image, "flags": rec.SetCommand})
 	}
 
 	if rec.Group != "" {
@@ -144,39 +180,11 @@ func (o *operation) recreate(ctx context.Context, task *plan.Recreate) {
 			o.apply(func(c *content) { c.Current.Operation.Disrupted = false })
 		}
 
-		o.digestMismatch(ctx, log, task, ref)
+		log.Info("the local image changed after the pull; image need superseded")
+		o.setSteps(task.IDs, protocol.StepSuperseded,
+			fmt.Sprintf("the local image of %s is not the granted digest %s any more", ref, task.Digest))
 	default:
 		msg := fmt.Sprintf("recreate container %s: %v", name, err)
-
-		o.fail(msg)
-		o.setSteps(task.IDs, protocol.StepFailed, msg)
-	}
-}
-
-// digestMismatch supersedes the step when the tag moved on and fails it
-// otherwise.
-func (o *operation) digestMismatch(
-	ctx context.Context, log logrus.FieldLogger, task *plan.Recreate, ref string,
-) {
-	rctx, cancel := context.WithTimeout(ctx, resolveTimeout)
-	current, err := o.r.deps.Registry.Resolve(rctx, ref)
-
-	cancel()
-
-	switch {
-	case err != nil:
-		msg := fmt.Sprintf("the local image of %s is not the granted digest %s and the "+
-			"registry could not be asked: %v", ref, task.Digest, err)
-
-		o.fail(msg)
-		o.setSteps(task.IDs, protocol.StepFailed, msg)
-	case current != task.Digest:
-		log.WithField("current", current).Info("tag moved on; image need superseded")
-
-		o.setSteps(task.IDs, protocol.StepSuperseded, fmt.Sprintf("tag %s now points at %s", ref, current))
-	default:
-		msg := fmt.Sprintf("the local image of %s is not the granted digest %s "+
-			"although the tag still points at it", ref, task.Digest)
 
 		o.fail(msg)
 		o.setSteps(task.IDs, protocol.StepFailed, msg)

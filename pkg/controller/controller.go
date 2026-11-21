@@ -1,5 +1,5 @@
 // Package controller wires the per-devnet controller: store, beacon watcher,
-// scheduler, API and the embedded web UI.
+// scheduler, registry lookups, API and the embedded web UI.
 package controller
 
 import (
@@ -21,10 +21,13 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/api"
 	"github.com/ethpandaops/upgradoor/pkg/controller/beacon"
+	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
+	"github.com/ethpandaops/upgradoor/pkg/controller/registry"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
+	"github.com/ethpandaops/upgradoor/pkg/registryauth"
 )
 
 // DatabaseFile is the SQLite file name inside the data directory.
@@ -50,9 +53,6 @@ type Config struct {
 	// variable would show it in the process listing or the pod
 	// specification.
 	ControllerSeedFile string
-	// ControllerGeneration is the generation of the controller key to derive
-	// (default 0). Raising it rotates this network's controller key.
-	ControllerGeneration uint64
 	// AllowUnsignedAgentAnswers runs the controller without a controller
 	// seed: its answers are not signed, and agents that pin a controller key
 	// refuse them (development only).
@@ -71,6 +71,11 @@ type Config struct {
 	AuthService string
 	// BeaconEndpoints are beacon API base URLs, tried in order.
 	BeaconEndpoints []string
+	// RegistryAuthFile is a Docker config.json with the credentials for the
+	// registry lookups; empty or missing means anonymous.
+	RegistryAuthFile string
+	// Registry is how the registries are reached for the lookups.
+	Registry registry.Config
 	// DefaultSettings are "key=value" overrides of the built-in setting
 	// defaults; keys are the JSON names of fleet.Settings.
 	DefaultSettings []string
@@ -93,6 +98,7 @@ type controller struct {
 	store     store.Store
 	beacon    beacon.Service
 	scheduler scheduler.Service
+	lookups   discovery.Tracker
 	api       *api.Server
 	server    *http.Server
 	served    chan error
@@ -150,6 +156,20 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Changed: func() { c.api.Notify() },
 	})
 
+	logins := registryauth.Logins{}
+	if cfg.RegistryAuthFile != "" {
+		if logins, err = registryauth.LoadLogins(log, cfg.RegistryAuthFile); err != nil {
+			return nil, fmt.Errorf("controller: --registry-auth-file: %w", err)
+		}
+	}
+
+	resolver, err := registry.NewResolver(log, &cfg.Registry, logins)
+	if err != nil {
+		return nil, fmt.Errorf("controller: %w", err)
+	}
+
+	c.lookups = discovery.NewTracker(log, resolver, defaults.LookupInterval.Std(), time.Now)
+
 	c.api, err = api.New(log, api.Options{
 		Network:                cfg.Network,
 		Version:                cfg.Version,
@@ -163,6 +183,7 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Store:                  c.store,
 		Scheduler:              c.scheduler,
 		Beacon:                 c.beacon,
+		Lookups:                c.lookups,
 		DefaultSettings:        defaults,
 		WebFS:                  cfg.WebFS,
 		Registry:               prometheus.NewRegistry(),
@@ -178,28 +199,21 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 			"the controller's name. Development only.")
 	} else {
 		// The fingerprint names the public key; it is no secret. It is what
-		// the agents list under controller_keys_sha256.
-		c.log.WithFields(logrus.Fields{
-			"controller_key_sha256": identity.KeyFingerprint(answers.PublicKey()),
-			"controller_generation": cfg.ControllerGeneration,
-		}).Info("Signing answers to agents with the controller key derived " +
-			"from the controller seed")
+		// the agents log as controller_key_sha256.
+		c.log.WithField("controller_key_sha256", identity.KeyFingerprint(answers.PublicKey())).
+			Info("Signing answers to agents with the controller key derived " +
+				"from the controller seed")
 	}
 
 	return c, nil
 }
 
 // loadAnswerSigner reads the controller seed and derives the controller key
-// of this network and generation from it. Without a seed it returns nil,
+// of this network from it. Without a seed it returns nil,
 // which is only accepted with the explicit opt-out.
 func loadAnswerSigner(cfg *Config) (*identity.AnswerSigner, error) {
 	switch {
 	case cfg.ControllerSeedFile == "" && cfg.AllowUnsignedAgentAnswers:
-		if cfg.ControllerGeneration != 0 {
-			return nil, errors.New("controller: --controller-generation without " +
-				"--controller-seed-file")
-		}
-
 		return nil, nil //nolint:nilnil // no key and no error is the opt-out
 	case cfg.ControllerSeedFile == "":
 		return nil, errors.New("controller: --controller-seed-file is required: agents act " +
@@ -216,7 +230,7 @@ func loadAnswerSigner(cfg *Config) (*identity.AnswerSigner, error) {
 		return nil, fmt.Errorf("controller: --controller-seed-file: %w", err)
 	}
 
-	key, err := identity.DeriveControllerKey(seed, cfg.Network, cfg.ControllerGeneration)
+	key, err := identity.DeriveControllerKey(seed, cfg.Network)
 	if err != nil {
 		return nil, fmt.Errorf("controller: derive the controller key: %w", err)
 	}
@@ -243,9 +257,14 @@ func (c *controller) Start(ctx context.Context) error {
 		return errors.Join(fmt.Errorf("scheduler: %w", err), c.beacon.Stop(), c.store.Stop())
 	}
 
+	if err := c.lookups.Start(ctx); err != nil {
+		return errors.Join(fmt.Errorf("lookups: %w", err),
+			c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
+	}
+
 	if err := c.api.Start(ctx); err != nil {
 		return errors.Join(fmt.Errorf("api: %w", err),
-			c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
+			c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
 	}
 
 	var lc net.ListenConfig
@@ -253,7 +272,7 @@ func (c *controller) Start(ctx context.Context) error {
 	listener, err := lc.Listen(ctx, "tcp", c.cfg.Listen)
 	if err != nil {
 		return errors.Join(fmt.Errorf("listen: %w", err),
-			c.api.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
+			c.api.Stop(), c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
 	}
 
 	// WriteTimeout is that of a request. An event stream sets its own
@@ -304,7 +323,7 @@ func (c *controller) Stop() error {
 		errs = append(errs, c.server.Shutdown(ctx), <-c.served)
 	}
 
-	errs = append(errs, c.api.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
+	errs = append(errs, c.api.Stop(), c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
 
 	return errors.Join(errs...)
 }

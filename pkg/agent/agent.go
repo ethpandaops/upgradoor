@@ -34,10 +34,6 @@ type Service interface {
 type Deps struct {
 	// Host is the machine. Required.
 	Host host.Host
-	// Logins are the registry logins of cfg.Registry.AuthFile.
-	Logins registry.Logins
-	// Resolver looks tags up; nil uses registry.NewResolver with Logins.
-	Resolver registry.Resolver
 	// Now is the clock (default time.Now).
 	Now func() time.Time
 	// Version is the reported agent version (default "dev").
@@ -54,14 +50,13 @@ type agent struct {
 	hostName string
 	network  string
 
-	host     host.Host
-	resolver registry.Resolver
-	link     link.Client
-	tracker  registry.Tracker
-	files    local.Files
-	audit    local.Audit
-	rolls    local.Rolls
-	server   local.Server
+	host    host.Host
+	link    link.Client
+	tracker registry.Tracker
+	files   local.Files
+	audit   local.Audit
+	rolls   local.Rolls
+	server  local.Server
 	// state and runner are set by Start.
 	state  lease.State
 	runner lease.Runner
@@ -75,13 +70,22 @@ type agent struct {
 	mu     sync.Mutex
 	view   *plan.View
 	status local.Status
+	// seen are the facts of view; Status classifies them again.
+	seen *plan.Facts
 
 	// Owned by the loop goroutine.
-	directives     directives
+	directives directives
+	// tags are the followed tags as last reported.
+	tags           []string
 	facts          plan.Facts
 	lastValidators *protocol.Validators
 	queue          protocol.Queue
 	syncFailing    bool
+	// lastAnswer is when the controller last answered; the start before that.
+	lastAnswer time.Time
+	// fallbackTried are the needs the fallback has given a lease during this
+	// silence; nil while the fallback is off.
+	fallbackTried map[string]struct{}
 
 	lifeMu   sync.Mutex
 	started  bool
@@ -132,28 +136,21 @@ func New(log logrus.FieldLogger, cfg *Config, creds *identity.Credentials, deps 
 		return nil, fmt.Errorf("agent: %w", err)
 	}
 
-	resolver := deps.Resolver
-	if resolver == nil {
-		if resolver, err = registry.NewResolver(log, &cfg.Registry, deps.Logins); err != nil {
-			return nil, fmt.Errorf("agent: %w", err)
-		}
-	}
-
 	audit := local.NewAudit(log, &cfg.Local.AuditLog, now)
 
 	a := &agent{
 		log: log, cfg: cfg, now: now, version: version,
 		hostName: claims.Subject, network: claims.Network,
-		host: deps.Host, resolver: resolver, link: client,
+		host: deps.Host, link: client,
 		// Without the roll verb nothing is pulled.
-		tracker: registry.NewTracker(log, deps.Host, resolver, cfg.Registry.PollInterval,
-			cfg.Policy.Allows(protocol.VerbRoll), now),
+		tracker:          registry.NewTracker(log, deps.Host, cfg.Policy.Allows(protocol.VerbRoll), now),
 		files:            local.NewFiles(log, cfg.Local.OverridesFile, audit, now),
 		audit:            audit,
 		rolls:            local.NewRolls(now),
 		kick:             make(chan struct{}, 1),
 		inventoryTimeout: inventoryTimeout,
 		directives:       directives{pending: make(map[string]pendingRoll, 4)},
+		lastAnswer:       now(),
 	}
 	a.server = local.NewServer(log, &cfg.Local, localAPI{a})
 
@@ -220,7 +217,7 @@ func (a *agent) open() error {
 
 	a.state = state
 	a.runner = lease.New(a.log, &a.cfg.Verify, state, &lease.Deps{
-		Host: a.host, Policy: &a.cfg.Policy, Overrides: a.files, Registry: a.resolver,
+		Host: a.host, Policy: &a.cfg.Policy, Overrides: a.files, Registry: a.tracker,
 		Audit: a.audit, Notify: a.wake, Now: a.now,
 	})
 

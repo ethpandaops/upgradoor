@@ -62,7 +62,9 @@ const (
 	// RolloutSuperseded: the cause changed (the tag moved to a newer digest,
 	// newer package versions appeared) before the rollout finished.
 	RolloutSuperseded RolloutState = "superseded"
-	// RolloutAborted: a manual rollout that a person closed.
+	// RolloutAborted: a person closed the rollout. That is final: a group or
+	// packages rollout's target is not rolled again (open skips its key)
+	// until the target changes or someone rolls it by hand.
 	RolloutAborted RolloutState = "aborted"
 )
 
@@ -120,9 +122,9 @@ type Rollout struct {
 	// can only be set explicitly by a person and is audited.
 	IgnoreBudget bool `json:"ignoreBudget"`
 	// Canary is the host that goes alone until the rollout has its first
-	// success. Empty for a forced rollout, for a rollout with a single member
-	// and for a rollout whose first success came without one (a broken host
-	// that was repaired).
+	// success. Empty for a forced rollout and for a rollout with a single
+	// member. A rollout whose broken hosts went first has none until the
+	// first of them succeeds; that host is its canary then.
 	Canary string `json:"canary,omitempty"`
 
 	CreatedBy string     `json:"createdBy"`
@@ -166,11 +168,14 @@ const (
 	// (RolloutHost.SkippedBy), the host was forgotten, or its agent rejected
 	// the directive of a manual rollout.
 	HostSkipped HostState = "skipped"
+	// HostAborted: the rollout was aborted before the host was served. A
+	// member that held a lease then gets the outcome of that lease instead.
+	HostAborted HostState = "aborted"
 )
 
 // Settled reports whether the host is no longer waited for.
 func (s HostState) Settled() bool {
-	return s == HostDone || s == HostSkipped
+	return s == HostDone || s == HostSkipped || s == HostAborted
 }
 
 // Stage is the place of a host inside a rollout: hosts the change already
@@ -323,6 +328,11 @@ type Lease struct {
 	// open the agent is told with every sync (protocol.Lease.Cancel) and
 	// stops after the step in progress.
 	Cancelled *LeaseCancel `json:"cancelled,omitempty"`
+	// Recheck marks a lease that only repeats the readiness check of a
+	// failed lease whose steps the agent did, after a person retried its
+	// host. It starts verifying, carries that lease's needs and operation
+	// and is never offered to the agent.
+	Recheck bool `json:"recheck,omitempty"`
 }
 
 // DirectiveState is the controller-side state of a directive.

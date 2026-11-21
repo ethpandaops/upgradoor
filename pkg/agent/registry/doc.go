@@ -1,11 +1,9 @@
-// Package registry resolves tags to digests, loads registry credentials from
-// Docker's config.json and tracks and pulls the images the agent needs.
+// Package registry tracks the tags the agent follows.
 //
-// An image is pulled by its tag only while the pull window names it at the
-// digest of the tracker's check, and accepted only at that digest; the
-// controller cannot name a digest to pull. Credentials go only to the
-// registry they belong to, never across a redirect to another host, and
-// token URLs are kept out of errors. Registry answers are bounded.
+// The controller looks the tags up; the agent never asks a registry. The
+// tracker compares the digests with the local images. A lease pulls its
+// images itself; the tracker pulls only for the fallback, while the
+// controller cannot be reached.
 package registry
 
 // logPackage is the package field of the log lines.

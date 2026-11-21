@@ -14,17 +14,17 @@ import (
 // testControllerSeed is a controller seed: another secret than testSeed.
 const testControllerSeed = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-func controllerKey(t *testing.T, network string, generation uint64) *mldsa.PrivateKey {
+func controllerKey(t *testing.T, network string) *mldsa.PrivateKey {
 	t.Helper()
 
-	key, err := DeriveControllerKey([]byte(testControllerSeed), network, generation)
+	key, err := DeriveControllerKey([]byte(testControllerSeed), network)
 	require.NoError(t, err)
 
 	return key
 }
 
 func TestAnswerEncoding(t *testing.T) {
-	key := controllerKey(t, "net", 0)
+	key := controllerKey(t, "net")
 
 	signer, err := NewAnswerSigner(key, "net")
 	require.NoError(t, err)
@@ -65,7 +65,7 @@ func TestAnswerVerify(t *testing.T) {
 		body    = `{"lease":{"id":"l1"}}`
 	)
 
-	key := controllerKey(t, "net", 0)
+	key := controllerKey(t, "net")
 	pub := PublicKey(key)
 
 	signer, err := NewAnswerSigner(key, "net")
@@ -82,8 +82,9 @@ func TestAnswerVerify(t *testing.T) {
 
 	good := signedBy(t, signer, host, request, body)
 
-	rotated := controllerKey(t, "net", 1)
-	rotatedSigner, err := NewAnswerSigner(rotated, "net")
+	otherSeed, err := DeriveControllerKey([]byte(testSeed), "net")
+	require.NoError(t, err)
+	otherKey, err := NewAnswerSigner(otherSeed, "net")
 	require.NoError(t, err)
 
 	otherNet, err := NewAnswerSigner(key, "net2")
@@ -107,7 +108,7 @@ func TestAnswerVerify(t *testing.T) {
 		return out
 	}
 
-	verifier, err := NewAnswerVerifier([]*mldsa.PublicKey{pub}, "net", host)
+	verifier, err := NewAnswerVerifier(pub, "net", host)
 	require.NoError(t, err)
 
 	got, err := verifier.Verify(request, good)
@@ -148,20 +149,20 @@ func TestAnswerVerify(t *testing.T) {
 		},
 		{
 			name: "signed by another controller key", request: request,
-			answer: signedBy(t, rotatedSigner, host, request, body),
-			reason: "not signed by an accepted controller key",
+			answer: signedBy(t, otherKey, host, request, body),
+			reason: "not signed by the controller key",
 		},
 		{
 			name: "signature altered", request: request,
 			answer: reencode(t, func(s *SignedAnswer) {
 				s.Signature = s.Signature[:len(s.Signature)-4] + "AAAA"
 			}),
-			reason: "not signed by an accepted controller key",
+			reason: "not signed by the controller key",
 		},
 		{
 			name: "a token of the key that is no answer", request: request,
 			answer: reencode(t, func(s *SignedAnswer) { s.Signature = foreignType }),
-			reason: "not signed by an accepted controller key",
+			reason: "not signed by the controller key",
 		},
 		{
 			name: "unsigned answer", request: request, answer: []byte(body),
@@ -185,29 +186,8 @@ func TestAnswerVerify(t *testing.T) {
 		})
 	}
 
-	t.Run("a host accepts each key of its list", func(t *testing.T) {
-		both, err := NewAnswerVerifier([]*mldsa.PublicKey{pub, PublicKey(rotated)}, "net", host)
-		require.NoError(t, err)
-
-		for _, s := range []*AnswerSigner{signer, rotatedSigner} {
-			got, verr := both.Verify(request, signedBy(t, s, host, request, body))
-			require.NoError(t, verr)
-			assert.Equal(t, body, string(got))
-		}
-
-		// Once the old key is taken off the list it is refused.
-		onlyNew, err := NewAnswerVerifier([]*mldsa.PublicKey{PublicKey(rotated)}, "net", host)
-		require.NoError(t, err)
-
-		_, err = onlyNew.Verify(request, good)
-		require.ErrorIs(t, err, ErrBadAnswer)
-	})
-
 	t.Run("a verifier needs a key", func(t *testing.T) {
 		_, err := NewAnswerVerifier(nil, "net", host)
-		require.ErrorIs(t, err, ErrInvalidKey)
-
-		_, err = NewAnswerVerifier([]*mldsa.PublicKey{nil}, "net", host)
 		require.ErrorIs(t, err, ErrInvalidKey)
 
 		_, err = NewAnswerSigner(nil, "net")

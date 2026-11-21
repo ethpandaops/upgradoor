@@ -10,10 +10,6 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 )
 
-// MaxControllerKeys bounds controller.publicKeys: every key listed is one
-// more key the host obeys.
-const MaxControllerKeys = 4
-
 const (
 	defaultSyncInterval      = 30 * time.Second
 	defaultLeaseSyncInterval = 5 * time.Second
@@ -36,9 +32,9 @@ type Config struct {
 	MaxSyncInterval time.Duration `yaml:"maxSyncInterval"`
 	// AllowInsecure permits a plain http controller URL (development only).
 	AllowInsecure bool `yaml:"allowInsecure"`
-	// PublicKeys are the accepted controller public keys (unpadded base64url).
-	PublicKeys []string `yaml:"publicKeys"`
-	// AllowUnsignedAnswers runs without PublicKeys (development only).
+	// PublicKey is the controller public key (unpadded base64url).
+	PublicKey string `yaml:"publicKey"`
+	// AllowUnsignedAnswers runs without PublicKey (development only).
 	AllowUnsignedAnswers bool `yaml:"allowUnsignedAnswers"`
 }
 
@@ -56,7 +52,7 @@ func (c *Config) ApplyDefaults() {
 	def(&c.MaxSyncInterval, defaultMaxSyncInterval)
 }
 
-// Validate checks the URL and the keys.
+// Validate checks the URL and the key.
 func (c *Config) Validate() error {
 	u, err := url.Parse(c.URL)
 	if err != nil || u.Host == "" {
@@ -67,37 +63,29 @@ func (c *Config) Validate() error {
 		return errors.New("controller.url must be https (or http with controller.allowInsecure)")
 	}
 
-	_, err = c.Keys()
+	_, err = c.Key()
 
 	return err
 }
 
-// Keys decodes publicKeys; the result is empty only with allowUnsignedAnswers.
-func (c *Config) Keys() ([]*mldsa.PublicKey, error) {
+// Key decodes publicKey; it is nil only with allowUnsignedAnswers.
+func (c *Config) Key() (*mldsa.PublicKey, error) {
 	switch {
-	case len(c.PublicKeys) == 0 && c.AllowUnsignedAnswers:
-		return nil, nil
-	case len(c.PublicKeys) == 0:
-		return nil, errors.New("controller.publicKeys is required: the agent acts only on " +
+	case c.PublicKey == "" && c.AllowUnsignedAnswers:
+		return nil, nil //nolint:nilnil // no key and no error is the opt-out
+	case c.PublicKey == "":
+		return nil, errors.New("controller.publicKey is required: the agent acts only on " +
 			"answers signed by the controller key (controller.allowUnsignedAnswers runs " +
 			"without, for development)")
 	case c.AllowUnsignedAnswers:
 		return nil, errors.New(
-			"controller.publicKeys and controller.allowUnsignedAnswers exclude each other")
-	case len(c.PublicKeys) > MaxControllerKeys:
-		return nil, fmt.Errorf("controller.publicKeys lists more than %d keys", MaxControllerKeys)
+			"controller.publicKey and controller.allowUnsignedAnswers exclude each other")
 	}
 
-	keys := make([]*mldsa.PublicKey, 0, len(c.PublicKeys))
-
-	for i, raw := range c.PublicKeys {
-		key, err := identity.DecodePublicKey(raw)
-		if err != nil {
-			return nil, fmt.Errorf("controller.publicKeys[%d]: %w", i, err)
-		}
-
-		keys = append(keys, key)
+	key, err := identity.DecodePublicKey(c.PublicKey)
+	if err != nil {
+		return nil, fmt.Errorf("controller.publicKey: %w", err)
 	}
 
-	return keys, nil
+	return key, nil
 }

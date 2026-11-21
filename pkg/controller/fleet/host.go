@@ -7,6 +7,7 @@ package fleet
 import (
 	"errors"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/identity"
@@ -20,8 +21,6 @@ type Host struct {
 	// CertHash is the hash of the certificate last presented. A change is
 	// audited, not rejected.
 	CertHash string `json:"certHash"`
-	// Generation and Roles are copied from the certificate.
-	Generation uint64 `json:"generation"`
 	// Validators is the range of validators the controller counts for the
 	// host: its weight, and the validators whose attestations are tracked
 	// for it. It comes from what the host reports (Status.Validators), not
@@ -33,7 +32,8 @@ type Host struct {
 	// counted (UnclaimedRange). The ranges of all hosts are therefore
 	// disjoint.
 	Validators *identity.ValidatorRange `json:"validators,omitempty"`
-	Roles      []string                 `json:"roles"`
+	// Roles are copied from the certificate.
+	Roles []string `json:"roles"`
 
 	FirstSeen time.Time `json:"firstSeen"`
 	LastSeen  time.Time `json:"lastSeen"`
@@ -52,9 +52,9 @@ type Host struct {
 	// into hold / release-hold directives until the agent agrees.
 	HoldWanted bool   `json:"holdWanted"`
 	HoldReason string `json:"holdReason,omitempty"`
-	// HoldBy says through what the hold was set: HoldByTeam when a person
-	// set it with a team feature, empty for every other hold. A team feature
-	// lifts only a hold that was set through one.
+	// HoldBy says through what the hold was set: TeamHold of the teams when
+	// a person set it with a team feature, empty for every other hold. A team
+	// feature lifts only a hold that one of its teams set.
 	HoldBy string `json:"holdBy,omitempty"`
 	// HoldActor is the person who set the controller hold, as the audit log
 	// names them; the agent writes them into the hold entry of its overrides
@@ -74,30 +74,32 @@ type Host struct {
 	// it where a lease is released with the group's steps done; it goes with
 	// the host when the host is forgotten.
 	Broken map[string]string `json:"broken,omitempty"`
-	// Pull is the host's pull window: the images the scheduler lets it pull
-	// now. Nil while it may pull nothing.
-	Pull *PullWindow `json:"pull,omitempty"`
 
 	// SyncInterval is the longest sync interval the controller asked of the
 	// host in its last answer. StaleAfter allows for it.
 	SyncInterval time.Duration `json:"syncInterval,omitempty"`
 }
 
-// PullWindow is a host's permission to pull the images its needs wait for.
-type PullWindow struct {
-	Images    []protocol.PullImage `json:"images"`
-	GrantedAt time.Time            `json:"grantedAt"`
-	// EndedAt is when the scheduler ended the window. It is no longer
-	// offered, and counts for the limit until the agent synced after it
-	// without pulling.
-	EndedAt *time.Time `json:"endedAt,omitempty"`
+// HoldByTeam is OfflineMark.By for a mark set through a team feature, and
+// starts Host.HoldBy of a hold set through one (TeamHold).
+const HoldByTeam = "team"
+
+// TeamHold is Host.HoldBy for a hold that the teams set through a team
+// feature: "team:geth,reth".
+func TeamHold(teams []string) string {
+	return HoldByTeam + ":" + strings.Join(teams, ",")
 }
 
-// Open reports whether the window is offered to the agent.
-func (w *PullWindow) Open() bool { return w != nil && w.EndedAt == nil }
+// HoldTeams returns the teams of a Host.HoldBy that TeamHold wrote, and
+// whether it is one.
+func HoldTeams(by string) ([]string, bool) {
+	rest, ok := strings.CutPrefix(by, HoldByTeam+":")
+	if !ok || rest == "" {
+		return nil, false
+	}
 
-// HoldByTeam is Host.HoldBy for a hold set through a team feature.
-const HoldByTeam = "team"
+	return strings.Split(rest, ","), true
+}
 
 // OfflineMark marks a host as known offline.
 type OfflineMark struct {

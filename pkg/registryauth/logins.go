@@ -1,4 +1,5 @@
-package registry
+// Package registryauth reads registry credentials from a Docker config.json.
+package registryauth
 
 import (
 	"encoding/base64"
@@ -21,8 +22,8 @@ type Login struct {
 	Password string
 }
 
-// basic renders the value of a Basic Authorization header.
-func (l Login) basic() string {
+// Basic renders the value of a Basic Authorization header.
+func (l Login) Basic() string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(l.Username+":"+l.Password))
 }
 
@@ -54,7 +55,7 @@ type dockerConfig struct {
 // When several keys name one registry, the key spelling the registry host
 // wins, then a bare host alias, then a URL, then the key that sorts first.
 func LoadLogins(log logrus.FieldLogger, path string) (Logins, error) {
-	log = log.WithFields(logrus.Fields{"package": logPackage, "auth_file": path})
+	log = log.WithFields(logrus.Fields{"package": "registryauth", "auth_file": path})
 
 	raw, err := os.ReadFile(path)
 	if errors.Is(err, fs.ErrNotExist) {

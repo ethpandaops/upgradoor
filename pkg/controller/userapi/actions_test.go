@@ -468,90 +468,53 @@ func TestActionsEndToEnd(t *testing.T) {
 	}
 }
 
-// TestRetryOfAnAbortedRolloutNeedsSupervise: retrying an aborted rollout
-// reopens its cause for every host. It needs the rollout-level feature,
-// whatever hosts the request names; recover and its twin are about hosts.
-func TestRetryOfAnAbortedRolloutNeedsSupervise(t *testing.T) {
+// TestRolloutActionRequirements: a retry with hosts recovers hosts, whatever
+// the rollout's state (an aborted one is refused by the scheduler); pause and
+// resume (approve) of a rollout are the team's of its client; abort needs
+// supervise itself.
+func TestRolloutActionRequirements(t *testing.T) {
 	h := newHarness(t, nil)
 	controllertest.OwnershipFixture(h.store)
 
-	retry := func(rollout string, hosts ...string) string {
-		quoted := make([]string, 0, len(hosts))
-		for _, host := range hosts {
-			quoted = append(quoted, fmt.Sprintf("%q", host))
-		}
-
-		return fmt.Sprintf(`{"rollout":%q,"hosts":[%s]}`, rollout, strings.Join(quoted, ","))
-	}
-
-	lacksSupervise := "forbidden: this login lacks the feature upgradoor:supervise"
-	teamRecover, lighthouse := "+upgradoor:team_recover", []string{"lighthouse"}
+	retry := fmt.Sprintf(`{"rollout":"r-aborted","hosts":[%q]}`, controllertest.HostMixed)
+	lighthouse := []string{"lighthouse"}
 
 	for _, tt := range []authzCase{
 		{
-			name: "the team twin, an owned host", body: retry("r-aborted", controllertest.HostMixed),
-			services: teamRecover, teams: lighthouse, refusal: lacksSupervise,
+			name: "retry hosts of an aborted rollout, the team twin", action: "retry", body: retry,
+			services: "+upgradoor:team_recover", teams: lighthouse, by: "team_recover",
 		},
 		{
-			name: "the team twin, a host that is no member", body: retry("r-aborted", controllertest.HostTeku),
-			services: "+upgradoor:team_*", teams: []string{"geth", "teku"}, refusal: lacksSupervise,
+			name: "retry an aborted rollout, recover", action: "retry", body: `{"rollout":"r-aborted"}`,
+			services: "+upgradoor:recover",
+			refusal:  "forbidden: this login lacks the feature upgradoor:supervise",
 		},
 		{
-			name: "recover", body: retry("r-aborted", controllertest.HostMixed),
-			services: "+upgradoor:recover", refusal: lacksSupervise,
+			name: "approve the team's client", action: "resume", body: `{"rollout":"r-lighthouse"}`,
+			services: "+upgradoor:team_supervise", teams: lighthouse, by: "team_supervise",
 		},
 		{
-			name: "recover and every twin", body: retry("r-aborted", controllertest.HostMixed),
-			services: "+upgradoor:recover:roll:reboot:hold:team_*", teams: lighthouse, refusal: lacksSupervise,
+			name: "approve another team's client", action: "resume", body: `{"rollout":"r-lighthouse"}`,
+			services: "+upgradoor:team_supervise", teams: []string{"geth"},
+			refusal: "forbidden: upgradoor:team_supervise does not cover client lighthouse: container " +
+				"lighthouse on host lighthouse-geth-1 (owners: lighthouse)",
 		},
 		{
-			// Allowed here; the scheduler then refuses the hosts.
-			name: "supervise", body: retry("r-aborted", controllertest.HostMixed),
-			services: "+upgradoor:supervise", by: "supervise",
+			name: "pause a rollout for no client", action: "pause", body: `{"rollout":"r-1"}`,
+			services: "+upgradoor:team_supervise", teams: lighthouse,
+			refusal: "forbidden: upgradoor:team_supervise does not cover rollout r-1: it is for no client",
 		},
 		{
-			name: "supervise, no hosts", body: retry("r-aborted"),
-			services: "+upgradoor:supervise", by: "supervise",
+			name: "pause an unknown rollout", action: "pause", body: `{"rollout":"r-ghost"}`,
+			services: "+upgradoor:team_supervise", teams: lighthouse,
+			refusal: "forbidden: upgradoor:team_supervise does not cover rollout r-ghost (owners: none)",
 		},
 		{
-			name: "recover, no hosts", body: retry("r-aborted"),
-			services: "+upgradoor:recover", refusal: lacksSupervise,
-		},
-
-		// A rollout that is not aborted: hosts are a recovery.
-		{
-			name: "halted, the team twin", body: retry("r-1", controllertest.HostMixed),
-			services: teamRecover, teams: lighthouse, by: "team_recover",
-		},
-		{
-			name: "halted, recover", body: retry("r-1", controllertest.HostMixed),
-			services: "+upgradoor:recover", by: "recover",
-		},
-		{
-			name: "halted, supervise names hosts", body: retry("r-1", controllertest.HostMixed),
-			services: "+upgradoor:supervise",
-			refusal:  "forbidden: this login lacks the feature upgradoor:recover",
-		},
-
-		// A rollout nobody knows: nothing is owned in it. With the plain
-		// feature the scheduler answers.
-		{
-			name: "unknown, the team twin", body: retry("r-ghost", controllertest.HostMixed),
-			services: teamRecover, teams: lighthouse,
-			refusal: "forbidden: upgradoor:team_recover does not cover rollout r-ghost (owners: none)",
-		},
-		{
-			name: "unknown, recover", body: retry("r-ghost", controllertest.HostMixed),
-			services: "+upgradoor:recover", by: "recover",
-		},
-		{
-			name: "unknown, nothing", body: retry("r-ghost", controllertest.HostMixed),
-			services: "+upgradoor:supervise",
-			refusal:  "forbidden: this login lacks the feature upgradoor:recover",
+			name: "abort the team's client", action: "abort", body: `{"rollout":"r-lighthouse"}`,
+			services: "+upgradoor:team_*", teams: lighthouse,
+			refusal: "forbidden: this login lacks the feature upgradoor:supervise",
 		},
 	} {
-		tt.action = "retry"
-
 		t.Run(tt.name, func(t *testing.T) {
 			runAuthz(t, h, &tt)
 		})
@@ -561,18 +524,56 @@ func TestRetryOfAnAbortedRolloutNeedsSupervise(t *testing.T) {
 	h.store.SetErr(assert.AnError)
 
 	req := httptest.NewRequest(http.MethodPost, controllertest.BaseURL+"/api/v1/x",
-		strings.NewReader(retry("r-aborted", controllertest.HostMixed)))
+		strings.NewReader(`{"rollout":"r-lighthouse"}`))
 	req.Header.Set("Content-Type", "application/json")
 
 	rec := httptest.NewRecorder()
-	h.srv.actions()["retry"](rec, req, &authz.User{Actor: controllertest.UserEmail, Services: "+upgradoor:recover"})
+	h.srv.actions()["resume"](rec, req, &authz.User{
+		Actor: controllertest.UserEmail, Services: "+upgradoor:team_supervise", Teams: lighthouse,
+	})
 	require.Equal(t, http.StatusInternalServerError, rec.Code)
 }
 
-// TestTeamTwinDoesNotTouchStaffHolds: team_hold lifts a hold that was set
-// through team_hold, by any team that owns a container of the host. A hold
-// that staff, the scheduler or the end of a lease set is not the twin's to
-// lift, nor to set again as its own.
+// TestRefusalsAreAudited: a refusal is audited once per actor and path in a
+// window, so refusals cannot flood the log.
+func TestRefusalsAreAudited(t *testing.T) {
+	h := newHarness(t, nil)
+
+	refusals := func() []fleet.AuditEntry {
+		return slices.DeleteFunc(h.store.AuditEntries(), func(e fleet.AuditEntry) bool {
+			return e.Action != "auth.refused"
+		})
+	}
+
+	send := func(actor, path string) {
+		req := httptest.NewRequest(http.MethodPost, controllertest.BaseURL+path, strings.NewReader(`{}`))
+		req.Header.Set("Content-Type", "application/json")
+
+		rec := httptest.NewRecorder()
+		h.srv.actions()["forget"](rec, req, &authz.User{Actor: actor, Teams: []string{"geth"}})
+		require.Equal(t, http.StatusForbidden, rec.Code)
+	}
+
+	send("eve@example.com", "/api/v1/actions/forget")
+	send("eve@example.com", "/api/v1/actions/forget")
+	send("mallory@example.com", "/api/v1/actions/forget")
+
+	got := refusals()
+	require.Len(t, got, 2)
+	assert.Equal(t, "eve@example.com", got[0].Actor)
+	assert.Equal(t, "/api/v1/actions/forget", got[0].Target)
+	assert.Equal(t, "forbidden: this login lacks the feature upgradoor:admin", got[0].Detail["reason"])
+	assert.Equal(t, []string{"geth"}, got[0].Detail["teams"])
+
+	h.clock.Advance(time.Minute)
+	send("eve@example.com", "/api/v1/actions/forget")
+	assert.Len(t, refusals(), 3, "audited again after the window")
+}
+
+// TestTeamTwinDoesNotTouchStaffHolds: team_hold lifts a hold that one of
+// its teams set through team_hold. A hold that staff, the scheduler, the end
+// of a lease or another team set is not the twin's to lift, nor to set again
+// as its own.
 func TestTeamTwinDoesNotTouchStaffHolds(t *testing.T) {
 	h := newHarness(t, nil)
 	controllertest.OwnershipFixture(h.store)
@@ -583,7 +584,7 @@ func TestTeamTwinDoesNotTouchStaffHolds(t *testing.T) {
 	h.store.Hosts[controllertest.HostMixed].HoldReason = "lease ended by operator"
 	// A team's.
 	h.store.Hosts[controllertest.HostTeku].HoldWanted = true
-	h.store.Hosts[controllertest.HostTeku].HoldBy = fleet.HoldByTeam
+	h.store.Hosts[controllertest.HostTeku].HoldBy = fleet.TeamHold([]string{"nimbus", "teku"})
 	h.store.Unlock()
 
 	hosts := func(names ...string) string { return `{"hosts":["` + strings.Join(names, `","`) + `"]}` }
@@ -611,7 +612,8 @@ func TestTeamTwinDoesNotTouchStaffHolds(t *testing.T) {
 		},
 		{
 			name: "unhold a team's hold, another owner of the host", action: "unhold", body: hosts(controllertest.HostTeku),
-			services: twin, teams: []string{"geth"}, by: "team_hold",
+			services: twin, teams: []string{"geth"},
+			refusal: "forbidden: upgradoor:team_hold does not lift the hold on host teku-geth-1 (set by team nimbus, teku)",
 		},
 		{
 			name: "unhold a team's hold, a team without a container there", action: "unhold",
@@ -619,12 +621,17 @@ func TestTeamTwinDoesNotTouchStaffHolds(t *testing.T) {
 			refusal: "forbidden: upgradoor:team_hold does not cover host teku-geth-1 (owners: geth, nimbus, teku)",
 		},
 		{
-			name: "hold again what a team holds", action: "hold", body: hosts(controllertest.HostTeku),
-			services: twin, teams: []string{"geth"}, by: "team_hold",
+			name: "hold again what the team holds", action: "hold", body: hosts(controllertest.HostTeku),
+			services: twin, teams: []string{"teku"}, by: "team_hold",
+		},
+		{
+			name: "hold again what another team holds", action: "hold", body: hosts(controllertest.HostTeku),
+			services: twin, teams: []string{"geth"},
+			refusal: "forbidden: upgradoor:team_hold does not change the hold on host teku-geth-1 (set by team nimbus, teku)",
 		},
 		{
 			name: "one of two is staff's", action: "unhold", body: hosts(controllertest.HostTeku, controllertest.HostMixed),
-			services: twin, teams: []string{"geth"},
+			services: twin, teams: []string{"geth", "teku"},
 			refusal: "forbidden: upgradoor:team_hold does not lift the hold on host lighthouse-geth-1 (set by staff)",
 		},
 		{
@@ -660,7 +667,7 @@ func TestTeamTwinDoesNotTouchStaffHolds(t *testing.T) {
 	}
 
 	assert.Equal(t, map[string]string{
-		controllertest.HostMixed: "staff", controllertest.HostTeku: "team", controllertest.HostUnowned: "", controllertest.HostFresh: "",
+		controllertest.HostMixed: "staff", controllertest.HostTeku: "team:nimbus,teku", controllertest.HostUnowned: "", controllertest.HostFresh: "",
 	}, by)
 	assert.Equal(t, "staff", controllertest.DecodeJSON[views.HostDetail](t, h.get("/api/v1/hosts/"+controllertest.HostMixed)).HoldBy)
 	assert.NotContains(t, h.get("/api/v1/public/hosts").Body.String(), "holdBy")
@@ -846,7 +853,7 @@ func TestRefusalsEchoSafely(t *testing.T) {
 		"host":      refusal("hold", `{"hosts":["bad\u0007\u001b[2Jhosté`+long+`"]}`),
 		"container": refusal("roll", `{"hosts":["`+controllertest.HostMixed+`"],"containers":["c\n\u0000`+long+`"]}`),
 		"lease":     refusal("end-lease", `{"lease":"l\t`+long+`"}`),
-		"rollout":   refusal("retry", `{"rollout":"r\u001b`+long+`","hosts":["`+controllertest.HostMixed+`"]}`),
+		"rollout":   refusal("pause", `{"rollout":"r\u001b`+strings.Repeat("r", 200)+`"}`),
 		"agent":     refusal("roll", `{"hosts":["`+controllertest.HostUnowned+`"]}`),
 	} {
 		assert.Less(t, len(got), 400, name)
@@ -1037,17 +1044,12 @@ func TestRetryAndHoldEndToEnd(t *testing.T) {
 		return `{"rollout":"` + id + `","hosts":["` + strings.Join(hosts, `","`) + `"]}`
 	}
 
-	// A team member cannot reopen an aborted cause by naming a host.
-	code, msg := send("retry", retry("r-aborted", controllertest.HostMixed), lighthouse)
-	assert.Equal(t, http.StatusForbidden, code)
-	assert.Equal(t, "forbidden: this login lacks the feature upgradoor:supervise", msg)
+	// An abort is final: nobody retries an aborted rollout.
+	code, msg := send("retry", retry("r-aborted", controllertest.HostTeku), teku)
+	assert.Equal(t, http.StatusConflict, code)
+	assert.Equal(t, "scheduler: invalid action: rollout r-aborted is aborted, which is final", msg)
 
-	code, _ = send("retry", retry("r-aborted", controllertest.HostTeku), teku)
-	assert.Equal(t, http.StatusForbidden, code)
-
-	// With the feature it is refused all the same: a rollout that is closed
-	// is not retried.
-	code, msg = send("retry", retry("r-aborted", controllertest.HostMixed), supervisor)
+	code, msg = send("retry", retry("r-aborted"), supervisor)
 	assert.Equal(t, http.StatusConflict, code)
 	assert.Contains(t, msg, "rollout r-aborted is aborted")
 
@@ -1077,12 +1079,12 @@ func TestRetryAndHoldEndToEnd(t *testing.T) {
 	assert.Equal(t, fleet.RolloutActive, rollout("r-halted").State)
 	assert.Equal(t, 2, actions())
 
-	// Holds. A team's hold: any owner of the host lifts it.
+	// Holds. A team's hold: the team lifts it.
 	ok("hold", `{"hosts":["`+controllertest.HostTeku+`"],"reason":"ours"}`, teku)
 
 	host, err := st.GetHost(ctx, controllertest.HostTeku)
 	require.NoError(t, err)
-	assert.Equal(t, fleet.HoldByTeam, host.HoldBy)
+	assert.Equal(t, fleet.TeamHold([]string{"teku"}), host.HoldBy)
 
 	ok("unhold", `{"hosts":["`+controllertest.HostTeku+`"]}`, teku)
 
@@ -1247,14 +1249,14 @@ func TestEndLeaseLeavesATeamsHoldTheTeams(t *testing.T) {
 
 	rec := send("hold", `{"hosts":["`+controllertest.HostMixed+`"],"reason":"ours"}`, team)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	require.Equal(t, fleet.HoldByTeam, host().HoldBy)
+	require.Equal(t, fleet.TeamHold([]string{"lighthouse"}), host().HoldBy)
 
 	rec = send("end-lease", `{"lease":"lease-1"}`, team)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 	assert.True(t, host().HoldWanted)
 	assert.Equal(t, "ours", host().HoldReason)
-	assert.Equal(t, fleet.HoldByTeam, host().HoldBy, "ending a lease changes no hold")
+	assert.Equal(t, fleet.TeamHold([]string{"lighthouse"}), host().HoldBy, "ending a lease changes no hold")
 
 	entries, err := st.ListAudit(ctx, store.AuditFilter{ActionPrefix: "action.end-lease"})
 	require.NoError(t, err)
@@ -1262,7 +1264,7 @@ func TestEndLeaseLeavesATeamsHoldTheTeams(t *testing.T) {
 	assert.NotContains(t, entries[0].Detail, "hold")
 
 	rec = h.serve(userRoute{method: http.MethodGet, path: "/api/v1/hosts/" + controllertest.HostMixed}.request(team))
-	assert.Equal(t, fleet.HoldByTeam, controllertest.DecodeJSON[views.HostDetail](t, rec).HoldBy)
+	assert.Equal(t, fleet.TeamHold([]string{"lighthouse"}), controllertest.DecodeJSON[views.HostDetail](t, rec).HoldBy)
 
 	// The team lifts its hold, while the lease is still open.
 	rec = send("unhold", hosts, team)

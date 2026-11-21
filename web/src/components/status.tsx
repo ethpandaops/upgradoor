@@ -9,7 +9,6 @@ import {
   type Need,
   type OfflineMark,
   type PublicImageRef,
-  type PullState,
   type RolloutKind,
   type RolloutState,
   type Stage,
@@ -76,6 +75,7 @@ const HOST_STATE_TONE: Record<HostState, Tone> = {
   done: 'success',
   failed: 'danger',
   skipped: 'neutral',
+  aborted: 'neutral',
 };
 
 export function HostStateBadge({ state }: { state: HostState }) {
@@ -140,6 +140,7 @@ const STEP_TONE: Record<StepStatus, Tone> = {
   failed: 'danger',
   superseded: 'neutral',
   refused: 'warning',
+  deferred: 'warning',
   cancelled: 'neutral',
 };
 
@@ -283,14 +284,9 @@ export function NeedLine({ need }: { need: Need }) {
           </span>
         ))}
       {need.kind === 'reboot' && <span>{list(need.reboot?.reasons).join(', ')}</span>}
-      {list(need.unpulled).length > 0 && (
-        <Badge
-          tone="neutral"
-          title={`Not on the host yet: ${list(need.unpulled)
-            .map(i => `${i.ref}@${shortDigest(i.digest)}`)
-            .join(', ')}`}
-        >
-          not pulled
+      {need.pullError && (
+        <Badge tone="warning" title={`image pull failed: ${need.pullError}`}>
+          pull failed
         </Badge>
       )}
       {need.directiveId && <Badge title={`directive ${need.directiveId}`}>manual</Badge>}
@@ -309,37 +305,6 @@ export function WorkTag({ kind }: { kind: keyof typeof WORK_LABEL }) {
       {WORK_LABEL[kind]}
     </span>
   );
-}
-
-const PULL: Record<PullState, { tone: Tone; label: string; title: string }> = {
-  waiting: {
-    tone: 'neutral',
-    label: 'waiting for a pull window',
-    title:
-      'Its needs wait for images that are not on the host yet; only a share of the hosts pulls at once (Max pulling)',
-  },
-  pulling: {
-    tone: 'accent',
-    label: 'pulling',
-    title: 'The host has a pull window and pulls the images its needs wait for',
-  },
-  pulled: { tone: 'success', label: 'pulled', title: 'The images are on the host; it waits for a slot' },
-};
-
-/** PullBadge says where a host that waits in a rollout stands with the images its needs wait for. */
-export function PullBadge({ pull }: { pull: PullState | undefined }) {
-  if (!pull) return null;
-  const p = PULL[pull];
-  return (
-    <Badge tone={p.tone} title={p.title}>
-      {p.label}
-    </Badge>
-  );
-}
-
-/** pullLabel names a pull state as its badge does. */
-export function pullLabel(pull: PullState): string {
-  return PULL[pull].label;
 }
 
 /** OfflineBadge says that a host is marked known offline, with why and until when. */

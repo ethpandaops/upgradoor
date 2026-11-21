@@ -15,7 +15,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/host"
-	"github.com/ethpandaops/upgradoor/pkg/agent/registry"
 	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -32,8 +31,8 @@ const (
 	parkPoll = 20 * time.Millisecond
 )
 
-// Host is a deterministic in-memory host implementing host.Host and
-// registry.Resolver with the same contracts. It records every call (Calls)
+// Host is a deterministic in-memory host implementing host.Host with the
+// same contracts, and the registry it pulls from. It records every call (Calls)
 // and can fail or park any of them (Fail, OnCall). Safe for concurrent use.
 // An injected Recreate failure leaves the container exited, modelling an
 // interrupted recreate, not the real host's rollback.
@@ -66,14 +65,14 @@ type Host struct {
 
 	failures map[string]error
 	resolves int
-	calls    []string
-	onCall   func(call string)
+	// remote, when set, is asked for a tag's digest by every pull.
+	remote func(ctx context.Context, ref string) (string, error)
+	calls  []string
+	notes  []string
+	onCall func(call string)
 }
 
-var (
-	_ host.Host         = (*Host)(nil)
-	_ registry.Resolver = (*Host)(nil)
-)
+var _ host.Host = (*Host)(nil)
 
 // NewHost builds a host from a scenario; validators is agent.yaml's
 // validators section, read with host.ReadValidators (nil: none).
@@ -243,9 +242,22 @@ func (h *Host) Pull(ctx context.Context, ref string) (digest, revision string, e
 	}
 
 	h.mu.Lock()
-	defer h.mu.Unlock()
+	remote := h.remote
+	h.mu.Unlock()
 
 	key := imageref.Normalize(ref)
+
+	if remote != nil {
+		digest, err := remote(ctx, ref)
+		if err != nil {
+			return "", "", fmt.Errorf("agenttest: pull %s: %w", ref, err)
+		}
+
+		h.SetRegistry(ref, digest, "")
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
 
 	tag, ok := h.registry[key]
 	if !ok {
@@ -486,7 +498,8 @@ func (h *Host) inventoryLocked() (*protocol.Inventory, error) {
 }
 
 // UpgradePackages implements host.Host (op "upgrade"); a name outside the
-// blocked set is refused before the call is recorded.
+// blocked set is refused before the call is recorded. Upgrading docker-ce
+// restarts the daemon and with it the running containers.
 func (h *Host) UpgradePackages(ctx context.Context, names []string) error {
 	h.mu.Lock()
 	blocked := h.blocked
@@ -520,6 +533,16 @@ func (h *Host) UpgradePackages(ctx context.Context, names []string) error {
 
 		return true
 	})
+
+	if slices.Contains(names, docker) {
+		now := time.Now()
+
+		for _, c := range h.containers {
+			if c.State == protocol.StateRunning {
+				c.StartedAt = now
+			}
+		}
+	}
 
 	return nil
 }
@@ -581,8 +604,9 @@ func (h *Host) Close() error {
 	return nil
 }
 
-// Resolve implements registry.Resolver (op "resolve:<ref>"). Every lookup
-// counts in Resolves except one failed by injection.
+// Resolve looks a tag up in the registry (op "resolve:<ref>"), as the
+// controller does: it is agenttest.Controller's Lookup. Every lookup counts
+// in Resolves except one failed by injection.
 func (h *Host) Resolve(ctx context.Context, ref string) (string, error) {
 	if err := h.begin(ctx, "resolve:"+ref, ""); err != nil {
 		return "", fmt.Errorf("agenttest: resolve %s: %w", ref, err)
@@ -599,6 +623,15 @@ func (h *Host) Resolve(ctx context.Context, ref string) (string, error) {
 	}
 
 	return tag.Digest, nil
+}
+
+// PullFrom makes every pull take the tag's digest from resolve, a registry
+// outside the host, instead of the host's own.
+func (h *Host) PullFrom(resolve func(ctx context.Context, ref string) (string, error)) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.remote = resolve
 }
 
 // SetRegistry points a tag at a digest in the registry.
@@ -829,4 +862,25 @@ func CallsAfter(calls []string, prefix string) []string {
 	}
 
 	return nil
+}
+
+// NotePull records how a lease's pull went; PullNotes returns the records.
+func (h *Host) NotePull(ref string, err error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	note := "pulled " + ref
+	if err != nil {
+		note = "failed " + ref
+	}
+
+	h.notes = append(h.notes, note)
+}
+
+// PullNotes returns "pulled <ref>" or "failed <ref>" for every NotePull.
+func (h *Host) PullNotes() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return slices.Clone(h.notes)
 }

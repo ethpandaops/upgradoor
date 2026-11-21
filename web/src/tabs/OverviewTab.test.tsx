@@ -98,7 +98,7 @@ describe('OverviewTab, logged in', () => {
     const progress = await screen.findByRole('region', { name: 'In progress' });
     const lease = (await within(progress).findByText('lighthouse-geth-2')).closest('li');
     expect(lease).toHaveTextContent('Image roll');
-    expect(within(lease as HTMLElement).getByRole('list', { name: 'Step 5 of 5: Ready check' })).toBeInTheDocument();
+    expect(within(lease as HTMLElement).getByRole('list', { name: 'Step 6 of 6: Ready check' })).toBeInTheDocument();
     expect(lease).toHaveTextContent('validators attesting: 0 of 1 epochs with at least 115 of 128');
 
     expect(screen.getByRole('region', { name: 'Outage budget' })).toHaveTextContent(
@@ -112,8 +112,11 @@ describe('OverviewTab, logged in', () => {
       .getAllByRole('listitem')
       .map(li => li.textContent);
     expect(hosts).toHaveLength(3);
-    // Its images come first: a pull window is granted without anybody acting.
-    expect(hosts[0]).toMatch(/^1lighthouse-nethermind-1Image rollwaits: waiting for its images to be pulled$/);
+    expect(hosts[0]).toMatch(/^1lighthouse-nethermind-1Image rollwaits: budget [\d.]+% of 10%$/);
+    // A failed pull is tried again without anybody acting.
+    expect(hosts).toContainEqual(
+      expect.stringMatching(/lighthouse-geth-4Image rollwaits: waiting to pull its image again after a failed pull$/)
+    );
     // A bootnode costs the budget nothing and waits for nothing: the queue does not hold it.
     expect(next).not.toHaveTextContent('bootnode-1');
     expect(next).not.toHaveTextContent('teku-besu-1');
@@ -175,18 +178,15 @@ describe('OverviewTab, logged in', () => {
     expect(first).toHaveTextContent('The network gate is closed');
 
     // A host holds a lease, so the closed gate lets nobody pass: every host
-    // that could be served waits for it. The gate holds back no pull: the
-    // hosts whose images are not there yet are the only ones up next.
+    // that could be served waits for it. The host that waits to pull its
+    // image again is the only one up next.
     expect(first).toHaveTextContent(/\d+ hosts? waits? for it to open/);
     const next = screen.getByRole('region', { name: 'Up next' });
     expect(
       within(next)
         .getAllByRole('listitem')
         .map(li => li.textContent)
-    ).toEqual([
-      '1lighthouse-nethermind-1Image rollwaits: waiting for its images to be pulled',
-      '2lighthouse-geth-4Image rollwaits: waiting for its images to be pulled',
-    ]);
+    ).toEqual(['1lighthouse-geth-4Image rollwaits: waiting to pull its image again after a failed pull']);
   });
 
   it('speaks of hosts, not validators, on a fleet without validators', async () => {

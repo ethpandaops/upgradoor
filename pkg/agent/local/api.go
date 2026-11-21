@@ -1,6 +1,7 @@
 package local
 
 import (
+	"context"
 	"slices"
 	"time"
 
@@ -15,6 +16,7 @@ const (
 	PathHold      = "/v1/hold"
 	PathRolls     = "/v1/rolls"
 	PathInit      = "/v1/init-overrides"
+	PathDeploy    = "/v1/deploy"
 )
 
 // Agent is what the socket asks of the running agent; user is "local:<unix
@@ -31,6 +33,8 @@ type Agent interface {
 	Roll(user, container string) (*Roll, error)
 	// InitOverrides writes the generated block and returns the file's path.
 	InitOverrides(user string) (string, error)
+	// Deploy writes what a container is deployed as; only root reaches it.
+	Deploy(ctx context.Context, user string, req *DeployRequest) (*DeployResult, error)
 }
 
 // Status is the answer of GET /v1/status.
@@ -169,6 +173,39 @@ type HoldRequest struct {
 type RollRequest struct {
 	Container string `json:"container"`
 }
+
+// DeployRequest is the body of POST /v1/deploy.
+type DeployRequest struct {
+	Container string `json:"container"`
+	Image     string `json:"image"`
+	// Command is the command line; null keeps the one the container was
+	// created with.
+	Command []string `json:"command"`
+	// Reset also removes the container's override entry.
+	Reset bool `json:"reset,omitempty"`
+}
+
+// DeployResult is the answer of POST /v1/deploy, printed for Ansible.
+type DeployResult struct {
+	Container string `json:"container"`
+	Exists    bool   `json:"exists"`
+	// Managed: the agent rolls the container to its target.
+	Managed bool `json:"managed"`
+	// Changed: the deployed block or the overrides changed.
+	Changed bool `json:"changed"`
+	// Roll is DeployRollRequested or DeployRollNone.
+	Roll string `json:"roll"`
+	// Ignore are the docker_container comparisons Ansible leaves to the agent.
+	Ignore []string `json:"ignore"`
+	// Pull: Ansible pulls the image itself.
+	Pull bool `json:"pull"`
+}
+
+// Roll values of a DeployResult.
+const (
+	DeployRollRequested = "requested"
+	DeployRollNone      = "none"
+)
 
 // Answer is the answer to every local request that changes something.
 type Answer struct {

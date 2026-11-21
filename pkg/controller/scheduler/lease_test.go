@@ -351,6 +351,36 @@ func TestOperationThatDisruptedNothing(t *testing.T) {
 		assert.Equal(t, fleet.HostPending, r.Host("a").State)
 		assert.Empty(t, r.Host("a").LeaseID)
 	})
+
+	t.Run("the image could not be pulled: pending until the agent lets it be tried again", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.host("a", 10)
+		b.wantsImage("a", imgLighthouse, digestA)
+		b.step()
+
+		b.report("a", protocol.PhasePulling, false)
+		b.step()
+		require.Equal(t, fleet.LeaseRunning, b.lease("a").State)
+
+		b.report("a", protocol.PhaseDone, false, protocol.StepDeferred)
+		b.get("a").Status.Needs[0].PullError = "manifest unknown"
+
+		out := b.step()
+		assert.Equal(t, fleet.LeaseExpired, out.Leases[0].State)
+		assert.Nil(t, b.lease("a"))
+		assert.Empty(t, b.get("a").Broken)
+		assert.Equal(t, reasonPull, queueReasons(out.Plan)["a"])
+
+		r := b.mustRollout(imageKey("", imgLighthouse, digestA))
+		assert.Equal(t, fleet.RolloutActive, r.State)
+		assert.Equal(t, fleet.HostPending, r.Host("a").State)
+
+		b.advance(time.Second)
+		b.get("a").Status.Needs[0].PullError = ""
+		b.get("a").Status.Operation = nil
+		b.step()
+		assert.NotNil(t, b.lease("a"))
+	})
 }
 
 func TestStepOutcomes(t *testing.T) {
@@ -1617,6 +1647,7 @@ func comparing(t *testing.T, share float64, prepare func(b *worldBuilder), refs 
 	b.w.Settings.ReadyEpochs = 0
 	b.w.Settings.MinPeers = 1
 	b.w.Settings.MaxUnavailablePercent = 100
+	b.w.Settings.MaxLeasedPercent = 100
 
 	b.host("a", 0)
 	b.wants("a", packagesNeed("2.0"))

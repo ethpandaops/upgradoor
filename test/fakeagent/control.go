@@ -31,7 +31,6 @@ type state struct {
 // a loopback address only:
 //
 //	GET  /state
-//	POST /registry         {"ref": "...", "digest": "sha256:...", "revision": "..."}
 //	POST /reboot-required  {"required": true}
 //	POST /crash            {"container": "geth"}
 type control struct {
@@ -91,27 +90,6 @@ func (c *control) handler() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("GET /state", func(w http.ResponseWriter, r *http.Request) {
-		c.writeState(w, r)
-	})
-
-	mux.HandleFunc("POST /registry", func(w http.ResponseWriter, r *http.Request) {
-		var in struct {
-			Ref      string `json:"ref"`
-			Digest   string `json:"digest"`
-			Revision string `json:"revision"`
-		}
-
-		if !readJSON(w, r, &in) {
-			return
-		}
-
-		if in.Ref == "" || in.Digest == "" {
-			writeError(w, http.StatusBadRequest, errors.New("ref and digest are required"))
-
-			return
-		}
-
-		c.host.SetRegistry(in.Ref, in.Digest, in.Revision)
 		c.writeState(w, r)
 	})
 

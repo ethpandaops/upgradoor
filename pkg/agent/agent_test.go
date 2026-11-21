@@ -22,7 +22,6 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/agent/link"
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
-	"github.com/ethpandaops/upgradoor/pkg/agent/registry"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -35,8 +34,6 @@ type env struct {
 	cfg   *Config
 	creds *identity.Credentials
 	log   *logrus.Logger
-	// resolver looks tags up; nil is the host's registry.
-	resolver registry.Resolver
 	// offset shifts the clock of the agent and the controller.
 	offset atomic.Int64
 }
@@ -50,6 +47,7 @@ func newEnv(t *testing.T, sc *agenttest.Scenario) *env {
 	e := &env{t: t, host: h, log: logrus.New(), creds: agenttest.Credentials(t)}
 	e.log.SetOutput(io.Discard)
 	e.ctrl = agenttest.NewController(t, e.now)
+	e.ctrl.Lookup = h.Resolve
 
 	dir := t.TempDir()
 	overrides := []string{protocol.OverrideImage, protocol.OverrideFlags}
@@ -62,7 +60,7 @@ func newEnv(t *testing.T, sc *agenttest.Scenario) *env {
 			MinSyncInterval:   5 * time.Millisecond,
 			MaxSyncInterval:   15 * time.Millisecond,
 			AllowInsecure:     true,
-			PublicKeys:        []string{agenttest.ControllerPublicKey(t, 0)},
+			PublicKey:         agenttest.ControllerPublicKey(t),
 		},
 		StateDir: filepath.Join(dir, "state"),
 		Local: local.Config{
@@ -77,8 +75,7 @@ func newEnv(t *testing.T, sc *agenttest.Scenario) *env {
 			},
 			Packages: plan.Packages{Blocked: []string{"docker-ce", "containerd.io"}},
 		},
-		Registry: registry.Config{PollInterval: 20 * time.Millisecond},
-		Verify:   lease.Config{Window: 30 * time.Millisecond, Timeout: 3 * time.Second},
+		Verify: lease.Config{Window: 30 * time.Millisecond, Timeout: 3 * time.Second},
 	}
 	e.cfg.ApplyDefaults()
 
@@ -125,14 +122,7 @@ func (e *env) now() time.Time {
 func (e *env) newAgent() Service {
 	e.t.Helper()
 
-	resolver := e.resolver
-	if resolver == nil {
-		resolver = e.host
-	}
-
-	svc, err := New(e.log, e.cfg, e.creds, &Deps{
-		Host: e.host, Resolver: resolver, Now: e.now, Version: "test",
-	})
+	svc, err := New(e.log, e.cfg, e.creds, &Deps{Host: e.host, Now: e.now, Version: "test"})
 	require.NoError(e.t, err)
 
 	return svc
@@ -233,11 +223,6 @@ func hasNeed(req *protocol.SyncRequest, id string) bool {
 	return slices.Contains(agenttest.NeedIDs(req), id)
 }
 
-// hasPulledNeed reports whether the need is reported with its image local.
-func hasPulledNeed(req *protocol.SyncRequest, id string) bool {
-	return slices.ContainsFunc(req.Needs, func(n protocol.Need) bool { return n.ID == id && len(n.Unpulled) == 0 })
-}
-
 func findNeed(t *testing.T, req *protocol.SyncRequest, id string) protocol.Need {
 	t.Helper()
 
@@ -258,7 +243,7 @@ func awaitNeeds(t *testing.T, e *env, ids ...string) []protocol.Need {
 
 	req := e.ctrl.Await("needs "+strings.Join(ids, ", "), func(req *protocol.SyncRequest) bool {
 		for _, id := range ids {
-			if !hasPulledNeed(req, id) {
+			if !hasNeed(req, id) {
 				return false
 			}
 		}
@@ -283,7 +268,7 @@ func awaitOverrideNeed(t *testing.T, e *env, container string, restore bool) pro
 	e.ctrl.Await("an override need for "+container, func(req *protocol.SyncRequest) bool {
 		for _, n := range req.Needs {
 			if n.Kind == protocol.NeedOverride && n.Override.Container == container &&
-				len(n.Unpulled) == 0 && n.Override.Restore == restore {
+				n.Override.Restore == restore {
 				found = n
 
 				return true
@@ -332,15 +317,15 @@ func TestNewValidatesItsInput(t *testing.T) {
 
 	raw := *e.cfg
 	raw.Verify.Window = 0
-	_, err = New(e.log, &raw, e.creds, &Deps{Host: e.host, Resolver: e.host})
+	_, err = New(e.log, &raw, e.creds, &Deps{Host: e.host})
 	require.ErrorContains(t, err, "without defaults")
 
 	invalid := *e.cfg
 	invalid.Policy.Verbs = []protocol.Verb{"exec"}
-	_, err = New(e.log, &invalid, e.creds, &Deps{Host: e.host, Resolver: e.host})
+	_, err = New(e.log, &invalid, e.creds, &Deps{Host: e.host})
 	require.ErrorContains(t, err, "unknown verb")
 
-	svc, err := New(e.log, e.cfg, e.creds, &Deps{Host: e.host, Resolver: e.host})
+	svc, err := New(e.log, e.cfg, e.creds, &Deps{Host: e.host})
 	require.NoError(t, err)
 	require.NoError(t, svc.Stop(), "stopping an agent that never started is fine")
 	require.NoError(t, svc.Start(t.Context()))

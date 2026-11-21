@@ -238,6 +238,9 @@ func leasedRollState(p *Progress, step *protocol.Step) (state, detail string) {
 		return RollRejected, step.Error
 	case protocol.StepSuperseded, protocol.StepCancelled:
 		return RollSuperseded, step.Error
+	case protocol.StepDeferred:
+		// The need stays open: the roll is tried again.
+		return RollQueued, "not begun, it is tried again: " + step.Error
 	case protocol.StepDone:
 		switch op.Phase {
 		case protocol.PhaseDone:

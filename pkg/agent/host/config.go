@@ -6,6 +6,7 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/host/docker"
 	"github.com/ethpandaops/upgradoor/pkg/agent/host/probe"
+	"github.com/ethpandaops/upgradoor/pkg/agent/host/system"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -14,6 +15,8 @@ type Config struct {
 	Docker     docker.Config `yaml:"docker"`
 	Probes     probe.Config  `yaml:"probes"`
 	Validators Validators    `yaml:"validators"`
+	// Commands are run for the package upgrade and the reboot when set.
+	Commands system.Commands `yaml:"commands"`
 }
 
 // Validators says where the host's validator range is read from.
@@ -30,8 +33,12 @@ func (c *Config) ApplyDefaults() {
 	c.Docker.ApplyDefaults()
 }
 
-// Validate checks the static validator range.
+// Validate checks the commands and the static validator range.
 func (c *Config) Validate() error {
+	if err := c.Commands.Validate(); err != nil {
+		return err
+	}
+
 	v := &c.Validators
 
 	if err := protocol.CheckValidatorRange(v.Start, v.End); err != nil {

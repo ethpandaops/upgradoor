@@ -45,13 +45,23 @@ export function offlineIntent(mark: boolean, hosts: readonly string[]): ActionIn
   };
 }
 
-/** scopeIntent pauses, resumes or aborts one rollout, or everything with an empty rollout ID. */
-export function scopeIntent(action: 'pause' | 'resume' | 'abort', title: string, rollout: string): ActionIntent {
+/**
+ * scopeIntent pauses, resumes or aborts one rollout, or everything with an
+ * empty rollout ID. client is the client the rollout is for ("" for none):
+ * its team may pause and resume (approve) it.
+ */
+export function scopeIntent(
+  action: 'pause' | 'resume' | 'abort',
+  title: string,
+  rollout: string,
+  client?: string
+): ActionIntent {
   return {
     kind: 'call',
     title,
     verb: action === 'pause' ? 'Pause' : action === 'resume' ? 'Resume' : 'Abort',
     danger: action === 'abort',
+    rolloutClient: rollout === '' ? undefined : (client ?? ''),
     make: reason => ({ action, body: buildScopeRequest(rollout, reason) }),
   };
 }
@@ -61,15 +71,12 @@ export function hostsIntent(
   action: 'skip' | 'retry',
   title: string,
   rollout: string,
-  hosts: readonly string[],
-  /** rolloutState is the state of the rollout, for the permission to retry hosts of it. */
-  rolloutState?: string
+  hosts: readonly string[]
 ): ActionIntent {
   return {
     kind: 'call',
     title,
     verb: action === 'skip' ? 'Skip' : 'Retry',
-    rolloutState,
     make: reason => ({ action, body: buildRolloutHostsRequest(rollout, hosts, reason) }),
   };
 }

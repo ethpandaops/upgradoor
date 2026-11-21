@@ -60,7 +60,7 @@ func (s *Handler) handleClientOverride(w http.ResponseWriter, r *http.Request, u
 		var err error
 
 		if result, err = s.opts.Scheduler.ClientOverride(ctx, u.Actor, req); err != nil {
-			s.writeSchedulerError(w, r, err)
+			s.writeSchedulerError(w, r, u, err)
 
 			return
 		}

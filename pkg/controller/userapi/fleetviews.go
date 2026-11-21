@@ -11,6 +11,7 @@ import (
 	"strings"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
+	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
 	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/controller/views"
@@ -18,6 +19,7 @@ import (
 
 const (
 	maxPackageQuery = 128
+	maxImageQuery   = 256
 
 	// The package and audit limits are the store's.
 	defaultRolloutLimit = 20
@@ -128,6 +130,71 @@ func (s *Handler) handleHost(w http.ResponseWriter, r *http.Request, _ *authz.Us
 	default:
 		httpjson.InternalError(s.log, w, r, err)
 	}
+}
+
+// handleImages serves GET /api/v1/images?q=<part of a reference>&limit=&after=:
+// one page of the images the containers of the fleet run, one entry per
+// reference with its digests and the hosts on each. It pages like
+// handlePackages.
+func (s *Handler) handleImages(w http.ResponseWriter, r *http.Request, _ *authz.User) {
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	after := r.URL.Query().Get("after")
+
+	if len(query) > maxImageQuery || len(after) > maxImageQuery+1 {
+		httpjson.Error(s.log, w, http.StatusBadRequest, fmt.Sprintf(
+			"q must be at most %d characters", maxImageQuery))
+
+		return
+	}
+
+	limit, err := queryLimit(r, store.DefaultPackageSearchLimit, store.MaxPackageSearchLimit)
+	if err != nil {
+		httpjson.BadRequest(s.log, w, err)
+
+		return
+	}
+
+	hosts, err := s.opts.Store.ListHosts(r.Context())
+	if err != nil {
+		httpjson.InternalError(s.log, w, r, err)
+
+		return
+	}
+
+	out, err := views.NewImages(hosts, query, after, limit)
+	if err != nil {
+		httpjson.Error(s.log, w, http.StatusBadRequest, "after is not the next of a page")
+
+		return
+	}
+
+	httpjson.Write(s.log, w, http.StatusOK, out)
+}
+
+// handleRefreshImages serves POST /api/v1/images/refresh: every followed tag
+// is looked up at its registry now instead of at its next interval, which
+// needs the feature roll; a tag looked up within discovery.RefreshFloor is
+// left alone, and the answer says until when.
+func (s *Handler) handleRefreshImages(w http.ResponseWriter, r *http.Request, u *authz.User) {
+	if _, ok := s.authz.Allow(w, r, u, &authz.Requirement{Feature: authz.FeatureRoll}); !ok {
+		return
+	}
+
+	var body struct{}
+
+	if err := decodeBody(w, r, &body); err != nil {
+		s.writeBodyError(w, err)
+
+		return
+	}
+
+	var done discovery.Refreshed
+	if s.opts.Lookups != nil {
+		done = s.opts.Lookups.Refresh()
+	}
+
+	httpjson.Write(s.log, w, http.StatusOK, views.NewImagesRefresh(done.Tags, done.Recent, done.Next,
+		discovery.RefreshFloor))
 }
 
 // handlePackages serves GET /api/v1/packages?q=<part of a name>&limit=&after=:

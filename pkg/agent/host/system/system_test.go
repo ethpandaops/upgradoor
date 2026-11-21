@@ -73,6 +73,11 @@ func (f *fakeRunner) Run(ctx context.Context, name string, args ...string) ([]by
 	return resp.out, resp.err
 }
 
+// Exec answers a configured command under the key "exec <argv>".
+func (f *fakeRunner) Exec(ctx context.Context, argv []string) ([]byte, error) {
+	return f.Run(ctx, "exec", argv...)
+}
+
 func (f *fakeRunner) set(key string, out []byte, err error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -572,6 +577,15 @@ func TestReboot(t *testing.T) {
 		})
 
 		require.NoError(t, sys.Reboot(t.Context()))
+	})
+
+	t.Run("configured command", func(t *testing.T) {
+		sys, runner, _ := newCaptureSystem(t, nil)
+		sys.commands.Reboot = []string{"/usr/bin/sudo", "-n", "/usr/bin/systemctl", "reboot"}
+		runner.set("exec /usr/bin/sudo -n /usr/bin/systemctl reboot", nil, nil)
+
+		require.NoError(t, sys.Reboot(t.Context()))
+		assert.Equal(t, []string{"exec /usr/bin/sudo -n /usr/bin/systemctl reboot"}, runner.recorded())
 	})
 
 	t.Run("refused", func(t *testing.T) {

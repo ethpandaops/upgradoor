@@ -67,7 +67,18 @@ export const FIELDS: readonly FieldSpec[] = [
     max: 100,
     step: 0.5,
     range: '0 to 100 %',
-    hint: 'Share of the tracked validator weight that may be unavailable at once: hosts being updated, and validators that are not attesting. Also bounds how many hosts hold a lease at once.',
+    hint: 'Share of the tracked validator weight that may be unavailable at once: hosts being updated, and validators that are not attesting.',
+  },
+  {
+    key: 'maxLeasedPercent',
+    label: 'Max hosts at once',
+    kind: 'percent',
+    unit: '%',
+    min: 0,
+    max: 100,
+    step: 0.5,
+    range: 'above 0, up to 100 %',
+    hint: 'Share of the hosts that may be worked on at once (node and slot work), at least one. Max unavailable limits the validator weight offline; this limits the number of hosts.',
   },
   {
     key: 'maxIndependentPercent',
@@ -86,18 +97,7 @@ export const FIELDS: readonly FieldSpec[] = [
     kind: 'duration',
     min: 30_000,
     range: 'a duration like 5m, 30s to 24h',
-    hint: 'How often a tag is looked up at its registry, for the whole devnet: each time one host that runs it, in turn. The controller tells every other host on the tag what it points at.',
-  },
-  {
-    key: 'maxPullingPercent',
-    label: 'Max pulling',
-    kind: 'percent',
-    unit: '%',
-    min: 0.5,
-    max: 100,
-    step: 0.5,
-    range: 'above 0 to 100 %',
-    hint: 'Share of the hosts that may pull images at once, at least one. A host pulls only in a pull window: the images its needs wait for, hosts near their slot first, and for a rollout of a manual policy only once it is approved.',
+    hint: 'How often the controller looks a tag up at its registry. It tells every host on the tag what it points at.',
   },
   {
     key: 'minParticipationPercent',
@@ -244,7 +244,7 @@ export interface GroupSpec {
 /**
  * The groups of the settings page, in display order. Every setting is in
  * exactly one. The first two are strips over the whole width; the three below
- * it have three lines each, so they are of one height side by side.
+ * them stand side by side, stretched to one height.
  */
 export const GROUPS: readonly GroupSpec[] = [
   {
@@ -258,16 +258,16 @@ export const GROUPS: readonly GroupSpec[] = [
   },
   {
     id: 'images',
-    title: 'Image lookups and pulls',
-    about: 'How often the devnet asks a registry where a tag points, and how many hosts may pull at once.',
+    title: 'Image lookups',
+    about: 'How often the controller asks a registry where a tag points.',
     wide: true,
-    keys: ['lookupInterval', 'maxPullingPercent'],
+    keys: ['lookupInterval'],
   },
   {
     id: 'limits',
     title: 'Budget and network gate',
     about: 'How much of the fleet may be down at once, and when the network is healthy enough to take a host down.',
-    keys: ['maxUnavailablePercent', 'minParticipationPercent', 'maxFinalityLagEpochs'],
+    keys: ['maxUnavailablePercent', 'maxLeasedPercent', 'minParticipationPercent', 'maxFinalityLagEpochs'],
   },
   {
     id: 'readiness',
@@ -382,6 +382,7 @@ export function fromForm(form: SettingsForm): FormSettings {
 
   return {
     maxUnavailablePercent: Number(form.maxUnavailablePercent),
+    maxLeasedPercent: Number(form.maxLeasedPercent),
     maxIndependentPercent: Number(form.maxIndependentPercent),
     minParticipationPercent: Number(form.minParticipationPercent),
     maxFinalityLagEpochs: Number(form.maxFinalityLagEpochs),
@@ -399,7 +400,6 @@ export function fromForm(form: SettingsForm): FormSettings {
     pauseAfterCanaryReboot: form.pauseAfterCanaryReboot === 'true',
     readyPeerShare: Number(form.readyPeerShare),
     lookupInterval: duration('lookupInterval'),
-    maxPullingPercent: Number(form.maxPullingPercent),
     paused: form.paused === 'true',
   };
 }

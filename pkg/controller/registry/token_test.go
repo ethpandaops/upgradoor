@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/upgradoor/pkg/registryauth"
 )
 
 func basicHeader(userPass string) string {
@@ -215,7 +217,7 @@ func TestBasicAuthRegistry(t *testing.T) {
 	var status *statusError
 
 	// Wrong and missing credentials end in a 401 without any token request.
-	for _, logins := range []Logins{loginFor(f.host(), "user:wrong"), nil} {
+	for _, logins := range []registryauth.Logins{loginFor(f.host(), "user:wrong"), nil} {
 		r = newResolver(t, f, logins)
 
 		_, err = r.Resolve(t.Context(), f.ref(tagMulti))

@@ -11,6 +11,7 @@ import (
 	"regexp"
 	"slices"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/ethpandaops/service-authenticatoor/pkg/auth"
@@ -37,25 +38,28 @@ import (
 // feature name starts with another one (TestFeatureNames): a grant of
 // "upgradoor:roll*" is the feature roll and nothing else.
 const (
-	// FeatureRoll covers the action roll. Twin: team_roll, for containers a
-	// team of the token owns.
+	// FeatureRoll covers the action roll and, without a twin, POST
+	// /api/v1/images/refresh. Twin: team_roll, for containers a team of the
+	// token owns.
 	FeatureRoll = "roll"
 	// FeatureReboot covers the action reboot. Twin: team_reboot, for hosts
 	// on which a team of the token owns a container.
 	FeatureReboot = "reboot"
 	// FeatureHold covers the actions hold, unhold, mark-offline and
-	// unmark-offline. Twin: team_hold, for
-	// hosts on which a team of the token owns a container, and only for
-	// holds that were set through the twin.
+	// unmark-offline. Twin: team_hold, for hosts on which a team of the
+	// token owns a container, and only for holds that a team of the token
+	// set through the twin.
 	FeatureHold = "hold"
 	// FeatureRecover covers what gets a stuck host moving again: the actions
-	// skip, retry with hosts (of a rollout that is not aborted) and
-	// end-lease. Twin: team_recover, for hosts on which a team of the token
-	// owns a container.
+	// skip, retry with hosts and end-lease. Twin: team_recover, for hosts on
+	// which a team of the token owns a container.
 	FeatureRecover = "recover"
 	// FeatureSupervise covers the actions on one rollout as a whole: pause,
-	// resume and abort with a rollout, retry without hosts, and every retry
-	// of an aborted rollout, which reopens its cause for all hosts. No twin.
+	// resume (which approves) and abort with a rollout, and retry without
+	// hosts. An aborted rollout is final: nothing retries it. Twin:
+	// team_supervise, for pause and resume of a rollout of a client whose
+	// reported containers are all owned by a team of the token (the rule of
+	// team_client_policy).
 	FeatureSupervise = "supervise"
 	// FeatureImageOverride covers the action image-override: setting or
 	// taking away the image override of one container on one host. Twin:
@@ -93,6 +97,13 @@ const (
 
 	// maxEchoedName bounds a name that a refusal repeats.
 	maxEchoedName = 128
+
+	// refusalWindow is how often a refusal of one actor on one path is
+	// audited at most; maxRefusalKeys bounds the remembered pairs.
+	refusalWindow  = time.Minute
+	maxRefusalKeys = 4096
+	// auditTimeout bounds the audit write of a refusal.
+	auditTimeout = 5 * time.Second
 )
 
 // authServicePattern is what a service name may look like: a name that can
@@ -122,10 +133,6 @@ type Requirement struct {
 	// admin, when not empty, says why the request needs FeatureAdmin on top
 	// ("force", "ignoreBudget", "all").
 	Admin string
-	// reopens names the rollout of a retry with hosts. When that rollout is
-	// aborted the request is not about its hosts: it reopens the cause for
-	// every host, and needs FeatureSupervise instead, which has no twin.
-	Reopens string
 	// teamAdmin, when not empty, names what the request asks for that the
 	// team twin alone does not give ("now" for a roll or reboot that is not
 	// staggered). A login with FeatureAdmin next to the twin gets it, and the
@@ -156,6 +163,10 @@ type Targets struct {
 	// of a roll (every one of them owned by a team of the token). A client
 	// no host reports is owned by nobody.
 	Client string
+	// rollout names a rollout instead: the target is the client the rollout
+	// is for, by the rule of Client. A rollout for no client is owned by
+	// nobody.
+	rollout string
 	// hold says that the request sets or lifts the hold of its hosts. The
 	// twin does neither to a hold that was not set through the twin.
 	hold holdChange
@@ -174,6 +185,11 @@ func HoldTargets(hosts []string, change holdChange) *Targets {
 // containerTargets are the targets of a roll.
 func ContainerTargets(hosts []string, all bool, containers []string) *Targets {
 	return &Targets{hosts: hosts, all: all, containers: containers, perContainer: true}
+}
+
+// RolloutTarget is the target of an action on one rollout.
+func RolloutTarget(rollout string) *Targets {
+	return &Targets{rollout: rollout}
 }
 
 // leaseTarget is the target of an action on one lease.
@@ -257,7 +273,7 @@ type Authorizer interface {
 	// Allow authorizes need for u. It answers a refusal itself and returns
 	// false; on success the context carries the authorization.
 	Allow(w http.ResponseWriter, r *http.Request, u *User, need *Requirement) (context.Context, bool)
-	// Refuse answers 403 with msg and logs it.
+	// Refuse answers 403 with msg, logs it and audits it.
 	Refuse(w http.ResponseWriter, r *http.Request, u *User, msg string)
 }
 
@@ -267,18 +283,34 @@ type authorizer struct {
 	log         logrus.FieldLogger
 	authService string
 	store       Store
+	now         func() time.Time
+
+	// refusedMu guards refused: when a refusal was last audited, by actor
+	// and path.
+	refusedMu sync.Mutex
+	refused   map[string]time.Time
 }
 
-// Store is what the authorizer reads to apply the team rule.
+// Store is what the authorizer reads to apply the team rule, and where it
+// audits refusals.
 type Store interface {
 	GetRollout(ctx context.Context, id string) (*fleet.Rollout, error)
 	GetLease(ctx context.Context, id string) (*fleet.Lease, error)
 	ListHosts(ctx context.Context) ([]*fleet.Host, error)
+	AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error
 }
 
 // New returns the authorizer of the login features named after authService.
-func New(log logrus.FieldLogger, authService string, st Store) Authorizer {
-	return &authorizer{log: log, authService: authService, store: st}
+// now is the clock; time.Now when nil.
+func New(log logrus.FieldLogger, authService string, st Store, now func() time.Time) Authorizer {
+	if now == nil {
+		now = time.Now
+	}
+
+	return &authorizer{
+		log: log, authService: authService, store: st, now: now,
+		refused: make(map[string]time.Time, 16),
+	}
 }
 
 func (s *authorizer) HasFeature(u *User, feature string) bool {
@@ -301,22 +333,6 @@ func (s *authorizer) authorize(ctx context.Context, u *User, need *Requirement) 
 	}
 
 	feature, team := need.Feature, need.Team
-	unknownRollout := false
-
-	if need.Reopens != "" {
-		rollout, err := s.store.GetRollout(ctx, need.Reopens)
-
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			// With the plain feature the scheduler answers.
-			unknownRollout = true
-		case err != nil:
-			return "", fmt.Errorf("authorize: get rollout %s: %w", Echo(need.Reopens), err)
-		case rollout.State == fleet.RolloutAborted:
-			feature, team = FeatureSupervise, nil
-		}
-	}
-
 	by := feature
 	viaTeam := false
 
@@ -325,11 +341,6 @@ func (s *authorizer) authorize(ctx context.Context, u *User, need *Requirement) 
 
 		if team == nil || !s.HasFeature(u, twin) {
 			return "", forbiddenf("this login lacks the feature %s:%s", s.authService, feature)
-		}
-
-		if unknownRollout {
-			return "", forbiddenf("%s:%s does not cover rollout %s (owners: none)",
-				s.authService, twin, Echo(need.Reopens))
 		}
 
 		uncovered, err := s.uncovered(ctx, u.Teams, team)
@@ -379,6 +390,22 @@ func (s *authorizer) authorize(ctx context.Context, u *User, need *Requirement) 
 // and a container the host does not manage have no owners.
 func (s *authorizer) uncovered(ctx context.Context, teams []string, t *Targets) (string, error) {
 	names := slices.Clone(t.hosts)
+	client := t.Client
+
+	if t.rollout != "" {
+		r, err := s.store.GetRollout(ctx, t.rollout)
+
+		switch {
+		case errors.Is(err, store.ErrNotFound):
+			return fmt.Sprintf("does not cover rollout %s (owners: none)", Echo(t.rollout)), nil
+		case err != nil:
+			return "", fmt.Errorf("authorize: get rollout %s: %w", Echo(t.rollout), err)
+		case r.Client == "":
+			return fmt.Sprintf("does not cover rollout %s: it is for no client", Echo(t.rollout)), nil
+		}
+
+		client = r.Client
+	}
 
 	if t.lease != "" {
 		lease, err := s.store.GetLease(ctx, t.lease)
@@ -406,8 +433,8 @@ func (s *authorizer) uncovered(ctx context.Context, teams []string, t *Targets) 
 		}
 	}
 
-	if t.Client != "" {
-		return UncoveredClient(teams, t.Client, hosts), nil
+	if client != "" {
+		return UncoveredClient(teams, client, hosts), nil
 	}
 
 	if len(names) == 0 {
@@ -433,7 +460,7 @@ func OwnershipOf(hosts []*fleet.Host) map[string]*hostOwnership {
 	known := make(map[string]*hostOwnership, len(hosts))
 
 	for _, host := range hosts {
-		own := &hostOwnership{held: host.HoldWanted, heldByTeam: host.HoldBy == fleet.HoldByTeam}
+		own := &hostOwnership{held: host.HoldWanted, holdBy: host.HoldBy}
 
 		if host.Status != nil {
 			own.containers = make([]containerOwners, 0, len(host.Status.Containers))
@@ -457,10 +484,9 @@ func OwnershipOf(hosts []*fleet.Host) map[string]*hostOwnership {
 type hostOwnership struct {
 	// containers are the managed containers with their owners.
 	containers []containerOwners
-	// held: the controller hold is wanted; heldByTeam: it was set through a
-	// team feature.
-	held       bool
-	heldByTeam bool
+	// held: the controller hold is wanted; holdBy is fleet.Host.HoldBy.
+	held   bool
+	holdBy string
 }
 
 // containerOwners is one managed container of a host with its owners.
@@ -498,15 +524,15 @@ func UncoveredOn(teams []string, host string, own *hostOwnership, t *Targets) st
 			return onHost
 		}
 
-		// A hold that was not set through the twin is not the twin's to
-		// lift, nor to set again as its own.
-		if t.hold != HoldUntouched && own.held && !own.heldByTeam {
+		// A hold that no team of the token set through the twin is not the
+		// twin's to lift, nor to set again as its own.
+		if by := scheduler.HoldSetBy(own.holdBy, teams); t.hold != HoldUntouched && own.held && by != "" {
 			verb := "lift"
 			if t.hold == HoldSet {
 				verb = "change"
 			}
 
-			return fmt.Sprintf("does not %s the hold on host %s (set by staff)", verb, Echo(host))
+			return fmt.Sprintf("does not %s the hold on host %s (set by %s)", verb, Echo(host), Echo(by))
 		}
 
 		return ""
@@ -590,13 +616,63 @@ func ownerList(owners []string) string {
 	return Echo(strings.Join(owners, ", "))
 }
 
-// Refuse answers a request the login may not make, and logs it at debug
-// level.
+// Refuse answers a request the login may not make, logs it at debug level
+// and audits it as auth.refused, once per refusalWindow for each actor and
+// path.
 func (s *authorizer) Refuse(w http.ResponseWriter, r *http.Request, u *User, msg string) {
 	s.log.WithFields(logrus.Fields{
 		"path": r.URL.Path, "actor": u.Actor, "reason": msg,
 	}).Debug("Refused user request")
+
+	if s.auditDue(u.Actor + " " + r.URL.Path) {
+		teams := slices.Clone(u.Teams)
+		if teams == nil {
+			teams = []string{}
+		}
+
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), auditTimeout)
+
+		if err := s.store.AppendAudit(ctx, fleet.AuditEntry{
+			Actor: u.Actor, Action: "auth.refused", Target: Echo(r.URL.Path),
+			Detail: map[string]any{"method": r.Method, "reason": msg, "teams": teams},
+		}); err != nil {
+			s.log.WithError(err).Warn("Could not audit a refused request")
+		}
+
+		cancel()
+	}
+
 	httpjson.Error(s.log, w, http.StatusForbidden, msg)
+}
+
+// auditDue reports whether the refusal of key is audited now, and notes it.
+// Pairs older than the window are forgotten once the map is full; while it
+// is full of recent ones nothing more is audited.
+func (s *authorizer) auditDue(key string) bool {
+	s.refusedMu.Lock()
+	defer s.refusedMu.Unlock()
+
+	now := s.now()
+
+	if last, ok := s.refused[key]; ok && now.Sub(last) < refusalWindow {
+		return false
+	}
+
+	if len(s.refused) >= maxRefusalKeys {
+		for k, at := range s.refused {
+			if now.Sub(at) >= refusalWindow {
+				delete(s.refused, k)
+			}
+		}
+
+		if len(s.refused) >= maxRefusalKeys {
+			return false
+		}
+	}
+
+	s.refused[key] = now
+
+	return true
 }
 
 // Allow authorizes a request and answers a refusal. On success it returns

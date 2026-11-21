@@ -2,6 +2,7 @@ package lease
 
 import (
 	"errors"
+	"slices"
 	"strings"
 	"testing"
 
@@ -14,7 +15,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-func TestDigestMismatchSupersedesWhenTheTagMovedOn(t *testing.T) {
+func TestPullSupersedesWhenTheTagMovedOn(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, agenttest.BaseScenario())
@@ -38,29 +39,56 @@ func TestDigestMismatchSupersedesWhenTheTagMovedOn(t *testing.T) {
 	assert.Equal(t, agenttest.GethV1, e.host.Container("geth").Digest)
 }
 
-func TestDigestMismatchFailsWhenTheTagStillPointsThere(t *testing.T) {
+func TestLeasePullsAnImageThatIsNotLocal(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, agenttest.BaseScenario())
-	// The registry has geth-2, but the image never arrived locally.
 	e.host.SetRegistry(agenttest.GethImage, agenttest.GethV2, "")
+	e.pull(agenttest.TekuImage, agenttest.TekuV2)
 	e.start(t.Context())
 
-	need := gethNeed(agenttest.GethV2)
-	e.grant("lease-unpulled", need)
+	e.grant("lease-1", gethNeed(agenttest.GethV2), tekuNeed())
 
-	op := e.awaitFinished("lease-unpulled")
-	assert.Equal(t, protocol.PhaseFailed, op.Phase)
-	assert.False(t, op.Disrupted, "the digest is checked before anything stops")
-	assert.Contains(t, op.Error, "although the tag still points at it")
+	op := e.awaitFinished("lease-1")
+	require.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.Equal(t, agenttest.GethV2, e.host.Container("geth").Digest)
+	assert.Equal(t, agenttest.TekuV2, e.host.Container("teku").Digest)
+	e.assertPhases("lease-1", protocol.PhasePulling, protocol.PhaseApplying, protocol.PhaseStarting,
+		protocol.PhaseVerifying, protocol.PhaseDone)
 
-	step := stepOf(t, op, need.ID)
-	assert.Equal(t, protocol.StepFailed, step.Status)
-	assert.Equal(t, op.Error, step.Error)
+	// Pulled before anything stopped, and only what was not local.
+	calls := e.host.Calls()
+	assert.Less(t, slices.Index(calls, "pull "+agenttest.GethImage),
+		slices.IndexFunc(calls, func(c string) bool { return strings.HasPrefix(c, "recreate ") }))
+	assert.Equal(t, []string{"pulled " + agenttest.GethImage}, e.host.PullNotes())
+}
+
+// A pull that fails defers every step of the lease: nothing is begun.
+func TestFailedPullDefersTheLease(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.host.SetRegistry(agenttest.GethImage, agenttest.GethV2, "")
+	e.pull(agenttest.TekuImage, agenttest.TekuV2)
+	e.host.Fail("pull:"+agenttest.GethImage, errors.New("registry is down"))
+	e.start(t.Context())
+
+	geth, teku := gethNeed(agenttest.GethV2), tekuNeed()
+	e.grant("lease-1", teku, geth)
+
+	op := e.awaitFinished("lease-1")
+	assert.Equal(t, protocol.PhaseDone, op.Phase)
+	assert.False(t, op.Disrupted)
+	assert.Empty(t, op.Error)
+
+	for _, s := range op.Steps {
+		assert.Equal(t, protocol.StepDeferred, s.Status, s.NeedID)
+		assert.Equal(t, "pull "+agenttest.GethImage+": agenttest: pull "+agenttest.GethImage+": registry is down", s.Error)
+	}
 
 	assert.Empty(t, e.disruptive())
-	assert.Equal(t, agenttest.GethV1, e.host.Container("geth").Digest)
-	assert.Equal(t, protocol.StateRunning, e.host.Container("geth").State)
+	assert.Equal(t, []string{"failed " + agenttest.GethImage}, e.host.PullNotes())
+	e.assertPhases("lease-1", protocol.PhasePulling, protocol.PhaseDone)
 }
 
 // A name-mapped container gets its group labels on recreate; a default-group one none.
@@ -145,11 +173,37 @@ func TestRollOrder(t *testing.T) {
 		needs[0].ID + " done", needs[1].ID + " done", needs[2].ID + " done", needs[3].ID + " done",
 	}, e.audit.got(), "every need goes to the audit log")
 
-	e.assertPhases("lease-all", protocol.PhaseApplying, protocol.PhaseStarting,
+	e.assertPhases("lease-all", protocol.PhasePulling, protocol.PhaseApplying, protocol.PhaseStarting,
 		protocol.PhaseVerifying, protocol.PhaseDone)
 }
 
 // What a container is recreated as comes from the host's files, never from the lease.
+// A package upgrade that restarted no container is not a disruption.
+func TestPackageUpgradeWithoutRestartsIsNotDisruptive(t *testing.T) {
+	t.Parallel()
+
+	sc := agenttest.BaseScenario()
+	sc.Packages.Upgradable = []protocol.Upgradable{
+		{Name: "containerd.io", Arch: "amd64", Current: "1.7", Candidate: "1.7.1"},
+	}
+
+	pkgs := []protocol.PackageChange{{Name: "containerd.io", From: "1.7", To: "1.7.1"}}
+	need := protocol.Need{
+		ID: protocol.PackagesNeedID(pkgs), Kind: protocol.NeedPackages,
+		Packages: &protocol.PackagesNeed{Packages: pkgs},
+	}
+
+	e := newEnv(t, sc)
+	e.start(t.Context())
+	e.grant("lease-1", need)
+
+	op := e.awaitFinished("lease-1")
+	require.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.False(t, op.Disrupted)
+	assert.Equal(t, protocol.StepDone, stepOf(t, op, need.ID).Status)
+	e.assertPhases("lease-1", protocol.PhaseApplying, protocol.PhaseDone)
+}
+
 func TestRecreateTakesTheTargetFromTheHostsFiles(t *testing.T) {
 	t.Parallel()
 
@@ -235,8 +289,8 @@ func overrideNeed(t *testing.T, e *env) protocol.Need {
 	return protocol.Need{}
 }
 
-// A digest mismatch clears the disrupted mark only when its call set it.
-func TestDigestMismatchKeepsAnEarlierMark(t *testing.T) {
+// A recreate whose tag moved on is superseded; the others of the lease are served.
+func TestSupersededPullKeepsTheOtherRecreates(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, agenttest.BaseScenario())
@@ -252,7 +306,7 @@ func TestDigestMismatchKeepsAnEarlierMark(t *testing.T) {
 	assert.True(t, op.Disrupted)
 	assert.Equal(t, protocol.StepDone, stepOf(t, op, geth.ID).Status)
 	assert.Equal(t, protocol.StepSuperseded, stepOf(t, op, teku.ID).Status)
-	e.assertPhases("lease-1", protocol.PhaseApplying, protocol.PhaseStarting,
+	e.assertPhases("lease-1", protocol.PhasePulling, protocol.PhaseApplying, protocol.PhaseStarting,
 		protocol.PhaseVerifying, protocol.PhaseDone)
 }
 
@@ -284,25 +338,4 @@ func TestRecreateWithoutAContainerList(t *testing.T) {
 	assert.NotContains(t, strings.Join(e.disruptive(), "\n"), "recreate")
 }
 
-// A digest mismatch the registry cannot explain fails the step.
-func TestDigestMismatchWithoutTheRegistry(t *testing.T) {
-	t.Parallel()
-
-	e := newEnv(t, agenttest.BaseScenario())
-	e.host.SetRegistry(agenttest.GethImage, agenttest.GethV2, "")
-	e.host.Fail("resolve:"+agenttest.GethImage, errors.New("registry is down"))
-	e.start(t.Context())
-
-	need := gethNeed(agenttest.GethV2)
-	e.grant("lease-1", need)
-
-	op := e.awaitFinished("lease-1")
-	assert.Equal(t, protocol.PhaseFailed, op.Phase)
-	assert.False(t, op.Disrupted)
-
-	step := stepOf(t, op, need.ID)
-	assert.Equal(t, protocol.StepFailed, step.Status)
-	assert.Equal(t, "the local image of "+agenttest.GethImage+" is not the granted digest "+agenttest.GethV2+
-		" and the registry could not be asked: agenttest: resolve "+agenttest.GethImage+": registry is down",
-		step.Error)
-}
+// A digest mismatch without a known digest of the tag fails the step.

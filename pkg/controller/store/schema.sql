@@ -6,7 +6,6 @@
 CREATE TABLE hosts (
     name             TEXT PRIMARY KEY,
     cert_hash        TEXT NOT NULL,
-    generation       INTEGER NOT NULL DEFAULT 0,
     validators_start INTEGER,            -- NULL for hosts without validators
     validators_end   INTEGER,
     roles            TEXT NOT NULL DEFAULT '[]',   -- JSON array
@@ -39,10 +38,7 @@ CREATE TABLE hosts (
     -- The longest sync interval the controller asked of the host in its
     -- last answer, in milliseconds; the host counts as stale only after
     -- missing a couple of those (fleet.Host.StaleAfter).
-    sync_interval    INTEGER NOT NULL DEFAULT 0,
-    -- The host's pull window as a JSON fleet.PullWindow; '' while it has none.
-    -- The scheduler writes it.
-    pull             TEXT NOT NULL DEFAULT ''
+    sync_interval    INTEGER NOT NULL DEFAULT 0
 );
 
 -- OS and kernel part of the last inventory; packages and upgradable are
@@ -123,7 +119,8 @@ CREATE TABLE directives (
     container  TEXT NOT NULL DEFAULT '',
     reason     TEXT NOT NULL DEFAULT '',
     -- Who asked and, for an override directive, what: a JSON object with the
-    -- protocol.Directive fields "by" and "override"; '' when it has neither.
+    -- protocol.Directive fields "by", "override" and "withdraws"; '' when it
+    -- has none of them.
     detail     TEXT NOT NULL DEFAULT '',
     state      TEXT NOT NULL,
     rollout_id TEXT NOT NULL DEFAULT '',

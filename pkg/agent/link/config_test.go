@@ -10,44 +10,36 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/agent/link"
 )
 
-func TestConfigControllerKeys(t *testing.T) {
-	key0 := controllerPublicKey(t, 0)
-	key1 := controllerPublicKey(t, 1)
+func TestConfigControllerKey(t *testing.T) {
+	key := controllerPublicKey(t)
 
 	tests := []struct {
 		name     string
-		keys     []string
+		key      string
 		unsigned bool
-		want     int
+		want     bool
 		wantErr  string
 	}{
-		{name: "one key", keys: []string{key0}, want: 1},
-		{name: "two keys for a rotation", keys: []string{key0, key1 + "\n"}, want: 2},
-		{name: "the opt-out", unsigned: true, want: 0},
-		{name: "nothing configured", wantErr: "controller.publicKeys is required"},
-		{
-			name: "keys and the opt-out", keys: []string{key0}, unsigned: true,
-			wantErr: "exclude each other",
-		},
-		{name: "not a key", keys: []string{key0, "bm90IGEga2V5"}, wantErr: "publicKeys[1]"},
+		{name: "the key", key: key, want: true},
+		{name: "the key with a newline", key: key + "\n", want: true},
+		{name: "the opt-out", unsigned: true},
+		{name: "nothing configured", wantErr: "controller.publicKey is required"},
+		{name: "key and the opt-out", key: key, unsigned: true, wantErr: "exclude each other"},
+		{name: "not a key", key: "bm90IGEga2V5", wantErr: "controller.publicKey:"},
 		{
 			name: "a private key in place of a public one",
-			keys: []string{"3ccsBTOwGo_w6jKJ-xCQ6L5VPI5GOtA1pIHEY8gpUdA"}, wantErr: "publicKeys[0]",
-		},
-		{
-			name: "too many", keys: []string{key0, key1, key0, key1, key0},
-			wantErr: "more than 4",
+			key:  "3ccsBTOwGo_w6jKJ-xCQ6L5VPI5GOtA1pIHEY8gpUdA", wantErr: "controller.publicKey:",
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := link.Config{
-				URL: "https://upgradoor.example", PublicKeys: tt.keys,
+				URL: "https://upgradoor.example", PublicKey: tt.key,
 				AllowUnsignedAnswers: tt.unsigned,
 			}
 
-			keys, err := cfg.Keys()
+			got, err := cfg.Key()
 
 			if tt.wantErr != "" {
 				require.ErrorContains(t, err, tt.wantErr)
@@ -58,7 +50,7 @@ func TestConfigControllerKeys(t *testing.T) {
 
 			require.NoError(t, err)
 			require.NoError(t, cfg.Validate())
-			assert.Len(t, keys, tt.want)
+			assert.Equal(t, tt.want, got != nil)
 		})
 	}
 }

@@ -219,6 +219,7 @@ mkdir -p "$work/data"
     --controller-seed-file "$work/controller.seed" \
     --allow-insecure-agent-http \
     --auth-provider-url "$auth" \
+    --registry-plain-http "$registry" --registry-allow-private \
     "${beacon_args[@]}" \
     --default-setting maxUnavailablePercent=25 \
     --default-setting readyEpochs=1 \
@@ -259,7 +260,7 @@ for i in $(seq 1 $nodes); do
 controller:
   url: $ctl
   allowInsecure: true
-  publicKeys: ["$controller_pub"]
+  publicKey: "$controller_pub"
   syncInterval: 5s
   leaseSyncInterval: 2s
   maxSyncInterval: 5s
@@ -275,9 +276,6 @@ validators: {start: $start, end: $((start + validators))}
 groups:
   execution: {client: geth, owners: [geth], stopTimeout: 30s}
   consensus: {client: lighthouse, owners: [lighthouse], stopTimeout: 30s}
-registry:
-  pollInterval: 10s
-  plainHttp: ["$registry"]
 probes:
   el: http://$(ip_of "$el"):8545
   cl: http://$(ip_of "$cl"):4000

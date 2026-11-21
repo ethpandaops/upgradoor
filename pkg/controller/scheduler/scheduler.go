@@ -113,10 +113,8 @@ type Assignment struct {
 	// Ended is the host's newest lease when it is over and the host holds
 	// none: how it ended, for the host's own status.
 	Ended *protocol.EndedLease
-	// Pull is the host's pull window, if it has one.
-	Pull *protocol.PullWindow
-	// LookupInterval is the setting of the same name: how often one host of
-	// those on a tag looks it up.
+	// LookupInterval is the setting of the same name: how often a tag is
+	// looked up.
 	LookupInterval time.Duration
 }
 
@@ -370,9 +368,10 @@ type QueueEntry struct {
 type WaitKind string
 
 // Wait kinds. Budget, host limit and order clear by themselves as the
-// rollout proceeds; working clears when the operation the host works on
-// without a lease is over; gate clears when the network recovers; the others
-// need somebody to act.
+// rollout proceeds; pull clears when the agent lets a failed pull be tried
+// again; working clears when the operation the host works on without a lease
+// is over; gate clears when the network recovers; the others need somebody
+// to act.
 const (
 	WaitBudget        WaitKind = "budget"
 	WaitPull          WaitKind = "pull"
@@ -400,6 +399,7 @@ const (
 	SlotVerifying SlotState = "verifying" // agent done, readiness pending
 	SlotFailed    SlotState = "failed"    // last lease failed, not retried yet
 	SlotHeld      SlotState = "held"      // hold in effect
+	SlotOffline   SlotState = "offline"   // marked known offline
 	SlotStale     SlotState = "stale"     // agent silent
 )
 
@@ -416,7 +416,4 @@ type HostPlan struct {
 	LeaseID string `json:"leaseId,omitempty"`
 	// Reason is the waiting reason when queued.
 	Reason string `json:"reason,omitempty"`
-	// Pull is the host's pull state while it waits in a rollout: waiting
-	// (for a pull window), pulling (it has one) or pulled; empty otherwise.
-	Pull string `json:"pull,omitempty"`
 }

@@ -99,7 +99,7 @@ func (r *resolver) fetchToken(ctx context.Context, ref imageref.Reference, chall
 	req.Header.Set("User-Agent", userAgent)
 
 	if login, ok := r.logins[ref.Host]; ok {
-		req.Header.Set("Authorization", login.basic())
+		req.Header.Set("Authorization", login.Basic())
 	}
 
 	resp, err := r.client.Do(req)

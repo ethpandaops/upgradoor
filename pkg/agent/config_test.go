@@ -39,6 +39,9 @@ func TestLoadConfigReadsEveryKey(t *testing.T) {
 	assert.Equal(t, "http://127.0.0.1:8545", cfg.Host.Probes.EL)
 	assert.Equal(t, "http://127.0.0.1:5052", cfg.Host.Probes.CL)
 	assert.Equal(t, host.Validators{MarkerFile: "/data/.validator_keyrange"}, cfg.Host.Validators)
+	assert.Equal(t, []string{"/usr/bin/sudo", "-n", "/usr/local/lib/upgradoor/upgrade-packages"},
+		cfg.Host.Commands.UpgradePackages)
+	assert.Equal(t, []string{"/usr/bin/sudo", "-n", "/usr/bin/systemctl", "reboot"}, cfg.Host.Commands.Reboot)
 
 	cfg.Host = host.Config{}
 
@@ -47,7 +50,7 @@ func TestLoadConfigReadsEveryKey(t *testing.T) {
 			URL:          "https://upgradoor.testnet-0.example",
 			SyncInterval: 20 * time.Second, LeaseSyncInterval: 3 * time.Second,
 			MinSyncInterval: 2 * time.Second, MaxSyncInterval: 5 * time.Minute,
-			PublicKeys: []string{agenttest.ControllerPublicKey(t, 0)},
+			PublicKey: agenttest.ControllerPublicKey(t),
 		},
 		KeyFile:  "/etc/upgradoor/test.key",
 		CertFile: "/etc/upgradoor/test.crt",
@@ -76,12 +79,12 @@ func TestLoadConfigReadsEveryKey(t *testing.T) {
 			},
 			DefaultGroup: plan.DefaultGroup{Roll: true, Exclude: []string{"tmp-*", "debug"}},
 			Packages:     plan.Packages{Blocked: []string{"docker-ce", "containerd.io"}},
+			Fallback: plan.Fallback{
+				Containers: []string{"execution", "exp*"}, After: 2 * time.Hour, Interval: 20 * time.Minute,
+			},
 		},
-		Registry: registry.Config{
-			PollInterval: 15 * time.Minute, AuthFile: "/root/.docker/test.json",
-			PlainHTTP: []string{"registry.local:5000"}, CAFile: "/etc/ssl/registry-ca.pem",
-		},
-		Verify: lease.Config{Window: 30 * time.Second, Timeout: 5 * time.Minute},
+		Registry: registry.Config{AuthFile: "/root/.docker/test.json"},
+		Verify:   lease.Config{Window: 30 * time.Second, Timeout: 5 * time.Minute},
 	}, cfg)
 }
 
@@ -100,7 +103,7 @@ func TestLoadConfigAppliesTheDefaults(t *testing.T) {
 	assert.Equal(t, local.DefaultSocket, cfg.Local.Socket.Path)
 	assert.Equal(t, filepath.Join(DefaultStateDir, "audit.log"), cfg.Local.AuditLog.File)
 	assert.Equal(t, "unix:///var/run/docker.sock", cfg.Host.Docker.Host)
-	assert.Equal(t, 30*time.Minute, cfg.Registry.PollInterval)
+	assert.Equal(t, "/root/.docker/config.json", cfg.Registry.AuthFile)
 	assert.Equal(t, 45*time.Second, cfg.Verify.Window)
 }
 
@@ -121,7 +124,7 @@ func TestLoadConfigRefusesWhatItDoesNotKnow(t *testing.T) {
 		"an unknown defaultGroup key":  {head + "defaultGroup:\n  rolls: true\n", "not found"},
 		"an unknown verify key":        {head + "verify:\n  grace: 1s\n", "not found"},
 		"no controller url":            {"controller:\n  allowUnsignedAnswers: true\n", "absolute URL"},
-		"no controller key":            {"controller:\n  url: https://upgradoor.example\n", "publicKeys is required"},
+		"no controller key":            {"controller:\n  url: https://upgradoor.example\n", "publicKey is required"},
 		"an unknown verb":              {head + "verbs: [exec]\n", `unknown verb "exec"`},
 		"a static range start and end": {head + "validators: {start: 5, end: 5}\n", "validators"},
 		"not yaml":                     {"controller: [\n", "parse config"},

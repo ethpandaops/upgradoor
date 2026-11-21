@@ -26,7 +26,7 @@ const (
 	reasonRolloutPaused = "rollout paused"
 	// reasonResume ends the pause reasons that say why a rollout is paused.
 	reasonResume = "; resume to continue"
-	// reasonAborted starts the pause reason of a rollout of an observed cause
+	// reasonAborted starts the pause reason of a reboot or local rollout
 	// that a person aborted (abortedReason).
 	reasonAborted = "aborted"
 	// reasonCanaryPause is the pause reason of a rollout that the scheduler
@@ -35,6 +35,7 @@ const (
 	reasonApproval     = "waiting for approval (policy manual)"
 	reasonHaltedPrefix = "rollout halted: "
 	reasonVerb         = "verb not allowed by the agent"
+	reasonPull         = "waiting to pull its image again after a failed pull"
 	reasonGatePrefix   = "network gate: "
 	reasonAfter        = "after "
 	reasonAfterCanary  = "after canary "
@@ -148,10 +149,16 @@ func (p *pass) budget() *budgetState {
 	}
 
 	b.allowed = b.percent * float64(b.total) / 100
-	b.maxLeased = hostLimit(b.percent, len(p.hosts))
+	b.maxLeased = hostLimit(p.set.MaxLeasedPercent, len(p.hosts))
 	b.maxIndependent = hostLimit(p.set.MaxIndependentPercent, len(p.hosts))
 
 	return b
+}
+
+// pullFailed reports whether the last lease could not pull the image of any
+// of the needs.
+func pullFailed(needs []protocol.Need) bool {
+	return slices.ContainsFunc(needs, func(n protocol.Need) bool { return n.PullError != "" })
 }
 
 // hostLimit is a share of the hosts, at least one.
@@ -398,9 +405,10 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 		return verdict{rank: rankVerb, reason: reasonVerb}, nil, false
 	}
 
-	// The images come first, in a pull window: the slot is spent on the
-	// restart alone. A group waits for all of its images.
-	if unpulled(needs) {
+	// A lease pulls its images first. After a failed pull the agent marks
+	// the need until the pull may be tried again; a group waits for all of
+	// its needs.
+	if pullFailed(needs) {
 		return verdict{rank: rankPull, reason: reasonPull}, nil, false
 	}
 
@@ -622,8 +630,9 @@ type waiting struct {
 }
 
 // servingOrder lists the hosts that wait in an open rollout and hold no
-// lease: oldest rollout first, inside a rollout by stage (broken hosts,
-// the canary, the rest), then ascending weight and name.
+// lease: what hosts ask for themselves (local rollouts) first, then the
+// oldest rollout first, inside a rollout by stage (broken hosts, the canary,
+// the rest), then ascending weight and name.
 func (p *pass) servingOrder() []*waiting {
 	var (
 		order  []*waiting
@@ -632,7 +641,12 @@ func (p *pass) servingOrder() []*waiting {
 
 	sortRollouts(p.rollouts)
 
-	for _, r := range p.rollouts {
+	rollouts := slices.Clone(p.rollouts)
+	slices.SortStableFunc(rollouts, func(a, b *fleet.Rollout) int {
+		return cmp.Compare(localFirst(a), localFirst(b))
+	})
+
+	for _, r := range rollouts {
 		if r.State.Terminal() {
 			continue
 		}
@@ -669,6 +683,15 @@ func (p *pass) servingOrder() []*waiting {
 	}
 
 	return order
+}
+
+// localFirst ranks the local rollouts before the others.
+func localFirst(r *fleet.Rollout) int {
+	if r.Kind == fleet.RolloutLocal {
+		return 0
+	}
+
+	return 1
 }
 
 // grant makes the grants of this pass and builds the plan.
@@ -746,6 +769,8 @@ func (p *pass) grant() *Plan {
 		case hv.working():
 			// At work without a lease: it is down like a host that holds one.
 			hp.Slot = SlotLeased
+		case hv.offline:
+			hp.Slot = SlotOffline
 		case hv.held:
 			hp.Slot = SlotHeld
 		case hv.stale:

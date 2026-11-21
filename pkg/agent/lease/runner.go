@@ -28,6 +28,11 @@ const (
 	pollPerWindow = 5
 	minPoll       = 5 * time.Millisecond
 	maxPoll       = time.Second
+
+	// ownLeasePrefix starts the ID of a lease the agent gave itself, which
+	// has ownLeaseTTL to start.
+	ownLeasePrefix = "fallback-"
+	ownLeaseTTL    = 10 * time.Minute
 )
 
 // errInterrupted ends an operation run without a verdict while the runner
@@ -39,9 +44,9 @@ type Overrides interface {
 	Load() plan.Overrides
 }
 
-// Resolver resolves a tag to its current digest; registry.Resolver satisfies it.
-type Resolver interface {
-	Resolve(ctx context.Context, ref string) (string, error)
+// Pulls hears how the pulls of a lease went; registry.Tracker satisfies it.
+type Pulls interface {
+	NotePull(ref string, err error)
 }
 
 // Audit records how requested needs ended; local.Audit satisfies it.
@@ -54,7 +59,7 @@ type Deps struct {
 	Host      host.Host
 	Policy    *plan.Policy
 	Overrides Overrides
-	Registry  Resolver
+	Registry  Pulls
 	Audit     Audit
 	// Notify tells the loop to sync now.
 	Notify func()
@@ -87,6 +92,11 @@ type Runner interface {
 	// A lease without ID or with Cancel is never taken. Every call wakes the
 	// goroutine, which retries a failed start or decline write.
 	Follow(lease *protocol.Lease, reported *protocol.Operation) (taken bool)
+	// Grant takes a lease the agent gives itself for needs, while the
+	// controller cannot be reached, and reports whether it was taken: only
+	// when no lease is held or the held one is finished. Follow treats it
+	// like any other lease the controller does not offer.
+	Grant(needs []protocol.Need) (taken bool)
 	// Current returns a copy of the held lease record, or nil.
 	Current() *Record
 }
@@ -234,6 +244,32 @@ func (r *runner) Follow(lease *protocol.Lease, reported *protocol.Operation) boo
 	return r.takeLocked(lease)
 }
 
+// Grant implements Runner.
+func (r *runner) Grant(needs []protocol.Need) bool {
+	defer r.wake()
+
+	r.st.mu.Lock()
+	defer r.st.mu.Unlock()
+
+	if cur := r.st.cur.Current; cur != nil && !cur.Operation.Phase.Terminal() {
+		return false
+	}
+
+	if len(needs) == 0 {
+		return false
+	}
+
+	now := r.deps.Now()
+
+	return r.takeLocked(&protocol.Lease{
+		ID:         fmt.Sprintf("%s%d", ownLeasePrefix, now.UnixMilli()),
+		GrantedAt:  now,
+		ExpiresAt:  now.Add(ownLeaseTTL),
+		TTLSeconds: int64(ownLeaseTTL / time.Second),
+		Needs:      needs,
+	})
+}
+
 // cancelLocked marks the lease cancelled, in memory even when the write
 // fails.
 func (r *runner) cancelLocked(log logrus.FieldLogger) {
@@ -353,13 +389,23 @@ type operation struct {
 	failed bool
 	// cancelled skips the remaining steps as after a failure.
 	cancelled bool
+	// deferred: an image could not be pulled, so nothing is begun.
+	deferred bool
 	// view is the last classified view, for order and stop timeouts.
 	view *plan.View
 }
 
 // execute runs a started operation. Draining, applying and issuing the
-// reboot are not cancelled by ctx; only the waits are.
+// reboot are not cancelled by ctx; only the pulls and the waits are.
 func (o *operation) execute(ctx context.Context) error {
+	if err := o.pullImages(ctx); err != nil {
+		return err
+	}
+
+	if o.deferred {
+		return o.bringBack(ctx)
+	}
+
 	work := context.WithoutCancel(ctx)
 	reboot := len(o.lp.Reboot) > 0
 
@@ -393,6 +439,9 @@ func (o *operation) resume(ctx context.Context, rec *Record) error {
 		if err := o.awaitReboot(ctx, stepIDs(rec, protocol.StepRunning)); err != nil {
 			return err
 		}
+	case protocol.PhasePulling:
+		// Nothing was stopped yet: the lease is not begun.
+		o.deferSteps(reasonPullInterrupted)
 	case protocol.PhaseDraining, protocol.PhaseApplying:
 		// Only a kill or crash leaves these phases; the running step's
 		// outcome is unknown, so it failed.

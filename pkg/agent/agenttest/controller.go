@@ -3,6 +3,7 @@ package agenttest
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,11 +64,12 @@ type Controller struct {
 	Down bool
 	// Gate is called with every sync before it is answered.
 	Gate func(req *protocol.SyncRequest)
-	// NoLookups hands no lookup duty, NoPulls no pull window; Relay is
-	// relayed as other hosts' lookups.
-	NoLookups bool
-	NoPulls   bool
-	Relay     []protocol.TagDigest
+	// Lookup looks every tag of a sync up for its Digests, as the
+	// controller's registry lookup (Host.Resolve of the agent's host); nil
+	// looks nothing up, and a tag it answers neither digest nor error for is
+	// not looked up yet. Relay is answered as Digests before those.
+	Lookup func(ctx context.Context, ref string) (string, error)
+	Relay  []protocol.TagDigest
 	// Signer signs the answers; nil answers unsigned.
 	Signer *identity.AnswerSigner
 	// Forge rewrites an answer's wire body, to play a party that is not the controller.
@@ -75,7 +77,7 @@ type Controller struct {
 }
 
 // NewController starts the controller for the test network with
-// AutoRelease and the Signer of generation 0; now is its clock.
+// AutoRelease and the Signer of the controller key; now is its clock.
 func NewController(t *testing.T, now func() time.Time) *Controller {
 	t.Helper()
 
@@ -87,7 +89,7 @@ func NewController(t *testing.T, now func() time.Time) *Controller {
 		now:         now,
 		verifier:    identity.NewVerifier(identity.PublicKey(signer), Network, identity.WithClock(now)),
 		AutoRelease: true,
-		Signer:      AnswerSigner(t, 0),
+		Signer:      AnswerSigner(t, ControllerSeed),
 	}
 	c.srv = httptest.NewServer(http.HandlerFunc(c.serve))
 
@@ -258,7 +260,23 @@ func (c *Controller) answerSync(req *protocol.SyncRequest) *protocol.SyncRespons
 		ServerTime:    c.now(),
 		Directives:    slices.Clone(c.Directives),
 		WantInventory: c.WantInventory,
-		Digests:       c.Relay,
+		Digests:       slices.Clone(c.Relay),
+	}
+
+	if c.Lookup != nil {
+		for _, ref := range req.Tags {
+			d := protocol.TagDigest{Ref: ref, CheckedAt: c.now()}
+
+			digest, err := c.Lookup(context.Background(), ref)
+			if err != nil {
+				d.Error = err.Error()
+			} else if digest == "" {
+				continue
+			}
+
+			d.Digest = digest
+			resp.Digests = append(resp.Digests, d)
+		}
 	}
 
 	if c.Lease != nil {
@@ -267,26 +285,6 @@ func (c *Controller) answerSync(req *protocol.SyncRequest) *protocol.SyncRespons
 	} else {
 		resp.Ended = c.Ended
 		resp.Queue = c.Queue
-	}
-
-	if !c.NoLookups {
-		for i := range req.Containers {
-			if ctr := &req.Containers[i]; ctr.Managed {
-				resp.Lookups = append(resp.Lookups, ctr.Image)
-			}
-		}
-	}
-
-	if !c.NoPulls {
-		window := &protocol.PullWindow{}
-
-		for _, n := range req.Needs {
-			window.Images = append(window.Images, n.Unpulled...)
-		}
-
-		if len(window.Images) > 0 {
-			resp.Pull = window
-		}
 	}
 
 	return resp
@@ -401,7 +399,7 @@ func (c *Controller) Inventories() []protocol.Inventory {
 func Credentials(t *testing.T) *identity.Credentials {
 	t.Helper()
 
-	key, err := identity.DeriveHostKey([]byte(Seed), Network, HostName, 0)
+	key, err := identity.DeriveHostKey([]byte(Seed), Network, HostName)
 	require.NoError(t, err)
 
 	cert, err := identity.IssueCertificate([]byte(Seed), identity.CertificateSpec{
@@ -415,21 +413,21 @@ func Credentials(t *testing.T) *identity.Credentials {
 	return creds
 }
 
-// ControllerPublicKey is a generation's controller public key, as in controller.publicKeys.
-func ControllerPublicKey(t *testing.T, generation uint64) string {
+// ControllerPublicKey is the controller public key, as in controller.publicKey.
+func ControllerPublicKey(t *testing.T) string {
 	t.Helper()
 
-	key, err := identity.DeriveControllerKey([]byte(ControllerSeed), Network, generation)
+	key, err := identity.DeriveControllerKey([]byte(ControllerSeed), Network)
 	require.NoError(t, err)
 
 	return identity.EncodePublicKey(identity.PublicKey(key))
 }
 
-// AnswerSigner signs like the controller key of a generation.
-func AnswerSigner(t *testing.T, generation uint64) *identity.AnswerSigner {
+// AnswerSigner signs like the controller key derived from controllerSeed.
+func AnswerSigner(t *testing.T, controllerSeed string) *identity.AnswerSigner {
 	t.Helper()
 
-	key, err := identity.DeriveControllerKey([]byte(ControllerSeed), Network, generation)
+	key, err := identity.DeriveControllerKey([]byte(controllerSeed), Network)
 	require.NoError(t, err)
 
 	signer, err := identity.NewAnswerSigner(key, Network)

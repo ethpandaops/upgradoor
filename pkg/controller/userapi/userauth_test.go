@@ -33,6 +33,7 @@ func userRoutes() []userRoute {
 		{method: http.MethodGet, path: "/api/v1/hosts"},
 		{method: http.MethodGet, path: "/api/v1/hosts/lighthouse-geth-1"},
 		{method: http.MethodGet, path: "/api/v1/packages?q=openssl"},
+		{method: http.MethodGet, path: "/api/v1/images?q=geth"},
 		{method: http.MethodGet, path: "/api/v1/rollouts"},
 		{method: http.MethodGet, path: "/api/v1/plan"},
 		{method: http.MethodGet, path: "/api/v1/settings"},

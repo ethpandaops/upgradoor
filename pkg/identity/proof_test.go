@@ -31,7 +31,7 @@ func newFixture(t *testing.T) *fixture {
 
 	f.signer = PublicKey(signer)
 
-	key, err := DeriveHostKey(seed, "net", "host-1", 0)
+	key, err := DeriveHostKey(seed, "net", "host-1")
 	require.NoError(t, err)
 	cert, err := IssueCertificate(seed, CertificateSpec{Network: "net", Hostname: "host-1"})
 	require.NoError(t, err)
@@ -143,7 +143,7 @@ func TestVerifyKnownCertificateStillChecksProof(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, f.verifier.certs, 1)
 
-	other, err := DeriveHostKey([]byte(testSeed), "net", "host-2", 0)
+	other, err := DeriveHostKey([]byte(testSeed), "net", "host-2")
 	require.NoError(t, err)
 
 	forged, err := SignProof(other, &ProofClaims{
@@ -165,7 +165,7 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 	seed := []byte(testSeed)
 
 	t.Run("other network", func(t *testing.T) {
-		key, err := DeriveHostKey(seed, "net2", "host-1", 0)
+		key, err := DeriveHostKey(seed, "net2", "host-1")
 		require.NoError(t, err)
 		cert, err := IssueCertificate(seed, CertificateSpec{Network: "net2", Hostname: "host-1"})
 		require.NoError(t, err)
@@ -189,7 +189,7 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 	})
 
 	t.Run("self-signed certificate", func(t *testing.T) {
-		key, err := DeriveHostKey(seed, "net", "evil", 0)
+		key, err := DeriveHostKey(seed, "net", "evil")
 		require.NoError(t, err)
 		cert, err := SignCertificate(key, PublicKey(key),
 			CertificateSpec{Network: "net", Hostname: "host-2"})
@@ -203,7 +203,7 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 	})
 
 	t.Run("stolen certificate, other key", func(t *testing.T) {
-		thief, err := DeriveHostKey(seed, "net", "host-2", 0)
+		thief, err := DeriveHostKey(seed, "net", "host-2")
 		require.NoError(t, err)
 
 		_, err = NewCredentials(thief, f.creds.Certificate())
@@ -230,7 +230,7 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 	})
 
 	t.Run("over-long proof lifetime", func(t *testing.T) {
-		key, err := DeriveHostKey(seed, "net", "host-1", 0)
+		key, err := DeriveHostKey(seed, "net", "host-1")
 		require.NoError(t, err)
 		proof, err := SignProof(key, &ProofClaims{
 			IssuedAt: f.now.Unix(), ExpiresAt: f.now.Unix() + 3600, ID: "y",

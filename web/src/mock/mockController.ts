@@ -27,6 +27,9 @@ import {
   type Hosts,
   type Lease,
   type Need,
+  type ImageMatch,
+  type Images,
+  type ImagesRefresh,
   type PackageMatch,
   type Packages,
   type Plan,
@@ -37,7 +40,6 @@ import {
   type PublicImage,
   type PublicImageRef,
   type PublicImages,
-  type PullImage,
   type QueueEntry,
   type RebootRequest,
   type RollRequest,
@@ -55,7 +57,7 @@ import { applyFlags, validateFlags } from '../lib/flags';
 import { formatPercent } from '../lib/format';
 import { validateImageRef } from '../lib/imageRef';
 import { parseGoDuration } from '../lib/goDuration';
-import { TEAM_PREFIX, TWINNED, can, type Login, type PermissionCall } from '../lib/permissions';
+import { FEATURE, TEAM_PREFIX, TWINNED, can, type Login, type PermissionCall } from '../lib/permissions';
 import { FIELDS, toForm, validateField } from '../lib/settingsForm';
 import {
   EPOCH_MS,
@@ -192,8 +194,8 @@ function waitKind(reason: string): WaitKind {
   return 'host-limit';
 }
 
-/** The waiting reason of a host whose needs wait for images (reasonPull). */
-const REASON_PULL = 'waiting for its images to be pulled';
+/** The waiting reason of a host whose last lease could not pull an image (reasonPull). */
+const REASON_PULL = 'waiting to pull its image again after a failed pull';
 
 /** The stage of fleet.Stage that the mock gives every member it adds. */
 const STAGE_REST = 3;
@@ -470,6 +472,7 @@ export class MockController {
       if (clientHosts) return clientHostsPage(this.clientIndex(), decodeURIComponent(clientHosts[1] ?? ''), q);
       if (route === 'packages')
         return this.packages(q.get('q') ?? '', Number(q.get('limit')) || 50, q.get('after') ?? '');
+      if (route === 'images') return this.images(q.get('q') ?? '', Number(q.get('limit')) || 50, q.get('after') ?? '');
       if (route === 'settings') return this.settingsBody();
       if (route === 'slots') return this.slots(q.get('window'), true);
       if (route === 'audit') {
@@ -487,6 +490,14 @@ export class MockController {
     if (method === 'PUT' && route === 'settings') {
       this.authorize(login, { action: 'settings' });
       return this.putSettings(body);
+    }
+
+    if (method === 'POST' && route === 'images/refresh') {
+      if (!login.open && !login.hasFeature(FEATURE.roll)) {
+        throw new HttpError(403, `forbidden: this login lacks the feature ${login.service}:${FEATURE.roll}`);
+      }
+
+      return this.refreshImages();
     }
 
     if (method === 'POST' && route.startsWith('actions/')) {
@@ -522,10 +533,13 @@ export class MockController {
   private authorize(login: Login, call: PermissionCall): void {
     const verdict = can(login, call, {
       hosts: [...this.data.hosts.values()],
-      // The client table is only read for the policy of a client.
-      clients: call.action === 'client-policy' ? this.clientIndex().views : [],
+      // The client table is only read for the policy of a client and its rollouts.
+      clients: ['client-policy', 'pause', 'resume'].includes(call.action) ? this.clientIndex().views : [],
       leaseHost: id => this.data.leases.find(l => l.id === id)?.host,
-      rolloutState: id => this.data.rollouts.find(r => r.id === id)?.state,
+      rolloutClient: id => {
+        const r = this.data.rollouts.find(x => x.id === id);
+        return r ? (r.client ?? '') : undefined;
+      },
     });
     if (!verdict.allowed) throw new HttpError(403, `forbidden: ${verdict.reason}`);
 
@@ -856,7 +870,7 @@ export class MockController {
       allowedWeight: share * total,
       unavailableWeight: unavailable,
       leasedHosts: leased,
-      maxLeasedHosts: Math.max(1, Math.floor(share * this.data.hosts.size)),
+      maxLeasedHosts: Math.max(1, Math.floor((this.data.settings.maxLeasedPercent / 100) * this.data.hosts.size)),
       independentHosts: 0,
       maxIndependent: Math.max(1, Math.floor((this.data.settings.maxIndependentPercent / 100) * this.data.hosts.size)),
     };
@@ -899,14 +913,9 @@ export class MockController {
     }
   }
 
-  /** grantable: the rollout may be served (pullWants): active, not paused, approved where its policy is manual. */
-  private grantable(r: Rollout): boolean {
-    return r.state === 'active' && !r.paused && (this.policy(r) !== 'manual' || r.approved);
-  }
-
-  /** unpulled are the images the host's needs in a rollout wait for. */
-  private unpulled(r: Rollout, host: HostDetail): PullImage[] {
-    return this.rolloutNeeds(r, host).flatMap(n => list(n.unpulled));
+  /** pullFailed: the last lease could not pull the image of one of the host's needs in the rollout. */
+  private pullFailed(r: Rollout, host: HostDetail): boolean {
+    return this.rolloutNeeds(r, host).some(n => n.pullError);
   }
 
   /**
@@ -941,8 +950,8 @@ export class MockController {
     const allowed = approved.filter(r => this.hasVerb(r, host));
     if (allowed.length === 0) return 'verb not allowed by the agent';
 
-    // The images come first, in a pull window.
-    const able = allowed.filter(r => this.unpulled(r, host).length === 0);
+    // A failed pull is tried again when the agent clears the need's error.
+    const able = allowed.filter(r => !this.pullFailed(r, host));
     if (able.length === 0) return REASON_PULL;
 
     const ignoresBudget = able.some(r => r.ignoreBudget);
@@ -1034,6 +1043,8 @@ export class MockController {
       if (lease) {
         plan.slot = lease.state === 'verifying' ? 'verifying' : 'leased';
         plan.leaseId = lease.id;
+      } else if (host.offline) {
+        plan.slot = 'offline';
       } else if (held) {
         plan.slot = 'held';
       } else if (this.isStale(host.name)) {
@@ -1050,8 +1061,6 @@ export class MockController {
 
       hosts[host.name] = plan;
     }
-
-    this.pulls(open, order, hosts);
 
     // The queue is the hosts that wait, with what they wait for.
     for (const name of order) {
@@ -1071,36 +1080,6 @@ export class MockController {
     }
 
     return { computedAt: this.iso(this.now() - 1000), paused: this.data.settings.paused, gate, budget, queue, hosts };
-  }
-
-  /**
-   * pulls notes each host's pull state in the plan, the way the scheduler
-   * grants pull windows: hosts whose needs in a rollout that may be served
-   * wait for images pull, at most maxPullingPercent of the hosts at once, in
-   * serving order; a host that waits in such a rollout with its images on it
-   * has pulled.
-   */
-  private pulls(open: Rollout[], order: readonly string[], hosts: Record<string, HostPlan>): void {
-    const limit = Math.max(1, Math.floor((this.data.settings.maxPullingPercent * this.data.hosts.size) / 100 + 1e-9));
-    const servable = open.filter(r => this.grantable(r));
-    let busy = 0;
-
-    for (const name of order) {
-      const host = this.data.hosts.get(name);
-      const plan = hosts[name];
-      if (!host || !plan) continue;
-
-      const memberOf = servable.filter(r => list(r.hosts).some(m => m.host === name && m.state === 'pending'));
-      if (memberOf.length === 0) continue;
-
-      if (memberOf.some(r => this.unpulled(r, host).length > 0)) {
-        const pulls = busy < limit && plan.slot !== 'held' && plan.slot !== 'stale';
-        plan.pull = pulls ? 'pulling' : 'waiting';
-        if (pulls) busy++;
-      } else if (!plan.leaseId) {
-        plan.pull = 'pulled';
-      }
-    }
   }
 
   // -------------------------------------------------------------- views
@@ -1259,6 +1238,98 @@ export class MockController {
       matches,
       ...(after === '' ? { total: names.length } : {}),
       ...(rest.length > limit ? { next: cursor(page[page.length - 1] ?? '') } : {}),
+    };
+  }
+
+  /** images is one page of the images the fleet's containers run, paged like packages. */
+  private images(query: string, limit: number, after: string): Images {
+    const needle = query.trim().toLowerCase();
+    const byName = new Map<string, Map<string, { revision?: string; hosts: Set<string> }>>();
+    const lookups = new Map<string, { digest?: string; checkedAt: string; error?: string }>();
+
+    for (const host of this.data.hosts.values()) {
+      for (const c of list(host.containers)) {
+        if (!c.image || !c.image.toLowerCase().includes(needle)) continue;
+        const versions = byName.get(c.image) ?? new Map<string, { revision?: string; hosts: Set<string> }>();
+        const known = lookups.get(c.image);
+        if (c.registry && (!known || c.registry.checkedAt > known.checkedAt)) {
+          const { digest, checkedAt, error } = c.registry;
+          lookups.set(c.image, { checkedAt, ...(digest ? { digest } : {}), ...(error ? { error } : {}) });
+        }
+
+        const version = versions.get(c.digest ?? '') ?? { hosts: new Set<string>() };
+        version.revision ??= c.revision;
+        version.hosts.add(host.name);
+        versions.set(c.digest ?? '', version);
+        byName.set(c.image, versions);
+      }
+    }
+
+    const rank = (name: string) => {
+      const lower = name.toLowerCase();
+      return needle === '' || lower === needle ? 0 : lower.startsWith(needle) ? 1 : 2;
+    };
+    const cursor = (name: string) => `${rank(name)}${name}`;
+    if (after !== '' && !/^[012]./.test(after)) throw new HttpError(400, 'after is not the next of a page');
+
+    const names = [...byName.keys()].sort((a, b) => (cursor(a) < cursor(b) ? -1 : 1));
+    const rest = names.filter(name => cursor(name) > after);
+    const page = rest.slice(0, limit);
+
+    const matches: ImageMatch[] = page.map(name => ({
+      name,
+      ...(lookups.has(name) ? { registry: lookups.get(name) } : {}),
+      versions: [...(byName.get(name) ?? new Map<string, { revision?: string; hosts: Set<string> }>()).entries()]
+        .map(([digest, v]) => ({
+          digest,
+          ...(v.revision ? { revision: v.revision } : {}),
+          hosts: [...v.hosts].sort(),
+        }))
+        .sort((a, b) => b.hosts.length - a.hosts.length || (a.digest < b.digest ? -1 : 1)),
+    }));
+
+    return {
+      query: query.trim(),
+      matches,
+      ...(after === '' ? { total: names.length } : {}),
+      ...(rest.length > limit ? { next: cursor(page[page.length - 1] ?? '') } : {}),
+    };
+  }
+
+  /**
+   * refreshImages marks every followed tag that was not looked up within the
+   * last half minute as looked up now, and says how many that are and when
+   * the others may be looked up again, like the controller.
+   */
+  private refreshImages(): ImagesRefresh {
+    const now = this.now();
+    const at = new Date(now).toISOString();
+    const floor = 30_000;
+    const tags = new Set<string>();
+    const recent = new Set<string>();
+    let next = Infinity;
+
+    for (const host of this.data.hosts.values()) {
+      for (const c of list(host.containers)) {
+        if (!c.registry) continue;
+        const checked = Date.parse(c.registry.checkedAt);
+        if (now - checked < floor && !tags.has(c.image)) {
+          recent.add(c.image);
+          next = Math.min(next, checked + floor);
+          continue;
+        }
+        c.registry.checkedAt = at;
+        tags.add(c.image);
+      }
+    }
+
+    if (recent.size === 0) return { tags: tags.size, message: `${tags.size} tag(s) are looked up now` };
+
+    return {
+      tags: tags.size,
+      recent: recent.size,
+      next: new Date(next).toISOString(),
+      message: `${tags.size} tag(s) are looked up now; the next lookup on request is possible later`,
     };
   }
 
@@ -1740,10 +1811,20 @@ export class MockController {
         // The plan has no reason for the host to wait: it is granted.
         if (slot?.slot !== 'queued' || slot.reason !== undefined) continue;
 
+        const id = this.newId('ls');
         const lease: Lease = {
-          id: this.newId('ls'),
+          id,
           host: host.name,
           state: 'running',
+          // The agent pulls first; nothing is stopped yet.
+          operation: {
+            leaseId: id,
+            phase: 'pulling',
+            startedAt: this.iso(now),
+            updatedAt: this.iso(now),
+            steps: [{ needId: need.id, status: 'pending' }],
+            disrupted: false,
+          },
           needs: [need],
           rollouts: { [need.id]: r.id },
           weight: host.validators,
@@ -1942,11 +2023,15 @@ export class MockController {
         rejected[host.name] = 'the host is not held';
         continue;
       }
-      // A hold set through the team feature is a team's; a hold that staff
-      // set stays staff's when a team sets it again.
+      // A hold set through the team feature is the hold of the login's teams
+      // that own a container of the host; a hold that staff set stays
+      // staff's when a team sets it again.
       const viaTeam = this.authorization?.authorizedBy.startsWith(TEAM_PREFIX) === true;
-      const teams = viaTeam && (!host.holdWanted || host.holdBy === 'team');
-      host.holdBy = action === 'hold' ? (teams ? 'team' : 'staff') : undefined;
+      const asTeam = viaTeam && (!host.holdWanted || host.holdBy?.startsWith('team:') === true);
+      const login = this.authorization?.teams ?? [];
+      const owning = login.filter(t => list(host.containers).some(c => c.managed && (c.owners ?? []).includes(t)));
+      const teams = (owning.length > 0 ? owning : login).slice().sort();
+      host.holdBy = action === 'hold' ? (asTeam ? `team:${teams.join(',')}` : 'staff') : undefined;
       host.holdWanted = action === 'hold';
       host.holdReason = action === 'hold' && req.reason ? req.reason : undefined;
       // The mock agent agrees at once.
@@ -2102,9 +2187,9 @@ export class MockController {
   }
 
   /**
-   * abort closes a manual rollout. A rollout of an observed cause stays open
-   * while hosts report the cause, so aborting it pauses it instead, with a
-   * reason that says so; a resume lifts that.
+   * abort closes a rollout for good; its waiting members are aborted. The
+   * reboot and local rollouts, whose key does not change with their target,
+   * are paused instead, with a reason that says so; a resume lifts that.
    */
   private abort(req: ScopeRequest): ActionResult {
     if (req.rollout === '') throw new HttpError(400, 'scheduler: invalid action: abort needs a rollout');
@@ -2113,7 +2198,7 @@ export class MockController {
     const now = this.iso(this.now());
     r.updatedAt = now;
 
-    if (r.kind !== 'manual') {
+    if (r.kind === 'reboot' || r.kind === 'local') {
       const before = { paused: r.paused };
       r.paused = true;
       r.pauseReason = `aborted${req.reason ? `: ${req.reason}` : ''}${RESUME}`;
@@ -2129,9 +2214,16 @@ export class MockController {
     r.state = 'aborted';
     r.reason = req.reason || 'aborted';
     r.endedAt = now;
+    for (const m of list(r.hosts)) {
+      if (!['done', 'skipped', 'leased', 'failed'].includes(m.state)) m.state = 'aborted';
+    }
     this.log('action.abort', r.id, { before, after: { state: r.state }, reason: req.reason });
 
-    return { message: 'rollout aborted', rollout: r.id };
+    const message =
+      r.kind === 'manual'
+        ? 'rollout aborted'
+        : 'rollout aborted: its target is not rolled again until it changes or someone rolls it by hand';
+    return { message, rollout: r.id };
   }
 
   /**

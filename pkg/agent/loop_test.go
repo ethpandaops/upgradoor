@@ -7,6 +7,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -23,7 +24,6 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/agent/link"
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
-	"github.com/ethpandaops/upgradoor/pkg/agent/registry"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -31,8 +31,7 @@ import (
 
 // stubLink answers the syncs of a cycle test.
 type stubLink struct {
-	sync   func(ctx context.Context) (*protocol.SyncResponse, error)
-	silent int
+	sync func(ctx context.Context) (*protocol.SyncResponse, error)
 }
 
 var _ link.Client = (*stubLink)(nil)
@@ -44,12 +43,6 @@ func (s *stubLink) Sync(ctx context.Context, _ *protocol.SyncRequest) (*protocol
 func (*stubLink) Inventory(context.Context, *protocol.Inventory) error { return nil }
 
 func (*stubLink) Interval(bool) time.Duration { return time.Hour }
-
-func (s *stubLink) Silent(time.Duration) bool {
-	s.silent++
-
-	return true
-}
 
 func TestCycle(t *testing.T) {
 	t.Parallel()
@@ -69,7 +62,6 @@ func TestCycle(t *testing.T) {
 
 	assert.False(t, a.cycle(ctx))
 	assert.Nil(t, a.view, "a sync cut short by the end publishes nothing")
-	assert.Zero(t, stub.silent, "nor switches the fallback")
 
 	spy := &holdSpy{Files: a.files, state: a.state}
 	a.files = spy
@@ -105,19 +97,19 @@ func (h *holdSpy) SetHold(origin plan.Origin, hold *plan.Hold, who, note string)
 	return h.Files.SetHold(origin, hold, who, note)
 }
 
-// countingResolver counts the lookups of one tag.
-type countingResolver struct {
-	registry.Resolver
-	ref string
-	n   atomic.Int64
+// countingLookup counts the controller's lookups of one tag.
+type countingLookup struct {
+	lookup func(ctx context.Context, ref string) (string, error)
+	ref    string
+	n      atomic.Int64
 }
 
-func (r *countingResolver) Resolve(ctx context.Context, ref string) (string, error) {
+func (r *countingLookup) Resolve(ctx context.Context, ref string) (string, error) {
 	if imageref.Same(ref, r.ref) {
 		r.n.Add(1)
 	}
 
-	return r.Resolver.Resolve(ctx, ref)
+	return r.lookup(ctx, ref)
 }
 
 // While Docker cannot be asked, the last good containers and the open rolls stand.
@@ -125,14 +117,9 @@ func TestDockerOutage(t *testing.T) {
 	t.Parallel()
 
 	e := overrideEnv(t)
-	e.cfg.Registry.PollInterval = time.Hour
-	e.ctrl.Set(func(c *agenttest.Controller) { c.NoLookups = true })
-
-	held := &heldResolver{
-		Host: e.host, ref: agenttest.GethImage, entered: make(chan struct{}, 1), release: make(chan struct{}),
-	}
-	counted := &countingResolver{Resolver: held, ref: agenttest.FixImage}
-	e.resolver = counted
+	held := e.withhold(agenttest.GethImage)
+	counted := &countingLookup{lookup: held.Resolve, ref: agenttest.FixImage}
+	e.ctrl.Set(func(c *agenttest.Controller) { c.Lookup = counted.Resolve })
 	e.start()
 
 	teku := protocol.Directive{ID: "d-teku", Kind: protocol.DirectiveRoll, Container: "teku"}
@@ -141,9 +128,8 @@ func TestDockerOutage(t *testing.T) {
 		return hasNeed(req, protocol.ManualNeedID("d-teku"))
 	})
 
-	held.hold.Store(true)
 	e.ctrl.Direct(teku, protocol.Directive{ID: "d-geth", Kind: protocol.DirectiveRoll, Container: "geth"})
-	agenttest.AwaitParked(t, held.entered, "the lookup of the geth roll")
+	e.ctrl.AwaitSyncs(3)
 
 	e.host.Fail("observe", errors.New("docker is restarting"))
 
@@ -158,12 +144,11 @@ func TestDockerOutage(t *testing.T) {
 	}
 
 	held.hold.Store(false)
-	close(held.release)
 	e.ctrl.Await("the geth roll answered", func(req *protocol.SyncRequest) bool {
 		return agenttest.AckOf(req, "d-geth") != nil
 	})
 
-	// A new target while Docker is away is not tracked from the stale containers.
+	// A new target while Docker is away is not followed from the stale containers.
 	e.writeOverrides("overrides:\n  geth:\n    image: " + agenttest.FixImage + "\n")
 	e.ctrl.AwaitSyncs(5)
 	assert.Zero(t, counted.n.Load())
@@ -268,73 +253,77 @@ func TestSyncReportsTheHost(t *testing.T) {
 }
 
 // The image of a need is pulled only in a pull window.
-func TestImageNeedWaitsForItsPull(t *testing.T) {
+// The lease pulls its image first. When that fails nothing is begun and the
+// need says why until the pull may be tried again.
+func TestLeasePullsItsImage(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, agenttest.BaseScenario())
-	e.ctrl.Set(func(c *agenttest.Controller) { c.NoPulls = true })
 	e.host.SetRegistry(agenttest.GethImage, agenttest.GethV2, "rev-2")
+	e.host.Fail("pull:"+agenttest.GethImage, errors.New("registry is slow today"))
 	e.start()
 
 	needID := protocol.ImageNeedID("geth", agenttest.GethV2)
-	req := e.ctrl.Await("the need, waiting for its image", func(req *protocol.SyncRequest) bool {
-		return hasNeed(req, needID)
-	})
+	req := e.ctrl.Await("the need", func(req *protocol.SyncRequest) bool { return hasNeed(req, needID) })
 
 	need := findNeed(t, &req, needID)
-	assert.Equal(t, []protocol.PullImage{{Ref: agenttest.GethImage, Digest: agenttest.GethV2}}, need.Unpulled)
+	assert.Empty(t, need.PullError)
 	assert.False(t, agenttest.ContainerOf(t, &req, "geth").Registry.Pulled)
+	assert.NotContains(t, e.host.Calls(), "pull "+agenttest.GethImage, "no pull without a lease")
 
-	e.ctrl.AwaitSyncs(3)
-	assert.NotContains(t, e.host.Calls(), "pull "+agenttest.GethImage, "no pull without a window")
+	e.ctrl.Grant(e.lease("lease-1", need))
 
-	e.host.Fail("pull:"+agenttest.GethImage, errors.New("registry is slow today"))
-	e.ctrl.Set(func(c *agenttest.Controller) { c.NoPulls = false })
+	op := e.ctrl.AwaitFinished("lease-1")
+	assert.Equal(t, protocol.PhaseDone, op.Phase)
+	assert.False(t, op.Disrupted)
+	require.Len(t, op.Steps, 1)
+	assert.Equal(t, protocol.StepDeferred, op.Steps[0].Status)
+	assert.Contains(t, op.Steps[0].Error, "registry is slow today")
+	assert.Empty(t, agenttest.Disruptive(e.host.Calls()), "nothing was begun")
 
-	req = e.ctrl.Await("failed pull reported", func(req *protocol.SyncRequest) bool {
-		c := agenttest.ContainerOf(t, req, "geth")
+	e.ctrl.Set(func(c *agenttest.Controller) { c.Lease = nil })
 
-		return c.Registry != nil && c.Registry.Error != ""
+	req = e.ctrl.Await("the need says why", func(req *protocol.SyncRequest) bool {
+		return hasNeed(req, needID) && findNeed(t, req, needID).PullError != ""
 	})
-	assert.Contains(t, agenttest.ContainerOf(t, &req, "geth").Registry.Error, "registry is slow today")
-	assert.Equal(t, agenttest.GethV1, agenttest.ContainerOf(t, &req, "geth").Digest)
+	assert.Contains(t, findNeed(t, &req, needID).PullError, "registry is slow today")
+	assert.True(t, agenttest.ContainerOf(t, &req, "geth").Registry.PullFailed)
 
+	// The pause passes: the need may be granted again, and the pull works.
 	e.host.Fail("pull:"+agenttest.GethImage, nil)
+	e.offset.Add(int64(10 * time.Minute))
 
-	req = e.ctrl.Await("pulled", func(req *protocol.SyncRequest) bool { return hasPulledNeed(req, needID) })
+	req = e.ctrl.Await("the need is open again", func(req *protocol.SyncRequest) bool {
+		return hasNeed(req, needID) && findNeed(t, req, needID).PullError == ""
+	})
 
-	need = findNeed(t, &req, needID)
-	assert.Equal(t, &protocol.ImageNeed{
-		Container: "geth", Group: agenttest.GroupExecution, Image: agenttest.GethImage,
-		FromDigest: agenttest.GethV1, ToDigest: agenttest.GethV2, ToRevision: "rev-2",
-	}, need.Image)
-	assert.Empty(t, need.DirectiveID)
-	assert.Contains(t, e.host.Calls(), "pull "+agenttest.GethImage)
-	assert.Empty(t, agenttest.Disruptive(e.host.Calls()), "nothing but pulls without a lease")
+	e.ctrl.Grant(e.lease("lease-2", findNeed(t, &req, needID)))
+
+	op = e.ctrl.AwaitFinished("lease-2")
+	assert.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.True(t, op.Disrupted)
+	assert.Equal(t, agenttest.GethV2, e.host.Container("geth").Digest)
 }
 
-// Without the lookup duty no tag is looked up; a relayed digest is taken.
-func TestLookupsAreCoordinated(t *testing.T) {
+// The agent lists its tags and knows of them what the controller answers.
+func TestTagsAreListedAndTheirDigestsTaken(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, agenttest.BaseScenario())
-	e.ctrl.Set(func(c *agenttest.Controller) { c.NoLookups = true })
+	e.ctrl.Set(func(c *agenttest.Controller) { c.Lookup = nil })
 	e.start()
 
-	e.ctrl.AwaitSyncs(3)
-
-	before := e.host.Resolves()
+	req := e.ctrl.AwaitSyncs(3)
+	assert.Equal(t, []string{agenttest.TekuImage, agenttest.GethImage, "sigp/lighthouse:stable"}, req.Tags)
+	assert.Nil(t, agenttest.ContainerOf(t, &req, "geth").Registry, "the controller has not looked it up")
+	assert.Empty(t, req.Needs)
 
 	e.host.SetRegistry(agenttest.GethImage, agenttest.GethV2, "rev-2")
-	e.ctrl.AwaitSyncs(3)
-	assert.Equal(t, before, e.host.Resolves(), "no lookup without the duty while the controller answers")
-
 	e.ctrl.Set(func(c *agenttest.Controller) {
 		c.Relay = []protocol.TagDigest{{Ref: agenttest.GethImage, Digest: agenttest.GethV2, CheckedAt: e.now()}}
 	})
 
 	awaitNeeds(t, e, protocol.ImageNeedID("geth", agenttest.GethV2))
-	assert.Equal(t, before, e.host.Resolves(), "the relayed digest needed no lookup")
 }
 
 func TestVerbsBoundTheNeeds(t *testing.T) {
@@ -384,7 +373,7 @@ func TestContainerIsRolledOntoItsSpec(t *testing.T) {
 
 	e.ctrl.Await("a pulled spec need", func(req *protocol.SyncRequest) bool {
 		for _, n := range req.Needs {
-			if n.Kind == protocol.NeedSpec && len(n.Unpulled) == 0 {
+			if n.Kind == protocol.NeedSpec {
 				need = n
 
 				return true
@@ -550,6 +539,55 @@ func TestControllerDowntimeIsTolerated(t *testing.T) {
 		return hasNeed(req, protocol.RebootNeedID)
 	})
 	assert.Equal(t, "boot", req.BootID)
+}
+
+// With the controller silent for fallback.after, the listed containers
+// follow their tags on the agent's own lease; the others wait.
+func TestFallbackRollsWithoutTheController(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.cfg.Policy.Fallback = plan.Fallback{
+		Containers: []string{"geth"}, After: 5 * time.Minute, Interval: time.Minute,
+	}
+	e.host.SetRegistry(agenttest.GethImage, agenttest.GethV2, "rev-2")
+	e.host.SetRegistry(agenttest.TekuImage, agenttest.TekuV2, "rev-t2")
+	e.ctrl.Set(func(c *agenttest.Controller) { c.Down = true })
+	e.start()
+
+	time.Sleep(60 * time.Millisecond)
+	require.NotContains(t, e.host.Calls(), "pull "+agenttest.GethImage, "not silent for long enough")
+
+	// The first pull is at a random point of the interval.
+	e.offset.Add(int64(6 * time.Minute))
+	require.Eventually(t, func() bool {
+		if slices.Contains(e.host.Calls(), "pull "+agenttest.GethImage) {
+			return true
+		}
+
+		e.offset.Add(int64(20 * time.Second))
+
+		return false
+	}, 5*time.Second, 10*time.Millisecond)
+
+	require.Eventually(t, func() bool {
+		return e.host.Container("geth").Digest == agenttest.GethV2
+	}, 5*time.Second, 5*time.Millisecond)
+
+	assert.Equal(t, agenttest.TekuV1, e.host.Container("teku").Digest)
+	assert.NotContains(t, e.host.Calls(), "pull "+agenttest.TekuImage)
+	require.Zero(t, e.ctrl.SyncCount())
+
+	// The controller hears of the operation when it is back.
+	e.ctrl.Set(func(c *agenttest.Controller) { c.Down = false })
+
+	req := e.ctrl.Await("the fallback's operation", func(req *protocol.SyncRequest) bool {
+		return req.Operation != nil && req.Operation.Phase.Terminal()
+	})
+	assert.True(t, strings.HasPrefix(req.Operation.LeaseID, "fallback-"))
+	assert.Equal(t, protocol.PhaseDone, req.Operation.Phase, req.Operation.Error)
+
+	e.ctrl.Await("operation forgotten", func(req *protocol.SyncRequest) bool { return req.Operation == nil })
 }
 
 func TestInventoryIsSentWhenAsked(t *testing.T) {
@@ -724,7 +762,7 @@ func TestOverrideByHand(t *testing.T) {
 	assert.True(t, need.Local)
 	assert.Equal(t, &protocol.OverrideNeed{
 		Container: "geth", Image: agenttest.FixImage, FromImage: agenttest.GethImage,
-		FromDigest: agenttest.GethV1, ToDigest: agenttest.FixV1, ToRevision: "rev-fix", Flags: true,
+		FromDigest: agenttest.GethV1, ToDigest: agenttest.FixV1, Flags: true,
 	}, need.Override)
 
 	req := e.ctrl.Await("the override is reported", func(req *protocol.SyncRequest) bool {
@@ -864,7 +902,7 @@ func TestOverrideThatCannotBeApplied(t *testing.T) {
 	e.writeOverrides("overrides:\n  geth:\n    image: " + agenttest.FixImage + "\n    flags: {add: [\"--y\"]}\n")
 	e.ctrl.Await("another override need", func(req *protocol.SyncRequest) bool {
 		for _, n := range req.Needs {
-			if n.Kind == protocol.NeedOverride && n.ID != need.ID && len(n.Unpulled) == 0 {
+			if n.Kind == protocol.NeedOverride && n.ID != need.ID {
 				return true
 			}
 		}
@@ -902,7 +940,7 @@ func TestRefusedAnswersAreNotActedOn(t *testing.T) {
 		"for another host": func(t *testing.T) func([]byte, string, string) []byte {
 			t.Helper()
 
-			signer := agenttest.AnswerSigner(t, 0)
+			signer := agenttest.AnswerSigner(t, agenttest.ControllerSeed)
 
 			return func(answer []byte, _, proofID string) []byte {
 				return signAs(t, signer, "prysm-besu-1", proofID, answer)
@@ -911,7 +949,7 @@ func TestRefusedAnswersAreNotActedOn(t *testing.T) {
 		"body altered": func(t *testing.T) func([]byte, string, string) []byte {
 			t.Helper()
 
-			signer := agenttest.AnswerSigner(t, 0)
+			signer := agenttest.AnswerSigner(t, agenttest.ControllerSeed)
 
 			return func(answer []byte, host, proofID string) []byte {
 				harmless, err := json.Marshal(protocol.SyncResponse{})
@@ -931,7 +969,7 @@ func TestRefusedAnswersAreNotActedOn(t *testing.T) {
 		"a key the host does not accept": func(t *testing.T) func([]byte, string, string) []byte {
 			t.Helper()
 
-			signer := agenttest.AnswerSigner(t, 1)
+			signer := agenttest.AnswerSigner(t, "another controller seed, at least 32 bytes long")
 
 			return func(answer []byte, host, proofID string) []byte {
 				return signAs(t, signer, host, proofID, answer)
@@ -986,7 +1024,7 @@ func TestSignedAnswersAreRefusedWithoutControllerKeys(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, agenttest.BaseScenario())
-	e.cfg.Controller.PublicKeys = nil
+	e.cfg.Controller.PublicKey = ""
 	e.cfg.Controller.AllowUnsignedAnswers = true
 
 	e.ctrl.Set(func(c *agenttest.Controller) {

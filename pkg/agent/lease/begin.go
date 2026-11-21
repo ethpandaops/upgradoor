@@ -103,6 +103,8 @@ func (o *operation) start(lp *plan.LeasePlan) bool {
 	switch {
 	case lp.Empty():
 		first = protocol.PhaseDone
+	case len(lp.Recreates) > 0:
+		first = protocol.PhasePulling
 	case len(lp.Reboot) > 0:
 		first = protocol.PhaseDraining
 	}

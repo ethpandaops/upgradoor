@@ -13,11 +13,14 @@ export const FEATURE = {
   roll: 'roll',
   /** reboot: the action reboot. Twin team_reboot: hosts on which a team of the login owns a container. */
   reboot: 'reboot',
-  /** hold: the actions hold and unhold. Twin team_hold, which leaves a hold of staff alone. */
+  /** hold: the actions hold and unhold. Twin team_hold, which lifts only a hold one of the login's teams set. */
   hold: 'hold',
-  /** recover: skip, retry with hosts (of a rollout that is not aborted), end-lease. Twin team_recover. */
+  /** recover: skip, retry with hosts, end-lease. Twin team_recover. */
   recover: 'recover',
-  /** supervise: pause, resume and abort of one rollout, retry without hosts, every retry of an aborted rollout. No twin. */
+  /**
+   * supervise: pause, resume (approve) and abort of one rollout, retry without hosts. An abort is final.
+   * Twin team_supervise: pause and resume of a rollout of a client whose containers a team of the login all owns.
+   */
   supervise: 'supervise',
   /** client_policy: the image policy of one client. Twin team_client_policy: a client whose containers a team of the login all owns. */
   client_policy: 'client_policy',
@@ -40,6 +43,7 @@ export const TWINNED: readonly Feature[] = [
   FEATURE.reboot,
   FEATURE.hold,
   FEATURE.recover,
+  FEATURE.supervise,
   FEATURE.client_policy,
   FEATURE.image_override,
   FEATURE.flag_override,
@@ -72,7 +76,7 @@ interface OwnedContainer {
 export interface OwnedHost {
   name: string;
   containers?: readonly OwnedContainer[] | null;
-  /** holdWanted and holdBy: a hold that was not set through a team feature is not a team's to lift. */
+  /** holdWanted and holdBy ("team:<teams>" or "staff"): a team lifts only a hold one of its teams set. */
   holdWanted?: boolean;
   holdBy?: string;
 }
@@ -97,11 +101,10 @@ export interface Ownership {
   /** leaseHost names the host of a lease; a lease it does not know has no owner. */
   leaseHost?: (lease: string) => string | undefined;
   /**
-   * rolloutState names the state of a rollout. A retry of an aborted rollout
-   * reopens its cause for every host and is no recovery of hosts. A rollout
-   * the page does not know is taken as not aborted; the controller decides.
+   * rolloutClient names the client a rollout is for: empty for a rollout for
+   * no client, undefined for one the page does not know.
    */
-  rolloutState?: (rollout: string) => string | undefined;
+  rolloutClient?: (rollout: string) => string | undefined;
 }
 
 /** PermissionCall is an action call, or saving the settings. */
@@ -135,6 +138,8 @@ type Targets =
     }
   | { rule: 'lease'; lease: string }
   | { rule: 'client'; client: string }
+  /** rollout: the client the rollout is for, by the rule of a client. */
+  | { rule: 'rollout'; rollout: string }
   /** someOf: a request on many hosts of a client, judged host by host; a team that owns a container of the client opens it. */
   | { rule: 'someOf'; client: string };
 
@@ -158,7 +163,7 @@ function adminReason(force: boolean, ignoreBudget: boolean, all: boolean): strin
 }
 
 /** requirement is what each request needs: the one table of this page, the mirror of actions.go. */
-function requirement(call: PermissionCall, ownership: Ownership): Requirement {
+function requirement(call: PermissionCall): Requirement {
   switch (call.action) {
     case 'roll': {
       const b = call.body;
@@ -203,16 +208,17 @@ function requirement(call: PermissionCall, ownership: Ownership): Requirement {
     case 'pause':
     case 'resume':
       // Without a rollout it is the global switch.
-      return { feature: call.body.rollout === '' ? FEATURE.admin : FEATURE.supervise, admin: '' };
+      return call.body.rollout === ''
+        ? { feature: FEATURE.admin, admin: '' }
+        : { feature: FEATURE.supervise, team: { rule: 'rollout', rollout: call.body.rollout }, admin: '' };
     case 'abort':
+      // An abort is final: no twin.
       return { feature: FEATURE.supervise, admin: '' };
     case 'skip':
       return { feature: FEATURE.recover, team: { rule: 'host', hosts: call.body.hosts, all: false }, admin: '' };
     case 'retry':
-      // Without hosts it reopens the rollout. So does every retry of an
-      // aborted rollout, whatever hosts it names. Otherwise it recovers the
-      // named hosts.
-      return call.body.hosts.length === 0 || ownership.rolloutState?.(call.body.rollout) === 'aborted'
+      // Without hosts it reopens the rollout; otherwise it recovers the named hosts.
+      return call.body.hosts.length === 0
         ? { feature: FEATURE.supervise, admin: '' }
         : { feature: FEATURE.recover, team: { rule: 'host', hosts: call.body.hosts, all: false }, admin: '' };
     case 'client-policy':
@@ -266,6 +272,13 @@ function managedContainers(host: OwnedHost | undefined): OwnedContainer[] {
   return (host?.containers ?? []).filter(c => c.managed);
 }
 
+/** holdSetBy says who set a hold that none of the teams set: "staff" or "team <teams>"; empty when one of them did. */
+function holdSetBy(holdBy: string | undefined, teams: readonly string[]): string {
+  if (!holdBy?.startsWith('team:') || holdBy === 'team:') return 'staff';
+  const holders = holdBy.slice('team:'.length).split(',');
+  return ownedBy(teams, holders) ? '' : `team ${echo(holders.join(', '))}`;
+}
+
 /** uncoveredOn applies the target rule to one host; empty when the host is covered. */
 function uncoveredOn(teams: readonly string[], name: string, host: OwnedHost | undefined, t: Targets): string {
   const containers = managedContainers(host);
@@ -278,10 +291,12 @@ function uncoveredOn(teams: readonly string[], name: string, host: OwnedHost | u
     // The any-owner rule of host-level actions.
     if (!ownedBy(teams, all)) return onHost;
 
-    // A hold that was not set through the twin is not the twin's to lift,
-    // nor to set again as its own.
-    if (t.rule === 'host' && t.hold && host?.holdWanted === true && host.holdBy !== 'team') {
-      return `does not ${t.hold === 'lift' ? 'lift' : 'change'} the hold on host ${echo(name)} (set by staff)`;
+    // A hold that no team of the login set through the twin is not the
+    // twin's to lift, nor to set again as its own.
+    if (t.rule === 'host' && t.hold && host?.holdWanted === true) {
+      const by = holdSetBy(host.holdBy, teams);
+      const verb = t.hold === 'lift' ? 'lift' : 'change';
+      if (by !== '') return `does not ${verb} the hold on host ${echo(name)} (set by ${by})`;
     }
 
     return '';
@@ -330,6 +345,12 @@ function uncovered(teams: readonly string[], t: Targets, ownership: Ownership): 
   let names: string[];
 
   if (t.rule === 'client') return uncoveredClient(teams, t.client, ownership);
+  if (t.rule === 'rollout') {
+    const client = ownership.rolloutClient?.(t.rollout);
+    if (client === undefined) return `does not cover rollout ${echo(t.rollout)} (owners: none)`;
+    if (client === '') return `does not cover rollout ${echo(t.rollout)}: it is for no client`;
+    return uncoveredClient(teams, client, ownership);
+  }
   if (t.rule === 'someOf') {
     const owners = [...(ownership.clients?.find(c => c.name === t.client)?.owners ?? [])].sort();
     return ownedBy(teams, owners)
@@ -363,6 +384,8 @@ function targetWords(t: Targets): string {
       return 'the host of this lease';
     case 'client':
       return 'every container of this client';
+    case 'rollout':
+      return "every container of this rollout's client";
     case 'someOf':
       return 'the containers of this client on the hosts';
     case 'container':
@@ -384,7 +407,7 @@ const denied = (reason: string): Verdict => ({ allowed: false, reason, by: '', s
 export function can(login: Login, call: PermissionCall, ownership: Ownership): Verdict {
   if (login.open) return { allowed: true, reason: '', by: 'open', staggered: false };
 
-  const need = requirement(call, ownership);
+  const need = requirement(call);
   const feature = `${login.service}:${need.feature}`;
   let by: string = need.feature;
   let viaTeam = false;

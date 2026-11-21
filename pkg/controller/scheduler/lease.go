@@ -13,7 +13,7 @@ import (
 const (
 	reasonAgentSilent   = "agent silent"
 	reasonNeverStarted  = "the agent did not start before the lease expired"
-	reasonNotDisrupted  = "nothing was disrupted: every step was superseded or refused"
+	reasonNotDisrupted  = "nothing was disrupted: every step was superseded, refused or deferred"
 	reasonLostOperation = "the agent no longer reports the operation"
 	reasonHostForgotten = "host forgotten"
 	reasonAgentFailed   = "the agent reported a failure"
@@ -558,10 +558,10 @@ func (p *pass) endLease(l *fleet.Lease, state fleet.LeaseState) {
 	}
 }
 
-// leaseRollouts returns the open rollouts a lease serves with the host's
-// member entry, in a stable order. Rollouts that closed meanwhile are left
-// out: a closed rollout is not written again, and its member stays leased
-// with the ID of the lease, which says how it ended.
+// leaseRollouts returns the open and the aborted rollouts a lease serves
+// with the host's member entry, in a stable order. Rollouts that closed
+// otherwise meanwhile are left out: such a rollout is not written again, and
+// its member stays leased with the ID of the lease, which says how it ended.
 func (p *pass) leaseRollouts(l *fleet.Lease) []*fleet.Rollout {
 	ids := make([]string, 0, len(l.Rollouts))
 
@@ -577,7 +577,7 @@ func (p *pass) leaseRollouts(l *fleet.Lease) []*fleet.Rollout {
 
 	for _, id := range ids {
 		r := p.rolloutByID[id]
-		if r == nil || r.State.Terminal() {
+		if r == nil || (r.State.Terminal() && r.State != fleet.RolloutAborted) {
 			continue
 		}
 
@@ -605,14 +605,26 @@ func (p *pass) expireLease(l *fleet.Lease, reason string) {
 	for _, r := range p.leaseRollouts(l) {
 		m := p.member(r, l.Host)
 		m.LeaseID = ""
-		p.setMember(m, fleet.HostPending)
+		p.setMember(m, unserved(r))
 	}
 
 	p.record("lease.expired", l.Host, map[string]any{keyLease: l.ID, keyReason: reason})
 }
 
+// unserved is the state of a member whose lease ended without serving it:
+// pending, or aborted in an aborted rollout.
+func unserved(r *fleet.Rollout) fleet.HostState {
+	if r.State == fleet.RolloutAborted {
+		return fleet.HostAborted
+	}
+
+	return fleet.HostPending
+}
+
 // releaseLease ends a lease whose host is ready. Steps the agent reported
-// done settle their rollout's member; anything else returns to pending.
+// done settle their rollout's member, as does a recheck; anything else
+// returns to pending. The first success of a rollout that has no canary
+// (its broken hosts went first) makes that host its canary.
 func (p *pass) releaseLease(l *fleet.Lease) {
 	p.endLease(l, fleet.LeaseReleased)
 	p.repairHost(l)
@@ -620,9 +632,13 @@ func (p *pass) releaseLease(l *fleet.Lease) {
 	for _, r := range p.leaseRollouts(l) {
 		m := p.member(r, l.Host)
 
-		if stepsDone(l, r.ID) {
+		if stepsDone(l, r.ID) || l.Recheck {
 			if !p.succeeded(r) {
 				p.first[r.ID] = l
+
+				if r.Canary == "" && !r.Force && m.Stage == fleet.StageRepair {
+					r.Canary = l.Host
+				}
 			}
 
 			p.setMember(m, fleet.HostDone)
@@ -631,7 +647,7 @@ func (p *pass) releaseLease(l *fleet.Lease) {
 		}
 
 		m.LeaseID = ""
-		p.setMember(m, fleet.HostPending)
+		p.setMember(m, unserved(r))
 	}
 
 	p.record("lease.released", l.Host, map[string]any{

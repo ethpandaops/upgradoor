@@ -164,7 +164,6 @@
     "reason": "zz debugging a consensus bug, ask sam"
    },
    "certHash": "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
-   "generation": 3,
    "firstSeen": "2026-11-12T12:00:00Z",
    "remoteAddr": "203.0.113.77",
    "validatorStart": 0,
@@ -720,6 +719,7 @@
   "settings": {
    "settings": {
     "maxUnavailablePercent": 10,
+    "maxLeasedPercent": 10,
     "maxIndependentPercent": 10,
     "minParticipationPercent": 90,
     "maxFinalityLagEpochs": 3,
@@ -738,11 +738,11 @@
     "pauseAfterCanaryReboot": false,
     "readyPeerShare": 0,
     "lookupInterval": "5m0s",
-    "maxPullingPercent": 10,
     "paused": false
    },
    "defaults": {
     "maxUnavailablePercent": 10,
+    "maxLeasedPercent": 10,
     "maxIndependentPercent": 10,
     "minParticipationPercent": 90,
     "maxFinalityLagEpochs": 3,
@@ -761,7 +761,6 @@
     "pauseAfterCanaryReboot": false,
     "readyPeerShare": 0,
     "lookupInterval": "5m0s",
-    "maxPullingPercent": 10,
     "paused": false
    }
   }
@@ -876,7 +875,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "295c746b8efc"
+  "v": "658d817e61d2"
  },
  "user": {
   "a": {
@@ -1213,7 +1212,6 @@
         "zz debugging a consensus bug, ask sam"
        ],
        "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
-       3,
        1794484800,
        "203.0.113.77",
        [
@@ -1696,6 +1694,7 @@
      [
       10,
       10,
+      10,
       90,
       3,
       1,
@@ -1722,12 +1721,12 @@
       0,
       [
        "5m0s"
-      ],
-      10
+      ]
      ],
      [
       10,
       10,
+      10,
       90,
       3,
       1,
@@ -1754,8 +1753,7 @@
       0,
       [
        "5m0s"
-      ],
-      10
+      ]
      ]
     ]
    ]
@@ -1778,7 +1776,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "295c746b8efc"
+  "v": "658d817e61d2"
  },
  "patch": {
   "h": {

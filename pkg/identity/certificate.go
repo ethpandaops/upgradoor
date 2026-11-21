@@ -67,12 +67,11 @@ type Confirmation struct {
 // Claims are the claims of a host certificate. The field order is the
 // canonical member order of the encoded payload and must not change.
 type Claims struct {
-	Issuer     string       `json:"iss"`
-	Network    string       `json:"net"`
-	Subject    string       `json:"sub"`
-	Cnf        Confirmation `json:"cnf"`
-	Generation uint64       `json:"gen"`
-	Roles      []string     `json:"roles"`
+	Issuer  string       `json:"iss"`
+	Network string       `json:"net"`
+	Subject string       `json:"sub"`
+	Cnf     Confirmation `json:"cnf"`
+	Roles   []string     `json:"roles"`
 }
 
 // HostKey returns the host public key the certificate is bound to.
@@ -91,9 +90,8 @@ func (c *Claims) HostKey() (*mldsa.PublicKey, error) {
 
 // CertificateSpec is the operator-side input of a host certificate.
 type CertificateSpec struct {
-	Network    string
-	Hostname   string
-	Generation uint64
+	Network  string
+	Hostname string
 	// Roles are sorted and de-duplicated before encoding.
 	Roles []string
 }
@@ -107,7 +105,7 @@ func IssueCertificate(seed []byte, spec CertificateSpec) (string, error) {
 		return "", err
 	}
 
-	host, err := DeriveHostKey(seed, spec.Network, spec.Hostname, spec.Generation)
+	host, err := DeriveHostKey(seed, spec.Network, spec.Hostname)
 	if err != nil {
 		return "", err
 	}
@@ -149,8 +147,7 @@ func SignCertificate(
 			Alg: Algorithm,
 			Pub: EncodePublicKey(hostKey),
 		}},
-		Generation: spec.Generation,
-		Roles:      roles,
+		Roles: roles,
 	}
 
 	// All string members are restricted to nameRe or base64url, so

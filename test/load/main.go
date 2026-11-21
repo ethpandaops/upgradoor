@@ -44,18 +44,17 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/agent/link"
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
-	"github.com/ethpandaops/upgradoor/pkg/agent/registry"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 const (
-	network   = "loadnet"
-	gethImage = "ethpandaops/geth:master"
-	clImage   = "sigp/lighthouse:latest"
-	gethOld   = "sha256:" + "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
-	gethNew   = "sha256:" + "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
-	clDigest  = "sha256:" + "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
+	network  = "loadnet"
+	gethRepo = "/ethpandaops/geth:master"
+	clRepo   = "/sigp/lighthouse:latest"
+	gethOld  = "sha256:" + "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1"
+	gethNew  = "sha256:" + "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+	clDigest = "sha256:" + "c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3c3"
 )
 
 type options struct {
@@ -99,6 +98,10 @@ type world struct {
 	controller string
 	hosts      []*agenttest.Host
 	log        *logrus.Logger
+	// registry is what the controller looks the tags up at; the images are
+	// named under its address.
+	registry           *agenttest.Registry
+	gethImage, clImage string
 }
 
 func run(ctx context.Context, o *options) error {
@@ -148,13 +151,21 @@ func (w *world) start(ctx context.Context) error {
 		}
 	}
 
-	ports, err := freePorts(3)
+	ports, err := freePorts(4)
 	if err != nil {
 		return err
 	}
 
-	beaconAddr, ctlAddr := "127.0.0.1:"+ports[0], "127.0.0.1:"+ports[1]
+	beaconAddr, ctlAddr, regAddr := "127.0.0.1:"+ports[0], "127.0.0.1:"+ports[1], "127.0.0.1:"+ports[3]
 	w.ctlURL = "http://" + ctlAddr
+
+	w.registry = agenttest.NewRegistry()
+	w.gethImage, w.clImage = regAddr+gethRepo, regAddr+clRepo
+	w.registry.Set(w.gethImage, gethOld)
+	w.registry.Set(w.clImage, clDigest)
+
+	//nolint:gosec // G114: a local test registry that lives as long as the process
+	go func() { _ = http.ListenAndServe(regAddr, w.registry) }()
 
 	if w.beacon, err = startProcess(filepath.Join(w.o.dir, "beacon.log"),
 		filepath.Join(bin, "fakebeacon"), "-listen", beaconAddr); err != nil {
@@ -174,7 +185,7 @@ func (w *world) start(ctx context.Context) error {
 		return err
 	}
 
-	ctlKey, err := identity.DeriveControllerKey([]byte(controllerSeed), network, 0)
+	ctlKey, err := identity.DeriveControllerKey([]byte(controllerSeed), network)
 	if err != nil {
 		return err
 	}
@@ -185,6 +196,8 @@ func (w *world) start(ctx context.Context) error {
 		"--network", network, "--signer-public-key", identity.EncodePublicKey(identity.PublicKey(signer)),
 		"--controller-seed-file", seedFile, "--allow-insecure-agent-http",
 		"--beacon-endpoint", "http://" + beaconAddr,
+		"--registry-plain-http", regAddr, "--registry-allow-private",
+		"--default-setting", "lookupInterval=30s",
 		"--default-setting", "pauseAfterCanaryImage=false"}
 
 	if w.o.pprof {
@@ -271,7 +284,7 @@ func (w *world) newAgent(i int) (agent.Service, *agenttest.Host, error) {
 		return nil, nil, err
 	}
 
-	key, err := identity.DeriveHostKey(w.seed, network, name, 0)
+	key, err := identity.DeriveHostKey(w.seed, network, name)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -286,8 +299,8 @@ func (w *world) newAgent(i int) (agent.Service, *agenttest.Host, error) {
 		OS:            agenttest.OS{ID: "debian", VersionID: "13", PrettyName: "Debian 13", Arch: "amd64"},
 		RunningKernel: "6.12.57-amd64", NewestKernel: "6.12.57-amd64",
 		Containers: []agenttest.Container{
-			{Name: "geth", Image: gethImage, Digest: gethOld, Group: "execution", Kind: "el"},
-			{Name: "beacon", Image: clImage, Digest: clDigest, Group: "consensus", Kind: "cl"},
+			{Name: "geth", Image: w.gethImage, Digest: gethOld, Group: "execution", Kind: "el"},
+			{Name: "beacon", Image: w.clImage, Digest: clDigest, Group: "consensus", Kind: "cl"},
 		},
 	}, nil)
 	if err != nil {
@@ -296,7 +309,7 @@ func (w *world) newAgent(i int) (agent.Service, *agenttest.Host, error) {
 
 	cfg := &agent.Config{
 		Controller: link.Config{
-			URL: w.ctlURL, AllowInsecure: true, PublicKeys: []string{w.controller},
+			URL: w.ctlURL, AllowInsecure: true, PublicKey: w.controller,
 		},
 		StateDir: filepath.Join(dir, "state"),
 		Local: local.Config{
@@ -310,14 +323,11 @@ func (w *world) newAgent(i int) (agent.Service, *agenttest.Host, error) {
 				"consensus": {Client: "lighthouse"},
 			},
 		},
-		Registry: registry.Config{PollInterval: 30 * time.Second},
-		Verify:   lease.Config{Window: time.Second, Timeout: 30 * time.Second},
+		Verify: lease.Config{Window: time.Second, Timeout: 30 * time.Second},
 	}
 	cfg.ApplyDefaults()
 
-	svc, err := agent.New(w.log, cfg, creds, &agent.Deps{
-		Host: host, Resolver: host, Version: "load",
-	})
+	svc, err := agent.New(w.log, cfg, creds, &agent.Deps{Host: host, Version: "load"})
 
 	return svc, host, err
 }
@@ -377,8 +387,10 @@ func (w *world) measure(ctx context.Context, viewer *streamViewer) error {
 
 		if !rolled && time.Now().After(rollout) {
 			for _, h := range w.hosts {
-				h.SetRegistry(gethImage, gethNew, "")
+				h.SetRegistry(w.gethImage, gethNew, "")
 			}
+
+			w.registry.Set(w.gethImage, gethNew)
 
 			rolled = true
 			rollout = time.Now()

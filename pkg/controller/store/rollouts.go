@@ -164,6 +164,30 @@ func (s *sqliteStore) GetRollout(ctx context.Context, id string) (*fleet.Rollout
 	return rollout, nil
 }
 
+// AbortedKeys returns the keys of the aborted rollouts.
+func (s *sqliteStore) AbortedKeys(ctx context.Context) ([]string, error) {
+	keys := make([]string, 0, 4)
+
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		return queryRows(ctx, tx, `SELECT DISTINCT key FROM rollouts WHERE state = ?`,
+			[]any{string(fleet.RolloutAborted)}, func(row rowScanner) error {
+				var key string
+				if err := row.Scan(&key); err != nil {
+					return err
+				}
+
+				keys = append(keys, key)
+
+				return nil
+			})
+	})
+	if err != nil {
+		return nil, fmt.Errorf("store: aborted keys: %w", err)
+	}
+
+	return keys, nil
+}
+
 func scanRollout(row rowScanner) (*fleet.Rollout, error) {
 	var data string
 	if err := row.Scan(&data); err != nil {
@@ -315,7 +339,7 @@ func (s *sqliteStore) ListDirectives(
 					return fmt.Errorf("directive %s: detail: %w", d.ID, err)
 				}
 
-				d.By, d.Override = extra.By, extra.Override
+				d.By, d.Override, d.Withdraws = extra.By, extra.Override, extra.Withdraws
 			}
 
 			d.Kind = protocol.DirectiveKind(kind)
@@ -384,12 +408,6 @@ func (s *sqliteStore) Commit(ctx context.Context, changes *Changes) error {
 		for _, marks := range changes.Broken {
 			if err := setHostBroken(ctx, tx, marks.Host, marks.Marks); err != nil {
 				return fmt.Errorf("broken marks of %s: %w", marks.Host, err)
-			}
-		}
-
-		for _, pull := range changes.Pulls {
-			if err := setHostPull(ctx, tx, pull.Host, pull.Window); err != nil {
-				return fmt.Errorf("pull window of %s: %w", pull.Host, err)
 			}
 		}
 
@@ -598,8 +616,9 @@ func upsertLease(ctx context.Context, tx *sql.Tx, lease *fleet.Lease) error {
 
 // directiveDetail is the detail column of a directive.
 type directiveDetail struct {
-	By       *protocol.Actor               `json:"by,omitempty"`
-	Override *protocol.OverrideInstruction `json:"override,omitempty"`
+	By        *protocol.Actor               `json:"by,omitempty"`
+	Override  *protocol.OverrideInstruction `json:"override,omitempty"`
+	Withdraws string                        `json:"withdraws,omitempty"`
 }
 
 func upsertDirective(ctx context.Context, tx *sql.Tx, d *fleet.Directive) error {
@@ -613,8 +632,8 @@ func upsertDirective(ctx context.Context, tx *sql.Tx, d *fleet.Directive) error 
 
 	detail := ""
 
-	if d.By != nil || d.Override != nil {
-		extra := directiveDetail{By: d.By, Override: d.Override}
+	if d.By != nil || d.Override != nil || d.Withdraws != "" {
+		extra := directiveDetail{By: d.By, Override: d.Override, Withdraws: d.Withdraws}
 
 		// Times are stored as every other one: UTC, to the millisecond.
 		if d.Override != nil && d.Override.Until != nil {

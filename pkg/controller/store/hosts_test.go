@@ -41,7 +41,6 @@ func TestRecordSync(t *testing.T) {
 			want := &fleet.Host{
 				Name:       "node-1",
 				CertHash:   "hash-node-1",
-				Generation: 1,
 				Validators: validators,
 				Roles:      []string{"bootnode", "rpc"},
 				FirstSeen:  at(0),
@@ -74,18 +73,16 @@ func TestRecordSync(t *testing.T) {
 			assert.Equal(t, "10.0.0.2:999", res.Host.RemoteAddr)
 			assert.Len(t, res.Host.Status.Needs, 3, "the status is stored verbatim")
 
-			// A re-issued certificate: new hash, generation and roles. The
+			// A re-issued certificate: new hash and roles. The
 			// sync reports no validators any more.
 			reissued := testCert("node-1")
 			reissued.Hash = "hash-2"
-			reissued.Generation = 2
 
 			res, err = s.RecordSync(ctx, &HostSync{Cert: reissued, Request: testRequest(), At: at(120)})
 			require.NoError(t, err)
 			assert.False(t, res.Created)
 			assert.Equal(t, "hash-node-1", res.PreviousCertHash)
 			assert.Equal(t, "hash-2", res.Host.CertHash)
-			assert.Equal(t, uint64(2), res.Host.Generation)
 			assert.Nil(t, res.Host.Validators)
 			assert.Equal(t, []string{}, res.Host.Roles)
 			assert.Empty(t, res.Host.RemoteAddr)
@@ -146,57 +143,6 @@ func TestRecordSyncConfirms(t *testing.T) {
 			res = sync(90, reporting(100, 201, imageNeed("a"), imageNeed("b")))
 			assert.True(t, res.Changed, "another range")
 			assert.Equal(t, &identity.ValidatorRange{Start: 100, End: 201}, res.Host.Validators)
-		})
-	}
-}
-
-// The generation is the floor below which the API rejects certificates. A
-// sync with an older certificate that reached the store anyway does not lower
-// it.
-func TestRecordSyncNeverLowersGeneration(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-
-	for _, backend := range backends {
-		t.Run(backend.name, func(t *testing.T) {
-			t.Parallel()
-
-			s := backend.open(t)
-
-			cert := func(generation uint64) *identity.Certificate {
-				c := testCert("node-1")
-				c.Generation = generation
-				c.Hash = fmt.Sprintf("hash-gen-%d", generation)
-
-				return c
-			}
-
-			for _, step := range []struct {
-				generation, want uint64
-			}{
-				{generation: 0, want: 0},
-				{generation: 2, want: 2},
-				{generation: 1, want: 2},
-				{generation: 0, want: 2},
-				{generation: 2, want: 2},
-				{generation: 5, want: 5},
-			} {
-				res, err := s.RecordSync(ctx, &HostSync{
-					Cert: cert(step.generation), Request: testRequest(), At: at(0),
-				})
-				require.NoError(t, err)
-				assert.Equal(t, step.want, res.Host.Generation, "after generation %d", step.generation)
-
-				got, err := s.GetHost(ctx, "node-1")
-				require.NoError(t, err)
-				assert.Equal(t, step.want, got.Generation)
-			}
-
-			// Without a request (identity only) the same holds.
-			res, err := s.RecordSync(ctx, &HostSync{Cert: cert(3), At: at(10)})
-			require.NoError(t, err)
-			assert.Equal(t, uint64(5), res.Host.Generation)
 		})
 	}
 }

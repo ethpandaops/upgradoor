@@ -31,6 +31,7 @@ type harness struct {
 	store   *controllertest.Store
 	sched   *controllertest.Scheduler
 	beacon  *controllertest.Beacon
+	lookups *controllertest.Lookups
 	clock   *controllertest.Clock
 	reg     *prometheus.Registry
 	// notified counts the calls of Options.Notify.
@@ -43,12 +44,13 @@ func newHarness(t *testing.T, mod func(*Options)) *harness {
 	t.Helper()
 
 	h := &harness{
-		t:      t,
-		store:  controllertest.NewStore(),
-		sched:  controllertest.NewScheduler(),
-		beacon: &controllertest.Beacon{},
-		clock:  controllertest.NewClock(controllertest.Epoch),
-		reg:    prometheus.NewRegistry(),
+		t:       t,
+		store:   controllertest.NewStore(),
+		sched:   controllertest.NewScheduler(),
+		beacon:  &controllertest.Beacon{},
+		lookups: &controllertest.Lookups{},
+		clock:   controllertest.NewClock(controllertest.Epoch),
+		reg:     prometheus.NewRegistry(),
 	}
 
 	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed), controllertest.Network)
@@ -72,6 +74,7 @@ func newHarness(t *testing.T, mod func(*Options)) *harness {
 			identity.WithClock(h.clock.Now)),
 		Store:     h.store,
 		Scheduler: h.sched,
+		Lookups:   h.lookups,
 		Metrics:   collector,
 		Notify:    func() { h.notified.Add(1) },
 		Now:       h.clock.Now,
@@ -106,13 +109,6 @@ func (h *harness) serve(req *http.Request) *httptest.ResponseRecorder {
 	h.handler.ServeHTTP(rec, req)
 
 	return rec
-}
-
-// get runs a GET without credentials.
-func (h *harness) get(target string) *httptest.ResponseRecorder {
-	h.t.Helper()
-
-	return h.serve(httptest.NewRequest(http.MethodGet, controllertest.BaseURL+target, http.NoBody))
 }
 
 // agentRequest builds a signed agent request on the harness's clock.

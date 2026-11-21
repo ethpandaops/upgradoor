@@ -27,6 +27,8 @@ type Policy struct {
 	DefaultGroup DefaultGroup `yaml:"defaultGroup"`
 	// Packages bounds the packages verb.
 	Packages Packages `yaml:"packages"`
+	// Fallback is what the host does while the controller cannot be reached.
+	Fallback Fallback `yaml:"fallback"`
 }
 
 // Group is the agent.yaml entry of one roll group.
@@ -70,8 +72,11 @@ type Packages struct {
 // Allows reports whether the policy allows a verb.
 func (p *Policy) Allows(v protocol.Verb) bool { return slices.Contains(p.Verbs, v) }
 
-// ApplyDefaults fills unset fields: the kind of a mapped container is other.
+// ApplyDefaults fills unset fields: the kind of a mapped container is other,
+// the fallback's times.
 func (p *Policy) ApplyDefaults() {
+	p.Fallback.applyDefaults()
+
 	for name, m := range p.Containers {
 		if m.Kind == "" {
 			m.Kind = protocol.KindOther
@@ -80,7 +85,8 @@ func (p *Policy) ApplyDefaults() {
 	}
 }
 
-// Validate checks verbs, groups, mapped containers and exclude patterns.
+// Validate checks verbs, groups, mapped containers, exclude patterns and the
+// fallback.
 // packages.blocked is checked by host.
 func (p *Policy) Validate() error {
 	for _, v := range p.Verbs {
@@ -110,7 +116,7 @@ func (p *Policy) Validate() error {
 		}
 	}
 
-	return nil
+	return p.Fallback.validate()
 }
 
 // group returns a roll group's entry; the zero Group when it is not listed.

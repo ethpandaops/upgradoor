@@ -62,9 +62,13 @@ type World struct {
 	Liveness []fleet.Liveness
 	// Hosts are all known hosts with their last sync.
 	Hosts []*fleet.Host
-	// Rollouts are the non-terminal rollouts. No decision reads a rollout
-	// that is closed.
+	// Rollouts are the non-terminal rollouts, and the aborted ones that an
+	// open lease still serves: the end of the lease settles their member.
+	// No other decision reads a rollout that is closed.
 	Rollouts []*fleet.Rollout
+	// AbortedKeys are the keys of the aborted rollouts: their cause is not
+	// opened again.
+	AbortedKeys map[string]bool
 	// Leases are the non-terminal leases.
 	Leases []*fleet.Lease
 	// Directives are the pending directives plus every directive that
@@ -83,10 +87,8 @@ type Outcome struct {
 	// Broken are the broken marks of the hosts on which a lease failed or
 	// was released in this pass, as they are from now on.
 	Broken []store.HostBroken
-	// Pulls are the pull windows that were granted, changed or ended.
-	Pulls []store.HostPull
-	Audit []fleet.AuditEntry
-	Plan  *Plan
+	Audit  []fleet.AuditEntry
+	Plan   *Plan
 }
 
 // Changes returns the outcome as one store transaction.
@@ -96,7 +98,6 @@ func (o *Outcome) Changes() *store.Changes {
 		Leases:     o.Leases,
 		Directives: o.Directives,
 		Broken:     o.Broken,
-		Pulls:      o.Pulls,
 		Audit:      o.Audit,
 	}
 }
@@ -110,14 +111,9 @@ func Reconcile(w *World) *Outcome {
 	p.syncDirectives()
 	p.advanceLeases()
 	p.syncRollouts()
+	p.syncWithdrawals()
 
-	plan := p.grant()
-
-	pulls := p.pulls(plan)
-	out := p.outcome(plan)
-	out.Pulls = pulls
-
-	return out
+	return p.outcome(p.grant())
 }
 
 // hostView is one host with what the pass derives about it.

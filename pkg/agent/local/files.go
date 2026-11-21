@@ -23,7 +23,9 @@ import (
 // and writer. A change replaces one entry or hold and nothing else, adds a
 // history comment line above it, is parsed back and compared with what was
 // meant, and is written atomically with the file's owner and mode kept,
-// because the entry user edits it. The generated block is kept byte for byte.
+// because the entry user edits it; an agent that is not root keeps the group
+// and lets it write. The generated block is kept byte for byte; only
+// InitBlock and SetDeployed render it.
 //
 // The file is read only as a regular file with one name, not reached through
 // a symbolic link and, for root, in a directory whose ancestors only root can
@@ -49,12 +51,18 @@ type Files interface {
 	SetHold(origin plan.Origin, h *plan.Hold, who, note string) error
 	// InitBlock writes the generated block and keeps whatever is below it.
 	InitBlock(deployed map[string]plan.Deployed) error
+	// SetDeployed writes one container's entry of the generated block; reset
+	// also takes out its override entry, holds stay. It reports whether the
+	// file changed.
+	SetDeployed(container string, d plan.Deployed, reset bool, who string) (bool, error)
 }
 
 const (
 	maxFileSize = 1 << 20
 	// newFileMode lets the entry user edit a new file.
 	newFileMode = 0o664
+	// groupWrite is added when the agent replaces another owner's file.
+	groupWrite = 0o060
 	// replaceableBits let others replace a non-sticky directory's entries.
 	replaceableBits = 0o022
 	// tempInfix names the temp file of a write: <file>.tmp-<random>.
@@ -432,6 +440,66 @@ func (f *files) InitBlock(deployed map[string]plan.Deployed) error {
 	return f.write(cur)
 }
 
+// SetDeployed implements Files. Nothing is written when nothing changes.
+func (f *files) SetDeployed(container string, d plan.Deployed, reset bool, who string) (bool, error) {
+	if !containerName.MatchString(container) {
+		return false, plan.Refusal("%q is not a valid container name", container)
+	}
+
+	if !d.HasCommand {
+		d.Command = nil
+	}
+
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	cur, set, readErr := f.readParsed()
+	if readErr != nil {
+		return false, fmt.Errorf("the overrides file cannot be read: %w", readErr)
+	}
+
+	prev, had := set.Deployed[container]
+	entry, drop := set.Entries[container]
+	drop = drop && reset
+
+	if had && sameDeployed(&prev, &d) && !drop {
+		return false, nil
+	}
+
+	want := plan.Overrides{Deployed: maps.Clone(set.Deployed), Entries: set.Entries, Holds: set.Holds}
+	want.Deployed[container] = d
+
+	cur.text.setBlock(generatedBlock(want.Deployed))
+
+	if drop {
+		delete(want.Entries, container)
+
+		note := "cleared by deploy --reset; was " + entry.Describe()
+		if err := cur.text.setOverride(container, nil, f.now(), who, note); err != nil {
+			return false, err
+		}
+	}
+
+	after, err := parse(cur.text.bytes())
+	if err != nil {
+		return false, fmt.Errorf("the change would break the overrides file: %w", err)
+	}
+
+	if err := unchanged(&want, &after, nil, nil); err != nil {
+		return false, err
+	}
+
+	if err := f.write(cur); err != nil {
+		return false, err
+	}
+
+	if drop && f.seen != nil {
+		delete(f.seen, container)
+	}
+
+	return true, nil
+}
+
 // current is the file as read, with the owner and mode a rewrite keeps.
 type current struct {
 	text     *text
@@ -559,16 +627,23 @@ func (f *files) write(cur *current) error {
 }
 
 // writeTemp fills the temp file and sets mode and owner before the rename.
+// Only root can keep another user as the owner: any other agent keeps the
+// group and lets it write, so that the owner it replaces still can.
 func writeTemp(tmp *os.File, data []byte, mode os.FileMode, uid, gid int, owner bool) error {
 	if _, err := tmp.Write(data); err != nil {
 		return err
+	}
+
+	euid := os.Geteuid()
+	if owner && euid != 0 && uid != euid {
+		uid, mode = euid, mode|groupWrite
 	}
 
 	if err := tmp.Chmod(mode); err != nil {
 		return err
 	}
 
-	if owner && (uid != os.Geteuid() || gid != os.Getegid()) {
+	if owner && (uid != euid || gid != os.Getegid()) {
 		if err := tmp.Chown(uid, gid); err != nil {
 			return fmt.Errorf("keep the owner: %w", err)
 		}

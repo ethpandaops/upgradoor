@@ -60,6 +60,9 @@ type Settings struct {
 	// MaxUnavailablePercent is the share of tracked validator weight that may
 	// be unavailable at once (0-100).
 	MaxUnavailablePercent float64 `json:"maxUnavailablePercent"`
+	// MaxLeasedPercent is the share of hosts (0-100) that may hold a node or
+	// slot lease at once, at least one host.
+	MaxLeasedPercent float64 `json:"maxLeasedPercent"`
 	// MaxIndependentPercent is the share of hosts (0-100) that may hold a
 	// lease for independent containers at once, at least one host. Those
 	// leases have no gate and no budget and count for no other limit.
@@ -115,14 +118,9 @@ type Settings struct {
 	// limit allows.
 	ReadyPeerShare float64 `json:"readyPeerShare"`
 
-	// LookupInterval is how often one host of those that run a tag looks it
-	// up at the registry, in turn: for the whole devnet, not per host. The
-	// controller tells every other host what the tag points at.
+	// LookupInterval is how often the controller looks a tag up at its
+	// registry. It tells every host that follows the tag what it points at.
 	LookupInterval Duration `json:"lookupInterval"`
-	// MaxPullingPercent is the share of hosts (0-100) that may pull images
-	// at once, at least one host: each host pulls only inside a pull window
-	// the controller grants.
-	MaxPullingPercent float64 `json:"maxPullingPercent"`
 
 	// Paused is the global pause: nothing new is granted.
 	Paused bool `json:"paused"`
@@ -132,6 +130,7 @@ type Settings struct {
 func DefaultSettings() Settings {
 	return Settings{
 		MaxUnavailablePercent:   10,
+		MaxLeasedPercent:        10,
 		MaxIndependentPercent:   10,
 		MinParticipationPercent: 90,
 		MaxFinalityLagEpochs:    3,
@@ -145,7 +144,6 @@ func DefaultSettings() Settings {
 		PolicyReboot:            PolicyManual,
 		PolicyDefaultGroup:      PolicyAuto,
 		LookupInterval:          Duration(5 * time.Minute),
-		MaxPullingPercent:       10,
 	}
 }
 
@@ -242,6 +240,10 @@ func (s *Settings) Validate() error {
 		return errors.New("maxUnavailablePercent must be between 0 and 100")
 	}
 
+	if !(s.MaxLeasedPercent > 0 && s.MaxLeasedPercent <= 100) {
+		return errors.New("maxLeasedPercent must be above 0 and at most 100")
+	}
+
 	if !(s.MaxIndependentPercent >= 0 && s.MaxIndependentPercent <= 100) {
 		return errors.New("maxIndependentPercent must be between 0 and 100")
 	}
@@ -281,10 +283,6 @@ func (s *Settings) Validate() error {
 
 	if s.LookupInterval.Std() < MinLookupInterval || s.LookupInterval.Std() > MaxLookupInterval {
 		return errors.New("lookupInterval must be between 30s and 24h")
-	}
-
-	if !(s.MaxPullingPercent > 0 && s.MaxPullingPercent <= 100) {
-		return errors.New("maxPullingPercent must be above 0 and at most 100")
 	}
 
 	for _, p := range []Policy{s.PolicyImage, s.PolicyPackages, s.PolicyReboot, s.PolicyDefaultGroup} {

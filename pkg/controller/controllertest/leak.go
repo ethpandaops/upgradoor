@@ -141,7 +141,7 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 	}
 
 	st.Hosts["lighthouse-geth-1"] = &fleet.Host{
-		Name: "lighthouse-geth-1", CertHash: SecretCertHash, Generation: 3,
+		Name: "lighthouse-geth-1", CertHash: SecretCertHash,
 		Validators: &identity.ValidatorRange{Start: 0, End: 100},
 		Roles:      []string{"ethereum_node"},
 		FirstSeen:  Epoch.Add(-48 * time.Hour), LastSeen: Epoch,

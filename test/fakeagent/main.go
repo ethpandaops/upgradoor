@@ -1,9 +1,13 @@
 // Command fakeagent runs agent on agenttest's in-memory host described by a
 // scenario file, for local development: nothing on the machine is touched.
 //
-//	go run ./test/fakeagent --config agent.yaml --scenario host.yaml [--control 127.0.0.1:7771]
+//	go run ./test/fakeagent --config agent.yaml --scenario host.yaml \
+//	    [--registry 127.0.0.1:5050] [--control 127.0.0.1:7771]
 //
-// --control serves an endpoint that changes the host while the agent runs.
+// --registry is the address of test/fakeregistry: a pull takes the digest of
+// its tag from there, as the controller's lookup does. Without it a pull
+// takes what the scenario's registry holds. --control serves an endpoint
+// that changes the host while the agent runs.
 package main
 
 import (
@@ -21,14 +25,16 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/agent"
 	"github.com/ethpandaops/upgradoor/pkg/agent/agenttest"
+	"github.com/ethpandaops/upgradoor/pkg/controller/registry"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 )
 
 func main() {
-	var configFile, scenarioFile, control, logLevel string
+	var configFile, scenarioFile, registryAddr, control, logLevel string
 
 	flag.StringVar(&configFile, "config", agent.DefaultConfigFile, "agent configuration file")
 	flag.StringVar(&scenarioFile, "scenario", "", "scenario file of the in-memory host (required)")
+	flag.StringVar(&registryAddr, "registry", "", "address of the fake registry the pulls ask (optional)")
 	flag.StringVar(&control, "control", "", "loopback address of the control endpoint (optional)")
 	flag.StringVar(&logLevel, "log-level", "info", "log level")
 	flag.Parse()
@@ -36,7 +42,7 @@ func main() {
 	log := logrus.New()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	err := run(ctx, log, configFile, scenarioFile, control, logLevel)
+	err := run(ctx, log, configFile, scenarioFile, registryAddr, control, logLevel)
 
 	stop()
 
@@ -46,7 +52,9 @@ func main() {
 	}
 }
 
-func run(ctx context.Context, log *logrus.Logger, configFile, scenarioFile, control, logLevel string) error {
+func run(
+	ctx context.Context, log *logrus.Logger, configFile, scenarioFile, registryAddr, control, logLevel string,
+) error {
 	level, err := logrus.ParseLevel(logLevel)
 	if err != nil {
 		return err
@@ -78,9 +86,17 @@ func run(ctx context.Context, log *logrus.Logger, configFile, scenarioFile, cont
 		return err
 	}
 
-	svc, err := agent.New(log, cfg, creds, &agent.Deps{
-		Host: host, Resolver: host, Version: "fake",
-	})
+	if registryAddr != "" {
+		resolver, rerr := registry.NewResolver(log,
+			&registry.Config{PlainHTTP: []string{registryAddr}, AllowPrivate: true}, nil)
+		if rerr != nil {
+			return rerr
+		}
+
+		host.PullFrom(resolver.Resolve)
+	}
+
+	svc, err := agent.New(log, cfg, creds, &agent.Deps{Host: host, Version: "fake"})
 	if err != nil {
 		return err
 	}

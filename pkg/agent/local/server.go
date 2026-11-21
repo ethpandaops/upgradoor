@@ -46,13 +46,21 @@ const (
 	rootOnlyMode = 0o600
 )
 
-// peerKey is the context key of the caller's name.
+// peerKey is the context key of the caller.
 type peerKey struct{}
+
+// peer is the caller of a connection; uid is -1 when unknown.
+type peer struct {
+	name string
+	uid  int
+}
 
 type server struct {
 	log   logrus.FieldLogger
 	cfg   *Config
 	agent Agent
+	// deployer is the only uid that may deploy: root.
+	deployer int
 
 	mu   sync.Mutex
 	http *http.Server
@@ -83,6 +91,7 @@ func (s *server) Start(ctx context.Context) error {
 	mux.HandleFunc("POST "+PathHold, s.handleHold)
 	mux.HandleFunc("POST "+PathRolls, s.handleRoll)
 	mux.HandleFunc("POST "+PathInit, s.handleInit)
+	mux.HandleFunc("POST "+PathDeploy, s.handleDeploy)
 
 	srv := &http.Server{
 		Handler:           mux,
@@ -90,7 +99,7 @@ func (s *server) Start(ctx context.Context) error {
 		ReadTimeout:       requestTimeout,
 		WriteTimeout:      requestTimeout,
 		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			return context.WithValue(ctx, peerKey{}, peerName(c))
+			return context.WithValue(ctx, peerKey{}, peerOf(c))
 		},
 	}
 
@@ -195,27 +204,29 @@ func socketGroup(name, entryUser string) (int, bool) {
 	return gid, err == nil
 }
 
-// peerName is "local:<user>" for the kernel-reported peer of a connection.
-func peerName(c net.Conn) string {
+// peerOf is the kernel-reported peer of a connection, named "local:<user>".
+func peerOf(c net.Conn) peer {
 	uid, ok := peerUID(c)
 	if !ok {
-		return SourceLocal + ":unknown"
+		return peer{name: SourceLocal + ":unknown", uid: -1}
 	}
 
 	if u, err := user.LookupId(strconv.Itoa(uid)); err == nil {
-		return SourceLocal + ":" + u.Username
+		return peer{name: SourceLocal + ":" + u.Username, uid: uid}
 	}
 
-	return SourceLocal + ":uid " + strconv.Itoa(uid)
+	return peer{name: SourceLocal + ":uid " + strconv.Itoa(uid), uid: uid}
 }
 
-func who(r *http.Request) string {
-	if name, _ := r.Context().Value(peerKey{}).(string); name != "" {
-		return name
+func peerOfRequest(r *http.Request) peer {
+	if p, ok := r.Context().Value(peerKey{}).(peer); ok {
+		return p
 	}
 
-	return SourceLocal + ":unknown"
+	return peer{name: SourceLocal + ":unknown", uid: -1}
 }
+
+func who(r *http.Request) string { return peerOfRequest(r).name }
 
 func (s *server) answer(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
@@ -321,4 +332,28 @@ func (s *server) handleInit(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.answer(w, http.StatusOK, Answer{Message: "generated block written to " + file})
+}
+
+// handleDeploy serves only root: the deployed block is Ansible's, which runs
+// as root; the socket's group changes containers through overrides.
+func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
+	if peerOfRequest(r).uid != s.deployer {
+		s.answer(w, http.StatusForbidden, Answer{Error: "deploy is for root only"})
+
+		return
+	}
+
+	var req DeployRequest
+	if !s.decode(w, r, &req) {
+		return
+	}
+
+	res, err := s.agent.Deploy(r.Context(), who(r), &req)
+	if err != nil {
+		s.fail(w, err)
+
+		return
+	}
+
+	s.answer(w, http.StatusOK, res)
 }

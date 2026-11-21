@@ -87,7 +87,7 @@ func TestClassifyResolvesGroups(t *testing.T) {
 	cadvisor := view.Containers[3]
 	assert.Equal(t, protocol.ImpactIndependent, cadvisor.Impact)
 	assert.Equal(t, &protocol.RegistryCheck{Digest: "sha256:new"}, cadvisor.Registry, "its updates are reported")
-	assert.Equal(t, Tag{Ref: "cadvisor:1", InUse: true}, view.Tags[imageref.Normalize("cadvisor:1")])
+	assert.Equal(t, "cadvisor:1", view.Tags[imageref.Normalize("cadvisor:1")])
 	assert.NotContains(t, view.Tags, imageref.Normalize("cadvisor@sha256:aa"), "a digest is not followed")
 	assert.NotContains(t, view.Tags, imageref.Normalize("lighthouse:skipped"), "label none: not followed")
 	assert.NotContains(t, view.Tags, imageref.Normalize("busybox:1"), "defaultGroup.exclude: not followed")
@@ -139,7 +139,7 @@ func TestClassifyContainersByLabels(t *testing.T) {
 	assert.Equal(t, &protocol.Overridable{Image: true}, beacon.Overridable)
 	assert.Equal(t, "sigp/lighthouse:v2", beacon.ConfiguredImage, "what the deployed block says")
 	assert.True(t, view.Targets["beacon"].Spec, "the block names another image: a soft deploy")
-	assert.Equal(t, Tag{Ref: "sigp/lighthouse:v2"}, view.Tags[imageref.Normalize("sigp/lighthouse:v2")],
+	assert.Equal(t, "sigp/lighthouse:v2", view.Tags[imageref.Normalize("sigp/lighthouse:v2")],
 		"the tag of the target is followed, though no container runs it")
 
 	assert.True(t, nginx.Managed)
@@ -248,4 +248,39 @@ func TestDeployment(t *testing.T) {
 		"geth": {Image: "ethpandaops/geth:master", Command: []string{"--x"}, HasCommand: true},
 		"dora": {Image: "ethpandaops/dora:latest", Command: []string{}, HasCommand: true},
 	}, Deployment(view))
+}
+
+// A deploy hands a container to the agent only when the agent rolls it to its target.
+func TestDeployState(t *testing.T) {
+	p := &Policy{Verbs: []protocol.Verb{protocol.VerbRoll}}
+	facts := &Facts{Fresh: true, Containers: []protocol.Container{
+		{Name: "geth", Image: "geth:1", Digest: "sha256:a", Group: "el", Command: []string{"--x"}},
+		{Name: "teku", Image: "teku:1", Digest: "sha256:a", Group: "cl"},
+		{Name: "besu", Image: "besu:1", Digest: "sha256:old", Group: "el"},
+		{Name: "nginx", Image: "nginx:1", Group: "proxy", Linked: true},
+		{Name: "cadvisor", Image: "cadvisor:1"},
+		{Name: "dora", Image: "dora:1", Group: protocol.GroupNone},
+	}}
+	files := &Overrides{Known: true, Deployed: map[string]Deployed{
+		"geth": {Image: "geth:1", Command: []string{"--y"}, HasCommand: true},
+		"teku": {Image: "teku:1"},
+	}}
+	checks := map[string]protocol.RegistryCheck{imageref.Normalize("besu:1"): {Digest: "sha256:new"}}
+	view := Classify(p, facts, files, checks, testNow)
+
+	for name, want := range map[string][3]bool{
+		"geth":     {true, true, true},
+		"teku":     {true, true, false},
+		"besu":     {true, true, true},
+		"nginx":    {true, false, false},
+		"cadvisor": {true, false, false},
+		"dora":     {true, false, false},
+		"missing":  {false, false, false},
+	} {
+		exists, managed, differs := DeployState(p, &view, name)
+		assert.Equal(t, want, [3]bool{exists, managed, differs}, name)
+	}
+
+	exists, managed, _ := DeployState(&Policy{}, &view, "geth")
+	assert.Equal(t, [2]bool{true, false}, [2]bool{exists, managed}, "without the roll verb")
 }

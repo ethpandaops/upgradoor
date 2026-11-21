@@ -144,7 +144,7 @@ for h in "${hosts[@]}"; do
 controller:
   url: http://$id-controller:8080
   allowInsecure: true
-  publicKeys: ["$controller_pub"]
+  publicKey: "$controller_pub"
   syncInterval: 3s
   leaseSyncInterval: 1s
   maxSyncInterval: 3s
@@ -154,8 +154,6 @@ groups:
   app: {stopTimeout: 5s}
 docker:
   host: unix:///run/docker.sock
-registry:
-  pollInterval: 1h
 packages:
   blocked: [upgradoor-dummy]
 verify:

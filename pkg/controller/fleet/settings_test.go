@@ -54,6 +54,16 @@ func TestSettingsDefaultsAndValidation(t *testing.T) {
 
 	s.MinPeers = 1
 	require.NoError(t, s.Validate())
+
+	assert.InDelta(t, 10.0, s.MaxLeasedPercent, 0)
+
+	for _, v := range []float64{0, -1, 100.5, math.NaN()} {
+		s.MaxLeasedPercent = v
+		require.EqualError(t, s.Validate(), "maxLeasedPercent must be above 0 and at most 100", "%v", v)
+	}
+
+	s.MaxLeasedPercent = 100
+	require.NoError(t, s.Validate())
 }
 
 func TestSettingsCanaryPauseAndPeerShare(t *testing.T) {

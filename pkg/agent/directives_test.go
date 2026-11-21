@@ -107,11 +107,11 @@ func TestAcksFollowTheRepeatedDirectives(t *testing.T) {
 		}
 	}
 
-	e.ctrl.Direct(protocol.Directive{ID: "d-old", Kind: protocol.DirectiveRecheck})
+	e.ctrl.Direct(protocol.Directive{ID: "d-old", Kind: protocol.DirectiveReleaseHold})
 	e.ctrl.Await("the old ack", onlyAck("d-old"))
 
-	e.ctrl.Direct(protocol.Directive{ID: "d-new", Kind: protocol.DirectiveRecheck},
-		protocol.Directive{ID: "d-new", Kind: protocol.DirectiveRecheck})
+	e.ctrl.Direct(protocol.Directive{ID: "d-new", Kind: protocol.DirectiveReleaseHold},
+		protocol.Directive{ID: "d-new", Kind: protocol.DirectiveReleaseHold})
 	e.ctrl.Await("the new ack", onlyAck("d-new"))
 
 	seen := 0
@@ -182,96 +182,78 @@ func TestManualRoll(t *testing.T) {
 	assert.Empty(t, req.Needs, "served: the repeated directive does not bring the need back")
 }
 
-func TestManualRollResolvesAndPullsFirst(t *testing.T) {
+// A manual roll pulls nothing before its lease; the revision is known once
+// the image is local.
+func TestManualRollWaitsForItsLeaseToPull(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, agenttest.BaseScenario())
-	e.cfg.Registry.PollInterval = time.Hour
-	e.ctrl.Set(func(c *agenttest.Controller) { c.NoLookups = true })
 	e.start()
 
-	e.ctrl.Await("first registry check", func(req *protocol.SyncRequest) bool {
-		return agenttest.ContainerOf(t, req, "geth").Registry != nil
-	})
-
 	e.host.SetRegistry(agenttest.GethImage, agenttest.GethV2, "rev-2")
-
-	req := e.ctrl.AwaitSyncs(5)
-	require.Empty(t, req.Needs, "the agent has not looked at the registry again")
+	awaitNeeds(t, e, protocol.ImageNeedID("geth", agenttest.GethV2))
 
 	e.ctrl.Direct(protocol.Directive{ID: "d-roll", Kind: protocol.DirectiveRoll, Container: "geth"})
 
-	req = e.ctrl.Await("manual roll accepted", func(req *protocol.SyncRequest) bool {
+	req := e.ctrl.Await("manual roll accepted", func(req *protocol.SyncRequest) bool {
 		return agenttest.AckOf(req, "d-roll") != nil
 	})
 	require.Equal(t, protocol.DirectiveAccepted, agenttest.AckOf(&req, "d-roll").Status)
 	require.Equal(t, []string{protocol.ManualNeedID("d-roll")}, agenttest.NeedIDs(&req),
 		"one container, one image need: the manual one")
 
-	req = e.ctrl.Await("the image pulled", func(req *protocol.SyncRequest) bool {
-		return hasPulledNeed(req, protocol.ManualNeedID("d-roll"))
-	})
 	assert.Equal(t, &protocol.ImageNeed{
 		Container: "geth", Group: agenttest.GroupExecution, Image: agenttest.GethImage,
-		FromDigest: agenttest.GethV1, ToDigest: agenttest.GethV2, ToRevision: "rev-2",
+		FromDigest: agenttest.GethV1, ToDigest: agenttest.GethV2,
 	}, req.Needs[0].Image)
-	assert.Equal(t, []string{"pull " + agenttest.GethImage}, e.host.Calls())
+	assert.Empty(t, e.host.Calls())
 }
 
-// heldResolver holds the lookups of one tag while hold is set.
-type heldResolver struct {
+// withheld is the controller's lookup of the host's registry; while hold is
+// set it has not looked one tag up.
+type withheld struct {
 	*agenttest.Host
-	ref              string
-	hold             atomic.Bool
-	entered, release chan struct{}
+	ref  string
+	hold atomic.Bool
 }
 
-func (r *heldResolver) Resolve(ctx context.Context, ref string) (string, error) {
-	if r.hold.Load() && imageref.Same(ref, r.ref) {
-		select {
-		case r.entered <- struct{}{}:
-		default:
-		}
+// withhold sets the controller's lookup to one that has not looked ref up.
+func (e *env) withhold(ref string) *withheld {
+	w := &withheld{Host: e.host, ref: ref}
+	w.hold.Store(true)
 
-		select {
-		case <-r.release:
-		case <-ctx.Done():
-			return "", ctx.Err()
-		}
+	e.ctrl.Set(func(c *agenttest.Controller) { c.Lookup = w.Resolve })
+
+	return w
+}
+
+func (r *withheld) Resolve(ctx context.Context, ref string) (string, error) {
+	if r.hold.Load() && imageref.Same(ref, r.ref) {
+		return "", nil
 	}
 
 	return r.Host.Resolve(ctx, ref)
 }
 
-// A roll directive withdrawn before its lookup answered is dropped unanswered.
+// A roll directive withdrawn before the controller looked its tag up is
+// dropped unanswered.
 func TestRollDirectiveWithdrawnBeforeItsLookup(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, agenttest.BaseScenario())
-	e.cfg.Registry.PollInterval = time.Hour
-	e.ctrl.Set(func(c *agenttest.Controller) { c.NoLookups = true })
-
-	resolver := &heldResolver{
-		Host: e.host, ref: agenttest.GethImage, entered: make(chan struct{}, 1), release: make(chan struct{}),
-	}
-	e.resolver = resolver
+	lookup := e.withhold(agenttest.GethImage)
 	e.start()
 
-	e.ctrl.Await("first registry check", func(req *protocol.SyncRequest) bool {
-		return agenttest.ContainerOf(t, req, "geth").Registry != nil
-	})
-
-	resolver.hold.Store(true)
 	e.ctrl.Direct(protocol.Directive{ID: "d-roll", Kind: protocol.DirectiveRoll, Container: "geth"})
-	agenttest.AwaitParked(t, resolver.entered, "the lookup of the roll")
-
 	e.ctrl.AwaitSyncs(3)
 	e.ctrl.Direct()
 	e.ctrl.AwaitSyncs(3)
 
-	resolver.hold.Store(false)
-	close(resolver.release)
-	e.ctrl.AwaitSyncs(5)
+	lookup.hold.Store(false)
+	e.ctrl.Await("the tag looked up", func(req *protocol.SyncRequest) bool {
+		return agenttest.ContainerOf(t, req, "geth").Registry != nil
+	})
+	e.ctrl.AwaitSyncs(3)
 
 	for _, req := range e.ctrl.Syncs() {
 		require.Nil(t, agenttest.AckOf(&req, "d-roll"))
@@ -279,31 +261,6 @@ func TestRollDirectiveWithdrawnBeforeItsLookup(t *testing.T) {
 	}
 
 	assert.Nil(t, e.stateOnDisk()["answers"], "nothing is remembered of the roll")
-}
-
-func TestRecheckDirective(t *testing.T) {
-	t.Parallel()
-
-	e := newEnv(t, agenttest.BaseScenario())
-	e.cfg.Registry.PollInterval = time.Hour
-	e.ctrl.Set(func(c *agenttest.Controller) { c.NoLookups = true })
-	e.start()
-
-	e.ctrl.Await("first registry check", func(req *protocol.SyncRequest) bool {
-		return agenttest.ContainerOf(t, req, "teku").Registry != nil
-	})
-
-	e.host.SetRegistry(agenttest.TekuImage, agenttest.TekuV2, "")
-
-	req := e.ctrl.AwaitSyncs(5)
-	require.Empty(t, req.Needs)
-
-	e.ctrl.Direct(protocol.Directive{ID: "d-recheck", Kind: protocol.DirectiveRecheck})
-
-	needID := protocol.ImageNeedID("teku", agenttest.TekuV2)
-	req = e.ctrl.Await("need after recheck", func(req *protocol.SyncRequest) bool { return hasNeed(req, needID) })
-	assert.Equal(t, protocol.DirectiveAccepted, agenttest.AckOf(&req, "d-recheck").Status)
-	assert.Empty(t, findNeed(t, &req, needID).DirectiveID, "a recheck creates no manual need")
 }
 
 func TestDirectivesAreRejectedByLocalPolicy(t *testing.T) {
@@ -394,6 +351,28 @@ func TestManualNeedIsDroppedWhenTheContainerStopsQualifying(t *testing.T) {
 
 	req = e.ctrl.AwaitSyncs(3)
 	assert.Empty(t, req.Needs)
+}
+
+func TestWithdrawDirectiveDropsTheManualNeed(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.start()
+
+	e.ctrl.Direct(protocol.Directive{ID: "d-reboot", Kind: protocol.DirectiveReboot})
+	e.ctrl.Await("manual need", func(req *protocol.SyncRequest) bool {
+		return hasNeed(req, protocol.ManualNeedID("d-reboot"))
+	})
+
+	e.ctrl.Direct(protocol.Directive{ID: "d-withdraw", Kind: protocol.DirectiveWithdraw, Withdraws: "d-reboot"})
+
+	req := e.ctrl.Await("withdrawn", func(req *protocol.SyncRequest) bool {
+		return agenttest.AckOf(req, "d-withdraw") != nil && !hasNeed(req, protocol.ManualNeedID("d-reboot"))
+	})
+	assert.Equal(t, protocol.DirectiveAccepted, agenttest.AckOf(&req, "d-withdraw").Status)
+
+	req = e.ctrl.AwaitSyncs(3)
+	assert.Empty(t, req.Needs, "the repeated reboot directive was answered: it creates nothing again")
 }
 
 // Each directive sees what the ones before it in the same answer did.

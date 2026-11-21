@@ -493,6 +493,55 @@ func TestInitBlock(t *testing.T) {
 	assert.Equal(t, blockText(nil)+"\noverrides:\n", tf.read(t))
 }
 
+// A deploy writes one entry of the block; reset takes out the override and
+// keeps the holds; nothing changed is not written.
+func TestSetDeployed(t *testing.T) {
+	tf := newTestFiles(t)
+	beacon := plan.Deployed{Image: "a/beacon:1"}
+	rest := "\noverrides:\n  geth:\n    image: a/geth:fix\n    by: me\n" +
+		"hold:\n  local:\n    by: me\n    reason: disk\n"
+	tf.write(t, blockText(map[string]plan.Deployed{"beacon": beacon})+rest)
+
+	geth := plan.Deployed{Image: "a/geth:2", Command: []string{"--x"}, HasCommand: true}
+	changed, err := tf.SetDeployed("geth", geth, false, "local:root")
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Equal(t, blockText(map[string]plan.Deployed{"beacon": beacon, "geth": geth})+rest, tf.read(t))
+
+	before, err := os.Stat(tf.path)
+	require.NoError(t, err)
+
+	changed, err = tf.SetDeployed("geth", geth, false, "local:root")
+	require.NoError(t, err)
+	assert.False(t, changed)
+
+	after, err := os.Stat(tf.path)
+	require.NoError(t, err)
+	assert.True(t, os.SameFile(before, after), "not written again")
+
+	changed, err = tf.SetDeployed("geth", geth, true, "local:root")
+	require.NoError(t, err)
+	assert.True(t, changed)
+
+	files := tf.Load()
+	assert.Empty(t, files.Entries)
+	assert.Contains(t, files.Holds, plan.HoldLocal)
+	assert.Equal(t, map[string]plan.Deployed{"beacon": beacon, "geth": geth}, files.Deployed)
+	assert.Contains(t, tf.read(t), "# [geth] 2026-11-20T16:00:00Z local:root: cleared by deploy --reset; "+
+		"was image a/geth:fix\n")
+
+	changed, err = tf.SetDeployed("geth", geth, true, "local:root")
+	require.NoError(t, err)
+	assert.False(t, changed, "nothing left to reset")
+
+	_, err = tf.SetDeployed("../x", geth, false, "local:root")
+	require.ErrorIs(t, err, plan.ErrRefused)
+
+	tf.write(t, "hold: [broken\n")
+	_, err = tf.SetDeployed("geth", geth, false, "local:root")
+	require.ErrorContains(t, err, "cannot be read")
+}
+
 // Files in the entry user's home are replaced by rename, owner and mode kept.
 func TestFileIsReplacedWithItsMode(t *testing.T) {
 	tf := newTestFiles(t)
@@ -518,6 +567,24 @@ func TestFileIsReplacedWithItsMode(t *testing.T) {
 	entries, err := os.ReadDir(filepath.Dir(tf.path))
 	require.NoError(t, err)
 	assert.Len(t, entries, 1, "no temp file is left")
+}
+
+// An agent that is not root cannot keep another owner: the group can write.
+func TestWriteTempOfAnotherOwner(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root keeps the owner")
+	}
+
+	tmp, err := os.CreateTemp(t.TempDir(), "overrides")
+	require.NoError(t, err)
+
+	defer func() { _ = tmp.Close() }()
+
+	require.NoError(t, writeTemp(tmp, []byte("overrides:\n"), 0o644, os.Geteuid()+1, os.Getegid(), true))
+
+	info, err := tmp.Stat()
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(0o664), info.Mode().Perm())
 }
 
 // A file with a second name is neither read nor written.

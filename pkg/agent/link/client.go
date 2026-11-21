@@ -39,9 +39,6 @@ type Client interface {
 	// Interval is the time to the next sync: what the last answer asked for,
 	// bounded; else syncInterval, or leaseSyncInterval while busy.
 	Interval(busy bool) time.Duration
-	// Silent reports whether the controller has not answered for its lookup
-	// fallback (def when no answer named one); true before the first answer.
-	Silent(def time.Duration) bool
 }
 
 type client struct {
@@ -57,10 +54,6 @@ type client struct {
 	// asked is the interval the last answer asked for; zero after a failed
 	// sync, so a vanished controller is not waited for at its own pace.
 	asked time.Duration
-	// lastAnswer is when the controller last answered; fallback is the last
-	// lookupFallbackSeconds named.
-	lastAnswer time.Time
-	fallback   time.Duration
 	// failing and refused describe the current failure episode, logged once.
 	failing bool
 	refused bool
@@ -103,17 +96,17 @@ func New(
 	}, nil
 }
 
-// newAnswerVerifier returns the answer verifier for the configured keys;
+// newAnswerVerifier returns the answer verifier for the configured key;
 // nil, with a loud warning, under allowUnsignedAnswers.
 func newAnswerVerifier(
 	log logrus.FieldLogger, cfg *Config, claims *identity.Claims,
 ) (*identity.AnswerVerifier, error) {
-	keys, err := cfg.Keys()
+	key, err := cfg.Key()
 	if err != nil {
 		return nil, fmt.Errorf("configuration: %w", err)
 	}
 
-	if len(keys) == 0 {
+	if key == nil {
 		log.Warn("INSECURE: controller.allowUnsignedAnswers is set and no controller " +
 			"public key is configured. The controller's answers are NOT verified: this " +
 			"host acts on whatever answers under controller.url. Development only.")
@@ -121,18 +114,13 @@ func newAnswerVerifier(
 		return nil, nil //nolint:nilnil // no verifier and no error is the opt-out
 	}
 
-	answers, err := identity.NewAnswerVerifier(keys, claims.Network, claims.Subject)
+	answers, err := identity.NewAnswerVerifier(key, claims.Network, claims.Subject)
 	if err != nil {
-		return nil, fmt.Errorf("controller keys: %w", err)
+		return nil, fmt.Errorf("controller key: %w", err)
 	}
 
-	prints := make([]string, 0, len(keys))
-	for _, key := range keys {
-		prints = append(prints, identity.KeyFingerprint(key))
-	}
-
-	log.WithField("controller_keys_sha256", prints).
-		Info("acting only on answers signed by one of the configured controller keys")
+	log.WithField("controller_key_sha256", identity.KeyFingerprint(key)).
+		Info("acting only on answers signed by the configured controller key")
 
 	return answers, nil
 }
@@ -162,11 +150,6 @@ func (c *client) Sync(
 	}
 
 	c.asked = time.Duration(resp.NextSyncMillis) * time.Millisecond
-	c.lastAnswer = c.now()
-
-	if resp.LookupFallbackSeconds > 0 {
-		c.fallback = time.Duration(resp.LookupFallbackSeconds) * time.Second
-	}
 
 	return &resp, nil
 }
@@ -209,20 +192,6 @@ func (c *client) Interval(busy bool) time.Duration {
 	}
 
 	return c.cfg.SyncInterval
-}
-
-// Silent implements Client.
-func (c *client) Silent(def time.Duration) bool {
-	if c.lastAnswer.IsZero() {
-		return true
-	}
-
-	fallback := c.fallback
-	if fallback <= 0 {
-		fallback = def
-	}
-
-	return c.now().Sub(c.lastAnswer) > fallback
 }
 
 // post sends in as gzip JSON with the certificate and a proof over the bytes
@@ -291,7 +260,7 @@ func (c *client) post(ctx context.Context, path string, in, out any) error {
 		}
 	} else if identity.IsSignedAnswer(answer) {
 		return fmt.Errorf("answer of %s: the controller signs its answers and "+
-			"controller.allowUnsignedAnswers is set: configure controller.publicKeys", path)
+			"controller.allowUnsignedAnswers is set: configure controller.publicKey", path)
 	}
 
 	if err := json.Unmarshal(answer, out); err != nil {

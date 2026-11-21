@@ -57,7 +57,9 @@ type Options struct {
 
 	Store     Store
 	Scheduler scheduler.Service
-	Metrics   metrics.Metrics
+	// Lookups says what the tags of the hosts point at.
+	Lookups discovery.Tracker
+	Metrics metrics.Metrics
 	// Notify says that a sync or an inventory changed what the views show.
 	Notify func()
 	// Now is the clock.
@@ -73,9 +75,8 @@ type Handler struct {
 	publicURLs []string
 	metrics    metrics.Metrics
 
-	syncSlots chan struct{}
-	pacer     *pacer
-	// lookups hands out the registry lookups and relays what they found.
+	syncSlots            chan struct{}
+	pacer                *pacer
 	lookups              discovery.Tracker
 	inventorySlots       chan struct{}
 	syncReadTimeout      time.Duration
@@ -84,14 +85,10 @@ type Handler struct {
 	// overlapAudited remembers, per host, the hosts its reported validator
 	// range last overlapped with: an overlap is audited once per episode.
 	// validatorsAudited limits the audit entries about one host's range. Both
-	// are guarded by generationMu.
+	// are guarded by auditMu.
+	auditMu           sync.Mutex
 	overlapAudited    map[string]string
 	validatorsAudited map[string]time.Time
-
-	// generationAudited remembers, per host, when a certificate that was
-	// rejected for its generation was last audited.
-	generationMu      sync.Mutex
-	generationAudited map[string]time.Time
 }
 
 // New returns the agent API over opts.
@@ -106,7 +103,7 @@ func New(log logrus.FieldLogger, opts Options) *Handler {
 		metrics:        opts.Metrics,
 		syncSlots:      make(chan struct{}, maxConcurrentSyncs),
 		pacer:          newPacer(),
-		lookups:        discovery.NewTracker(),
+		lookups:        opts.Lookups,
 		inventorySlots: make(chan struct{}, maxConcurrentInventories),
 
 		syncReadTimeout:      syncReadTimeout,

@@ -14,6 +14,7 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/agenttest"
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
+	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -211,6 +212,72 @@ func TestLocalHoldThroughTheSocket(t *testing.T) {
 		auditActions(e.auditRecords()))
 }
 
+// The status shows a write of the socket before the next sync; a release
+// without a local hold is refused and names the controller's hold.
+func TestLocalStatusFollowsTheWritesAtOnce(t *testing.T) {
+	t.Parallel()
+
+	e := overrideEnv(t)
+	e.start()
+
+	c := local.NewClient(e.cfg.Local.Socket.Path)
+	awaitLocal(t, c, "the containers", func(st *local.Status) bool { return len(st.Containers) == 3 })
+
+	e.ctrl.Direct(protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Reason: "maintenance"})
+	e.ctrl.Await("the controller hold", func(req *protocol.SyncRequest) bool { return req.Hold.Controller })
+
+	// From here on no sync is answered.
+	var (
+		entered = make(chan struct{}, 1)
+		blocked = make(chan struct{})
+	)
+
+	t.Cleanup(func() { close(blocked) })
+	e.ctrl.Set(func(c *agenttest.Controller) {
+		c.Gate = func(*protocol.SyncRequest) {
+			select {
+			case entered <- struct{}{}:
+			default:
+			}
+
+			<-blocked
+		}
+	})
+	<-entered
+
+	status := func() *local.Status {
+		st, err := c.Status(t.Context())
+		require.NoError(t, err)
+
+		return st
+	}
+
+	_, err := c.Hold(t.Context(), &local.HoldRequest{Reason: "debugging"})
+	require.NoError(t, err)
+	assert.Equal(t, protocol.Hold{Local: true, LocalReason: "debugging", Controller: true}, status().Hold)
+
+	until := e.now().Add(time.Hour).UTC().Truncate(time.Second)
+	_, err = c.Override(t.Context(), &local.OverrideRequest{Container: "geth", Image: agenttest.FixImage, Until: &until})
+	require.NoError(t, err)
+
+	o := localContainer(t, status(), "geth").Override
+	require.NotNil(t, o)
+	assert.Equal(t, agenttest.FixImage, o.Image)
+
+	_, err = c.Hold(t.Context(), &local.HoldRequest{Release: true})
+	require.NoError(t, err)
+	assert.Equal(t, protocol.Hold{Controller: true}, status().Hold)
+
+	_, err = c.Hold(t.Context(), &local.HoldRequest{Release: true})
+	require.ErrorContains(t, err, "there is no local hold; the host is on controller hold")
+	assert.Contains(t, err.Error(), "(maintenance), which is lifted on the controller")
+
+	assert.Equal(t, []string{
+		"hold.set accepted", "hold.set accepted", "override.set accepted", "hold.release accepted",
+		"hold.release refused",
+	}, auditActions(e.auditRecords()), "the controller's hold, then the socket's writes")
+}
+
 // A local roll is a need served under a lease, followed to the release.
 func TestLocalRoll(t *testing.T) {
 	t.Parallel()
@@ -279,16 +346,11 @@ func TestLocalRollStates(t *testing.T) {
 	e.cfg.Verify.Window = 300 * time.Millisecond
 	e.ctrl.Set(func(c *agenttest.Controller) { c.AutoRelease = false })
 
-	resolver := &heldResolver{
-		Host: e.host, ref: agenttest.GethImage, entered: make(chan struct{}, 1), release: make(chan struct{}),
-	}
-	e.resolver = resolver
+	lookup := e.withhold(agenttest.GethImage)
 	e.start()
 
 	c := local.NewClient(e.cfg.Local.Socket.Path)
 	awaitLocal(t, c, "the containers", func(st *local.Status) bool { return len(st.Containers) == 3 })
-
-	resolver.hold.Store(true)
 
 	answer, err := c.Roll(t.Context(), "geth")
 	require.NoError(t, err)
@@ -304,11 +366,9 @@ func TestLocalRollStates(t *testing.T) {
 		})
 	}
 
-	agenttest.AwaitParked(t, resolver.entered, "the lookup of the roll")
 	state(local.RollResolving)
 
-	resolver.hold.Store(false)
-	close(resolver.release)
+	lookup.hold.Store(false)
 	state(local.RollQueued)
 
 	needs := awaitNeeds(t, e, protocol.LocalNeedID(id))
@@ -341,4 +401,89 @@ func TestLocalRollStates(t *testing.T) {
 		c.Ended = &protocol.EndedLease{ID: "lease-roll", State: "released"}
 	})
 	state(local.RollDone)
+}
+
+// A deploy writes the block and tells Ansible what to leave to the agent; it
+// wakes the loop only for a container off its target.
+func TestLocalDeploy(t *testing.T) {
+	t.Parallel()
+
+	e := overrideEnv(t)
+	a, ok := e.newAgent().(*agent)
+	require.True(t, ok)
+
+	api := localAPI{a}
+	deploy := func(req *local.DeployRequest) *local.DeployResult {
+		t.Helper()
+
+		res, err := api.Deploy(t.Context(), "local:root", req)
+		require.NoError(t, err)
+
+		return res
+	}
+	woken := func() bool {
+		select {
+		case <-a.kick:
+			return true
+		default:
+			return false
+		}
+	}
+	gethCommand := []string{"--http", "--maxpeers=50"}
+	managed := []string{"image", "command", "labels"}
+
+	res := deploy(&local.DeployRequest{Container: "geth", Image: agenttest.GethImage, Command: gethCommand})
+	assert.Equal(t, local.DeployResult{
+		Container: "geth", Exists: true, Managed: true, Changed: true, Roll: local.DeployRollNone, Ignore: managed,
+	}, *res)
+	assert.False(t, woken(), "in line with the target")
+	assert.Contains(t, e.readOverrides(), "  \"geth\":\n    image: \""+agenttest.GethImage+"\"\n"+
+		"    command: [\"--http\", \"--maxpeers=50\"]\n")
+
+	res = deploy(&local.DeployRequest{Container: "geth", Image: agenttest.FixImage, Command: gethCommand})
+	assert.Equal(t, local.DeployResult{
+		Container: "geth", Exists: true, Managed: true, Changed: true, Roll: local.DeployRollRequested,
+		Ignore: managed,
+	}, *res)
+	assert.True(t, woken())
+
+	// An override is kept by a deploy and dropped by a reset.
+	_, _, err := a.files.SetEntry("geth", "dev", func(*plan.Entry) (*plan.Entry, error) {
+		return &plan.Entry{Add: []string{"--pprof"}, By: "dev", Reason: "debug"}, nil
+	})
+	require.NoError(t, err)
+
+	res = deploy(&local.DeployRequest{Container: "geth", Image: agenttest.GethImage, Command: gethCommand})
+	assert.True(t, res.Changed)
+	assert.Equal(t, local.DeployRollRequested, res.Roll, "the override's flags are not applied yet")
+	assert.True(t, woken())
+
+	res = deploy(&local.DeployRequest{
+		Container: "geth", Image: agenttest.GethImage, Command: gethCommand, Reset: true,
+	})
+	assert.True(t, res.Changed)
+	assert.Equal(t, local.DeployRollNone, res.Roll)
+	assert.NotContains(t, e.readOverrides(), "--pprof\"]")
+
+	res = deploy(&local.DeployRequest{Container: "dora", Image: "ethpandaops/dora:latest"})
+	assert.Equal(t, local.DeployResult{
+		Container: "dora", Exists: true, Changed: true, Roll: local.DeployRollNone, Ignore: []string{}, Pull: true,
+	}, *res)
+
+	res = deploy(&local.DeployRequest{Container: "erigon", Image: "erigontech/erigon:latest", Command: []string{}})
+	assert.Equal(t, local.DeployResult{
+		Container: "erigon", Changed: true, Roll: local.DeployRollNone, Ignore: []string{}, Pull: true,
+	}, *res)
+	assert.Contains(t, e.readOverrides(), "  \"erigon\":\n    image: \"erigontech/erigon:latest\"\n    command: []\n")
+
+	res = deploy(&local.DeployRequest{Container: "erigon", Image: "erigontech/erigon:latest", Command: []string{}})
+	assert.False(t, res.Changed)
+
+	_, err = api.Deploy(t.Context(), "local:root", &local.DeployRequest{Container: "geth", Image: "Bad Image"})
+	require.Error(t, err)
+
+	assert.Equal(t, []string{
+		"deploy accepted", "deploy accepted", "deploy accepted", "deploy accepted", "deploy accepted",
+		"deploy accepted",
+	}, auditActions(e.auditRecords()))
 }

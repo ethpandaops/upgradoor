@@ -26,7 +26,7 @@ const (
 	blockBegin = "# >>> upgradoor generated block"
 	blockEnd   = "# <<< upgradoor generated block"
 
-	blockBeginLine = blockBegin + ": rewritten by Ansible on every run, do not edit >>>"
+	blockBeginLine = blockBegin + ": written by Ansible through upgradoor deploy, do not edit >>>"
 	blockEndLine   = blockEnd + " <<<"
 
 	keyDeployed  = "deployed"
@@ -581,8 +581,7 @@ func (t *text) setBlock(block []string) {
 	t.body = len(block)
 }
 
-// generatedBlock renders the generated block; the Ansible role writes the
-// same text.
+// generatedBlock renders the generated block.
 func generatedBlock(deployed map[string]plan.Deployed) []string {
 	out := []string{
 		blockBeginLine,
@@ -590,9 +589,9 @@ func generatedBlock(deployed map[string]plan.Deployed) []string {
 		"# What Ansible deployed the containers upgradoor manages on this host as",
 		"# (\"deployed:\" below), and their temporary overrides.",
 		"#",
-		"# Ansible rewrites this block on every run. A soft deploy changes the image",
-		"# or command line here and leaves the restart to upgradoor, which rolls the",
-		"# containers staggered across the devnet. Do not edit the block.",
+		"# Only Ansible changes this block, through upgradoor deploy. A soft deploy",
+		"# changes the image or command line here and leaves the restart to upgradoor,",
+		"# which rolls the containers staggered across the devnet. Do not edit the block.",
 		"#",
 		"# Add an entry under \"overrides:\" below this block (by hand, with the commands",
 		"# below, or from the upgradoor page). The agent notices a change within a",

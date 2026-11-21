@@ -227,7 +227,9 @@ func (s *osSystem) collectUpgradable(ctx context.Context) ([]protocol.Upgradable
 // UpgradePackages implements System: apt-get update, then apt-get install
 // --only-upgrade --no-remove keeping configuration files. Names that are not
 // installed are left out. The install is not interrupted by the context, as a
-// killed dpkg leaves packages half configured; it has its own timeout.
+// killed dpkg leaves packages half configured; it has its own timeout. With
+// an upgrade command that runs in their place, with the names as its
+// arguments and without a timeout.
 func (s *osSystem) UpgradePackages(ctx context.Context, names []string) error {
 	names, err := s.checkUpgradeNames(names)
 	if err != nil {
@@ -255,7 +257,11 @@ func (s *osSystem) UpgradePackages(ctx context.Context, names []string) error {
 	log := s.log.WithField("packages", strings.Join(names, " "))
 	log.Info("Upgrading packages")
 
-	err = s.runUpgrade(ctx, names)
+	if len(s.commands.UpgradePackages) > 0 {
+		err = s.runUpgradeCommand(ctx, names)
+	} else {
+		err = s.runUpgrade(ctx, names)
+	}
 
 	// Refresh even when the caller is gone or apt failed: some packages may
 	// have been upgraded.
@@ -409,6 +415,25 @@ func (s *osSystem) runUpgrade(ctx context.Context, names []string) error {
 		"packages": strings.Join(names, " "),
 		"lastLine": lastLine(out),
 	}).Debug("apt-get install finished")
+
+	return nil
+}
+
+// runUpgradeCommand runs the configured upgrade command with the names as
+// its arguments, to its end.
+func (s *osSystem) runUpgradeCommand(ctx context.Context, names []string) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+
+	argv := append(slices.Clone(s.commands.UpgradePackages), names...)
+
+	out, err := s.runner.Exec(context.WithoutCancel(ctx), argv)
+	if err != nil {
+		return err
+	}
+
+	s.log.WithField("lastLine", lastLine(out)).Debug("upgrade command finished")
 
 	return nil
 }

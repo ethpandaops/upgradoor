@@ -63,7 +63,7 @@ const (
 var simReasons = regexp.MustCompile(`^(held|known offline|agent silent|working on an operation without a lease|paused|rollout paused|` +
 	`paused after the canary; resume to continue|aborted(: .+)?; resume to continue|` +
 	`waiting for approval \(policy manual\)|rollout halted: .+|` +
-	`verb not allowed by the agent|waiting for its images to be pulled|network gate: .+|after .+|` +
+	`verb not allowed by the agent|waiting to pull its image again after a failed pull|network gate: .+|after .+|` +
 	`budget [0-9.]+% of [0-9.]+%|host limit \d+ of \d+|independent limit \d+ of \d+)$`)
 
 // sim is one simulation run.
@@ -224,10 +224,6 @@ func newSim(seed uint64) (*sim, error) {
 		LookupInterval:          fleet.Duration(5 * time.Minute),
 	}
 
-	// From the seed, not from the random stream: the share of hosts that may
-	// pull at once.
-	s.defaults.MaxPullingPercent = []float64{10, 25, 50, 100}[(seed/11)%4]
-
 	// From the seed, not from the random stream: every fifth seed asks a
 	// person to approve the rollouts of the default group.
 	s.defaults.PolicyDefaultGroup = fleet.PolicyAuto
@@ -238,6 +234,7 @@ func newSim(seed uint64) (*sim, error) {
 	// From the seed, not from the random stream, so that the other seeds keep
 	// their histories.
 	s.defaults.MaxIndependentPercent = []float64{0, 10, 25, 100}[(seed/7)%4]
+	s.defaults.MaxLeasedPercent = []float64{10, 25, 50, 100}[(seed/11)%4]
 
 	// Both from the seed, not from the random stream, so that the other seeds
 	// keep their histories. Every third seed pauses rollouts after their
@@ -449,7 +446,7 @@ func (s *sim) checkAssignment(a *simAgent, resp *Assignment) error {
 		cancelled := s.cancelled[open[0].ID]
 		// Withheld from an agent that has not said that it has it.
 		reported := a.lastSent != nil && a.lastSent.Operation != nil && a.lastSent.Operation.LeaseID == open[0].ID
-		withheld := cancelled && open[0].State == fleet.LeaseGranted && !reported
+		withheld := (cancelled && open[0].State == fleet.LeaseGranted && !reported) || open[0].Recheck
 
 		switch {
 		case withheld && resp.Lease != nil:
@@ -596,41 +593,7 @@ func (s *sim) observe() error {
 	err := s.oracle.observe(f, &simSnapshot{rollouts: rollouts, leases: leases})
 	s.retried = nil
 
-	if err != nil {
-		return err
-	}
-
-	return s.checkPulls(f)
-}
-
-// checkPulls is invariant 9: never more hosts pull at once than
-// maxPullingPercent of the hosts (at least one), by the world's
-// own count of the agents that are pulling. A pull under a window granted
-// before the controller lost its database is one it cannot know of and is
-// not counted.
-func (s *sim) checkPulls(f *simFacts) error {
-	pulling := make([]string, 0, 4)
-
-	for _, a := range s.world.agents {
-		if len(a.pulls) > 0 && a.windowEpoch == s.world.dbEpoch {
-			pulling = append(pulling, a.name)
-		}
-	}
-
-	if len(pulling) > 0 {
-		s.stats["observations with pulls"]++
-	}
-
-	// The share of the fleet's hosts: a host that is forgotten later does not
-	// take back a window granted while it counted.
-	hosts := len(s.world.agents)
-
-	limit := max(1, int(math.Floor(f.settings.MaxPullingPercent*float64(hosts)/100+budgetEpsilon)))
-	if len(pulling) > limit {
-		return fmt.Errorf("%d hosts pull at once (%v), at most %d of %d may", len(pulling), pulling, limit, hosts)
-	}
-
-	return nil
+	return err
 }
 
 // checkPlan checks the published plan against the committed state.
@@ -912,7 +875,6 @@ func (s *sim) loseDatabase() error {
 	s.oracle = newOracle()
 	s.retried = nil
 	s.cancelled = make(map[string]bool, 2)
-	s.world.dbEpoch++
 
 	for _, a := range s.world.agents {
 		s.world.dropped[a.name] = true
@@ -1171,12 +1133,9 @@ func (s *sim) operatorAction() error {
 		hosts := s.someHosts()[:1]
 		res, err := s.svc.Forget(ctx, simActor, HoldRequest{Hosts: hosts})
 
-		// The stored liveness rows of a forgotten host are gone, and so is
-		// its pull window: a pull under it is one the controller no longer
-		// knows of until the agent reports it.
+		// The stored liveness rows of a forgotten host are gone.
 		if s.store.host(hosts[0]) == nil {
 			s.world.dropped[hosts[0]] = true
-			s.world.byName[hosts[0]].windowEpoch = -1
 		}
 
 		return s.act(fmt.Sprintf("forget %v", hosts), res, err)
@@ -1366,6 +1325,14 @@ func (s *sim) converge() error {
 		w.digestKind[d] = digestGood
 	}
 
+	// An aborted target is not rolled again until it changes: every tag
+	// and the packages are released once more.
+	for _, image := range w.images {
+		w.registry[image] = w.newDigest(digestGood)
+	}
+
+	w.pkgVersion++
+
 	for _, a := range w.agents {
 		a.silentUntil, a.outageUntil, a.localHold, a.rebootSticks = time.Time{}, time.Time{}, false, false
 		a.syncingUntil, a.elOfflineUntil, a.elDownUntil = time.Time{}, time.Time{}, time.Time{}
@@ -1382,6 +1349,10 @@ func (s *sim) converge() error {
 	set.PolicyImage, set.PolicyPackages, set.PolicyReboot = fleet.PolicyAuto, fleet.PolicyAuto, fleet.PolicyAuto
 	set.PolicyDefaultGroup = fleet.PolicyAuto
 	set.LeaseTTL = fleet.Duration(5 * time.Minute)
+
+	// A retried host is done only through a readiness check (a recheck), so
+	// the check must be able to pass.
+	set.ReadinessTimeout = max(set.ReadinessTimeout, fleet.Duration(time.Duration(set.ReadyEpochs+3)*simEpoch))
 
 	if set.MaxUnavailablePercent == 0 {
 		set.MaxUnavailablePercent = 10
@@ -1760,9 +1731,6 @@ type simContainer struct {
 	running   string
 	seen      string
 	checkedAt time.Time
-	// local is the digest of the image the host has for the tag: what it
-	// last pulled.
-	local string
 }
 
 // simManual is a need created by a roll or reboot directive.
@@ -1876,61 +1844,6 @@ type simAgent struct {
 	// controller for the lease, up to the first report that it is over: its
 	// own record of what it said.
 	reported map[string]*protocol.Operation
-
-	// window is the pull window of the last answer; pulls are the pulls in
-	// progress, by tag reference, with the digest and when they finish. An
-	// agent pulls only what its window names and stops a pull the window no
-	// longer names.
-	window      []protocol.PullImage
-	windowEpoch int
-	pulls       map[string]simPull
-}
-
-// unpulled is what a need of the container waits for: the image at the
-// digest the tag points at, while the host does not have it.
-func (c *simContainer) unpulled() []protocol.PullImage {
-	if c.local == c.seen {
-		return nil
-	}
-
-	return []protocol.PullImage{{Ref: c.image, Digest: c.seen}}
-}
-
-// pull lets the agent start what its window names and finish what is done.
-func (w *simWorld) pull(a *simAgent) {
-	for ref, p := range a.pulls {
-		if w.now.Before(p.done) {
-			continue
-		}
-
-		for _, c := range a.containers {
-			if c.image == ref {
-				c.local = p.digest
-			}
-		}
-
-		delete(a.pulls, ref)
-	}
-
-	for _, img := range a.window {
-		if _, busy := a.pulls[img.Ref]; busy || a.held() {
-			continue
-		}
-
-		for _, c := range a.containers {
-			if c.image == img.Ref && c.seen == img.Digest && c.local != img.Digest {
-				a.pulls[img.Ref] = simPull{digest: img.Digest, done: w.now.Add(time.Duration(5+w.rng.IntN(120)) * time.Second)}
-
-				break
-			}
-		}
-	}
-}
-
-// simPull is one pull in progress.
-type simPull struct {
-	digest string
-	done   time.Time
 }
 
 // simBegin is one step that an agent began: the first disruptive thing it
@@ -1969,10 +1882,6 @@ type simWorld struct {
 	digestKind map[string]int
 	digests    int
 	pkgVersion int
-
-	// dbEpoch counts the databases the controller lost: a window granted
-	// before a loss is one the controller cannot know of.
-	dbEpoch int
 
 	// calm switches the random failures off (convergence).
 	calm               bool
@@ -2076,7 +1985,6 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 			late:         make(map[string]bool, 2),
 			reported:     make(map[string]*protocol.Operation, 8),
 			cancelSeen:   make(map[string]time.Time, 2),
-			pulls:        make(map[string]simPull, 2),
 			localHold:    rng.IntN(25) == 0,
 			dead:         rng.IntN(20) == 0,
 			sloppy:       rng.IntN(5) == 0,
@@ -2110,7 +2018,6 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 				// stream, so that the seeds keep their histories.
 				impact:    simImpacts[(i+2*c)%len(simImpacts)],
 				running:   w.registry[image],
-				local:     w.registry[image],
 				seen:      w.registry[image],
 				checkedAt: w.now,
 			})
@@ -2124,7 +2031,7 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 			image := w.images[i%len(w.images)]
 			a.containers = append(a.containers, &simContainer{
 				name: "tools", image: image, managed: true, group: protocol.DefaultGroup,
-				impact: protocol.ImpactIndependent, running: w.registry[image], local: w.registry[image],
+				impact: protocol.ImpactIndependent, running: w.registry[image],
 				seen: w.registry[image], checkedAt: w.now,
 			})
 		}
@@ -2510,8 +2417,6 @@ func (w *simWorld) health() fleet.NetworkHealth {
 // work lets one agent act at the current time: poll its registries, start
 // the lease it holds, move its operation on.
 func (w *simWorld) work(a *simAgent) {
-	w.pull(a)
-
 	if !w.now.Before(a.nextPoll) {
 		w.poll(a)
 	}
@@ -2586,8 +2491,8 @@ func (w *simWorld) stepFor(a *simAgent, n *protocol.Need) protocol.StepStatus {
 		switch {
 		case c == nil || !c.managed || c.custom:
 			return protocol.StepRefused
-		case c.image != n.Image.Image || w.registry[c.image] != n.Image.ToDigest || c.local != n.Image.ToDigest:
-			// The pulled digest must equal the lease's.
+		case c.image != n.Image.Image || w.registry[c.image] != n.Image.ToDigest:
+			// The digest the tag points at must equal the lease's.
 			return protocol.StepSuperseded
 		case n.DirectiveID == "" && c.running == n.Image.ToDigest:
 			return protocol.StepSuperseded
@@ -2885,7 +2790,6 @@ func (w *simWorld) needs(a *simAgent) []protocol.Need {
 				Image: &protocol.ImageNeed{
 					Container: c.name, Group: c.group, Image: c.image, FromDigest: c.running, ToDigest: c.seen,
 				},
-				Unpulled: c.unpulled(),
 			})
 		}
 	}
@@ -2927,7 +2831,6 @@ func (w *simWorld) needs(a *simAgent) []protocol.Need {
 			n.Image = &protocol.ImageNeed{
 				Container: c.name, Group: c.group, Image: c.image, FromDigest: c.running, ToDigest: c.seen,
 			}
-			n.Unpulled = c.unpulled()
 		} else {
 			n.Reboot = &protocol.RebootNeed{Reasons: []string{protocol.RebootReasonManual}}
 		}
@@ -2951,7 +2854,6 @@ func (w *simWorld) request(a *simAgent) *protocol.SyncRequest {
 		Needs:           w.needs(a),
 		Operation:       cloneOperation(a.op),
 		DirectiveAcks:   slices.Clone(a.acks),
-		Pulling:         sortedKeys(a.pulls),
 	}
 
 	for _, c := range a.containers {
@@ -2971,7 +2873,7 @@ func (w *simWorld) request(a *simAgent) *protocol.SyncRequest {
 		}
 
 		if c.managed && !c.custom {
-			pc.Registry = &protocol.RegistryCheck{Digest: c.seen, CheckedAt: c.checkedAt, Pulled: c.local == c.seen}
+			pc.Registry = &protocol.RegistryCheck{Digest: c.seen, CheckedAt: c.checkedAt, Pulled: c.running == c.seen}
 		}
 
 		req.Containers = append(req.Containers, pc)
@@ -2999,19 +2901,6 @@ func (w *simWorld) respond(a *simAgent, resp *Assignment) {
 	}
 
 	a.acks = acks
-	a.window = nil
-
-	if resp.Pull != nil {
-		a.window = slices.Clone(resp.Pull.Images)
-		a.windowEpoch = w.dbEpoch
-	}
-
-	// A pull the window no longer names stops.
-	for ref := range a.pulls {
-		if !slices.ContainsFunc(a.window, func(img protocol.PullImage) bool { return img.Ref == ref }) {
-			delete(a.pulls, ref)
-		}
-	}
 	busy := a.op != nil && !a.op.Phase.Terminal()
 
 	switch {
@@ -3099,8 +2988,6 @@ func (w *simWorld) apply(a *simAgent, d protocol.Directive) protocol.DirectiveAc
 		a.ctrlHold = true
 	case protocol.DirectiveReleaseHold:
 		a.ctrlHold = false
-	case protocol.DirectiveRecheck:
-		w.poll(a)
 	case protocol.DirectiveOverride:
 		return reject("the simulated agents have no overrides file")
 	case protocol.DirectiveRoll:
@@ -3127,6 +3014,8 @@ func (w *simWorld) apply(a *simAgent, d protocol.Directive) protocol.DirectiveAc
 		}
 
 		a.manual = append(a.manual, simManual{directive: d.ID, kind: protocol.NeedReboot})
+	case protocol.DirectiveWithdraw:
+		a.manual = slices.DeleteFunc(a.manual, func(m simManual) bool { return m.directive == d.Withdraws })
 	}
 
 	return ack
@@ -3321,11 +3210,14 @@ func (o *oracle) observe(f *simFacts, snap *simSnapshot) error {
 		o.leases[l.ID] = l.State
 
 		switch {
-		case !known:
+		case !known && !l.Recheck:
 			o.serves[l.ID] = maps.Clone(l.Rollouts)
 			granted = append(granted, l)
 
 			continue
+		case !known:
+			// A recheck comes from a person's retry, not from a grant.
+			o.serves[l.ID] = maps.Clone(l.Rollouts)
 		case was.Terminal() && was != l.State:
 			return fmt.Errorf("lease %s of %s was %s and is %s", l.ID, l.Host, was, l.State)
 		}
@@ -3422,7 +3314,8 @@ func (o *oracle) checkEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) error 
 
 	switch l.State {
 	case fleet.LeaseReleased:
-		if report == nil || report.Phase != protocol.PhaseDone {
+		// A recheck repeats the readiness check of a lease whose agent did.
+		if !l.Recheck && (report == nil || report.Phase != protocol.PhaseDone) {
 			return errors.New("released, and its agent never reported the operation done")
 		}
 	case fleet.LeaseFailed:
@@ -3562,7 +3455,7 @@ func oracleBudget(f *simFacts, leased map[string]protocol.Impact, host string, i
 			cost, unavailable, total, allowed, others)
 	}
 
-	limit := max(1, int(math.Floor(percent*float64(len(f.hosts))/100+budgetEpsilon)))
+	limit := max(1, int(math.Floor(f.settings.MaxLeasedPercent*float64(len(f.hosts))/100+budgetEpsilon)))
 	if others >= limit {
 		return fmt.Errorf("host limit: %d hosts already hold a node or slot lease, at most %d of %d may",
 			others, limit, len(f.hosts))

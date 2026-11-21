@@ -37,6 +37,7 @@ type Phase string
 
 // Operation phases, in order. Done and Failed are terminal.
 const (
+	PhasePulling   Phase = "pulling"   // pulling the images; nothing is stopped yet
 	PhaseDraining  Phase = "draining"  // stopping containers ahead of a reboot
 	PhaseApplying  Phase = "applying"  // upgrading packages, recreating containers
 	PhaseRebooting Phase = "rebooting" // reboot issued; persisted before it
@@ -66,6 +67,10 @@ const (
 	// StepRefused: local policy forbids the need (verb not allowed, hold,
 	// unmanaged container). Nothing was disrupted for it.
 	StepRefused StepStatus = "refused"
+	// StepDeferred: an image of the lease could not be pulled, so nothing was
+	// begun. Nothing was disrupted for it, it is not a failure and the need
+	// stays open.
+	StepDeferred StepStatus = "deferred"
 	// StepCancelled: the lease was cancelled (Lease.Cancel) before the step
 	// had begun. Nothing was disrupted for it and it is not a failure.
 	StepCancelled StepStatus = "cancelled"
@@ -110,15 +115,16 @@ const (
 	DirectiveRoll DirectiveKind = "roll"
 	// DirectiveReboot creates a reboot need.
 	DirectiveReboot DirectiveKind = "reboot"
-	// DirectiveRecheck asks the agent to check its registries and package
-	// state now instead of at the next poll. It has no other effect.
-	DirectiveRecheck DirectiveKind = "recheck"
 	// DirectiveOverride asks the agent to write (or take out) the image or
 	// the flags of Container's entry in the host's overrides file. Like a
 	// roll it only creates a need: the container follows under a lease. The
 	// agent accepts it only within what its own configuration allows the
 	// controller to override on that container.
 	DirectiveOverride DirectiveKind = "override"
+	// DirectiveWithdraw takes back the manual need that the roll or reboot
+	// directive Withdraws created: its rollout was aborted or the host left
+	// it. A need that is not there (served, dropped) is nothing to withdraw.
+	DirectiveWithdraw DirectiveKind = "withdraw"
 )
 
 // Parts of an override that an instruction can set.
@@ -168,6 +174,9 @@ type Directive struct {
 	By *Actor `json:"by,omitempty"`
 	// Override is the content of an override directive.
 	Override *OverrideInstruction `json:"override,omitempty"`
+	// Withdraws is the ID of the directive whose need a withdraw directive
+	// takes back.
+	Withdraws string `json:"withdraws,omitempty"`
 }
 
 // DirectiveStatus is the agent's answer to a directive.
@@ -176,7 +185,7 @@ type DirectiveStatus string
 // Directive statuses.
 const (
 	// DirectiveAccepted: the directive took effect (hold set or lifted,
-	// recheck started, manual need created and now listed in Needs).
+	// manual need created and now listed in Needs).
 	DirectiveAccepted DirectiveStatus = "accepted"
 	// DirectiveRejected: local policy refused it; Error says why.
 	DirectiveRejected DirectiveStatus = "rejected"

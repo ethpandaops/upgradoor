@@ -1072,7 +1072,7 @@ func storedFleet(b *testing.B, n int) (svc *service, st store.Store, sync func(i
 		start := uint64(i) * 32
 
 		return &store.HostSync{
-			Cert: &identity.Certificate{Claims: identity.Claims{Subject: name, Generation: 1}, Hash: "hash-" + name},
+			Cert: &identity.Certificate{Claims: identity.Claims{Subject: name}, Hash: "hash-" + name},
 			At:   now,
 			Request: &protocol.SyncRequest{
 				Verbs: allVerbs, Needs: []protocol.Need{packagesNeed("2.0")},

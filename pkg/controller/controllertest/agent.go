@@ -33,7 +33,7 @@ func NewAgent(t *testing.T, spec identity.CertificateSpec) *Agent {
 	cert, err := identity.IssueCertificate(seed, spec)
 	require.NoError(t, err)
 
-	key, err := identity.DeriveHostKey(seed, spec.Network, spec.Hostname, spec.Generation)
+	key, err := identity.DeriveHostKey(seed, spec.Network, spec.Hostname)
 	require.NoError(t, err)
 
 	creds, err := identity.NewCredentials(key, cert)
@@ -163,14 +163,12 @@ func InventoryFor(t *testing.T, pkgs ...protocol.Package) *protocol.Inventory {
 	return inv
 }
 
-// ValidatorAgent is the agent of lighthouse-geth-1, a validator host, with
-// the host key and certificate of the given generation.
-func ValidatorAgent(t *testing.T, generation uint64) *Agent {
+// ValidatorAgent is the agent of lighthouse-geth-1, a validator host.
+func ValidatorAgent(t *testing.T) *Agent {
 	t.Helper()
 
 	return NewAgent(t, identity.CertificateSpec{
-		Hostname:   "lighthouse-geth-1",
-		Generation: generation,
-		Roles:      []string{"ethereum_node"},
+		Hostname: "lighthouse-geth-1",
+		Roles:    []string{"ethereum_node"},
 	})
 }

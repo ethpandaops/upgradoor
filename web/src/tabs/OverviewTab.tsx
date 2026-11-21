@@ -551,7 +551,7 @@ function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (inte
           icon="check"
           label="Approve…"
           onAction={onAction}
-          intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id)}
+          intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.client)}
         />
       );
       break;
@@ -561,7 +561,7 @@ function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (inte
           icon="resume"
           label="Resume…"
           onAction={onAction}
-          intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id)}
+          intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.client)}
         />
       );
       break;

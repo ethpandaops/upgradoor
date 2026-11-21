@@ -58,7 +58,6 @@ func TestVectors(t *testing.T) {
 			cert, err := VerifyCertificate(signer, v.Network, v.Certificate)
 			require.NoError(t, err)
 			assert.Equal(t, v.Hostname, cert.Subject)
-			assert.Equal(t, v.Generation, cert.Generation)
 			assert.Equal(t, v.HostPublicKey, cert.Cnf.JWK.Pub)
 			assert.Equal(t, v.CertificateHash, cert.Hash)
 
@@ -82,8 +81,7 @@ func TestVectors(t *testing.T) {
 
 			// The stored signature is the one of a signed answer: wrapped
 			// with its body, the host's verifier takes it for that request.
-			answers, err := NewAnswerVerifier(
-				[]*mldsa.PublicKey{PublicKey(ctrl)}, v.Network, v.Hostname)
+			answers, err := NewAnswerVerifier(PublicKey(ctrl), v.Network, v.Hostname)
 			require.NoError(t, err)
 
 			envelope, err := json.Marshal(SignedAnswer{
@@ -106,16 +104,13 @@ type vector struct {
 	Name string `json:"name"`
 
 	// Inputs.
-	Seed       string   `json:"seed"`
-	Network    string   `json:"network"`
-	Hostname   string   `json:"hostname"`
-	Generation uint64   `json:"generation"`
-	Roles      []string `json:"roles"`
+	Seed     string   `json:"seed"`
+	Network  string   `json:"network"`
+	Hostname string   `json:"hostname"`
+	Roles    []string `json:"roles"`
 	// ControllerSeed is the controller seed, a secret of its own: the
 	// controller outputs are derived from it and from nothing of Seed.
 	ControllerSeed string `json:"controllerSeed"`
-	// ControllerGeneration is the generation of the controller key.
-	ControllerGeneration uint64 `json:"controllerGeneration"`
 
 	// Outputs.
 	SignerPublicKey string `json:"signerPublicKey"`
@@ -130,7 +125,7 @@ type vector struct {
 	Proof       string      `json:"proof"`
 
 	// ControllerKey and ControllerPublicKey are the controller key pair of
-	// Network at ControllerGeneration, derived from ControllerSeed.
+	// Network, derived from ControllerSeed.
 	ControllerKey       string `json:"controllerKey"`
 	ControllerPublicKey string `json:"controllerPublicKey"`
 
@@ -151,23 +146,21 @@ func (v *vector) compute() error {
 		return err
 	}
 
-	host, err := DeriveHostKey(seed, v.Network, v.Hostname, v.Generation)
+	host, err := DeriveHostKey(seed, v.Network, v.Hostname)
 	if err != nil {
 		return err
 	}
 
 	cert, err := IssueCertificate(seed, CertificateSpec{
-		Network:    v.Network,
-		Hostname:   v.Hostname,
-		Generation: v.Generation,
-		Roles:      v.Roles,
+		Network:  v.Network,
+		Hostname: v.Hostname,
+		Roles:    v.Roles,
 	})
 	if err != nil {
 		return err
 	}
 
-	ctrl, err := DeriveControllerKey(
-		[]byte(v.ControllerSeed), v.Network, v.ControllerGeneration)
+	ctrl, err := DeriveControllerKey([]byte(v.ControllerSeed), v.Network)
 	if err != nil {
 		return err
 	}
@@ -246,16 +239,6 @@ func vectorInputs() []vector {
 			AnswerBody:  "",
 		},
 		{
-			// The controller generation is rotated as well.
-			Name: "rotated-generation", Seed: seedA, ControllerSeed: ctrlSeedA,
-			Network: netA, Hostname: "lighthouse-geth-1", Generation: 3,
-			Roles:                []string{roleNode},
-			ControllerGeneration: 1,
-			ProofClaims:          proof(domainA),
-			ProofBody:            `{"protocolVersion":1}`,
-			AnswerBody:           answerA,
-		},
-		{
 			Name:           "roles-sorted-and-deduplicated",
 			Seed:           "correct horse battery staple, but at least 32 bytes long!",
 			ControllerSeed: ctrlSeedA,
@@ -270,12 +253,10 @@ func vectorInputs() []vector {
 			Seed:           "ünïcödé seed bytes are used as raw UTF-8 input ✓",
 			ControllerSeed: ctrlSeedB,
 			Network:        "net.with.dots", Hostname: "Host_With-Mixed.Case01",
-			Generation:           18446744073709551615,
-			Roles:                nil,
-			ControllerGeneration: 18446744073709551615,
-			ProofClaims:          proof("net.with.dots.example"),
-			ProofBody:            "x",
-			AnswerBody:           "x",
+			Roles:       nil,
+			ProofClaims: proof("net.with.dots.example"),
+			ProofBody:   "x",
+			AnswerBody:  "x",
 		},
 	}
 }
@@ -283,29 +264,25 @@ func vectorInputs() []vector {
 func TestDerivationIsolation(t *testing.T) {
 	seed := []byte(testSeed)
 
-	a, err := DeriveHostKey(seed, "net", "a", 0)
+	a, err := DeriveHostKey(seed, "net", "a")
 	require.NoError(t, err)
-	b, err := DeriveHostKey(seed, "net", "b", 0)
+	b, err := DeriveHostKey(seed, "net", "b")
 	require.NoError(t, err)
-	a1, err := DeriveHostKey(seed, "net", "a", 1)
-	require.NoError(t, err)
-	other, err := DeriveHostKey(seed, "net2", "a", 0)
+	other, err := DeriveHostKey(seed, "net2", "a")
 	require.NoError(t, err)
 	signer, err := DeriveSignerKey(seed, "net")
 	require.NoError(t, err)
 
-	ctrl, err := DeriveControllerKey(seed, "net", 0)
+	ctrl, err := DeriveControllerKey(seed, "net")
 	require.NoError(t, err)
-	ctrl1, err := DeriveControllerKey(seed, "net", 1)
-	require.NoError(t, err)
-	ctrlOther, err := DeriveControllerKey(seed, "net2", 0)
+	ctrlOther, err := DeriveControllerKey(seed, "net2")
 	require.NoError(t, err)
 	// A host named like the controller's info string cannot collide with it.
-	hostNamedController, err := DeriveHostKey(seed, "net", "controller", 0)
+	hostNamedController, err := DeriveHostKey(seed, "net", "controller")
 	require.NoError(t, err)
 
 	keys := []*mldsa.PrivateKey{
-		a, b, a1, other, signer, ctrl, ctrl1, ctrlOther, hostNamedController,
+		a, b, other, signer, ctrl, ctrlOther, hostNamedController,
 	}
 	for i := range keys {
 		for j := i + 1; j < len(keys); j++ {
@@ -317,17 +294,17 @@ func TestDerivationIsolation(t *testing.T) {
 	require.ErrorIs(t, err, ErrSeedTooShort)
 
 	for _, bad := range []string{"", "a/b", "-a", "a b", `a"b`, "ü", strings.Repeat("a", 254)} {
-		_, err = DeriveHostKey(seed, "net", bad, 0)
+		_, err = DeriveHostKey(seed, "net", bad)
 		require.ErrorIs(t, err, ErrInvalidName, bad)
 		_, err = DeriveSignerKey(seed, bad)
 		require.ErrorIs(t, err, ErrInvalidName, bad)
-		_, err = DeriveControllerKey(seed, bad, 0)
+		_, err = DeriveControllerKey(seed, bad)
 		require.ErrorIs(t, err, ErrInvalidName, bad)
 	}
 }
 
 func TestKeyEncoding(t *testing.T) {
-	key, err := DeriveHostKey([]byte(testSeed), "net", "host-1", 0)
+	key, err := DeriveHostKey([]byte(testSeed), "net", "host-1")
 	require.NoError(t, err)
 
 	decoded, err := DecodePrivateKey(EncodePrivateKey(key) + "\n")

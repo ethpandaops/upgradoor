@@ -194,7 +194,6 @@ func (s *fakeStore) recordSync(h *fleet.Host) (adopted bool) {
 		c.HoldBy = old.HoldBy
 		c.HoldActor = old.HoldActor
 		c.Broken = old.Broken
-		c.Pull = old.Pull
 	} else {
 		c.FirstSeen = h.LastSeen
 
@@ -389,6 +388,21 @@ func (s *fakeStore) GetRollout(_ context.Context, id string) (*fleet.Rollout, er
 	return cloneRollout(r), nil
 }
 
+func (s *fakeStore) AbortedKeys(context.Context) ([]string, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var out []string
+
+	for _, id := range s.rolloutSeq {
+		if r := s.rollouts[id]; r.State == fleet.RolloutAborted && !slices.Contains(out, r.Key) {
+			out = append(out, r.Key)
+		}
+	}
+
+	return out, nil
+}
+
 func (s *fakeStore) ListLeases(_ context.Context, f store.LeaseFilter) ([]*fleet.Lease, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -489,12 +503,6 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 	for _, marks := range ch.Broken {
 		if h := s.hosts[marks.Host]; h != nil {
 			h.Broken = viaJSON(&marks).Marks
-		}
-	}
-
-	for _, pull := range ch.Pulls {
-		if h := s.hosts[pull.Host]; h != nil {
-			h.Pull = viaJSON(&pull).Window
 		}
 	}
 
@@ -990,16 +998,6 @@ func applyOutcome(w *World, out *Outcome) {
 			if h.Name == marks.Host {
 				c := *h
 				c.Broken = marks.Marks
-				w.Hosts[i] = &c
-			}
-		}
-	}
-
-	for _, pull := range out.Pulls {
-		for i, h := range w.Hosts {
-			if h.Name == pull.Host {
-				c := *h
-				c.Pull = pull.Window
 				w.Hosts[i] = &c
 			}
 		}

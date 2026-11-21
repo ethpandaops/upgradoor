@@ -62,7 +62,7 @@ func newFakeController(t *testing.T, clk *clock) *fakeController {
 		t: t,
 		verifier: identity.NewVerifier(identity.PublicKey(signerKey), testNetwork,
 			identity.WithClock(clk.now)),
-		signer: answerSigner(t, 0),
+		signer: answerSigner(t, testControllerSeed),
 		status: http.StatusOK,
 		resp:   &protocol.SyncResponse{},
 	}
@@ -137,10 +137,10 @@ func (f *fakeController) serve(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(out)
 }
 
-func answerSigner(t *testing.T, generation uint64) *identity.AnswerSigner {
+func answerSigner(t *testing.T, controllerSeed string) *identity.AnswerSigner {
 	t.Helper()
 
-	key, err := identity.DeriveControllerKey([]byte(testControllerSeed), testNetwork, generation)
+	key, err := identity.DeriveControllerKey([]byte(controllerSeed), testNetwork)
 	require.NoError(t, err)
 
 	signer, err := identity.NewAnswerSigner(key, testNetwork)
@@ -149,10 +149,10 @@ func answerSigner(t *testing.T, generation uint64) *identity.AnswerSigner {
 	return signer
 }
 
-func controllerPublicKey(t *testing.T, generation uint64) string {
+func controllerPublicKey(t *testing.T) string {
 	t.Helper()
 
-	return identity.EncodePublicKey(answerSigner(t, generation).PublicKey())
+	return identity.EncodePublicKey(answerSigner(t, testControllerSeed).PublicKey())
 }
 
 func sign(t *testing.T, s *identity.AnswerSigner, host, id string, body []byte) []byte {
@@ -167,7 +167,7 @@ func sign(t *testing.T, s *identity.AnswerSigner, host, id string, body []byte) 
 func credentials(t *testing.T) *identity.Credentials {
 	t.Helper()
 
-	key, err := identity.DeriveHostKey([]byte(testSeed), testNetwork, testHost, 0)
+	key, err := identity.DeriveHostKey([]byte(testSeed), testNetwork, testHost)
 	require.NoError(t, err)
 
 	cert, err := identity.IssueCertificate([]byte(testSeed), identity.CertificateSpec{
@@ -216,7 +216,7 @@ func newEnv(t *testing.T, cfg func(c *link.Config)) *env {
 	ctrl := newFakeController(t, clk)
 	c := &link.Config{
 		URL: ctrl.srv.URL + "/", AllowInsecure: true,
-		PublicKeys: []string{controllerPublicKey(t, 0)},
+		PublicKey: controllerPublicKey(t),
 	}
 
 	if cfg != nil {
@@ -276,7 +276,7 @@ func TestAnswersNotOfTheControllerAreNotActedOn(t *testing.T) {
 			forge: func(t *testing.T) forgeFunc {
 				t.Helper()
 
-				signer := answerSigner(t, 0)
+				signer := answerSigner(t, testControllerSeed)
 				earlier := "the-request-before-the-first"
 
 				return func(answer []byte, host, proofID string) []byte {
@@ -294,7 +294,7 @@ func TestAnswersNotOfTheControllerAreNotActedOn(t *testing.T) {
 			forge: func(t *testing.T) forgeFunc {
 				t.Helper()
 
-				signer := answerSigner(t, 0)
+				signer := answerSigner(t, testControllerSeed)
 
 				return func(answer []byte, _, proofID string) []byte {
 					return sign(t, signer, "prysm-besu-1", proofID, answer)
@@ -307,7 +307,7 @@ func TestAnswersNotOfTheControllerAreNotActedOn(t *testing.T) {
 			forge: func(t *testing.T) forgeFunc {
 				t.Helper()
 
-				signer := answerSigner(t, 0)
+				signer := answerSigner(t, testControllerSeed)
 
 				return func(answer []byte, host, proofID string) []byte {
 					// A lease injected into a signed answer without one.
@@ -332,14 +332,13 @@ func TestAnswersNotOfTheControllerAreNotActedOn(t *testing.T) {
 			forge: func(t *testing.T) forgeFunc {
 				t.Helper()
 
-				// The next generation: a rotated key this host was not given.
-				signer := answerSigner(t, 1)
+				signer := answerSigner(t, "another controller seed, at least 32 bytes long")
 
 				return func(answer []byte, host, proofID string) []byte {
 					return sign(t, signer, host, proofID, answer)
 				}
 			},
-			reason: "not signed by an accepted controller key",
+			reason: "not signed by the controller key",
 		},
 	}
 
@@ -395,31 +394,12 @@ func TestAnswersNotOfTheControllerAreNotActedOn(t *testing.T) {
 	}
 }
 
-// Answers signed with any listed controller key are accepted.
-func TestAnswersOfEachListedControllerKeyAreAccepted(t *testing.T) {
-	t.Parallel()
-
-	for _, generation := range []uint64{0, 1} {
-		e := newEnv(t, func(c *link.Config) {
-			c.PublicKeys = []string{controllerPublicKey(t, 0), controllerPublicKey(t, 1)}
-		})
-		e.ctrl.set(func(f *fakeController) {
-			f.signer = answerSigner(t, generation)
-			f.resp = &protocol.SyncResponse{Lease: &protocol.Lease{ID: "lease-1"}}
-		})
-
-		resp, err := e.sync(t)
-		require.NoError(t, err)
-		require.NotNil(t, resp.Lease)
-	}
-}
-
 // With allowUnsignedAnswers unsigned answers are taken, with a warning at start.
 func TestUnsignedAnswersNeedTheOptOut(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, func(c *link.Config) {
-		c.PublicKeys = nil
+		c.PublicKey = ""
 		c.AllowUnsignedAnswers = true
 	})
 	e.ctrl.set(func(f *fakeController) {
@@ -449,7 +429,7 @@ func TestSignedAnswersAreRefusedWithoutControllerKeys(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, func(c *link.Config) {
-		c.PublicKeys = nil
+		c.PublicKey = ""
 		c.AllowUnsignedAnswers = true
 	})
 	e.ctrl.set(func(f *fakeController) {
@@ -459,7 +439,7 @@ func TestSignedAnswersAreRefusedWithoutControllerKeys(t *testing.T) {
 	})
 
 	resp, err := e.sync(t)
-	require.ErrorContains(t, err, "configure controller.publicKeys")
+	require.ErrorContains(t, err, "configure controller.publicKey")
 	require.NotErrorIs(t, err, identity.ErrBadAnswer,
 		"a misconfigured opt-out, not somebody else answering")
 	assert.Nil(t, resp)
@@ -627,38 +607,4 @@ func TestInterval(t *testing.T) {
 	_, err := e.sync(t)
 	require.Error(t, err)
 	assert.Equal(t, 5*time.Second, e.client.Interval(true))
-}
-
-func TestSilent(t *testing.T) {
-	t.Parallel()
-
-	const def = 90 * time.Minute
-
-	e := newEnv(t, nil)
-	assert.True(t, e.client.Silent(def), "silent before the first answer")
-
-	_, err := e.sync(t)
-	require.NoError(t, err)
-
-	e.clock.set(e.clock.now().Add(def))
-	assert.False(t, e.client.Silent(def))
-
-	e.clock.set(e.clock.now().Add(time.Second))
-	assert.True(t, e.client.Silent(def), "def without a fallback of the controller")
-
-	e.ctrl.set(func(f *fakeController) {
-		f.resp = &protocol.SyncResponse{LookupFallbackSeconds: 60}
-	})
-
-	_, err = e.sync(t)
-	require.NoError(t, err)
-
-	// The answer's fallback stays when a later answer names none.
-	e.ctrl.set(func(f *fakeController) { f.resp = &protocol.SyncResponse{} })
-
-	_, err = e.sync(t)
-	require.NoError(t, err)
-
-	e.clock.set(e.clock.now().Add(61 * time.Second))
-	assert.True(t, e.client.Silent(def), "the controller's fallback")
 }

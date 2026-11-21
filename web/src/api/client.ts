@@ -13,6 +13,8 @@ import type {
   HoldRequest,
   OfflineRequest,
   ImageOverrideRequest,
+  Images,
+  ImagesRefresh,
   Packages,
   SlotHistory,
   RebootRequest,
@@ -253,6 +255,19 @@ export class ApiClient {
    */
   packages(page: { q?: string; limit?: number; after?: string }, signal?: AbortSignal): Promise<Packages> {
     return this.request(`/api/v1/packages${query({ ...page })}`, { user: true, signal });
+  }
+
+  /**
+   * images asks for one page of the images the fleet's containers run: all of
+   * them, or those whose reference contains q. It pages like packages.
+   */
+  images(page: { q?: string; limit?: number; after?: string }, signal?: AbortSignal): Promise<Images> {
+    return this.request(`/api/v1/images${query({ ...page })}`, { user: true, signal });
+  }
+
+  /** refreshImages asks the controller to look every followed tag up at its registry now. */
+  refreshImages(): Promise<ImagesRefresh> {
+    return this.request('/api/v1/images/refresh', { user: true, method: 'POST', body: {} });
   }
 
   settings(signal?: AbortSignal): Promise<SettingsBody> {

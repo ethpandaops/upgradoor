@@ -196,7 +196,7 @@ func (s *Handler) handlePutSettings(w http.ResponseWriter, r *http.Request, u *a
 
 		return
 	default:
-		s.writeSchedulerError(w, r, err)
+		s.writeSchedulerError(w, r, u, err)
 
 		return
 	}

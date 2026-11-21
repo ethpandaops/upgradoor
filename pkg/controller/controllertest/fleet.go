@@ -94,10 +94,12 @@ func OwnershipFixture(st *Store) {
 	)}
 	st.Hosts[HostFresh] = &fleet.Host{Name: HostFresh, LastSeen: Epoch}
 
-	// r-1 is halted, r-aborted is aborted; r-ghost does not exist.
+	// r-1 is halted, r-aborted is aborted, r-lighthouse rolls the client
+	// lighthouse; r-ghost does not exist.
 	st.Rollouts = []*fleet.Rollout{
 		{ID: "r-1", State: fleet.RolloutHalted},
 		{ID: "r-aborted", State: fleet.RolloutAborted},
+		{ID: "r-lighthouse", Kind: fleet.RolloutGroup, Client: "lighthouse", State: fleet.RolloutActive},
 	}
 
 	st.Leases = []*fleet.Lease{

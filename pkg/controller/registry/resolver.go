@@ -9,14 +9,18 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"os"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/sirupsen/logrus"
 
 	"github.com/ethpandaops/upgradoor/pkg/imageref"
+	"github.com/ethpandaops/upgradoor/pkg/registryauth"
 )
 
 const (
@@ -28,10 +32,12 @@ const (
 		"application/vnd.docker.distribution.manifest.v2+json"
 
 	headerContentDigest = "Docker-Content-Digest"
-	userAgent           = "upgradoor-agent"
+	userAgent           = "upgradoor-controller"
 
 	// requestTimeout bounds every single request, body included.
 	requestTimeout = 30 * time.Second
+	// dialTimeout bounds the connect of a new connection.
+	dialTimeout = 10 * time.Second
 	// tlsHandshakeTimeout bounds the TLS handshake of a new connection.
 	tlsHandshakeTimeout = 10 * time.Second
 	// idleConnTimeout and maxIdleConns bound the kept-alive connections.
@@ -44,6 +50,12 @@ const (
 	// maxDrainBytes bounds a discarded body, so the connection is reused.
 	maxDrainBytes = 64 << 10
 )
+
+// errPrivateAddress refuses a connection publicOnly does not allow.
+var errPrivateAddress = errors.New("registry: refusing to connect to a non-public address")
+
+// cgnat is the shared address space of RFC 6598.
+var cgnat = netip.MustParsePrefix("100.64.0.0/10")
 
 // errBodyTooLarge is returned when a response exceeds its size cap.
 var errBodyTooLarge = errors.New("response body exceeds the size limit")
@@ -73,7 +85,7 @@ type Resolver interface {
 // manifest GETs, not HEADs, against the pull rate limit.
 type resolver struct {
 	client    *http.Client
-	logins    Logins
+	logins    registryauth.Logins
 	plainHTTP map[string]struct{}
 	now       func() time.Time
 
@@ -85,7 +97,7 @@ var _ Resolver = (*resolver)(nil)
 
 // NewResolver returns the resolver for cfg and logins; it reads the CA file
 // once and does not touch the network.
-func NewResolver(_ logrus.FieldLogger, cfg *Config, logins Logins) (Resolver, error) {
+func NewResolver(_ logrus.FieldLogger, cfg *Config, logins registryauth.Logins) (Resolver, error) {
 	r := &resolver{
 		logins:    logins,
 		plainHTTP: make(map[string]struct{}, len(cfg.PlainHTTP)),
@@ -110,10 +122,16 @@ func NewResolver(_ logrus.FieldLogger, cfg *Config, logins Logins) (Resolver, er
 		tlsConfig.RootCAs = pool
 	}
 
+	dialer := &net.Dialer{Timeout: dialTimeout, KeepAlive: idleConnTimeout}
+	if !cfg.AllowPrivate {
+		dialer.Control = publicOnly
+	}
+
 	r.client = &http.Client{
 		Timeout: requestTimeout,
 		Transport: &http.Transport{
 			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           dialer.DialContext,
 			TLSClientConfig:       tlsConfig,
 			ForceAttemptHTTP2:     true,
 			MaxIdleConns:          maxIdleConns,
@@ -125,6 +143,23 @@ func NewResolver(_ logrus.FieldLogger, cfg *Config, logins Logins) (Resolver, er
 	}
 
 	return r, nil
+}
+
+// publicOnly refuses a connection to an address that is not public. It sees
+// the address a name resolved to, so it holds for redirects and token
+// services too.
+func publicOnly(_, address string, _ syscall.RawConn) error {
+	ap, err := netip.ParseAddrPort(address)
+	if err != nil {
+		return fmt.Errorf("registry: dial %s: %w", address, err)
+	}
+
+	addr := ap.Addr().Unmap()
+	if !addr.IsGlobalUnicast() || addr.IsPrivate() || cgnat.Contains(addr) {
+		return fmt.Errorf("%w: %s", errPrivateAddress, addr)
+	}
+
+	return nil
 }
 
 // loadRoots returns the system roots plus the certificates of a PEM file.
@@ -309,7 +344,7 @@ func (r *resolver) send(
 	if bearer != "" {
 		req.Header.Set("Authorization", "Bearer "+bearer)
 	} else if login, ok := r.logins[ref.Host]; ok {
-		req.Header.Set("Authorization", login.basic())
+		req.Header.Set("Authorization", login.Basic())
 	}
 
 	resp, err := r.client.Do(req)

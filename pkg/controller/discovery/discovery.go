@@ -1,171 +1,324 @@
-// Package discovery coordinates the registry lookups of a devnet's agents.
+// Package discovery looks the tags of a devnet's hosts up at the registries.
 //
-// Every tag that managed containers run is looked up by one host at a time:
-// each lookup interval the controller hands the duty for the tag to one of
-// the hosts that run it, in turn, in that host's sync answer. A host that
-// sees a new digest reports it with its next sync; the controller relays the
-// digest to every other host on the tag in their sync answers. The relay is a
-// signal only: each agent looks at its own images and pulls in a pull window.
-// The controller never contacts a registry.
+// Every host lists the tags it follows with each sync. The tracker looks
+// each tag up once per lookup interval, one at a time, and answers a sync
+// with what the host's tags point at. A failed lookup keeps the last good
+// digest and is tried again sooner. The hosts never ask a registry: they
+// compare the digests with their local images and pull inside a lease.
 //
-// The tracker keeps what it learned in memory: after a restart the hosts'
-// reports fill it again within one sync interval.
+// The tracker keeps what it learned in memory: after a restart it looks the
+// tags up again as the hosts list them.
 package discovery
 
 import (
+	"context"
+	"errors"
 	"slices"
 	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 
 	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 const (
-	// forgetAfter is how long a host that has not synced still counts as
-	// running a tag.
+	// forgetAfter is how long a tag is followed after the last host listed it.
 	forgetAfter = time.Hour
-	// minDutyTimeout bounds how long a duty is waited for before another
-	// host gets it.
-	minDutyTimeout = 2 * time.Minute
+	// lookupTimeout bounds one lookup: the lookups run one at a time, so a
+	// registry that does not answer holds the others up for this long.
+	lookupTimeout = 20 * time.Second
+	// retryAfter is the pause after a failed lookup, when the interval is longer.
+	retryAfter = time.Minute
+	// maxTags bounds the followed tags of all hosts.
+	maxTags = 4096
+	// maxRefLength bounds a reference a host lists.
+	maxRefLength = 512
+	// maxErrorLength bounds a lookup error handed to the hosts.
+	maxErrorLength = 300
+	// maxIdle bounds how long the goroutine sleeps without looking again.
+	maxIdle = time.Minute
+	// refreshFloor is the age below which Refresh leaves a lookup alone.
+	refreshFloor = 30 * time.Second
+	// minIdle keeps a tag that was due in the past from spinning the loop.
+	minIdle = 10 * time.Millisecond
 )
 
-// Tracker is the lookup state of the devnet's tags. It is safe for
-// concurrent use.
+// Resolver resolves a tag to its digest; registry.Resolver satisfies it.
+type Resolver interface {
+	Resolve(ctx context.Context, ref string) (string, error)
+}
+
+// Tracker follows the tags of the hosts. It is safe for concurrent use.
 type Tracker interface {
-	// Sync takes in what a host reports of its tags and returns the tags the
-	// host is to look up now and the digests to relay to it.
-	Sync(host string, req *protocol.SyncRequest, now time.Time, interval time.Duration) (
-		lookups []string, digests []protocol.TagDigest)
-	// Forget drops a host.
-	Forget(host string)
+	// Start runs the lookups until ctx ends or Stop.
+	Start(ctx context.Context) error
+	// Stop ends the lookups and waits for the one in flight. Safe after a
+	// failed Start and more than once.
+	Stop() error
+	// Sync notes the tags a host follows (at most protocol.MaxTags, each a
+	// tag reference) and returns what those looked up so far point at.
+	// interval is the lookup interval from here on; zero keeps it.
+	Sync(host string, tags []string, interval time.Duration) []protocol.TagDigest
+	// Refresh asks for a lookup now of every followed tag whose newest one
+	// is older than RefreshFloor, and says how many that are.
+	Refresh() Refreshed
+}
+
+// RefreshFloor is the age below which Refresh leaves a lookup alone.
+const RefreshFloor = refreshFloor
+
+// Refreshed is what Refresh did.
+type Refreshed struct {
+	// Tags is how many tags are looked up now; Recent how many were looked
+	// up within RefreshFloor and are left alone.
+	Tags   int
+	Recent int
+	// Next is when the first of the recent ones may be refreshed again;
+	// zero when none is recent.
+	Next time.Time
 }
 
 // tag is one followed tag.
 type tag struct {
-	// digest and checkedAt are the newest good lookup of any host; by is
-	// that host.
+	// ref is the reference as the first host wrote it.
+	ref string
+	// digest is the newest good lookup; checkedAt and err are of the newest
+	// lookup, good or not.
 	digest    string
 	checkedAt time.Time
-	by        string
-	// duty is the host that was handed the lookup at dutyAt, until its
-	// report of a lookup after that arrives.
-	duty   string
-	dutyAt time.Time
-	// hosts are the hosts that run the tag, with when they last said so.
+	err       string
+	// hosts are the hosts that follow the tag, with when they last said so.
 	hosts map[string]time.Time
+	// refresh: a lookup was asked for, whatever the interval says.
+	refresh bool
 }
 
 type tracker struct {
-	mu   sync.Mutex
-	tags map[string]*tag
+	log      logrus.FieldLogger
+	resolver Resolver
+	now      func() time.Time
+
+	// wake is signalled, never blocking, when a tag was added or the
+	// interval changed.
+	wake chan struct{}
+
+	mu       sync.Mutex
+	tags     map[string]*tag // by normalised reference
+	interval time.Duration
+	// full says the log already tells that maxTags is reached.
+	full bool
+
+	lifeMu sync.Mutex
+	cancel context.CancelFunc
+	done   chan struct{}
 }
 
-// NewTracker returns an empty tracker.
-func NewTracker() Tracker {
-	return &tracker{tags: make(map[string]*tag, 16)}
+var _ Tracker = (*tracker)(nil)
+
+// NewTracker returns a tracker that looks up with resolver; interval is the
+// lookup interval until a Sync names one.
+func NewTracker(
+	log logrus.FieldLogger, resolver Resolver, interval time.Duration, now func() time.Time,
+) Tracker {
+	return &tracker{
+		log:      log.WithField("package", "discovery"),
+		resolver: resolver,
+		now:      now,
+		wake:     make(chan struct{}, 1),
+		tags:     make(map[string]*tag, 16),
+		interval: interval,
+	}
 }
 
-// followed returns the tags the host's managed containers run, by
-// normalized reference, with the reference as the host writes it and its
-// own last check.
-func followed(req *protocol.SyncRequest) map[string]protocol.Container {
-	out := make(map[string]protocol.Container, len(req.Containers))
+// Start implements Tracker.
+func (t *tracker) Start(ctx context.Context) error {
+	t.lifeMu.Lock()
+	defer t.lifeMu.Unlock()
 
-	for i := range req.Containers {
-		c := req.Containers[i]
-		if !c.Managed || !imageref.IsTag(c.Image) {
+	if t.cancel != nil {
+		return errors.New("discovery: tracker already started")
+	}
+
+	runCtx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		t.run(runCtx)
+	}()
+
+	t.cancel, t.done = cancel, done
+
+	return nil
+}
+
+// Stop implements Tracker.
+func (t *tracker) Stop() error {
+	t.lifeMu.Lock()
+	defer t.lifeMu.Unlock()
+
+	if t.cancel == nil {
+		return nil
+	}
+
+	t.cancel()
+	<-t.done
+
+	t.cancel, t.done = nil, nil
+
+	return nil
+}
+
+// Sync implements Tracker.
+func (t *tracker) Sync(host string, tags []string, interval time.Duration) []protocol.TagDigest {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	changed := interval > 0 && interval != t.interval
+	if changed {
+		t.interval = interval
+	}
+
+	if len(tags) > protocol.MaxTags {
+		tags = tags[:protocol.MaxTags]
+	}
+
+	var (
+		now   = t.now()
+		out   = make([]protocol.TagDigest, 0, len(tags))
+		added = false
+	)
+
+	for _, ref := range tags {
+		if len(ref) > maxRefLength {
 			continue
 		}
 
-		key := imageref.Normalize(c.Image)
-		if cur, ok := out[key]; ok && cur.Registry != nil {
+		parsed, err := imageref.Parse(ref)
+		if err != nil || parsed.Digest != "" {
 			continue
 		}
 
-		out[key] = c
+		key := parsed.String()
+
+		tg := t.tags[key]
+		if tg == nil {
+			if len(t.tags) >= maxTags {
+				if !t.full {
+					t.full = true
+
+					t.log.WithField("host", host).Warn("too many tags: new ones are not looked up")
+				}
+
+				continue
+			}
+
+			tg = &tag{ref: ref, hosts: make(map[string]time.Time, 4)}
+			t.tags[key] = tg
+			added = true
+		}
+
+		tg.hosts[host] = now
+
+		if !tg.checkedAt.IsZero() {
+			out = append(out, protocol.TagDigest{
+				Ref: ref, Digest: tg.digest, CheckedAt: tg.checkedAt, Error: tg.err,
+			})
+		}
+	}
+
+	if added || changed {
+		select {
+		case t.wake <- struct{}{}:
+		default:
+		}
 	}
 
 	return out
 }
 
-func (t *tracker) Sync(host string, req *protocol.SyncRequest, now time.Time, interval time.Duration) (
-	lookups []string, digests []protocol.TagDigest,
-) {
+// Refresh implements Tracker.
+func (t *tracker) Refresh() Refreshed {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	tags := followed(req)
-	dutyTimeout := max(minDutyTimeout, interval/2)
+	now := t.now()
 
-	for _, key := range sortedKeys(tags) {
-		c := tags[key]
+	var out Refreshed
 
+	for _, tg := range t.tags {
+		if tg.refresh || now.Sub(tg.checkedAt) >= refreshFloor {
+			tg.refresh = true
+			out.Tags++
+
+			continue
+		}
+
+		out.Recent++
+
+		if next := tg.checkedAt.Add(refreshFloor); out.Next.IsZero() || next.Before(out.Next) {
+			out.Next = next
+		}
+	}
+
+	if out.Tags > 0 {
+		select {
+		case t.wake <- struct{}{}:
+		default:
+		}
+	}
+
+	return out
+}
+
+// run looks the due tags up, one at a time, until ctx ends.
+func (t *tracker) run(ctx context.Context) {
+	for ctx.Err() == nil {
+		key, wait := t.nextDue()
+		if key != "" {
+			t.lookup(ctx, key)
+
+			continue
+		}
+
+		timer := time.NewTimer(wait)
+
+		select {
+		case <-ctx.Done():
+		case <-t.wake:
+		case <-timer.C:
+		}
+
+		timer.Stop()
+	}
+}
+
+// nextDue forgets the tags no host follows and returns the tag that is due
+// (the one that waited longest), or the time to sleep until one is.
+func (t *tracker) nextDue() (string, time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	var (
+		now     = t.now()
+		due     string
+		overdue time.Duration
+		wait    = maxIdle
+	)
+
+	keys := make([]string, 0, len(t.tags))
+	for key := range t.tags {
+		keys = append(keys, key)
+	}
+
+	slices.Sort(keys)
+
+	for _, key := range keys {
 		tg := t.tags[key]
-		if tg == nil {
-			tg = &tag{hosts: make(map[string]time.Time, 4)}
-			t.tags[key] = tg
-		}
 
-		tg.hosts[host] = now
-
-		if rc := c.Registry; rc != nil && rc.Error == "" && rc.Digest != "" && rc.CheckedAt.After(tg.checkedAt) &&
-			!rc.CheckedAt.After(now.Add(time.Minute)) {
-			tg.digest, tg.checkedAt, tg.by = rc.Digest, rc.CheckedAt, host
-		}
-
-		if tg.duty == host && c.Registry != nil && !c.Registry.CheckedAt.Before(tg.dutyAt) {
-			tg.duty = ""
-		}
-
-		// Relay what another host saw.
-		if tg.digest != "" && (c.Registry == nil || c.Registry.Digest != tg.digest) {
-			digests = append(digests, protocol.TagDigest{Ref: c.Image, Digest: tg.digest, CheckedAt: tg.checkedAt})
-		}
-
-		if t.due(tg, host, now, interval, dutyTimeout) {
-			tg.duty, tg.dutyAt = host, now
-
-			lookups = append(lookups, c.Image)
-		}
-	}
-
-	t.prune(now)
-
-	return lookups, digests
-}
-
-// due reports whether the host is to look the tag up now: the newest lookup
-// is an interval old, nobody holds the duty (or the one who does let it
-// lapse), and it is the host's turn: the host that looked last goes after
-// the others.
-func (t *tracker) due(tg *tag, host string, now time.Time, interval, dutyTimeout time.Duration) bool {
-	if now.Sub(tg.checkedAt) < interval {
-		return false
-	}
-
-	if tg.duty != "" && now.Sub(tg.dutyAt) < dutyTimeout {
-		return false
-	}
-
-	if host != tg.by || len(tg.hosts) == 1 {
-		return true
-	}
-
-	// The host looked last: another one that is around goes first, unless
-	// the tag waited a duty timeout longer for one.
-	for other, seen := range tg.hosts {
-		if other != host && now.Sub(seen) < dutyTimeout {
-			return now.Sub(tg.checkedAt) >= interval+dutyTimeout
-		}
-	}
-
-	return true
-}
-
-// prune forgets hosts that have not synced for long and tags nobody runs.
-func (t *tracker) prune(now time.Time) {
-	for key, tg := range t.tags {
 		for host, seen := range tg.hosts {
 			if now.Sub(seen) > forgetAfter {
 				delete(tg.hosts, host)
@@ -174,30 +327,100 @@ func (t *tracker) prune(now time.Time) {
 
 		if len(tg.hosts) == 0 {
 			delete(t.tags, key)
+			t.full = false
+
+			continue
+		}
+
+		// A tag never looked up is due first.
+		left := time.Duration(-1 << 62)
+		if !tg.checkedAt.IsZero() {
+			left = tg.checkedAt.Add(t.pause(tg)).Sub(now)
+		}
+
+		if tg.refresh {
+			left = min(left, 0)
+		}
+
+		if left <= 0 && (due == "" || -left > overdue) {
+			due, overdue = key, -left
+		}
+
+		if left > 0 {
+			wait = min(wait, left)
 		}
 	}
+
+	return due, max(wait, minIdle)
 }
 
-func (t *tracker) Forget(host string) {
+// pause is the time between two lookups of the tag. The caller holds t.mu.
+func (t *tracker) pause(tg *tag) time.Duration {
+	if tg.err != "" {
+		return min(t.interval, retryAfter)
+	}
+
+	return t.interval
+}
+
+// lookup asks the registry where one tag points, without the lock held.
+func (t *tracker) lookup(ctx context.Context, key string) {
+	t.mu.Lock()
+
+	tg, ok := t.tags[key]
+	if !ok {
+		t.mu.Unlock()
+
+		return
+	}
+
+	ref := tg.ref
+
+	t.mu.Unlock()
+
+	rctx, cancel := context.WithTimeout(ctx, lookupTimeout)
+	digest, err := t.resolver.Resolve(rctx, ref)
+
+	cancel()
+
+	if ctx.Err() != nil {
+		return
+	}
+
+	if err == nil && digest == "" {
+		err = errors.New("registry returned no digest")
+	}
+
 	t.mu.Lock()
 	defer t.mu.Unlock()
 
-	for _, tg := range t.tags {
-		delete(tg.hosts, host)
+	if t.tags[key] != tg {
+		return
+	}
 
-		if tg.duty == host {
-			tg.duty = ""
+	log := t.log.WithField("image", ref)
+	tg.checkedAt, tg.refresh = t.now(), false
+
+	if err != nil {
+		msg := err.Error()
+		if len(msg) > maxErrorLength {
+			msg = msg[:maxErrorLength]
 		}
+
+		// Logged once per failure, not once per retry.
+		if msg != tg.err {
+			log.WithError(err).Warn("registry lookup failed")
+		}
+
+		tg.err = msg
+
+		return
 	}
-}
 
-func sortedKeys[V any](m map[string]V) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
+	if digest != tg.digest {
+		log.WithFields(logrus.Fields{"digest": digest, "previous": tg.digest}).
+			Info("tag points at a new digest")
 	}
 
-	slices.Sort(keys)
-
-	return keys
+	tg.digest, tg.err = digest, ""
 }

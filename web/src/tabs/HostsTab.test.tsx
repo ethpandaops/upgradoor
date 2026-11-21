@@ -115,12 +115,8 @@ describe('HostsTab, logged in', () => {
     expect(rowOf(table, 'teku-reth-1')).toHaveTextContent('debian 13');
     expect(rowOf(table, 'lighthouse-geth-3')).toHaveTextContent(/budget [\d.]+% of 10%/);
 
-    // Where a host that waits in a rollout stands with its images: one host pulls at a time.
-    expect(within(rowOf(table, 'lighthouse-geth-3')).getByText('pulled')).toBeInTheDocument();
-    expect(within(rowOf(table, 'lighthouse-nethermind-1')).getByText('pulling')).toBeInTheDocument();
-    const waits = rowOf(table, 'lighthouse-geth-4');
-    expect(within(waits).getByText('waiting for a pull window')).toBeInTheDocument();
-    expect(waits).toHaveTextContent('waiting for its images to be pulled');
+    // A host whose last lease could not pull its image waits to try again.
+    expect(rowOf(table, 'lighthouse-geth-4')).toHaveTextContent('waiting to pull its image again after a failed pull');
   });
 
   it('filters by name, image and role, and sorts by a column', async () => {

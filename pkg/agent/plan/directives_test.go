@@ -49,12 +49,20 @@ func TestRollNeed(t *testing.T) {
 	p := needsPolicy(allVerbs...)
 	ref := "ethpandaops/geth:master"
 
-	need, reject := RollNeed(p, observed(p), "geth", ref, "manual/d1", nil, false)
+	// viewWith is the view with check as what the controller looked up for geth's tag.
+	viewWith := func(check *protocol.RegistryCheck) *View {
+		v := observed(p)
+		v.Containers[0].Registry = check
+
+		return v
+	}
+
+	need, reject := RollNeed(p, viewWith(nil), "geth", ref, "manual/d1")
 	assert.Nil(t, need)
-	assert.Empty(t, reject, "it waits for the lookup")
+	assert.Empty(t, reject, "it waits for the controller's lookup")
 
 	same := &protocol.RegistryCheck{Digest: "sha256:a", Revision: "r1"}
-	need, reject = RollNeed(p, observed(p), "geth", ref, "manual/d1", same, false)
+	need, reject = RollNeed(p, viewWith(same), "geth", ref, "manual/d1")
 	assert.Empty(t, reject)
 	require.NotNil(t, need)
 	assert.Equal(t, protocol.Need{
@@ -69,26 +77,25 @@ func TestRollNeed(t *testing.T) {
 		name   string
 		ref    string
 		check  *protocol.RegistryCheck
-		gone   bool
 		mutate func(v *View)
 		want   string
 	}{
-		{name: "refused first", ref: ref, gone: true, mutate: func(v *View) { v.Hold.Controller = true },
+		{name: "refused first", ref: "ethpandaops/geth:stable", mutate: func(v *View) { v.Hold.Controller = true },
 			want: "host is on controller hold"},
-		{name: "the tracker dropped the tag", ref: ref, gone: true, want: "container geth moved to another image"},
-		{name: "the container moved", ref: "ethpandaops/geth:stable", want: "container geth moved to another image"},
+		{name: "the container moved", ref: "ethpandaops/geth:stable", check: same,
+			want: "container geth moved to another image"},
 		{name: "no digest", ref: ref, check: &protocol.RegistryCheck{},
 			want: "the registry did not say where ethpandaops/geth:master points: no digest"},
 		{name: "a lookup error", ref: ref, check: &protocol.RegistryCheck{Error: "401 unauthorized"},
 			want: "the registry did not say where ethpandaops/geth:master points: 401 unauthorized"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			v := observed(p)
+			v := viewWith(tc.check)
 			if tc.mutate != nil {
 				tc.mutate(v)
 			}
 
-			need, reject := RollNeed(p, v, "geth", tc.ref, "manual/d1", tc.check, tc.gone)
+			need, reject := RollNeed(p, v, "geth", tc.ref, "manual/d1")
 			assert.Nil(t, need)
 			assert.Equal(t, tc.want, reject)
 		})

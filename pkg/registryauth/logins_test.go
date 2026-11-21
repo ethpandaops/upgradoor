@@ -1,8 +1,10 @@
-package registry
+package registryauth
 
 import (
 	"encoding/base64"
 	"fmt"
+	"io"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -14,6 +16,22 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
+
+func testLogger() logrus.FieldLogger {
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	return log
+}
+
+func writeAuthFile(t *testing.T, content string) string {
+	t.Helper()
+
+	path := filepath.Join(t.TempDir(), "config.json")
+	require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
+
+	return path
+}
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
 
@@ -45,7 +63,7 @@ func TestLoadLogins(t *testing.T) {
 		"both.example":       {Username: "from-auth", Password: "1"},
 	}, logins)
 
-	require.Equal(t, "Basic "+b64("gh:pa:ss:word"), logins["ghcr.io"].basic())
+	require.Equal(t, "Basic "+b64("gh:pa:ss:word"), logins["ghcr.io"].Basic())
 
 	user, pass, ok := logins.Lookup("ghcr.io")
 	require.True(t, ok)

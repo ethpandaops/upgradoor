@@ -9,33 +9,50 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
+// crashLoopRestarts is the restart count increase that fails the verifying
+// phase before its timeout.
+const crashLoopRestarts = 3
+
 // verify waits until every touched container has run for the window without
-// a restart, or fails the operation at deadline.
+// a restart, or fails the operation at deadline. A container that keeps
+// restarting or exited for good fails it at once.
 func (o *operation) verify(ctx context.Context, names []string, deadline time.Time) error {
 	o.setPhase(protocol.PhaseVerifying)
 
 	var (
+		first    = make(map[string]int, len(names))
 		baseline map[string]int
 		stable   time.Time
 		problem  = "containers were never observed"
 	)
 
 	for {
-		counts, reason, err := o.restartCounts(ctx, names)
+		list, err := o.containers(ctx)
 
 		switch {
 		case err != nil && ctx.Err() != nil:
 			return errInterrupted
 		case err != nil:
 			baseline, problem = nil, "cannot list containers: "+err.Error()
-		case reason != "":
-			baseline, problem = nil, reason
-		case baseline == nil:
-			baseline, stable = counts, o.now()
 		default:
-			if name := restarted(baseline, counts); name != "" {
-				problem = "container " + name + " restarted"
+			if fatal := crashed(list, names, first); fatal != "" {
+				o.fail(fatal)
+
+				return nil
+			}
+
+			counts, reason := restartCounts(list, names)
+
+			switch {
+			case reason != "":
+				baseline, problem = nil, reason
+			case baseline == nil:
 				baseline, stable = counts, o.now()
+			default:
+				if name := restarted(baseline, counts); name != "" {
+					problem = "container " + name + " restarted"
+					baseline, stable = counts, o.now()
+				}
 			}
 		}
 
@@ -56,15 +73,40 @@ func (o *operation) verify(ctx context.Context, names []string, deadline time.Ti
 	}
 }
 
-// restartCounts returns the named containers' restart counts, or why one is not up.
-func (o *operation) restartCounts(
-	ctx context.Context, names []string,
-) (counts map[string]int, reason string, err error) {
-	list, err := o.containers(ctx)
-	if err != nil {
-		return nil, "", err
+// crashed returns why one of the named containers will not come up: it
+// exited without a restart, or restarted crashLoopRestarts times since its
+// restart count was first recorded in first.
+func crashed(list []protocol.Container, names []string, first map[string]int) string {
+	for _, name := range names {
+		i := slices.IndexFunc(list, func(c protocol.Container) bool { return c.Name == name })
+		if i < 0 {
+			continue
+		}
+
+		c := &list[i]
+
+		switch c.State {
+		case protocol.StateExited, protocol.StateDead:
+			return fmt.Sprintf("container %s is %s (exit code %d)", name, c.State, c.ExitCode)
+		}
+
+		base, ok := first[name]
+		if !ok {
+			first[name] = c.RestartCount
+
+			continue
+		}
+
+		if n := c.RestartCount - base; n >= crashLoopRestarts {
+			return fmt.Sprintf("container %s is restarting: %d restarts", name, n)
+		}
 	}
 
+	return ""
+}
+
+// restartCounts returns the named containers' restart counts, or why one is not up.
+func restartCounts(list []protocol.Container, names []string) (counts map[string]int, reason string) {
 	counts = make(map[string]int, len(names))
 
 	for _, name := range names {
@@ -72,15 +114,15 @@ func (o *operation) restartCounts(
 
 		switch {
 		case i < 0:
-			return nil, "container " + name + " does not exist", nil
+			return nil, "container " + name + " does not exist"
 		case list[i].State != protocol.StateRunning:
-			return nil, "container " + name + " is " + list[i].State, nil
+			return nil, "container " + name + " is " + list[i].State
 		}
 
 		counts[name] = list[i].RestartCount
 	}
 
-	return counts, "", nil
+	return counts, ""
 }
 
 // restarted returns the first name whose restart count changed.

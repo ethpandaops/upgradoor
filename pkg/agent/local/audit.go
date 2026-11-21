@@ -39,7 +39,7 @@ type Record struct {
 	// Action: override.set, override.clear, override.expire, override.edit,
 	// override.apply, override.restore, spec.apply, roll.request,
 	// roll.result, reboot.request, reboot.result, hold.set, hold.release,
-	// overrides.init.
+	// overrides.init, deploy.
 	Action string `json:"action"`
 	// Source is SourceController, SourceLocal or SourceAgent.
 	Source    string   `json:"source"`

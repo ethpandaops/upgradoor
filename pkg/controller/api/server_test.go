@@ -272,9 +272,7 @@ func TestMetrics(t *testing.T) {
 	h := newHarness(t, nil)
 	metricsFixture(t, h)
 
-	// The fixture knows the host at generation 3; an older certificate would
-	// be rejected.
-	agent := controllertest.ValidatorAgent(t, 3)
+	agent := controllertest.ValidatorAgent(t)
 
 	// One good sync (which also refreshes the host) and one rejected one.
 	req := controllertest.ValidatorSyncRequest()
@@ -410,8 +408,8 @@ func TestEveryUserRouteIsGuarded(t *testing.T) {
 		})
 	}
 
-	// The eleven actions and the settings.
-	assert.Equal(t, len(actionNames(h))+1, mutating)
+	// The actions, the settings and the registry refresh.
+	assert.Equal(t, len(actionNames(h))+2, mutating)
 
 	for _, name := range actionNames(h) {
 		assert.Contains(t, routes, "POST /api/v1/actions/"+name)
@@ -423,7 +421,10 @@ func TestEveryUserRouteIsGuarded(t *testing.T) {
 		assert.Equal(t, scheduler.Authorization{By: authz.FeatureAdmin}, call.Auth, call.Name)
 	}
 
-	assert.Empty(t, h.store.AuditEntries())
+	// The refusals of the basic login are audited, nothing else is.
+	for _, e := range h.store.AuditEntries() {
+		assert.Equal(t, "auth.refused", e.Action, e.Target)
+	}
 }
 
 // TestOwnersFromAgentToViews: what an agent reports as owners reaches the

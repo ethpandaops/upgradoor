@@ -10,7 +10,6 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/agent/host"
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
-	"github.com/ethpandaops/upgradoor/pkg/agent/registry"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -22,17 +21,11 @@ const (
 	// soonSync is the longest wait after a cycle that answered something
 	// new or took a lease.
 	soonSync = time.Second
-	// fallbackPolls is the lookup fallback in registry poll intervals,
-	// until an answer names one.
-	fallbackPolls = 3
 )
 
-// The cycle converts host.System into plan.System and plan.Tag into
-// registry.Tag; these keep the twins identical.
-var (
-	_ = plan.System(host.System{})
-	_ = registry.Tag(plan.Tag{})
-)
+// The cycle converts host.System into plan.System; this keeps the twins
+// identical.
+var _ = plan.System(host.System{})
 
 // loop syncs until ctx ends: at link's interval, within soonSync after a
 // cycle that answered something, and when woken.
@@ -57,7 +50,7 @@ func (a *agent) loop(ctx context.Context) {
 	}
 }
 
-// busy reports whether a lease, a roll waiting for its lookup or a local
+// busy reports whether a lease, a roll waiting for its tag's digest or a local
 // roll is open.
 func (a *agent) busy() bool {
 	return a.runner.Current() != nil || len(a.directives.pending) > 0 || a.rolls.Open()
@@ -74,13 +67,10 @@ func (a *agent) cycle(ctx context.Context) bool {
 	files := a.files.Load()
 	view := plan.Classify(&a.cfg.Policy, &facts, &files, a.tracker.Checks(), a.now())
 
+	// Stale containers change nothing of what is followed.
 	if facts.Fresh {
-		tags := make(map[string]registry.Tag, len(view.Tags))
-		for key, t := range view.Tags {
-			tags[key] = registry.Tag(t)
-		}
-
-		a.tracker.Track(tags)
+		a.tracker.Track(view.Tags)
+		a.tags = followed(&view)
 	}
 
 	a.takeLocalRolls(&view)
@@ -97,18 +87,16 @@ func (a *agent) cycle(ctx context.Context) bool {
 
 		// link logs the episode; nothing of the answer is acted on.
 		a.syncFailing = true
-		a.tracker.SetFallback(a.link.Silent(fallbackPolls * a.cfg.Registry.PollInterval))
-		a.publish(&view, req, nil)
+		soon := a.fallback(&view, req.Needs)
+		a.publish(&facts, &view, req, nil)
 
-		return false
+		return soon
 	}
 
 	a.syncFailing = false
+	a.endFallback()
 
-	a.tracker.SetFallback(false)
-	a.tracker.Relay(resp.Digests)
-	a.tracker.Lookup(resp.Lookups)
-	a.tracker.SetWindow(resp.Pull)
+	a.tracker.SetDigests(resp.Digests)
 	a.logQueue(resp.Queue)
 
 	soon := a.handleDirectives(resp.Directives, &view)
@@ -121,9 +109,71 @@ func (a *agent) cycle(ctx context.Context) bool {
 		a.sendInventory(ctx)
 	}
 
-	a.publish(&view, req, resp)
+	a.publish(&facts, &view, req, resp)
 
 	return soon
+}
+
+// fallback serves the fallback's containers while the controller has been
+// silent for fallback.after: their tags are pulled by the tracker and their
+// needs get a lease of the agent's own. A need is tried once per silence. It
+// reports whether a lease was taken.
+func (a *agent) fallback(view *plan.View, needs []protocol.Need) bool {
+	fb := &a.cfg.Policy.Fallback
+
+	silent := a.now().Sub(a.lastAnswer)
+	if !fb.Enabled() || silent < fb.After {
+		return false
+	}
+
+	if a.fallbackTried == nil {
+		a.fallbackTried = make(map[string]struct{}, 4)
+
+		a.log.WithFields(logrus.Fields{"silent": silent.Round(time.Second), "interval": fb.Interval}).
+			Warn("the controller has been silent for fallback.after: " +
+				"the fallback's containers follow their tags without it")
+	}
+
+	// Stale containers change nothing of what is followed.
+	if view.Fresh {
+		a.tracker.SetFallback(plan.FallbackTags(&a.cfg.Policy, view), fb.Interval)
+	}
+
+	open := plan.FallbackNeeds(&a.cfg.Policy, needs)
+	open = slices.DeleteFunc(open, func(n protocol.Need) bool {
+		_, tried := a.fallbackTried[n.ID]
+
+		return tried
+	})
+
+	if !view.Fresh || !a.runner.Grant(open) {
+		return false
+	}
+
+	ids := make([]string, 0, len(open))
+
+	for i := range open {
+		a.fallbackTried[open[i].ID] = struct{}{}
+		ids = append(ids, open[i].ID)
+	}
+
+	a.log.WithField("needs", ids).Warn("fallback: serving needs without the controller")
+
+	return true
+}
+
+// endFallback notes an answer of the controller, which ends the fallback.
+func (a *agent) endFallback() {
+	a.lastAnswer = a.now()
+
+	if a.fallbackTried == nil {
+		return
+	}
+
+	a.fallbackTried = nil
+
+	a.tracker.SetFallback(nil, 0)
+	a.log.Info("the controller answers again: the fallback ended")
 }
 
 // observe reads the containers and the system state; a part that cannot be
@@ -197,7 +247,7 @@ func (a *agent) report(ctx context.Context, view *plan.View) *protocol.SyncReque
 		Node:            a.host.Probe(ctx),
 		Needs:           plan.Needs(&a.cfg.Policy, view, manual),
 		DirectiveAcks:   a.state.Acks(a.directives.repeated),
-		Pulling:         a.tracker.Pulling(),
+		Tags:            a.tags,
 		Validators:      a.validators(ctx),
 		Operation:       cur.Reported(),
 	}
@@ -211,6 +261,19 @@ func (a *agent) report(ctx context.Context, view *plan.View) *protocol.SyncReque
 	}
 
 	return req
+}
+
+// followed lists the tags of the view as written, sorted, at most
+// protocol.MaxTags.
+func followed(view *plan.View) []string {
+	tags := make([]string, 0, len(view.Tags))
+	for _, ref := range view.Tags {
+		tags = append(tags, ref)
+	}
+
+	slices.Sort(tags)
+
+	return tags[:min(len(tags), protocol.MaxTags)]
 }
 
 // validators reads the validator range and logs it when it changed.
@@ -287,9 +350,11 @@ func (a *agent) logQueue(q *protocol.Queue) {
 }
 
 // publish brings the local rolls up to date and stores the status the
-// socket serves, from one read of the lease and the manual needs. resp is
-// nil when the sync failed.
-func (a *agent) publish(view *plan.View, req *protocol.SyncRequest, resp *protocol.SyncResponse) {
+// socket serves, from one read of the lease and the manual needs, and the
+// facts of view. resp is nil when the sync failed.
+func (a *agent) publish(
+	facts *plan.Facts, view *plan.View, req *protocol.SyncRequest, resp *protocol.SyncResponse,
+) {
 	manual, cur := a.state.ManualAndCurrent()
 
 	progress := local.Progress{Hold: view.Hold, Answered: resp != nil, Open: make([]string, 0, len(manual))}
@@ -323,9 +388,14 @@ func (a *agent) publish(view *plan.View, req *protocol.SyncRequest, resp *protoc
 
 	if a.syncFailing {
 		status.SyncError = "the controller cannot be reached; nothing is granted until it can"
+
+		if a.fallbackTried != nil {
+			status.SyncError = "the controller cannot be reached; " +
+				"the fallback's containers follow their tags without it"
+		}
 	}
 
 	a.mu.Lock()
-	a.view, a.status = view, status
+	a.view, a.status, a.seen = view, status, facts
 	a.mu.Unlock()
 }

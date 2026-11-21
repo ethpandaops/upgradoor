@@ -34,6 +34,7 @@ type Store interface {
 	DeleteHost(ctx context.Context, name string) error
 	ListRollouts(ctx context.Context, filter store.RolloutFilter) ([]*fleet.Rollout, error)
 	GetRollout(ctx context.Context, id string) (*fleet.Rollout, error)
+	AbortedKeys(ctx context.Context) ([]string, error)
 	ListLeases(ctx context.Context, filter store.LeaseFilter) ([]*fleet.Lease, error)
 	GetLease(ctx context.Context, id string) (*fleet.Lease, error)
 	ListDirectives(ctx context.Context, filter store.DirectiveFilter) ([]*fleet.Directive, error)
@@ -308,6 +309,10 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 		return nil, fmt.Errorf("scheduler: list open leases: %w", err)
 	}
 
+	if err := s.loadAborted(ctx, w); err != nil {
+		return nil, err
+	}
+
 	if err := s.loadDirectives(ctx, w); err != nil {
 		return nil, err
 	}
@@ -323,7 +328,86 @@ func (s *service) write(ctx context.Context, changes *store.Changes) error {
 		return fmt.Errorf("scheduler: commit: %w", err)
 	}
 
+	s.logEvents(changes.Audit)
 	s.changed()
+
+	return nil
+}
+
+// loggedEvents are the audit actions that are logged at info as well, with
+// their message.
+var loggedEvents = map[string]string{
+	"lease.granted":     "Lease granted",
+	"lease.released":    "Lease released",
+	"lease.failed":      "Lease failed",
+	"rollout.created":   "Rollout opened",
+	"rollout.halted":    "Rollout halted",
+	"rollout.completed": "Rollout completed",
+	"action.abort":      "Rollout aborted",
+}
+
+// loggedDetail are the detail keys a logged event carries.
+var loggedDetail = []string{keyLease, keyRollouts, keyKey, "title", "host", keyReason}
+
+// logEvents logs the committed audit entries of loggedEvents, one line each.
+func (s *service) logEvents(entries []fleet.AuditEntry) {
+	for i := range entries {
+		e := &entries[i]
+
+		msg, ok := loggedEvents[e.Action]
+		if !ok {
+			continue
+		}
+
+		fields := logrus.Fields{"target": e.Target, "actor": e.Actor}
+
+		for _, k := range loggedDetail {
+			if v, ok := e.Detail[k]; ok && v != "" {
+				fields[k] = v
+			}
+		}
+
+		s.log.WithFields(fields).Info(msg)
+	}
+}
+
+// loadAborted gives the world the keys of the aborted rollouts and the
+// aborted rollouts that an open lease still serves.
+func (s *service) loadAborted(ctx context.Context, w *World) error {
+	keys, err := s.opts.Store.AbortedKeys(ctx)
+	if err != nil {
+		return fmt.Errorf("scheduler: aborted keys: %w", err)
+	}
+
+	w.AbortedKeys = make(map[string]bool, len(keys))
+	for _, k := range keys {
+		w.AbortedKeys[k] = true
+	}
+
+	known := make(map[string]bool, len(w.Rollouts))
+	for _, r := range w.Rollouts {
+		known[r.ID] = true
+	}
+
+	for _, l := range w.Leases {
+		for _, id := range l.Rollouts {
+			if known[id] {
+				continue
+			}
+
+			known[id] = true
+
+			r, err := s.opts.Store.GetRollout(ctx, id)
+
+			switch {
+			case errors.Is(err, store.ErrNotFound):
+			case err != nil:
+				return fmt.Errorf("scheduler: get rollout %s: %w", id, err)
+			case r.State == fleet.RolloutAborted:
+				w.Rollouts = append(w.Rollouts, r)
+			}
+		}
+	}
 
 	return nil
 }
@@ -394,10 +478,6 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 		a.Directives = append(a.Directives, d.Directive)
 	}
 
-	if h, hostErr := st.GetHost(ctx, host); hostErr == nil && h.Pull.Open() {
-		a.Pull = &protocol.PullWindow{Images: slices.Clone(h.Pull.Images)}
-	}
-
 	settings, err := s.Settings(ctx)
 	if err != nil {
 		return nil, err
@@ -440,6 +520,10 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 // that report so far: to it the lease is restated, with the mark, so that it
 // keeps a finished operation until the scheduler has taken it in.
 func (s *service) offer(ctx context.Context, l *fleet.Lease) (*protocol.Lease, error) {
+	if l.Recheck {
+		return nil, nil //nolint:nilnil // a recheck is the controller's alone.
+	}
+
 	if l.Cancelled != nil && l.State == fleet.LeaseGranted {
 		reported, err := s.reportsOperation(ctx, l.Host, l.ID)
 		if err != nil || !reported {

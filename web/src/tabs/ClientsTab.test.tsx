@@ -332,6 +332,30 @@ describe('ClientsTab', () => {
   });
 });
 
+describe("ClientsTab: a client's team", () => {
+  it("approves the client's rollout that waits on the manual policy", async () => {
+    const user = userEvent.setup();
+    const h = await open('team', '#clients/lighthouse');
+    await screen.findByRole('table', { name: 'Hosts of lighthouse' });
+
+    await user.click(
+      within(screen.getByRole('group', { name: 'Roll policy' })).getByRole('button', { name: 'Manual' })
+    );
+    await user.click(within(await screen.findByRole('dialog')).getByRole('button', PRIMARY));
+
+    const callout = await screen.findByRole('region', { name: 'Rollouts of lighthouse waiting for approval' });
+    const approve = within(callout).getByRole('button', { name: 'Approve…' });
+    expect(approve).toBeEnabled();
+
+    await user.click(approve);
+    await user.click(within(await screen.findByRole('dialog')).getByRole('button', PRIMARY));
+    await waitFor(() => {
+      expect(screen.queryByRole('region', { name: /waiting for approval/ })).not.toBeInTheDocument();
+    });
+    expect(h.calls.some(c => c.path === '/api/v1/actions/resume')).toBe(true);
+  });
+});
+
 describe('ClientsTab: changes for a group of hosts', () => {
   it('selects every host of the filter and changes their image in one request', async () => {
     const user = userEvent.setup();

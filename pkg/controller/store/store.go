@@ -25,9 +25,9 @@ type Store interface {
 	Stop() error
 
 	// RecordSync upserts the host from a verified certificate and its sync
-	// request, sets last_seen and replaces the host's rows in needs. The
-	// stored generation never goes down. A host that is new and reports a
-	// controller hold is created with the hold wanted.
+	// request, sets last_seen and replaces the host's rows in needs. A host
+	// that is new and reports a controller hold is created with the hold
+	// wanted.
 	RecordSync(ctx context.Context, sync *HostSync) (*SyncResult, error)
 	// GetHost returns one host or ErrNotFound.
 	GetHost(ctx context.Context, name string) (*fleet.Host, error)
@@ -78,6 +78,8 @@ type Store interface {
 	ListRollouts(ctx context.Context, filter RolloutFilter) ([]*fleet.Rollout, error)
 	// GetRollout returns one rollout or ErrNotFound.
 	GetRollout(ctx context.Context, id string) (*fleet.Rollout, error)
+	// AbortedKeys returns the keys of the aborted rollouts.
+	AbortedKeys(ctx context.Context) ([]string, error)
 	// ListLeases returns leases, newest first.
 	ListLeases(ctx context.Context, filter LeaseFilter) ([]*fleet.Lease, error)
 	// GetLease returns one lease or ErrNotFound.
@@ -245,17 +247,7 @@ type Changes struct {
 	Holds      []HostHold
 	Offline    []HostOffline
 	Broken     []HostBroken
-	// Pulls set or end the pull windows of hosts; a host that does not exist
-	// is passed over.
-	Pulls []HostPull
-	Audit []fleet.AuditEntry
-}
-
-// HostPull is the pull window of one host (fleet.Host.Pull) as it is from
-// now on; nil ends it.
-type HostPull struct {
-	Host   string
-	Window *fleet.PullWindow
+	Audit      []fleet.AuditEntry
 }
 
 // HostBroken is the broken marks of one host (fleet.Host.Broken) as they are
@@ -276,7 +268,7 @@ type HostHold struct {
 	Host   string
 	Wanted bool
 	Reason string
-	// By is fleet.Host.HoldBy: fleet.HoldByTeam for a hold set through a team
+	// By is fleet.Host.HoldBy: fleet.TeamHold for a hold set through a team
 	// feature, empty for every other writer. It is not kept for a hold that
 	// is lifted.
 	By string
@@ -288,5 +280,5 @@ type HostHold struct {
 func (c *Changes) Empty() bool {
 	return len(c.Rollouts) == 0 && len(c.Leases) == 0 &&
 		len(c.Directives) == 0 && len(c.Holds) == 0 && len(c.Offline) == 0 &&
-		len(c.Broken) == 0 && len(c.Pulls) == 0 && len(c.Audit) == 0
+		len(c.Broken) == 0 && len(c.Audit) == 0
 }

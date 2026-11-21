@@ -72,14 +72,14 @@ describe('HostDetailPanel, the containers of a client', () => {
     expect(screen.queryByRole('group', { name: 'Overrides of nginx' })).not.toBeInTheDocument();
   });
 
-  it('says where a host stands with the images its needs wait for', async () => {
+  it('says which image of a host could not be pulled, and why', async () => {
     const h = await createHarness({ mode: 'open' });
     renderWithApp(<Panel name="lighthouse-geth-4" />, h);
 
-    // One host pulls at a time: the one ahead of it in the queue has the window.
-    expect(await screen.findByText('waiting for a pull window')).toBeInTheDocument();
     const needs = (await screen.findByRole('heading', { name: /^Open needs/ })).closest('section') as HTMLElement;
-    expect(within(needs).getAllByText('not pulled')).toHaveLength(2);
+    const failed = within(needs).getAllByText('pull failed');
+    expect(failed).toHaveLength(2);
+    expect(failed[0]).toHaveAttribute('title', expect.stringMatching(/^image pull failed: toomanyrequests/));
   });
 
   it('lists no client section for a host without client containers', async () => {

@@ -136,6 +136,49 @@ func TestEndLeaseOfAVerifyingLease(t *testing.T) {
 	assert.Equal(t, reasonEndedByOperator, h.lease(lease).Error)
 }
 
+// A retried host whose ended lease did its step and whose need is gone is
+// not done by that: a recheck lease, which is not offered to the agent,
+// repeats the readiness check.
+func TestRetryAfterAnEndedLeaseRechecksReadiness(t *testing.T) {
+	h, lease := leasedFleet(t)
+	id := h.openRollouts()[0].ID
+
+	h.operation("a", lease, protocol.PhaseDone, true, protocol.StepDone)
+	h.sync("a", func(st *protocol.SyncRequest) { st.Needs = nil })
+	h.tick()
+
+	_, err := h.svc.EndLease(h.ctx, "alice", EndLeaseRequest{Lease: lease})
+	require.NoError(t, err)
+	h.tick()
+	require.Equal(t, fleet.RolloutHalted, h.rollout(id).State)
+	h.sync("a", func(st *protocol.SyncRequest) { st.Operation = nil })
+
+	_, err = h.svc.Retry(h.ctx, "alice", RolloutHostsRequest{Rollout: id, Hosts: []string{"a"}})
+	require.NoError(t, err)
+
+	m := h.rollout(id).Host("a")
+	require.Equal(t, fleet.HostLeased, m.State, "not done without the readiness check")
+
+	recheck := h.lease(m.LeaseID)
+	assert.True(t, recheck.Recheck)
+	assert.Equal(t, fleet.LeaseVerifying, recheck.State)
+	assert.Equal(t, h.lease(lease).Needs, recheck.Needs)
+	assert.Nil(t, h.assignment("a").Lease, "the agent is not offered a recheck")
+	assert.Equal(t, true, h.store.lastAuditOf("lease.granted").Detail["recheck"])
+
+	h.tick()
+	assert.Equal(t, fleet.HostLeased, h.rollout(id).Host("a").State)
+
+	for left := 2 * testEpoch; left > 0; left -= time.Minute {
+		h.advance(min(left, time.Minute))
+		h.tick()
+	}
+
+	assert.Equal(t, fleet.LeaseReleased, h.lease(recheck.ID).State)
+	assert.Equal(t, fleet.HostDone, h.rollout(id).Host("a").State)
+	assert.Equal(t, recheck.ID, h.rollout(id).Host("a").LeaseID)
+}
+
 // A lease that the agent has not started is no longer offered once it is
 // ended. However it goes on from there, it ends as failed and never as
 // expired: an expired lease would hand the host the same work at once.
@@ -227,51 +270,64 @@ func TestHoldIsIndependentOfAnEndedLease(t *testing.T) {
 	assert.NotNil(t, h.lease(lease).Cancelled)
 }
 
-// A rollout of an observed cause cannot be closed while hosts report the
-// cause. Aborting it pauses it: nothing more is granted, hosts that report
-// the cause later join and wait, and only a resume lifts it.
-func TestAbortPausesARolloutOfAnObservedCause(t *testing.T) {
+// An abort of a rollout of an observed cause is final: the waiting members
+// are aborted, an open lease finishes and settles its member, and the cause
+// is not opened again until it changes.
+func TestAbortClosesARolloutOfAnObservedCause(t *testing.T) {
 	h, lease := leasedFleet(t)
 	id := h.openRollouts()[0].ID
 
 	res, err := h.svc.Abort(h.ctx, "alice", ScopeRequest{Rollout: id, Reason: "bad build"})
 	require.NoError(t, err)
 	assert.Equal(t, id, res.Rollout)
+	assert.Contains(t, res.Message, "rollout aborted")
+
+	r := h.rollout(id)
+	assert.Equal(t, fleet.RolloutAborted, r.State)
+	assert.Equal(t, "bad build", r.Reason)
+	assert.Equal(t, fleet.HostLeased, r.Host("a").State)
+	assert.Equal(t, fleet.HostAborted, r.Host("b").State)
+	assert.Equal(t, fleet.LeaseGranted, h.lease(lease).State, "open leases finish")
+
+	h.addHost("late", 0, packagesNeed("2.0"))
+	h.finish("a")
+
+	assert.Equal(t, fleet.HostDone, h.rollout(id).Host("a").State, "the lease's outcome")
+	assert.Empty(t, h.openRollouts(), "the aborted cause is not opened again")
+
+	for _, name := range []string{"b", "late"} {
+		assert.Nil(t, h.assignment(name).Lease)
+	}
+
+	_, err = h.svc.Retry(h.ctx, "alice", RolloutHostsRequest{Rollout: id})
+	require.ErrorIs(t, err, ErrInvalidAction)
+	assert.Contains(t, err.Error(), "final")
+
+	// Another target is another cause.
+	h.reports("3.0", "b")
+	h.tick()
+
+	require.Len(t, h.openRollouts(), 1)
+	assert.NotNil(t, h.assignment("b").Lease)
+}
+
+// The reboot rollout's key does not change with its target: aborting it
+// pauses it until a resume.
+func TestAbortPausesTheRebootRollout(t *testing.T) {
+	h := newHarness(t)
+	h.addHost("a", 0, rebootNeed())
+	h.addHost("b", 0, rebootNeed())
+	h.tick()
+
+	id := h.openRollouts()[0].ID
+
+	res, err := h.svc.Abort(h.ctx, "alice", ScopeRequest{Rollout: id, Reason: "bad kernel"})
+	require.NoError(t, err)
 	assert.Contains(t, res.Message, "rollout paused")
 
 	r := h.rollout(id)
 	assert.Equal(t, fleet.RolloutActive, r.State)
-	assert.True(t, r.Paused)
-	assert.Equal(t, "aborted: bad build; resume to continue", r.PauseReason)
-	assert.Equal(t, fleet.LeaseGranted, h.lease(lease).State, "open leases finish")
-
-	entry := h.store.lastAuditOf("action.abort")
-	assert.Equal(t, map[string]any{keyPaused: false}, entry.Detail[keyBefore])
-	assert.Equal(t, map[string]any{keyPaused: true}, entry.Detail[keyAfter])
-
-	// The lease finishes. Nobody else is granted, a host that reports the
-	// cause only now included, and no second rollout opens for the cause.
-	h.addHost("late", 0, packagesNeed("2.0"))
-	h.finish("a")
-
-	assert.Len(t, h.openRollouts(), 1)
-	assert.Equal(t, fleet.HostPending, h.rollout(id).Host("late").State)
-
-	for _, name := range []string{"b", "late"} {
-		assert.Nil(t, h.assignment(name).Lease)
-		assert.Equal(t, "aborted: bad build; resume to continue", h.assignment(name).Queue.Reason)
-	}
-
-	// A retry lifts no pause.
-	_, err = h.svc.Retry(h.ctx, "alice", RolloutHostsRequest{Rollout: id})
-	require.ErrorIs(t, err, ErrInvalidAction)
-
-	_, err = h.svc.Resume(h.ctx, "alice", ScopeRequest{Rollout: id})
-	require.NoError(t, err)
-	h.tick()
-
-	assert.Empty(t, h.rollout(id).PauseReason)
-	assert.NotNil(t, h.assignment("b").Lease)
+	assert.Equal(t, "aborted: bad kernel; resume to continue", r.PauseReason)
 }
 
 // A manual rollout is closed by an abort: its unanswered directives are
@@ -294,6 +350,7 @@ func TestAbortClosesAManualRollout(t *testing.T) {
 
 	r := h.rollout(res.Rollout)
 	assert.Equal(t, fleet.RolloutAborted, r.State)
+	assert.Equal(t, map[string]fleet.HostState{"a": fleet.HostAborted, "b": fleet.HostAborted}, memberStates(r))
 	assert.Equal(t, "not today", r.Reason)
 	assert.NotNil(t, r.EndedAt)
 	assert.Empty(t, h.assignment("a").Directives)
@@ -483,26 +540,27 @@ func TestHoldRemembersWhoSetIt(t *testing.T) {
 		require.NoError(t, err)
 	}
 	by := func() string { return h.store.host("a").HoldBy }
+	teamHold := fleet.TeamHold([]string{"lighthouse"})
 
 	hold(asTeam(h.ctx), "ours")
 	assert.True(t, h.store.host("a").HoldWanted)
-	assert.Equal(t, fleet.HoldByTeam, by())
+	assert.Equal(t, teamHold, by())
 
 	entry := h.store.lastAuditOf("action.hold")
-	assert.Equal(t, map[string]any{keyHoldWanted: true, keyHoldReason: "ours", keyHoldBy: fleet.HoldByTeam},
+	assert.Equal(t, map[string]any{keyHoldWanted: true, keyHoldReason: "ours", keyHoldBy: teamHold},
 		entry.Detail[keyAfter])
 	assert.Equal(t, "team_hold", entry.Detail[keyAuthorizedBy])
 
 	// The team again: still the team's.
 	hold(asTeam(h.ctx), "ours, still")
-	assert.Equal(t, fleet.HoldByTeam, by())
+	assert.Equal(t, teamHold, by())
 
 	// Staff over it: staff's, and the entry says that it was a team's.
 	hold(asStaff(h.ctx), "staff")
 	assert.Empty(t, by())
 
 	entry = h.store.lastAuditOf("action.hold")
-	assert.Equal(t, map[string]any{keyHoldWanted: true, keyHoldReason: "ours, still", keyHoldBy: fleet.HoldByTeam},
+	assert.Equal(t, map[string]any{keyHoldWanted: true, keyHoldReason: "ours, still", keyHoldBy: teamHold},
 		entry.Detail[keyBefore])
 	assert.Equal(t, map[string]any{keyHoldWanted: true, keyHoldReason: "staff", keyHoldBy: holdByStaff},
 		entry.Detail[keyAfter])
@@ -547,7 +605,7 @@ func TestHoldRemembersWhoSetIt(t *testing.T) {
 	// The end of a lease leaves a team's hold what it is, and whose it is
 	// survives a restart, like the reason does.
 	hold(asTeam(h.ctx), "ours")
-	require.Equal(t, fleet.HoldByTeam, by())
+	require.Equal(t, teamHold, by())
 
 	lease := openLeaseOf(t, h, "a")
 	_, err = h.svc.EndLease(h.ctx, "bob", EndLeaseRequest{Lease: lease})
@@ -556,7 +614,35 @@ func TestHoldRemembersWhoSetIt(t *testing.T) {
 	h.restart()
 	h.tick()
 	assert.Equal(t, "ours", h.store.host("a").HoldReason)
-	assert.Equal(t, fleet.HoldByTeam, by())
+	assert.Equal(t, teamHold, by())
+}
+
+// A team lifts only a hold that one of its teams set; the hold records the
+// teams of the request that own a container of the host.
+func TestTeamLiftsOnlyItsOwnHold(t *testing.T) {
+	h := newHarness(t)
+	host := h.addHost("a", 0)
+	host.Status.Containers = []protocol.Container{
+		{Name: "geth", Managed: true, Owners: []string{"geth"}},
+		{Name: "beacon", Managed: true, Owners: []string{"lighthouse"}},
+	}
+	h.store.putHost(host)
+
+	as := func(teams ...string) context.Context {
+		return WithAuthorization(h.ctx, Authorization{By: "team_hold", Teams: teams})
+	}
+
+	_, err := h.svc.Hold(as("geth", "other"), "gina", HoldRequest{Hosts: []string{"a"}, Reason: "debug"})
+	require.NoError(t, err)
+	assert.Equal(t, "team:geth", h.store.host("a").HoldBy)
+
+	_, err = h.svc.Unhold(as("lighthouse"), "lena", HoldRequest{Hosts: []string{"a"}})
+	require.ErrorIs(t, err, ErrForbidden)
+	require.ErrorContains(t, err, "team_hold does not lift the hold on host a (set by team geth)")
+
+	_, err = h.svc.Unhold(as("geth"), "gus", HoldRequest{Hosts: []string{"a"}})
+	require.NoError(t, err)
+	assert.False(t, h.store.host("a").HoldWanted)
 }
 
 // TestUnholdOfAHostThatIsNotHeld changes nothing and writes no audit entry.
@@ -925,6 +1011,7 @@ func TestRebootAction(t *testing.T) {
 	require.NoError(t, err)
 
 	current.MaxUnavailablePercent = 100
+	current.MaxLeasedPercent = 100
 	require.NoError(t, replaceSettings(h.ctx, h.svc, "alice", current))
 
 	res, err := h.svc.Reboot(h.ctx, "alice", RebootRequest{All: true, Staggered: true, Reason: "kernel"})

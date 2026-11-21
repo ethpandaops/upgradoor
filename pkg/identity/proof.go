@@ -184,7 +184,7 @@ type verifiedCert struct {
 }
 
 // maxVerifiedCerts bounds the certificate cache; it is emptied when full.
-// A fleet presents one certificate per host, a rotation briefly two.
+// A fleet presents one certificate per host.
 const maxVerifiedCerts = 8192
 
 // VerifierOption configures a Verifier.

@@ -92,20 +92,35 @@ func ids(needs []protocol.Need) []string {
 	return out
 }
 
-// A need whose image is not local yet names it in Unpulled.
-func TestNeedsSayWhatTheyWaitFor(t *testing.T) {
+// pullFailed makes the view say that a lease could not pull any checked image.
+func pullFailed(v *View) {
+	for key, rc := range v.Checks {
+		rc.Pulled, rc.PullFailed, rc.Error = false, true, "pull: registry is down"
+		v.Checks[key] = rc
+	}
+}
+
+// A need whose image a lease could not pull says why, for its digest only.
+func TestNeedsSayWhyTheirPullFailed(t *testing.T) {
 	p := needsPolicy(protocol.VerbRoll)
 	v := observed(p)
 
+	notPulled(v)
+
 	got := Needs(p, v, nil)
 	require.Len(t, got, 1)
-	assert.Empty(t, got[0].Unpulled, "the image is local")
+	assert.Empty(t, got[0].PullError, "not local is not a failure")
 
-	notPulled(v)
+	pullFailed(v)
 
 	got = Needs(p, v, nil)
 	require.Len(t, got, 1)
-	assert.Equal(t, []protocol.PullImage{{Ref: "ethpandaops/geth:master", Digest: "sha256:b"}}, got[0].Unpulled)
+	assert.Equal(t, "pull: registry is down", got[0].PullError)
+
+	rc := v.Checks["docker.io/ethpandaops/geth:master"]
+	rc.Digest = "sha256:other"
+	v.Checks["docker.io/ethpandaops/geth:master"] = rc
+	assert.Empty(t, Needs(p, v, nil)[0].PullError, "the failure was of another digest")
 }
 
 func TestNeeds(t *testing.T) {
@@ -241,7 +256,6 @@ func TestNeedsOfTargets(t *testing.T) {
 		Image: "ethpandaops/geth:v2", FromImage: "ethpandaops/geth:master", FromDigest: "sha256:a",
 		ToDigest: "sha256:v2", Flags: true,
 	}, n.Spec)
-	assert.Equal(t, []protocol.PullImage{{Ref: "ethpandaops/geth:v2", Digest: "sha256:v2"}}, n.Unpulled)
 
 	// An override.
 	files := known()
@@ -261,7 +275,6 @@ func TestNeedsOfTargets(t *testing.T) {
 		Container: "geth", Image: "ethpandaops/geth:fix", FromImage: "ethpandaops/geth:master",
 		FromDigest: "sha256:a", ToDigest: "sha256:f",
 	}, got[0].Override)
-	assert.Empty(t, got[0].Unpulled)
 }
 
 func TestReconcileManualNeeds(t *testing.T) {
@@ -381,6 +394,17 @@ func TestReconcileManualNeeds(t *testing.T) {
 	})
 }
 
+func TestWithdrawn(t *testing.T) {
+	manual := []protocol.Need{
+		{ID: "manual/a", Kind: protocol.NeedReboot, DirectiveID: "a"},
+		{ID: "local/b", Kind: protocol.NeedImage, Local: true},
+	}
+
+	assert.Equal(t, []string{"manual/a"}, Withdrawn(manual, "a"))
+	assert.Empty(t, Withdrawn(manual, "c"))
+	assert.Empty(t, Withdrawn(manual, ""), "a local need has no directive to withdraw it")
+}
+
 // A request is good for one attempt: done and failed steps served it.
 func TestServed(t *testing.T) {
 	assert.Nil(t, Served(nil))
@@ -399,7 +423,7 @@ func TestCloneNeeds(t *testing.T) {
 	assert.Nil(t, CloneNeeds(nil))
 
 	in := []protocol.Need{
-		{ID: "a", Image: &protocol.ImageNeed{Container: "geth"}, Unpulled: []protocol.PullImage{{Ref: "r"}}},
+		{ID: "a", Image: &protocol.ImageNeed{Container: "geth"}},
 		{ID: "b", Reboot: &protocol.RebootNeed{Reasons: []string{"flag"}}},
 		{ID: "c", Packages: &protocol.PackagesNeed{Packages: []protocol.PackageChange{{Name: "docker-ce"}}}},
 	}
@@ -407,12 +431,10 @@ func TestCloneNeeds(t *testing.T) {
 	require.Equal(t, in, out)
 
 	out[0].Image.Container = "changed"
-	out[0].Unpulled[0].Ref = "changed"
 	out[1].Reboot.Reasons[0] = "changed"
 	out[2].Packages.Packages[0].Name = "changed"
 
 	assert.Equal(t, "geth", in[0].Image.Container)
-	assert.Equal(t, "r", in[0].Unpulled[0].Ref)
 	assert.Equal(t, "flag", in[1].Reboot.Reasons[0])
 	assert.Equal(t, "docker-ce", in[2].Packages.Packages[0].Name)
 }

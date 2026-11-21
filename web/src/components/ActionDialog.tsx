@@ -73,8 +73,8 @@ type ActionIntentKind =
       danger?: boolean;
       /** leaseHost is the host of the lease an end-lease call is about; the permission to end it follows the host. */
       leaseHost?: string;
-      /** rolloutState is the state of the rollout a retry is about: retrying an aborted one is no recovery of hosts. */
-      rolloutState?: string;
+      /** rolloutClient is the client of the rollout a pause or resume is about ("" for none): its team may approve it. */
+      rolloutClient?: string;
     };
 
 /** The intents this dialog confirms itself; an override has its own. */
@@ -212,7 +212,7 @@ function PlainActionDialog({
   const verdict = permissions.can(
     call,
     intent.kind === 'call' ? intent.leaseHost : undefined,
-    intent.kind === 'call' ? intent.rolloutState : undefined
+    intent.kind === 'call' ? intent.rolloutClient : undefined
   );
   const adminHint = permissions.admin ? '' : ` Needs ${permissions.login.service}:admin.`;
 

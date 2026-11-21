@@ -11,6 +11,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
+	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
@@ -49,8 +50,10 @@ type Options struct {
 
 	Store     Store
 	Scheduler scheduler.Service
-	Beacon    views.Beacon
-	Views     *views.Views
+	// Lookups looks the hosts' tags up at the registries; nil without them.
+	Lookups Lookups
+	Beacon  views.Beacon
+	Views   *views.Views
 	// DefaultSettings are the settings from flags, shown next to the
 	// effective ones.
 	DefaultSettings fleet.Settings
@@ -59,6 +62,11 @@ type Options struct {
 	Notify func()
 	// Now is the clock.
 	Now func() time.Time
+}
+
+// Lookups is the part of discovery.Tracker the user routes use.
+type Lookups interface {
+	Refresh() discovery.Refreshed
 }
 
 // Handler serves the user routes and the public REST views.
@@ -80,7 +88,7 @@ func New(log logrus.FieldLogger, opts Options) *Handler {
 		opts:  opts,
 		now:   opts.Now,
 		views: opts.Views,
-		authz: authz.New(log.WithField("package", "authz"), opts.AuthService, opts.Store),
+		authz: authz.New(log.WithField("package", "authz"), opts.AuthService, opts.Store, opts.Now),
 		users: newUserAuth(opts.AuthProviderURL, opts.AuthService, opts.Now),
 	}
 }
@@ -116,6 +124,8 @@ func (s *Handler) Routes() []Route {
 		{Method: http.MethodGet, Pattern: "/api/v1/clients", User: s.handleClients},
 		{Method: http.MethodGet, Pattern: "/api/v1/clients/{client}/hosts", User: s.handleClientHosts},
 		{Method: http.MethodGet, Pattern: "/api/v1/packages", User: s.handlePackages},
+		{Method: http.MethodGet, Pattern: "/api/v1/images", User: s.handleImages},
+		{Method: http.MethodPost, Pattern: "/api/v1/images/refresh", User: s.handleRefreshImages},
 		{Method: http.MethodGet, Pattern: "/api/v1/rollouts", User: s.handleRollouts},
 		{Method: http.MethodGet, Pattern: "/api/v1/plan", User: s.handlePlan},
 		{Method: http.MethodGet, Pattern: "/api/v1/settings", User: s.handleGetSettings},

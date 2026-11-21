@@ -2,8 +2,8 @@
 //
 //   - a group rollout in progress (lighthouse's consensus group): the canary
 //     and a host without validators are done, one host is verifying, the
-//     rest waits: one with the new image pulled, one pulling it and one
-//     waiting for a pull window (one host pulls at a time);
+//     rest waits, one of them to pull the new image again after a failed
+//     pull;
 //   - a halted group rollout (nethermind's execution group) with a failed
 //     host, which is broken for the group;
 //   - a reboot rollout that waits for approval (policy manual);
@@ -120,8 +120,8 @@ interface HostSpec {
   overrides?: Record<string, Omit<ContainerOverride, 'until'> & { until?: number }>;
   /** fixed: the agent configuration lets the controller override nothing on this host. */
   fixed?: boolean;
-  /** unpulled: the images the host's image needs wait for are not on the host yet. */
-  unpulled?: boolean;
+  /** pullFailed: the last lease could not pull the images of the host's image needs. */
+  pullFailed?: boolean;
 }
 
 function pair(cl: string, el: string, count: number): HostSpec[] {
@@ -156,8 +156,8 @@ function specs(): HostSpec[] {
   };
 
   patch('lighthouse-geth-3', { behind: [LIGHTHOUSE_IMAGE] });
-  patch('lighthouse-geth-4', { behind: [LIGHTHOUSE_IMAGE], unpulled: true });
-  patch('lighthouse-nethermind-1', { behind: [LIGHTHOUSE_IMAGE, NETHERMIND_IMAGE], unpulled: true });
+  patch('lighthouse-geth-4', { behind: [LIGHTHOUSE_IMAGE], pullFailed: true });
+  patch('lighthouse-nethermind-1', { behind: [LIGHTHOUSE_IMAGE, NETHERMIND_IMAGE] });
   patch('bootnode-1', { behind: [LIGHTHOUSE_IMAGE] });
   patch('nimbus-nethermind-1', { failedEL: true });
   patch('nimbus-nethermind-2', { behind: [NETHERMIND_IMAGE] });
@@ -329,6 +329,7 @@ export interface MockData {
 export function defaultSettings(): Settings {
   return {
     maxUnavailablePercent: 10,
+    maxLeasedPercent: 10,
     maxIndependentPercent: 10,
     minParticipationPercent: 90,
     maxFinalityLagEpochs: 3,
@@ -347,7 +348,6 @@ export function defaultSettings(): Settings {
     pauseAfterCanaryReboot: false,
     readyPeerShare: 0,
     lookupInterval: '5m0s',
-    maxPullingPercent: 10,
     paused: false,
   };
 }
@@ -448,12 +448,14 @@ function unmanaged(host: string, name: string, image: string, at: (s: number) =>
   };
 }
 
-function imageNeed(c: Container, unpulled = false): Need {
+const PULL_ERROR = 'toomanyrequests: You have reached your unauthenticated pull rate limit';
+
+function imageNeed(c: Container, pullFailed = false): Need {
   const to = currentDigest(c.image);
   return {
     id: `image/${c.name}/${to}`,
     kind: 'image',
-    ...(unpulled ? { unpulled: [{ ref: c.image, digest: to }] } : {}),
+    ...(pullFailed ? { pullError: PULL_ERROR } : {}),
     image: {
       container: c.name,
       group: c.group,
@@ -570,8 +572,9 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
     for (const c of containers) {
       if (c.managed && c.configuredImage && c.image !== c.configuredImage) needs.push(specNeed(c));
       else if (c.managed && c.digest !== c.registry?.digest) {
-        needs.push(imageNeed(c, spec.unpulled));
-        if (spec.unpulled && c.registry) c.registry.pulled = false;
+        needs.push(imageNeed(c, spec.pullFailed));
+        if (spec.pullFailed && c.registry)
+          Object.assign(c.registry, { pulled: false, pullFailed: true, error: PULL_ERROR });
       }
     }
     if (spec.reboot) needs.push({ id: 'reboot', kind: 'reboot', reboot: { reasons: ['flag', 'kernel'] } });
@@ -697,7 +700,6 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
     plan: { slot: 'idle', weight: 0, live: 0, liveKnown: false },
 
     certHash: hex(`cert/${spec.name}`),
-    generation: spec.name === 'prysm-geth-2' ? 1 : 0,
     firstSeen: at(19 * 86400 + (hash(`first/${spec.name}`) % 3600)),
     remoteAddr: `203.0.113.${10 + index}`,
     // One host has lost its marker file: the controller keeps counting the range it last knew.
@@ -1189,8 +1191,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     });
   }
   log(11 * 86400, 'agent:prysm-geth-2', 'host.certificate-changed', 'prysm-geth-2', {
-    before: { certHash: hex('cert/prysm-geth-2/old'), generation: 0 },
-    after: { certHash: hex('cert/prysm-geth-2'), generation: 1 },
+    before: { certHash: hex('cert/prysm-geth-2/old') },
+    after: { certHash: hex('cert/prysm-geth-2') },
   });
   log(6 * 86400, 'bob@example.org', 'settings.update', 'settings', {
     before: { ...defaults, maxUnavailablePercent: 5, readyEpochs: 2 },
@@ -1289,12 +1291,10 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     quiet: fleet === 'quiet',
     audit,
     // One client has an image policy of its own; no rollout of it is open.
-    // One host of the two dozen pulls at a time.
     settings: {
       ...defaults,
       pauseAfterCanaryImage: true,
       readyPeerShare: 0.25,
-      maxPullingPercent: 5,
       policyClients: { besu: 'manual' },
     },
     defaults,

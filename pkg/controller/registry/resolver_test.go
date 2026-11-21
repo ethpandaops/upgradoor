@@ -19,6 +19,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/upgradoor/pkg/registryauth"
 )
 
 const (
@@ -309,8 +311,10 @@ func testLogger() logrus.FieldLogger {
 }
 
 // buildResolver builds a resolver for cfg and logins.
-func buildResolver(t *testing.T, cfg Config, logins Logins) *resolver {
+func buildResolver(t *testing.T, cfg Config, logins registryauth.Logins) *resolver {
 	t.Helper()
+
+	cfg.AllowPrivate = true
 
 	r, err := NewResolver(testLogger(), &cfg, logins)
 	require.NoError(t, err)
@@ -322,7 +326,7 @@ func buildResolver(t *testing.T, cfg Config, logins Logins) *resolver {
 }
 
 // newResolver builds a resolver that talks plain http to the fake registry.
-func newResolver(t *testing.T, f *fakeRegistry, logins Logins) *resolver {
+func newResolver(t *testing.T, f *fakeRegistry, logins registryauth.Logins) *resolver {
 	t.Helper()
 
 	return buildResolver(t, Config{PlainHTTP: []string{f.host()}}, logins)
@@ -338,10 +342,10 @@ func writeAuthFile(t *testing.T, content string) string {
 }
 
 // loginFor is the login of one registry, from "user:password".
-func loginFor(host, userPass string) Logins {
+func loginFor(host, userPass string) registryauth.Logins {
 	user, pass, _ := strings.Cut(userPass, ":")
 
-	return Logins{host: {Username: user, Password: pass}}
+	return registryauth.Logins{host: {Username: user, Password: pass}}
 }
 
 func TestResolveIsOneHead(t *testing.T) {
@@ -573,7 +577,7 @@ func TestResolveDockerHub(t *testing.T) {
 
 	for _, key := range []string{"https://index.docker.io/v1/", "docker.io", "registry-1.docker.io", "INDEX.docker.io"} {
 		t.Run(key, func(t *testing.T) {
-			logins, err := LoadLogins(testLogger(), writeAuthFile(t,
+			logins, err := registryauth.LoadLogins(testLogger(), writeAuthFile(t,
 				`{"auths":{"`+key+`":{"auth":"`+base64.StdEncoding.EncodeToString([]byte(testBasic))+`"}}}`))
 			require.NoError(t, err)
 
@@ -718,4 +722,26 @@ func TestCredentialsNeverCrossARedirect(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, f.indexDigest, digest)
 	require.Equal(t, 0, f.unauthorized)
+}
+
+func TestPublicOnly(t *testing.T) {
+	for _, address := range []string{
+		"127.0.0.1:443", "[::1]:443", "10.1.2.3:443", "172.16.0.1:5000", "192.168.1.1:443",
+		"169.254.169.254:80", "100.64.0.1:443", "[fd00::1]:443", "[fe80::1]:443",
+		"[::ffff:10.0.0.1]:443", "0.0.0.0:443", "224.0.0.1:443", "not-an-address",
+	} {
+		require.Error(t, publicOnly("tcp", address, nil), address)
+	}
+
+	for _, address := range []string{"1.1.1.1:443", "[2606:4700::1111]:443"} {
+		require.NoError(t, publicOnly("tcp", address, nil), address)
+	}
+
+	f := newFakeRegistry(t, false)
+
+	r, err := NewResolver(testLogger(), &Config{PlainHTTP: []string{f.host()}}, nil)
+	require.NoError(t, err)
+
+	_, err = r.Resolve(t.Context(), f.host()+"/ethpandaops/geth:latest")
+	require.ErrorIs(t, err, errPrivateAddress)
 }

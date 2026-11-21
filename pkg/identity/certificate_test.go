@@ -23,14 +23,14 @@ func TestCertificateEncoding(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, `{"alg":"ML-DSA-44","typ":"JWT"}`, string(header))
 
-	host, err := DeriveHostKey([]byte(testSeed), "net", "host-1", 0)
+	host, err := DeriveHostKey([]byte(testSeed), "net", "host-1")
 	require.NoError(t, err)
 
 	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
 	require.NoError(t, err)
 	assert.Equal(t, `{"iss":"upgradoor-signer","net":"net","sub":"host-1",`+
 		`"cnf":{"jwk":{"kty":"AKP","alg":"ML-DSA-44","pub":"`+EncodePublicKey(PublicKey(host))+`"}},`+
-		`"gen":0,"roles":["a","b"]}`, string(payload))
+		`"roles":["a","b"]}`, string(payload))
 
 	noRoles, err := IssueCertificate([]byte(testSeed), CertificateSpec{
 		Network: "net", Hostname: "host-1",
@@ -39,5 +39,5 @@ func TestCertificateEncoding(t *testing.T) {
 
 	payload, err = base64.RawURLEncoding.DecodeString(strings.Split(noRoles, ".")[1])
 	require.NoError(t, err)
-	assert.True(t, strings.HasSuffix(string(payload), `"gen":0,"roles":[]}`))
+	assert.True(t, strings.HasSuffix(string(payload), `"roles":[]}`))
 }

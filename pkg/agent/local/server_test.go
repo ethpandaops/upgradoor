@@ -59,6 +59,15 @@ func (f *fakeAgent) InitOverrides(user string) (string, error) {
 	return "/home/devops/overrides.yaml", f.record("init " + user)
 }
 
+func (f *fakeAgent) Deploy(_ context.Context, user string, req *DeployRequest) (*DeployResult, error) {
+	if err := f.record(fmt.Sprintf("deploy %s %s %s %q reset=%t",
+		user, req.Container, req.Image, req.Command, req.Reset)); err != nil {
+		return nil, err
+	}
+
+	return &DeployResult{Container: req.Container, Roll: DeployRollNone, Ignore: []string{}, Pull: true}, nil
+}
+
 // maxSocketPath is the longest path a unix socket address holds.
 const maxSocketPath = 107
 
@@ -258,4 +267,51 @@ func TestServerStopAfterFailedStart(t *testing.T) {
 	srv := NewServer(quiet(), cfg, &fakeAgent{})
 	require.Error(t, srv.Start(t.Context()))
 	require.NoError(t, srv.Stop())
+}
+
+// Only the deployer's uid (root) may deploy; anyone else in the group is refused.
+func TestServerDeploy(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		deployer int
+		status   int
+	}{
+		{"another user", os.Getuid() + 1, http.StatusForbidden},
+		{"the deployer", os.Getuid(), http.StatusOK},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			agent := &fakeAgent{}
+			cfg := &Config{EntryUser: "nobody-here"}
+			cfg.Socket.Path = socketPath(t)
+
+			srv, ok := NewServer(quiet(), cfg, agent).(*server)
+			require.True(t, ok)
+
+			srv.deployer = tc.deployer
+			require.NoError(t, srv.Start(t.Context()))
+			t.Cleanup(func() { _ = srv.Stop() })
+
+			body := `{"container":"geth","image":"a/b:c","command":["--x"],"reset":true}`
+			assert.Equal(t, tc.status, post(t, cfg.Socket.Path, PathDeploy, body))
+
+			res, err := NewClient(cfg.Socket.Path).Deploy(t.Context(), &DeployRequest{Container: "geth", Image: "a/b:c"})
+			if tc.status != http.StatusOK {
+				require.EqualError(t, err, "deploy is for root only")
+				assert.Empty(t, agent.calls)
+
+				return
+			}
+
+			require.NoError(t, err)
+			assert.Equal(t, DeployResult{Container: "geth", Roll: DeployRollNone, Ignore: []string{}, Pull: true}, *res)
+
+			me, err := user.Current()
+			require.NoError(t, err)
+
+			assert.Equal(t, []string{
+				"deploy local:" + me.Username + ` geth a/b:c ["--x"] reset=true`,
+				"deploy local:" + me.Username + " geth a/b:c [] reset=false",
+			}, agent.calls)
+		})
+	}
 }

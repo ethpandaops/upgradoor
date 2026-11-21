@@ -1,5 +1,5 @@
 {
- "version": "295c746b8efc",
+ "version": "658d817e61d2",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -520,11 +520,6 @@
     "n": "reason",
     "t": "r",
     "omit": true
-   },
-   {
-    "n": "pull",
-    "t": "s",
-    "omit": true
    }
   ],
   "HostSlotParticipation": [
@@ -717,6 +712,11 @@
     "t": "o",
     "of": "LeaseCancel",
     "omit": true
+   },
+   {
+    "n": "recheck",
+    "t": "b",
+    "omit": true
    }
   ],
   "LeaseCancel": [
@@ -758,9 +758,8 @@
     "omit": true
    },
    {
-    "n": "unpulled",
-    "t": "a",
-    "of": "PullImage",
+    "n": "pullError",
+    "t": "s",
     "omit": true
    },
    {
@@ -1075,16 +1074,6 @@
     "omit": true
    }
   ],
-  "PullImage": [
-   {
-    "n": "ref",
-    "t": "s"
-   },
-   {
-    "n": "digest",
-    "t": "r"
-   }
-  ],
   "QueueEntry": [
    {
     "n": "host",
@@ -1146,6 +1135,11 @@
    {
     "n": "pulled",
     "t": "b"
+   },
+   {
+    "n": "pullFailed",
+    "t": "b",
+    "omit": true
    }
   ],
   "Rollout": [
@@ -1319,6 +1313,10 @@
     "t": "n"
    },
    {
+    "n": "maxLeasedPercent",
+    "t": "n"
+   },
+   {
     "n": "maxIndependentPercent",
     "t": "n"
    },
@@ -1389,10 +1387,6 @@
    {
     "n": "lookupInterval",
     "t": "j"
-   },
-   {
-    "n": "maxPullingPercent",
-    "t": "n"
    },
    {
     "n": "paused",
@@ -1667,10 +1661,6 @@
    {
     "n": "certHash",
     "t": "s"
-   },
-   {
-    "n": "generation",
-    "t": "n"
    },
    {
     "n": "firstSeen",

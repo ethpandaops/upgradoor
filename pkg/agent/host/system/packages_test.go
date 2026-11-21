@@ -346,6 +346,35 @@ func TestUpgradePackages(t *testing.T) {
 	assert.Equal(t, protocol.Pending{Upgradable: 6, Security: 5}, status.Pending)
 }
 
+// The upgrade command runs in place of apt-get, to its end, with the names.
+func TestUpgradePackagesCommand(t *testing.T) {
+	const upgrade = "exec /usr/bin/sudo -n /usr/local/lib/upgradoor/upgrade-packages containerd.io docker-ce-cli"
+
+	sys, runner, _ := newCaptureSystem(t, dockerBlocked)
+	sys.commands.UpgradePackages = []string{"/usr/bin/sudo", "-n", "/usr/local/lib/upgradoor/upgrade-packages"}
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+
+	runner.mu.Lock()
+	runner.hook = func(hookCtx context.Context, key string) {
+		if key == upgrade {
+			cancel()
+			assert.NoError(t, hookCtx.Err(), "the command is not interrupted")
+		}
+	}
+	runner.mu.Unlock()
+
+	runner.set(upgrade, []byte("1 upgraded.\n"), nil)
+
+	require.NoError(t, sys.UpgradePackages(ctx, []string{"docker-ce-cli", "containerd.io"}))
+	assert.Equal(t, []string{keyDpkgQuery, upgrade}, runner.recorded()[:2])
+	assert.Zero(t, runner.count(keyUpdate))
+
+	err := sys.UpgradePackages(t.Context(), []string{"bash"})
+	require.ErrorIs(t, err, errPackageNotAllowed)
+}
+
 // Names of packages that are not installed never reach apt, which reads them as regular expressions.
 func TestUpgradePackagesNotInstalled(t *testing.T) {
 	t.Run("only not installed: apt does not run", func(t *testing.T) {

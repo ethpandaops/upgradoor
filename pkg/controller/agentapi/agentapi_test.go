@@ -3,7 +3,6 @@ package agentapi
 import (
 	"bytes"
 	"context"
-	"crypto/mldsa"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -91,7 +90,7 @@ func TestAgentAuthentication(t *testing.T) {
 	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed), controllertest.Network)
 	require.NoError(t, err)
 
-	hostKey, err := identity.DeriveHostKey([]byte(controllertest.Seed), controllertest.Network, "lighthouse-geth-1", 0)
+	hostKey, err := identity.DeriveHostKey([]byte(controllertest.Seed), controllertest.Network, "lighthouse-geth-1")
 	require.NoError(t, err)
 
 	wrongNetCert, err := identity.SignCertificate(signer, identity.PublicKey(hostKey),
@@ -707,7 +706,7 @@ func TestSyncResponseAssembly(t *testing.T) {
 		f.Assignments[agent.Name] = &scheduler.Assignment{
 			Lease: lease,
 			Directives: []protocol.Directive{
-				{ID: "d-1", Kind: protocol.DirectiveRecheck},
+				{ID: "d-1", Kind: protocol.DirectiveReboot},
 				{ID: "d-2", Kind: protocol.DirectiveRoll, Container: "geth", Reason: "manual"},
 			},
 			Queue: &protocol.Queue{Position: 3, Reason: "budget 8% of 10%"},
@@ -818,21 +817,20 @@ func TestSyncAuditsIdentity(t *testing.T) {
 		h.agentPost(agent, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
 	require.Len(t, h.store.AuditEntries(), 1)
 
-	// A rotated key: accepted, and audited with both hashes.
-	rotated := controllertest.NewAgent(t, identity.CertificateSpec{
-		Hostname:   "lighthouse-geth-1",
-		Generation: 1,
-		Roles:      []string{"ethereum_node"},
+	// Another certificate of the host: accepted, and audited with both hashes.
+	reissued := controllertest.NewAgent(t, identity.CertificateSpec{
+		Hostname: "lighthouse-geth-1",
+		Roles:    []string{"ethereum_node", "mev_relay"},
 	})
 
 	require.Equal(t, http.StatusOK,
-		h.agentPost(rotated, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
+		h.agentPost(reissued, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
 
 	audit = h.store.AuditEntries()
 	require.Len(t, audit, 2)
 
 	changed := audit[1]
-	secondHash := identity.CertificateHash(rotated.Creds.Certificate())
+	secondHash := identity.CertificateHash(reissued.Creds.Certificate())
 
 	assert.Equal(t, "host.certificate-changed", changed.Action)
 	assert.Equal(t, "agent:lighthouse-geth-1", changed.Actor)
@@ -841,189 +839,7 @@ func TestSyncAuditsIdentity(t *testing.T) {
 	assert.Equal(t, map[string]any{"certHash": secondHash}, changed.Detail["after"])
 	assert.NotEqual(t, firstHash, secondHash)
 	assert.Equal(t, secondHash, h.store.Host("lighthouse-geth-1").CertHash)
-}
-
-// Rotating a host key means issuing the next generation. Once the controller
-// has accepted it, the certificates of older generations are refused, on both
-// endpoints, although the signer signed them.
-func TestOlderCertificateGenerationIsRejected(t *testing.T) {
-	const wantErr = "certificate generation 0 is older than generation 1 already seen for this host"
-
-	h := newHarness(t, nil)
-	leaked := controllertest.ValidatorAgent(t, 0)
-	rotated := controllertest.ValidatorAgent(t, 1)
-
-	inv := controllertest.InventoryFor(t, protocol.Package{Name: "openssl", Version: "3.5.1-1", Arch: "amd64"})
-
-	// Before the rotation the generation 0 key is the host's key.
-	require.Equal(t, http.StatusOK,
-		h.agentPost(leaked, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
-	require.Equal(t, http.StatusOK,
-		h.agentPost(leaked, protocol.PathInventory, inv, controllertest.CallOpts{}).Code)
-
-	// The rotated host syncs: accepted and audited as a changed certificate.
-	require.Equal(t, http.StatusOK,
-		h.agentPost(rotated, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
-	require.Equal(t, uint64(1), h.store.Host("lighthouse-geth-1").Generation)
-
-	before := *h.store.Host("lighthouse-geth-1")
-	auditBefore := len(h.store.AuditEntries())
-
-	// Whoever holds the old key is refused, and nothing of the request is
-	// recorded.
-	stolen := controllertest.SyncRequest()
-	stolen.AgentVersion = "evil"
-	stolen.Hold.Controller = true
-
-	h.clock.Advance(time.Minute)
-
-	rec := h.agentPost(leaked, protocol.PathSync, stolen, controllertest.CallOpts{})
-	require.Equal(t, http.StatusUnauthorized, rec.Code, rec.Body.String())
-	assert.Equal(t, wantErr, controllertest.DecodeJSON[protocol.ErrorResponse](t, rec).Error)
-	assert.Equal(t, before, *h.store.Host("lighthouse-geth-1"), "the host row is untouched")
-
-	evil := controllertest.InventoryFor(t, protocol.Package{Name: "evil", Version: "6.6.6", Arch: "amd64"})
-
-	rec = h.agentPost(leaked, protocol.PathInventory, evil, controllertest.CallOpts{Gzip: true})
-	require.Equal(t, http.StatusUnauthorized, rec.Code, rec.Body.String())
-	assert.Equal(t, wantErr, controllertest.DecodeJSON[protocol.ErrorResponse](t, rec).Error)
-
-	stored, err := h.store.GetInventory(t.Context(), "lighthouse-geth-1")
-	require.NoError(t, err)
-	assert.Equal(t, inv.Hash, stored.Hash, "the inventory is untouched")
-
-	// One audit entry for both rejections.
-	audit := h.store.AuditEntries()
-	require.Len(t, audit, auditBefore+1)
-
-	rejected := audit[len(audit)-1]
-	assert.Equal(t, "host.certificate-rejected", rejected.Action)
-	assert.Equal(t, "agent:lighthouse-geth-1", rejected.Actor)
-	assert.Equal(t, "lighthouse-geth-1", rejected.Target)
-	assert.Equal(t, uint64(0), rejected.Detail["generation"])
-	assert.Equal(t, uint64(1), rejected.Detail["seenGeneration"])
-	assert.Equal(t, identity.CertificateHash(leaked.Creds.Certificate()), rejected.Detail["certHash"])
-
-	// Counted like every other answer.
-	body := h.get("/metrics").Body.String()
-	assert.Contains(t, body, `upgradoor_agent_requests_total{code="401",endpoint="sync"} 1`+"\n")
-	assert.Contains(t, body, `upgradoor_agent_requests_total{code="401",endpoint="inventory"} 1`+"\n")
-
-	// The rotated host is not affected.
-	require.Equal(t, http.StatusOK,
-		h.agentPost(rotated, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
-	require.Equal(t, http.StatusOK,
-		h.agentPost(rotated, protocol.PathInventory, inv, controllertest.CallOpts{}).Code)
-}
-
-// The floor is not a pin: any certificate of the current or a higher
-// generation that the signer issued is accepted.
-func TestGenerationFloorIsNotAPin(t *testing.T) {
-	h := newHarness(t, nil)
-
-	require.Equal(t, http.StatusOK,
-		h.agentPost(controllertest.ValidatorAgent(t, 1), protocol.PathSync, controllertest.SyncRequest(),
-			controllertest.CallOpts{}).Code)
-
-	first := h.store.Host("lighthouse-geth-1").CertHash
-
-	// The same generation, another certificate (the host got another role):
-	// accepted, audited as changed.
-	reissued := controllertest.NewAgent(t, identity.CertificateSpec{
-		Hostname:   "lighthouse-geth-1",
-		Generation: 1,
-		Roles:      []string{"ethereum_node", "mev_relay"},
-	})
-
-	require.Equal(t, http.StatusOK,
-		h.agentPost(reissued, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
-
-	host := h.store.Host("lighthouse-geth-1")
-	assert.NotEqual(t, first, host.CertHash)
-	assert.Equal(t, uint64(1), host.Generation)
-	assert.Equal(t, []string{"ethereum_node", "mev_relay"}, host.Roles)
-
-	// A jump over a generation is accepted too, and raises the floor.
-	require.Equal(t, http.StatusOK,
-		h.agentPost(controllertest.ValidatorAgent(t, 4), protocol.PathSync, controllertest.SyncRequest(),
-			controllertest.CallOpts{}).Code)
-	assert.Equal(t, uint64(4), h.store.Host("lighthouse-geth-1").Generation)
-
-	rec := h.agentPost(reissued, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{})
-	requireAgentError(t, rec, http.StatusUnauthorized,
-		"certificate generation 1 is older than generation 4 already seen for this host")
-
-	// Another host is not concerned by this host's generation.
-	other := controllertest.NewAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1"})
-
-	require.Equal(t, http.StatusOK,
-		h.agentPost(other, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
-
-	actions := make([]string, 0, 5)
-	for _, e := range h.store.AuditEntries() {
-		actions = append(actions, e.Action)
-	}
-
-	assert.Equal(t, []string{
-		"host.registered", "host.certificate-changed", "host.certificate-changed",
-		"host.certificate-rejected", "host.registered",
-	}, actions)
-}
-
-// An agent that keeps trying with an old key must not flood the audit log:
-// one entry per host and hour.
-func TestRejectedGenerationAuditIsRateLimited(t *testing.T) {
-	h := newHarness(t, nil)
-	old := controllertest.ValidatorAgent(t, 0)
-	otherOld := controllertest.NewAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1"})
-
-	require.Equal(t, http.StatusOK,
-		h.agentPost(controllertest.ValidatorAgent(t, 2), protocol.PathSync, controllertest.SyncRequest(),
-			controllertest.CallOpts{}).Code)
-	require.Equal(t, http.StatusOK,
-		h.agentPost(controllertest.NewAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1", Generation: 1}),
-			protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
-
-	rejections := func() map[string]int {
-		out := make(map[string]int, 2)
-
-		for _, e := range h.store.AuditEntries() {
-			if e.Action == "host.certificate-rejected" {
-				out[e.Target]++
-			}
-		}
-
-		return out
-	}
-
-	attempt := func(agent *controllertest.Agent) {
-		t.Helper()
-
-		h.clock.Advance(time.Second)
-		require.Equal(t, http.StatusUnauthorized,
-			h.agentPost(agent, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
-	}
-
-	for range 20 {
-		attempt(old)
-	}
-
-	assert.Equal(t, map[string]int{"lighthouse-geth-1": 1}, rejections())
-
-	// The limit is per host.
-	attempt(otherOld)
-	attempt(otherOld)
-	assert.Equal(t, map[string]int{"lighthouse-geth-1": 1, "prysm-besu-1": 1}, rejections())
-
-	// Just short of an hour after the first entry: still quiet.
-	h.clock.Advance(generationAuditInterval - 30*time.Second)
-	attempt(old)
-	assert.Equal(t, 1, rejections()["lighthouse-geth-1"])
-
-	h.clock.Advance(time.Minute)
-	attempt(old)
-	attempt(old)
-	assert.Equal(t, 2, rejections()["lighthouse-geth-1"])
+	assert.Equal(t, []string{"ethereum_node", "mev_relay"}, h.store.Host("lighthouse-geth-1").Roles)
 }
 
 // A host that the controller sees for the first time and that reports a
@@ -1097,10 +913,9 @@ func TestSyncAuditsIdentityAfterClientWentAway(t *testing.T) {
 	require.Equal(t, http.StatusOK,
 		h.agentPost(agent, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
 
-	rotated := controllertest.NewAgent(t, identity.CertificateSpec{
-		Hostname:   "lighthouse-geth-1",
-		Generation: 1,
-		Roles:      []string{"ethereum_node"},
+	reissued := controllertest.NewAgent(t, identity.CertificateSpec{
+		Hostname: "lighthouse-geth-1",
+		Roles:    []string{"ethereum_node", "mev_relay"},
 	})
 
 	body, err := json.Marshal(controllertest.SyncRequest())
@@ -1109,14 +924,14 @@ func TestSyncAuditsIdentityAfterClientWentAway(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	cancel()
 
-	req := h.agentRequest(rotated, protocol.PathSync, body, controllertest.CallOpts{})
+	req := h.agentRequest(reissued, protocol.PathSync, body, controllertest.CallOpts{})
 	h.serve(req.WithContext(ctx))
 
 	audit := h.store.AuditEntries()
 	require.Len(t, audit, 2)
 	assert.Equal(t, "host.certificate-changed", audit[1].Action)
 	assert.Equal(t,
-		map[string]any{"certHash": identity.CertificateHash(rotated.Creds.Certificate())},
+		map[string]any{"certHash": identity.CertificateHash(reissued.Creds.Certificate())},
 		audit[1].Detail["after"])
 }
 
@@ -1289,7 +1104,7 @@ func signedCall(
 }
 
 func TestAgentAnswersAreSigned(t *testing.T) {
-	key, err := identity.DeriveControllerKey([]byte("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"), controllertest.Network, 0)
+	key, err := identity.DeriveControllerKey([]byte("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"), controllertest.Network)
 	require.NoError(t, err)
 
 	signer, err := identity.NewAnswerSigner(key, controllertest.Network)
@@ -1298,8 +1113,7 @@ func TestAgentAnswersAreSigned(t *testing.T) {
 	verifierFor := func(t *testing.T, host string) *identity.AnswerVerifier {
 		t.Helper()
 
-		v, verr := identity.NewAnswerVerifier(
-			[]*mldsa.PublicKey{identity.PublicKey(key)}, controllertest.Network, host)
+		v, verr := identity.NewAnswerVerifier(identity.PublicKey(key), controllertest.Network, host)
 		require.NoError(t, verr)
 
 		return v
@@ -1561,4 +1375,28 @@ func TestDuplicateContainerNames(t *testing.T) {
 	// The view shows what was stored.
 	detail := h.detail(controllertest.HostMixed)
 	require.Len(t, detail.Containers, 2)
+}
+
+func TestSyncAnswersTheDigestsOfTheHostsTags(t *testing.T) {
+	h := newHarness(t, nil)
+	agent := validatorAgent(t)
+
+	want := protocol.TagDigest{Ref: "ethpandaops/geth:master", Digest: "sha256:new", CheckedAt: controllertest.Epoch}
+	h.lookups.Digests = map[string]protocol.TagDigest{want.Ref: want}
+
+	h.sched.Set(func(f *controllertest.Scheduler) {
+		f.Assignments[agent.Name] = &scheduler.Assignment{LookupInterval: 7 * time.Minute}
+	})
+
+	req := controllertest.ValidatorSyncRequest()
+	req.Tags = []string{want.Ref, "ethpandaops/lighthouse:unstable"}
+
+	rec := h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	resp := controllertest.DecodeJSON[protocol.SyncResponse](t, rec)
+	require.Len(t, resp.Digests, 1)
+	assert.Equal(t, want.Digest, resp.Digests[0].Digest)
+	assert.Equal(t, req.Tags, h.lookups.Listed[agent.Name])
+	assert.Equal(t, 7*time.Minute, h.lookups.Interval)
 }

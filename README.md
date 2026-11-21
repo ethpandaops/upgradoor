@@ -5,9 +5,10 @@ hosts of an ethpandaops devnet. One controller per devnet, one small agent per
 host.
 
 - The **agent** runs on every host. It watches the Docker containers, the
-  registries, the package state and the reboot flag, and reports them. It
-  restarts nothing by itself.
-- The **controller** runs in the devnet's service cluster. It groups what the
+  package state and the reboot flag, and reports them. It restarts nothing
+  by itself.
+- The **controller** runs in the devnet's service cluster. It looks up where
+  the image tags of the hosts point, groups what the
   hosts need into rollouts and hands out slots ("leases") a few hosts at a
   time, only while the network is healthy, and stops when a host fails.
 
@@ -36,10 +37,11 @@ one place to see which host runs what.
  ┌───────────────────────────┐              ┌──────────────────────────────┐
  │ upgradoor agent (systemd) │  HTTPS poll  │ upgradoor-controller run     │
  │  - docker socket          │ ───────────> │  - scheduler / leases        │
- │  - registry checks        │  cert+proof  │  - SQLite on a PVC           │
+ │  - image pulls            │  cert+proof  │  - SQLite on a PVC           │
  │  - apt / kernel / reboot  │ <─────────── │  - beacon liveness + gate    │
- │  - local EL/CL probes     │ signed lease │  - API + embedded web UI     │
- └───────────────────────────┘  + directives └──────────────────────────────┘
+ │  - local EL/CL probes     │ signed lease │  - registry lookups          │
+ └───────────────────────────┘  + directives │  - API + embedded web UI     │
+                                             └──────────────────────────────┘
                                                  ▲                ▲
                                    in-cluster beacon node   authenticatoor JWKS
 ```
@@ -69,7 +71,7 @@ one place to see which host runs what.
 - **One secret in the cluster: the controller seed.** It is one entry per
   devnet group in the cluster's secrets file, mounted into the controller as
   a file. The controller derives its signing key from it at start, for its
-  own network and a generation; nothing is generated at run time and nothing
+  own network; nothing is generated at run time and nothing
   has to be fetched from a running controller. Everything else the controller
   holds is public: the signer public key for agents, the authenticatoor's
   public keys for users. Whoever holds the controller seed of a group can
@@ -148,9 +150,11 @@ runs it nightly and on pull requests labelled `e2e`).
 ## Quick start for local development
 
 This runs a controller and three agents against **fake hosts**, plus a fake
-beacon node. `test/fakeagent` runs the agent on an in-memory host described by
-a scenario file. It does not talk to Docker, apt or systemd and touches nothing
-on the machine.
+beacon node and a fake registry. `test/fakeagent` runs the agent on an
+in-memory host described by a scenario file. It does not talk to Docker, apt
+or systemd and touches nothing on the machine. `test/fakeregistry` answers
+the controller's tag lookups from the same scenario files, so the images are
+named under its address.
 
 Run everything from the repository root. All files go to `.tmp/dev`, which is
 ignored by git.
@@ -170,6 +174,10 @@ bin/upgradoor-controller keygen signer-pubkey --network dev > .tmp/dev/signer.pu
 controller_pub=$(bin/upgradoor-controller keygen controller-pubkey --network dev \
     --controller-seed-file .tmp/dev/controller.seed)
 
+# The fake registry's address, and digests for the images.
+reg=127.0.0.1:5050
+digest() { printf 'sha256:%064d' "$1"; }
+
 for h in node-1 node-2 bootnode-1; do
   mkdir -p .tmp/dev/$h
   role=ethereum_node; [ $h = bootnode-1 ] && role=bootnode
@@ -183,7 +191,7 @@ for h in node-1 node-2 bootnode-1; do
 controller:
   url: http://127.0.0.1:8080
   allowInsecure: true
-  publicKeys: ["$controller_pub"]
+  publicKey: "$controller_pub"
   syncInterval: 5s
 keyFile: .tmp/dev/$h/host.key
 certFile: .tmp/dev/$h/host.crt
@@ -195,8 +203,6 @@ groups:
   execution: {client: geth, owners: [geth], overrides: [image, flags], stopTimeout: 5s}
   consensus: {client: lighthouse, owners: [lighthouse], overrides: [image], stopTimeout: 5s}
   proxy: {stopTimeout: 5s}
-registry:
-  pollInterval: 10s
 packages:
   blocked: [docker-ce]
 verify:
@@ -209,15 +215,15 @@ os: {id: debian, versionId: "13", prettyName: Debian GNU/Linux 13, arch: amd64}
 runningKernel: 6.12.41-amd64
 newestKernel: 6.12.41-amd64
 containers:
-  - {name: geth, image: "ethpandaops/geth:master", digest: "sha256:aaa", command: ["--http", "--maxpeers=50"],
+  - {name: geth, image: "$reg/ethpandaops/geth:master", digest: "$(digest 1)", command: ["--http", "--maxpeers=50"],
      group: execution, kind: el}
-  - {name: beacon, image: "sigp/lighthouse:latest", digest: "sha256:bbb", command: ["bn", "--http"],
+  - {name: beacon, image: "$reg/sigp/lighthouse:latest", digest: "$(digest 2)", command: ["bn", "--http"],
      group: consensus, kind: cl}
-  - {name: validator, image: "sigp/lighthouse:latest", digest: "sha256:bbb", command: ["vc"],
+  - {name: validator, image: "$reg/sigp/lighthouse:latest", digest: "$(digest 2)", command: ["vc"],
      group: consensus, kind: vc}
-  - {name: nginx, image: "nginx:stable", digest: "sha256:ccc", group: proxy, kind: other}
+  - {name: nginx, image: "$reg/nginx:stable", digest: "$(digest 3)", group: proxy, kind: other}
 registry:
-  "ethpandaops/geth:fix": {digest: "sha256:fff", revision: f1f1f1}
+  "$reg/ethpandaops/geth:fix": {digest: "$(digest 9)"}
 packages:
   blocked: [docker-ce]
   installed:
@@ -235,33 +241,42 @@ go run ./test/e2e/fakebeacon --listen 127.0.0.1:5052
 ```
 
 ```sh
+# The tags of the fake hosts: the three scenarios hold the same.
+go run ./test/fakeregistry --listen 127.0.0.1:5050 --scenario .tmp/dev/node-1/host.yaml
+```
+
+```sh
+# The registry is on a loopback address and speaks plain http; a real
+# controller needs neither of the two registry flags.
 bin/upgradoor-controller run \
     --listen 127.0.0.1:8080 --data-dir .tmp/dev/data \
     --network dev --signer-public-key "$(cat .tmp/dev/signer.pub)" \
     --controller-seed-file .tmp/dev/controller.seed \
     --allow-insecure-agent-http \
+    --registry-plain-http 127.0.0.1:5050 --registry-allow-private \
+    --default-setting lookupInterval=30s \
     --beacon-endpoint http://127.0.0.1:5052
 ```
 
 ```sh
 go run ./test/fakeagent --config .tmp/dev/node-1/agent.yaml --scenario .tmp/dev/node-1/host.yaml \
-    --control 127.0.0.1:7771
+    --registry 127.0.0.1:5050 --control 127.0.0.1:7771
 ```
 
 ```sh
 go run ./test/fakeagent --config .tmp/dev/node-2/agent.yaml --scenario .tmp/dev/node-2/host.yaml \
-    --control 127.0.0.1:7772
+    --registry 127.0.0.1:5050 --control 127.0.0.1:7772
 ```
 
 ```sh
 go run ./test/fakeagent --config .tmp/dev/bootnode-1/agent.yaml --scenario .tmp/dev/bootnode-1/host.yaml \
-    --control 127.0.0.1:7773
+    --registry 127.0.0.1:5050 --control 127.0.0.1:7773
 ```
 
 `allowInsecure` and `--allow-insecure-agent-http` only permit plain http on
 the loopback interface. The answers are signed and verified as in production:
 an agent started against a controller with another controller key (another
-controller seed, or `--controller-generation 1`) logs
+controller seed) logs
 `refused the controller's answer` and does nothing. (The opt-outs
 `--allow-unsigned-agent-answers` and `controller.allowUnsignedAnswers` exist
 for development without keys; the quick start does not need them.)
@@ -272,28 +287,25 @@ permissions, run the auth stub and start the controller with
 `--auth-provider-url http://127.0.0.1:18099`; `--services` and `--teams` of
 the stub choose who the login button logs in.
 
-Make something happen through the fake hosts' control endpoints:
+Make something happen through the fake registry and a fake host's control
+endpoint:
 
 ```sh
-# The lighthouse tag moves to a new digest on all three hosts.
-for p in 7771 7772 7773; do
-  curl -s -X POST -d '{"ref":"sigp/lighthouse:latest","digest":"sha256:ccc","revision":"1a2b3c"}' \
-      http://127.0.0.1:$p/registry > /dev/null
-done
+# The lighthouse tag moves to a new digest.
+curl -s -X POST -d "{\"ref\":\"sigp/lighthouse:latest\",\"digest\":\"$(printf 'sha256:%064d' 4)\"}" \
+    http://127.0.0.1:5050/tags
 
 # A reboot becomes necessary on node-1.
 curl -s -X POST -d '{"required":true}' http://127.0.0.1:7771/reboot-required > /dev/null
 ```
 
-What to expect within the lookup interval (5 minutes by default; start the
-controller with `--default-setting lookupInterval=1m` to see it sooner):
+What to expect within the lookup interval (30 seconds here, 5 minutes by
+default):
 
-- One host looks the tag up (the agent logs `tag points at a new digest`);
-  the controller tells the other two in their sync answers.
-- The hosts pull the new image one at a time, each in a pull window (the
-  host status says waiting for a pull window, pulling, pulled).
-- A group rollout of `consensus` opens: one lease per host recreates the
-  beacon node and the validator client together. One host goes first as the canary (none of the
+- The controller looks the tag up (it logs `tag points at a new digest`) and
+  tells the three hosts in their sync answers.
+- A group rollout of `consensus` opens: one lease per host pulls the new
+  image and then recreates the beacon node and the validator client together. One host goes first as the canary (none of the
   fake hosts has validators, so it is the first host that reports the new
   digest, or the first of those by name); when
   it is ready the other two follow one after the other (the host limit is 1
@@ -303,7 +315,7 @@ controller with `--default-setting lookupInterval=1m` to see it sooner):
 
 Overrides and the on-host commands work on the fake hosts too. The **Clients**
 tab lists the hosts per client; "Image…" on a geth row sets an image override
-(`ethpandaops/geth:fix` is in the fake registry; the group `execution` allows
+(`127.0.0.1:5050/ethpandaops/geth:fix` is in the fake registry; the group `execution` allows
 image overrides), which the agent writes into the host's `overrides.yaml` and
 applies under a lease. On the "node", the same through the agent's socket:
 

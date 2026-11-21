@@ -146,6 +146,10 @@ func TestRollsFollowEnds(t *testing.T) {
 	}{
 		{protocol.Step{Status: protocol.StepFailed, Error: "boom"}, protocol.PhaseFailed, RollFailed, "boom"},
 		{protocol.Step{Status: protocol.StepRefused, Error: "hold"}, protocol.PhaseDone, RollRejected, "hold"},
+		{
+			protocol.Step{Status: protocol.StepDeferred, Error: "pull x: timeout"}, protocol.PhaseDone,
+			RollQueued, "not begun, it is tried again: pull x: timeout",
+		},
 		{protocol.Step{Status: protocol.StepCancelled, Error: "c"}, protocol.PhaseDone, RollSuperseded, "c"},
 		{protocol.Step{Status: protocol.StepPending}, protocol.PhaseFailed, RollFailed, "op"},
 	} {

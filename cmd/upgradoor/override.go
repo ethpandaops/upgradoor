@@ -118,7 +118,7 @@ func newInitOverridesCmd() *cobra.Command {
 		Short: "Write the generated block of the overrides file (where Ansible does not)",
 		Long: "Writes the block at the top of the overrides file: the how-to, these commands\n" +
 			"and what the agent's configuration deploys on this host. Entries below the\n" +
-			"block are kept. The Ansible role writes the same block on every run.",
+			"block are kept. Ansible writes the same block with upgradoor deploy.",
 		Args: cobra.NoArgs,
 	}
 

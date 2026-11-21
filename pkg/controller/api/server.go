@@ -19,6 +19,7 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/agentapi"
 	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
+	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
 	"github.com/ethpandaops/upgradoor/pkg/controller/metrics"
@@ -123,6 +124,8 @@ type Options struct {
 	Store     Store
 	Scheduler scheduler.Service
 	Beacon    Beacon
+	// Lookups says what the tags of the hosts point at.
+	Lookups discovery.Tracker
 	// DefaultSettings are the settings from flags, shown next to the
 	// effective ones.
 	DefaultSettings fleet.Settings
@@ -233,10 +236,12 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		Verifier: opts.Verifier, PublicURLs: publicURLs,
 		AllowInsecureAgentHTTP: opts.AllowInsecureAgentHTTP, AnswerSigner: opts.AnswerSigner,
 		TrustForwardedHeaders: opts.TrustForwardedHeaders,
-		Store:                 opts.Store, Scheduler: opts.Scheduler, Metrics: collector,
-		Notify: s.Notify, Now: opts.Now,
+		Store:                 opts.Store, Scheduler: opts.Scheduler, Lookups: opts.Lookups,
+		Metrics: collector,
+		Notify:  s.Notify, Now: opts.Now,
 	})
 	s.users = userapi.New(s.log, userapi.Options{
+		Lookups: opts.Lookups,
 		Network: opts.Network, Version: opts.Version,
 		AuthProviderURL: opts.AuthProviderURL, AuthService: opts.AuthService,
 		Store: opts.Store, Scheduler: opts.Scheduler, Beacon: opts.Beacon, Views: s.views,

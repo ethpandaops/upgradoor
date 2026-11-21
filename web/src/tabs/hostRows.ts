@@ -11,7 +11,6 @@ import {
   type QueueEntry,
 } from '../api/types';
 import type { SortDirection, Tone } from '../components/primitives';
-import { pullLabel } from '../components/status';
 
 export interface HostRow {
   name: string;
@@ -79,6 +78,8 @@ export function hostState(row: HostRow): { tone: Tone; label: string; detail?: s
       return { tone: 'danger', label: 'failed', detail: s.plan.reason };
     case 'held':
       return { tone: 'warning', label: 'held', detail: s.plan.reason === 'held' ? undefined : s.plan.reason };
+    case 'offline':
+      return { tone: 'warning', label: 'offline', detail: s.offline?.reason };
     case 'stale':
       return { tone: 'warning', label: 'silent', detail: 'the agent stopped syncing' };
     case 'queued':
@@ -111,7 +112,6 @@ export function matchesFilter(row: HostRow, filter: string): boolean {
     ...(row.summary ? hostOwners(row.summary) : []),
     row.summary ? (hostState(row)?.label ?? 'up to date') : undefined,
     row.summary?.plan.reason,
-    row.summary?.plan.pull ? pullLabel(row.summary.plan.pull) : undefined,
     row.summary?.hold.local ? 'local hold' : undefined,
     row.updatePending ? 'pending' : undefined,
   ]

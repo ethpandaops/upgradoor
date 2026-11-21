@@ -14,19 +14,18 @@ import (
 )
 
 // directives is the loop's memory of the controller's directives: the IDs
-// the last answer repeated, and the rolls waiting for their lookup (in
+// the last answer repeated, and the rolls waiting for their tag's digest (in
 // memory only; the controller repeats a roll directive after a restart).
 type directives struct {
 	repeated []string
 	pending  map[string]pendingRoll
 }
 
-// pendingRoll is a roll waiting for the lookup of its tag.
+// pendingRoll is a roll waiting for the digest of its tag.
 type pendingRoll struct {
 	container string
 	// ref is the tag the container ran when the roll was asked.
-	ref    string
-	ticket uint64
+	ref string
 	// local: requested on the host; the controller cannot drop it.
 	local bool
 }
@@ -75,7 +74,7 @@ func (a *agent) handleDirectives(list []protocol.Directive, view *plan.View) boo
 }
 
 // applyDirective carries out one new directive and reports whether it is
-// answered now. A roll waits for its lookup; a hold whose write failed is
+// answered now. A roll is answered by resolveRolls; a hold whose write failed is
 // tried again with the next answer.
 func (a *agent) applyDirective(d *protocol.Directive, view *plan.View) bool {
 	log := a.log.WithFields(logrus.Fields{"directive": d.ID, "kind": d.Kind})
@@ -94,8 +93,6 @@ func (a *agent) applyDirective(d *protocol.Directive, view *plan.View) bool {
 	case protocol.DirectiveReleaseHold:
 		err = a.files.SetHold(plan.FromController, nil, "controller", "released")
 		a.refreshHold(view)
-	case protocol.DirectiveRecheck:
-		a.tracker.Recheck()
 	case protocol.DirectiveReboot:
 		n, why := plan.ManualReboot(&a.cfg.Policy, view, d.ID)
 		if reject = why; why == "" {
@@ -103,14 +100,20 @@ func (a *agent) applyDirective(d *protocol.Directive, view *plan.View) bool {
 		}
 	case protocol.DirectiveRoll:
 		if reject = a.startRoll(d.ID, d.Container, view, false); reject == "" {
-			log.WithField("container", d.Container).
-				Info("manual roll requested: checking the registry and pulling the image")
+			log.WithField("container", d.Container).Info("manual roll requested")
 			a.auditDirective(d, "")
 
 			return false
 		}
 	case protocol.DirectiveOverride:
 		reject = a.overrideDirective(d, view)
+	case protocol.DirectiveWithdraw:
+		if ids := plan.Withdrawn(a.state.Manual(), d.Withdraws); len(ids) > 0 {
+			if err = a.state.ReconcileManual(nil, ids); err == nil {
+				log.WithFields(logrus.Fields{"needs": ids, "withdraws": d.Withdraws}).
+					Info("manual need withdrawn by the controller")
+			}
+		}
 	default:
 		reject = fmt.Sprintf("unknown directive kind %q", d.Kind)
 	}
@@ -161,16 +164,14 @@ func (a *agent) overrideDirective(d *protocol.Directive, view *plan.View) string
 	return ""
 }
 
-// startRoll refuses a roll (plan.RollRefusal) or asks the tracker for a
-// fresh lookup of the container's tag and keeps the roll pending.
+// startRoll refuses a roll (plan.RollRefusal) or keeps it pending.
 func (a *agent) startRoll(id, container string, view *plan.View, isLocal bool) string {
 	if reason := plan.RollRefusal(&a.cfg.Policy, view, container); reason != "" {
 		return reason
 	}
 
-	ref := view.Container(container).Image
 	a.directives.pending[id] = pendingRoll{
-		container: container, ref: ref, ticket: a.tracker.Request(ref), local: isLocal,
+		container: container, ref: view.Container(container).Image, local: isLocal,
 	}
 
 	return ""
@@ -191,19 +192,12 @@ func (a *agent) takeLocalRolls(view *plan.View) {
 // need or a rejection.
 func (a *agent) resolveRolls(view *plan.View) {
 	for id, p := range a.directives.pending {
-		var answer *protocol.RegistryCheck
-
-		check, done, gone := a.tracker.Answered(p.ref, p.ticket)
-		if done {
-			answer = &check
-		}
-
 		needID := protocol.ManualNeedID(id)
 		if p.local {
 			needID = protocol.LocalNeedID(id)
 		}
 
-		need, reject := plan.RollNeed(&a.cfg.Policy, view, p.container, p.ref, needID, answer, gone)
+		need, reject := plan.RollNeed(&a.cfg.Policy, view, p.container, p.ref, needID)
 		if need == nil && reject == "" {
 			continue
 		}

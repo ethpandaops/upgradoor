@@ -15,6 +15,8 @@
 //	GET  /api/v1/hosts                 user     -> Hosts
 //	GET  /api/v1/hosts/{name}          user     -> HostDetail
 //	GET  /api/v1/packages?q=&limit=    user     -> Packages
+//	GET  /api/v1/images?q=&limit=      user     -> Images
+//	POST /api/v1/images/refresh        user     {} -> ImagesRefresh
 //	GET  /api/v1/rollouts?limit=       user     -> Rollouts
 //	GET  /api/v1/plan                  user     -> scheduler.Plan
 //	GET  /api/v1/settings              user     -> SettingsBody
@@ -134,9 +136,10 @@ type HostSummary struct {
 	// HoldReason is the reason of the controller hold (HoldWanted), as the
 	// person gave it. It is for the authenticated views only.
 	HoldReason string `json:"holdReason,omitempty"`
-	// HoldBy says who set the controller hold: "team" for a hold set through
-	// a team feature, which a team feature may lift again, "staff" for every
-	// other hold. Absent when the host is not held.
+	// HoldBy says who set the controller hold: "team:<teams>" for a hold that
+	// these teams set through a team feature, which a team feature of one of
+	// them may lift again, "staff" for every other hold. Absent when the host
+	// is not held.
 	HoldBy string `json:"holdBy,omitempty"`
 	// Offline is the host's known-offline mark while it is in force: its
 	// validators are left out of the gate and the budget, and it gets no
@@ -216,7 +219,6 @@ type HostDetail struct {
 	HostSummary
 
 	CertHash   string    `json:"certHash"`
-	Generation uint64    `json:"generation"`
 	FirstSeen  time.Time `json:"firstSeen"`
 	RemoteAddr string    `json:"remoteAddr"`
 	// ValidatorStart and ValidatorEnd are the [start, end) range counted for

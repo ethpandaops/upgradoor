@@ -67,10 +67,6 @@ describe('the groups of the settings page', () => {
       expect(fieldSpec(kind.canary).kind).toBe('switch');
     }
     expect(GROUPS.filter(g => g.kinds)).toHaveLength(1);
-
-    // The groups that stand side by side have the same number of lines, so their cards line up.
-    const lines = GROUPS.filter(g => !g.wide).map(g => g.keys.length);
-    expect(new Set(lines).size).toBe(1);
   });
 
   it('find the setting a message of the controller is about', () => {

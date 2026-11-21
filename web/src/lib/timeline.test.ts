@@ -11,7 +11,7 @@ describe('wait kinds', () => {
   it('tells the waits that clear by themselves from the others', () => {
     expect(clearsByItself('budget')).toBe(true);
     expect(clearsByItself('order')).toBe(true);
-    // The scheduler grants pull windows by itself.
+    // The agent lets a failed pull be tried again by itself.
     expect(clearsByItself('pull')).toBe(true);
     expect(clearsByItself('gate')).toBe(false);
     expect(clearsByItself('approval')).toBe(false);

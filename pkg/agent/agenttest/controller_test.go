@@ -3,7 +3,6 @@ package agenttest
 import (
 	"bytes"
 	"compress/gzip"
-	"crypto/mldsa"
 	"encoding/json"
 	"io"
 	"net/http"
@@ -19,7 +18,7 @@ import (
 
 // post sends body to the controller as an agent does (gzip, certificate,
 // proof) and returns the status and the answer as verified with the
-// controller key of generation 0 (nil unless 200).
+// controller key (nil unless 200).
 func post(t *testing.T, c *Controller, path string, body any) (int, []byte) {
 	t.Helper()
 
@@ -57,10 +56,10 @@ func post(t *testing.T, c *Controller, path string, body any) (int, []byte) {
 		return resp.StatusCode, nil
 	}
 
-	key, err := identity.DecodePublicKey(ControllerPublicKey(t, 0))
+	key, err := identity.DecodePublicKey(ControllerPublicKey(t))
 	require.NoError(t, err)
 
-	verifier, err := identity.NewAnswerVerifier([]*mldsa.PublicKey{key}, Network, HostName)
+	verifier, err := identity.NewAnswerVerifier(key, Network, HostName)
 	require.NoError(t, err)
 
 	answer, err = verifier.Verify(id, answer)

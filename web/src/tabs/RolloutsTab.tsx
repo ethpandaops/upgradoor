@@ -216,6 +216,7 @@ const PIP: Record<RolloutHost['state'], string> = {
   pending: 'bg-border-strong',
   expected: 'bg-border',
   skipped: 'bg-border',
+  aborted: 'bg-border',
 };
 
 /** HostPips draws one mark per host of a rollout, in serving order, coloured by its state. */
@@ -344,7 +345,7 @@ export function RolloutCard({
               icon="check"
               label="Approve…"
               onAction={onAction}
-              intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id)}
+              intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.client)}
             />
           )}
           {r.paused ? (
@@ -352,14 +353,14 @@ export function RolloutCard({
               icon="resume"
               label="Resume…"
               onAction={onAction}
-              intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id)}
+              intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.client)}
             />
           ) : (
             <IntentAction
               icon="pause"
               label="Pause…"
               onAction={onAction}
-              intent={scopeIntent('pause', `Pause rollout: ${r.title}`, r.id)}
+              intent={scopeIntent('pause', `Pause rollout: ${r.title}`, r.id, r.client)}
             />
           )}
           {(r.state === 'halted' || failed.length > 0) && (
@@ -472,7 +473,7 @@ export function RolloutCard({
                       icon="retry"
                       label={`Retry ${h.host} in ${r.title}`}
                       onAction={onAction}
-                      intent={hostsIntent('retry', `Retry ${h.host}`, r.id, [h.host], r.state)}
+                      intent={hostsIntent('retry', `Retry ${h.host}`, r.id, [h.host])}
                     />
                   )}
                 </span>

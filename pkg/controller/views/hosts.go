@@ -35,7 +35,6 @@ func (v *Views) HostDetail(ctx context.Context, name string) (*HostDetail, error
 		HostSummary: Summarize(host, v.opts.Scheduler.Plan(), v.now(),
 			settings.HostStaleAfter.Std()),
 		CertHash:   host.CertHash,
-		Generation: host.Generation,
 		FirstSeen:  host.FirstSeen,
 		RemoteAddr: host.RemoteAddr,
 	}
@@ -166,15 +165,17 @@ func offlineMark(host *fleet.Host, now time.Time) *fleet.OfflineMark {
 	return host.Offline
 }
 
-// HoldBy says for the host views who set the controller hold: "team" for a
-// hold set through a team feature, "staff" for every other hold, nothing for
-// a host that is not held.
+// HoldBy says for the host views who set the controller hold: "team:<teams>"
+// for a hold set through a team feature, "staff" for every other hold,
+// nothing for a host that is not held.
 func HoldBy(host *fleet.Host) string {
+	_, team := fleet.HoldTeams(host.HoldBy)
+
 	switch {
 	case !host.HoldWanted:
 		return ""
-	case host.HoldBy == fleet.HoldByTeam:
-		return fleet.HoldByTeam
+	case team:
+		return host.HoldBy
 	default:
 		return authz.HoldByStaff
 	}

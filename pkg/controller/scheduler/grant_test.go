@@ -327,6 +327,7 @@ func TestBudgetZeroMaxUnavailable(t *testing.T) {
 func TestHostsThatCostNothingPassAFullBudget(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 50
+	b.w.Settings.MaxLeasedPercent = 50
 	b.w.Settings.MinParticipationPercent = 50
 	b.host("sick", 100)
 	b.live(b.w.Health.LivenessEpoch, "sick", 60) // 40 of 200 down by themselves
@@ -348,7 +349,7 @@ func TestHostsThatCostNothingPassAFullBudget(t *testing.T) {
 
 func TestHostLimitBoundsHostsWithoutValidators(t *testing.T) {
 	b := newWorldBuilder(t)
-	b.w.Settings.MaxUnavailablePercent = 25
+	b.w.Settings.MaxLeasedPercent = 25
 
 	for _, h := range []string{"t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8"} {
 		b.host(h, 0)
@@ -366,6 +367,48 @@ func TestHostLimitBoundsHostsWithoutValidators(t *testing.T) {
 	assert.Equal(t, 1, out.Plan.Queue[0].Position)
 	assert.Equal(t, "t4", out.Plan.Queue[0].Host)
 	assert.Equal(t, WaitHostLimit, out.Plan.Queue[0].Wait)
+}
+
+// The host limit and the validator budget are separate settings: either one
+// alone stops the rest of a rollout.
+func TestHostLimitAndBudgetAreIndependent(t *testing.T) {
+	for _, tt := range []struct {
+		name        string
+		unavailable float64
+		leased      float64
+		wantLeased  []string
+		wantMax     int
+		wantReason  string
+	}{
+		{
+			name: "host limit", unavailable: 100, leased: 25,
+			wantLeased: []string{"h2", "h3"}, wantMax: 2, wantReason: "host limit 2 of 2",
+		},
+		{
+			name: "budget", unavailable: 25, leased: 100,
+			wantLeased: []string{"h2", "h3"}, wantMax: 8, wantReason: "budget 25% of 25%",
+		},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			b := newWorldBuilder(t)
+			b.w.Settings.MaxUnavailablePercent = tt.unavailable
+			b.w.Settings.MaxLeasedPercent = tt.leased
+
+			for _, h := range []string{"h1", "h2", "h3", "h4", "h5", "h6", "h7", "h8"} {
+				b.host(h, 10)
+				b.wants(h, packagesNeed("2.0"))
+			}
+
+			b.step()
+			require.Equal(t, []string{"h1"}, b.leasedHosts(), "the canary")
+			b.serve("h1")
+
+			out := b.step()
+			assert.Equal(t, tt.wantLeased, b.leasedHosts())
+			assert.Equal(t, tt.wantMax, out.Plan.Budget.MaxLeasedHosts)
+			assert.Equal(t, tt.wantReason, queueReasons(out.Plan)["h4"])
+		})
+	}
 }
 
 // Every reason a host can wait for has a wait kind: a client that sorts the
@@ -699,6 +742,13 @@ func TestWaitingReasons(t *testing.T) {
 			},
 			want: "verb not allowed by the agent",
 		},
+		{
+			name: "failed pull",
+			setup: func(b *worldBuilder) {
+				b.get("h").Status.Needs[0].PullError = "manifest unknown"
+			},
+			want: "waiting to pull its image again after a failed pull",
+		},
 	}
 
 	for _, tt := range tests {
@@ -857,6 +907,7 @@ func TestUnknownLivenessKeepsTheGateClosed(t *testing.T) {
 func TestForceRollout(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 100
+	b.w.Settings.MaxLeasedPercent = 100
 	b.host("boot", 5, "bootnode")
 	b.host("val", 10)
 	b.host("tool", 0)
@@ -1043,7 +1094,7 @@ func TestKnownOfflineHost(t *testing.T) {
 	assert.Equal(t, 1, out.Plan.Budget.OfflineHosts)
 	assert.Equal(t, uint64(50), out.Plan.Budget.OfflineWeight)
 	assert.Equal(t, []string{"a"}, b.leasedHosts(), "the marked host gets no lease")
-	assert.Equal(t, SlotHeld, out.Plan.Hosts["dead"].Slot)
+	assert.Equal(t, SlotOffline, out.Plan.Hosts["dead"].Slot)
 	assert.Equal(t, "known offline", queueReasons(out.Plan)["dead"])
 
 	// The end passes: the host counts again and closes the gate.
@@ -1052,4 +1103,30 @@ func TestKnownOfflineHost(t *testing.T) {
 	out = b.step()
 	assert.Zero(t, out.Plan.Budget.OfflineHosts)
 	assert.False(t, out.Plan.Gate.OK)
+}
+
+// What a host asks for itself goes before the fleet's rollouts, however
+// old they are; the budget still applies.
+func TestLocalRolloutsGoFirst(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.w.Settings.MaxLeasedPercent = 50
+	b.w.Settings.Paused = true
+
+	for _, name := range []string{"a", "b"} {
+		b.host(name, 10)
+	}
+
+	b.wants("a", packagesNeed("2.0"))
+	b.step()
+
+	b.advance(time.Minute)
+
+	local := imageNeed("c", imgLighthouse, digestB)
+	local.ID, local.Local = protocol.LocalNeedID("r1"), true
+	b.wants("b", local)
+	b.w.Settings.Paused = false
+
+	out := b.step()
+	assert.Equal(t, []string{"b"}, b.leasedHosts())
+	assert.Equal(t, "budget 50% of 10%", queueReasons(out.Plan)["a"])
 }

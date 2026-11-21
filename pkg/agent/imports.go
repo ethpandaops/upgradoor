@@ -63,10 +63,7 @@ var (
 		"os/exec":                    pkgSystem,
 	}
 	// httpAllowed may import net/http.
-	httpAllowed = []string{
-		pkgLink, pkgRegistry, pkgDocker, pkgProbe, pkgLocal,
-		pkgAgenttest,
-	}
+	httpAllowed = []string{pkgLink, pkgDocker, pkgProbe, pkgLocal, pkgAgenttest}
 )
 
 // hostBinary runs as root on every host. Its released dependency closure

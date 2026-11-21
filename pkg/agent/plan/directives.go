@@ -23,20 +23,22 @@ func RollRefusal(policy *Policy, view *View, container string) string {
 	return reason
 }
 
-// RollNeed is the manual image need of a roll once its registry lookup
-// (check, nil while pending) has answered, or why the roll is rejected. Both
-// are empty while the roll waits. The caller sets DirectiveID or Local.
+// RollNeed is the manual image need of a roll of the container that ran ref
+// when it was asked, at the digest the controller looked up for its tag, or
+// why the roll is rejected. Both are empty while the controller has not
+// looked the tag up. The caller sets DirectiveID or Local.
 func RollNeed(
-	policy *Policy, view *View, container, ref, id string, check *protocol.RegistryCheck, gone bool,
+	policy *Policy, view *View, container, ref, id string,
 ) (need *protocol.Need, reject string) {
 	if reason := RollRefusal(policy, view, container); reason != "" {
 		return nil, reason
 	}
 
 	c := view.Container(container)
+	check := c.Registry
 
 	switch {
-	case gone || imageref.Normalize(c.Image) != imageref.Normalize(ref):
+	case imageref.Normalize(c.Image) != imageref.Normalize(ref):
 		return nil, "container " + container + " moved to another image"
 	case check == nil:
 		return nil, ""

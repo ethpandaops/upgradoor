@@ -7,7 +7,7 @@ import { PAGE_SIZE, PackagesTab } from './PackagesTab';
 
 /** names are the package names of the page on screen, in order. */
 function names(): string[] {
-  const table = screen.getByRole('table', { name: 'Packages' });
+  const table = screen.getByRole('table');
   return within(table)
     .getAllByRole('row')
     .slice(1)
@@ -110,5 +110,60 @@ describe('PackagesTab', () => {
       expect(names()).toEqual(page);
     });
     expect(pager()).toHaveTextContent(/^26–50 of/);
+  });
+
+  it('lists the images of the containers in a list of its own', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<PackagesTab />, h);
+    await screen.findByRole('table', { name: 'Packages' });
+
+    await user.click(screen.getByRole('button', { name: 'Docker images' }));
+
+    const table = await screen.findByRole('table', { name: 'Images' });
+    expect(screen.queryByRole('table', { name: 'Packages' })).toBeNull();
+    expect(pager()).toHaveTextContent(/^1–\d+ of \d+ images/);
+    expect(table).toHaveTextContent('latest');
+    expect(table).toHaveTextContent('registry checked');
+
+    await user.type(screen.getByRole('searchbox', { name: 'Filter images' }), 'geth');
+    await waitFor(() => {
+      expect(names().length).toBeGreaterThan(0);
+      expect(names().every(n => n.includes('geth'))).toBe(true);
+    });
+    expect(h.calls.map(c => c.path)).toContain(`/api/v1/images?q=geth&limit=${PAGE_SIZE}`);
+
+    // Each list keeps its own filter.
+    await user.click(screen.getByRole('button', { name: 'APT packages' }));
+    await screen.findByRole('table', { name: 'Packages' });
+    expect(screen.getByRole('searchbox', { name: 'Filter packages' })).toHaveValue('');
+
+    await user.click(screen.getByRole('button', { name: 'Docker images' }));
+    expect(screen.getByRole('searchbox', { name: 'Filter images' })).toHaveValue('geth');
+  });
+
+  it('asks for a registry lookup of every tag', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<PackagesTab />, h);
+
+    await user.click(await screen.findByRole('button', { name: 'Docker images' }));
+    await screen.findByRole('table', { name: 'Images' });
+
+    await user.click(screen.getByRole('button', { name: 'Check registries now' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent(/^Looking up \d+ tags/);
+    });
+    expect(h.calls.filter(c => c.path === '/api/v1/images/refresh')).toHaveLength(1);
+
+    // Within the half minute the controller says when it looks up again.
+    await user.click(screen.getByRole('button', { name: 'Check registries now' }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('status')).toHaveTextContent(
+        /^Every tag was looked up within the last half minute\. The next lookup on request is possible at /
+      );
+    });
   });
 });

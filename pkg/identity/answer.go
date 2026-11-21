@@ -8,7 +8,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"strconv"
 )
 
 const (
@@ -19,7 +18,7 @@ const (
 )
 
 // ErrBadAnswer is returned for a controller answer that is not signed, not
-// signed by an accepted controller key, or not the answer to the request it
+// signed by the controller key, or not the answer to the request it
 // is checked against. An agent acts on nothing of such an answer.
 var ErrBadAnswer = errors.New("identity: controller answer refused")
 
@@ -32,17 +31,13 @@ var ErrBadAnswer = errors.New("identity: controller answer refused")
 // public half. It is not the devnet seed the signer and host keys come from.
 // The network name in the derivation gives every devnet of the group its
 // own key. Like the devnet seed it is used as raw bytes and must be at least
-// MinSeedLength long. generation rotates the key of one network without
-// touching the seed.
-func DeriveControllerKey(
-	controllerSeed []byte, network string, generation uint64,
-) (*mldsa.PrivateKey, error) {
+// MinSeedLength long.
+func DeriveControllerKey(controllerSeed []byte, network string) (*mldsa.PrivateKey, error) {
 	if err := ValidateName(network); err != nil {
 		return nil, err
 	}
 
-	return derive(controllerSeed,
-		infoControllerPrefix+network+"/"+strconv.FormatUint(generation, 10))
+	return derive(controllerSeed, infoControllerPrefix+network)
 }
 
 // KeyFingerprint is the lower-case hex SHA-256 of a public key's bytes. It
@@ -150,37 +145,30 @@ func IsSignedAnswer(answer []byte) bool {
 
 // AnswerVerifier checks controller answers on behalf of one host.
 type AnswerVerifier struct {
-	keys    []*mldsa.PublicKey
+	key     *mldsa.PublicKey
 	network string
 	subject string
 }
 
 // NewAnswerVerifier returns a verifier for the answers the host subject of
-// network gets. keys are the accepted controller keys: more than one while a
-// controller key is rotated.
+// network gets, signed with the controller key key.
 func NewAnswerVerifier(
-	keys []*mldsa.PublicKey, network, subject string,
+	key *mldsa.PublicKey, network, subject string,
 ) (*AnswerVerifier, error) {
-	if len(keys) == 0 {
+	if key == nil {
 		return nil, fmt.Errorf("%w: no controller public key", ErrInvalidKey)
-	}
-
-	for _, key := range keys {
-		if key == nil {
-			return nil, fmt.Errorf("%w: empty controller public key", ErrInvalidKey)
-		}
 	}
 
 	if network == "" || subject == "" {
 		return nil, errors.New("identity: an answer verifier needs a network and a host")
 	}
 
-	return &AnswerVerifier{keys: keys, network: network, subject: subject}, nil
+	return &AnswerVerifier{key: key, network: network, subject: subject}, nil
 }
 
 // Verify checks answer, the body of a controller answer, against the request
 // whose proof had the id requestID, and returns the answer it carries. The
-// answer must be a SignedAnswer, signed by one of the accepted keys, for
+// answer must be a SignedAnswer, signed by the controller key, for
 // this network, this host and this request, over exactly the returned bytes.
 // Every failure is an ErrBadAnswer.
 func (v *AnswerVerifier) Verify(requestID string, answer []byte) ([]byte, error) {
@@ -194,20 +182,9 @@ func (v *AnswerVerifier) Verify(requestID string, answer []byte) ([]byte, error)
 		return nil, fmt.Errorf("%w: it is not signed", ErrBadAnswer)
 	}
 
-	var (
-		raw []byte
-		err error
-	)
-
-	for _, key := range v.keys {
-		if raw, err = verifyCompact(key, answerHeader, signed.Signature); err == nil {
-			break
-		}
-	}
-
+	raw, err := verifyCompact(v.key, answerHeader, signed.Signature)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"%w: not signed by an accepted controller key (%w)", ErrBadAnswer, err)
+		return nil, fmt.Errorf("%w: not signed by the controller key (%w)", ErrBadAnswer, err)
 	}
 
 	var claims AnswerClaims

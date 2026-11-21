@@ -35,7 +35,15 @@ const HOSTS: OwnedHost[] = [
 
 const LEASES: Record<string, string> = { 'lease-mixed': MIXED, 'lease-unowned': UNOWNED };
 
-const OWNERSHIP = { hosts: HOSTS, leaseHost: (id: string) => LEASES[id] };
+/** r-lighthouse rolls the client lighthouse, r-1 no client; others are unknown. */
+const ROLLOUT_CLIENTS: Record<string, string> = { 'r-lighthouse': 'lighthouse', 'r-1': '' };
+
+const OWNERSHIP = {
+  hosts: HOSTS,
+  clients: [{ name: 'lighthouse', hosts: 1, allOwned: ['lighthouse'], owners: ['lighthouse'] }],
+  leaseHost: (id: string) => LEASES[id],
+  rolloutClient: (id: string) => ROLLOUT_CLIENTS[id],
+};
 
 /** login builds a login from the features a grant gives; "all" is a grant like upgradoor:all. */
 function login(features: readonly string[] | 'all', teams: readonly string[] = [], service = 'upgradoor'): Login {
@@ -79,8 +87,8 @@ const SAMPLES: Sample[] = [
   { name: 'skip', call: rolloutHosts('skip', [MIXED]), feature: FEATURE.recover, twin: true },
   { name: 'retry hosts', call: rolloutHosts('retry', [MIXED]), feature: FEATURE.recover, twin: true },
   { name: 'end-lease', call: endLease('lease-mixed'), feature: FEATURE.recover, twin: true },
-  { name: 'pause one', call: scope('pause', 'r-1'), feature: FEATURE.supervise, twin: false },
-  { name: 'resume one', call: scope('resume', 'r-1'), feature: FEATURE.supervise, twin: false },
+  { name: 'pause one', call: scope('pause', 'r-lighthouse'), feature: FEATURE.supervise, twin: true },
+  { name: 'resume one', call: scope('resume', 'r-lighthouse'), feature: FEATURE.supervise, twin: true },
   { name: 'abort', call: scope('abort', 'r-1'), feature: FEATURE.supervise, twin: false },
   { name: 'retry rollout', call: rolloutHosts('retry', []), feature: FEATURE.supervise, twin: false },
   { name: 'pause all', call: scope('pause', ''), feature: FEATURE.admin, twin: false },
@@ -401,7 +409,10 @@ describe('can, what the team twins cover', () => {
       'pause one rollout with admin only',
       login(['admin']),
       scope('pause', 'r-1'),
-      { reason: 'Needs upgradoor:supervise' },
+      {
+        reason:
+          "Needs upgradoor:supervise or upgradoor:team_supervise for a team that owns every container of this rollout's client",
+      },
     ],
     [
       'pause everything with rollouts only',
@@ -497,23 +508,32 @@ describe('needsOwnership', () => {
 
 describe('can, what the review of the first version found', () => {
   const teamRecover = (...teams: string[]) => login(['team_recover'], teams);
-  const states: Record<string, string> = { 'r-1': 'halted', 'r-aborted': 'aborted' };
-  const withRollouts = { ...OWNERSHIP, rolloutState: (id: string) => states[id] };
   const retry = (rollout: string, hosts: string[]) =>
     ({ action: 'retry', body: { rollout, hosts, reason: '' } }) satisfies ActionCall;
 
-  it('needs supervise to retry an aborted rollout, whatever hosts are named', () => {
-    const lacks = { allowed: false, reason: 'Needs upgradoor:supervise', by: '', staggered: false };
+  it('takes a retry with hosts for a recovery, whatever the state of the rollout', () => {
+    // An aborted rollout is refused by the controller: an abort is final.
+    expect(can(teamRecover('lighthouse'), retry('r-aborted', [MIXED]), OWNERSHIP).by).toBe('team_recover');
+    expect(can(teamRecover('lighthouse'), retry('r-1', [MIXED]), OWNERSHIP).by).toBe('team_recover');
+    expect(can(login(['supervise']), retry('r-1', [MIXED]), OWNERSHIP).allowed).toBe(false);
+    expect(can(login(['supervise']), retry('r-1', []), OWNERSHIP).by).toBe('supervise');
+  });
 
-    expect(can(teamRecover('lighthouse'), retry('r-aborted', [MIXED]), withRollouts)).toEqual(lacks);
-    expect(can(login(['recover']), retry('r-aborted', [MIXED]), withRollouts)).toEqual(lacks);
-    expect(can(login(['recover', ...ALL_TWINS], ['geth']), retry('r-aborted', [TEKU]), withRollouts)).toEqual(lacks);
-    expect(can(login(['supervise']), retry('r-aborted', [MIXED]), withRollouts).by).toBe('supervise');
+  it("lets a client's team approve and pause the client's rollouts, not abort them", () => {
+    const team = login(['team_supervise'], ['lighthouse']);
 
-    // A rollout that is not aborted, and one the page does not know: hosts are a recovery.
-    expect(can(teamRecover('lighthouse'), retry('r-1', [MIXED]), withRollouts).by).toBe('team_recover');
-    expect(can(teamRecover('lighthouse'), retry('r-ghost', [MIXED]), withRollouts).by).toBe('team_recover');
-    expect(can(login(['supervise']), retry('r-1', [MIXED]), withRollouts).allowed).toBe(false);
+    expect(can(team, scope('resume', 'r-lighthouse'), OWNERSHIP).by).toBe('team_supervise');
+    expect(can(team, scope('pause', 'r-lighthouse'), OWNERSHIP).by).toBe('team_supervise');
+    expect(can(team, scope('abort', 'r-lighthouse'), OWNERSHIP).reason).toBe('Needs upgradoor:supervise');
+    expect(can(login(['team_supervise'], ['geth']), scope('resume', 'r-lighthouse'), OWNERSHIP).reason).toBe(
+      'upgradoor:team_supervise does not cover client lighthouse (owners of all of it: lighthouse)'
+    );
+    expect(can(team, scope('resume', 'r-1'), OWNERSHIP).reason).toBe(
+      'upgradoor:team_supervise does not cover rollout r-1: it is for no client'
+    );
+    expect(can(team, scope('resume', 'r-ghost'), OWNERSHIP).reason).toBe(
+      'upgradoor:team_supervise does not cover rollout r-ghost (owners: none)'
+    );
   });
 
   it('leaves a hold of staff alone on the team path', () => {
@@ -534,10 +554,13 @@ describe('can, what the review of the first version found', () => {
       );
     }
 
-    // A team's hold: any owner of the host, not a stranger.
-    expect(can(twin, hold('unhold', [MIXED]), { hosts: held('team') }).by).toBe('team_hold');
-    expect(can(login(['team_hold'], ['geth']), hold('unhold', [MIXED]), { hosts: held('team') }).by).toBe('team_hold');
-    expect(can(login(['team_hold'], ['teku']), hold('unhold', [MIXED]), { hosts: held('team') }).reason).toBe(
+    // A team's hold: the team that set it, not another owner, not a stranger.
+    const theirs = held('team:lighthouse');
+    expect(can(twin, hold('unhold', [MIXED]), { hosts: theirs }).by).toBe('team_hold');
+    expect(can(login(['team_hold'], ['geth']), hold('unhold', [MIXED]), { hosts: theirs }).reason).toBe(
+      'upgradoor:team_hold does not lift the hold on host lighthouse-geth-1 (set by team lighthouse)'
+    );
+    expect(can(login(['team_hold'], ['teku']), hold('unhold', [MIXED]), { hosts: theirs }).reason).toBe(
       'upgradoor:team_hold does not cover host lighthouse-geth-1 (owners: geth, lighthouse)'
     );
 
@@ -655,7 +678,7 @@ describe('can, what the review of the first version found', () => {
       );
     }
     // Without the client table nobody owns a client; without a team neither.
-    expect(can(login([twin], ['lighthouse']), policy('lighthouse'), OWNERSHIP).allowed).toBe(false);
+    expect(can(login([twin], ['lighthouse']), policy('lighthouse'), { ...OWNERSHIP, clients: [] }).allowed).toBe(false);
     expect(can(login([twin]), policy('lighthouse'), ownership).allowed).toBe(false);
 
     expect(can(login(['admin', 'roll', 'supervise']), policy('geth'), ownership).reason).toBe(

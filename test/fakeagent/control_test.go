@@ -51,16 +51,8 @@ func TestControlHandler(t *testing.T) {
 	require.Equal(t, http.StatusOK, code)
 	assert.True(t, st.RebootRequired)
 
-	code, _ = call(http.MethodPost, "/registry", `{"ref":"`+agenttest.GethImage+`","digest":"`+agenttest.GethV2+`"}`)
-	assert.Equal(t, http.StatusOK, code)
-
-	digest, err := host.Resolve(t.Context(), agenttest.GethImage)
-	require.NoError(t, err)
-	assert.Equal(t, agenttest.GethV2, digest)
-
 	for _, bad := range []struct{ path, body string }{
-		{"/registry", `{"ref":"x"}`},
-		{"/registry", `{"ref":"x","digest":"sha256:a","other":1}`},
+		{"/reboot-required", `{"required":true,"other":1}`},
 		{"/reboot-required", `not json`},
 		{"/reboot-required", `{"required":true} {"required":false}`},
 	} {

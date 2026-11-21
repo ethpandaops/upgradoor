@@ -17,9 +17,9 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-const hostColumns = `name, cert_hash, generation, validators_start, validators_end, roles,
+const hostColumns = `name, cert_hash, validators_start, validators_end, roles,
 	first_seen, last_seen, remote_addr, status, inventory_hash, hold_wanted, hold_reason, hold_by,
-	offline, broken, sync_interval, status_hash, pull, hold_actor`
+	offline, broken, sync_interval, status_hash, hold_actor`
 
 // RecordSync upserts the host named by the certificate subject. first_seen
 // is kept for a known host. With a nil Request only the identity, last_seen
@@ -29,10 +29,6 @@ const hostColumns = `name, cert_hash, generation, validators_start, validators_e
 // The validator range of the row is what the controller counts for the host
 // (fleet.Host.Validators). It follows the range the request reports: see
 // countedValidators.
-//
-// The generation only ever goes up: it is the floor below which the API
-// rejects certificates, and a sync that slipped past that check must not
-// lower it.
 //
 // A host seen for the first time that reports a controller hold is created
 // with hold_wanted set. The hold was put there by a controller whose database
@@ -120,13 +116,12 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 
 		// hold_wanted and hold_reason are only written for a new row.
 		_, txErr = tx.ExecContext(ctx, `
-			INSERT INTO hosts (name, cert_hash, generation, validators_start, validators_end,
+			INSERT INTO hosts (name, cert_hash, validators_start, validators_end,
 				roles, first_seen, last_seen, remote_addr, status, hold_wanted, hold_reason,
 				status_hash, sync_interval)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(name) DO UPDATE SET
 				cert_hash = excluded.cert_hash,
-				generation = max(hosts.generation, excluded.generation),
 				validators_start = excluded.validators_start,
 				validators_end = excluded.validators_end,
 				roles = excluded.roles,
@@ -136,7 +131,7 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 				status_hash = CASE WHEN excluded.status IS NULL
 					THEN hosts.status_hash ELSE excluded.status_hash END,
 				sync_interval = excluded.sync_interval`,
-			cert.Subject, cert.Hash, int64(cert.Generation), valStart, valEnd,
+			cert.Subject, cert.Hash, valStart, valEnd,
 			rolesJSON, millis(at), millis(at), in.RemoteAddr, status,
 			result.HoldAdopted, holdReason, statusHash, in.SyncInterval.Milliseconds())
 		if txErr != nil {
@@ -186,8 +181,7 @@ func (p *storedSync) confirms(
 }
 
 // confirmSync writes what a confirming sync changes: the time, the uptime
-// and the asked sync interval. The certificate generation is not written:
-// confirms compared the certificate hash, which covers it.
+// and the asked sync interval.
 func (s *sqliteStore) confirmSync(ctx context.Context, tx *sql.Tx, in *HostSync, at time.Time) (*fleet.Host, error) {
 	_, err := tx.ExecContext(ctx, `
 		UPDATE hosts SET last_seen = ?, sync_interval = ?,
@@ -392,28 +386,20 @@ func (s *sqliteStore) ListHosts(ctx context.Context) ([]*fleet.Host, error) {
 func (s *sqliteStore) scanHost(row rowScanner) (*fleet.Host, error) {
 	var (
 		host                fleet.Host
-		generation          int64
 		valStart, valEnd    sql.NullInt64
 		roles               string
 		firstSeen, lastSeen int64
 		status              sql.NullString
 		broken, offline     string
-		pull                string
 		syncInterval        int64
 	)
 
-	err := row.Scan(&host.Name, &host.CertHash, &generation, &valStart, &valEnd, &roles,
+	err := row.Scan(&host.Name, &host.CertHash, &valStart, &valEnd, &roles,
 		&firstSeen, &lastSeen, &host.RemoteAddr, &status, &host.InventoryHash,
 		&host.HoldWanted, &host.HoldReason, &host.HoldBy, &offline, &broken, &syncInterval,
-		&host.StatusHash, &pull, &host.HoldActor)
+		&host.StatusHash, &host.HoldActor)
 	if err != nil {
 		return nil, err
-	}
-
-	if pull != "" {
-		if err := json.Unmarshal([]byte(pull), &host.Pull); err != nil {
-			return nil, fmt.Errorf("decode pull window of %s: %w", host.Name, err)
-		}
 	}
 
 	if offline != "" {
@@ -428,7 +414,6 @@ func (s *sqliteStore) scanHost(row rowScanner) (*fleet.Host, error) {
 		}
 	}
 
-	host.Generation = uint64(generation)
 	host.SyncInterval = time.Duration(syncInterval) * time.Millisecond
 	host.FirstSeen = fromMillis(firstSeen)
 	host.LastSeen = fromMillis(lastSeen)
@@ -569,25 +554,6 @@ func setHostBroken(ctx context.Context, tx *sql.Tx, name string, marks map[strin
 	}
 
 	_, err = tx.ExecContext(ctx, `UPDATE hosts SET broken = ? WHERE name = ?`, string(raw), name)
-
-	return err
-}
-
-// setHostPull sets or ends the pull window of a host. A host that does not
-// exist has none: nothing is written and nothing fails.
-func setHostPull(ctx context.Context, tx *sql.Tx, name string, window *fleet.PullWindow) error {
-	raw := ""
-
-	if window != nil {
-		b, err := json.Marshal(window)
-		if err != nil {
-			return fmt.Errorf("encode pull window: %w", err)
-		}
-
-		raw = string(b)
-	}
-
-	_, err := tx.ExecContext(ctx, `UPDATE hosts SET pull = ? WHERE name = ?`, raw, name)
 
 	return err
 }

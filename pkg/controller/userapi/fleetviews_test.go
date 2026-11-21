@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/controllertest"
+	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
@@ -99,7 +100,6 @@ func TestHostDetail(t *testing.T) {
 	detail := controllertest.DecodeJSON[views.HostDetail](t, rec)
 	assert.Equal(t, "lighthouse-geth-1", detail.Name)
 	assert.Equal(t, controllertest.SecretCertHash, detail.CertHash)
-	assert.Equal(t, uint64(3), detail.Generation)
 	assert.Equal(t, controllertest.SecretAddr, detail.RemoteAddr)
 	assert.True(t, detail.FirstSeen.Equal(controllertest.Epoch.Add(-48*time.Hour)))
 	require.NotNil(t, detail.ValidatorStart)
@@ -229,6 +229,70 @@ func TestPackages(t *testing.T) {
 
 // The list is paged: the first page says how many there are and where the
 // next one starts; the last page has no next.
+func TestImages(t *testing.T) {
+	h := newHarness(t, nil)
+
+	for name, digest := range map[string]string{"a": "sha256:1", "b": "sha256:1", "c": "sha256:2"} {
+		h.store.Hosts[name] = &fleet.Host{Name: name, LastSeen: controllertest.Epoch, Status: &protocol.SyncRequest{
+			Containers: []protocol.Container{
+				{Name: "geth", Image: "ethpandaops/geth:master", Digest: digest},
+				{Name: "dora", Image: "ethpandaops/dora:latest", Digest: "sha256:d"},
+			},
+		}}
+	}
+
+	var page views.Images
+
+	rec := h.get("/api/v1/images?q=%20geth%20")
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &page))
+	assert.Equal(t, "geth", page.Query)
+	require.Len(t, page.Matches, 1)
+	assert.Equal(t, []views.ImageVersion{
+		{Digest: "sha256:1", Hosts: []string{"a", "b"}}, {Digest: "sha256:2", Hosts: []string{"c"}},
+	}, page.Matches[0].Versions)
+
+	rec = h.get("/api/v1/images?limit=1")
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	page = views.Images{}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &page))
+	require.Len(t, page.Matches, 1)
+	require.NotNil(t, page.Total)
+	assert.Equal(t, 2, *page.Total)
+	require.NotEmpty(t, page.Next)
+
+	rec = h.get("/api/v1/images?limit=1&after=" + url.QueryEscape(page.Next))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	page = views.Images{}
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &page))
+	require.Len(t, page.Matches, 1)
+	assert.Equal(t, "ethpandaops/geth:master", page.Matches[0].Name)
+	assert.Empty(t, page.Next)
+
+	for _, bad := range []string{"?after=x", "?limit=0", "?q=" + strings.Repeat("g", 300)} {
+		assert.Equal(t, http.StatusBadRequest, h.get("/api/v1/images"+bad).Code, bad)
+	}
+}
+
+func TestRefreshImages(t *testing.T) {
+	h := newHarness(t, nil)
+
+	rec := h.sendJSON(http.MethodPost, "/api/v1/images/refresh", `{}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.JSONEq(t, `{"tags":3,"message":"3 tag(s) are looked up now"}`, rec.Body.String())
+	assert.Equal(t, 1, h.lookups.Refreshed)
+
+	h.lookups.Refreshable = discovery.Refreshed{Recent: 2, Next: time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)}
+
+	rec = h.sendJSON(http.MethodPost, "/api/v1/images/refresh", `{}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.JSONEq(t, `{"tags":0,"recent":2,"next":"2026-01-02T03:04:05Z",`+
+		`"message":"every tag was looked up within the last 30s; `+
+		`the next lookup on request is possible at 03:04:05 UTC"}`, rec.Body.String())
+}
+
 func TestPackagesPaging(t *testing.T) {
 	h := newHarness(t, nil)
 

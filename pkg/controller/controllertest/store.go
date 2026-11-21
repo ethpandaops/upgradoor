@@ -75,7 +75,6 @@ func (f *Store) RecordSync(_ context.Context, sync *store.HostSync) (*store.Sync
 	}
 
 	host.CertHash = sync.Cert.Hash
-	host.Generation = max(host.Generation, sync.Cert.Generation)
 	res.ValidatorsBefore = host.Validators
 	host.Validators, res.ValidatorOverlaps = f.countedValidators(name, sync, host.Validators)
 	host.Roles = sync.Cert.Roles

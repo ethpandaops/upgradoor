@@ -11,7 +11,8 @@ import (
 // Needs returns the host's open needs sorted by ID, none while on hold:
 // allowed manual needs (covering the observed need they replace), a target
 // or image need per managed container, the blocked packages and the reboot
-// need. Unpulled lists images not yet local at the need's digest.
+// need. PullError is set while a lease's pull of the need's image has just
+// failed.
 func Needs(policy *Policy, view *View, manual []protocol.Need) []protocol.Need {
 	needs := make([]protocol.Need, 0, len(manual)+len(view.Containers)+2)
 
@@ -82,7 +83,7 @@ func Needs(policy *Policy, view *View, manual []protocol.Need) []protocol.Need {
 	}
 
 	for i := range needs {
-		needs[i].Unpulled = unpulled(&needs[i], view.Checks)
+		needs[i].PullError = pullError(&needs[i], view.Checks)
 	}
 
 	slices.SortFunc(needs, func(a, b protocol.Need) int { return cmp.Compare(a.ID, b.ID) })
@@ -149,29 +150,25 @@ func imageNeed(c *protocol.Container) (protocol.Need, bool) {
 	}, true
 }
 
-// unpulled is the need's image when it is not local at the need's digest; it
-// is pulled in a pull window so the rollout slot is spent on the restart alone.
-func unpulled(n *protocol.Need, checks map[string]protocol.RegistryCheck) []protocol.PullImage {
-	var img protocol.PullImage
+// pullError is why the last lease could not pull the need's image, while
+// the check of its tag says PullFailed for the need's digest.
+func pullError(n *protocol.Need, checks map[string]protocol.RegistryCheck) string {
+	var ref, digest string
 
 	switch {
 	case n.Image != nil:
-		img = protocol.PullImage{Ref: n.Image.Image, Digest: n.Image.ToDigest}
+		ref, digest = n.Image.Image, n.Image.ToDigest
 	case n.Spec != nil:
-		img = protocol.PullImage{Ref: n.Spec.Image, Digest: n.Spec.ToDigest}
+		ref, digest = n.Spec.Image, n.Spec.ToDigest
 	case n.Override != nil:
-		img = protocol.PullImage{Ref: n.Override.Image, Digest: n.Override.ToDigest}
+		ref, digest = n.Override.Image, n.Override.ToDigest
 	}
 
-	if img.Ref == "" || img.Digest == "" {
-		return nil
+	if rc, ok := checks[imageref.Normalize(ref)]; ok && ref != "" && rc.PullFailed && rc.Digest == digest {
+		return rc.Error
 	}
 
-	if rc, ok := checks[imageref.Normalize(img.Ref)]; ok && rc.Pulled && rc.Digest == img.Digest {
-		return nil
-	}
-
-	return []protocol.PullImage{img}
+	return ""
 }
 
 func rebootReasons(sys *System) []string {
@@ -230,7 +227,6 @@ func CloneNeeds(in []protocol.Need) []protocol.Need {
 // cloneNeed returns a deep copy, so stored manual needs are never shared.
 func cloneNeed(n *protocol.Need) protocol.Need {
 	out := *n
-	out.Unpulled = slices.Clone(n.Unpulled)
 
 	if n.Image != nil {
 		img := *n.Image
@@ -320,6 +316,19 @@ func Reconcile(policy *Policy, view *View, manual []protocol.Need) Reconciled {
 	out.Changed = out.Changed || len(out.Dropped) > 0
 
 	return out
+}
+
+// Withdrawn returns the IDs of the manual needs that the directive created.
+func Withdrawn(manual []protocol.Need, directive string) []string {
+	ids := make([]string, 0, 1)
+
+	for i := range manual {
+		if directive != "" && manual[i].DirectiveID == directive {
+			ids = append(ids, manual[i].ID)
+		}
+	}
+
+	return ids
 }
 
 // followTag moves a manual image need to the running and the tag's current

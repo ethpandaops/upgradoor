@@ -76,7 +76,7 @@ func New(log logrus.FieldLogger, cfg *Config, blocked []string, login Login) (Ho
 
 	return &machine{
 		Runtime:    runtime,
-		system:     system.New(log, blocked),
+		system:     system.New(log, blocked, cfg.Commands),
 		Prober:     probe.New(log, &cfg.Probes),
 		validators: cfg.Validators,
 	}, nil

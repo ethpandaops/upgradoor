@@ -47,11 +47,13 @@ var commandEnv = []string{
 // errCommandNotAllowed is returned for a command outside the closed set.
 var errCommandNotAllowed = errors.New("system: command not allowed")
 
-// commandRunner runs one of the fixed programs with an argument vector, never
-// through a shell, and returns its standard output; a failure is a
-// *commandError.
+// commandRunner runs a program with an argument vector, never through a
+// shell, and returns its standard output; a failure is a *commandError.
 type commandRunner interface {
+	// Run runs one of the fixed programs.
 	Run(ctx context.Context, name string, args ...string) ([]byte, error)
+	// Exec runs a configured command: argv[0] is the program's path.
+	Exec(ctx context.Context, argv []string) ([]byte, error)
 }
 
 // commandError describes a command that failed.
@@ -117,6 +119,24 @@ func (execRunner) Run(ctx context.Context, name string, args ...string) ([]byte,
 	path, err := lookupCommand(name)
 	if err != nil {
 		return nil, fail(err)
+	}
+
+	return execute(ctx, path, name, args)
+}
+
+// Exec implements commandRunner.
+func (execRunner) Exec(ctx context.Context, argv []string) ([]byte, error) {
+	if len(argv) == 0 || !filepath.IsAbs(argv[0]) {
+		return nil, &commandError{Name: strings.Join(argv, " "), ExitCode: -1, Err: errCommandNotAllowed}
+	}
+
+	return execute(ctx, argv[0], argv[0], argv[1:])
+}
+
+// execute runs the program at path; name and args are for the error.
+func execute(ctx context.Context, path, name string, args []string) ([]byte, error) {
+	fail := func(err error) *commandError {
+		return &commandError{Name: name, Args: args, ExitCode: -1, Err: err}
 	}
 
 	if err := ctx.Err(); err != nil {

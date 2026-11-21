@@ -55,10 +55,10 @@ type Need struct {
 	// with the local command line. The controller serves them in a rollout
 	// of the host's own, under the budget and the gate like any other.
 	Local bool `json:"local,omitempty"`
-	// Unpulled are the images the need waits for (tag references at the
-	// need's target digest) that are not local yet. The host pulls them in a
-	// pull window; a need with any is not granted.
-	Unpulled []PullImage `json:"unpulled,omitempty"`
+	// PullError is why the last lease could not pull the need's image. It is
+	// set until the agent lets the pull be tried again; a need with it is
+	// not granted.
+	PullError string `json:"pullError,omitempty"`
 
 	Image    *ImageNeed    `json:"image,omitempty"`
 	Override *OverrideNeed `json:"override,omitempty"`

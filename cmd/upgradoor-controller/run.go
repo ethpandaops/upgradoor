@@ -57,8 +57,6 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 	f.StringVar(&cfg.ControllerSeedFile, "controller-seed-file", "",
 		"file holding the controller seed (never the devnet seed): "+
 			"the key that signs answers to agents is derived from it for --network")
-	f.Uint64Var(&cfg.ControllerGeneration, "controller-generation", 0,
-		"generation of the controller key to derive from the controller seed")
 	f.BoolVar(&cfg.AllowUnsignedAgentAnswers, "allow-unsigned-agent-answers", false,
 		"run without a controller seed: answers to agents are not signed (development only)")
 	f.StringArrayVar(&cfg.PublicURLs, "public-url", nil,
@@ -74,6 +72,15 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 			"its features (roll, team_roll, ...) are what allows actions")
 	f.StringArrayVar(&cfg.BeaconEndpoints, "beacon-endpoint", nil,
 		"beacon API base URL (repeatable; tried in order)")
+	f.StringVar(&cfg.RegistryAuthFile, "registry-auth-file", "",
+		"Docker config.json with credentials for the registry lookups (anonymous when empty)")
+	f.StringVar(&cfg.Registry.CAFile, "registry-ca-file", "",
+		"extra CA bundle for private registries")
+	f.StringArrayVar(&cfg.Registry.PlainHTTP, "registry-plain-http", nil,
+		"registry host to look up without TLS (repeatable)")
+	f.BoolVar(&cfg.Registry.AllowPrivate, "registry-allow-private", false,
+		"look tags up at registries on loopback, private and link-local addresses too "+
+			"(hosts name the registries: leave it off unless such a registry is in use)")
 	f.StringArrayVar(&cfg.DefaultSettings, "default-setting", nil,
 		"default for a setting as key=value, e.g. maxUnavailablePercent=10 (repeatable)")
 	f.StringVar(&pprofListen, "pprof-listen", "",

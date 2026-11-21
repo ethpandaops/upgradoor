@@ -401,7 +401,7 @@ func TestWebFeaturesAreTheServers(t *testing.T) {
 	slices.Sort(twinned)
 	assert.Equal(t, []string{
 		authz.FeatureClientPolicy, authz.FeatureFlagOverride, authz.FeatureHold, authz.FeatureImageOverride,
-		authz.FeatureReboot, authz.FeatureRecover, authz.FeatureRoll,
+		authz.FeatureReboot, authz.FeatureRecover, authz.FeatureRoll, authz.FeatureSupervise,
 	}, twinned,
 		"the features with a team twin")
 

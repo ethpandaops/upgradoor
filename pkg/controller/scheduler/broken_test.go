@@ -161,6 +161,7 @@ func nonNilMarks(marks map[string]string) map[string]string {
 func TestBrokenHostGoesFirst(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 100
+	b.w.Settings.MaxLeasedPercent = 100
 
 	for _, name := range []string{"a", "b", "c"} {
 		b.host(name, 10)
@@ -184,7 +185,7 @@ func TestBrokenHostGoesFirst(t *testing.T) {
 
 	assert.Empty(t, b.get("c").Broken)
 	assert.Equal(t, fleet.StageRepair, r.Host("c").Stage, "the stage says how it was served")
-	assert.Empty(t, r.Canary, "the repair was the first success")
+	assert.Equal(t, "c", r.Canary, "the repair was the first success")
 	assert.Equal(t, []string{"a", "b"}, b.leasedHosts())
 	assert.Equal(t, map[string]string{prefixGroup + "g-" + imgLighthouse: "broke-b"}, b.get("b").Broken)
 }

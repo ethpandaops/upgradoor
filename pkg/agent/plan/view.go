@@ -32,16 +32,6 @@ type System struct {
 	InventoryHash string
 }
 
-// Tag is one tag the registry tracker is to follow; it mirrors registry.Tag.
-type Tag struct {
-	// Ref is the reference as written on the container or in the target.
-	Ref string
-	// InUse: a container runs the tag. A tag only a target names is looked
-	// up on the tracker's own schedule even while the controller hands out
-	// lookups.
-	InUse bool
-}
-
 // View is what one cycle saw of the host, classified by the policy and the
 // overrides file.
 type View struct {
@@ -55,7 +45,7 @@ type View struct {
 	Targets map[string]Target
 	// Tags are the tags to follow, by normalised reference: every managed
 	// container's tag and the tag of each pending valid target.
-	Tags map[string]Tag
+	Tags map[string]string
 	// Hold is the hold state at the time of the view.
 	Hold protocol.Hold
 	// OverridesError is Overrides.Err.
@@ -89,7 +79,7 @@ func Classify(
 	view := View{
 		Containers: list, Fresh: facts.Fresh, System: facts.System, Checks: checks,
 		Targets:        make(map[string]Target, len(list)),
-		Tags:           make(map[string]Tag, len(list)),
+		Tags:           make(map[string]string, len(list)),
 		Hold:           HoldState(files, now),
 		OverridesError: files.Err,
 	}
@@ -150,7 +140,7 @@ func Classify(
 		}
 
 		key := imageref.Normalize(c.Image)
-		follow(view.Tags, key, c.Image, true)
+		follow(view.Tags, key, c.Image)
 
 		if rc, ok := checks[key]; ok {
 			c.Registry = &rc
@@ -159,7 +149,7 @@ func Classify(
 		// The target image is followed too: no container runs it yet.
 		if next := imageref.Normalize(target.Image); next != key && !target.InSync &&
 			target.Err == "" && imageref.IsTag(target.Image) {
-			follow(view.Tags, next, target.Image, false)
+			follow(view.Tags, next, target.Image)
 		}
 	}
 
@@ -167,14 +157,10 @@ func Classify(
 }
 
 // follow adds a tag, keeping the first reference written for it.
-func follow(tags map[string]Tag, key, ref string, inUse bool) {
-	t := tags[key]
-	if t.Ref == "" {
-		t.Ref = ref
+func follow(tags map[string]string, key, ref string) {
+	if _, ok := tags[key]; !ok {
+		tags[key] = ref
 	}
-
-	t.InUse = t.InUse || inUse
-	tags[key] = t
 }
 
 // currentEntry is a container's unexpired override, or nil.
@@ -346,4 +332,28 @@ func Deployment(view *View) map[string]Deployed {
 	}
 
 	return out
+}
+
+// DeployState is what a deploy finds of a container: whether it exists,
+// whether the agent rolls it to its target (outside the default group, not
+// linked, the target a tag, the roll verb allowed), and whether it runs
+// another image, digest or command line than that target.
+func DeployState(policy *Policy, view *View, name string) (exists, managed, differs bool) {
+	c := view.Container(name)
+	if c == nil {
+		return false, false, false
+	}
+
+	t, ok := view.Targets[name]
+	if !ok || c.Linked || !imageref.IsTag(t.Image) || !policy.Allows(protocol.VerbRoll) {
+		return true, false, false
+	}
+
+	if !t.InSync {
+		return true, true, true
+	}
+
+	rc, ok := view.Checks[imageref.Normalize(t.Image)]
+
+	return true, true, ok && rc.Digest != "" && rc.Digest != c.Digest
 }

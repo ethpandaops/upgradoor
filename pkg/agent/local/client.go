@@ -25,6 +25,8 @@ type Client interface {
 	Roll(ctx context.Context, container string) (*Answer, error)
 	// InitOverrides writes the generated block of the overrides file.
 	InitOverrides(ctx context.Context) (*Answer, error)
+	// Deploy writes what a container is deployed as.
+	Deploy(ctx context.Context, req *DeployRequest) (*DeployResult, error)
 }
 
 const (
@@ -81,6 +83,16 @@ func (c *client) Roll(ctx context.Context, container string) (*Answer, error) {
 // InitOverrides implements Client.
 func (c *client) InitOverrides(ctx context.Context) (*Answer, error) {
 	return c.post(ctx, PathInit, struct{}{})
+}
+
+// Deploy implements Client.
+func (c *client) Deploy(ctx context.Context, req *DeployRequest) (*DeployResult, error) {
+	var out DeployResult
+	if err := c.call(ctx, http.MethodPost, PathDeploy, req, &out); err != nil {
+		return nil, err
+	}
+
+	return &out, nil
 }
 
 func (c *client) post(ctx context.Context, path string, body any) (*Answer, error) {

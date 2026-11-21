@@ -148,8 +148,8 @@ function SettingsEditor({
     >
       {/*
         The scheduler's switches as a strip over the whole width, and below it
-        three groups of three lines each: side by side they are of one height,
-        on a narrow window everything is one column.
+        three groups side by side, stretched to one height; on a narrow window
+        everything is one column.
       */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         {GROUPS.map(group => (

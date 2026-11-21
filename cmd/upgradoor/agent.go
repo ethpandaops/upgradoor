@@ -9,7 +9,7 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/agent"
 	"github.com/ethpandaops/upgradoor/pkg/agent/host"
-	"github.com/ethpandaops/upgradoor/pkg/agent/registry"
+	"github.com/ethpandaops/upgradoor/pkg/registryauth"
 )
 
 func newAgentCmd(log *logrus.Logger) *cobra.Command {
@@ -41,8 +41,7 @@ func runAgent(ctx context.Context, log *logrus.Logger, configFile string) error 
 		return err
 	}
 
-	// One set of logins for the registry lookups and the pulls.
-	logins, err := registry.LoadLogins(log, cfg.Registry.AuthFile)
+	logins, err := registryauth.LoadLogins(log, cfg.Registry.AuthFile)
 	if err != nil {
 		return err
 	}
@@ -59,7 +58,7 @@ func runAgent(ctx context.Context, log *logrus.Logger, configFile string) error 
 	}()
 
 	svc, err := agent.New(log, cfg, creds, &agent.Deps{
-		Host: machine, Logins: logins, Version: version,
+		Host: machine, Version: version,
 	})
 	if err != nil {
 		return err

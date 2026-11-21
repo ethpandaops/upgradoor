@@ -162,11 +162,11 @@ func TestSettingsFieldsCoverEveryField(t *testing.T) {
 	// Every field of fleet.Settings must have its own key: a field with
 	// `json:"-"` or omitempty would silently never be stored.
 	assert.ElementsMatch(t, []string{
-		"maxUnavailablePercent", "maxIndependentPercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyEpochs", "minPeers",
+		"maxUnavailablePercent", "maxLeasedPercent", "maxIndependentPercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyEpochs", "minPeers",
 		"leaseTtl", "hostStaleAfter", "readinessTimeout",
 		"policyImage", "policyPackages", "policyReboot", "policyDefaultGroup", "paused",
 		"pauseAfterCanaryImage", "pauseAfterCanaryPackages", "pauseAfterCanaryReboot", "readyPeerShare",
-		"lookupInterval", "maxPullingPercent",
+		"lookupInterval",
 		"policyClients",
 	}, keysOf(fields))
 }

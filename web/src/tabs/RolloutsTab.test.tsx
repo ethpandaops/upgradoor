@@ -44,10 +44,10 @@ describe('RolloutsTab', () => {
         .map(li => li.textContent)
     ).toEqual([expect.stringMatching(/^sigp\/lighthouse:unstable@[0-9a-f]{12}revision [0-9a-f]{8}$/) as string]);
 
-    // The hosts that wait for their images say so.
+    // A host that waits to pull its image again says so.
     const hosts = within(card).getByRole('table', { name: /^Hosts of / });
     expect(within(hosts).getByText('lighthouse-geth-4').closest('tr')).toHaveTextContent(
-      'waiting for its images to be pulled'
+      'waiting to pull its image again after a failed pull'
     );
   });
 });

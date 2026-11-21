@@ -109,5 +109,5 @@ func (c *Config) defaulted() bool {
 	return c.StateDir != "" && c.Local.OverridesFile != "" && c.Local.Socket.Path != "" &&
 		c.Controller.SyncInterval > 0 && c.Controller.LeaseSyncInterval > 0 &&
 		c.Controller.MinSyncInterval > 0 && c.Controller.MaxSyncInterval >= c.Controller.MinSyncInterval &&
-		c.Registry.PollInterval > 0 && c.Verify.Window > 0 && c.Verify.Timeout > 0
+		c.Registry.AuthFile != "" && c.Verify.Window > 0 && c.Verify.Timeout > 0
 }

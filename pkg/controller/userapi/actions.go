@@ -54,7 +54,7 @@ func (s *Handler) actions() map[string]UserHandler {
 		"end-lease": action(s, needEndLease, validateEndLease, sched.EndLease),
 		"pause":     action(s, needScope, validateScope(false), sched.Pause),
 		"resume":    action(s, needScope, validateScope(false), sched.Resume),
-		"abort":     action(s, needScope, validateScope(true), sched.Abort),
+		"abort":     action(s, needAbort, validateScope(true), sched.Abort),
 		"skip":      action(s, needRecoverHosts, validateRolloutHosts(true), sched.Skip),
 		"retry":     action(s, needRetry, validateRolloutHosts(false), sched.Retry),
 	}
@@ -174,13 +174,19 @@ func needEndLease(req *scheduler.EndLeaseRequest) authz.Requirement {
 	return authz.Requirement{Feature: authz.FeatureRecover, Team: authz.LeaseTarget(req.Lease)}
 }
 
-// needScope: supervise for one rollout (pause, resume, abort); without a
-// rollout the request is the global switch and needs admin.
+// needScope: supervise, or team_supervise for the client of the rollout,
+// for pause and resume (which approves) of one rollout; without a rollout
+// the request is the global switch and needs admin.
 func needScope(req *scheduler.ScopeRequest) authz.Requirement {
 	if req.Rollout == "" {
 		return authz.Requirement{Feature: authz.FeatureAdmin}
 	}
 
+	return authz.Requirement{Feature: authz.FeatureSupervise, Team: authz.RolloutTarget(req.Rollout)}
+}
+
+// needAbort: supervise. An abort is final: it has no twin.
+func needAbort(*scheduler.ScopeRequest) authz.Requirement {
 	return authz.Requirement{Feature: authz.FeatureSupervise}
 }
 
@@ -190,19 +196,14 @@ func needRecoverHosts(req *scheduler.RolloutHostsRequest) authz.Requirement {
 }
 
 // needRetry: without hosts it reopens the whole rollout and needs supervise.
-// With hosts it is the recovery of those hosts, like skip, unless the rollout
-// is aborted: retrying an aborted rollout reopens its cause for every host,
-// whatever hosts the request names, and needs supervise (authorize reads the
-// rollout).
+// With hosts it is the recovery of those hosts, like skip. An aborted
+// rollout is retried by nobody (the scheduler answers 409).
 func needRetry(req *scheduler.RolloutHostsRequest) authz.Requirement {
 	if len(req.Hosts) == 0 {
 		return authz.Requirement{Feature: authz.FeatureSupervise}
 	}
 
-	need := needRecoverHosts(req)
-	need.Reopens = req.Rollout
-
-	return need
+	return needRecoverHosts(req)
 }
 
 // action builds the handler of one action: decode, authorize, validate, call,
@@ -238,7 +239,7 @@ func action[T any](
 
 		result, err := call(ctx, u.Actor, req)
 		if err != nil {
-			s.writeSchedulerError(w, r, err)
+			s.writeSchedulerError(w, r, u, err)
 
 			return
 		}
@@ -257,7 +258,7 @@ func action[T any](
 // request's authorization does not allow on the state the scheduler finds is
 // 403. Those messages
 // are written by the scheduler for people; anything else stays internal.
-func (s *Handler) writeSchedulerError(w http.ResponseWriter, r *http.Request, err error) {
+func (s *Handler) writeSchedulerError(w http.ResponseWriter, r *http.Request, u *authz.User, err error) {
 	switch {
 	case errors.Is(err, scheduler.ErrUnknownHost), errors.Is(err, scheduler.ErrUnknownRollout),
 		errors.Is(err, scheduler.ErrUnknownLease):
@@ -268,8 +269,7 @@ func (s *Handler) writeSchedulerError(w http.ResponseWriter, r *http.Request, er
 		// The scheduler asked again, under its lock, what authorize asked
 		// before: the answer has the same shape.
 		msg := strings.TrimPrefix(err.Error(), scheduler.ErrForbidden.Error()+": ")
-		s.log.WithField("reason", msg).Debug("Refused user request")
-		httpjson.Error(s.log, w, http.StatusForbidden, "forbidden: "+s.opts.AuthService+":"+msg)
+		s.authz.Refuse(w, r, u, "forbidden: "+s.opts.AuthService+":"+msg)
 	default:
 		httpjson.InternalError(s.log, w, r, err)
 	}

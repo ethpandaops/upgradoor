@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -17,6 +18,7 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 	"github.com/ethpandaops/upgradoor/pkg/controller/controllertest"
+	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
@@ -39,6 +41,7 @@ type harness struct {
 	store   *controllertest.Store
 	sched   *controllertest.Scheduler
 	beacon  *controllertest.Beacon
+	lookups *controllertest.Lookups
 	clock   *controllertest.Clock
 	// notified counts the calls of Options.Notify.
 	notified atomic.Int32
@@ -49,11 +52,12 @@ func newHarness(t *testing.T, mod func(*Options)) *harness {
 	t.Helper()
 
 	h := &harness{
-		t:      t,
-		store:  controllertest.NewStore(),
-		sched:  controllertest.NewScheduler(),
-		beacon: &controllertest.Beacon{},
-		clock:  controllertest.NewClock(controllertest.Epoch),
+		t:       t,
+		store:   controllertest.NewStore(),
+		sched:   controllertest.NewScheduler(),
+		beacon:  &controllertest.Beacon{},
+		lookups: &controllertest.Lookups{Refreshable: discovery.Refreshed{Tags: 3}},
+		clock:   controllertest.NewClock(controllertest.Epoch),
 	}
 
 	opts := Options{
@@ -62,6 +66,7 @@ func newHarness(t *testing.T, mod func(*Options)) *harness {
 		AuthService:     "upgradoor",
 		Store:           h.store,
 		Scheduler:       h.sched,
+		Lookups:         h.lookups,
 		Beacon:          h.beacon,
 		DefaultSettings: fleet.DefaultSettings(),
 		Notify:          func() { h.notified.Add(1) },
@@ -300,7 +305,12 @@ func runAuthz(t *testing.T, h *harness, tt *authzCase) {
 	}
 
 	assert.Len(t, calls, len(before), "a refused request does not reach the scheduler")
-	assert.Equal(t, audit, h.store.AuditEntries(), "a refused request is not audited")
+
+	notRefusals := func(entries []fleet.AuditEntry) []fleet.AuditEntry {
+		return slices.DeleteFunc(entries, func(e fleet.AuditEntry) bool { return e.Action == "auth.refused" })
+	}
+	assert.Len(t, notRefusals(h.store.AuditEntries()), len(notRefusals(audit)),
+		"a refused request is audited as a refusal only")
 }
 
 // actionSample is one request per kind of action, on targets the team
@@ -366,8 +376,8 @@ func actionSamples(t *testing.T) []actionSample {
 			action: "client-policy", body: `{"client":"lighthouse","policy":"manual"}`,
 			feature: authz.FeatureClientPolicy, twin: true,
 		},
-		{action: "pause", body: `{"rollout":"r-1"}`, feature: authz.FeatureSupervise},
-		{action: "resume", body: `{"rollout":"r-1"}`, feature: authz.FeatureSupervise},
+		{action: "pause", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureSupervise, twin: true},
+		{action: "resume", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureSupervise, twin: true},
 		{action: "abort", body: `{"rollout":"r-1"}`, feature: authz.FeatureSupervise},
 		{action: "retry", body: `{"rollout":"r-1"}`, feature: authz.FeatureSupervise},
 		{action: "pause", body: `{}`, feature: authz.FeatureAdmin},

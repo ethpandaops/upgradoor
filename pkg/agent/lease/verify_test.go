@@ -1,6 +1,7 @@
 package lease
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"strings"
@@ -62,12 +63,11 @@ func TestVerifyingCatchesARestartingContainer(t *testing.T) {
 
 	op := e.awaitFinished("lease-crashloop")
 	assert.Equal(t, protocol.PhaseFailed, op.Phase)
-	assert.Contains(t, op.Error, "did not stay up")
-	assert.Contains(t, op.Error, "geth restarted")
+	assert.Contains(t, op.Error, "container geth is restarting: ")
 	// The recreate itself worked; what failed is the operation.
 	assert.Equal(t, protocol.StepDone, stepOf(t, op, need.ID).Status)
 
-	e.assertPhases("lease-crashloop", protocol.PhaseApplying, protocol.PhaseStarting,
+	e.assertPhases("lease-crashloop", protocol.PhasePulling, protocol.PhaseApplying, protocol.PhaseStarting,
 		protocol.PhaseVerifying, protocol.PhaseFailed)
 }
 
@@ -97,6 +97,9 @@ type tickingHost struct {
 
 	clock    *steppedClock
 	startsAt time.Time
+	// state is geth's state; empty is running.
+	state    string
+	exitCode int
 	flapping bool
 	restarts int
 }
@@ -108,7 +111,10 @@ func (h *tickingHost) Containers(context.Context) ([]protocol.Container, error) 
 		h.restarts++
 	}
 
-	return []protocol.Container{{Name: "geth", State: protocol.StateRunning, RestartCount: h.restarts}}, nil
+	return []protocol.Container{{
+		Name: "geth", State: cmp.Or(h.state, protocol.StateRunning), ExitCode: h.exitCode,
+		RestartCount: h.restarts,
+	}}, nil
 }
 
 func (h *tickingHost) Start(context.Context, string) error {
@@ -163,16 +169,60 @@ func TestStartingAndVerifyingShareOneTimeout(t *testing.T) {
 	clock := &steppedClock{now: time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)}
 	began := clock.Now()
 
-	// Starting takes 60 of the 100 seconds; geth then never stays up.
-	rec := bringBack(t, &tickingHost{clock: clock, startsAt: began.Add(60 * time.Second), flapping: true})
+	// Starting takes 60 of the 100 seconds; geth then never comes up.
+	rec := bringBack(t, &tickingHost{
+		clock: clock, startsAt: began.Add(60 * time.Second), state: protocol.StateRestarting,
+	})
 
 	assert.Equal(t, protocol.PhaseFailed, rec.Operation.Phase)
-	assert.Contains(t, rec.Operation.Error, "did not stay up")
-	assert.Contains(t, rec.Operation.Error, "container geth restarted")
+	assert.Equal(t, "containers did not stay up for 10s within 1m40s: container geth is restarting",
+		rec.Operation.Error)
 
 	took := clock.Now().Sub(began)
 	assert.GreaterOrEqual(t, took, 100*time.Second)
 	assert.LessOrEqual(t, took, 102*time.Second, "starting and verifying took %s of 100s", took)
+}
+
+// A crash loop or a container that exited for good fails verifying at once.
+func TestVerifyingFailsEarly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		host tickingHost
+		err  string
+	}{
+		{
+			name: "crash loop", host: tickingHost{state: protocol.StateRestarting, flapping: true},
+			err: "container geth is restarting: 3 restarts",
+		},
+		{
+			name: "running between restarts", host: tickingHost{flapping: true},
+			err: "container geth is restarting: 3 restarts",
+		},
+		{
+			name: "exited", host: tickingHost{state: protocol.StateExited, exitCode: 1},
+			err: "container geth is exited (exit code 1)",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			clock := &steppedClock{now: time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)}
+			began := clock.Now()
+
+			h := tt.host
+			h.clock, h.startsAt = clock, began
+
+			rec := bringBack(t, &h)
+
+			assert.Equal(t, protocol.PhaseFailed, rec.Operation.Phase)
+			assert.Equal(t, tt.err, rec.Operation.Error)
+			assert.Less(t, clock.Now().Sub(began), 10*time.Second, "failed before the window")
+		})
+	}
 }
 
 // The window is measured on the agent's clock.

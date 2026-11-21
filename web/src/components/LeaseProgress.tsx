@@ -1,19 +1,24 @@
 import { list, type Lease } from '../api/types';
 import { cx } from './primitives';
 
-const STEPS = ['Drain', 'Apply', 'Reboot', 'Start', 'Verify', 'Ready check'] as const;
+const STEPS = ['Pull', 'Drain', 'Apply', 'Reboot', 'Start', 'Verify', 'Ready check'] as const;
 type StepName = (typeof STEPS)[number];
 
 /** leaseStep says which step a lease is in, or -1 before the agent picked it up. */
 function leaseStep(lease: Lease): { steps: StepName[]; current: number; failed: boolean } {
   const reboots = list(lease.needs).some(n => n.kind === 'reboot');
-  const steps = STEPS.filter(s => s !== 'Reboot' || reboots);
+  // Only an operation that recreates containers pulls.
+  const pulls =
+    lease.operation?.phase === 'pulling' || list(lease.needs).some(n => n.kind !== 'packages' && n.kind !== 'reboot');
+  const steps = STEPS.filter(s => (s !== 'Reboot' || reboots) && (s !== 'Pull' || pulls));
   const at = (name: StepName) => steps.indexOf(name);
   const failed = lease.state === 'failed' || lease.operation?.phase === 'failed';
 
   if (lease.state === 'verifying') return { steps, current: at('Ready check'), failed };
 
   switch (lease.operation?.phase) {
+    case 'pulling':
+      return { steps, current: at('Pull'), failed };
     case 'draining':
       return { steps, current: at('Drain'), failed };
     case 'applying':
@@ -35,7 +40,8 @@ function leaseStep(lease: Lease): { steps: StepName[]; current: number; failed: 
 }
 
 /**
- * LeaseProgress shows where a host is in its lease: the agent drains, applies
+ * LeaseProgress shows where a host is in its lease: the agent pulls the
+ * images (nothing is stopped yet), drains, applies
  * (and reboots), starts and verifies; then the controller checks that the
  * node is back at head with peers and its validators attest again (the ready
  * check) before it releases the lease.

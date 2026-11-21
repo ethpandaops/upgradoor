@@ -115,6 +115,77 @@ func (p *pass) syncDirectives() {
 	}
 }
 
+// syncWithdrawals takes back the manual needs that hosts report and nothing
+// serves any more: the need of a directive whose rollout is closed or
+// unknown, or that the host left (skipped, aborted). A need of the host's
+// open lease is left to the lease. A withdraw directive is repeated until the
+// agent answers it or the host no longer reports the need.
+func (p *pass) syncWithdrawals() {
+	for _, name := range p.names {
+		hv := p.hosts[name]
+		if hv.h.Status == nil || hv.stale {
+			continue
+		}
+
+		unwanted := make(map[string]bool, 1)
+
+		for _, n := range hv.needs() {
+			if n.DirectiveID != "" && !p.manualWanted(hv, n.DirectiveID) &&
+				(hv.lease == nil || !slices.ContainsFunc(hv.lease.Needs, func(l protocol.Need) bool {
+					return l.ID == n.ID
+				})) {
+				unwanted[n.DirectiveID] = true
+			}
+		}
+
+		for _, d := range p.byHost[name] {
+			if d.Kind != protocol.DirectiveWithdraw || d.State != fleet.DirectivePending {
+				continue
+			}
+
+			if unwanted[d.Withdraws] {
+				delete(unwanted, d.Withdraws)
+			} else {
+				d.State = fleet.DirectiveCancelled
+			}
+		}
+
+		for _, id := range sortedKeys(unwanted) {
+			p.addDirective(&fleet.Directive{
+				Directive: protocol.Directive{
+					ID: p.w.NewID(), Kind: protocol.DirectiveWithdraw, Withdraws: id,
+					Reason: "its rollout no longer serves this host",
+				},
+				Host:      name,
+				State:     fleet.DirectivePending,
+				CreatedBy: actorScheduler,
+				CreatedAt: p.now,
+			})
+		}
+	}
+}
+
+// manualWanted reports whether the manual directive of the host belongs to
+// an open rollout in which the host still waits or was served.
+func (p *pass) manualWanted(hv *hostView, id string) bool {
+	for _, d := range p.byHost[hv.h.Name] {
+		if d.ID != id {
+			continue
+		}
+
+		r := p.rolloutByID[d.RolloutID]
+		if r == nil || r.State.Terminal() {
+			return false
+		}
+
+		m := p.member(r, hv.h.Name)
+
+		return m != nil && m.State != fleet.HostSkipped && m.State != fleet.HostAborted
+	}
+
+	return false
+}
+
 // settleOverride records the agent's answer to an override directive, which
 // belongs to no rollout that would show it, and withdraws one that the agent
 // has not answered in time.
@@ -149,7 +220,7 @@ func holdActor(h *fleet.Host) *protocol.Actor {
 	}
 
 	feature := "staff"
-	if h.HoldBy == fleet.HoldByTeam {
+	if _, team := fleet.HoldTeams(h.HoldBy); team {
 		feature = "team"
 	}
 
@@ -211,7 +282,7 @@ func (p *pass) syncRollouts() {
 
 	p.supersede(rep)
 
-	created := p.open(rep)
+	p.open(rep)
 
 	p.assignNeeds()
 
@@ -220,7 +291,7 @@ func (p *pass) syncRollouts() {
 			continue
 		}
 
-		p.syncMembers(r, created[r.ID])
+		p.syncMembers(r)
 		p.complete(r)
 		p.pauseAfterCanary(r)
 	}
@@ -336,7 +407,7 @@ func (rep *reportedNeeds) group(n *protocol.Need, checked time.Time) {
 	g.add(n, checked)
 }
 
-// registryChecked is when the host last looked at the tag of a container.
+// registryChecked is when the tag of a container was looked up, as the host has it.
 func registryChecked(h *fleet.Host, container string) time.Time {
 	if h.Status == nil {
 		return time.Time{}
@@ -421,14 +492,12 @@ func (p *pass) closeRollout(r *fleet.Rollout, state fleet.RolloutState, reason s
 	p.record("rollout."+string(state), r.ID, map[string]any{keyKey: r.Key, keyReason: reason})
 }
 
-// open creates a rollout for every reported cause that has none. It returns
-// the IDs of the new rollouts.
-func (p *pass) open(rep *reportedNeeds) map[string]bool {
-	created := make(map[string]bool, 2)
+// open creates a rollout for every reported cause that has none.
+func (p *pass) open(rep *reportedNeeds) {
 	openKeys := p.openKeys()
 
 	add := func(r *fleet.Rollout) {
-		if openKeys[r.Key] {
+		if openKeys[r.Key] || p.w.AbortedKeys[r.Key] {
 			return
 		}
 
@@ -441,8 +510,6 @@ func (p *pass) open(rep *reportedNeeds) map[string]bool {
 		p.rollouts = append(p.rollouts, r)
 		p.rolloutByID[r.ID] = r
 		openKeys[r.Key] = true
-
-		created[r.ID] = true
 
 		p.record("rollout.created", r.ID, map[string]any{keyKey: r.Key, "title": r.Title})
 	}
@@ -483,8 +550,6 @@ func (p *pass) open(rep *reportedNeeds) map[string]bool {
 			Title: localTitle(host, rep.local[host]),
 		})
 	}
-
-	return created
 }
 
 // assignNeeds sorts every reported need to the open rollout it belongs to.
@@ -547,9 +612,8 @@ func (p *pass) assignNeeds() {
 	}
 }
 
-// syncMembers updates the members of one open rollout. created says that
-// the rollout was created in this pass.
-func (p *pass) syncMembers(r *fleet.Rollout, created bool) {
+// syncMembers updates the members of one open rollout.
+func (p *pass) syncMembers(r *fleet.Rollout) {
 	needs := p.needs[r.ID]
 
 	for i := range r.Hosts {
@@ -584,10 +648,6 @@ func (p *pass) syncMembers(r *fleet.Rollout, created bool) {
 	r.Hosts = append(r.Hosts, joined...)
 
 	p.stages(r)
-
-	if created && r.Kind == fleet.RolloutGroup {
-		p.recheckExpected(r)
-	}
 }
 
 // stages settles the canary and gives every member its stage: the canary is
@@ -602,11 +662,11 @@ func (p *pass) stages(r *fleet.Rollout) {
 		m := &r.Hosts[i]
 
 		switch {
+		case m.Stage == fleet.StageRepair && m.State == fleet.HostDone && m.LeaseID != "":
 		case r.Canary == m.Host:
 			m.Stage = fleet.StageCanary
 		case p.broken(r, m.Host):
 			m.Stage = fleet.StageRepair
-		case m.Stage == fleet.StageRepair && m.State == fleet.HostDone && m.LeaseID != "":
 		default:
 			m.Stage = fleet.StageRest
 		}
@@ -778,33 +838,6 @@ func (p *pass) canaryBefore(a, b *fleet.RolloutHost) bool {
 	) < 0
 }
 
-// recheckExpected queues a recheck directive for every expected host of a
-// new image rollout so it reports within one sync.
-func (p *pass) recheckExpected(r *fleet.Rollout) {
-	for i := range r.Hosts {
-		m := &r.Hosts[i]
-		if m.State != fleet.HostExpected {
-			continue
-		}
-
-		if slices.ContainsFunc(p.byHost[m.Host], func(d *fleet.Directive) bool {
-			return d.Kind == protocol.DirectiveRecheck && d.State == fleet.DirectivePending
-		}) {
-			continue
-		}
-
-		p.addDirective(&fleet.Directive{
-			Directive: protocol.Directive{
-				ID: p.w.NewID(), Kind: protocol.DirectiveRecheck, Reason: r.Title,
-			},
-			Host:      m.Host,
-			State:     fleet.DirectivePending,
-			CreatedBy: actorScheduler,
-			CreatedAt: p.now,
-		})
-	}
-}
-
 // syncMember applies the membership rules to one existing member.
 func (p *pass) syncMember(r *fleet.Rollout, m *fleet.RolloutHost, needs []protocol.Need) {
 	hv := p.hosts[m.Host]
@@ -973,6 +1006,8 @@ func (p *pass) blocks(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 		return false
 	case fleet.HostSkipped:
 		return operatorSkipped(m) && r.Kind != fleet.RolloutManual
+	case fleet.HostAborted:
+		return false
 	case fleet.HostExpected:
 		return p.blockingExpected(r, m)
 	default:

@@ -10,7 +10,7 @@ import { OverrideButtons, OverrideSummary } from '../components/Overrides';
 import { IntentAction } from '../components/SelectionBar';
 import { RelTime } from '../components/RelTime';
 import { Badge, Dash, Empty, ErrorBanner, Loading, Section, Table, Td, Th, cx } from '../components/primitives';
-import { ImpactBadge, NeedLine, PullBadge } from '../components/status';
+import { ImpactBadge, NeedLine } from '../components/status';
 import { percentOf, shortRevision } from '../lib/format';
 import { holdIntent, offlineIntent } from '../lib/intents';
 import { hostOwners, rollableContainers } from './hostRows';
@@ -90,8 +90,7 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
               <ValidatorRange host={h} />
             </Fact>
             <Fact label="certificate">
-              <ShortId value={h.certHash} label="certificate hash" />{' '}
-              <span className="text-muted">generation {h.generation}</span>
+              <ShortId value={h.certHash} label="certificate hash" />
             </Fact>
             <Fact label="first seen">
               <RelTime value={h.firstSeen} />
@@ -113,8 +112,8 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
                 <Badge
                   tone="warning"
                   title={
-                    h.holdBy === 'team'
-                      ? 'Set through a team feature: a member of a team that owns a container of this host can lift it'
+                    h.holdBy?.startsWith('team:') === true
+                      ? 'Set through a team feature: a member of the team that set it can lift it'
                       : h.holdWanted
                         ? 'Set by staff: a team feature does not lift it'
                         : undefined
@@ -131,11 +130,6 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
                 </span>
               )}
             </Fact>
-            {h.plan.pull && (
-              <Fact label="images">
-                <PullBadge pull={h.plan.pull} />
-              </Fact>
-            )}
             {h.broken && Object.keys(h.broken).length > 0 && (
               <Fact label="broken">
                 <span className="flex flex-wrap gap-1">
@@ -517,8 +511,11 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
                     <Digest value={c.registry.digest} />
                     {behind && <Badge tone="warning">{c.registry.pulled ? 'newer, pulled' : 'newer'}</Badge>}
                     {c.registry.error && (
-                      <Badge tone="danger" title={c.registry.error}>
-                        check failed
+                      <Badge
+                        tone="danger"
+                        title={c.registry.pullFailed ? `image pull failed: ${c.registry.error}` : c.registry.error}
+                      >
+                        {c.registry.pullFailed ? 'pull failed' : 'check failed'}
                       </Badge>
                     )}
                     <span className="text-faint">

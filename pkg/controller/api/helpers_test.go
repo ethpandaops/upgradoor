@@ -57,6 +57,7 @@ func newHarness(t *testing.T, mod func(*Options)) *harness {
 		Store:           h.store,
 		Scheduler:       h.sched,
 		Beacon:          h.beacon,
+		Lookups:         &controllertest.Lookups{},
 		DefaultSettings: fleet.DefaultSettings(),
 		Now:             h.clock.Now,
 		Registry:        h.reg,

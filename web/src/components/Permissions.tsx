@@ -27,11 +27,14 @@ export interface Permissions {
   login: Login;
   /** admin reports whether the login may set force and ignoreBudget and select the whole fleet. */
   admin: boolean;
+  /** refreshImages reports whether the login may ask for a registry lookup of every tag now (the feature roll). */
+  refreshImages: boolean;
   /**
    * can decides one call. leaseHost names the host of the lease an end-lease
-   * call is about, rolloutState the state of the rollout a retry is about.
+   * call is about, rolloutClient the client of the rollout a pause or resume
+   * is about ("" for none).
    */
-  can: (call: PermissionCall, leaseHost?: string, rolloutState?: string) => Verdict;
+  can: (call: PermissionCall, leaseHost?: string, rolloutClient?: string) => Verdict;
   /** canIntent decides whether the dialog of an intent can end in a call the login may make. */
   canIntent: (intent: ActionIntent) => Verdict;
   /**
@@ -61,12 +64,12 @@ function build(
   clients: readonly OwnedClient[],
   ready: boolean
 ): Permissions {
-  const decide = (call: PermissionCall, leaseHost?: string, rolloutState?: string): Verdict => {
+  const decide = (call: PermissionCall, leaseHost?: string, rolloutClient?: string): Verdict => {
     const verdict = can(login, call, {
       hosts,
       clients,
       leaseHost: () => leaseHost,
-      rolloutState: () => rolloutState,
+      rolloutClient: () => rolloutClient,
     });
 
     // Until the hosts are loaded nobody owns anything: say so instead.
@@ -100,7 +103,7 @@ function build(
           body: buildRebootRequest({ hosts: intent.hosts, all: intent.all, ...QUIET }),
         });
       case 'call':
-        return decide(intent.make(''), intent.leaseHost, intent.rolloutState);
+        return decide(intent.make(''), intent.leaseHost, intent.rolloutClient);
       case 'client-override': {
         // One part the login may override is enough to open the dialog; the controller judges every host.
         const parts = intent.part === 'clear' ? (['image', 'flags'] as const) : ([intent.part] as const);
@@ -136,6 +139,7 @@ function build(
   return {
     login,
     admin: login.open || login.hasFeature(FEATURE.admin),
+    refreshImages: login.open || login.hasFeature(FEATURE.roll),
     can: decide,
     canIntent,
     ownContainers,

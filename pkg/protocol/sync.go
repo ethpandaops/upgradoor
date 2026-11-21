@@ -72,11 +72,13 @@ type SyncRequest struct {
 	// answers WantInventory when it does not hold that inventory.
 	InventoryHash string `json:"inventoryHash"`
 
+	// Tags are the tags the host follows (references as it writes them, at
+	// most MaxTags): those its managed containers run and those they are to
+	// move to. The controller looks them up and answers Digests.
+	Tags []string `json:"tags,omitempty"`
+
 	// Needs are all currently open needs of the host.
 	Needs []Need `json:"needs"`
-	// Pulling are the tag references the agent is pulling right now, inside
-	// the pull window the controller granted.
-	Pulling []string `json:"pulling,omitempty"`
 	// Operation is the lease the agent is working on or has just finished.
 	Operation *Operation `json:"operation,omitempty"`
 	// DirectiveAcks answer directives received in earlier responses.
@@ -400,19 +402,25 @@ func (c *Container) ShouldRun() bool {
 	}
 }
 
-// RegistryCheck is the result of the agent's last look at a tag.
+// RegistryCheck is what the agent knows of a tag: the digest the controller
+// looked up, and whether the image is local at it.
 type RegistryCheck struct {
 	// Digest is the manifest digest the tag points at (the index digest for
 	// multi-arch tags).
 	Digest string `json:"digest,omitempty"`
 	// Revision is the revision label of the image for Digest, read from the
 	// local image: it is empty until that image is pulled.
-	Revision  string    `json:"revision,omitempty"`
+	Revision string `json:"revision,omitempty"`
+	// CheckedAt is when the controller looked the tag up.
 	CheckedAt time.Time `json:"checkedAt"`
-	// Error is the last check error; Digest then holds the last good value.
+	// Error is the lookup, local image or pull error; Digest then holds the
+	// last good value.
 	Error string `json:"error,omitempty"`
 	// Pulled is true when the image for Digest is present locally.
 	Pulled bool `json:"pulled"`
+	// PullFailed is set after a lease could not pull the image, until the
+	// agent lets it be tried again; Error says why.
+	PullFailed bool `json:"pullFailed,omitempty"`
 }
 
 // NodeHealth is the result of the agent's local EL and CL probes. A nil
@@ -524,38 +532,25 @@ type SyncResponse struct {
 	// local bounds.
 	NextSyncMillis int64 `json:"nextSyncMillis"`
 
-	// Lookups are the tags (references as the agent reported them) this
-	// host is to look up at the registry now: the controller hands the duty
-	// for each tag to one host at a time, in turn.
-	Lookups []string `json:"lookups,omitempty"`
-	// Digests are what the tags this host follows point at, as another host
-	// saw it: a signal for the agent, which then looks at its local images.
-	// The controller never asks a registry itself.
+	// Digests are what the tags of the request point at, by the controller's
+	// lookups at the registries. The agent compares them with its local
+	// images and pulls an image as the first phase of the lease that needs it.
 	Digests []TagDigest `json:"digests,omitempty"`
-	// Pull is the host's pull window: the images it may pull now, those of
-	// its needs in the rollouts it waits in. Absent: pull nothing.
-	Pull *PullWindow `json:"pull,omitempty"`
-	// LookupFallbackSeconds is how long the agent goes without an answer
-	// before it looks up its tags itself again (three lookup intervals).
-	LookupFallbackSeconds int64 `json:"lookupFallbackSeconds,omitempty"`
 }
 
-// TagDigest is what one tag points at, by the newest lookup of any host.
+// MaxTags bounds SyncRequest.Tags.
+const MaxTags = 64
+
+// TagDigest is what one tag points at, by the controller's newest lookup.
 type TagDigest struct {
-	Ref       string    `json:"ref"`
-	Digest    string    `json:"digest"`
+	// Ref is the reference as the host wrote it.
+	Ref string `json:"ref"`
+	// Digest is the manifest digest (the index digest for multi-arch tags);
+	// after a failed lookup the last good one, empty when there is none.
+	Digest    string    `json:"digest,omitempty"`
 	CheckedAt time.Time `json:"checkedAt"`
-}
-
-// PullWindow names the images a host may pull.
-type PullWindow struct {
-	Images []PullImage `json:"images"`
-}
-
-// PullImage is one image of a pull window: a tag at a digest.
-type PullImage struct {
-	Ref    string `json:"ref"`
-	Digest string `json:"digest"`
+	// Error is why the newest lookup failed.
+	Error string `json:"error,omitempty"`
 }
 
 // EndedLease says how a lease ended.

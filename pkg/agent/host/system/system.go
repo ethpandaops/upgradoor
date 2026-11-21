@@ -6,6 +6,8 @@
 // Only the closed set of programs runs (dpkg-query, dpkg, apt-get,
 // systemctl), by absolute path, with a fixed environment, no shell and
 // bounded output; only packages of the configured blocked set are upgraded.
+// An agent that is not root is given a command for the upgrade and one for
+// the reboot (Commands), which run in their place.
 package system
 
 import (
@@ -32,7 +34,7 @@ type System interface {
 	// UpgradePackages upgrades exactly the named packages; a name outside
 	// the blocked set is an error before anything runs.
 	UpgradePackages(ctx context.Context, names []string) error
-	// Reboot issues systemctl reboot and returns once it is accepted.
+	// Reboot issues the reboot and returns once it is accepted.
 	Reboot(ctx context.Context) error
 }
 
@@ -50,8 +52,11 @@ type Status struct {
 
 // New returns the operating system of this host. blocked are the packages
 // UpgradePackages may upgrade; an invalid name is dropped with a warning.
-func New(log logrus.FieldLogger, blocked []string) System {
-	return newOSSystem(log, blocked, "/", execRunner{})
+func New(log logrus.FieldLogger, blocked []string, commands Commands) System {
+	s := newOSSystem(log, blocked, "/", execRunner{})
+	s.commands = commands
+
+	return s
 }
 
 var _ System = (*osSystem)(nil)
@@ -73,7 +78,9 @@ type osSystem struct {
 	root    string
 	runner  commandRunner
 	blocked map[string]struct{}
-	now     func() time.Time
+	// commands replace apt-get and systemctl where set.
+	commands Commands
+	now      func() time.Time
 	// listsLockRetry is the pause between apt-get update attempts while the lists are locked.
 	listsLockRetry time.Duration
 
@@ -221,12 +228,19 @@ func (s *osSystem) Inventory(ctx context.Context) (*protocol.Inventory, error) {
 func (s *osSystem) Reboot(ctx context.Context) error {
 	s.log.Warn("Rebooting the host")
 
-	_, err := s.runner.Run(ctx, cmdSystemctl, "reboot")
+	var err error
+
+	if argv := s.commands.Reboot; len(argv) > 0 {
+		_, err = s.runner.Exec(ctx, argv)
+	} else {
+		_, err = s.runner.Run(ctx, cmdSystemctl, "reboot")
+	}
+
 	if err == nil {
 		return nil
 	}
 
-	// systemctl itself can be terminated by the shutdown it started.
+	// The command itself can be terminated by the shutdown it started.
 	var cmdErr *commandError
 	if errors.As(err, &cmdErr) && cmdErr.Signal == syscall.SIGTERM && ctx.Err() == nil {
 		return nil

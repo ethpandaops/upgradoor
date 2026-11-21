@@ -253,6 +253,7 @@ func TestCanaryThatCannotFitTheBudgetDoesNotStallTheRollout(t *testing.T) {
 func TestHostWithoutLiveValidatorsIsNeitherFirstNorCanary(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 100
+	b.w.Settings.MaxLeasedPercent = 100
 	b.w.Settings.MinParticipationPercent = 50
 
 	for _, name := range []string{"dead", "x", "y", "z"} {
@@ -286,6 +287,7 @@ func canaryPauseReplay(t *testing.T, restart bool) *replay {
 	r.set(func(s *fleet.Settings) {
 		s.PauseAfterCanaryPackages = true
 		s.MaxUnavailablePercent = 100
+		s.MaxLeasedPercent = 100
 	})
 
 	for _, name := range []string{"a", "b", "c", "d"} {
@@ -430,6 +432,7 @@ func TestCanaryPauseLeavesAPersonsPauseAndComesOnlyWithTheFirstSuccess(t *testin
 		r.set(func(s *fleet.Settings) {
 			s.PauseAfterCanaryPackages = true
 			s.MaxUnavailablePercent = 100
+			s.MaxLeasedPercent = 100
 		})
 
 		for _, name := range []string{"a", "b", "c"} {
@@ -551,6 +554,7 @@ func TestRolloutOpensPerCause(t *testing.T) {
 func TestImageSupersedeCarriesFailedHostsFirst(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 100
+	b.w.Settings.MaxLeasedPercent = 100
 
 	for _, h := range []string{"h1", "h2", "h3"} {
 		b.host(h, 10)
@@ -591,16 +595,6 @@ func TestImageSupersedeCarriesFailedHostsFirst(t *testing.T) {
 	assert.Equal(t, fleet.StageRepair, second.Host("h3").Stage)
 	assert.Equal(t, map[string]string{"h1": "after h3"}, queueReasons(out.Plan))
 
-	// The expected hosts are told to look at the registry now.
-	rechecks := map[string]bool{}
-
-	for _, d := range b.w.Directives {
-		if d.Kind == protocol.DirectiveRecheck && d.State == fleet.DirectivePending {
-			rechecks[d.Host] = true
-		}
-	}
-
-	assert.Equal(t, map[string]bool{"h2": true, "h3": true}, rechecks)
 	// Hosts that still report the old digest do not reopen it.
 	b.step()
 	assert.Len(t, b.w.Rollouts, 1)
@@ -626,7 +620,7 @@ func TestImageSupersedeCarriesFailedHostsFirst(t *testing.T) {
 	b.serve("h3")
 	second = b.mustRollout(second.Key)
 	assert.Equal(t, []string{"h1", "h2"}, b.leasedHosts())
-	assert.Empty(t, second.Canary)
+	assert.Equal(t, "h3", second.Canary, "the repair was the first success")
 	assert.Equal(t, fleet.StageRepair, second.Host("h3").Stage, "a served member keeps its stage")
 }
 
@@ -841,6 +835,7 @@ func TestMembership(t *testing.T) {
 func TestCanaryThenTheRest(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 100
+	b.w.Settings.MaxLeasedPercent = 100
 
 	b.host("tool1", 0)
 	b.host("tool2", 0)
@@ -919,6 +914,7 @@ func TestCanaryChoice(t *testing.T) {
 
 		b := newWorldBuilder(t)
 		b.w.Settings.MaxUnavailablePercent = 100
+		b.w.Settings.MaxLeasedPercent = 100
 
 		for _, name := range sortedKeys(hosts) {
 			b.host(name, hosts[name])
@@ -1323,6 +1319,7 @@ func TestAdoptedControllerHoldIsNotReleased(t *testing.T) {
 func TestStaggeredManualRolloutHasACanary(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 100
+	b.w.Settings.MaxLeasedPercent = 100
 	b.w.Settings.PolicyReboot = fleet.PolicyManual // manual rollouts answer to no policy
 	b.host("v1", 5)
 	b.host("v2", 6)
@@ -1527,6 +1524,7 @@ func TestImageRolloutPerClient(t *testing.T) {
 
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 50 // room for a canary per client
+	b.w.Settings.MaxLeasedPercent = 50
 	b.w.Settings.PolicyClients = make(fleet.ClientPolicies, len(clients))
 
 	for _, tt := range clients {
@@ -1568,4 +1566,80 @@ func TestImageRolloutPerClient(t *testing.T) {
 			assert.Equal(t, tt.granted, leased > 0, "a lease for the canary")
 		})
 	}
+}
+
+// A manual need that its rollout no longer serves is withdrawn: the hosts
+// of an aborted rollout, and a host skipped in an open one, are sent a
+// withdraw directive until their agent drops the need.
+func TestManualNeedsAreWithdrawn(t *testing.T) {
+	h := newHarness(t)
+
+	for _, name := range []string{"a", "b", "c"} {
+		h.addHost(name, 0)
+	}
+
+	res, err := h.svc.Reboot(h.ctx, "alice", RebootRequest{All: true, Staggered: true})
+	require.NoError(t, err)
+
+	directive := make(map[string]string, 3)
+
+	for _, name := range res.Hosts {
+		d := h.assignment(name).Directives[0]
+		directive[name] = d.ID
+
+		h.sync(name, func(st *protocol.SyncRequest) {
+			st.DirectiveAcks = []protocol.DirectiveAck{{ID: d.ID, Status: protocol.DirectiveAccepted}}
+			st.Needs = []protocol.Need{{
+				ID: protocol.ManualNeedID(d.ID), Kind: protocol.NeedReboot, DirectiveID: d.ID,
+				Reboot: &protocol.RebootNeed{Reasons: []string{protocol.RebootReasonManual}},
+			}}
+		})
+	}
+
+	h.tick()
+
+	canary := h.rollout(res.Rollout).Canary
+	require.NotEmpty(t, canary)
+
+	withdraws := func(name string) []string {
+		var out []string
+
+		for _, d := range h.assignment(name).Directives {
+			if d.Kind == protocol.DirectiveWithdraw {
+				out = append(out, d.Withdraws)
+			}
+		}
+
+		return out
+	}
+
+	for _, name := range res.Hosts {
+		assert.Empty(t, withdraws(name), "the open rollout serves %s", name)
+	}
+
+	skipped := slices.DeleteFunc(slices.Clone(res.Hosts), func(n string) bool { return n == canary })[0]
+
+	_, err = h.svc.Skip(h.ctx, "alice", RolloutHostsRequest{Rollout: res.Rollout, Hosts: []string{skipped}})
+	require.NoError(t, err)
+	h.tick()
+	assert.Equal(t, []string{directive[skipped]}, withdraws(skipped))
+
+	_, err = h.svc.Abort(h.ctx, "alice", ScopeRequest{Rollout: res.Rollout})
+	require.NoError(t, err)
+	h.tick()
+
+	for _, name := range res.Hosts {
+		if name == canary {
+			assert.Empty(t, withdraws(name), "the need of an open lease is the lease's")
+
+			continue
+		}
+
+		assert.Equal(t, []string{directive[name]}, withdraws(name), "repeated until answered")
+	}
+
+	// The agent drops the need: nothing more to withdraw.
+	h.sync(skipped, func(st *protocol.SyncRequest) { st.Needs = nil })
+	h.tick()
+	assert.Empty(t, withdraws(skipped))
 }

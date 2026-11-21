@@ -59,8 +59,8 @@ func TestLoadAnswerSigner(t *testing.T) {
 		return path
 	}
 
-	publicKey := func(seed string, net string, generation uint64) string {
-		key, err := identity.DeriveControllerKey([]byte(seed), net, generation)
+	publicKey := func(seed string, net string) string {
+		key, err := identity.DeriveControllerKey([]byte(seed), net)
 		require.NoError(t, err)
 
 		return identity.EncodePublicKey(identity.PublicKey(key))
@@ -76,22 +76,18 @@ func TestLoadAnswerSigner(t *testing.T) {
 		return identity.EncodePublicKey(signer.PublicKey())
 	}
 
-	// The controller derives the key of its own network and generation, the
+	// The controller derives the key of its own network, the
 	// one 'keygen controller-pubkey' gives the agents. A trailing newline of
 	// the file is not part of the seed.
 	good := write("controller.seed", controllerSeed+"\n")
 
-	assert.Equal(t, publicKey(controllerSeed, network, 0),
+	assert.Equal(t, publicKey(controllerSeed, network),
 		signerKey(t, &Config{Network: network, ControllerSeedFile: good}))
-	assert.Equal(t, publicKey(controllerSeed, network, 3),
-		signerKey(t, &Config{Network: network, ControllerSeedFile: good, ControllerGeneration: 3}))
 
-	// Every devnet of a group has a key of its own from the one seed, and a
-	// generation is another key.
+	// Every devnet of a group has a key of its own from the one seed.
 	other := signerKey(t, &Config{Network: "testnet-devnet-1", ControllerSeedFile: good})
-	assert.Equal(t, publicKey(controllerSeed, "testnet-devnet-1", 0), other)
-	assert.NotEqual(t, publicKey(controllerSeed, network, 0), other)
-	assert.NotEqual(t, publicKey(controllerSeed, network, 0), publicKey(controllerSeed, network, 3))
+	assert.Equal(t, publicKey(controllerSeed, "testnet-devnet-1"), other)
+	assert.NotEqual(t, publicKey(controllerSeed, network), other)
 
 	// The opt-out is the only way to run without a seed.
 	signer, err := loadAnswerSigner(&Config{Network: network, AllowUnsignedAgentAnswers: true})
@@ -105,11 +101,6 @@ func TestLoadAnswerSigner(t *testing.T) {
 		Network: network, ControllerSeedFile: good, AllowUnsignedAgentAnswers: true,
 	})
 	require.ErrorContains(t, err, "exclude each other")
-
-	_, err = loadAnswerSigner(&Config{
-		Network: network, AllowUnsignedAgentAnswers: true, ControllerGeneration: 1,
-	})
-	require.ErrorContains(t, err, "--controller-generation without")
 
 	_, err = loadAnswerSigner(&Config{
 		Network: network, ControllerSeedFile: filepath.Join(dir, "missing"),

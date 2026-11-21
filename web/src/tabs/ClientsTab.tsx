@@ -650,7 +650,7 @@ function ApprovalCallout({
                 icon={r.paused ? 'resume' : 'check'}
                 label={r.paused ? 'Resume and approve…' : 'Approve…'}
                 onAction={onAction}
-                intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id)}
+                intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.client)}
               />
             </span>
           </li>

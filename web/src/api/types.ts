@@ -65,6 +65,8 @@ interface RegistryCheck {
   checkedAt: string;
   error?: string;
   pulled: boolean;
+  /** Set after a lease could not pull the image, until the agent lets it be tried again; error says why. */
+  pullFailed?: boolean;
 }
 
 /** protocol.Container */
@@ -251,12 +253,6 @@ interface RebootNeed {
   reasons: List<string>;
 }
 
-/** protocol.PullImage: a tag reference at the digest a need waits for. */
-export interface PullImage {
-  ref: string;
-  digest: string;
-}
-
 /** protocol.Need */
 export interface Need {
   id: string;
@@ -264,8 +260,8 @@ export interface Need {
   directiveId?: string;
   /** local: the need was asked for on the host itself (every override need, a roll from the local command line). */
   local?: boolean;
-  /** The images the need waits for that are not local yet: the host pulls them in a pull window; until then the need is not granted. */
-  unpulled?: List<PullImage>;
+  /** Why the last lease could not pull the need's image; set until the agent lets the pull be tried again. A need with it is not granted. */
+  pullError?: string;
   image?: ImageNeed;
   override?: OverrideNeed;
   spec?: SpecNeed;
@@ -273,14 +269,24 @@ export interface Need {
   reboot?: RebootNeed;
 }
 
-/** protocol.Phase */
-export type Phase = 'draining' | 'applying' | 'rebooting' | 'starting' | 'verifying' | 'done' | 'failed';
+/** protocol.Phase. `pulling`: the images are pulled first; nothing is stopped yet. */
+export type Phase = 'pulling' | 'draining' | 'applying' | 'rebooting' | 'starting' | 'verifying' | 'done' | 'failed';
 
 /**
  * protocol.StepStatus. `cancelled`: the lease was cancelled before the step
  * had begun; nothing was disrupted for it and it is not a failure.
+ * `deferred`: an image of the lease could not be pulled, so nothing was
+ * begun; not a failure, the need stays open.
  */
-export type StepStatus = 'pending' | 'running' | 'done' | 'failed' | 'superseded' | 'refused' | 'cancelled';
+export type StepStatus =
+  | 'pending'
+  | 'running'
+  | 'done'
+  | 'failed'
+  | 'superseded'
+  | 'refused'
+  | 'deferred'
+  | 'cancelled';
 
 /** protocol.Step */
 export interface Step {
@@ -394,7 +400,7 @@ export type RolloutKind = 'group' | 'packages' | 'reboot' | 'manual' | 'local';
 export type RolloutState = 'active' | 'halted' | 'completed' | 'superseded' | 'aborted';
 
 /** fleet.HostState */
-export type HostState = 'expected' | 'pending' | 'leased' | 'done' | 'failed' | 'skipped';
+export type HostState = 'expected' | 'pending' | 'leased' | 'done' | 'failed' | 'skipped' | 'aborted';
 
 /**
  * fleet.Stage, in serving order: 1 repair (a member whose host is broken for
@@ -412,9 +418,10 @@ export interface RolloutHost {
   stage: Stage;
   needId?: string;
   /**
-   * The lease the member holds or was served by. A member that held a lease
-   * when its rollout closed stays leased with it: a closed rollout is not
-   * written again, and the lease says how it ended.
+   * The lease the member holds or was served by. A member of an aborted
+   * rollout gets the outcome of its lease; one that held a lease when its
+   * rollout closed otherwise stays leased with it, and the lease says how it
+   * ended.
    */
   leaseId?: string;
   /** The person who skipped the member; absent on a member the scheduler skipped (its host was forgotten). */
@@ -530,6 +537,11 @@ export interface Lease {
    * told with every sync and stops after the step in progress.
    */
   cancelled?: LeaseCancel;
+  /**
+   * recheck marks a lease that only repeats the readiness check of a failed
+   * lease whose steps the agent did, after a retry; the agent is not offered it.
+   */
+  recheck?: boolean;
 }
 
 /** fleet.AuditEntry */
@@ -548,6 +560,7 @@ export type Policy = 'auto' | 'manual';
 /** fleet.Settings; durations are Go duration strings ("30m0s"). */
 export interface Settings {
   maxUnavailablePercent: number;
+  maxLeasedPercent: number;
   maxIndependentPercent: number;
   minParticipationPercent: number;
   maxFinalityLagEpochs: number;
@@ -573,10 +586,8 @@ export interface Settings {
   pauseAfterCanaryReboot: boolean;
   /** Share (0–1) of the fleet's median peer count a client must have before a slot is released; 0, the default, is off. */
   readyPeerShare: number;
-  /** How often one host of those on a tag looks it up, for the whole devnet (Go duration). */
+  /** How often the controller looks a tag up at its registry (Go duration). */
   lookupInterval: string;
-  /** Share (0–100) of the hosts that may pull images at once, at least one. */
-  maxPullingPercent: number;
   paused: boolean;
 }
 
@@ -732,7 +743,7 @@ export interface Budget {
 
 /**
  * scheduler.WaitKind: the class of a waiting reason. budget, host-limit,
- * order and pull (the host's images are not local yet) clear by themselves; working clears when the operation the host
+ * order and pull (the host waits to pull an image again after a failed pull) clear by themselves; working clears when the operation the host
  * works on without a lease is over; gate clears when the network recovers;
  * the rest needs somebody to act.
  */
@@ -772,14 +783,7 @@ export interface QueueEntry {
 }
 
 /** scheduler.SlotState */
-type SlotState = 'idle' | 'queued' | 'leased' | 'verifying' | 'failed' | 'held' | 'stale';
-
-/**
- * The pull state of a host that waits in a rollout (scheduler.Pull*):
- * waiting for a pull window, pulling inside its window, or its images pulled
- * and waiting for a slot.
- */
-export type PullState = 'waiting' | 'pulling' | 'pulled';
+type SlotState = 'idle' | 'queued' | 'leased' | 'verifying' | 'failed' | 'held' | 'offline' | 'stale';
 
 /** scheduler.HostPlan */
 export interface HostPlan {
@@ -789,7 +793,6 @@ export interface HostPlan {
   liveKnown: boolean;
   leaseId?: string;
   reason?: string;
-  pull?: PullState;
 }
 
 /** scheduler.Plan */
@@ -977,11 +980,12 @@ export interface HostListing {
   /** holdReason is the reason of the controller hold (holdWanted); left out when there is none. */
   holdReason?: string;
   /**
-   * holdBy says who set the controller hold: "team" for a hold set through a
-   * team feature, which a team feature may lift again, "staff" for every
-   * other hold. Left out when the host is not held.
+   * holdBy says who set the controller hold: "team:<teams>" for a hold that
+   * these teams set through a team feature, which a team feature of one of
+   * them may lift again, "staff" for every other hold. Left out when the host
+   * is not held.
    */
-  holdBy?: 'team' | 'staff';
+  holdBy?: string;
   /** offline is the known-offline mark while it is in force. */
   offline?: OfflineMark;
   verbs: List<Verb>;
@@ -1016,7 +1020,6 @@ export interface Hosts {
 /** api.HostDetail */
 export interface HostDetail extends HostSummary {
   certHash: string;
-  generation: number;
   firstSeen: string;
   remoteAddr: string;
   /** The [start, end) range counted for the host. It follows validatorReport and differs while the host does not know its range. */
@@ -1126,6 +1129,47 @@ export interface Packages {
   /** The number of package names the query selects; on the first page only. */
   total?: number;
   /** Continues after this page (the `after` parameter); absent on the last page. */
+  next?: string;
+}
+
+/** views.ImageVersion: one digest of a reference; digest is empty for an image without a registry digest. */
+interface ImageVersion {
+  digest: string;
+  revision?: string;
+  hosts: List<string>;
+}
+
+/** views.ImageLookup: where a tag points by the controller's newest lookup; with an error, digest is the last good one. */
+interface ImageLookup {
+  digest?: string;
+  checkedAt: string;
+  error?: string;
+}
+
+/** views.ImageMatch: one image reference with the digests it runs at across the fleet. */
+export interface ImageMatch {
+  name: string;
+  versions: List<ImageVersion>;
+  /** Absent for a reference nobody follows (a container that is never rolled or pinned to a digest). */
+  registry?: ImageLookup;
+}
+
+/**
+ * api.ImagesRefresh: the number of tags that are looked up now, and of those
+ * looked up too recently to be looked up again until next.
+ */
+export interface ImagesRefresh {
+  tags: number;
+  recent?: number;
+  next?: string;
+  message: string;
+}
+
+/** api.Images: one page of the images the fleet's containers run; it pages like Packages. */
+export interface Images {
+  query: string;
+  matches: List<ImageMatch>;
+  total?: number;
   next?: string;
 }
 

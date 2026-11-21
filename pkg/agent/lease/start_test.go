@@ -53,7 +53,7 @@ func TestFailedStepStillRestartsContainers(t *testing.T) {
 	assert.Equal(t, agenttest.VCV1, e.host.Container("validator").Digest)
 
 	// No verifying after a failed step.
-	e.assertPhases("lease-broken", protocol.PhaseApplying, protocol.PhaseStarting, protocol.PhaseFailed)
+	e.assertPhases("lease-broken", protocol.PhasePulling, protocol.PhaseApplying, protocol.PhaseStarting, protocol.PhaseFailed)
 }
 
 // A crashed container comes back with its roll; a stopped one stays down.

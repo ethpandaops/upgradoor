@@ -90,11 +90,10 @@ func countRows(t *testing.T, s Store, table string) int {
 func testCert(name string, roles ...string) *identity.Certificate {
 	return &identity.Certificate{
 		Claims: identity.Claims{
-			Issuer:     identity.Issuer,
-			Network:    "testnet-0",
-			Subject:    name,
-			Generation: 1,
-			Roles:      roles,
+			Issuer:  identity.Issuer,
+			Network: "testnet-0",
+			Subject: name,
+			Roles:   roles,
 		},
 		Raw:  "raw-" + name,
 		Hash: "hash-" + name,

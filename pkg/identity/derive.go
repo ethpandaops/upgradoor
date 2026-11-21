@@ -10,13 +10,9 @@
 // or the other, never both.
 //
 // Keys and signatures are ML-DSA-44 (FIPS 204), a post-quantum scheme.
-//
-// The same derivation is implemented in Python by the Ansible filter plugin
-// (ansible-collection-general, plugins/filter/upgradoor.py). Keys and the
-// certificate's header and claims must be byte-identical on both sides;
-// signatures are deterministic here and randomized there, so they are
-// verified across implementations instead. testdata/vectors.json is the
-// shared truth.
+// Signatures are deterministic: the same input gives the same certificate.
+// Ansible derives keys and certificates with upgradoor-controller keygen;
+// testdata/vectors.json pins the encoding.
 package identity
 
 import (
@@ -28,7 +24,6 @@ import (
 	"fmt"
 	"os"
 	"regexp"
-	"strconv"
 	"strings"
 )
 
@@ -99,11 +94,8 @@ func DeriveSignerKey(seed []byte, network string) (*mldsa.PrivateKey, error) {
 	return derive(seed, infoSignerPrefix+network)
 }
 
-// DeriveHostKey derives the key of one host. generation rotates a single
-// leaked host key without touching the seed.
-func DeriveHostKey(
-	seed []byte, network, hostname string, generation uint64,
-) (*mldsa.PrivateKey, error) {
+// DeriveHostKey derives the key of one host.
+func DeriveHostKey(seed []byte, network, hostname string) (*mldsa.PrivateKey, error) {
 	if err := ValidateName(network); err != nil {
 		return nil, err
 	}
@@ -112,10 +104,7 @@ func DeriveHostKey(
 		return nil, err
 	}
 
-	info := infoHostPrefix + network + "/" + hostname + "/" +
-		strconv.FormatUint(generation, 10)
-
-	return derive(seed, info)
+	return derive(seed, infoHostPrefix+network+"/"+hostname)
 }
 
 func derive(seed []byte, info string) (*mldsa.PrivateKey, error) {

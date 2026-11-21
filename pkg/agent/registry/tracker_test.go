@@ -3,52 +3,53 @@ package registry
 import (
 	"context"
 	"errors"
+	"io"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// fakeImages is a Resolver and Images; an image's revision is "rev of <digest>".
+// fakeImages is an Images; an image's revision is "rev of <digest>".
 type fakeImages struct {
-	mu         sync.Mutex
-	registry   map[string]string
-	local      map[string]string
-	pulls      int
-	resolves   int
-	resolveErr error
-	// pullAs, when set, is the digest a pull ends up with (the tag moved).
-	pullAs string
+	mu sync.Mutex
+	// registry is what a pull of a tag yields.
+	registry map[string]string
+	local    map[string]string
+	pulls    int
+	localErr error
 	// pullErr fails the pulls.
 	pullErr error
 	// pullBlock, when set, holds every pull until its context ends.
 	pullBlock bool
+	// onLocal is called by LocalImage, without the lock held.
+	onLocal func()
 }
 
 var _ Images = (*fakeImages)(nil)
 
 func revisionOf(digest string) string { return "rev of " + digest }
 
-func (h *fakeImages) Resolve(_ context.Context, ref string) (string, error) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-
-	h.resolves++
-
-	if h.resolveErr != nil {
-		return "", h.resolveErr
-	}
-
-	return h.registry[ref], nil
-}
-
 func (h *fakeImages) LocalImage(_ context.Context, ref string) (digest, revision string, err error) {
 	h.mu.Lock()
+	hook := h.onLocal
+	h.mu.Unlock()
+
+	if hook != nil {
+		hook()
+	}
+
+	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	if h.localErr != nil {
+		return "", "", h.localErr
+	}
 
 	return h.local[ref], revisionOf(h.local[ref]), nil
 }
@@ -73,9 +74,6 @@ func (h *fakeImages) Pull(ctx context.Context, ref string) (digest, revision str
 	}
 
 	h.local[ref] = h.registry[ref]
-	if h.pullAs != "" {
-		h.local[ref] = h.pullAs
-	}
 
 	return h.local[ref], revisionOf(h.local[ref]), nil
 }
@@ -87,61 +85,20 @@ func (h *fakeImages) do(fn func(h *fakeImages)) {
 	fn(h)
 }
 
-func (h *fakeImages) counts() (pulls, resolves int) {
+func (h *fakeImages) pulled() int {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	return h.pulls, h.resolves
-}
-
-// gatedResolver holds every lookup until released; digest "" asks the fake.
-type gatedResolver struct {
-	*fakeImages
-	digest           string
-	started, release chan struct{}
-}
-
-func newGatedResolver(host *fakeImages, digest string) *gatedResolver {
-	return &gatedResolver{
-		fakeImages: host, digest: digest, started: make(chan struct{}), release: make(chan struct{}),
-	}
-}
-
-func (g *gatedResolver) Resolve(ctx context.Context, ref string) (string, error) {
-	g.started <- struct{}{}
-	<-g.release
-
-	if g.digest != "" {
-		return g.digest, nil
-	}
-
-	return g.fakeImages.Resolve(ctx, ref)
-}
-
-// buildTracker is NewTracker with the concrete type.
-func buildTracker(
-	t *testing.T, images Images, resolver Resolver, interval time.Duration, pull bool,
-	now func() time.Time,
-) *tracker {
-	t.Helper()
-
-	tr, ok := NewTracker(testLogger(), images, resolver, interval, pull, now).(*tracker)
-	require.True(t, ok)
-
-	return tr
-}
-
-// checkOf is the tracker's check of one tag, from Checks.
-func checkOf(tr *tracker, key string) (protocol.RegistryCheck, bool) {
-	check, ok := tr.Checks()[key]
-
-	return check, ok
+	return h.pulls
 }
 
 const (
 	appKey = "docker.io/library/app:latest"
 	appRef = "app"
 )
+
+// start is the time of the controller's first lookup in the tests.
+var start = time.Unix(1_800_000_000, 0)
 
 func newAppImages() *fakeImages {
 	return &fakeImages{
@@ -150,486 +107,335 @@ func newAppImages() *fakeImages {
 	}
 }
 
-func TestImageWatcher(t *testing.T) {
+// buildTracker is NewTracker with the concrete type, following the app tag.
+func buildTracker(t *testing.T, images Images, pull bool, now func() time.Time) *tracker {
+	t.Helper()
+
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	tr, ok := NewTracker(log, images, pull, now).(*tracker)
+	require.True(t, ok)
+
+	tr.Track(map[string]string{appKey: appRef})
+
+	return tr
+}
+
+// lookedUp is the controller's lookup of the app tag, n minutes after start.
+func lookedUp(digest string, n int) []protocol.TagDigest {
+	return []protocol.TagDigest{{
+		Ref: appRef, Digest: digest, CheckedAt: start.Add(time.Duration(n) * time.Minute),
+	}}
+}
+
+// checkOf is the tracker's check of the app tag, from Checks.
+func checkOf(tr *tracker) (protocol.RegistryCheck, bool) {
+	check, ok := tr.Checks()[appKey]
+
+	return check, ok
+}
+
+func TestTrackerFollowsTheControllersLookups(t *testing.T) {
 	host := newAppImages()
-	tr := buildTracker(t, host, host, time.Hour, true, time.Now)
+	tr := buildTracker(t, host, true, time.Now)
 	ctx := t.Context()
 
-	_, ok := checkOf(tr, appKey)
-	assert.False(t, ok, "nothing is known before the first check")
+	_, ok := checkOf(tr)
+	assert.False(t, ok, "nothing is known before the controller looked the tag up")
+	assert.Empty(t, tr.nextDue())
 
-	tr.Track(map[string]Tag{appKey: {Ref: appRef, InUse: true}})
+	_, err := tr.Resolve(ctx, appRef)
+	require.Error(t, err)
 
-	due, _ := tr.nextDue()
-	require.Equal(t, appKey, due, "a new tag is due at once")
+	tr.SetDigests(lookedUp("sha256:1", 0))
+	require.Equal(t, appKey, tr.nextDue(), "a lookup makes a look at the local images due")
 
 	tr.checkTag(ctx, appKey)
 
-	check, ok := checkOf(tr, appKey)
+	check, ok := checkOf(tr)
 	require.True(t, ok)
 	assert.Equal(t, "sha256:1", check.Digest)
+	assert.Equal(t, start, check.CheckedAt, "the controller's time")
 	assert.True(t, check.Pulled)
 	assert.Equal(t, revisionOf("sha256:1"), check.Revision, "read from the local image")
 	assert.Empty(t, check.Error)
+	assert.Empty(t, tr.nextDue())
 
-	// The controller answers: from now on it hands out the lookups.
-	tr.SetFallback(false)
-
-	due, wait := tr.nextDue()
-	assert.Empty(t, due, "no lookup of its own while the controller answers")
-	assert.Equal(t, maxIdle, wait)
-
-	// The controller's lookup sees the tag moved; nothing is pulled without a window.
+	// The tag moved: the tracker pulls nothing itself.
 	host.do(func(h *fakeImages) { h.registry[appRef] = "sha256:2" })
+	tr.SetDigests(lookedUp("sha256:2", 1))
 
-	tr.Lookup([]string{appRef})
-
-	due, _ = tr.nextDue()
-	require.Equal(t, appKey, due)
-
-	tr.checkTag(ctx, appKey)
-
-	check, _ = checkOf(tr, appKey)
-	assert.Equal(t, "sha256:2", check.Digest)
-	assert.False(t, check.Pulled, "no pull outside a pull window")
-
-	pulls, resolves := host.counts()
-	assert.Equal(t, 0, pulls)
-	assert.Equal(t, 2, resolves)
-
-	// The window names the image: it is pulled without another lookup.
-	tr.SetWindow(&protocol.PullWindow{Images: []protocol.PullImage{{Ref: appRef, Digest: "sha256:2"}}})
-
-	due, _ = tr.nextDue()
-	require.Equal(t, appKey, due, "the window makes the pull due")
-
-	tr.checkTag(ctx, appKey)
-
-	check, _ = checkOf(tr, appKey)
-	assert.True(t, check.Pulled)
-	assert.Equal(t, revisionOf("sha256:2"), check.Revision, "read from the pulled image")
-
-	pulls, resolves = host.counts()
-	assert.Equal(t, 1, pulls)
-	assert.Equal(t, 2, resolves, "the pull needs no lookup")
-
-	due, _ = tr.nextDue()
-	assert.Empty(t, due, "pulled: nothing more to do")
-
-	// A relayed move is taken without a lookup; the local images are looked at.
-	tr.SetWindow(nil)
-	tr.Relay([]protocol.TagDigest{{Ref: appRef, Digest: "sha256:3", CheckedAt: time.Now()}})
-
-	check, _ = checkOf(tr, appKey)
+	check, _ = checkOf(tr)
 	assert.False(t, check.Pulled, "pulled belonged to the old digest")
 	assert.Empty(t, check.Revision, "so did the revision")
 
-	due, _ = tr.nextDue()
-	require.Equal(t, appKey, due)
-
 	tr.checkTag(ctx, appKey)
 
-	check, _ = checkOf(tr, appKey)
-	assert.Equal(t, "sha256:3", check.Digest)
+	check, _ = checkOf(tr)
+	assert.Equal(t, "sha256:2", check.Digest)
 	assert.False(t, check.Pulled)
+	assert.Zero(t, host.pulled())
+	assert.Empty(t, tr.nextDue())
 
-	_, resolves = host.counts()
-	assert.Equal(t, 2, resolves, "a relayed digest needs no lookup")
+	digest, err := tr.Resolve(ctx, "docker.io/library/app:latest")
+	require.NoError(t, err)
+	assert.Equal(t, "sha256:2", digest)
 
-	// An older relay changes nothing.
-	tr.Relay([]protocol.TagDigest{{Ref: appRef, Digest: "sha256:old", CheckedAt: time.Now().Add(-time.Hour)}})
+	// A lease could not pull it: the check says so for a while.
+	tr.NotePull(appRef, errors.New("registry is down"))
 
-	check, _ = checkOf(tr, appKey)
-	assert.Equal(t, "sha256:3", check.Digest)
+	check, _ = checkOf(tr)
+	assert.True(t, check.PullFailed)
+	assert.Equal(t, "pull: registry is down", check.Error)
+	assert.Empty(t, tr.nextDue())
 
-	// A roll asks for a lookup, not a pull; a relay does not answer it.
-	host.do(func(h *fakeImages) { h.registry[appRef] = "sha256:3" })
-
-	ticket := tr.Request(appRef)
-
-	tr.Relay([]protocol.TagDigest{{Ref: appRef, Digest: "sha256:3", CheckedAt: time.Now()}})
-
-	_, done, gone := tr.Answered(appRef, ticket)
-	assert.False(t, done, "a relay is not a lookup")
-	assert.False(t, gone)
+	// A lease pulled it: the local image is looked at again.
+	host.do(func(h *fakeImages) { h.local[appRef] = "sha256:2" })
+	tr.NotePull(appRef, nil)
+	require.Equal(t, appKey, tr.nextDue())
 
 	tr.checkTag(ctx, appKey)
 
-	check, done, gone = tr.Answered(appRef, ticket)
-	require.True(t, done)
-	assert.False(t, gone)
-	assert.Equal(t, "sha256:3", check.Digest)
+	check, _ = checkOf(tr)
+	assert.True(t, check.Pulled)
+	assert.False(t, check.PullFailed)
+	assert.Empty(t, check.Error)
+	assert.Equal(t, revisionOf("sha256:2"), check.Revision, "read from the pulled image")
+	assert.Zero(t, host.pulled())
+	assert.Empty(t, tr.nextDue())
 
-	pulls, _ = host.counts()
-	assert.Equal(t, 1, pulls)
+	tr.NotePull("somebody/else:latest", errors.New("not followed"))
 
-	// A registry error keeps the last good digest.
-	host.do(func(h *fakeImages) { h.resolveErr = errors.New("registry unreachable") })
+	// The same or an older lookup changes nothing and makes nothing due.
+	tr.SetDigests(lookedUp("sha256:old", 0))
+	tr.SetDigests(lookedUp("sha256:other", 1))
 
-	tr.Recheck()
+	check, _ = checkOf(tr)
+	assert.Equal(t, "sha256:2", check.Digest)
+	assert.Empty(t, tr.nextDue())
+
+	// A newer lookup of the same digest looks at the local images again: the
+	// image was removed meanwhile.
+	host.do(func(h *fakeImages) { h.local[appRef] = "" })
+	tr.SetDigests(lookedUp("sha256:2", 2))
 	tr.checkTag(ctx, appKey)
 
-	check, _ = checkOf(tr, appKey)
-	assert.Equal(t, "sha256:3", check.Digest)
-	assert.Contains(t, check.Error, "registry unreachable")
+	check, _ = checkOf(tr)
+	assert.False(t, check.Pulled)
+	assert.Equal(t, start.Add(2*time.Minute), check.CheckedAt)
+
+	// A failed lookup keeps the last good digest.
+	failed := lookedUp("", 3)
+	failed[0].Error = "registry unreachable"
+	tr.SetDigests(failed)
+
+	check, _ = checkOf(tr)
+	assert.Equal(t, "sha256:2", check.Digest)
+	assert.Equal(t, "registry: registry unreachable", check.Error)
+
+	// An error of the local images comes first.
+	host.do(func(h *fakeImages) { h.localErr = errors.New("daemon down") })
+	tr.checkTag(ctx, appKey)
+
+	check, _ = checkOf(tr)
+	assert.Equal(t, "local image: daemon down", check.Error)
 
 	// Checks is a copy.
 	tr.Checks()[appKey] = protocol.RegistryCheck{Digest: "changed"}
 
-	check, _ = checkOf(tr, appKey)
-	assert.Equal(t, "sha256:3", check.Digest)
+	check, _ = checkOf(tr)
+	assert.Equal(t, "sha256:2", check.Digest)
 
-	// An untracked tag is forgotten.
-	tr.Track(map[string]Tag{})
+	// A lookup of a tag that is not followed is ignored; an unlisted tag is forgotten.
+	tr.SetDigests([]protocol.TagDigest{{Ref: "other", Digest: "sha256:x", CheckedAt: start}})
+	assert.Len(t, tr.Checks(), 1)
 
-	_, ok = checkOf(tr, appKey)
+	tr.Track(map[string]string{})
+
+	_, ok = checkOf(tr)
 	assert.False(t, ok)
-
-	_, _, gone = tr.Answered(appRef, ticket)
-	assert.True(t, gone)
 }
 
-// A tag no container runs is looked up on the tracker's own schedule; a tag in use is not.
-func TestTrackerOwnScheduleForATagNotInUse(t *testing.T) {
-	host := newAppImages()
-	now := time.Unix(1_800_000_000, 0)
-	tr := buildTracker(t, host, host, time.Hour, true, func() time.Time { return now })
-	tr.SetFallback(false)
+// A tag the controller could never look up is known with its error only.
+func TestTrackerATagNeverLookedUp(t *testing.T) {
+	tr := buildTracker(t, newAppImages(), true, time.Now)
 
-	tr.Track(map[string]Tag{appKey: {Ref: appRef}})
+	failed := lookedUp("", 0)
+	failed[0].Error = "404 Not Found"
+	tr.SetDigests(failed)
 	tr.checkTag(t.Context(), appKey)
 
-	due, wait := tr.nextDue()
-	assert.Empty(t, due)
-	assert.Equal(t, maxIdle, wait)
-
-	now = now.Add(time.Hour + time.Duration(pollJitter*float64(time.Hour)))
-
-	due, _ = tr.nextDue()
-	assert.Equal(t, appKey, due, "due on its own schedule")
-
-	tr.Track(map[string]Tag{appKey: {Ref: appRef, InUse: true}})
-
-	due, _ = tr.nextDue()
-	assert.Empty(t, due, "the controller hands out the lookups of a tag in use")
-}
-
-// An image is pulled by its tag and accepted only at the digest of the tracker's check.
-func TestTrackerPullsOnlyAtTheExpectedDigest(t *testing.T) {
-	host := newAppImages()
-	now := time.Unix(1_800_000_000, 0)
-	tr := buildTracker(t, host, host, time.Hour, true, func() time.Time { return now })
-	ctx := t.Context()
-
-	host.do(func(h *fakeImages) { h.registry[appRef] = "sha256:2" })
-	tr.Track(map[string]Tag{appKey: {Ref: appRef, InUse: true}})
-	tr.checkTag(ctx, appKey)
-
-	// A window at a digest the tracker did not see: nothing is pulled.
-	tr.SetWindow(&protocol.PullWindow{Images: []protocol.PullImage{{Ref: appRef, Digest: "sha256:evil"}}})
-
-	due, _ := tr.nextDue()
-	assert.Empty(t, due)
-
-	pulls, _ := host.counts()
-	assert.Equal(t, 0, pulls)
-
-	// The tag moved before the pull: the image is refused and the tag rests.
-	tr.SetWindow(&protocol.PullWindow{Images: []protocol.PullImage{{Ref: appRef, Digest: "sha256:2"}}})
-	host.do(func(h *fakeImages) { h.pullAs = "sha256:9" })
-
-	tr.checkTag(ctx, appKey)
-
-	check, _ := checkOf(tr, appKey)
-	assert.False(t, check.Pulled)
-	assert.Contains(t, check.Error, "pulled digest sha256:9 differs from registry digest sha256:2")
-
-	due, _ = tr.nextDue()
-	assert.Empty(t, due, "a failed pull pauses the tag")
-
-	// A failed pull pauses it too.
-	now = now.Add(pullRetry)
-	host.do(func(h *fakeImages) { h.pullErr = errors.New("no space left") })
-
-	due, _ = tr.nextDue()
-	require.Equal(t, appKey, due)
-
-	tr.checkTag(ctx, appKey)
-
-	check, _ = checkOf(tr, appKey)
-	assert.Equal(t, "pull: no space left", check.Error)
-
-	due, _ = tr.nextDue()
-	assert.Empty(t, due)
-
-	now = now.Add(pullRetry)
-	host.do(func(h *fakeImages) { h.pullErr, h.pullAs = nil, "" })
-
-	tr.checkTag(ctx, appKey)
-
-	check, _ = checkOf(tr, appKey)
-	assert.True(t, check.Pulled)
-	assert.Equal(t, revisionOf("sha256:2"), check.Revision)
-
-	pulls, _ = host.counts()
-	assert.Equal(t, 3, pulls)
-}
-
-func TestImageWatcherRunPolls(t *testing.T) {
-	host := newAppImages()
-	tr := buildTracker(t, host, host, 5*time.Millisecond, true, time.Now)
-
-	require.NoError(t, tr.Stop(), "stop before start")
-	require.NoError(t, tr.Start(t.Context()))
-	require.Error(t, tr.Start(t.Context()), "started once")
-
-	tr.Track(map[string]Tag{appKey: {Ref: appRef, InUse: true}})
-
-	require.Eventually(t, func() bool {
-		_, resolves := host.counts()
-
-		return resolves >= 4
-	}, 5*time.Second, time.Millisecond, "the tracker keeps polling at its interval")
-
-	require.NoError(t, tr.Stop())
-	require.NoError(t, tr.Stop(), "stop twice")
-}
-
-// A pull is stopped when the window stops naming it at its digest, and at Stop.
-func TestTrackerStopsAPullTheWindowNoLongerNames(t *testing.T) {
-	host := newAppImages()
-	host.do(func(h *fakeImages) {
-		h.registry[appRef] = "sha256:2"
-		h.pullBlock = true
-	})
-
-	window := &protocol.PullWindow{Images: []protocol.PullImage{{Ref: appRef, Digest: "sha256:2"}}}
-	tr := buildTracker(t, host, host, time.Hour, true, time.Now)
-	tr.Track(map[string]Tag{appKey: {Ref: appRef, InUse: true}})
-	tr.SetWindow(window)
-
-	require.NoError(t, tr.Start(t.Context()))
-
-	for _, next := range []*protocol.PullWindow{
-		nil,
-		{Images: []protocol.PullImage{{Ref: appRef, Digest: "sha256:other"}}},
-	} {
-		require.Eventually(t, func() bool { return len(tr.Pulling()) == 1 }, 5*time.Second, time.Millisecond)
-		assert.Equal(t, []string{appRef}, tr.Pulling())
-
-		// The round's check is written after its pull ends; wait for a newer one.
-		before, _ := checkOf(tr, appKey)
-
-		tr.SetWindow(next)
-
-		require.Eventually(t, func() bool {
-			check, _ := checkOf(tr, appKey)
-
-			return check.CheckedAt.After(before.CheckedAt)
-		}, 5*time.Second, time.Millisecond)
-
-		check, _ := checkOf(tr, appKey)
-		assert.False(t, check.Pulled)
-		assert.Contains(t, check.Error, "pull: ")
-
-		// The next round: a fresh lookup clears the error, the window opens.
-		tr.SetWindow(window)
-		tr.Recheck()
-	}
-
-	// A dropped tag is reported while its pull runs; Stop ends the pull.
-	require.Eventually(t, func() bool { return len(tr.Pulling()) == 1 }, 5*time.Second, time.Millisecond)
-
-	tr.Track(map[string]Tag{})
-
-	assert.Equal(t, []string{appRef}, tr.Pulling())
-	require.NoError(t, tr.Stop())
-	assert.Empty(t, tr.Pulling())
-}
-
-// A lookup that began before a request never answers it, even when Track re-added the tag.
-func TestTrackerStaleLookupDoesNotAnswerANewRequest(t *testing.T) {
-	host := newAppImages()
-	res := newGatedResolver(host, "sha256:old")
-	tr := buildTracker(t, host, res, time.Hour, true, time.Now)
-
-	tr.Track(map[string]Tag{appKey: {Ref: appRef, InUse: true}})
-
-	for range 5 {
-		tr.Lookup([]string{appRef})
-	}
-
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		tr.checkTag(t.Context(), appKey)
-	}()
-
-	<-res.started
-
-	tr.Track(map[string]Tag{})
-	ticket := tr.Request(appRef)
-
-	close(res.release)
-	<-done
-
-	_, answered, gone := tr.Answered(appRef, ticket)
-	require.False(t, answered, "a lookup that began before the request answered it")
-	require.False(t, gone)
-
-	_, ok := checkOf(tr, appKey)
-	assert.False(t, ok, "the stale result is not recorded")
-}
-
-// slowImages delays LocalImage without synchronizing, for the race detector.
-type slowImages struct {
-	*fakeImages
-}
-
-func (s slowImages) LocalImage(ctx context.Context, ref string) (string, string, error) {
-	time.Sleep(2 * time.Millisecond)
-
-	return s.fakeImages.LocalImage(ctx, ref)
-}
-
-// Track may run while a check looks at the local images (pinned under -race).
-func TestTrackerTrackDuringACheck(t *testing.T) {
-	host := newAppImages()
-	tr := buildTracker(t, slowImages{host}, host, time.Hour, true, time.Now)
-	tags := map[string]Tag{appKey: {Ref: appRef, InUse: true}}
-
-	tr.Track(tags)
-
-	stop := make(chan struct{})
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		for {
-			select {
-			case <-stop:
-				return
-			default:
-				tr.Track(tags)
-			}
-		}
-	}()
-
-	for range 5 {
-		tr.checkTag(t.Context(), appKey)
-	}
-
-	close(stop)
-	<-done
-
-	check, ok := checkOf(tr, appKey)
+	check, ok := checkOf(tr)
 	require.True(t, ok)
-	assert.True(t, check.Pulled)
+	assert.Empty(t, check.Digest)
+	assert.Equal(t, "registry: 404 Not Found", check.Error)
+
+	_, err := tr.Resolve(t.Context(), appRef)
+	require.Error(t, err)
 }
 
-// The window is checked again right before a pull.
-func TestTrackerNoPullAfterTheWindowDroppedTheTagDuringTheLookup(t *testing.T) {
-	host := newAppImages()
-	host.do(func(h *fakeImages) { h.registry[appRef] = "sha256:2" })
+// A failed pull of a lease counts for pullRetry, and not for another digest.
+func TestTrackerAFailedPullCountsForAWhile(t *testing.T) {
+	now := start
+	tr := buildTracker(t, newAppImages(), true, func() time.Time { return now })
 
-	res := newGatedResolver(host, "")
-	tr := buildTracker(t, host, res, time.Hour, true, time.Now)
+	tr.SetDigests(lookedUp("sha256:2", 0))
+	tr.NotePull(appRef, errors.New("registry is down"))
 
-	tr.Track(map[string]Tag{appKey: {Ref: appRef, InUse: true}})
-	tr.SetWindow(&protocol.PullWindow{Images: []protocol.PullImage{{Ref: appRef, Digest: "sha256:2"}}})
+	now = now.Add(pullRetry - time.Second)
+	check, _ := checkOf(tr)
+	assert.True(t, check.PullFailed)
 
-	done := make(chan struct{})
-
-	go func() {
-		defer close(done)
-
-		tr.checkTag(t.Context(), appKey)
-	}()
-
-	<-res.started
-
-	tr.SetWindow(nil)
-
-	close(res.release)
-	<-done
-
-	pulls, _ := host.counts()
-	require.Equal(t, 0, pulls, "pulled after the window dropped the tag")
-
-	check, _ := checkOf(tr, appKey)
-	assert.Equal(t, "sha256:2", check.Digest)
-	assert.False(t, check.Pulled)
-}
-
-// Request adds an untracked tag and has it looked up; Lookup ignores it.
-func TestTrackerRequestAndLookupOfUntrackedTags(t *testing.T) {
-	host := newAppImages()
-	tr := buildTracker(t, host, host, time.Hour, true, time.Now)
-	tr.SetFallback(false)
-
-	tr.Lookup([]string{appRef})
-
-	due, _ := tr.nextDue()
-	assert.Empty(t, due)
-	assert.Empty(t, tr.Checks())
-
-	ticket := tr.Request(appRef)
-
-	due, _ = tr.nextDue()
-	require.Equal(t, appKey, due, "added and due")
-
-	tr.checkTag(t.Context(), appKey)
-
-	check, done, gone := tr.Answered(appRef, ticket)
-	require.True(t, done)
-	assert.False(t, gone)
-	assert.Equal(t, "sha256:1", check.Digest)
-
-	_, resolves := host.counts()
-	assert.Equal(t, 1, resolves)
-}
-
-// Without the roll verb the tracker looks tags up and never pulls.
-func TestImageWatcherDoesNotPullWhenTheHostNeverRolls(t *testing.T) {
-	host := newAppImages()
-	tr := buildTracker(t, host, host, time.Hour, false, time.Now)
-	ctx := t.Context()
-
-	tr.Track(map[string]Tag{appKey: {Ref: appRef, InUse: true}})
-	tr.checkTag(ctx, appKey)
-
-	check, ok := checkOf(tr, appKey)
-	require.True(t, ok)
-	assert.Equal(t, revisionOf("sha256:1"), check.Revision)
-
-	host.do(func(h *fakeImages) { h.registry[appRef] = "sha256:2" })
-
-	tr.SetWindow(&protocol.PullWindow{Images: []protocol.PullImage{{Ref: appRef, Digest: "sha256:2"}}})
-	tr.Recheck()
-	tr.checkTag(ctx, appKey)
-
-	check, ok = checkOf(tr, appKey)
-	require.True(t, ok)
-	assert.Equal(t, "sha256:2", check.Digest)
-	assert.False(t, check.Pulled)
-	assert.Empty(t, check.Revision, "the old image's revision is not the new digest's")
+	now = now.Add(time.Second)
+	check, _ = checkOf(tr)
+	assert.False(t, check.PullFailed)
 	assert.Empty(t, check.Error)
 
-	due, _ := tr.nextDue()
-	assert.Empty(t, due, "the window makes nothing due")
+	tr.NotePull(appRef, errors.New("registry is down"))
+	tr.SetDigests(lookedUp("sha256:3", 1))
 
-	ticket := tr.Request(appRef)
+	check, _ = checkOf(tr)
+	assert.False(t, check.PullFailed, "the failure was of another digest")
+}
+
+func TestTrackerALookupDuringACheckWins(t *testing.T) {
+	host := newAppImages()
+	tr := buildTracker(t, host, true, time.Now)
+
+	tr.SetDigests(lookedUp("sha256:1", 0))
+	host.do(func(h *fakeImages) {
+		h.onLocal = func() { tr.SetDigests(lookedUp("sha256:2", 1)) }
+	})
+
+	tr.checkTag(t.Context(), appKey)
+
+	check, _ := checkOf(tr)
+	assert.Equal(t, "sha256:2", check.Digest)
+	assert.False(t, check.Pulled, "the local image is at the older digest")
+	assert.Equal(t, appKey, tr.nextDue(), "the new digest is looked at next")
+}
+
+// The tag is dropped and followed again while its image is looked at: the
+// result does not reach the new entry.
+func TestTrackerTrackDuringACheck(t *testing.T) {
+	host := newAppImages()
+	tr := buildTracker(t, host, true, time.Now)
+
+	tr.SetDigests(lookedUp("sha256:1", 0))
+	host.do(func(h *fakeImages) {
+		h.onLocal = func() {
+			tr.Track(map[string]string{})
+			tr.Track(map[string]string{appKey: appRef})
+		}
+	})
+
+	tr.checkTag(t.Context(), appKey)
+
+	_, ok := checkOf(tr)
+	assert.False(t, ok)
+}
+
+func TestTrackerFallbackPulls(t *testing.T) {
+	host := newAppImages()
+	now := start
+	tr := buildTracker(t, host, true, func() time.Time { return now })
+	ctx := t.Context()
+
+	tr.SetFallback(map[string]string{appKey: appRef}, 10*time.Minute)
+	host.do(func(h *fakeImages) { h.registry[appRef] = "sha256:2" })
+
+	// The first pull is at a random point of the interval.
+	now = now.Add(10 * time.Minute)
+	require.Equal(t, appKey, tr.nextDue())
 	tr.checkTag(ctx, appKey)
 
-	check, done, _ := tr.Answered(appRef, ticket)
-	require.True(t, done)
-	assert.False(t, check.Pulled)
+	check, ok := checkOf(tr)
+	require.True(t, ok)
+	assert.Equal(t, protocol.RegistryCheck{
+		Digest: "sha256:2", Revision: revisionOf("sha256:2"), Pulled: true, CheckedAt: now,
+	}, check)
+	assert.Equal(t, 1, host.pulled())
 
-	pulls, resolves := host.counts()
-	assert.Equal(t, 0, pulls)
-	assert.Equal(t, 3, resolves)
-	assert.Equal(t, "sha256:1", host.local[appRef], "the local tag is left where it was")
+	digest, err := tr.Resolve(ctx, appRef)
+	require.NoError(t, err)
+	assert.Equal(t, "sha256:2", digest)
+
+	now = now.Add(10*time.Minute - time.Second)
+	assert.Empty(t, tr.nextDue(), "once per interval")
+
+	// A failed pull keeps the digest and is tried again sooner.
+	host.do(func(h *fakeImages) { h.pullErr = errors.New("registry is down") })
+
+	now = now.Add(time.Second)
+	tr.checkTag(ctx, appKey)
+
+	check, _ = checkOf(tr)
+	assert.Equal(t, "sha256:2", check.Digest)
+	assert.Contains(t, check.Error, "registry is down")
+
+	now = now.Add(pullRetry)
+	assert.Equal(t, appKey, tr.nextDue())
+
+	// The controller is back: its lookups count again, nothing is pulled.
+	tr.SetFallback(nil, 0)
+	assert.Empty(t, tr.nextDue())
+
+	now = now.Add(time.Hour)
+	assert.Empty(t, tr.nextDue())
+
+	tr.SetDigests([]protocol.TagDigest{{Ref: appRef, Digest: "sha256:3", CheckedAt: now}})
+	check, _ = checkOf(tr)
+	assert.Equal(t, "sha256:3", check.Digest)
+	assert.False(t, check.Pulled)
+}
+
+func TestTrackerFallbackNeverPullsWhenTheHostNeverRolls(t *testing.T) {
+	host := newAppImages()
+	now := start
+	tr := buildTracker(t, host, false, func() time.Time { return now })
+
+	tr.SetFallback(map[string]string{appKey: appRef}, time.Minute)
+
+	now = now.Add(time.Hour)
+	assert.Empty(t, tr.nextDue())
+}
+
+func TestTrackerEndingTheFallbackStopsItsPull(t *testing.T) {
+	host := newAppImages()
+	host.pullBlock = true
+
+	now := start
+	var mu sync.Mutex
+	clock := func() time.Time {
+		mu.Lock()
+		defer mu.Unlock()
+
+		return now
+	}
+	tr := buildTracker(t, host, true, clock)
+
+	tr.SetFallback(map[string]string{appKey: appRef}, time.Minute)
+
+	mu.Lock()
+	now = now.Add(time.Minute)
+	mu.Unlock()
+
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		tr.checkTag(t.Context(), appKey)
+	}()
+
+	require.Eventually(t, func() bool { return tr.pullingNow() == appRef }, 5*time.Second, time.Millisecond)
+
+	tr.SetFallback(nil, 0)
+	<-done
+
+	assert.Empty(t, tr.pullingNow())
+
+	_, ok := checkOf(tr)
+	assert.False(t, ok, "a stopped pull says nothing")
 }

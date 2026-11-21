@@ -282,7 +282,6 @@ type wireDetail struct {
 	views.HostSummary
 
 	CertHash       string    `json:"certHash"`
-	Generation     uint64    `json:"generation"`
 	FirstSeen      time.Time `json:"firstSeen"`
 	RemoteAddr     string    `json:"remoteAddr"`
 	ValidatorStart *uint64   `json:"validatorStart,omitempty"`
