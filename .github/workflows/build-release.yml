@@ -1,0 +1,232 @@
+
+name: Build Release
+
+# Dispatch: tags vX.Y.Z at the dispatched commit, builds the reproducible binaries (make release),
+# pushes the controller image to GHCR by digest only, attests both and opens a draft release with
+# the binaries and the manifest. The maintainer signs the manifest offline (scripts/sign-release.sh)
+# and publishes. Publishing verifies the signature, only then tags the signed image digest vX.Y.Z
+# and latest on GHCR, and mirrors those tags to Docker Hub when the repository variable IMAGE_MIRROR is true.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version Number ('0.x.y')"
+        required: true
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/ethpandaops/upgradoor
+
+jobs:
+  prepare:
+    name: "Check release version"
+    if: ${{ github.event_name == 'workflow_dispatch' }}
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Exactly vX.Y.Z, tag free or at this commit, no release yet
+      id: version
+      env:
+        VERSION: ${{ inputs.version }}
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -eu
+        tag="v${VERSION#v}"
+        ./scripts/release-manifest.sh seq "$tag"
+        # the peeled line of an annotated tag sorts last
+        at=$(git ls-remote --tags origin "refs/tags/$tag" "refs/tags/$tag^{}" | sort -k2 | tail -n1 | cut -f1)
+        if [ -n "$at" ] && [ "$at" != "$GITHUB_SHA" ]; then
+          echo "::error::$tag already points at $at, not $GITHUB_SHA"
+          exit 1
+        fi
+        if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+          echo "::error::release $tag already exists"
+          exit 1
+        fi
+        echo "tag=$tag" >> $GITHUB_OUTPUT
+
+  check_source:
+    name: "Run code checks"
+    needs: [prepare]
+    uses: ./.github/workflows/_shared-check.yaml
+
+  build_release:
+    name: "Build Upgradoor release"
+    needs: [prepare, check_source]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+      id-token: write
+      attestations: write
+    env:
+      TAG: ${{ needs.prepare.outputs.tag }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      with:
+        fetch-depth: 0
+
+    - name: Set up go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+    - name: Set up node
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 24.x
+        cache: npm
+        cache-dependency-path: web/package-lock.json
+
+    - name: Build reproducible binaries and their manifest
+      run: make release VERSION="$TAG"
+
+    # prepare docker
+    - name: Set up QEMU
+      uses: docker/setup-qemu-action@29109295f81e9208d7d86ff1c6c12d2833863392 # v3.6.0
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+
+    # The image holds exactly the manifest's upgradoor-controller. Pushed by digest only: no tag
+    # points at it until the signed release is published.
+    - name: Build multiarch docker image, by digest
+      run: |
+        set -eu
+        mkdir -p .cache
+        docker buildx build . --file Dockerfile --target release \
+          --platform linux/amd64,linux/arm64 --provenance=false --sbom=false \
+          --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+          --metadata-file .cache/image.json
+        digest=$(jq -r '."containerimage.digest"' .cache/image.json)
+        [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest: $digest"; exit 1; }
+        echo "DIGEST=$digest" >> "$GITHUB_ENV"
+        # the index and its platform manifests, as the mirror wants them attested
+        {
+          echo "${digest#sha256:}  $IMAGE"
+          docker buildx imagetools inspect --raw "$IMAGE@$digest" | jq -r '.manifests[].digest | ltrimstr("sha256:") + "  '"$IMAGE"'"'
+        } > .cache/image-subjects.txt
+        cat .cache/image-subjects.txt
+
+    - name: Attest docker image
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-checksums: .cache/image-subjects.txt
+
+    - name: Write the manifest with the image digest
+      run: |
+        ./scripts/release-manifest.sh write "$TAG" dist "$DIGEST"
+        ./scripts/release-manifest.sh check "$TAG" dist/upgradoor-manifest.txt
+
+    - name: Attest release binaries and manifest
+      uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+      with:
+        subject-path: |
+          dist/upgradoor-manifest.txt
+          dist/upgradoor-linux-*
+          dist/upgradoor-controller-linux-*
+
+    - name: Generate release notes
+      run: |
+        set -eu
+        prev_tag=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vx "$TAG" | head -n 1 || true)
+        echo "previous release: $prev_tag"
+        {
+          echo "Unsigned draft. Sign the manifest (\`scripts/sign-release.sh $TAG\`), then publish: publishing verifies the signature and tags the image."
+          echo
+          echo "Image: \`$IMAGE@$DIGEST\`"
+          echo
+          echo "### Changelog"
+          git log --oneline --no-decorate ${prev_tag:+$prev_tag..HEAD} | sed 's/^/ - /'
+        } > .cache/notes.md
+
+    - name: Create tag and draft release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        set -eu
+        if [ -z "$(git ls-remote --tags origin "refs/tags/$TAG")" ]; then
+          gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/$TAG" -f sha="$GITHUB_SHA" >/dev/null
+        fi
+        gh release create "$TAG" --draft --verify-tag --title "$TAG" --notes-file .cache/notes.md \
+          dist/upgradoor-manifest.txt dist/upgradoor-linux-amd64 dist/upgradoor-linux-arm64 \
+          dist/upgradoor-controller-linux-amd64 dist/upgradoor-controller-linux-arm64
+
+  # The signature over the manifest must verify against deploy/allowed_signers of the tag and the
+  # binaries must match it; only then is the signed image digest tagged vX.Y.Z and latest.
+  publish_release:
+    name: "Publish signed release image"
+    if: ${{ github.event_name == 'release' && !github.event.release.prerelease }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      tags: ${{ steps.tag.outputs.tags }}
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Verify the signed release
+      env:
+        GH_TOKEN: ${{ github.token }}
+        TAG: ${{ github.event.release.tag_name }}
+      run: |
+        set -eu
+        mkdir -p .cache/release
+        gh release download "$TAG" --dir .cache/release --pattern 'upgradoor-*'
+        ./scripts/verify-release.sh "$TAG" .cache/release --require-all
+        digest=$(awk '$1 == "image" { print $4 }' .cache/release/upgradoor-manifest.txt)
+        echo "DIGEST=sha256:$digest" >> "$GITHUB_ENV"
+
+    # prepare docker
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+    - name: Login to GitHub Container Registry
+      uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+      with:
+        registry: ghcr.io
+        username: ${{ github.actor }}
+        password: ${{ github.token }}
+
+    # one source index: imagetools copies it as it is, the tags point at the signed digest
+    - name: Tag the signed image
+      id: tag
+      env:
+        TAG: ${{ github.event.release.tag_name }}
+      run: |
+        set -eu
+        docker buildx imagetools create -t "$IMAGE:$TAG" -t "$IMAGE:latest" "$IMAGE@$DIGEST"
+        for t in "$TAG" latest; do
+          got=$(docker buildx imagetools inspect "$IMAGE:$t" --format '{{ .Manifest.Digest }}')
+          [ "$got" = "$DIGEST" ] || { echo "::error::$IMAGE:$t is $got, not the signed $DIGEST"; exit 1; }
+        done
+        echo "tags=$TAG@$DIGEST latest@$DIGEST" >> "$GITHUB_OUTPUT"
+
+  # Its own job, so a failed mirror is re-run without re-tagging. The build job attested the digest.
+  mirror_release:
+    name: "Mirror signed release image to Docker Hub"
+    needs: [publish_release]
+    if: ${{ vars.IMAGE_MIRROR == 'true' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    steps:
+    - name: Mirror release image to Docker Hub
+      uses: ethpandaops/actions/mirror-image@738aeadbcdc54f1c9af659d35f8ef29dd5c0fae6
+      with:
+        image: upgradoor
+        tags: ${{ needs.publish_release.outputs.tags }}
+        attest: "false"
+        mirror-url: ${{ secrets.IMAGE_MIRROR_URL }}

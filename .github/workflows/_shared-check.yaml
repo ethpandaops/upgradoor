@@ -1,0 +1,103 @@
+
+name: Reusable check workflow
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  GOTOOLCHAIN: local
+
+# shared check jobs
+jobs:
+  check_source:
+    name: Run code checks
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    # setup global dependencies
+    - name: Set up go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+    - name: Set up node
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 24.x
+        cache: npm
+        cache-dependency-path: web/package-lock.json
+
+    - name: Verify dependencies
+      run: go mod verify
+
+    - name: Check go mod tidy
+      run: |
+        go mod tidy
+        git diff --exit-code go.mod go.sum
+
+    - name: Run tests
+      run: make test
+
+    - name: Run fleet-size tests
+      run: make test-scale
+
+    - name: Build upgradoor
+      run: make build
+
+  lint_source:
+    name: Run linters
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+    - name: Set up node
+      uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 24.x
+        cache: npm
+        cache-dependency-path: web/package-lock.json
+
+    - name: Install golangci-lint
+      run: |
+        curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/v2.15.0/install.sh \
+          | sh -s -- -b "$(go env GOPATH)/bin" v2.15.0
+
+    - name: Run linters
+      run: make lint
+
+  test_docker:
+    name: Test container recreate (real Docker)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+
+    - name: Run docker tests
+      run: make test-docker
+
+  test_system:
+    name: Test packages and reboot (systemd container)
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+
+    - name: Run system tests
+      run: make test-system
+
+    - name: Run reboot tests
+      run: make test-reboot

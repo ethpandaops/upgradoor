@@ -1,0 +1,39 @@
+
+name: Build master
+
+on:
+  push:
+    branches:
+      - 'master'
+  workflow_dispatch:
+
+concurrency:
+  group: docker-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+# No snapshot release: hosts only install signed releases (build-release.yml).
+jobs:
+
+  check_source:
+    name: "Run code checks"
+    uses: ./.github/workflows/_shared-check.yaml
+
+  build_binaries:
+    name: "Build Upgradoor"
+    needs: [check_source]
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    uses: ./.github/workflows/_shared-build.yaml
+    with:
+      docker: true
+      docker_repository: "ghcr.io/ethpandaops/upgradoor"
+      docker_tag_prefix: "master"
+      additional_tags: "['master','master-latest']"
+    secrets:
+      IMAGE_MIRROR_URL: ${{ secrets.IMAGE_MIRROR_URL }}

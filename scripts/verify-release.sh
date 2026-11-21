@@ -13,7 +13,7 @@
 # 3. --min-seq N: the release's seq is not below N (the highest a host ever installed);
 # 4. every binary present in DIR matches its line; with --require-all every binary of the
 #    manifest must be present.
-# Prints the image reference to pull, ethpandaops/upgradoor@sha256:<digest>.
+# Prints the image reference to pull, ghcr.io/ethpandaops/upgradoor@sha256:<digest>.
 #
 # ALLOWED_SIGNERS=<file> checks against another allowed_signers file (tests, self-builders).
 set -euo pipefail

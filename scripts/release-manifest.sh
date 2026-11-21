@@ -13,7 +13,7 @@
 #       prints the tag's seq
 #
 # One line per artifact, sorted (LC_ALL=C), every seq the same:
-#   image <seq> ethpandaops/upgradoor <sha256 hex of the image index>
+#   image <seq> ghcr.io/ethpandaops/upgradoor <sha256 hex of the image index>
 #   upgradoor <seq> linux-amd64 <sha256 hex>
 #   upgradoor <seq> linux-arm64 <sha256 hex>
 #   upgradoor-controller <seq> linux-amd64 <sha256 hex>
@@ -26,7 +26,7 @@ MANIFEST=upgradoor-manifest.txt
 PLATFORMS="linux-amd64 linux-arm64"
 BINARIES="upgradoor upgradoor-controller"
 LINE_RE='^(image|upgradoor|upgradoor-controller) ([1-9][0-9]*) ([a-z0-9/._-]+) ([0-9a-f]{64})$'
-IMAGE=ethpandaops/upgradoor
+IMAGE=ghcr.io/ethpandaops/upgradoor
 export LC_ALL=C
 
 die() { echo "!!! $*" >&2; exit 1; }

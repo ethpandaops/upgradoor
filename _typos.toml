@@ -1,0 +1,11 @@
+[files]
+extend-exclude = ["go.mod", "go.sum", "web/package-lock.json", "**/testdata/**"]
+
+[default]
+check-filename = false
+# base64 keys and signatures
+extend-ignore-re = ["[A-Za-z0-9+/_=-]{40,}"]
+
+[default.extend-words]
+overides = "overides" # misspelled key in a parser test
+stopp = "stopp" # matches stopping and stopped

@@ -27,7 +27,7 @@
 #                        the signature is written into it
 # UPGRADOOR_RELEASE_REF  what to rebuild (default refs/tags/vX.Y.Z)
 # UPGRADOOR_IMAGE_PULL   the repository to pull the signed digest from (default
-#                        ethpandaops/upgradoor; a mirror holds the same digest)
+#                        ghcr.io/ethpandaops/upgradoor; the Docker Hub mirror holds the same digest)
 set -euo pipefail
 
 usage="usage: sign-release.sh vX.Y.Z [--no-rebuild] [--no-image-check]"
@@ -47,7 +47,7 @@ HERE=$(cd "$(dirname "$0")/.." && pwd)
 SIGNERS=${ALLOWED_SIGNERS:-$HERE/deploy/allowed_signers}
 LOCAL=${UPGRADOOR_RELEASE_DIR:-}
 REF=${UPGRADOOR_RELEASE_REF:-refs/tags/$VERSION}
-PULL=${UPGRADOOR_IMAGE_PULL:-ethpandaops/upgradoor}
+PULL=${UPGRADOOR_IMAGE_PULL:-ghcr.io/ethpandaops/upgradoor}
 MANIFEST=upgradoor-manifest.txt
 CHECK=$HERE/scripts/release-manifest.sh
 
