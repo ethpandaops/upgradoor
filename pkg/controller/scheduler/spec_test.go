@@ -40,7 +40,7 @@ func TestSpecRolloutIsShared(t *testing.T) {
 
 	b.step()
 
-	r := b.mustRollout(specKey("exporter", "k1"))
+	r := b.mustRollout(specKey("", "exporter", "k1"))
 	assert.Equal(t, fleet.RolloutSpec, r.Kind)
 	assert.Equal(t, "exporter", r.Container)
 	assert.Equal(t, "exporter to org/x:new "+shortDigest(digestA), r.Title)
@@ -65,13 +65,13 @@ func TestSpecRolloutIsSuperseded(t *testing.T) {
 	b.wantsSpec("h1", "geth", "k1", protocol.ImpactNode)
 	b.step()
 
-	first := b.mustRollout(specKey("geth", "k1"))
+	first := b.mustRollout(specKey("", "geth", "k1"))
 
 	b.get("h1").Status.Needs = []protocol.Need{specNeed("geth", "k2", "org/x:newer", digestB)}
 	b.step()
 
 	assert.Equal(t, fleet.RolloutSuperseded, b.closed(first.Key).State)
-	assert.NotNil(t, b.mustRollout(specKey("geth", "k2")))
+	assert.NotNil(t, b.mustRollout(specKey("", "geth", "k2")))
 }
 
 func TestSpecRolloutAnswersToTheImagePolicy(t *testing.T) {

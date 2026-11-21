@@ -1,49 +1,105 @@
 name: Release
 
+# A release tag (exactly vX.Y.Z) builds the reproducible binaries, pushes the controller image
+# by digest only (no tag) and opens a draft release with the binaries and the manifest that
+# names them all. The maintainer signs the manifest offline (scripts/sign-release.sh) and
+# publishes; publishing verifies the signature and only then tags the signed image digest.
+# Any other tag (v1.2.3-rc1) gets nothing. docs/release.md describes the flow.
 on:
   push:
     tags: ["v*"]
+  release:
+    types: [published]
 
 permissions:
-  contents: write
-  packages: write
+  contents: read
+
+env:
+  IMAGE: ethpandaops/upgradoor
 
 jobs:
-  binaries:
+  draft:
+    if: github.event_name == 'push' && !contains(github.ref_name, '-') && !contains(github.ref_name, '+')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+      - name: Exactly vX.Y.Z
+        run: ./scripts/release-manifest.sh seq "$GITHUB_REF_NAME"
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-      - uses: goreleaser/goreleaser-action@v6
-        with:
-          version: "~> v2"
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  image:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
+      - name: make test
+        run: make test
+      - name: Reproducible binaries and their manifest
+        run: make release VERSION="$GITHUB_REF_NAME"
       - uses: docker/setup-qemu-action@v3
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
+      # The image holds exactly the manifest's binaries (target release). Pushed by digest
+      # only: nothing points at it until the signed release is published.
+      - name: Controller image, by digest
+        id: image
+        uses: docker/build-push-action@v6
         with:
           context: .
+          target: release
           platforms: linux/amd64,linux/arm64
-          push: true
-          build-args: VERSION=${{ github.ref_name }}
-          tags: |
-            ethpandaops/upgradoor:${{ github.ref_name }}
-            ethpandaops/upgradoor:latest
+          provenance: false
+          sbom: false
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+      - name: Manifest with the image's digest
+        env:
+          DIGEST: ${{ steps.image.outputs.digest }}
+        run: |
+          ./scripts/release-manifest.sh write "$GITHUB_REF_NAME" dist "$DIGEST"
+          ./scripts/release-manifest.sh check "$GITHUB_REF_NAME" dist/upgradoor-manifest.txt
+      - name: Draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" \
+            --notes "Sign the manifest (scripts/sign-release.sh $GITHUB_REF_NAME), then publish: publishing tags the signed image." \
+            dist/upgradoor-manifest.txt dist/upgradoor-linux-amd64 dist/upgradoor-linux-arm64
+
+  # Publishing: the signature over the release's manifest must verify against the
+  # deploy/allowed_signers of the tag, the binaries must match it; only then is the signed
+  # image digest tagged vX.Y.Z and latest.
+  publish:
+    if: github.event_name == 'release' && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify the signed release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -eu
+          mkdir -p .cache/release
+          gh release download "$TAG" --dir .cache/release --pattern 'upgradoor-*'
+          ./scripts/verify-release.sh "$TAG" .cache/release
+          digest=$(awk '$1 == "image" { print $4 }' .cache/release/upgradoor-manifest.txt)
+          echo "DIGEST=sha256:$digest" >> "$GITHUB_ENV"
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+      - name: Tag the signed image
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        # one source index: imagetools copies it as it is, the tags point at the signed digest
+        run: |
+          set -eu
+          docker buildx imagetools create \
+            -t "$IMAGE:$TAG" -t "$IMAGE:latest" "$IMAGE@$DIGEST"
+          got=$(docker buildx imagetools inspect "$IMAGE:$TAG" --format '{{ .Manifest.Digest }}')
+          [ "$got" = "$DIGEST" ] || { echo "::error::$IMAGE:$TAG is $got, not the signed $DIGEST"; exit 1; }

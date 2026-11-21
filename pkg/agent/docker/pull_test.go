@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
 func TestPull(t *testing.T) {
@@ -75,7 +75,7 @@ func TestPull(t *testing.T) {
 		r.login = func(host string) (username, password string, ok bool) {
 			asked = append(asked, host)
 
-			return "user", "secret", host == agent.DockerHubHost
+			return "user", "secret", host == imageref.DockerHubHost
 		}
 
 		_, _, err := r.Pull(t.Context(), "registry-1.docker.io/"+fakeRef)
@@ -84,7 +84,7 @@ func TestPull(t *testing.T) {
 		_, _, err = r.Pull(t.Context(), "ghcr.io/"+fakeRef)
 		require.ErrorContains(t, err, "absent after the pull")
 
-		assert.Equal(t, []string{agent.DockerHubHost, "ghcr.io"}, asked,
+		assert.Equal(t, []string{imageref.DockerHubHost, "ghcr.io"}, asked,
 			"asked by the host as the registry lookups spell it")
 		require.Len(t, f.pulls, 2)
 

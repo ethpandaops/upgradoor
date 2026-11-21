@@ -14,7 +14,7 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
 )
 
 const (
@@ -66,17 +66,17 @@ type recreatePlan struct {
 	wasRunning bool
 }
 
-// Recreate implements agent.ContainerRuntime.
+// Recreate implements hostapi.ContainerRuntime.
 func (r *Runtime) Recreate(
 	ctx context.Context,
 	name, digest string,
 	stopTimeout time.Duration,
 	start bool,
 ) error {
-	return r.RecreateAs(ctx, name, digest, stopTimeout, start, agent.Recreation{})
+	return r.RecreateAs(ctx, name, digest, stopTimeout, start, hostapi.Recreation{})
 }
 
-// RecreateAs implements agent.ContainerRuntime: a Recreate whose replacement
+// RecreateAs implements hostapi.ContainerRuntime: a Recreate whose replacement
 // is created from another image reference, with another command line or
 // with other labels. Everything else is kept as Recreate keeps it, and the
 // digest is verified against the image the replacement is created from.
@@ -85,7 +85,7 @@ func (r *Runtime) RecreateAs(
 	name, digest string,
 	stopTimeout time.Duration,
 	start bool,
-	change agent.Recreation,
+	change hostapi.Recreation,
 ) error {
 	r.recreateMu.Lock()
 	defer r.recreateMu.Unlock()
@@ -162,7 +162,7 @@ func (r *Runtime) referenceOf(ctx context.Context, name string) (string, error) 
 }
 
 // verifyDigest returns the local image ref names if digest is one of its
-// registry digests, and agent.ErrDigestMismatch otherwise.
+// registry digests, and hostapi.ErrDigestMismatch otherwise.
 func (r *Runtime) verifyDigest(
 	ctx context.Context,
 	ref, digest string,
@@ -173,7 +173,7 @@ func (r *Runtime) verifyDigest(
 	}
 
 	if img == nil {
-		return nil, fmt.Errorf("%w: there is no local image %s", agent.ErrDigestMismatch, ref)
+		return nil, fmt.Errorf("%w: there is no local image %s", hostapi.ErrDigestMismatch, ref)
 	}
 
 	if !hasDigest(ref, img.RepoDigests, digest) {
@@ -183,7 +183,7 @@ func (r *Runtime) verifyDigest(
 		}
 
 		return nil, fmt.Errorf("%w: %s is %s, wanted %q",
-			agent.ErrDigestMismatch, ref, local, digest)
+			hostapi.ErrDigestMismatch, ref, local, digest)
 	}
 
 	return img, nil
@@ -192,7 +192,7 @@ func (r *Runtime) verifyDigest(
 // planRecreate inspects the container and its images, verifies the digest
 // and derives the create request. It changes nothing.
 func (r *Runtime) planRecreate(
-	ctx context.Context, name, digest string, change *agent.Recreation,
+	ctx context.Context, name, digest string, change *hostapi.Recreation,
 ) (*recreatePlan, error) {
 	res, err := r.engine.ContainerInspect(ctx, name, client.ContainerInspectOptions{})
 	if err != nil {
@@ -351,7 +351,7 @@ func (r *Runtime) create(
 
 	if res.Container.Image != plan.imageID {
 		return created.ID, fmt.Errorf("%w: the new container is on image %s, verified was %s",
-			agent.ErrDigestMismatch, res.Container.Image, plan.imageID)
+			hostapi.ErrDigestMismatch, res.Container.Image, plan.imageID)
 	}
 
 	// Further networks are connected one by one: API versions before 1.44

@@ -36,9 +36,9 @@ func needKey(n *protocol.Need) string {
 	case n.DirectiveID != "", isLocal(n):
 		return ""
 	case n.Kind == protocol.NeedImage && n.Image != nil:
-		return imageKey(n.Image.Image, n.Image.ToDigest)
+		return imageKey(n.Image.Client, n.Image.Image, n.Image.ToDigest)
 	case n.Kind == protocol.NeedSpec && n.Spec != nil:
-		return specKey(n.Spec.Container, n.Spec.Key)
+		return specKey(n.Spec.Client, n.Spec.Container, n.Spec.Key)
 	case n.Kind == protocol.NeedPackages && n.Packages != nil:
 		return prefixPackages + protocol.PackagesKey(n.Packages.Packages)
 	case n.Kind == protocol.NeedReboot:

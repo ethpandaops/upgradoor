@@ -29,6 +29,7 @@ import (
 	"github.com/ethpandaops/service-authenticatoor/pkg/issuer"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/api"
+	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 )
 
 // noServices asks /mint for a token without the "services" claim.
@@ -75,11 +76,11 @@ const clientJS = `(function () {
 // the controller and their team twins.
 func features() []string {
 	twinned := []string{
-		api.FeatureRoll, api.FeatureReboot, api.FeatureHold, api.FeatureRecover,
-		api.FeatureClientPolicy, api.FeatureImageOverride, api.FeatureFlagOverride,
+		authz.FeatureRoll, authz.FeatureReboot, authz.FeatureHold, authz.FeatureRecover,
+		authz.FeatureClientPolicy, authz.FeatureImageOverride, authz.FeatureFlagOverride,
 	}
 	out := make([]string, 0, 2+2*len(twinned))
-	out = append(out, api.FeatureSupervise, api.FeatureAdmin)
+	out = append(out, authz.FeatureSupervise, authz.FeatureAdmin)
 
 	for _, f := range twinned {
 		out = append(out, f, "team_"+f)

@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"regexp"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
 // dockerHubAPIHost is the host that serves Docker Hub's registry API.
@@ -22,22 +22,22 @@ var digestPattern = regexp.MustCompile(`^[a-z0-9]+(?:[+._-][a-z0-9]+)*:[a-f0-9]{
 
 // parseTagReference parses [host/]path[:tag]. A reference with a digest is
 // refused with errDigestReference.
-func parseTagReference(ref string) (agent.Reference, error) {
-	parsed, err := agent.ParseReference(ref)
+func parseTagReference(ref string) (imageref.Reference, error) {
+	parsed, err := imageref.Parse(ref)
 	if err != nil {
-		return agent.Reference{}, fmt.Errorf("registry: %w", err)
+		return imageref.Reference{}, fmt.Errorf("registry: %w", err)
 	}
 
 	if parsed.Digest != "" {
-		return agent.Reference{}, fmt.Errorf("%w: %q", errDigestReference, ref)
+		return imageref.Reference{}, fmt.Errorf("%w: %q", errDigestReference, ref)
 	}
 
 	return parsed, nil
 }
 
 // apiHost is the host to send requests for ref to.
-func apiHost(ref agent.Reference) string {
-	if ref.Host == agent.DockerHubHost {
+func apiHost(ref imageref.Reference) string {
+	if ref.Host == imageref.DockerHubHost {
 		return dockerHubAPIHost
 	}
 

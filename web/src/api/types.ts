@@ -181,6 +181,8 @@ export type NeedKind = 'image' | 'override' | 'spec' | 'packages' | 'reboot';
 /** protocol.ImageNeed */
 interface ImageNeed {
   container: string;
+  /** The client the container runs; the image rollouts of each client are their own. */
+  client?: string;
   image: string;
   fromDigest?: string;
   toDigest: string;
@@ -209,6 +211,8 @@ interface OverrideNeed {
  */
 interface SpecNeed {
   container: string;
+  /** The client the container runs; the spec rollouts of each client are their own. */
+  client?: string;
   key: string;
   image: string;
   fromImage?: string;

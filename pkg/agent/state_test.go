@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -18,13 +17,6 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
-
-func quietLog() logrus.FieldLogger {
-	l := logrus.New()
-	l.SetOutput(io.Discard)
-
-	return l
-}
 
 func sampleRecord() *operationRecord {
 	at := time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)

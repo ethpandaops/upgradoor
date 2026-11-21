@@ -17,7 +17,9 @@ import (
 	"sync"
 	"time"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
+	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -58,9 +60,9 @@ type Host struct {
 }
 
 var (
-	_ agent.ContainerRuntime = (*Host)(nil)
-	_ agent.Registry         = (*Host)(nil)
-	_ agent.System           = (*Host)(nil)
+	_ hostapi.ContainerRuntime = (*Host)(nil)
+	_ hostapi.Registry         = (*Host)(nil)
+	_ hostapi.System           = (*Host)(nil)
 )
 
 // New builds a host from a scenario.
@@ -92,7 +94,7 @@ func New(sc *Scenario) (*Host, error) {
 	for _, c := range sc.Containers {
 		h.created++
 
-		key := agent.NormalizeReference(c.Image)
+		key := imageref.Normalize(c.Image)
 
 		h.containers = append(h.containers, &protocol.Container{
 			Name:      c.Name,
@@ -115,7 +117,7 @@ func New(sc *Scenario) (*Host, error) {
 	}
 
 	for ref, tag := range sc.Registry {
-		h.registry[agent.NormalizeReference(ref)] = tag
+		h.registry[imageref.Normalize(ref)] = tag
 	}
 
 	for i := range h.upgradable {
@@ -168,7 +170,7 @@ func (h *Host) find(name string) *protocol.Container {
 	return nil
 }
 
-// Observe implements agent.ContainerRuntime.
+// Observe implements hostapi.ContainerRuntime.
 func (h *Host) Observe(ctx context.Context) ([]protocol.Container, error) {
 	if err := h.begin(ctx, "observe", ""); err != nil {
 		return nil, fmt.Errorf("fakehost: observe: %w", err)
@@ -185,7 +187,7 @@ func (h *Host) Observe(ctx context.Context) ([]protocol.Container, error) {
 	return out, nil
 }
 
-// LocalImage implements agent.ContainerRuntime.
+// LocalImage implements hostapi.ContainerRuntime.
 func (h *Host) LocalImage(ctx context.Context, ref string) (digest, revision string, err error) {
 	if err := h.begin(ctx, "local:"+ref, ""); err != nil {
 		return "", "", fmt.Errorf("fakehost: local image of %s: %w", ref, err)
@@ -194,12 +196,12 @@ func (h *Host) LocalImage(ctx context.Context, ref string) (digest, revision str
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	local := h.local[agent.NormalizeReference(ref)]
+	local := h.local[imageref.Normalize(ref)]
 
 	return local.Digest, local.Revision, nil
 }
 
-// Pull implements agent.ContainerRuntime: the local image of ref becomes
+// Pull implements hostapi.ContainerRuntime: the local image of ref becomes
 // what the registry has, revision included. Containers are not touched.
 func (h *Host) Pull(ctx context.Context, ref string) (digest, revision string, err error) {
 	if err := h.begin(ctx, "pull:"+ref, "pull "+ref); err != nil {
@@ -209,7 +211,7 @@ func (h *Host) Pull(ctx context.Context, ref string) (digest, revision string, e
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	key := agent.NormalizeReference(ref)
+	key := imageref.Normalize(ref)
 
 	tag, ok := h.registry[key]
 	if !ok {
@@ -221,18 +223,18 @@ func (h *Host) Pull(ctx context.Context, ref string) (digest, revision string, e
 	return tag.Digest, tag.Revision, nil
 }
 
-// Recreate implements agent.ContainerRuntime. An injected failure leaves
+// Recreate implements hostapi.ContainerRuntime. An injected failure leaves
 // the container stopped, as a recreate that broke half-way would.
 func (h *Host) Recreate(
 	ctx context.Context, name, digest string, timeout time.Duration, start bool,
 ) error {
-	return h.RecreateAs(ctx, name, digest, timeout, start, agent.Recreation{})
+	return h.RecreateAs(ctx, name, digest, timeout, start, hostapi.Recreation{})
 }
 
-// RecreateAs implements agent.ContainerRuntime: Recreate onto another image
+// RecreateAs implements hostapi.ContainerRuntime: Recreate onto another image
 // reference, command line or set of override labels.
 func (h *Host) RecreateAs(
-	ctx context.Context, name, digest string, _ time.Duration, start bool, change agent.Recreation,
+	ctx context.Context, name, digest string, _ time.Duration, start bool, change hostapi.Recreation,
 ) error {
 	h.mu.Lock()
 
@@ -244,7 +246,7 @@ func (h *Host) RecreateAs(
 	}
 
 	image := cmp.Or(change.Image, c.Image)
-	key := agent.NormalizeReference(image)
+	key := imageref.Normalize(image)
 	local := h.local[key]
 
 	h.mu.Unlock()
@@ -253,7 +255,7 @@ func (h *Host) RecreateAs(
 	// call counts as a disruption.
 	if local.Digest != digest {
 		return fmt.Errorf("fakehost: recreate %s: local image is %q, wanted %q: %w",
-			name, local.Digest, digest, agent.ErrDigestMismatch)
+			name, local.Digest, digest, hostapi.ErrDigestMismatch)
 	}
 
 	call := fmt.Sprintf("recreate %s %s start=%t", name, digest, start)
@@ -288,7 +290,7 @@ func (h *Host) RecreateAs(
 	}
 
 	h.relabel(name, change.Labels)
-	c.Base = agent.BaseFromLabels(h.labels[name])
+	c.Base = overrides.BaseFromLabels(h.labels[name])
 	c.Digest = local.Digest
 	c.ImageID = imageID(local.Digest)
 	c.Revision = local.Revision
@@ -330,7 +332,7 @@ func (h *Host) relabel(name string, changes map[string]*string) {
 	}
 }
 
-// Stop implements agent.ContainerRuntime.
+// Stop implements hostapi.ContainerRuntime.
 func (h *Host) Stop(ctx context.Context, name string, _ time.Duration) error {
 	if err := h.begin(ctx, "stop:"+name, "stop "+name); err != nil {
 		return fmt.Errorf("fakehost: stop %s: %w", name, err)
@@ -353,7 +355,7 @@ func (h *Host) Stop(ctx context.Context, name string, _ time.Duration) error {
 	return nil
 }
 
-// Start implements agent.ContainerRuntime.
+// Start implements hostapi.ContainerRuntime.
 func (h *Host) Start(ctx context.Context, name string) error {
 	if err := h.begin(ctx, "start:"+name, "start "+name); err != nil {
 		return fmt.Errorf("fakehost: start %s: %w", name, err)
@@ -376,7 +378,7 @@ func (h *Host) Start(ctx context.Context, name string) error {
 	return nil
 }
 
-// Resolve implements agent.Registry.
+// Resolve implements hostapi.Registry.
 func (h *Host) Resolve(ctx context.Context, ref string) (string, error) {
 	if err := h.begin(ctx, "resolve:"+ref, ""); err != nil {
 		return "", fmt.Errorf("fakehost: resolve %s: %w", ref, err)
@@ -385,7 +387,7 @@ func (h *Host) Resolve(ctx context.Context, ref string) (string, error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	tag, ok := h.registry[agent.NormalizeReference(ref)]
+	tag, ok := h.registry[imageref.Normalize(ref)]
 	if !ok {
 		return "", fmt.Errorf("fakehost: resolve %s: manifest unknown", ref)
 	}
@@ -393,8 +395,8 @@ func (h *Host) Resolve(ctx context.Context, ref string) (string, error) {
 	return tag.Digest, nil
 }
 
-// Status implements agent.System.
-func (h *Host) Status(ctx context.Context) (*agent.SystemStatus, error) {
+// Status implements hostapi.System.
+func (h *Host) Status(ctx context.Context) (*hostapi.SystemStatus, error) {
 	if err := h.begin(ctx, "status", ""); err != nil {
 		return nil, fmt.Errorf("fakehost: status: %w", err)
 	}
@@ -407,7 +409,7 @@ func (h *Host) Status(ctx context.Context) (*agent.SystemStatus, error) {
 		return nil, err
 	}
 
-	st := &agent.SystemStatus{
+	st := &hostapi.SystemStatus{
 		BootID: h.bootIDLocked(),
 		Uptime: time.Since(h.bootedAt),
 		OS: protocol.OSSummary{
@@ -440,7 +442,7 @@ func (h *Host) Status(ctx context.Context) (*agent.SystemStatus, error) {
 	return st, nil
 }
 
-// Inventory implements agent.System.
+// Inventory implements hostapi.System.
 func (h *Host) Inventory(ctx context.Context) (*protocol.Inventory, error) {
 	if err := h.begin(ctx, "inventory", ""); err != nil {
 		return nil, fmt.Errorf("fakehost: inventory: %w", err)
@@ -488,7 +490,7 @@ func (h *Host) inventoryLocked() (*protocol.Inventory, error) {
 	return inv, nil
 }
 
-// UpgradePackages implements agent.System: every name must be in the
+// UpgradePackages implements hostapi.System: every name must be in the
 // scenario's blocked set; those with a candidate move to it.
 func (h *Host) UpgradePackages(ctx context.Context, names []string) error {
 	sorted := slices.Sorted(slices.Values(names))
@@ -523,7 +525,7 @@ func (h *Host) UpgradePackages(ctx context.Context, names []string) error {
 	return nil
 }
 
-// Reboot implements agent.System. It simulates the reboot in place: new
+// Reboot implements hostapi.System. It simulates the reboot in place: new
 // boot id, the newest kernel runs, the reboot flag is gone, and containers
 // that were running have restarted. Stopped containers stay stopped, as
 // they do under Docker's unless-stopped policy.
@@ -568,7 +570,7 @@ func (h *Host) SetRegistry(ref, digest, revision string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	h.registry[agent.NormalizeReference(ref)] = Tag{Digest: digest, Revision: revision}
+	h.registry[imageref.Normalize(ref)] = Tag{Digest: digest, Revision: revision}
 }
 
 // SetUpgradable replaces the upgradable list. Blocked is derived from the

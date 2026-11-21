@@ -10,6 +10,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -32,8 +33,8 @@ const (
 // loop must not wait for it. Pulling never touches a running container.
 type imageWatcher struct {
 	log      logrus.FieldLogger
-	runtime  ContainerRuntime
-	registry Registry
+	runtime  hostapi.ContainerRuntime
+	registry hostapi.Registry
 	interval time.Duration
 	now      func() time.Time
 	// pull is false on a host that never rolls: tags are resolved for the
@@ -65,8 +66,8 @@ type watchedTag struct {
 
 func newImageWatcher(
 	log logrus.FieldLogger,
-	runtime ContainerRuntime,
-	registry Registry,
+	runtime hostapi.ContainerRuntime,
+	registry hostapi.Registry,
 	interval time.Duration,
 	now func() time.Time,
 	pull bool,

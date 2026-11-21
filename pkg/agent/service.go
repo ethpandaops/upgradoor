@@ -11,6 +11,9 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/auditlog"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
+	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -18,11 +21,11 @@ import (
 // Deps are the host-facing parts of the agent.
 type Deps struct {
 	// Runtime, Registry and System are required.
-	Runtime  ContainerRuntime
-	Registry Registry
-	System   System
+	Runtime  hostapi.ContainerRuntime
+	Registry hostapi.Registry
+	System   hostapi.System
 	// Prober checks the local nodes; nil reports no node health.
-	Prober Prober
+	Prober hostapi.Prober
 	// Now is the clock (default time.Now).
 	Now func() time.Time
 	// Version is the agent version reported to the controller (default
@@ -47,16 +50,15 @@ type service struct {
 	holds   *holds
 	watcher *imageWatcher
 	// audit is the host's audit log.
-	audit *auditLog
+	audit auditlog.Log
 	// overridesFile is the host's overrides file; overrideMu serializes its
 	// readers and writers (the loop, the local socket). seenOverrides and
 	// overridesErr are what the loop last saw of it.
-	overridesFile *overridesFile
+	overridesFile *overrides.File
 	overrideMu    sync.Mutex
-	seenOverrides map[string]Override
+	seenOverrides map[string]overrides.Entry
 	overridesErr  string
-	// local is the local socket; localState what it serves.
-	local      *localServer
+	// localState is what the local socket serves.
 	localState localState
 	// store is opened by Start.
 	store *stateStore
@@ -72,7 +74,7 @@ type service struct {
 
 	// kick asks the loop for a sync now (an operation changed phase).
 	kick chan struct{}
-	// inventoryTimeout bounds one System.Inventory call.
+	// inventoryTimeout bounds one hostapi.System.Inventory call.
 	inventoryTimeout time.Duration
 	// opActive is true while the operation goroutine runs.
 	opActive atomic.Bool
@@ -81,7 +83,7 @@ type service struct {
 
 	// lastContainers and lastSys are the last good observations.
 	lastContainers []protocol.Container
-	lastSys        *SystemStatus
+	lastSys        *hostapi.SystemStatus
 	// repeated are the directive IDs of the last response.
 	repeated     []string
 	pendingRolls map[string]pendingRoll
@@ -159,8 +161,8 @@ func New(
 		network:       claims.Network,
 		client:        newControllerClient(cfg.Controller.URL, creds, answers, deps.Now),
 		holds:         newHolds(cfg),
-		audit:         newAuditLog(log, cfg, deps.Now),
-		overridesFile: &overridesFile{path: cfg.OverridesFile},
+		audit:         auditlog.New(log, cfg.AuditLog, deps.Now),
+		overridesFile: overrides.NewFile(cfg.OverridesFile),
 		// Without the roll verb the tags are still looked up, for the report,
 		// but nothing is pulled: this host never rolls, and a pulled image
 		// would be picked up by whoever recreates the container next.

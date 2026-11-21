@@ -13,6 +13,8 @@ import (
 
 	"gopkg.in/yaml.v3"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/auditlog"
+	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -25,6 +27,10 @@ const (
 	DefaultHoldFile   = "/etc/upgradoor/hold"
 	DefaultStateDir   = "/var/lib/upgradoor"
 	DefaultSocketFile = "/run/upgradoor/agent.sock"
+
+	// DefaultEntryUser is the user whose home directory holds the overrides
+	// file and whose group may use the local socket.
+	DefaultEntryUser = "devops"
 )
 
 // Config is /etc/upgradoor/agent.yaml. It is written by Ansible and never
@@ -52,7 +58,7 @@ type Config struct {
 	Socket SocketConfig `yaml:"socket"`
 	// AuditLog is the host's own audit log of what users and the local
 	// commands asked for (default audit.log in StateDir).
-	AuditLog AuditLogConfig `yaml:"auditLog"`
+	AuditLog auditlog.Config `yaml:"auditLog"`
 
 	// Verbs are the allowed verbs: any of roll, packages, reboot.
 	Verbs []protocol.Verb `yaml:"verbs"`
@@ -109,16 +115,6 @@ type SocketConfig struct {
 	// Group is the group that may use the socket besides root (default: the
 	// primary group of EntryUser). The socket has mode 0660.
 	Group string `yaml:"group"`
-}
-
-// AuditLogConfig is the host's audit log and its rotation.
-type AuditLogConfig struct {
-	// File is the log file (default audit.log in StateDir).
-	File string `yaml:"file"`
-	// MaxSizeBytes is the size at which the file is rotated (default 1 MiB).
-	MaxSizeBytes int64 `yaml:"maxSizeBytes"`
-	// MaxFiles is how many rotated files are kept next to it (default 5).
-	MaxFiles int `yaml:"maxFiles"`
 }
 
 // MaxControllerKeys bounds controller.publicKeys: the keys of a rotation and
@@ -186,18 +182,7 @@ type ManagedContainer struct {
 	// The zero value is nothing. What a person writes into the overrides
 	// file by hand is not bounded by it: whoever can edit that file has
 	// SSH.
-	Overrides OverridePolicy `yaml:"overrides"`
-}
-
-// OverridePolicy is the host's own bound on overrides that arrive from the
-// controller.
-type OverridePolicy struct {
-	// Images are the image repositories an image override may name
-	// ("ethpandaops/geth", "ghcr.io/ethereum/*"; "*" stands for any run of
-	// characters without a slash). Empty: no image overrides.
-	Images []string `yaml:"images"`
-	// Flags allows flag overrides.
-	Flags bool `yaml:"flags"`
+	Overrides overrides.Policy `yaml:"overrides"`
 }
 
 // DockerConfig locates the Docker daemon.
@@ -294,16 +279,16 @@ func (c *Config) ApplyDefaults() {
 	str(&c.HoldFile, DefaultHoldFile)
 	str(&c.StateDir, DefaultStateDir)
 	str(&c.EntryUser, DefaultEntryUser)
-	str(&c.OverridesFile, filepath.Join(homeOf(c.EntryUser), overridesFileName))
+	str(&c.OverridesFile, filepath.Join(homeOf(c.EntryUser), overrides.FileName))
 	str(&c.Socket.Path, DefaultSocketFile)
-	str(&c.AuditLog.File, filepath.Join(c.StateDir, auditLogName))
+	str(&c.AuditLog.File, filepath.Join(c.StateDir, auditlog.FileName))
 
 	if c.AuditLog.MaxSizeBytes <= 0 {
-		c.AuditLog.MaxSizeBytes = defaultAuditLogSize
+		c.AuditLog.MaxSizeBytes = auditlog.DefaultMaxSize
 	}
 
 	if c.AuditLog.MaxFiles <= 0 {
-		c.AuditLog.MaxFiles = defaultAuditLogFiles
+		c.AuditLog.MaxFiles = auditlog.DefaultMaxFiles
 	}
 
 	str(&c.Docker.Host, "unix:///var/run/docker.sock")
@@ -384,10 +369,8 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("container %q: %w", m.Name, err)
 		}
 
-		for _, pattern := range m.Overrides.Images {
-			if err := validateRepositoryPattern(pattern); err != nil {
-				return fmt.Errorf("container %q: overrides.images: %w", m.Name, err)
-			}
+		if err := m.Overrides.Validate(); err != nil {
+			return fmt.Errorf("container %q: %w", m.Name, err)
 		}
 	}
 

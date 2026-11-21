@@ -1,8 +1,9 @@
 package agent
 
 import (
+	"bufio"
+	"encoding/json"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -10,393 +11,279 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/auditlog"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-var overrideTime = time.Date(2026, 11, 20, 16, 0, 0, 0, time.UTC)
+const (
+	fixImage = "ethpandaops/geth:fix"
+	fixV1    = "sha256:fix-1"
+	fixV2    = "sha256:fix-2"
+)
 
-func untilOf(d time.Duration) *time.Time {
-	t := overrideTime.Add(d)
+// overrideEnv is an agent on a host whose geth has a command line, with the
+// override image in the registry.
+func overrideEnv(t *testing.T) *env {
+	t.Helper()
 
-	return &t
+	sc := baseScenario()
+	sc.Containers[1].Command = []string{"--http", "--maxpeers=50"}
+
+	e := newEnv(t, sc)
+	e.host.SetRegistry(fixImage, fixV1, "rev-fix")
+
+	return e
 }
 
-func TestParseOverrides(t *testing.T) {
-	block := strings.Join(GeneratedBlock([]GeneratedContainer{
-		{Name: "geth", Image: "ethpandaops/geth:master", Command: []string{"--http", "--a=b c"}},
-		{Name: "beacon", Image: "sigp/lighthouse:latest"},
-	}), "\n") + "\n"
-
-	for name, content := range map[string]string{
-		"empty":                "",
-		"the generated block":  block,
-		"the key alone":        block + "\noverrides:\n",
-		"an empty mapping":     "overrides: {}\n",
-		"only comments in it":  "overrides:\n  # [geth] 2026-11-20T16:00:00Z sam: cleared\n",
-		"an entry without any": "overrides:\n  geth:\n",
-	} {
-		t.Run(name, func(t *testing.T) {
-			set, err := parseOverrides([]byte(content))
-			require.NoError(t, err)
-			assert.True(t, set.known)
-			assert.True(t, set.entry("geth").empty())
-		})
-	}
-
-	set, err := parseOverrides([]byte(block + `
-overrides:
-  geth:
-    image: ethpandaops/geth:fix
-    flags:
-      add: ["--verbosity=4", --pprof]
-      remove:
-        - --maxpeers
-    by: sam
-    reason: "sync: stuck"
-    until: 2026-11-21T16:00:00Z
-  beacon:
-    image: sigp/lighthouse:unstable
-`))
-	require.NoError(t, err)
-
-	geth := set.entry("geth")
-	require.NotNil(t, geth)
-	assert.Equal(t, Override{
-		Image: "ethpandaops/geth:fix", Add: []string{"--verbosity=4", "--pprof"},
-		Remove: []string{"--maxpeers"}, By: "sam", Reason: "sync: stuck", Until: untilOf(24 * time.Hour),
-	}, *geth)
-	assert.Nil(t, set.entry("beacon").Until, "an end is optional by hand")
-	assert.False(t, geth.expired(overrideTime))
-	assert.True(t, geth.expired(overrideTime.Add(24*time.Hour)))
-
-	_, err = parseOverrides([]byte("overrides:\n  geth:\n    flag: [a]\n"))
-	require.ErrorContains(t, err, "field flag not found")
-
-	_, err = parseOverrides([]byte("overrides: [geth\n"))
-	require.Error(t, err)
-
-	// A key that is not known is an error, not "no overrides": a typo must
-	// not put every container back.
-	_, err = parseOverrides([]byte("overides:\n  geth:\n    image: a/b:c\n"))
-	require.ErrorContains(t, err, "field overides not found")
-
-	missing := readOverrides(filepath.Join(t.TempDir(), "none.yaml"))
-	assert.True(t, missing.known, "no file is no overrides")
-
-	broken := filepath.Join(t.TempDir(), "o.yaml")
-	require.NoError(t, os.WriteFile(broken, []byte("overrides: [geth\n"), 0o600))
-	assert.False(t, readOverrides(broken).known, "a broken file is not no overrides")
+func (e *env) writeOverrides(content string) {
+	e.t.Helper()
+	require.NoError(e.t, os.WriteFile(e.cfg.OverridesFile, []byte(content), 0o600))
 }
 
-// The agent changes the entry it is asked to change and no other byte.
-func TestOverridesTextSet(t *testing.T) {
-	block := strings.Join(GeneratedBlock(nil), "\n") + "\n"
-	hand := block + `
-# my notes
-overrides:
+// auditActions reads the actions of the host's audit log, oldest first.
+func (e *env) auditRecords() []auditlog.Record {
+	e.t.Helper()
 
-  # keep an eye on this one
-  beacon:
-      image: sigp/lighthouse:unstable   # indented my way
-      reason: testing
-
-      by: me
-  geth:
-    image: ethpandaops/geth:old
-    by: me
-
-# the end
-`
-
-	text := newOverridesText([]byte(hand))
-	entry := &Override{
-		Image: "ethpandaops/geth:fix", Add: []string{"--a=b", "--c \"d\""}, By: "sam@example.org",
-		Reason: "why: because", Until: untilOf(time.Hour),
-	}
-	require.NoError(t, text.set("geth", entry, overrideTime, "sam@example.org",
-		"image ethpandaops/geth:fix (was ethpandaops/geth:old)"))
-
-	want := block + `
-# my notes
-overrides:
-
-  # keep an eye on this one
-  beacon:
-      image: sigp/lighthouse:unstable   # indented my way
-      reason: testing
-
-      by: me
-  # [geth] 2026-11-20T16:00:00Z sam@example.org: image ethpandaops/geth:fix (was ethpandaops/geth:old)
-  "geth":
-    image: "ethpandaops/geth:fix"
-    flags:
-      add: ["--a=b", "--c \"d\""]
-    by: "sam@example.org"
-    reason: "why: because"
-    until: 2026-11-20T17:00:00Z
-
-# the end
-`
-	assert.Equal(t, want, string(text.bytes()))
-
-	set, err := parseOverrides(text.bytes())
-	require.NoError(t, err)
-	assert.Equal(t, entry.Add, set.entry("geth").Add)
-
-	// Removing it leaves the history, and the other entry as it was.
-	require.NoError(t, text.set("geth", nil, overrideTime.Add(time.Hour), "upgradoor", "expired"))
-
-	set, err = parseOverrides(text.bytes())
-	require.NoError(t, err)
-	assert.Nil(t, set.entry("geth"))
-	assert.Equal(t, "sigp/lighthouse:unstable", set.entry("beacon").Image)
-	assert.Contains(t, string(text.bytes()),
-		"  # [geth] 2026-11-20T16:00:00Z sam@example.org: image ethpandaops/geth:fix (was ethpandaops/geth:old)\n"+
-			"  # [geth] 2026-11-20T17:00:00Z upgradoor: expired\n\n# the end\n")
-	assert.True(t, strings.HasPrefix(string(text.bytes()), block), "the generated block is kept byte for byte")
-
-	// Only the newest history lines are kept.
-	for i := range 2 * maxOverrideHistory {
-		require.NoError(t, text.set("geth", entry, overrideTime.Add(time.Duration(i)*time.Minute), "sam", "again"))
+	f, err := os.Open(e.cfg.AuditLog.File)
+	if err != nil {
+		return nil
 	}
 
-	assert.Equal(t, maxOverrideHistory, strings.Count(string(text.bytes()), "# [geth] "))
-	assert.NotContains(t, string(text.bytes()), "expired")
-	assert.Contains(t, string(text.bytes()), "# keep an eye on this one\n  beacon:\n")
+	defer func() { _ = f.Close() }()
+
+	var out []auditlog.Record
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		var rec auditlog.Record
+		require.NoError(e.t, json.Unmarshal(sc.Bytes(), &rec))
+		out = append(out, rec)
+	}
+
+	return out
 }
 
-func TestOverridesTextSetWhereThereIsNothing(t *testing.T) {
-	entry := &Override{Image: "a/b:c", By: "x", Reason: "y"}
-
-	for name, tt := range map[string]struct{ before, want string }{
-		"an empty file": {"", "overrides:\n  # [geth] 2026-11-20T16:00:00Z x: n\n  \"geth\":\n" +
-			"    image: \"a/b:c\"\n    by: \"x\"\n    reason: \"y\"\n"},
-		"an empty mapping": {"overrides: {}\n", "overrides:\n  # [geth] 2026-11-20T16:00:00Z x: n\n" +
-			"  \"geth\":\n    image: \"a/b:c\"\n    by: \"x\"\n    reason: \"y\"\n"},
-		"comments only": {"# notes", "# notes\n\noverrides:\n  # [geth] 2026-11-20T16:00:00Z x: n\n" +
-			"  \"geth\":\n    image: \"a/b:c\"\n    by: \"x\"\n    reason: \"y\"\n"},
-	} {
-		t.Run(name, func(t *testing.T) {
-			text := newOverridesText([]byte(tt.before))
-			require.NoError(t, text.set("geth", entry, overrideTime, "x", "n"))
-			assert.Equal(t, tt.want, string(text.bytes()))
-		})
+func auditActions(records []auditlog.Record) []string {
+	out := make([]string, 0, len(records))
+	for _, r := range records {
+		out = append(out, r.Action+" "+r.Result)
 	}
 
-	text := newOverridesText([]byte("overrides: {geth: {image: a}}\n"))
-	require.ErrorContains(t, text.set("geth", entry, overrideTime, "x", "n"), "indented block")
-
-	text = newOverridesText([]byte("overrides: [broken\n"))
-	require.Error(t, text.set("geth", entry, overrideTime, "x", "n"))
+	return out
 }
 
-func TestGeneratedBlockIsReplaced(t *testing.T) {
-	old := strings.Join(GeneratedBlock([]GeneratedContainer{{Name: "geth", Image: "a/geth:1"}}), "\n")
-	rest := "\noverrides:\n  geth:\n    image: a/geth:2\n"
+// awaitOverrideNeed waits for the override need of a container.
+func awaitOverrideNeed(t *testing.T, e *env, container string, restore bool) protocol.Need {
+	t.Helper()
 
-	text := newOverridesText([]byte(old + "\n" + rest))
-	block := GeneratedBlock([]GeneratedContainer{{Name: "geth", Image: "a/geth:3", Command: []string{"--x"}}})
-	text.setGeneratedBlock(block)
-	assert.Equal(t, strings.Join(block, "\n")+"\n"+rest, string(text.bytes()))
+	var found protocol.Need
 
-	text = newOverridesText([]byte("overrides:\n"))
-	text.setGeneratedBlock(block)
-	assert.Equal(t, strings.Join(block, "\n")+"\n\noverrides:\n", string(text.bytes()))
+	e.ctrl.await("an override need for "+container, func(req *protocol.SyncRequest) bool {
+		for _, n := range req.Needs {
+			if n.Kind == protocol.NeedOverride && n.Override.Container == container &&
+				n.Override.Restore == restore {
+				found = n
 
-	set, err := parseOverrides([]byte(strings.Join(block, "\n")))
-	require.NoError(t, err)
-	assert.Empty(t, set.entries, "the block is comments only")
-}
-
-func TestImageAllowed(t *testing.T) {
-	patterns := []string{"ethpandaops/geth", "ghcr.io/ethereum/*", "registry.example:5000/team/*-debug"}
-
-	for ref, want := range map[string]bool{
-		"ethpandaops/geth:fix":                    true,
-		"docker.io/ethpandaops/geth:fix":          true,
-		"index.docker.io/ethpandaops/geth":        true,
-		"ethpandaops/geth-debug:fix":              false,
-		"ethpandaops/besu:fix":                    false,
-		"ghcr.io/ethereum/go-ethereum:x":          true,
-		"ghcr.io/ethereum/a/b:x":                  false,
-		"ghcr.io/other/go-ethereum:x":             false,
-		"registry.example:5000/team/geth-debug:1": true,
-		"registry.example:5000/team/geth:1":       false,
-		"evil.example/ethpandaops/geth:fix":       false,
-		"not a reference":                         false,
-	} {
-		assert.Equal(t, want, imageAllowed(patterns, ref), ref)
-	}
-
-	assert.False(t, imageAllowed(nil, "ethpandaops/geth:fix"), "no pattern allows nothing")
-	assert.True(t, imageAllowed([]string{"nginx"}, "nginx:1"), "an official image")
-
-	require.NoError(t, validateRepositoryPattern("registry.example:5000/team/*"))
-	require.Error(t, validateRepositoryPattern("ethpandaops/geth:master"))
-	require.Error(t, validateRepositoryPattern("ethpandaops/[geth"))
-	require.Error(t, validateRepositoryPattern(""))
-}
-
-func TestTargetOf(t *testing.T) {
-	m := &ManagedContainer{Name: "geth", Image: "ethpandaops/geth:master"}
-	base := []string{"--http", "--maxpeers=50"}
-	running := func(image string, command []string, ob *protocol.OverrideBase) *protocol.Container {
-		return &protocol.Container{Name: "geth", Image: image, Command: command, Base: ob}
-	}
-	label := func(t overrideTarget, name string) string {
-		if v := t.labels[name]; v != nil {
-			return *v
+				return true
+			}
 		}
 
-		return "<removed>"
-	}
+		return false
+	})
 
-	// Nothing to do.
-	got := targetOf(m, running(m.Image, base, nil), nil)
-	assert.True(t, got.inSync)
-	assert.Nil(t, got.report(running(m.Image, base, nil), nil))
-
-	// An image and flags, not applied yet.
-	entry := &Override{Image: "ethpandaops/geth:fix", Add: []string{"--pprof"}, Remove: []string{"--maxpeers"}, By: "sam"}
-	got = targetOf(m, running(m.Image, base, nil), entry)
-	assert.False(t, got.inSync)
-	assert.True(t, got.flags)
-	assert.Equal(t, "ethpandaops/geth:fix", got.image)
-	assert.Equal(t, []string{"--http", "--pprof"}, got.command)
-	assert.Equal(t, m.Image, label(got, LabelOverrideImage))
-	assert.JSONEq(t, `["--http","--maxpeers=50"]`, label(got, LabelOverrideCommand))
-	assert.False(t, got.report(running(m.Image, base, nil), entry).Applied)
-
-	// Applied: the labels say what the container was.
-	ob := &protocol.OverrideBase{Image: m.Image, Command: base, HasCommand: true}
-	applied := running("ethpandaops/geth:fix", []string{"--http", "--pprof"}, ob)
-	got = targetOf(m, applied, entry)
-	assert.True(t, got.inSync)
-	assert.False(t, got.spec)
-	assert.True(t, got.report(applied, entry).Applied)
-
-	// The entry is gone: back to the configuration, command included.
-	got = targetOf(m, applied, nil)
-	assert.True(t, got.restore)
-	assert.Equal(t, m.Image, got.image)
-	assert.Equal(t, base, got.command)
-	assert.Equal(t, "<removed>", label(got, LabelOverrideImage))
-	assert.Equal(t, "<removed>", label(got, LabelOverrideCommand))
-	assert.Equal(t, &protocol.ContainerOverride{Restoring: true, Image: "ethpandaops/geth:fix"},
-		got.report(applied, nil))
-
-	// Another image without a label is not what agent.yaml says: it is rolled
-	// onto the configured one, overrides applied.
-	got = targetOf(m, running("me/geth:mine", base, nil), nil)
-	assert.True(t, got.spec)
-	assert.False(t, got.restore)
-	assert.Equal(t, m.Image, got.image)
-
-	got = targetOf(m, running("me/geth:mine", base, nil), &Override{Add: []string{"--x"}})
-	assert.True(t, got.spec)
-	assert.Empty(t, got.err)
-	assert.Equal(t, []string{"--http", "--maxpeers=50", "--x"}, got.command)
-
-	// Ansible created the container with the override applied, no labels.
-	got = targetOf(m, running("ethpandaops/geth:fix", []string{"--http", "--pprof"}, nil), entry)
-	assert.True(t, got.inSync, "applying the flags to what has them changes nothing")
-	assert.False(t, got.spec)
-
-	// An entry that cannot be applied changes nothing.
-	bad := &Override{Image: "ethpandaops/geth@sha256:" + strings.Repeat("a", 64)}
-	got = targetOf(m, running(m.Image, base, nil), bad)
-	assert.True(t, got.inSync)
-	assert.Contains(t, got.err, "pinned to a digest")
-
-	// The need's key follows the image, the digest and the command.
-	a := targetOf(m, running(m.Image, base, nil), entry)
-	b := targetOf(m, running(m.Image, base, nil), &Override{Image: "ethpandaops/geth:fix"})
-	assert.NotEqual(t, a.key("sha256:1"), b.key("sha256:1"))
-	assert.NotEqual(t, a.key("sha256:1"), a.key("sha256:2"))
-	c := targetOf(m, running(m.Image, base, nil), entry)
-	assert.Equal(t, a.key("sha256:1"), c.key("sha256:1"))
+	return found
 }
 
-func TestOverridesFileKeepsItsMode(t *testing.T) {
-	file := filepath.Join(t.TempDir(), "overrides.yaml")
-	f := &overridesFile{path: file}
-	entry := &Override{Image: "a/b:c", By: "x", Reason: "y"}
+// An override written into the file by hand is applied under a lease, the
+// container then follows the override's tag, and it is put back, command
+// line included, once the entry is gone. The lease names the need; what the
+// container becomes comes from the file.
+func TestOverrideByHand(t *testing.T) {
+	e := overrideEnv(t)
+	e.ctrl.autoRelease = true
+	e.start()
+	e.ctrl.awaitSyncs(2)
 
-	require.NoError(t, f.change(func(text *overridesText) error {
-		return text.set("geth", entry, overrideTime, "x", "set")
-	}))
+	e.writeOverrides("overrides:\n  geth:\n    image: " + fixImage + "\n    flags:\n" +
+		"      add: [\"--pprof\"]\n      remove: [\"--maxpeers\"]\n    by: sam\n    reason: sync\n")
 
-	info, err := os.Stat(file)
+	need := awaitOverrideNeed(t, e, "geth", false)
+	assert.True(t, need.Local)
+	assert.Equal(t, &protocol.OverrideNeed{
+		Container: "geth", Image: fixImage, FromImage: gethImage, FromDigest: gethV1,
+		ToDigest: fixV1, ToRevision: "rev-fix", Flags: true,
+	}, need.Override)
+
+	req := e.ctrl.await("the override is reported", func(req *protocol.SyncRequest) bool {
+		return containerOf(t, req, "geth").Override != nil
+	})
+	geth := containerOf(t, &req, "geth")
+	assert.False(t, geth.Override.Applied)
+	assert.Equal(t, "sam", geth.Override.By)
+	assert.Equal(t, []string{"--http", "--maxpeers=50"}, geth.Command)
+	assert.Empty(t, containerOf(t, &req, "dora").Command, "an unmanaged container's command line is not reported")
+
+	e.ctrl.grant(e.lease("lease-override", need))
+
+	op := e.ctrl.awaitFinished("lease-override")
+	require.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.Contains(t, disruptive(e.host.Calls()),
+		"recreate geth "+fixV1+" start=true image="+fixImage+" command=--http --pprof")
+
+	req = e.ctrl.await("the override is applied", func(req *protocol.SyncRequest) bool {
+		c := containerOf(t, req, "geth")
+
+		return c.Override != nil && c.Override.Applied && len(req.Needs) == 0
+	})
+	geth = containerOf(t, &req, "geth")
+	assert.Equal(t, fixImage, geth.Image)
+	assert.Equal(t, fixV1, geth.Digest)
+	assert.Equal(t, "docker.io/"+gethImage, geth.ConfiguredImage)
+	assert.Equal(t, []string{"--http", "--pprof"}, geth.Command)
+
+	// The override's tag moves: an ordinary image need, like any tag.
+	e.host.SetRegistry(fixImage, fixV2, "")
+
+	follow := awaitNeeds(t, e, protocol.ImageNeedID("geth", fixV2))
+	assert.Equal(t, protocol.NeedImage, follow[0].Kind)
+	assert.Equal(t, fixImage, follow[0].Image.Image)
+
+	// A reset: the file holds nothing but comments.
+	e.writeOverrides("# nothing\noverrides:\n")
+
+	back := awaitOverrideNeed(t, e, "geth", true)
+	assert.Equal(t, "docker.io/"+gethImage, back.Override.Image, "the reference of the configuration")
+	assert.True(t, back.Override.Flags)
+
+	req = e.ctrl.await("restoring is reported", func(req *protocol.SyncRequest) bool {
+		c := containerOf(t, req, "geth")
+
+		return c.Override != nil && c.Override.Restoring
+	})
+	assert.Equal(t, fixImage, containerOf(t, &req, "geth").Image)
+
+	e.ctrl.grant(e.lease("lease-restore", back))
+
+	op = e.ctrl.awaitFinished("lease-restore")
+	require.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+
+	req = e.ctrl.await("the container is back", func(req *protocol.SyncRequest) bool {
+		return containerOf(t, req, "geth").Override == nil && len(req.Needs) == 0
+	})
+	geth = containerOf(t, &req, "geth")
+	assert.Equal(t, "docker.io/"+gethImage, geth.Image)
+	assert.Equal(t, gethV1, geth.Digest)
+	assert.Equal(t, []string{"--http", "--maxpeers=50"}, geth.Command)
+	assert.Nil(t, e.host.Container("geth").Base, "the labels are gone with the override")
+
+	assert.Equal(t, []string{
+		"override.edit accepted", "override.apply done", "override.edit accepted", "override.restore done",
+	}, auditActions(e.auditRecords()))
+
+	apply := e.auditRecords()[1]
+	assert.Equal(t, "lease-override", apply.Lease)
+	assert.Equal(t, "geth", apply.Container)
+}
+
+// An override ends by itself: the agent takes the entry out of the file,
+// leaves a comment line, and puts the container back under a lease.
+func TestOverrideExpires(t *testing.T) {
+	e := overrideEnv(t)
+	e.ctrl.autoRelease = true
+	e.start()
+	e.ctrl.awaitSyncs(2)
+
+	until := e.now().Add(time.Hour).UTC().Format(time.RFC3339)
+	e.writeOverrides("# mine\noverrides:\n  geth:\n    image: " + fixImage + "\n    by: sam\n" +
+		"    reason: sync\n    until: " + until + "\n  teku:\n    flags: {add: [\"--x\"]}\n")
+
+	need := awaitOverrideNeed(t, e, "geth", false)
+	teku := awaitOverrideNeed(t, e, "teku", false)
+	e.ctrl.grant(e.lease("lease-1", need, teku))
+	require.Equal(t, protocol.PhaseDone, e.ctrl.awaitFinished("lease-1").Phase)
+
+	e.clockOffset.Add(int64(2 * time.Hour))
+
+	back := awaitOverrideNeed(t, e, "geth", true)
+
+	raw, err := os.ReadFile(e.cfg.OverridesFile)
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o664), info.Mode().Perm(), "a new file is for the entry user to edit")
 
-	require.NoError(t, os.Chmod(file, 0o640))
-	require.NoError(t, f.change(func(text *overridesText) error {
-		return text.set("geth", nil, overrideTime, "x", "cleared")
-	}))
+	content := string(raw)
+	assert.NotContains(t, content, "\n  geth:")
+	assert.Contains(t, content, "# [geth] ")
+	assert.Contains(t, content, "upgradoor: expired; was image "+fixImage+" by sam")
+	assert.True(t, strings.HasPrefix(content, "# mine\noverrides:\n"))
+	assert.Contains(t, content, "  teku:\n    flags: {add: [\"--x\"]}\n", "the other entry is as it was written")
 
-	info, err = os.Stat(file)
-	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o640), info.Mode().Perm())
-	assert.Empty(t, readOverrides(file).entries)
+	e.ctrl.grant(e.lease("lease-2", back))
+	require.Equal(t, protocol.PhaseDone, e.ctrl.awaitFinished("lease-2").Phase)
+
+	req := e.ctrl.await("geth is back, teku stays", func(req *protocol.SyncRequest) bool {
+		return containerOf(t, req, "geth").Override == nil && len(req.Needs) == 0
+	})
+	assert.Equal(t, "docker.io/"+gethImage, containerOf(t, &req, "geth").Image)
+	assert.True(t, containerOf(t, &req, "teku").Override.Applied)
+	assert.Contains(t, auditActions(e.auditRecords()), "override.expire accepted")
 }
 
-// What agent.yaml says (image, command line) is the base the overrides apply
-// to; a container that was created otherwise moves there with a spec need.
-func TestTargetOfSpec(t *testing.T) {
-	m := &ManagedContainer{Name: "geth", Image: "ethpandaops/geth:v2", Command: []string{"--http", "--syncmode=full"}}
-	running := func(image string, command ...string) *protocol.Container {
-		return &protocol.Container{Name: "geth", Image: image, Command: command}
-	}
+// What cannot be applied changes nothing and is said: an image that does not
+// exist, a file that does not parse, a hold.
+func TestOverrideThatCannotBeApplied(t *testing.T) {
+	e := overrideEnv(t)
+	e.start()
+	e.ctrl.awaitSyncs(2)
 
-	got := targetOf(m, running("ethpandaops/geth:v2", "--http", "--syncmode=full"), nil)
-	assert.True(t, got.inSync)
-	assert.False(t, got.spec)
+	// An image the registry does not have: no need, ever.
+	e.writeOverrides("overrides:\n  geth:\n    image: ethpandaops/geth:nope\n")
 
-	// Ansible rendered a new image and a new flag.
-	got = targetOf(m, running("ethpandaops/geth:v1", "--http"), nil)
-	assert.True(t, got.spec)
-	assert.True(t, got.flags)
-	assert.False(t, got.restore)
-	assert.Equal(t, "ethpandaops/geth:v2", got.image)
-	assert.Equal(t, []string{"--http", "--syncmode=full"}, got.command)
+	req := e.ctrl.await("the override is reported", func(req *protocol.SyncRequest) bool {
+		return containerOf(t, req, "geth").Override != nil
+	})
+	assert.False(t, containerOf(t, &req, "geth").Override.Applied)
+	e.ctrl.awaitSyncs(e.ctrl.syncCount() + 3)
+	assert.Empty(t, e.ctrl.allSyncs()[e.ctrl.syncCount()-1].Needs)
 
-	// An override stays: the image override keeps its image, the base moves
-	// underneath it.
-	entry := &Override{Image: "ethpandaops/geth:fix", Add: []string{"--pprof"}}
-	onOverride := running("ethpandaops/geth:fix", "--http", "--pprof")
-	onOverride.Base = &protocol.OverrideBase{Image: "ethpandaops/geth:v1", Command: []string{"--http"}, HasCommand: true}
+	// A broken file applies nothing and takes nothing back.
+	e.writeOverrides("overrides: [geth\n")
+	e.ctrl.awaitSyncs(e.ctrl.syncCount() + 3)
 
-	got = targetOf(m, onOverride, entry)
-	assert.True(t, got.spec)
-	assert.Equal(t, "ethpandaops/geth:fix", got.image)
-	assert.Equal(t, []string{"--http", "--syncmode=full", "--pprof"}, got.command)
+	last := e.ctrl.allSyncs()[e.ctrl.syncCount()-1]
+	assert.Empty(t, last.Needs)
+	assert.Nil(t, containerOf(t, &last, "geth").Override)
 
-	// Without a command line in agent.yaml the container's own is the base.
-	plain := &ManagedContainer{Name: "geth", Image: "ethpandaops/geth:v2"}
-	got = targetOf(plain, running("ethpandaops/geth:v1", "--nat=extip:10.0.0.1"), nil)
-	assert.True(t, got.spec)
-	assert.False(t, got.flags)
+	// A lease for a need the file no longer asks for is superseded.
+	e.writeOverrides("overrides:\n  geth:\n    image: " + fixImage + "\n")
+	need := awaitOverrideNeed(t, e, "geth", false)
+
+	e.writeOverrides("overrides:\n  geth:\n    image: " + fixImage + "\n    flags: {add: [\"--y\"]}\n")
+	awaitNeeds(t, e, awaitOverrideNeedOtherThan(t, e, need.ID).ID)
+
+	e.ctrl.grant(e.lease("lease-stale", need))
+
+	op := e.ctrl.awaitFinished("lease-stale")
+	assert.False(t, op.Disrupted)
+	assert.Equal(t, protocol.StepSuperseded, stepOf(t, op, need.ID).Status)
+	assert.Contains(t, stepOf(t, op, need.ID).Error, "asks for something else now")
+	assert.Empty(t, disruptive(e.host.Calls()))
 }
 
-// Hosts whose command lines differ in per-host values share the key of a
-// spec need when the change is the same.
-func TestSpecKeyIsShared(t *testing.T) {
-	key := func(own string) string {
-		c := &protocol.Container{Name: "geth", Image: "ethpandaops/geth:v1", Command: []string{"--http", own}}
-		m := &ManagedContainer{Name: "geth", Image: "ethpandaops/geth:v2", Command: []string{"--http", own, "--new"}}
-		target := targetOf(m, c, nil)
+func awaitOverrideNeedOtherThan(t *testing.T, e *env, id string) protocol.Need {
+	t.Helper()
 
-		return target.specKey(c, "sha256:a")
-	}
+	var found protocol.Need
 
-	assert.Equal(t, key("--nat=extip:10.0.0.1"), key("--nat=extip:10.0.0.2"))
+	e.ctrl.await("another override need", func(req *protocol.SyncRequest) bool {
+		for _, n := range req.Needs {
+			if n.Kind == protocol.NeedOverride && n.ID != id {
+				found = n
 
-	c := &protocol.Container{Name: "geth", Image: "ethpandaops/geth:v1", Command: []string{"--http"}}
-	target := targetOf(&ManagedContainer{Name: "geth", Image: "ethpandaops/geth:v2"}, c, nil)
-	assert.NotEqual(t, target.specKey(c, "sha256:a"), target.specKey(c, "sha256:b"), "another digest")
+				return true
+			}
+		}
 
-	added, removed := argDelta([]string{"--a", "--b", "--b"}, []string{"--b", "--c", "--c"})
-	assert.Equal(t, []string{"--c"}, added)
-	assert.Equal(t, []string{"--a"}, removed)
+		return false
+	})
+
+	return found
 }

@@ -7,7 +7,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// A host is broken for a group (the rollouts of one image reference, or the
+// A host is broken for a group (the rollouts of one client's image reference, or the
 // packages rollouts) when its last lease for the group failed. The mark is
 // kept with the host (fleet.Host.Broken): set where a lease fails, cleared
 // where a lease is released with the group's steps done, gone with the host
@@ -26,9 +26,9 @@ func needGroup(n *protocol.Need) string {
 	case n.DirectiveID != "", isLocal(n):
 		return ""
 	case n.Kind == protocol.NeedImage && n.Image != nil:
-		return prefixImageKey + n.Image.Image
+		return ImageGroup(n.Image.Client, n.Image.Image)
 	case n.Kind == protocol.NeedSpec && n.Spec != nil:
-		return specGroup(n.Spec.Container)
+		return specGroup(n.Spec.Client, n.Spec.Container)
 	case n.Kind == protocol.NeedPackages && n.Packages != nil:
 		return groupPackages
 	default:
@@ -42,9 +42,9 @@ func needGroup(n *protocol.Need) string {
 func rolloutGroup(r *fleet.Rollout) string {
 	switch r.Kind {
 	case fleet.RolloutImage:
-		return prefixImageKey + r.Image
+		return ImageGroup(r.Client, r.Image)
 	case fleet.RolloutSpec:
-		return specGroup(r.Container)
+		return specGroup(r.Client, r.Container)
 	case fleet.RolloutPackages:
 		return groupPackages
 	default:

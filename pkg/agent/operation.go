@@ -11,6 +11,10 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/auditlog"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
+	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -65,9 +69,9 @@ var (
 type operation struct {
 	log      logrus.FieldLogger
 	cfg      *Config
-	runtime  ContainerRuntime
-	registry Registry
-	system   System
+	runtime  hostapi.ContainerRuntime
+	registry hostapi.Registry
+	system   hostapi.System
 	holds    *holds
 	store    *stateStore
 	now      func() time.Time
@@ -76,7 +80,7 @@ type operation struct {
 	// notify tells the sync loop that the phase changed.
 	notify func()
 	// audit is the host's audit log; nil writes none.
-	audit *auditLog
+	audit auditlog.Log
 
 	// failed is true once a step failed; the remaining steps are skipped,
 	// the containers are still brought back.
@@ -478,7 +482,7 @@ func manualNeedOpen(manual []protocol.Need, n *protocol.Need) bool {
 	return false
 }
 
-func (o *operation) planReboot(plan *operationPlan, n *protocol.Need, sys *SystemStatus) {
+func (o *operation) planReboot(plan *operationPlan, n *protocol.Need, sys *hostapi.SystemStatus) {
 	switch {
 	case n.Reboot == nil:
 		plan.verdict(n.ID, protocol.StepRefused, "malformed reboot need")
@@ -490,7 +494,7 @@ func (o *operation) planReboot(plan *operationPlan, n *protocol.Need, sys *Syste
 }
 
 func (o *operation) planPackages(
-	plan *operationPlan, n *protocol.Need, sys *SystemStatus, names map[string]struct{},
+	plan *operationPlan, n *protocol.Need, sys *hostapi.SystemStatus, names map[string]struct{},
 ) {
 	if n.Packages == nil || len(n.Packages.Packages) == 0 {
 		plan.verdict(n.ID, protocol.StepRefused, "malformed packages need")
@@ -531,8 +535,8 @@ func (o *operation) planPackages(
 
 // overrides reads the overrides file as it is now. An entry whose end has
 // passed counts as gone, whether or not it has been taken out of the file.
-func (o *operation) overrides() *overrideSet {
-	return currentOverrides(o.cfg.OverridesFile, o.now())
+func (o *operation) overrides() *overrides.Set {
+	return overrides.Current(o.cfg.OverridesFile, o.now())
 }
 
 // planOverride validates an override need: the container is still not what
@@ -540,7 +544,7 @@ func (o *operation) overrides() *overrideSet {
 // reported for.
 func (o *operation) planOverride(
 	plan *operationPlan, n *protocol.Need, containers []protocol.Container,
-	targets map[string]overrideTarget, byContainer map[string]int,
+	targets map[string]overrides.Target, byContainer map[string]int,
 ) {
 	name, digest := recreateTarget(n)
 	if name == "" || digest == "" {
@@ -596,16 +600,16 @@ func recreates(n *protocol.Need) bool {
 // overrideStale says why an override or spec need no longer applies; empty
 // when it does.
 func overrideStale(
-	c *protocol.Container, target *overrideTarget, known bool, needID, digest string,
+	c *protocol.Container, target *overrides.Target, known bool, needID, digest string,
 ) string {
 	switch {
 	case c == nil || !known:
 		return "the container does not exist"
-	case target.err != "":
-		return target.err
-	case target.inSync:
+	case target.Err != "":
+		return target.Err
+	case target.InSync:
 		return "container " + c.Name + " already runs what agent.yaml and the overrides file say"
-	case target.needID(c, digest) != needID:
+	case target.NeedID(c, digest) != needID:
 		return "agent.yaml or the overrides file asks for something else now"
 	default:
 		return ""
@@ -636,7 +640,7 @@ func (o *operation) planImage(
 	}
 
 	switch {
-	case n.Image.Image != "" && !SameReference(n.Image.Image, c.Image):
+	case n.Image.Image != "" && !imageref.Same(n.Image.Image, c.Image):
 		plan.verdict(n.ID, protocol.StepSuperseded, fmt.Sprintf(
 			"container %s is on %s, the need was for %s", name, c.Image, n.Image.Image))
 
@@ -866,7 +870,7 @@ func (o *operation) recreate(ctx context.Context, plan *operationPlan, task *ima
 	_, targets := enrichContainers(o.cfg, containers, o.overrides(), noRegistryCheck)
 	c := findContainer(containers, name)
 
-	var change Recreation
+	var change hostapi.Recreation
 
 	if task.override != "" {
 		target, ok := targets[name]
@@ -876,12 +880,12 @@ func (o *operation) recreate(ctx context.Context, plan *operationPlan, task *ima
 			return
 		}
 
-		change = Recreation{
-			Image: target.image, Command: target.command, SetCommand: target.flags,
-			Labels: target.labels,
+		change = hostapi.Recreation{
+			Image: target.Image, Command: target.Command, SetCommand: target.Flags,
+			Labels: target.Labels,
 		}
 
-		log = log.WithFields(logrus.Fields{"image": target.image, "flags": target.flags})
+		log = log.WithFields(logrus.Fields{"image": target.Image, "flags": target.Flags})
 	} else if reason, _ := rollable(o.cfg, c, name); reason != "" {
 		o.setSteps(task.ids, protocol.StepSuperseded, reason)
 
@@ -918,7 +922,7 @@ func (o *operation) recreate(ctx context.Context, plan *operationPlan, task *ima
 		}
 
 		o.setSteps(task.ids, protocol.StepDone, "")
-	case errors.Is(err, ErrDigestMismatch):
+	case errors.Is(err, hostapi.ErrDigestMismatch):
 		if !wasDisrupted {
 			o.clearDisrupted()
 		}
@@ -1333,8 +1337,8 @@ func (o *operation) auditResults(rec *operationRecord) {
 			}
 		}
 
-		out := AuditRecord{
-			Source: auditAgent, Lease: rec.Lease.ID, Result: string(step.Status), Error: step.Error,
+		out := auditlog.Record{
+			Source: auditlog.SourceAgent, Lease: rec.Lease.ID, Result: string(step.Status), Error: step.Error,
 		}
 
 		switch {
@@ -1373,7 +1377,7 @@ func (o *operation) auditResults(rec *operationRecord) {
 			continue
 		}
 
-		o.audit.record(out)
+		o.audit.Record(out)
 	}
 }
 
@@ -1579,7 +1583,7 @@ func (o *operation) observe(ctx context.Context) ([]protocol.Container, error) {
 	return o.runtime.Observe(cctx)
 }
 
-func (o *operation) status(ctx context.Context) (*SystemStatus, error) {
+func (o *operation) status(ctx context.Context) (*hostapi.SystemStatus, error) {
 	cctx, cancel := context.WithTimeout(ctx, statusTimeout)
 	defer cancel()
 

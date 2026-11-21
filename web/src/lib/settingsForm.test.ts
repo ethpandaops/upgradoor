@@ -47,7 +47,7 @@ describe('the ready peer share field', () => {
 
 describe('the groups of the settings page', () => {
   // The settings as the controller answers them (written by TestWireFiles in
-  // pkg/controller/api): a setting the controller gains and the page does not
+  // pkg/controller/userapi): a setting the controller gains and the page does not
   // place fails here.
   const served = Object.keys((golden.rest.settings as { settings: object }).settings).sort();
 

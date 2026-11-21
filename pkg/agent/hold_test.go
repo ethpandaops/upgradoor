@@ -8,6 +8,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/auditlog"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -55,5 +56,5 @@ func TestHolds(t *testing.T) {
 	}
 
 	require.NoError(t, os.WriteFile(cfg.HoldFile, long, 0o600))
-	assert.Len(t, h.Read().LocalReason, maxHoldReason, "the reported reason is bounded")
+	assert.Len(t, h.Read().LocalReason, auditlog.MaxLine, "the reported reason is bounded")
 }

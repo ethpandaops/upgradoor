@@ -68,6 +68,9 @@ type Need struct {
 // is then recreated on the same image.
 type ImageNeed struct {
 	Container string `json:"container"`
+	// Client is the client the container runs (Container.Client); the image
+	// rollouts of each client are their own.
+	Client string `json:"client,omitempty"`
 	// Image is the container's image reference (tag form).
 	Image      string `json:"image"`
 	FromDigest string `json:"fromDigest,omitempty"`
@@ -118,6 +121,9 @@ func (n *Need) Container() string {
 // line from its own files when it serves the lease.
 type SpecNeed struct {
 	Container string `json:"container"`
+	// Client is the client the container runs (Container.Client); the spec
+	// rollouts of each client are their own.
+	Client string `json:"client,omitempty"`
 	// Key identifies the target across hosts: the image at its digest and
 	// the arguments the command line gains and loses. Hosts whose rendered
 	// command lines differ only in what stays the same share it.

@@ -7,6 +7,9 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/auditlog"
+	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -103,7 +106,7 @@ func (s *service) applyDirective(d *protocol.Directive, obs *observation) bool {
 		reject = s.rollRefusal(d.Container, obs)
 		if reject == "" {
 			c := obs.container(d.Container)
-			key := NormalizeReference(c.Image)
+			key := imageref.Normalize(c.Image)
 
 			s.pendingRolls[d.ID] = pendingRoll{
 				container: d.Container,
@@ -141,12 +144,12 @@ func (s *service) applyDirective(d *protocol.Directive, obs *observation) bool {
 // verification is switched off for development); the user in it is the
 // controller's word.
 func actorOf(d *protocol.Directive) *origin {
-	who := &origin{source: auditController, user: "unknown", directive: d.ID}
+	who := &origin{source: auditlog.SourceController, user: "unknown", directive: d.ID}
 
 	if d.By != nil {
-		who.user = cmp.Or(firstLine(d.By.User), "unknown")
+		who.user = cmp.Or(auditlog.Line(d.By.User), "unknown")
 		who.teams = protocol.CleanOwners(d.By.Teams)
-		who.feature = firstLine(d.By.Feature)
+		who.feature = auditlog.Line(d.By.Feature)
 	}
 
 	return who
@@ -157,9 +160,9 @@ func actorOf(d *protocol.Directive) *origin {
 // is recorded where the file is written; a recheck is nobody's request.
 func (s *service) auditDirective(d *protocol.Directive, reject string) {
 	who := actorOf(d)
-	rec := AuditRecord{
-		Source: auditController, User: who.user, Teams: who.teams, Feature: who.feature,
-		Directive: d.ID, Container: d.Container, Reason: d.Reason, Result: auditAccepted,
+	rec := auditlog.Record{
+		Source: auditlog.SourceController, User: who.user, Teams: who.teams, Feature: who.feature,
+		Directive: d.ID, Container: d.Container, Reason: d.Reason, Result: auditlog.Accepted,
 	}
 
 	switch d.Kind {
@@ -176,10 +179,10 @@ func (s *service) auditDirective(d *protocol.Directive, reject string) {
 	}
 
 	if reject != "" {
-		rec.Result, rec.Error = auditRefused, reject
+		rec.Result, rec.Error = auditlog.Refused, reject
 	}
 
-	s.audit.record(rec)
+	s.audit.Record(rec)
 }
 
 // overrideDirective writes what an override directive asks for into the
@@ -196,7 +199,7 @@ func (s *service) overrideDirective(d *protocol.Directive) string {
 	case !s.cfg.Allows(protocol.VerbRoll):
 		// Recorded like every refusal.
 		err = s.changeOverride(who, d.Container, d.Reason,
-			func(*Override) (*Override, *Override, error) {
+			func(*overrides.Entry) (*overrides.Entry, *overrides.Entry, error) {
 				return nil, nil, refusedf("verb roll is not allowed on this host")
 			})
 	default:
@@ -207,7 +210,7 @@ func (s *service) overrideDirective(d *protocol.Directive) string {
 		return ""
 	}
 
-	return strings.TrimPrefix(err.Error(), errRefused.Error()+": ")
+	return strings.TrimPrefix(err.Error(), auditlog.ErrRefused.Error()+": ")
 }
 
 // concludeDirective persists the answer to a directive together with the
@@ -308,7 +311,7 @@ func (s *service) resolvePendingRolls(obs *observation) {
 		)
 
 		switch {
-		case gone || NormalizeReference(c.Image) != p.key:
+		case gone || imageref.Normalize(c.Image) != p.key:
 			reject = "container " + p.container + " moved to another image"
 		case !done:
 			continue
@@ -322,6 +325,7 @@ func (s *service) resolvePendingRolls(obs *observation) {
 				DirectiveID: id,
 				Image: &protocol.ImageNeed{
 					Container:  c.Name,
+					Client:     c.Client,
 					Image:      c.Image,
 					FromDigest: c.Digest,
 					ToDigest:   check.Digest,

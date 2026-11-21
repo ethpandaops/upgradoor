@@ -6,13 +6,13 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
 func TestParseTagReference(t *testing.T) {
 	ref, err := parseTagReference("geth")
 	require.NoError(t, err)
-	require.Equal(t, agent.Reference{Host: agent.DockerHubHost, Path: "library/geth", Tag: "latest"}, ref)
+	require.Equal(t, imageref.Reference{Host: imageref.DockerHubHost, Path: "library/geth", Tag: "latest"}, ref)
 	require.Equal(t, dockerHubAPIHost, apiHost(ref), "Docker Hub is served by another host")
 
 	ref, err = parseTagReference("GHCR.io/org/app:v1")

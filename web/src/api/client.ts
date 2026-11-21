@@ -134,7 +134,7 @@ class EventParser {
   }
 }
 
-/** Every action route with its request body type (pkg/controller/api/schema.go). */
+/** Every action route with its request body type (pkg/controller/views/schema.go). */
 interface ActionBodies {
   roll: RollRequest;
   reboot: RebootRequest;

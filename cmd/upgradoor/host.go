@@ -13,6 +13,8 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/local"
+	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -39,7 +41,7 @@ func newHostCmd() *cobra.Command {
 
 	cmd.PersistentFlags().StringVar(&socket, "socket", def, "the agent's socket ($"+envSocket+")")
 
-	client := func() *agent.LocalClient { return agent.NewLocalClient(socket) }
+	client := func() *local.Client { return local.NewClient(socket) }
 
 	cmd.AddCommand(
 		newHostListCmd(client),
@@ -54,7 +56,7 @@ func newHostCmd() *cobra.Command {
 	return cmd
 }
 
-func newHostListCmd(client func() *agent.LocalClient) *cobra.Command {
+func newHostListCmd(client func() *local.Client) *cobra.Command {
 	return &cobra.Command{
 		Use:   "list",
 		Short: "List the managed containers with image, digest, revision, flags and overrides",
@@ -74,7 +76,7 @@ func newHostListCmd(client func() *agent.LocalClient) *cobra.Command {
 
 // printContainers writes every managed container with what an override
 // changed about it marked.
-func printContainers(w io.Writer, st *agent.LocalStatus) {
+func printContainers(w io.Writer, st *local.Status) {
 	if st.OverridesError != "" {
 		fmt.Fprintf(w, "! the overrides file %s cannot be read: %s\n\n", st.OverridesFile, st.OverridesError)
 	}
@@ -111,7 +113,7 @@ func printContainers(w io.Writer, st *agent.LocalStatus) {
 	fmt.Fprintf(w, "overrides file: %s\n", st.OverridesFile)
 }
 
-func clientOf(c *agent.LocalContainer) string {
+func clientOf(c *local.Container) string {
 	if c.Client == "" {
 		return ""
 	}
@@ -129,7 +131,7 @@ func orDash(s string) string {
 
 // printFlags writes the command line, one argument per line; an argument an
 // override added is marked "+", one it removed "-".
-func printFlags(w io.Writer, c *agent.LocalContainer) {
+func printFlags(w io.Writer, c *local.Container) {
 	fmt.Fprintln(w, "  flags:")
 
 	if c.BaseCommand == nil {
@@ -216,7 +218,7 @@ func printOverride(w io.Writer, o *protocol.ContainerOverride) {
 	fmt.Fprintf(w, "    by %s, %s: %s\n", orDash(o.By), until, orDash(o.Reason))
 }
 
-func newHostStatusCmd(client func() *agent.LocalClient) *cobra.Command {
+func newHostStatusCmd(client func() *local.Client) *cobra.Command {
 	return &cobra.Command{
 		Use:   "status",
 		Short: "Show the hold, the open needs, the lease and the rolls requested here",
@@ -234,7 +236,7 @@ func newHostStatusCmd(client func() *agent.LocalClient) *cobra.Command {
 	}
 }
 
-func printStatus(w io.Writer, st *agent.LocalStatus) {
+func printStatus(w io.Writer, st *local.Status) {
 	fmt.Fprintf(w, "host %s (%s), agent %s, looked at %s\n",
 		st.Host, st.Network, st.Version, st.At.Local().Format(time.TimeOnly))
 
@@ -298,28 +300,28 @@ func describeNeed(n *protocol.Need) string {
 	}
 }
 
-func rollDetail(r *agent.LocalRoll) string {
-	if r.State == agent.RollQueued && r.Position > 0 {
+func rollDetail(r *local.Roll) string {
+	if r.State == local.RollQueued && r.Position > 0 {
 		return fmt.Sprintf("position %d: %s", r.Position, r.Detail)
 	}
 
 	return r.Detail
 }
 
-func newHostOverrideCmd(client func() *agent.LocalClient) *cobra.Command {
+func newHostOverrideCmd(client func() *local.Client) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "override",
 		Short: "Set or clear the override of a container (the agent writes the overrides file)",
 	}
 
 	var (
-		req   agent.OverrideRequest
+		req   local.OverrideRequest
 		until string
 	)
 
 	set := &cobra.Command{
 		Use:   "set <container>",
-		Short: "Override the image, the flags or both of a container for a while",
+		Short: "overrides.Entry the image, the flags or both of a container for a while",
 		Long: "Writes the container's entry in the overrides file; an entry that is there is\n" +
 			"replaced as a whole. The container is recreated under the next lease.\n\n" +
 			"Flags: --remove-flag takes arguments out first (\"--name\" removes the flag\n" +
@@ -337,7 +339,7 @@ func newHostOverrideCmd(client func() *agent.LocalClient) *cobra.Command {
 
 			req.Until = end
 
-			return printAnswer(cmd, func(ctx context.Context) (*agent.LocalAnswer, error) {
+			return printAnswer(cmd, func(ctx context.Context) (*local.Answer, error) {
 				return client().Override(ctx, &req)
 			})
 		},
@@ -346,7 +348,7 @@ func newHostOverrideCmd(client func() *agent.LocalClient) *cobra.Command {
 	set.Flags().StringVar(&req.Image, "image", "", "image reference to run instead (repository:tag)")
 	set.Flags().StringArrayVar(&req.AddFlags, "add-flag", nil, "argument to add (repeatable)")
 	set.Flags().StringArrayVar(&req.RemoveFlags, "remove-flag", nil, "argument to remove (repeatable)")
-	set.Flags().StringVar(&until, "until", agent.DefaultOverrideDuration.String(),
+	set.Flags().StringVar(&until, "until", overrides.DefaultDuration.String(),
 		"end of the override: a duration (24h), a time (RFC 3339) or \"never\"")
 	set.Flags().StringVar(&req.Reason, "reason", "", "why (written into the file and the audit log)")
 
@@ -357,8 +359,8 @@ func newHostOverrideCmd(client func() *agent.LocalClient) *cobra.Command {
 		Short: "Remove the override of a container; it is put back under the next lease",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return printAnswer(cmd, func(ctx context.Context) (*agent.LocalAnswer, error) {
-				return client().Override(ctx, &agent.OverrideRequest{
+			return printAnswer(cmd, func(ctx context.Context) (*local.Answer, error) {
+				return client().Override(ctx, &local.OverrideRequest{
 					Container: args[0], Clear: true, Reason: reason,
 				})
 			})
@@ -405,7 +407,7 @@ func parseUntil(value string, now time.Time) (*time.Time, error) {
 }
 
 func printAnswer(
-	cmd *cobra.Command, call func(ctx context.Context) (*agent.LocalAnswer, error),
+	cmd *cobra.Command, call func(ctx context.Context) (*local.Answer, error),
 ) error {
 	answer, err := call(cmd.Context())
 	if err != nil {
@@ -417,33 +419,33 @@ func printAnswer(
 	return nil
 }
 
-func newHostHoldCmd(client func() *agent.LocalClient) *cobra.Command {
+func newHostHoldCmd(client func() *local.Client) *cobra.Command {
 	return &cobra.Command{
 		Use:   "hold [reason]",
 		Short: "Hold the host: the agent reports no needs and refuses all work",
 		Args:  cobra.ArbitraryArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return printAnswer(cmd, func(ctx context.Context) (*agent.LocalAnswer, error) {
-				return client().Hold(ctx, &agent.HoldRequest{Reason: strings.Join(args, " ")})
+			return printAnswer(cmd, func(ctx context.Context) (*local.Answer, error) {
+				return client().Hold(ctx, &local.HoldRequest{Reason: strings.Join(args, " ")})
 			})
 		},
 	}
 }
 
-func newHostReleaseCmd(client func() *agent.LocalClient) *cobra.Command {
+func newHostReleaseCmd(client func() *local.Client) *cobra.Command {
 	return &cobra.Command{
 		Use:   "release",
 		Short: "Release the local hold (a hold of the controller is lifted on the page)",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return printAnswer(cmd, func(ctx context.Context) (*agent.LocalAnswer, error) {
-				return client().Hold(ctx, &agent.HoldRequest{Release: true})
+			return printAnswer(cmd, func(ctx context.Context) (*local.Answer, error) {
+				return client().Hold(ctx, &local.HoldRequest{Release: true})
 			})
 		},
 	}
 }
 
-func newHostInitCmd(client func() *agent.LocalClient) *cobra.Command {
+func newHostInitCmd(client func() *local.Client) *cobra.Command {
 	return &cobra.Command{
 		Use:   "init-overrides",
 		Short: "Write the generated block of the overrides file (where Ansible does not)",
@@ -452,14 +454,14 @@ func newHostInitCmd(client func() *agent.LocalClient) *cobra.Command {
 			"block are kept. The Ansible role writes the same block on every run.",
 		Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
-			return printAnswer(cmd, func(ctx context.Context) (*agent.LocalAnswer, error) {
+			return printAnswer(cmd, func(ctx context.Context) (*local.Answer, error) {
 				return client().InitOverrides(ctx)
 			})
 		},
 	}
 }
 
-func newHostRollCmd(client func() *agent.LocalClient) *cobra.Command {
+func newHostRollCmd(client func() *local.Client) *cobra.Command {
 	var noWait bool
 
 	cmd := &cobra.Command{
@@ -500,7 +502,7 @@ func newHostRollCmd(client func() *agent.LocalClient) *cobra.Command {
 
 // followRolls prints every change of the named rolls until all are final.
 // It fails when one of them did.
-func followRolls(ctx context.Context, out io.Writer, c *agent.LocalClient, ids []string) error {
+func followRolls(ctx context.Context, out io.Writer, c *local.Client, ids []string) error {
 	last := make(map[string]string, len(ids))
 	failed := make([]string, 0, len(ids))
 
@@ -527,7 +529,7 @@ func followRolls(ctx context.Context, out io.Writer, c *agent.LocalClient, ids [
 				last[r.ID] = line
 				fmt.Fprintf(out, "%s  %s  %s\n", time.Now().Format(time.TimeOnly), r.Container, line)
 
-				if r.Final() && r.State != agent.RollDone {
+				if r.Final() && r.State != local.RollDone {
 					failed = append(failed, r.Container+" "+r.State)
 				}
 			}

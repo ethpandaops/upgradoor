@@ -12,7 +12,7 @@ import (
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
 )
 
 // shortIDLength is the length of the short container ID Docker uses as the
@@ -81,7 +81,7 @@ func buildCreateSpec(
 
 // apply makes the changes of a recreation to the create request: the image
 // reference, the command line, the labels.
-func (s *createSpec) apply(change *agent.Recreation) {
+func (s *createSpec) apply(change *hostapi.Recreation) {
 	if change.Image != "" {
 		s.Config.Image = change.Image
 	}

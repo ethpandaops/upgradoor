@@ -10,6 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -63,7 +64,7 @@ func (h *watchedHost) Recreate(context.Context, string, string, time.Duration, b
 }
 
 func (h *watchedHost) RecreateAs(
-	context.Context, string, string, time.Duration, bool, Recreation,
+	context.Context, string, string, time.Duration, bool, hostapi.Recreation,
 ) error {
 	return errors.New("not used")
 }

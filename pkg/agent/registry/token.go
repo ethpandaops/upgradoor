@@ -10,7 +10,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
 const (
@@ -70,7 +70,7 @@ func (r *Resolver) dropToken(key, value string) {
 // fetchToken follows a Bearer challenge as the distribution token
 // specification describes. The scope asked for is always pull on the one
 // repository, whatever the challenge suggests.
-func (r *Resolver) fetchToken(ctx context.Context, ref agent.Reference, challenge map[string]string) (token, error) {
+func (r *Resolver) fetchToken(ctx context.Context, ref imageref.Reference, challenge map[string]string) (token, error) {
 	realm, err := url.Parse(challenge["realm"])
 	if err != nil || realm.Host == "" {
 		return token{}, fmt.Errorf("registry: %s sent an unusable bearer realm", apiHost(ref))

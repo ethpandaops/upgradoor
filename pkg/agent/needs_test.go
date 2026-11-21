@@ -6,6 +6,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
+	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -30,7 +32,7 @@ func observed(cfg *Config) *observation {
 }
 
 // observedWith is observed on a host whose overrides file says set.
-func observedWith(cfg *Config, set *overrideSet) *observation {
+func observedWith(cfg *Config, set *overrides.Set) *observation {
 	containers := []protocol.Container{
 		{Name: "geth", Image: "ethpandaops/geth:master", Digest: "sha256:a", State: protocol.StateRunning},
 		{Name: "teku", Image: "consensys/teku:develop", Digest: "sha256:t", State: protocol.StateRunning},
@@ -56,7 +58,7 @@ func observedWith(cfg *Config, set *overrideSet) *observation {
 		containersFresh: true,
 		targets:         targets,
 		check:           check,
-		sys: &SystemStatus{
+		sys: &hostapi.SystemStatus{
 			OS: protocol.OSSummary{
 				RunningKernel: "6.12.41", NewestKernel: "6.12.48", RebootRequired: true,
 			},

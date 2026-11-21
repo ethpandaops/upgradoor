@@ -11,6 +11,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/atomicfile"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -26,7 +27,6 @@ const (
 	maxHandledDirectives = 256
 
 	corruptSuffix = ".corrupt"
-	tempPattern   = ".tmp-*"
 )
 
 // persistedState is the content of state.json: everything the agent must
@@ -111,7 +111,7 @@ func (s *persistedState) rememberDirective(h handledDirective) {
 type stateStore struct {
 	log  logrus.FieldLogger
 	path string
-	// syncDir makes the rename of the state file durable (syncDir, unless a
+	// syncDir makes the rename of the state file durable (atomicfile.SyncDir, unless a
 	// test replaces it).
 	syncDir func(dir string) error
 
@@ -131,12 +131,12 @@ func openStateStore(log logrus.FieldLogger, dir string) (*stateStore, error) {
 	s := &stateStore{
 		log:     log,
 		path:    filepath.Join(dir, StateFileName),
-		syncDir: syncDir,
+		syncDir: atomicfile.SyncDir,
 		cur:     persistedState{Version: stateVersion},
 	}
 
 	// Temp files are leftovers of a write that was cut short.
-	if stale, err := filepath.Glob(s.path + tempPattern); err == nil {
+	if stale, err := filepath.Glob(s.path + atomicfile.TempPattern); err == nil {
 		for _, name := range stale {
 			_ = os.Remove(name)
 		}
@@ -165,7 +165,7 @@ func openStateStore(log logrus.FieldLogger, dir string) (*stateStore, error) {
 			return nil, fmt.Errorf("move corrupt state file aside: %w", err)
 		}
 
-		if err := syncDir(dir); err != nil {
+		if err := atomicfile.SyncDir(dir); err != nil {
 			return nil, err
 		}
 
@@ -233,7 +233,7 @@ func (s *stateStore) write(st *persistedState) error {
 		return fmt.Errorf("encode state: %w", err)
 	}
 
-	if err := replaceFile(s.path, append(raw, '\n'), 0o600); err != nil {
+	if err := atomicfile.Replace(s.path, append(raw, '\n'), 0o600); err != nil {
 		return fmt.Errorf("write state file: %w", err)
 	}
 
@@ -309,85 +309,4 @@ func cloneNeeds(in []protocol.Need) []protocol.Need {
 	}
 
 	return out
-}
-
-// writeFileAtomic replaces path with data so that a crash at any point
-// leaves either the old or the new content, never a mix: temp file in the
-// same directory, fsync, rename, fsync of the directory.
-func writeFileAtomic(path string, data []byte, perm os.FileMode) error {
-	if err := replaceFile(path, data, perm); err != nil {
-		return err
-	}
-
-	return syncDir(filepath.Dir(path))
-}
-
-// replaceFile is writeFileAtomic up to and including the rename. After an
-// error path still has its previous content; after success it has data,
-// durably once its directory is fsynced.
-func replaceFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-
-	tmp, err := os.CreateTemp(dir, filepath.Base(path)+tempPattern)
-	if err != nil {
-		return fmt.Errorf("create temp file: %w", err)
-	}
-
-	tmpName := tmp.Name()
-	cleanup := func() {
-		_ = tmp.Close()
-		_ = os.Remove(tmpName)
-	}
-
-	if _, err := tmp.Write(data); err != nil {
-		cleanup()
-
-		return fmt.Errorf("write temp file: %w", err)
-	}
-
-	if err := tmp.Chmod(perm); err != nil {
-		cleanup()
-
-		return fmt.Errorf("chmod temp file: %w", err)
-	}
-
-	if err := tmp.Sync(); err != nil {
-		cleanup()
-
-		return fmt.Errorf("sync temp file: %w", err)
-	}
-
-	if err := tmp.Close(); err != nil {
-		_ = os.Remove(tmpName)
-
-		return fmt.Errorf("close temp file: %w", err)
-	}
-
-	if err := os.Rename(tmpName, path); err != nil {
-		_ = os.Remove(tmpName)
-
-		return fmt.Errorf("rename temp file: %w", err)
-	}
-
-	return nil
-}
-
-// syncDir fsyncs a directory so that a rename or removal in it is durable.
-func syncDir(dir string) error {
-	d, err := os.Open(dir)
-	if err != nil {
-		return fmt.Errorf("open dir: %w", err)
-	}
-
-	if err := d.Sync(); err != nil {
-		_ = d.Close()
-
-		return fmt.Errorf("sync dir: %w", err)
-	}
-
-	if err := d.Close(); err != nil {
-		return fmt.Errorf("close dir: %w", err)
-	}
-
-	return nil
 }

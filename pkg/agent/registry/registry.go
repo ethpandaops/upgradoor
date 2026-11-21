@@ -42,7 +42,8 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
 const (
@@ -109,7 +110,7 @@ type Resolver struct {
 	tokens map[string]token // by API host/path
 }
 
-var _ agent.Registry = (*Resolver)(nil)
+var _ hostapi.Registry = (*Resolver)(nil)
 
 // New builds a Resolver. It reads the CA file once; it does not touch the
 // network.
@@ -123,7 +124,7 @@ func New(log logrus.FieldLogger, opts Options) (*Resolver, error) {
 	}
 
 	for _, host := range opts.PlainHTTP {
-		if host = agent.RegistryHost(host); host != "" {
+		if host = imageref.RegistryHost(host); host != "" {
 			r.plainHTTP[host] = struct{}{}
 		}
 	}
@@ -208,7 +209,7 @@ func (r *Resolver) Resolve(ctx context.Context, ref string) (string, error) {
 
 // head returns the tag's digest from a HEAD request, or "" when the registry
 // sends no digest header or does not serve HEAD.
-func (r *Resolver) head(ctx context.Context, ref agent.Reference) (string, error) {
+func (r *Resolver) head(ctx context.Context, ref imageref.Reference) (string, error) {
 	resp, err := r.do(ctx, ref, http.MethodHead, r.baseURL(ref)+"/manifests/"+ref.Tag)
 	if err != nil {
 		var status *statusError
@@ -233,7 +234,7 @@ func (r *Resolver) head(ctx context.Context, ref agent.Reference) (string, error
 // tagManifest fetches the manifest of the tag with a GET and returns its
 // digest: the registry's digest header when it sends one and the hash of the
 // body otherwise.
-func (r *Resolver) tagManifest(ctx context.Context, ref agent.Reference) (string, error) {
+func (r *Resolver) tagManifest(ctx context.Context, ref imageref.Reference) (string, error) {
 	u := r.baseURL(ref) + "/manifests/" + ref.Tag
 
 	resp, err := r.do(ctx, ref, http.MethodGet, u)
@@ -261,7 +262,7 @@ func (r *Resolver) tagManifest(ctx context.Context, ref agent.Reference) (string
 }
 
 // baseURL is the repository's /v2/ URL.
-func (r *Resolver) baseURL(ref agent.Reference) string {
+func (r *Resolver) baseURL(ref imageref.Reference) string {
 	scheme := schemeHTTPS
 	if r.isPlainHTTP(ref) {
 		scheme = schemeHTTP
@@ -271,7 +272,7 @@ func (r *Resolver) baseURL(ref agent.Reference) string {
 }
 
 // isPlainHTTP reports whether the registry of ref is configured as plain http.
-func (r *Resolver) isPlainHTTP(ref agent.Reference) bool {
+func (r *Resolver) isPlainHTTP(ref imageref.Reference) bool {
 	_, ok := r.plainHTTP[ref.Host]
 
 	return ok
@@ -281,7 +282,7 @@ func (r *Resolver) isPlainHTTP(ref agent.Reference) bool {
 // On 401 it drops the cached token, follows the Bearer challenge and retries
 // once; that covers both the first contact and an expired token. Every other
 // outcome is an error, a *statusError when the registry answered.
-func (r *Resolver) do(ctx context.Context, ref agent.Reference, method, u string) (*http.Response, error) {
+func (r *Resolver) do(ctx context.Context, ref imageref.Reference, method, u string) (*http.Response, error) {
 	key := apiHost(ref) + "/" + ref.Path
 	bearer := r.cachedToken(key)
 
@@ -329,7 +330,7 @@ func (r *Resolver) do(ctx context.Context, ref agent.Reference, method, u string
 // send performs one request, with the bearer token when there is one and the
 // registry's basic credentials otherwise.
 func (r *Resolver) send(
-	ctx context.Context, ref agent.Reference, method, u, bearer string,
+	ctx context.Context, ref imageref.Reference, method, u, bearer string,
 ) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, method, u, http.NoBody)
 	if err != nil {

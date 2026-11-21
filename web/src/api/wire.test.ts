@@ -5,7 +5,7 @@ import type { HostDetail, Hosts, LiveViews, NetworkHealth } from './types';
 import golden from './wire.golden.json';
 import { WIRE_VERSION, WireDoc, buildHostDetail, buildViews, chainAt, decodeRow, without, type DocBody } from './wire';
 
-// wire.golden.json is written by TestWireFiles in pkg/controller/api: the
+// wire.golden.json is written by TestWireFiles in pkg/controller/stream: the
 // views as the REST routes answer them and the events of streams that carry
 // them. What the page decodes from the events must be what the routes say.
 

@@ -1,4 +1,4 @@
-package agent_test
+package agent
 
 import (
 	"os"
@@ -11,17 +11,17 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/local"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 // awaitLocal polls the local socket until pred holds.
 func awaitLocal(
-	t *testing.T, c *agent.LocalClient, what string, pred func(st *agent.LocalStatus) bool,
-) *agent.LocalStatus {
+	t *testing.T, c *local.Client, what string, pred func(st *local.Status) bool,
+) *local.Status {
 	t.Helper()
 
-	var last *agent.LocalStatus
+	var last *local.Status
 
 	require.Eventually(t, func() bool {
 		st, err := c.Status(t.Context())
@@ -37,10 +37,10 @@ func awaitLocal(
 	return last
 }
 
-func localContainer(t *testing.T, st *agent.LocalStatus, name string) agent.LocalContainer {
+func localContainer(t *testing.T, st *local.Status, name string) local.Container {
 	t.Helper()
 
-	i := slices.IndexFunc(st.Containers, func(c agent.LocalContainer) bool { return c.Name == name })
+	i := slices.IndexFunc(st.Containers, func(c local.Container) bool { return c.Name == name })
 	require.GreaterOrEqual(t, i, 0, "no container %s in the local status", name)
 
 	return st.Containers[i]
@@ -63,9 +63,9 @@ func TestLocalOverride(t *testing.T) {
 	e.ctrl.autoRelease = true
 	e.start()
 
-	c := agent.NewLocalClient(e.cfg.Socket.Path)
+	c := local.NewClient(e.cfg.Socket.Path)
 
-	st := awaitLocal(t, c, "the containers", func(st *agent.LocalStatus) bool { return len(st.Containers) == 3 })
+	st := awaitLocal(t, c, "the containers", func(st *local.Status) bool { return len(st.Containers) == 3 })
 	assert.Equal(t, testHost, st.Host)
 	assert.Equal(t, e.cfg.OverridesFile, st.OverridesFile)
 	assert.Equal(t, []string{"--http", "--maxpeers=50"}, localContainer(t, st, "geth").Command)
@@ -79,7 +79,7 @@ func TestLocalOverride(t *testing.T) {
 
 	until := e.now().Add(time.Hour).UTC().Truncate(time.Second)
 
-	answer, err := c.Override(t.Context(), &agent.OverrideRequest{
+	answer, err := c.Override(t.Context(), &local.OverrideRequest{
 		Container: "geth", Image: fixImage, AddFlags: []string{"--pprof"}, Until: &until, Reason: "sync",
 	})
 	require.NoError(t, err)
@@ -99,7 +99,7 @@ func TestLocalOverride(t *testing.T) {
 	e.ctrl.grant(e.lease("lease-local", need))
 	require.Equal(t, protocol.PhaseDone, e.ctrl.awaitFinished("lease-local").Phase)
 
-	st = awaitLocal(t, c, "the override applied", func(st *agent.LocalStatus) bool {
+	st = awaitLocal(t, c, "the override applied", func(st *local.Status) bool {
 		o := localContainer(t, st, "geth").Override
 
 		return o != nil && o.Applied
@@ -109,13 +109,13 @@ func TestLocalOverride(t *testing.T) {
 	assert.Equal(t, []string{"--http", "--maxpeers=50"}, geth.BaseCommand, "what the override changed is told apart")
 
 	// What the host's own rules refuse says so and changes nothing.
-	_, err = c.Override(t.Context(), &agent.OverrideRequest{Container: "dora", Image: fixImage})
+	_, err = c.Override(t.Context(), &local.OverrideRequest{Container: "dora", Image: fixImage})
 	require.ErrorContains(t, err, "container dora is not managed")
 
-	_, err = c.Override(t.Context(), &agent.OverrideRequest{Container: "geth", Image: "ethpandaops/geth@sha256:abc"})
+	_, err = c.Override(t.Context(), &local.OverrideRequest{Container: "geth", Image: "ethpandaops/geth@sha256:abc"})
 	require.Error(t, err)
 
-	_, err = c.Override(t.Context(), &agent.OverrideRequest{Container: "geth", Clear: true, Reason: "done"})
+	_, err = c.Override(t.Context(), &local.OverrideRequest{Container: "geth", Clear: true, Reason: "done"})
 	require.NoError(t, err)
 	awaitOverrideNeed(t, e, "geth", true)
 
@@ -138,10 +138,10 @@ func TestLocalHoldThroughTheSocket(t *testing.T) {
 	e.host.SetRegistry(gethImage, gethV2, "")
 	e.start()
 
-	c := agent.NewLocalClient(e.cfg.Socket.Path)
+	c := local.NewClient(e.cfg.Socket.Path)
 	awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2))
 
-	_, err := c.Hold(t.Context(), &agent.HoldRequest{Reason: "debugging"})
+	_, err := c.Hold(t.Context(), &local.HoldRequest{Reason: "debugging"})
 	require.NoError(t, err)
 
 	req := e.ctrl.await("the hold", func(req *protocol.SyncRequest) bool { return req.Hold.Local })
@@ -151,7 +151,7 @@ func TestLocalHoldThroughTheSocket(t *testing.T) {
 	_, err = c.Roll(t.Context(), "geth")
 	require.ErrorContains(t, err, "debugging")
 
-	_, err = c.Hold(t.Context(), &agent.HoldRequest{Release: true})
+	_, err = c.Hold(t.Context(), &local.HoldRequest{Release: true})
 	require.NoError(t, err)
 	awaitNeeds(t, e, protocol.ImageNeedID("geth", gethV2))
 
@@ -169,8 +169,8 @@ func TestLocalRoll(t *testing.T) {
 	})
 	e.start()
 
-	c := agent.NewLocalClient(e.cfg.Socket.Path)
-	awaitLocal(t, c, "the containers", func(st *agent.LocalStatus) bool { return len(st.Containers) == 3 })
+	c := local.NewClient(e.cfg.Socket.Path)
+	awaitLocal(t, c, "the containers", func(st *local.Status) bool { return len(st.Containers) == 3 })
 
 	_, err := c.Roll(t.Context(), "dora")
 	require.ErrorContains(t, err, "not managed")
@@ -179,7 +179,7 @@ func TestLocalRoll(t *testing.T) {
 	require.NoError(t, err)
 
 	id := answer.Roll
-	rollOf := func(st *agent.LocalStatus) *agent.LocalRoll {
+	rollOf := func(st *local.Status) *local.Roll {
 		for i := range st.Rolls {
 			if st.Rolls[i].ID == id {
 				return &st.Rolls[i]
@@ -192,10 +192,10 @@ func TestLocalRoll(t *testing.T) {
 	_, err = c.Roll(t.Context(), "geth")
 	require.ErrorContains(t, err, "already under way")
 
-	st := awaitLocal(t, c, "the roll queued", func(st *agent.LocalStatus) bool {
+	st := awaitLocal(t, c, "the roll queued", func(st *local.Status) bool {
 		r := rollOf(st)
 
-		return r != nil && r.State == agent.RollQueued && r.Position == 2
+		return r != nil && r.State == local.RollQueued && r.Position == 2
 	})
 	assert.Equal(t, "budget 10% of 10%", rollOf(st).Detail)
 	assert.Equal(t, "local:"+me(t), rollOf(st).RequestedBy)
@@ -211,12 +211,12 @@ func TestLocalRoll(t *testing.T) {
 	require.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
 	assert.Contains(t, disruptive(e.host.Calls()), "recreate geth "+gethV1+" start=true")
 
-	st = awaitLocal(t, c, "the roll done", func(st *agent.LocalStatus) bool {
+	st = awaitLocal(t, c, "the roll done", func(st *local.Status) bool {
 		r := rollOf(st)
 
 		return r != nil && r.Final()
 	})
-	assert.Equal(t, agent.RollDone, rollOf(st).State)
+	assert.Equal(t, local.RollDone, rollOf(st).State)
 	assert.Equal(t, "lease-roll", rollOf(st).Lease)
 
 	req := e.ctrl.await("the need is closed", func(req *protocol.SyncRequest) bool {

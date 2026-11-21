@@ -1398,7 +1398,9 @@ func TestClientPolicyAction(t *testing.T) {
 			c := container("c", tt.image, digestOld, digestA, h.now)
 			c.Client = tt.client
 			st.Containers = []protocol.Container{c}
-			st.Needs = []protocol.Need{imageNeed("c", tt.image, digestA)}
+			n := imageNeed("c", tt.image, digestA)
+			n.Image.Client = tt.client
+			st.Needs = []protocol.Need{n}
 		})
 	}
 
@@ -1421,7 +1423,7 @@ func TestClientPolicyAction(t *testing.T) {
 
 	h.tick()
 
-	geth := h.openRollout(imageKey("ethpandaops/geth:master", digestA))
+	geth := h.openRollout(imageKey("geth", "ethpandaops/geth:master", digestA))
 	assert.Equal(t, "geth", geth.Client)
 	assert.Equal(t, "waiting for approval (policy manual)", h.assignment("a").Queue.Reason)
 	assert.NotNil(t, h.assignment("b").Lease, "lighthouse follows policyImage, which is auto")

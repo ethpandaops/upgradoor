@@ -1,14 +1,14 @@
+// Package api is the controller's HTTP server: it validates the options and
+// mounts the agent API (agentapi), the user API (userapi) and the event
+// streams (stream), next to the health check, the metrics and the web UI.
 package api
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io/fs"
-	"net"
 	"net/http"
-	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -17,23 +17,19 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/controller/agentapi"
+	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
+	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
+	"github.com/ethpandaops/upgradoor/pkg/controller/metrics"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
+	"github.com/ethpandaops/upgradoor/pkg/controller/stream"
+	"github.com/ethpandaops/upgradoor/pkg/controller/userapi"
+	"github.com/ethpandaops/upgradoor/pkg/controller/views"
 	"github.com/ethpandaops/upgradoor/pkg/controller/webui"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
-)
-
-const (
-	// maxUserBody bounds the body of authenticated PUT and POST requests.
-	maxUserBody = 64 << 10
-
-	headerContentType = "Content-Type"
-	contentTypeJSON   = "application/json; charset=utf-8"
-
-	// actorAnonymous is the audit actor when the API runs open.
-	actorAnonymous = "anonymous"
 )
 
 // Store is the part of store.Store the API needs.
@@ -76,6 +72,10 @@ type Store interface {
 type Beacon interface {
 	Health() fleet.NetworkHealth
 }
+
+// DefaultAuthService is the name this binary answers to in the token's
+// "services" claim unless Options.AuthService names another.
+const DefaultAuthService = "upgradoor"
 
 // Registry is where the API registers its metrics and what /metrics serves.
 // *prometheus.Registry implements it.
@@ -135,7 +135,8 @@ type Options struct {
 	Registry Registry
 }
 
-// Server is the controller's HTTP API.
+// Server is the controller's HTTP API. It mounts the agent API, the user API
+// and the event streams.
 //
 // Handler() can be used right after New. When an auth provider is configured,
 // user routes answer 503 until Start has built the token verifier; the agent
@@ -143,40 +144,16 @@ type Options struct {
 type Server struct {
 	log  logrus.FieldLogger
 	opts Options
-	now  func() time.Time
 
-	publicURLs []string
-	handler    http.Handler
-	metrics    *metrics
-	users      *userAuth
+	handler http.Handler
+	views   *views.Views
+	agents  *agentapi.Handler
+	users   *userapi.Handler
+	streams *stream.Handler
 	// userRoutes lists the routes behind the user authentication, as
 	// "METHOD pattern". The route tests walk it, so a new route cannot miss
 	// them.
 	userRoutes []string
-
-	syncSlots            chan struct{}
-	pacer                *pacer
-	inventorySlots       chan struct{}
-	syncReadTimeout      time.Duration
-	inventoryReadTimeout time.Duration
-
-	// events is the hub of the event streams; it runs between Start and Stop.
-	events            eventHubs
-	streamMinInterval time.Duration
-	streamDebounce    time.Duration
-	streamHeartbeat   time.Duration
-
-	// overlapAudited remembers, per host, the hosts its reported validator
-	// range last overlapped with: an overlap is audited once per episode.
-	// validatorsAudited limits the audit entries about one host's range. Both
-	// are guarded by generationMu.
-	overlapAudited    map[string]string
-	validatorsAudited map[string]time.Time
-
-	// generationAudited remembers, per host, when a certificate that was
-	// rejected for its generation was last audited.
-	generationMu      sync.Mutex
-	generationAudited map[string]time.Time
 
 	mu     sync.Mutex
 	cancel context.CancelFunc
@@ -215,12 +192,12 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		opts.AuthService = DefaultAuthService
 	}
 
-	if !authServicePattern.MatchString(opts.AuthService) {
+	if !authz.AuthServicePattern.MatchString(opts.AuthService) {
 		return nil, fmt.Errorf("api: auth service %q is not a service name "+
 			"([a-z0-9][a-z0-9_-]{0,62})", opts.AuthService)
 	}
 
-	publicURLs, err := normalizePublicURLs(opts.PublicURLs, opts.AllowInsecureAgentHTTP)
+	publicURLs, err := agentapi.NormalizePublicURLs(opts.PublicURLs, opts.AllowInsecureAgentHTTP)
 	if err != nil {
 		return nil, err
 	}
@@ -234,27 +211,37 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 	}
 
 	s := &Server{
-		log:            log.WithField("package", "api"),
-		opts:           opts,
-		now:            opts.Now,
-		publicURLs:     publicURLs,
-		users:          newUserAuth(opts.AuthProviderURL, opts.AuthService, opts.Now),
-		syncSlots:      make(chan struct{}, maxConcurrentSyncs),
-		pacer:          newPacer(),
-		inventorySlots: make(chan struct{}, maxConcurrentInventories),
-
-		syncReadTimeout:      syncReadTimeout,
-		inventoryReadTimeout: inventoryReadTimeout,
-
-		streamMinInterval: streamMinInterval,
-		streamDebounce:    streamDebounce,
-		streamHeartbeat:   streamHeartbeat,
+		log:  log.WithField("package", "api"),
+		opts: opts,
+		views: views.New(views.Options{
+			Store: opts.Store, Scheduler: opts.Scheduler, Beacon: opts.Beacon, Now: opts.Now,
+		}),
 	}
 
-	s.metrics, err = newMetrics(s.log, opts.Registry, s)
+	collector, err := metrics.New(s.log, opts.Registry, metrics.Options{
+		Store: opts.Store, Scheduler: opts.Scheduler, Gate: s.views.Gate, Now: opts.Now,
+	})
 	if err != nil {
 		return nil, err
 	}
+
+	s.streams = stream.New(s.log, stream.Options{
+		Store: opts.Store, Scheduler: opts.Scheduler, Beacon: opts.Beacon, Views: s.views,
+		DefaultSettings: opts.DefaultSettings, Now: opts.Now,
+	})
+	s.agents = agentapi.New(s.log, agentapi.Options{
+		Verifier: opts.Verifier, PublicURLs: publicURLs,
+		AllowInsecureAgentHTTP: opts.AllowInsecureAgentHTTP, AnswerSigner: opts.AnswerSigner,
+		TrustForwardedHeaders: opts.TrustForwardedHeaders,
+		Store:                 opts.Store, Scheduler: opts.Scheduler, Metrics: collector,
+		Notify: s.Notify, Now: opts.Now,
+	})
+	s.users = userapi.New(s.log, userapi.Options{
+		Network: opts.Network, Version: opts.Version,
+		AuthProviderURL: opts.AuthProviderURL, AuthService: opts.AuthService,
+		Store: opts.Store, Scheduler: opts.Scheduler, Beacon: opts.Beacon, Views: s.views,
+		DefaultSettings: opts.DefaultSettings, Notify: s.Notify, Now: opts.Now,
+	})
 
 	ui, err := webui.New(log, opts.WebFS, webui.Options{AuthProviderURL: opts.AuthProviderURL})
 	if err != nil {
@@ -264,39 +251,6 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 	s.handler = s.routes(ui)
 
 	return s, nil
-}
-
-// normalizePublicURLs checks the configured base URLs and strips trailing
-// slashes.
-func normalizePublicURLs(raw []string, allowHTTP bool) ([]string, error) {
-	out := make([]string, 0, len(raw))
-
-	for _, base := range raw {
-		u, err := url.Parse(base)
-		if err != nil {
-			return nil, fmt.Errorf("api: public URL %q: %w", base, err)
-		}
-
-		if u.Host == "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
-			return nil, fmt.Errorf("api: public URL %q must be scheme://host[/prefix]", base)
-		}
-
-		switch u.Scheme {
-		case "https":
-		case "http":
-			if !allowHTTP {
-				return nil, fmt.Errorf(
-					"api: public URL %q is plain http; allow insecure agent HTTP to accept it",
-					base)
-			}
-		default:
-			return nil, fmt.Errorf("api: public URL %q must be http or https", base)
-		}
-
-		out = append(out, strings.TrimRight(base, "/"))
-	}
-
-	return out, nil
 }
 
 // Handler returns the HTTP handler for every route.
@@ -317,13 +271,18 @@ func (s *Server) Start(ctx context.Context) error {
 	// cancelled by Stop.
 	refreshCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
 
-	if err := s.users.start(ctx, refreshCtx, s.log); err != nil {
+	if err := s.users.Start(ctx, refreshCtx); err != nil {
 		cancel()
 
 		return err
 	}
 
-	s.events.start(refreshCtx, s.log, s)
+	if err := s.streams.Start(refreshCtx); err != nil {
+		cancel()
+
+		return err
+	}
+
 	s.cancel = cancel
 
 	return nil
@@ -335,12 +294,25 @@ func (s *Server) Stop() error {
 	defer s.mu.Unlock()
 
 	if s.cancel != nil {
-		s.events.stop()
+		_ = s.streams.Stop()
 		s.cancel()
 		s.cancel = nil
 	}
 
 	return nil
+}
+
+// Notify says that state the API serves may have changed. It never blocks,
+// so it can be called under any lock. The scheduler is wired to it.
+func (s *Server) Notify() {
+	s.streams.Notify()
+}
+
+// CloseStreams ends every open event stream and refuses new ones. An open
+// stream never becomes idle, so an http.Server that serves the handler cannot
+// shut down gracefully before this was called. Stop calls it too.
+func (s *Server) CloseStreams() {
+	_ = s.streams.Stop()
 }
 
 // routes builds the mux. Everything else, a known path with another method
@@ -353,40 +325,28 @@ func (s *Server) routes(ui http.Handler) http.Handler {
 		mux.Handle(method+" "+pattern, handler)
 	}
 
-	handle(http.MethodPost, protocol.PathSync, http.HandlerFunc(s.handleSync))
-	handle(http.MethodPost, protocol.PathInventory, http.HandlerFunc(s.handleInventory))
-
-	handle(http.MethodGet, "/api/v1/config", http.HandlerFunc(s.handleConfig))
-	handle(http.MethodGet, "/api/v1/public/hosts", http.HandlerFunc(s.handlePublicHosts))
-	handle(http.MethodGet, "/api/v1/public/images", http.HandlerFunc(s.handlePublicImages))
-	handle(http.MethodGet, "/api/v1/public/network", http.HandlerFunc(s.handlePublicNetwork))
-	handle(http.MethodGet, pathPublicEvents, http.HandlerFunc(s.handlePublicEvents))
-	handle(http.MethodGet, "/api/v1/public/slots", http.HandlerFunc(s.handlePublicSlots))
-
-	// A userHandler can only be registered through here, behind the user
+	// A user handler can only be registered through here, behind the user
 	// authentication.
-	user := func(method, pattern string, handler userHandler) {
-		handle(method, pattern, s.user(handler))
+	user := func(method, pattern string, handler userapi.UserHandler) {
+		handle(method, pattern, s.users.Guard(handler))
 
 		s.userRoutes = append(s.userRoutes, method+" "+pattern)
 	}
 
-	user(http.MethodGet, "/api/v1/hosts", s.handleHosts)
-	user(http.MethodGet, "/api/v1/hosts/{name}", s.handleHost)
-	user(http.MethodGet, "/api/v1/clients", s.handleClients)
-	user(http.MethodGet, "/api/v1/clients/{client}/hosts", s.handleClientHosts)
-	user(http.MethodGet, "/api/v1/packages", s.handlePackages)
-	user(http.MethodGet, "/api/v1/rollouts", s.handleRollouts)
-	user(http.MethodGet, "/api/v1/plan", s.handlePlan)
-	user(http.MethodGet, "/api/v1/settings", s.handleGetSettings)
-	user(http.MethodPut, "/api/v1/settings", s.handlePutSettings)
-	user(http.MethodGet, "/api/v1/audit", s.handleAudit)
-	user(http.MethodGet, pathEvents, s.handleEvents)
-	user(http.MethodGet, "/api/v1/slots", s.handleSlots)
-
-	for name, handler := range s.actions() {
-		user(http.MethodPost, "/api/v1/actions/"+name, handler)
+	for _, route := range s.agents.Routes() {
+		handle(route.Method, route.Pattern, route.Handler)
 	}
+
+	for _, route := range s.users.Routes() {
+		if route.User != nil {
+			user(route.Method, route.Pattern, route.User)
+		} else {
+			handle(route.Method, route.Pattern, route.Public)
+		}
+	}
+
+	handle(http.MethodGet, stream.PathPublicEvents, http.HandlerFunc(s.streams.HandlePublic))
+	user(http.MethodGet, stream.PathEvents, s.streams.Handle)
 
 	handle(http.MethodGet, "/healthz", http.HandlerFunc(s.handleHealthz))
 	handle(http.MethodGet, "/metrics", promhttp.HandlerFor(s.opts.Registry, promhttp.HandlerOpts{
@@ -415,69 +375,5 @@ func apiHeaders(next http.Handler) http.Handler {
 }
 
 func (s *Server) handleHealthz(w http.ResponseWriter, _ *http.Request) {
-	s.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
-}
-
-// writeJSON writes v as the JSON answer.
-func (s *Server) writeJSON(w http.ResponseWriter, status int, v any) {
-	body, err := json.Marshal(v)
-	if err != nil {
-		s.log.WithError(err).Error("Cannot encode response")
-
-		status = http.StatusInternalServerError
-		body = []byte(`{"error":"internal error"}`)
-	}
-
-	w.Header().Set(headerContentType, contentTypeJSON)
-	w.WriteHeader(status)
-
-	if _, err := w.Write(append(body, '\n')); err != nil {
-		s.log.WithError(err).Debug("Cannot write response")
-	}
-}
-
-// writeError writes an ErrorBody.
-func (s *Server) writeError(w http.ResponseWriter, status int, msg string) {
-	s.writeJSON(w, status, ErrorBody{Error: msg})
-}
-
-// internalError logs err and answers 500 without detail: store and scheduler
-// errors can carry anything.
-func (s *Server) internalError(w http.ResponseWriter, r *http.Request, err error) {
-	if errors.Is(err, context.Canceled) && r.Context().Err() != nil {
-		// The client went away; nobody reads the answer.
-		s.writeError(w, http.StatusServiceUnavailable, "request cancelled")
-
-		return
-	}
-
-	s.log.WithError(err).WithFields(logrus.Fields{
-		"method": r.Method,
-		"path":   r.URL.Path,
-	}).Error("Request failed")
-	s.writeError(w, http.StatusInternalServerError, "internal error")
-}
-
-// remoteAddr returns the client address without port. With
-// TrustForwardedHeaders it is the last entry of X-Forwarded-For, which is
-// the one the nearest proxy added; earlier entries are client-supplied.
-func (s *Server) remoteAddr(r *http.Request) string {
-	if s.opts.TrustForwardedHeaders {
-		values := r.Header.Values("X-Forwarded-For")
-		if len(values) > 0 {
-			parts := strings.Split(values[len(values)-1], ",")
-			candidate := strings.TrimSpace(parts[len(parts)-1])
-
-			if ip := net.ParseIP(candidate); ip != nil {
-				return ip.String()
-			}
-		}
-	}
-
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
-	}
-
-	return host
+	httpjson.Write(s.log, w, http.StatusOK, map[string]string{"status": "ok"})
 }

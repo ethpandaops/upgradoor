@@ -22,24 +22,47 @@ const (
 	prefixLocal    = "local:"
 )
 
-// imageKey is the rollout key of an image reference at a digest.
-func imageKey(image, digest string) string {
-	return prefixImageKey + image + "@" + digest
+// ImageGroup names the image rollouts of the containers of one client on one
+// image reference, whatever the digest: each client's hosts are a rollout of
+// their own, under the client's policy. Containers without a client share the
+// reference alone. A host's broken mark for the rollouts carries the name.
+func ImageGroup(client, image string) string {
+	if client == "" {
+		return prefixImageKey + image
+	}
+
+	return prefixImageKey + image + "#" + client
 }
 
-// imageTarget is the digest an image reference is rolled to: the one named
-// by the need with the freshest registry check.
+// imageKey is the rollout key of a client's image reference at a digest.
+func imageKey(client, image, digest string) string {
+	return ImageGroup(client, image) + "@" + digest
+}
+
+// imageTarget is the digest a client's image reference is rolled to: the one
+// named by the need with the freshest registry check.
 type imageTarget struct {
+	client   string
+	image    string
 	digest   string
 	revision string
 	checked  time.Time
-	// client is the client of the container the need is about.
-	client string
+}
+
+// imageTitle says what an image rollout does, for people.
+func imageTitle(t *imageTarget) string {
+	title := t.image + " to " + shortDigest(t.digest)
+	if t.client != "" {
+		title = t.client + ": " + title
+	}
+
+	return title
 }
 
 // reportedNeeds is what the hosts' observed needs (those without a
 // directive) ask for.
 type reportedNeeds struct {
+	// images are the targets by image group (ImageGroup).
 	images   map[string]*imageTarget
 	packages map[string][]protocol.PackageChange
 	reboot   bool
@@ -306,12 +329,10 @@ func (p *pass) reported() *reportedNeeds {
 			case isLocal(&n):
 				rep.local[name] = append(rep.local[name], n)
 			case n.Kind == protocol.NeedImage && n.Image != nil:
-				checked, client := reportedContainer(hv.h, n.Image.Container)
-				rep.image(n.Image, checked, client)
+				rep.image(n.Image, registryChecked(hv.h, n.Image.Container))
 			case n.Kind == protocol.NeedSpec && n.Spec != nil:
-				if key := specKey(n.Spec.Container, n.Spec.Key); rep.specs[key] == nil {
-					_, client := reportedContainer(hv.h, n.Spec.Container)
-					rep.specs[key] = specRollout(n.Spec, client)
+				if key := needKey(&n); rep.specs[key] == nil {
+					rep.specs[key] = specRollout(n.Spec)
 				}
 			case n.Kind == protocol.NeedPackages && n.Packages != nil:
 				rep.packages[protocol.PackagesKey(n.Packages.Packages)] = n.Packages.Packages
@@ -324,10 +345,11 @@ func (p *pass) reported() *reportedNeeds {
 	return rep
 }
 
-// image offers one image need as the target of its reference. The freshest
-// registry check wins; on a tie the smaller digest.
-func (rep *reportedNeeds) image(n *protocol.ImageNeed, checked time.Time, client string) {
-	cur := rep.images[n.Image]
+// image offers one image need as the target of its client's reference. The
+// freshest registry check wins; on a tie the smaller digest.
+func (rep *reportedNeeds) image(n *protocol.ImageNeed, checked time.Time) {
+	group := ImageGroup(n.Client, n.Image)
+	cur := rep.images[group]
 
 	better := cur == nil
 	if !better && n.ToDigest != cur.digest {
@@ -336,36 +358,30 @@ func (rep *reportedNeeds) image(n *protocol.ImageNeed, checked time.Time, client
 	}
 
 	if better {
-		rep.images[n.Image] = &imageTarget{
-			digest: n.ToDigest, revision: n.ToRevision, checked: checked, client: client,
+		rep.images[group] = &imageTarget{
+			client: n.Client, image: n.Image, digest: n.ToDigest, revision: n.ToRevision,
+			checked: checked,
 		}
 	}
 }
 
-// reportedContainer is when the host last looked at the tag of a container,
-// and the client the container runs.
-func reportedContainer(h *fleet.Host, container string) (checked time.Time, client string) {
+// registryChecked is when the host last looked at the tag of a container.
+func registryChecked(h *fleet.Host, container string) time.Time {
 	if h.Status == nil {
-		return time.Time{}, ""
+		return time.Time{}
 	}
 
 	for i := range h.Status.Containers {
-		c := &h.Status.Containers[i]
-		if c.Name != container {
-			continue
+		if c := &h.Status.Containers[i]; c.Name == container && c.Registry != nil {
+			return c.Registry.CheckedAt
 		}
-
-		if c.Registry != nil {
-			checked = c.Registry.CheckedAt
-		}
-
-		return checked, c.Client
 	}
 
-	return time.Time{}, ""
+	return time.Time{}
 }
 
-// supersede closes image rollouts whose reference now has another target
+// supersede closes image rollouts whose client's reference now has another
+// target
 // and packages rollouts whose key nobody reports while another key exists.
 func (p *pass) supersede(rep *reportedNeeds) {
 	for _, r := range p.rollouts {
@@ -375,7 +391,7 @@ func (p *pass) supersede(rep *reportedNeeds) {
 
 		switch r.Kind {
 		case fleet.RolloutImage:
-			if t := rep.images[r.Image]; t != nil && t.digest != r.Digest {
+			if t := rep.images[rolloutGroup(r)]; t != nil && t.digest != r.Digest {
 				p.closeRollout(r, fleet.RolloutSuperseded, "the tag moved to "+shortDigest(t.digest))
 			}
 		case fleet.RolloutPackages:
@@ -464,13 +480,13 @@ func (p *pass) open(rep *reportedNeeds) map[string]bool {
 		p.record("rollout.created", r.ID, map[string]any{keyKey: r.Key, "title": r.Title})
 	}
 
-	for _, image := range sortedKeys(rep.images) {
-		t := rep.images[image]
+	for _, group := range sortedKeys(rep.images) {
+		t := rep.images[group]
 		add(&fleet.Rollout{
 			Kind:     fleet.RolloutImage,
-			Key:      imageKey(image, t.digest),
-			Title:    image + " to " + shortDigest(t.digest),
-			Image:    image,
+			Key:      imageKey(t.client, t.image, t.digest),
+			Title:    imageTitle(t),
+			Image:    t.image,
 			Digest:   t.digest,
 			Revision: t.revision,
 			Client:   t.client,
@@ -939,14 +955,14 @@ func (p *pass) manualDirectives(r *fleet.Rollout, host string) (outstanding bool
 	return outstanding, rejected
 }
 
-// expectsImage reports whether the host runs a managed container on the
-// rollout's image reference at another digest.
+// expectsImage reports whether the host runs a managed container of the
+// rollout's client on its image reference at another digest.
 func expectsImage(r *fleet.Rollout, hv *hostView) bool {
 	return hasContainer(r, hv, false)
 }
 
-// runsImage reports whether the host runs a managed container on the
-// rollout's image reference at its digest.
+// runsImage reports whether the host runs a managed container of the
+// rollout's client on its image reference at its digest.
 func runsImage(r *fleet.Rollout, hv *hostView) bool {
 	return hasContainer(r, hv, true)
 }
@@ -958,7 +974,8 @@ func hasContainer(r *fleet.Rollout, hv *hostView, onTarget bool) bool {
 
 	for i := range hv.h.Status.Containers {
 		c := &hv.h.Status.Containers[i]
-		if c.Managed && c.Image == r.Image && (c.Digest == r.Digest) == onTarget {
+		if c.Managed && c.Client == r.Client && c.Image == r.Image &&
+			(c.Digest == r.Digest) == onTarget {
 			return true
 		}
 	}

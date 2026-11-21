@@ -1,5 +1,5 @@
 // The writing side of the stream encoding for the mock controller: what
-// pkg/controller/api/events.go does with the views (streamDocs) and
+// pkg/controller/stream/events.go does with the views (streamDocs) and
 // wire.go with the tables (diff), so the page reads the mock through the
 // same decoder as a real controller.
 

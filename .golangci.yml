@@ -85,7 +85,8 @@ linters:
           - gosec
           - wsl
           - wsl_v5
-        path: _test\.go
+        # controllertest holds the fakes and fixtures the tests share.
+        path: (_test\.go|pkg/controller/controllertest/)
 formatters:
   enable:
     - gofmt

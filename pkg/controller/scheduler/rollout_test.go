@@ -1,6 +1,8 @@
 package scheduler
 
 import (
+	"maps"
+	"slices"
 	"testing"
 	"time"
 
@@ -518,7 +520,7 @@ func TestRolloutOpensPerCause(t *testing.T) {
 
 	require.Len(t, b.w.Rollouts, 3)
 
-	img := b.mustRollout(imageKey(imgLighthouse, digestA))
+	img := b.mustRollout(imageKey("", imgLighthouse, digestA))
 	assert.Equal(t, fleet.RolloutImage, img.Kind)
 	assert.Equal(t, imgLighthouse, img.Image)
 	assert.Equal(t, digestA, img.Digest)
@@ -565,7 +567,7 @@ func TestImageSupersedeCarriesFailedHostsFirst(t *testing.T) {
 	b.get("h2").HoldWanted = false
 	b.step()
 
-	first := b.mustRollout(imageKey(imgLighthouse, digestA))
+	first := b.mustRollout(imageKey("", imgLighthouse, digestA))
 	require.Equal(t, fleet.RolloutHalted, first.State)
 	require.Empty(t, b.leasedHosts(), "the digest is blocked")
 
@@ -582,7 +584,7 @@ func TestImageSupersedeCarriesFailedHostsFirst(t *testing.T) {
 	assert.Equal(t, fleet.RolloutSuperseded, b.closed(first.Key).State)
 	assert.Contains(t, auditActions(out), "rollout.superseded")
 
-	second := b.mustRollout(imageKey(imgLighthouse, digestB))
+	second := b.mustRollout(imageKey("", imgLighthouse, digestB))
 	assert.Equal(t, map[string]fleet.HostState{
 		"h1": fleet.HostPending, "h2": fleet.HostExpected, "h3": fleet.HostExpected,
 	}, memberStates(second), "nothing is granted before the host the change broke had its turn")
@@ -644,7 +646,7 @@ func TestImageTargetIsTheFreshestRegistryCheck(t *testing.T) {
 	b.step()
 
 	require.Len(t, b.w.Rollouts, 1)
-	r := b.mustRollout(imageKey(imgGeth, digestB))
+	r := b.mustRollout(imageKey("", imgGeth, digestB))
 	assert.Equal(t, map[string]fleet.HostState{
 		"fresh-view": fleet.HostLeased, "stale-view": fleet.HostExpected,
 	}, memberStates(r))
@@ -702,7 +704,7 @@ func TestPackagesRolloutCompletesWhenNeedsVanish(t *testing.T) {
 }
 
 func TestMembership(t *testing.T) {
-	key := imageKey(imgLighthouse, digestA)
+	key := imageKey("", imgLighthouse, digestA)
 
 	t.Run("an expected host joins when it reports and is done when someone fixed it", func(t *testing.T) {
 		b := newWorldBuilder(t)
@@ -1439,7 +1441,7 @@ func TestLocalRollout(t *testing.T) {
 	assert.Equal(t, "a: override geth, roll beacon", r.Title)
 	assert.Empty(t, r.Canary)
 	assert.Equal(t, map[string]fleet.HostState{"a": fleet.HostLeased}, memberStates(r))
-	assert.Nil(t, b.rollout(imageKey("sigp/lighthouse:latest", digestA)),
+	assert.Nil(t, b.rollout(imageKey("", "sigp/lighthouse:latest", digestA)),
 		"a roll requested on the host is no image rollout")
 
 	l := b.lease("a")
@@ -1506,4 +1508,64 @@ func TestLocalRolloutHaltsOnFailure(t *testing.T) {
 
 	assert.Equal(t, fleet.RolloutSuperseded, b.closed(key).State)
 	require.NotNil(t, b.lease("a"), "what the host asks for now is served")
+}
+
+// One image followed by the containers of several clients opens a rollout per
+// client, each with the client's hosts and under the client's image policy.
+func TestImageRolloutPerClient(t *testing.T) {
+	const image = "ethpandaops/dummy:devnet"
+
+	clients := []struct {
+		client  string
+		policy  fleet.Policy
+		granted bool
+	}{
+		{client: "teku", policy: fleet.PolicyAuto, granted: true},
+		{client: "lighthouse", policy: fleet.PolicyManual, granted: false},
+		{client: "lodestar", policy: fleet.PolicyAuto, granted: true},
+	}
+
+	b := newWorldBuilder(t)
+	b.w.Settings.MaxUnavailablePercent = 50 // room for a canary per client
+	b.w.Settings.PolicyClients = make(fleet.ClientPolicies, len(clients))
+
+	for _, tt := range clients {
+		b.w.Settings.PolicyClients[tt.client] = tt.policy
+
+		for _, name := range []string{tt.client + "-1", tt.client + "-2"} {
+			c := container("cl", image, digestOld, digestA, b.w.Now)
+			c.Client = tt.client
+			n := imageNeed("cl", image, digestA)
+			n.Image.Client = tt.client
+
+			h := b.host(name, 0)
+			h.Status.Containers = []protocol.Container{c}
+			h.Status.Needs = []protocol.Need{n}
+		}
+	}
+
+	out := b.step()
+	require.Len(t, b.w.Rollouts, len(clients))
+
+	for _, tt := range clients {
+		t.Run(tt.client, func(t *testing.T) {
+			r := b.mustRollout(imageKey(tt.client, image, digestA))
+			assert.Equal(t, tt.client, r.Client)
+			members := slices.Collect(maps.Keys(memberStates(r)))
+			assert.ElementsMatch(t, []string{tt.client + "-1", tt.client + "-2"}, members)
+
+			leased := 0
+
+			for _, m := range r.Hosts {
+				if l := b.lease(m.Host); l != nil {
+					assert.Contains(t, slices.Collect(maps.Values(l.Rollouts)), r.ID)
+					leased++
+				} else if !tt.granted {
+					assert.Equal(t, "waiting for approval (policy manual)", queueReasons(out.Plan)[m.Host])
+				}
+			}
+
+			assert.Equal(t, tt.granted, leased > 0, "a lease for the canary")
+		})
+	}
 }

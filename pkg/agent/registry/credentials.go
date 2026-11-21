@@ -12,7 +12,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
 // Login is the login of one registry.
@@ -26,7 +26,7 @@ func (l Login) basic() string {
 	return "Basic " + base64.StdEncoding.EncodeToString([]byte(l.Username+":"+l.Password))
 }
 
-// Logins are registry logins by registry host, as agent.Reference.Host
+// Logins are registry logins by registry host, as imageref.Reference.Host
 // spells it. The registry lookups and the image pulls both take theirs from
 // here, so that a poll and a pull of one image authenticate alike.
 type Logins map[string]Login
@@ -106,7 +106,7 @@ func LoadLogins(log logrus.FieldLogger, path string) (Logins, error) {
 
 	for _, key := range keys {
 		entry := cfg.Auths[key]
-		host := agent.RegistryHost(key)
+		host := imageref.RegistryHost(key)
 		login := Login{Username: entry.Username, Password: entry.Password}
 
 		switch {
@@ -149,11 +149,11 @@ func LoadLogins(log logrus.FieldLogger, path string) (Logins, error) {
 }
 
 // authKeyRank orders the keys of the "auths" map that name one registry:
-// 0 for the registry host as agent.Reference.Host spells it, 1 for another
+// 0 for the registry host as imageref.Reference.Host spells it, 1 for another
 // bare host (a Docker Hub alias, or a different case), 2 for a URL.
 func authKeyRank(key string) int {
 	switch {
-	case key == agent.RegistryHost(key):
+	case key == imageref.RegistryHost(key):
 		return 0
 	case !strings.Contains(key, "/"):
 		return 1

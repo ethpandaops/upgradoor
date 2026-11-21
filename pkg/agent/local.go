@@ -2,470 +2,145 @@ package agent
 
 import (
 	"context"
-	"encoding/json"
-	"errors"
 	"fmt"
-	"net"
-	"net/http"
-	"os"
-	"os/user"
-	"path/filepath"
 	"slices"
-	"strconv"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/auditlog"
+	"github.com/ethpandaops/upgradoor/pkg/agent/local"
+	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// The local socket is how a person on the host talks to the running agent:
-// the 'upgradoor host' commands. It is a Unix socket for root and one group
-// (the entry user's), and it can do what that person could do anyway with
-// SSH and the overrides file, plus ask for a roll: list the managed
-// containers, set and clear an override (the agent writes the file), set and
-// release the local hold, request a roll and follow it.
-//
-// Nothing that comes through the socket acts by itself. An override and a
-// roll become needs, served under a lease of the controller like any other,
-// within the verbs the configuration allows and never under a hold.
-
-// Paths of the local API.
 const (
-	LocalPathStatus    = "/v1/status"
-	LocalPathOverrides = "/v1/overrides"
-	LocalPathHold      = "/v1/hold"
-	LocalPathRolls     = "/v1/rolls"
-	LocalPathInit      = "/v1/init-overrides"
-
-	maxLocalBody   = 64 << 10
 	maxLocalRolls  = 32
 	localRollStale = time.Hour
 )
 
-// LocalStatus is the answer of GET /v1/status.
-type LocalStatus struct {
-	Host    string `json:"host"`
-	Network string `json:"network"`
-	Version string `json:"version"`
-	// At is when the agent last looked at the host.
-	At    time.Time       `json:"at"`
-	Verbs []protocol.Verb `json:"verbs"`
-	Hold  protocol.Hold   `json:"hold"`
-	// Containers are the managed containers.
-	Containers []LocalContainer `json:"containers"`
-	Needs      []protocol.Need  `json:"needs"`
-	// Queue is the controller's last word on why the host waits.
-	Queue *protocol.Queue `json:"queue,omitempty"`
-	// Lease and Operation are the lease the agent holds and its work on it.
-	Lease     string              `json:"lease,omitempty"`
-	Operation *protocol.Operation `json:"operation,omitempty"`
-	// Rolls are the rolls requested through the socket, oldest first.
-	Rolls []LocalRoll `json:"rolls"`
-	// OverridesFile is the overrides file; OverridesError says why it cannot
-	// be read.
-	OverridesFile  string `json:"overridesFile"`
-	OverridesError string `json:"overridesError,omitempty"`
-	// SyncError is set while the controller cannot be reached.
-	SyncError string `json:"syncError,omitempty"`
-}
-
-// LocalContainer is one managed container in the local status.
-type LocalContainer struct {
-	protocol.Container
-
-	// BaseCommand is the command line without the override's flags, when an
-	// override changed it.
-	BaseCommand []string `json:"baseCommand,omitempty"`
-	// Target is the image the container is to run, when that is not the one
-	// it runs.
-	Target string `json:"target,omitempty"`
-}
-
-// LocalRoll is one roll requested through the socket, and how far it got.
-type LocalRoll struct {
-	ID          string    `json:"id"`
-	Container   string    `json:"container"`
-	RequestedBy string    `json:"requestedBy"`
-	RequestedAt time.Time `json:"requestedAt"`
-	UpdatedAt   time.Time `json:"updatedAt"`
-	// State is one of the Roll* states.
-	State string `json:"state"`
-	// Detail says more: the controller's waiting reason, the error.
-	Detail string `json:"detail,omitempty"`
-	// Position is the host's place in the controller's queue while queued.
-	Position int    `json:"position,omitempty"`
-	Lease    string `json:"lease,omitempty"`
+// localRoll is a roll requested through the socket as the loop follows it.
+type localRoll struct {
+	local.Roll
 
 	// seenLease is true once the roll's need was part of a lease.
 	seenLease bool
 }
 
-// States of a local roll. RollDone, RollFailed, RollRejected and
-// RollSuperseded are final.
-const (
-	// RollResolving: the registry is asked and the image pulled.
-	RollResolving = "resolving"
-	// RollQueued: the need is reported; the host waits for a slot.
-	RollQueued = "queued"
-	// RollGranted: the controller granted a lease.
-	RollGranted = "granted"
-	// RollRecreating: the container is being recreated.
-	RollRecreating = "recreating"
-	// RollRecreated: the container is recreated; the agent watches that it
-	// stays up.
-	RollRecreated = "recreated"
-	// RollVerified: the agent's check passed; the controller checks that the
-	// node is back before it gives the slot away.
-	RollVerified = "verified"
-	// RollDone: the controller released the slot.
-	RollDone = "done"
-	// RollFailed: the roll failed; Detail says why.
-	RollFailed = "failed"
-	// RollRejected: the host's own rules refuse the roll.
-	RollRejected = "rejected"
-	// RollSuperseded: the roll was not needed any more, or was dropped.
-	RollSuperseded = "superseded"
-)
-
-// Final reports whether the roll will not change any more.
-func (r *LocalRoll) Final() bool {
-	return slices.Contains([]string{RollDone, RollFailed, RollRejected, RollSuperseded}, r.State)
-}
-
-// OverrideRequest is the body of POST /v1/overrides.
-type OverrideRequest struct {
-	Container   string   `json:"container"`
-	Image       string   `json:"image,omitempty"`
-	AddFlags    []string `json:"addFlags,omitempty"`
-	RemoveFlags []string `json:"removeFlags,omitempty"`
-	// Until is when the override ends; absent for one without an end.
-	Until  *time.Time `json:"until,omitempty"`
-	Reason string     `json:"reason,omitempty"`
-	// Clear removes the override instead.
-	Clear bool `json:"clear,omitempty"`
-}
-
-// HoldRequest is the body of POST /v1/hold.
-type HoldRequest struct {
-	Reason string `json:"reason"`
-	// Release lifts the local hold instead.
-	Release bool `json:"release,omitempty"`
-}
-
-// RollRequest is the body of POST /v1/rolls.
-type RollRequest struct {
-	Container string `json:"container"`
-}
-
-// LocalAnswer is the answer to every local request that changes something.
-type LocalAnswer struct {
-	Message string `json:"message,omitempty"`
-	// Roll is the ID of a requested roll.
-	Roll  string `json:"roll,omitempty"`
-	Error string `json:"error,omitempty"`
-}
-
 // localState is what the socket's handlers read and the loop writes.
 type localState struct {
 	mu     sync.Mutex
-	status LocalStatus
-	rolls  []*LocalRoll
+	status local.Status
+	rolls  []*localRoll
 	// requests are the rolls asked for and not yet taken up by the loop.
-	requests []*LocalRoll
+	requests []*localRoll
 	nextRoll int
-}
-
-type peerKey struct{}
-
-// localServer serves the local socket.
-type localServer struct {
-	log      logrus.FieldLogger
-	svc      *service
-	listener net.Listener
-	server   *http.Server
 }
 
 // startLocal opens the local socket. An agent whose socket cannot be opened
 // still does everything else: it says so and goes on.
 func (s *service) startLocal(ctx context.Context) {
-	path := s.cfg.Socket.Path
-	log := s.log.WithFields(logrus.Fields{"component": "local", "socket": path})
+	socket := local.Socket{Path: s.cfg.Socket.Path, Group: s.cfg.Socket.Group, EntryUser: s.cfg.EntryUser}
+	log := s.log.WithFields(logrus.Fields{"component": "local", "socket": socket.Path})
+	srv := local.NewServer(log, socket, &localService{s: s})
 
-	listener, err := listenLocal(ctx, &s.cfg.Socket, s.cfg.EntryUser)
-	if err != nil {
+	if err := srv.Start(ctx); err != nil {
 		log.WithError(err).Error("cannot open the local socket; the 'upgradoor host' " +
 			"commands do not work on this host")
 
 		return
 	}
 
-	srv := &localServer{log: log, svc: s, listener: listener}
-
-	mux := http.NewServeMux()
-	mux.HandleFunc("GET "+LocalPathStatus, srv.handleStatus)
-	mux.HandleFunc("POST "+LocalPathOverrides, srv.handleOverride)
-	mux.HandleFunc("POST "+LocalPathHold, srv.handleHold)
-	mux.HandleFunc("POST "+LocalPathRolls, srv.handleRoll)
-	mux.HandleFunc("POST "+LocalPathInit, srv.handleInit)
-
-	srv.server = &http.Server{
-		Handler:           mux,
-		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
-		ConnContext: func(ctx context.Context, c net.Conn) context.Context {
-			return context.WithValue(ctx, peerKey{}, peerName(c))
-		},
-	}
-
-	s.local = srv
-
-	s.wg.Go(func() {
-		if err := srv.server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.WithError(err).Error("the local socket stopped")
-		}
-	})
-
 	s.wg.Go(func() {
 		<-ctx.Done()
 
-		shutdown, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		defer cancel()
-
-		_ = srv.server.Shutdown(shutdown)
-		_ = os.Remove(path)
+		_ = srv.Stop()
 	})
 
 	log.Info("local socket open")
 }
 
-// listenLocal creates the socket with mode 0660 for root and the group.
-func listenLocal(ctx context.Context, cfg *SocketConfig, entryUser string) (net.Listener, error) {
-	if err := os.MkdirAll(filepath.Dir(cfg.Path), 0o755); err != nil {
-		return nil, fmt.Errorf("create the socket directory: %w", err)
-	}
-
-	// What is left of a socket of an earlier run is in the way.
-	if info, err := os.Lstat(cfg.Path); err == nil && info.Mode()&os.ModeSocket != 0 {
-		_ = os.Remove(cfg.Path)
-	}
-
-	var lc net.ListenConfig
-
-	listener, err := lc.Listen(ctx, "unix", cfg.Path)
-	if err != nil {
-		return nil, fmt.Errorf("listen: %w", err)
-	}
-
-	mode := os.FileMode(0o600)
-
-	if gid, ok := socketGroup(cfg.Group, entryUser); ok {
-		if err := os.Chown(cfg.Path, -1, gid); err == nil {
-			mode = 0o660
-		}
-	}
-
-	if err := os.Chmod(cfg.Path, mode); err != nil {
-		_ = listener.Close()
-
-		return nil, fmt.Errorf("set the socket mode: %w", err)
-	}
-
-	return listener, nil
+// localService is the agent as the local socket sees it.
+type localService struct {
+	s *service
 }
 
-// socketGroup is the group that may use the socket: the configured one, or
-// the primary group of the entry user.
-func socketGroup(name, entryUser string) (int, bool) {
-	var raw string
+var _ local.Service = (*localService)(nil)
 
-	switch {
-	case name != "":
-		g, err := user.LookupGroup(name)
-		if err != nil {
-			return 0, false
-		}
-
-		raw = g.Gid
-	default:
-		u, err := user.Lookup(entryUser)
-		if err != nil {
-			return 0, false
-		}
-
-		raw = u.Gid
-	}
-
-	gid, err := strconv.Atoi(raw)
-
-	return gid, err == nil
+func (l *localService) Status() local.Status {
+	return l.s.localStatus()
 }
 
-// peerName is "local:<user>" for the Unix user at the other end of a
-// connection of the socket.
-func peerName(c net.Conn) string {
-	uid, ok := peerUID(c)
-	if !ok {
-		return auditLocal + ":unknown"
-	}
+func (l *localService) Override(user string, req *local.OverrideRequest) (string, error) {
+	who := &origin{source: auditlog.SourceLocal, user: user}
 
-	if u, err := user.LookupId(strconv.Itoa(uid)); err == nil {
-		return auditLocal + ":" + u.Username
-	}
-
-	return auditLocal + ":uid " + strconv.Itoa(uid)
-}
-
-func (l *localServer) who(r *http.Request) *origin {
-	name, _ := r.Context().Value(peerKey{}).(string)
-	if name == "" {
-		name = auditLocal + ":unknown"
-	}
-
-	return &origin{source: auditLocal, user: name}
-}
-
-func (l *localServer) answer(w http.ResponseWriter, status int, v any) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-
-	if err := json.NewEncoder(w).Encode(v); err != nil {
-		l.log.WithError(err).Debug("cannot write a local answer")
-	}
-}
-
-func (l *localServer) fail(w http.ResponseWriter, err error) {
-	status := http.StatusInternalServerError
-	if errors.Is(err, errRefused) {
-		status = http.StatusConflict
-	}
-
-	l.answer(w, status, LocalAnswer{Error: strings.TrimPrefix(err.Error(), errRefused.Error()+": ")})
-}
-
-func (l *localServer) decode(w http.ResponseWriter, r *http.Request, v any) bool {
-	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxLocalBody))
-	dec.DisallowUnknownFields()
-
-	if err := dec.Decode(v); err != nil {
-		l.answer(w, http.StatusBadRequest, LocalAnswer{Error: "invalid request: " + err.Error()})
-
-		return false
-	}
-
-	return true
-}
-
-func (l *localServer) handleStatus(w http.ResponseWriter, _ *http.Request) {
-	l.answer(w, http.StatusOK, l.svc.localStatus())
-}
-
-func (l *localServer) handleOverride(w http.ResponseWriter, r *http.Request) {
-	var req OverrideRequest
-	if !l.decode(w, r, &req) {
-		return
-	}
-
-	who := l.who(r)
-
-	var entry *Override
+	var entry *overrides.Entry
 	if !req.Clear {
-		entry = &Override{
+		entry = &overrides.Entry{
 			Image: strings.TrimSpace(req.Image), Add: req.AddFlags, Remove: req.RemoveFlags,
-			By: strings.TrimPrefix(who.user, auditLocal+":"), Reason: firstLine(req.Reason), Until: req.Until,
+			By: strings.TrimPrefix(user, auditlog.SourceLocal+":"), Reason: auditlog.Line(req.Reason), Until: req.Until,
 		}
 	}
 
-	if err := l.svc.setOverride(who, req.Container, entry, firstLine(req.Reason)); err != nil {
-		l.fail(w, err)
-
-		return
+	if err := l.s.setOverride(who, req.Container, entry, auditlog.Line(req.Reason)); err != nil {
+		return "", err
 	}
 
-	msg := "override of " + req.Container + " cleared; the container is put back under the next lease"
-	if entry != nil {
-		msg = "override of " + req.Container + " set (" + entry.describe() +
-			"); the container follows under the next lease"
+	if entry == nil {
+		return "", nil
 	}
 
-	l.answer(w, http.StatusOK, LocalAnswer{Message: msg})
+	return entry.Describe(), nil
 }
 
-func (l *localServer) handleHold(w http.ResponseWriter, r *http.Request) {
-	var req HoldRequest
-	if !l.decode(w, r, &req) {
-		return
-	}
-
-	who := l.who(r)
-	rec := AuditRecord{
-		Action: "hold.set", Source: auditLocal, User: who.user, Reason: firstLine(req.Reason),
-		Result: auditAccepted,
+func (l *localService) Hold(user string, req *local.HoldRequest) error {
+	rec := auditlog.Record{
+		Action: "hold.set", Source: auditlog.SourceLocal, User: user, Reason: auditlog.Line(req.Reason),
+		Result: auditlog.Accepted,
 	}
 
 	var err error
 
 	if req.Release {
 		rec.Action = "hold.release"
-		err = l.svc.holds.ReleaseLocal()
+		err = l.s.holds.ReleaseLocal()
 	} else {
-		reason := firstLine(req.Reason)
+		reason := auditlog.Line(req.Reason)
 		if reason == "" {
 			reason = "held"
 		}
 
-		err = l.svc.holds.SetLocal(reason + " (" + strings.TrimPrefix(who.user, auditLocal+":") + ")")
+		err = l.s.holds.SetLocal(reason + " (" + strings.TrimPrefix(user, auditlog.SourceLocal+":") + ")")
 	}
 
 	if err != nil {
 		rec.Result, rec.Error = "failed", err.Error()
-		l.svc.audit.record(rec)
-		l.fail(w, err)
+		l.s.audit.Record(rec)
 
-		return
+		return err
 	}
 
-	l.svc.audit.record(rec)
-	l.svc.requestSync()
+	l.s.audit.Record(rec)
+	l.s.requestSync()
 
-	msg := "host held: the agent reports no needs and refuses all work until it is released"
-	if req.Release {
-		msg = "local hold released"
-	}
-
-	l.answer(w, http.StatusOK, LocalAnswer{Message: msg})
+	return nil
 }
 
-func (l *localServer) handleRoll(w http.ResponseWriter, r *http.Request) {
-	var req RollRequest
-	if !l.decode(w, r, &req) {
-		return
-	}
-
-	who := l.who(r)
-
-	roll, err := l.svc.requestLocalRoll(who, req.Container)
-	if err != nil {
-		l.fail(w, err)
-
-		return
-	}
-
-	l.answer(w, http.StatusOK, LocalAnswer{
-		Roll: roll.ID, Message: "roll of " + req.Container + " requested",
-	})
+func (l *localService) Roll(user, container string) (*local.Roll, error) {
+	return l.s.requestLocalRoll(&origin{source: auditlog.SourceLocal, user: user}, container)
 }
 
-func (l *localServer) handleInit(w http.ResponseWriter, r *http.Request) {
-	status := l.svc.localStatus()
-	containers := make([]GeneratedContainer, 0, len(l.svc.cfg.Containers))
+func (l *localService) InitOverrides(user string) (string, error) {
+	s := l.s
+	status := s.localStatus()
+	containers := make([]overrides.GeneratedContainer, 0, len(s.cfg.Containers))
 
-	for i := range l.svc.cfg.Containers {
-		m := l.svc.cfg.current(&l.svc.cfg.Containers[i])
-		g := GeneratedContainer{Name: m.Name, Image: m.Image}
+	for i := range s.cfg.Containers {
+		m := s.cfg.current(&s.cfg.Containers[i])
+		g := overrides.GeneratedContainer{Name: m.Name, Image: m.Image}
 
 		for j := range status.Containers {
 			if c := &status.Containers[j]; c.Name == m.Name {
@@ -479,32 +154,29 @@ func (l *localServer) handleInit(w http.ResponseWriter, r *http.Request) {
 		containers = append(containers, g)
 	}
 
-	if err := l.svc.initOverrides(containers); err != nil {
-		l.fail(w, err)
-
-		return
+	if err := s.initOverrides(containers); err != nil {
+		return "", err
 	}
 
-	l.svc.audit.record(AuditRecord{
-		Action: "overrides.init", Source: auditLocal, User: l.who(r).user, Result: auditAccepted,
+	s.audit.Record(auditlog.Record{
+		Action: "overrides.init", Source: auditlog.SourceLocal, User: user, Result: auditlog.Accepted,
 	})
-	l.answer(w, http.StatusOK, LocalAnswer{
-		Message: "generated block written to " + l.svc.cfg.OverridesFile,
-	})
+
+	return s.cfg.OverridesFile, nil
 }
 
 // localStatus returns a copy of what the loop last published.
-func (s *service) localStatus() LocalStatus {
+func (s *service) localStatus() local.Status {
 	s.localState.mu.Lock()
 	defer s.localState.mu.Unlock()
 
 	out := s.localState.status
 	out.Containers = slices.Clone(out.Containers)
 	out.Needs = cloneNeeds(out.Needs)
-	out.Rolls = make([]LocalRoll, 0, len(s.localState.rolls)+len(s.localState.requests))
+	out.Rolls = make([]local.Roll, 0, len(s.localState.rolls)+len(s.localState.requests))
 
 	for _, r := range slices.Concat(s.localState.rolls, s.localState.requests) {
-		out.Rolls = append(out.Rolls, *r)
+		out.Rolls = append(out.Rolls, r.Roll)
 	}
 
 	return out
@@ -512,12 +184,12 @@ func (s *service) localStatus() LocalStatus {
 
 // publishLocal makes what a cycle saw available to the socket.
 func (s *service) publishLocal(obs *observation, req *protocol.SyncRequest, st *persistedState) {
-	status := LocalStatus{
+	status := local.Status{
 		Host: s.host, Network: s.network, Version: s.version, At: s.now().UTC(),
 		Verbs: slices.Clone(s.cfg.Verbs), Hold: obs.hold,
-		Containers:    make([]LocalContainer, 0, len(s.cfg.Containers)),
+		Containers:    make([]local.Container, 0, len(s.cfg.Containers)),
 		Needs:         cloneNeeds(req.Needs),
-		Rolls:         []LocalRoll{},
+		Rolls:         []local.Roll{},
 		OverridesFile: s.cfg.OverridesFile, OverridesError: s.overridesErr,
 	}
 
@@ -542,15 +214,15 @@ func (s *service) publishLocal(obs *observation, req *protocol.SyncRequest, st *
 			continue
 		}
 
-		lc := LocalContainer{Container: *c}
+		lc := local.Container{Container: *c}
 
 		if t, ok := obs.targets[c.Name]; ok {
 			if c.Base != nil && c.Base.HasCommand && !slices.Equal(c.Base.Command, c.Command) {
-				lc.BaseCommand = nonNilStrings(c.Base.Command)
+				lc.BaseCommand = append([]string{}, c.Base.Command...)
 			}
 
-			if !t.inSync {
-				lc.Target = t.image
+			if !t.InSync {
+				lc.Target = t.Image
 			}
 		}
 
@@ -564,16 +236,16 @@ func (s *service) publishLocal(obs *observation, req *protocol.SyncRequest, st *
 
 // requestLocalRoll takes a roll asked for through the socket. The loop
 // turns it into a need: the registry is asked and the image pulled first.
-func (s *service) requestLocalRoll(who *origin, container string) (*LocalRoll, error) {
+func (s *service) requestLocalRoll(who *origin, container string) (*local.Roll, error) {
 	now := s.now().UTC()
-	rec := AuditRecord{
-		Action: "roll.request", Source: auditLocal, User: who.user, Container: container,
-		Result: auditAccepted,
+	rec := auditlog.Record{
+		Action: "roll.request", Source: auditlog.SourceLocal, User: who.user, Container: container,
+		Result: auditlog.Accepted,
 	}
 
-	refuse := func(err error) (*LocalRoll, error) {
-		rec.Result, rec.Error = auditRefused, err.Error()
-		s.audit.record(rec)
+	refuse := func(err error) (*local.Roll, error) {
+		rec.Result, rec.Error = auditlog.Refused, err.Error()
+		s.audit.Record(rec)
 
 		return nil, err
 	}
@@ -600,17 +272,17 @@ func (s *service) requestLocalRoll(who *origin, container string) (*LocalRoll, e
 	}
 
 	s.localState.nextRoll++
-	roll := &LocalRoll{
+	roll := &localRoll{Roll: local.Roll{
 		ID:        fmt.Sprintf("%s-%d", now.Format("20060102T150405"), s.localState.nextRoll),
 		Container: container, RequestedBy: who.user, RequestedAt: now, UpdatedAt: now,
-		State: RollResolving, Detail: "asking the registry and pulling the image",
-	}
+		State: local.RollResolving, Detail: "asking the registry and pulling the image",
+	}}
 	s.localState.requests = append(s.localState.requests, roll)
-	out := *roll
+	out := roll.Roll
 
 	s.localState.mu.Unlock()
 
-	s.audit.record(rec)
+	s.audit.Record(rec)
 	s.requestSync()
 
 	return &out, nil
@@ -627,13 +299,13 @@ func (s *service) takeLocalRolls(obs *observation) {
 
 	for _, roll := range requests {
 		if reason := s.rollRefusal(roll.Container, obs); reason != "" {
-			s.setLocalRoll(roll.ID, RollRejected, reason)
+			s.setLocalRoll(roll.ID, local.RollRejected, reason)
 
 			continue
 		}
 
 		c := obs.container(roll.Container)
-		key := NormalizeReference(c.Image)
+		key := imageref.Normalize(c.Image)
 
 		s.pendingRolls[roll.ID] = pendingRoll{
 			container: roll.Container, key: key, ticket: s.watcher.Request(key, c.Image), local: true,
@@ -648,7 +320,7 @@ func (s *service) localRollsOpen() bool {
 	defer s.localState.mu.Unlock()
 
 	return slices.ContainsFunc(slices.Concat(s.localState.rolls, s.localState.requests),
-		func(r *LocalRoll) bool { return !r.Final() })
+		func(r *localRoll) bool { return !r.Final() })
 }
 
 // setLocalRoll moves a roll to a state.
@@ -667,9 +339,9 @@ func (s *service) setLocalRoll(id, state, detail string) {
 // resolved and local, or rejects the roll.
 func (s *service) concludeLocalRoll(id string, need *protocol.Need, reject string) bool {
 	if reject != "" {
-		s.setLocalRoll(id, RollRejected, reject)
-		s.audit.record(AuditRecord{
-			Action: "roll.result", Source: auditAgent, Result: auditRefused, Error: reject,
+		s.setLocalRoll(id, local.RollRejected, reject)
+		s.audit.Record(auditlog.Record{
+			Action: "roll.result", Source: auditlog.SourceAgent, Result: auditlog.Refused, Error: reject,
 			Reason: "requested on the host as " + id,
 		})
 
@@ -687,7 +359,7 @@ func (s *service) concludeLocalRoll(id string, need *protocol.Need, reject strin
 		return false
 	}
 
-	s.setLocalRoll(id, RollQueued, "waiting for the controller")
+	s.setLocalRoll(id, local.RollQueued, "waiting for the controller")
 
 	return true
 }
@@ -701,7 +373,7 @@ func (s *service) followLocalRolls(st *persistedState, resp *protocol.SyncRespon
 	now := s.now().UTC()
 
 	for _, r := range s.localState.rolls {
-		if r.Final() || r.State == RollResolving {
+		if r.Final() || r.State == local.RollResolving {
 			continue
 		}
 
@@ -711,13 +383,13 @@ func (s *service) followLocalRolls(st *persistedState, resp *protocol.SyncRespon
 		}
 
 		r.Position = 0
-		if r.State == RollQueued && resp != nil && resp.Queue != nil {
+		if r.State == local.RollQueued && resp != nil && resp.Queue != nil {
 			r.Position = resp.Queue.Position
 		}
 	}
 
 	// The list stays short: the oldest finished rolls go.
-	s.localState.rolls = slices.DeleteFunc(s.localState.rolls, func(r *LocalRoll) bool {
+	s.localState.rolls = slices.DeleteFunc(s.localState.rolls, func(r *localRoll) bool {
 		return r.Final() && now.Sub(r.UpdatedAt) > localRollStale
 	})
 
@@ -728,7 +400,7 @@ func (s *service) followLocalRolls(st *persistedState, resp *protocol.SyncRespon
 
 // localRollState says where a roll stands.
 func (s *service) localRollState(
-	r *LocalRoll, st *persistedState, resp *protocol.SyncResponse,
+	r *localRoll, st *persistedState, resp *protocol.SyncResponse,
 ) (state, detail string) {
 	needID := protocol.LocalNeedID(r.ID)
 
@@ -749,15 +421,15 @@ func (s *service) localRollState(
 
 	switch {
 	case open && resp != nil && resp.Queue != nil:
-		return RollQueued, resp.Queue.Reason
+		return local.RollQueued, resp.Queue.Reason
 	case open:
-		return RollQueued, cmpOr(holdReasonIfHeld(s.holds.Read()), "waiting for the controller")
+		return local.RollQueued, cmpOr(holdReasonIfHeld(s.holds.Read()), "waiting for the controller")
 	case !r.seenLease:
-		return RollSuperseded, "the roll was dropped: the container no longer qualifies"
+		return local.RollSuperseded, "the roll was dropped: the container no longer qualifies"
 	case resp != nil && resp.Ended != nil && resp.Ended.ID == r.Lease && resp.Ended.State != "released":
-		return RollFailed, cmpOr(resp.Ended.Reason, "the controller ended the lease as "+resp.Ended.State)
-	case r.State == RollVerified || (resp != nil && resp.Ended != nil && resp.Ended.ID == r.Lease):
-		return RollDone, "the controller released the slot"
+		return local.RollFailed, cmpOr(resp.Ended.Reason, "the controller ended the lease as "+resp.Ended.State)
+	case r.State == local.RollVerified || (resp != nil && resp.Ended != nil && resp.Ended.ID == r.Lease):
+		return local.RollDone, "the controller released the slot"
 	default:
 		// The operation is forgotten and it was not seen to be verified.
 		return r.State, r.Detail
@@ -787,31 +459,31 @@ func leasedRollState(cur *operationRecord, step *protocol.Step) (state, detail s
 
 	switch step.Status {
 	case protocol.StepFailed:
-		return RollFailed, step.Error
+		return local.RollFailed, step.Error
 	case protocol.StepRefused:
-		return RollRejected, step.Error
+		return local.RollRejected, step.Error
 	case protocol.StepSuperseded, protocol.StepCancelled:
-		return RollSuperseded, step.Error
+		return local.RollSuperseded, step.Error
 	case protocol.StepDone:
 		switch op.Phase {
 		case protocol.PhaseDone:
-			return RollVerified, "the container stayed up; the controller now checks that the node is back"
+			return local.RollVerified, "the container stayed up; the controller now checks that the node is back"
 		case protocol.PhaseFailed:
-			return RollFailed, op.Error
+			return local.RollFailed, op.Error
 		default:
-			return RollRecreated, "watching that the container stays up"
+			return local.RollRecreated, "watching that the container stays up"
 		}
 	case protocol.StepRunning:
-		return RollRecreating, ""
+		return local.RollRecreating, ""
 	case protocol.StepPending:
 	}
 
 	switch {
 	case op.Phase == protocol.PhaseFailed:
-		return RollFailed, cmpOr(step.Error, op.Error)
+		return local.RollFailed, cmpOr(step.Error, op.Error)
 	case !cur.Started:
-		return RollGranted, "lease " + cur.Lease.ID + " granted"
+		return local.RollGranted, "lease " + cur.Lease.ID + " granted"
 	default:
-		return RollRecreating, "lease " + cur.Lease.ID + ": " + string(op.Phase)
+		return local.RollRecreating, "lease " + cur.Lease.ID + ": " + string(op.Phase)
 	}
 }

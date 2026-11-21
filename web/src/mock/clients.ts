@@ -1,5 +1,5 @@
 // The client views of the mock controller, with the rules of
-// pkg/controller/api/clients.go: the fleet grouped by the client software of
+// pkg/controller/views/clients.go: the fleet grouped by the client software of
 // its managed containers, one state per host and client, and one page of a
 // client's hosts at a time.
 
@@ -63,9 +63,14 @@ function needContainer(n: Need): string {
   return n.image?.container ?? n.override?.container ?? n.spec?.container ?? '';
 }
 
+/** scheduler.ImageGroup: the image rollouts of one client on one reference. */
+function imageGroup(client: string | undefined, image: string): string {
+  return client ? `image:${image}#${client}` : `image:${image}`;
+}
+
 function failure(sum: HostSummary, containers: readonly Container[]): string {
   for (const c of containers) {
-    if (sum.broken && `image:${c.image}` in sum.broken) return `the last lease for ${c.image} failed`;
+    if (sum.broken && imageGroup(c.client, c.image) in sum.broken) return `the last lease for ${c.image} failed`;
     if (c.state !== 'running' && shouldRun(c)) return `container ${c.name} is ${c.state}`;
   }
 

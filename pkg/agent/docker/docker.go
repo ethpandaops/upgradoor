@@ -1,4 +1,4 @@
-// Package docker implements agent.ContainerRuntime against the Docker Engine
+// Package docker implements hostapi.ContainerRuntime against the Docker Engine
 // API: it observes containers, pulls images and replaces a container by one
 // with the same configuration on the image its tag now names.
 //
@@ -86,11 +86,12 @@ import (
 	"github.com/moby/moby/client"
 	"github.com/sirupsen/logrus"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
+	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-var _ agent.ContainerRuntime = (*Runtime)(nil)
+var _ hostapi.ContainerRuntime = (*Runtime)(nil)
 
 // engine is the part of the Docker Engine API client the runtime uses.
 type engine interface {
@@ -130,7 +131,7 @@ type engine interface {
 	Close() error
 }
 
-// Runtime is the Docker implementation of agent.ContainerRuntime.
+// Runtime is the Docker implementation of hostapi.ContainerRuntime.
 type Runtime struct {
 	log    logrus.FieldLogger
 	engine engine
@@ -146,7 +147,7 @@ type Runtime struct {
 	pulled   map[string]string
 }
 
-// Login returns the login for a registry host (as agent.Reference.Host
+// Login returns the login for a registry host (as imageref.Reference.Host
 // spells it); ok is false when there is none.
 type Login func(registryHost string) (username, password string, ok bool)
 
@@ -187,7 +188,7 @@ func (r *Runtime) Close() error {
 	return nil
 }
 
-// Observe implements agent.ContainerRuntime.
+// Observe implements hostapi.ContainerRuntime.
 func (r *Runtime) Observe(ctx context.Context) ([]protocol.Container, error) {
 	list, err := r.engine.ContainerList(ctx, client.ContainerListOptions{All: true})
 	if err != nil {
@@ -274,7 +275,7 @@ func (r *Runtime) describe(
 	if ctr.Config != nil {
 		out.Image = ctr.Config.Image
 		out.Command = slices.Clone(ctr.Config.Cmd)
-		out.Base = agent.BaseFromLabels(ctr.Config.Labels)
+		out.Base = overrides.BaseFromLabels(ctr.Config.Labels)
 	}
 
 	if ctr.State != nil {
@@ -354,7 +355,7 @@ func (r *Runtime) digestOf(ref string, img *client.ImageInspectResult) string {
 
 func pulledKey(repo, imageID string) string { return repo + "\x00" + imageID }
 
-// LocalImage implements agent.ContainerRuntime.
+// LocalImage implements hostapi.ContainerRuntime.
 func (r *Runtime) LocalImage(ctx context.Context, ref string) (digest, revision string, err error) {
 	if _, err = repositoryOf(ref); err != nil {
 		return "", "", err
@@ -377,7 +378,7 @@ func revisionOf(img *client.ImageInspectResult) string {
 	return img.Config.Labels[labelImageRevision]
 }
 
-// Stop implements agent.ContainerRuntime.
+// Stop implements hostapi.ContainerRuntime.
 func (r *Runtime) Stop(ctx context.Context, name string, timeout time.Duration) error {
 	if err := r.recoverFor(ctx, name); err != nil {
 		return err
@@ -392,7 +393,7 @@ func (r *Runtime) Stop(ctx context.Context, name string, timeout time.Duration) 
 	return nil
 }
 
-// Start implements agent.ContainerRuntime.
+// Start implements hostapi.ContainerRuntime.
 func (r *Runtime) Start(ctx context.Context, name string) error {
 	if err := r.recoverFor(ctx, name); err != nil {
 		return err

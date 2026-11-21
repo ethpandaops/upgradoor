@@ -778,7 +778,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
 
   // The lease that failed on nimbus-nethermind-1 left its mark on the host.
   const brokenHost = hosts.get('nimbus-nethermind-1');
-  if (brokenHost) brokenHost.broken = { [`image:${NETHERMIND_IMAGE}`]: leaseFailed };
+  if (brokenHost) brokenHost.broken = { [`image:${NETHERMIND_IMAGE}#nethermind`]: leaseFailed };
 
   const withLease = (m: RolloutHost, leaseId: string, needId: string): RolloutHost => ({ ...m, leaseId, needId });
   const pending = (host: string, stage: RolloutHost['stage'], prefix: string, ago: number): RolloutHost => ({
@@ -790,7 +790,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     {
       id: lighthouseRollout,
       kind: 'image',
-      key: `image:${LIGHTHOUSE_IMAGE}@${lhDigest}`,
+      key: `image:${LIGHTHOUSE_IMAGE}#lighthouse@${lhDigest}`,
       title: `${LIGHTHOUSE_IMAGE} → ${lhDigest.slice(7, 19)}`,
       image: LIGHTHOUSE_IMAGE,
       client: 'lighthouse',
@@ -818,7 +818,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     {
       id: nethermindRollout,
       kind: 'image',
-      key: `image:${NETHERMIND_IMAGE}@${nmDigest}`,
+      key: `image:${NETHERMIND_IMAGE}#nethermind@${nmDigest}`,
       title: `${NETHERMIND_IMAGE} → ${nmDigest.slice(7, 19)}`,
       image: NETHERMIND_IMAGE,
       client: 'nethermind',
@@ -851,7 +851,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       // rollout waits for a person before the second host goes.
       id: grandineRollout,
       kind: 'image',
-      key: `image:${GRANDINE_IMAGE}@${grDigest}`,
+      key: `image:${GRANDINE_IMAGE}#grandine@${grDigest}`,
       title: `${GRANDINE_IMAGE} → ${grDigest.slice(7, 19)}`,
       image: GRANDINE_IMAGE,
       client: 'grandine',
@@ -922,7 +922,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     {
       id: oldLighthouseRollout,
       kind: 'image',
-      key: `image:${LIGHTHOUSE_IMAGE}@${previousDigest(LIGHTHOUSE_IMAGE)}x`,
+      key: `image:${LIGHTHOUSE_IMAGE}#lighthouse@${previousDigest(LIGHTHOUSE_IMAGE)}x`,
       title: `${LIGHTHOUSE_IMAGE} → ${digest('lighthouse/older').slice(7, 19)}`,
       image: LIGHTHOUSE_IMAGE,
       client: 'lighthouse',

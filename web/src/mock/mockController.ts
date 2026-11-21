@@ -1,5 +1,5 @@
 // An in-browser stand-in for the controller API, serving the fixture through
-// the same routes and JSON shapes (pkg/controller/api/schema.go). Actions
+// the same routes and JSON shapes (pkg/controller/views/schema.go). Actions
 // change the in-memory state, so the UI can be exercised end to end.
 
 import type { FetchFn } from '../api/client';
@@ -1802,7 +1802,7 @@ export class MockController {
             id: `manual/${directive}/${c.name}`,
             kind: 'image',
             directiveId: directive,
-            image: { container: c.name, image: c.image, fromDigest: c.digest, toDigest: to },
+            image: { container: c.name, client: c.client, image: c.image, fromDigest: c.digest, toDigest: to },
           });
         }
       }

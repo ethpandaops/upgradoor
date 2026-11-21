@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
 )
 
 func TestRecreate(t *testing.T) {
@@ -123,7 +123,7 @@ func TestRecreateRefusesBeforeStopping(t *testing.T) {
 
 			err := newTestRuntime(t, f).Recreate(t.Context(), "geth", tt.digest, time.Second, true)
 			require.Error(t, err)
-			assert.Equal(t, tt.wantMismatch, errors.Is(err, agent.ErrDigestMismatch), err.Error())
+			assert.Equal(t, tt.wantMismatch, errors.Is(err, hostapi.ErrDigestMismatch), err.Error())
 
 			if tt.wantErr != "" {
 				assert.ErrorContains(t, err, tt.wantErr)
@@ -190,7 +190,7 @@ func TestRecreateRollsBack(t *testing.T) {
 				"stop old t=1", "rename old " + tmp, "create geth",
 				"remove new1 with volumes", "rename old geth", "start old",
 			},
-			wantErr: agent.ErrDigestMismatch,
+			wantErr: hostapi.ErrDigestMismatch,
 		},
 		{
 			name:    "network connect fails",
@@ -317,7 +317,7 @@ func TestRecreateCannotRemoveOld(t *testing.T) {
 		delete(f.fail, "remove old")
 
 		err := r.Recreate(t.Context(), "geth", digestA, time.Second, true)
-		require.ErrorIs(t, err, agent.ErrDigestMismatch)
+		require.ErrorIs(t, err, hostapi.ErrDigestMismatch)
 		assert.Empty(t, f.calls, "nothing may be touched")
 		assert.Equal(t, "new1", f.find("geth").ID)
 		assert.True(t, f.find("geth").State.Running, "the replacement keeps running")
@@ -423,7 +423,7 @@ func TestRecreateRecoversInterruptedRun(t *testing.T) {
 			f := interruptedEngine(running)
 
 			err := newTestRuntime(t, f).Recreate(t.Context(), "geth", digestA, time.Second, true)
-			require.ErrorIs(t, err, agent.ErrDigestMismatch)
+			require.ErrorIs(t, err, hostapi.ErrDigestMismatch)
 			assert.Empty(t, f.calls, "nothing may be touched")
 			assert.Equal(t, running, f.containers["half"].State.Running)
 		}

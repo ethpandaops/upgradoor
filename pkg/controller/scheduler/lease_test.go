@@ -354,7 +354,7 @@ func TestOperationThatDisruptedNothing(t *testing.T) {
 }
 
 func TestStepOutcomes(t *testing.T) {
-	imgKey := imageKey(imgLighthouse, digestA)
+	imgKey := imageKey("", imgLighthouse, digestA)
 	pkgKey := packagesKey("2.0")
 
 	tests := []struct {
@@ -562,7 +562,7 @@ func TestNeedStillReportedAfterTheOperationFails(t *testing.T) {
 		// weight of the host: validator hosts are verified by liveness.
 		weight uint64
 	}{
-		{name: "image", need: imageNeed("c", imgLighthouse, digestA), key: imageKey(imgLighthouse, digestA)},
+		{name: "image", need: imageNeed("c", imgLighthouse, digestA), key: imageKey("", imgLighthouse, digestA)},
 		{name: "packages", need: packagesNeed("2.0"), key: packagesKey("2.0")},
 		{name: "reboot: the host came back still requiring one", need: rebootNeed(), key: keyReboot},
 		{name: "reboot on a validator host", need: rebootNeed(), key: keyReboot, weight: 10},
@@ -1183,7 +1183,7 @@ func TestStepDoneInAFailedLeaseIsNoSuccess(t *testing.T) {
 	b.wants("a", rebootNeed())
 	b.step()
 
-	key := imageKey(imgLighthouse, digestA)
+	key := imageKey("", imgLighthouse, digestA)
 	require.Equal(t, []string{"a"}, b.leasedHosts())
 	require.Equal(t, "a", b.mustRollout(key).Canary)
 	require.Len(t, b.lease("a").Needs, 2)

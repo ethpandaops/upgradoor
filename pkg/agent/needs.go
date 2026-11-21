@@ -4,6 +4,9 @@ import (
 	"cmp"
 	"slices"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
+	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -17,11 +20,11 @@ type observation struct {
 	// containers is the previous observation.
 	containersFresh bool
 	node            protocol.NodeHealth
-	// sys is nil until the first successful System.Status.
-	sys *SystemStatus
+	// sys is nil until the first successful hostapi.System.Status.
+	sys *hostapi.SystemStatus
 	// targets is what every managed container is to run, by the
 	// configuration and the overrides file.
-	targets map[string]overrideTarget
+	targets map[string]overrides.Target
 	// check is the registry check of a tag, by normalised reference.
 	check func(key string) (protocol.RegistryCheck, bool)
 }
@@ -61,11 +64,11 @@ func findContainer(list []protocol.Container, name string) *protocol.Container {
 // container on an override is followed on the override's tag like any other,
 // and put back when the override is gone.
 func enrichContainers(
-	cfg *Config, list []protocol.Container, set *overrideSet,
+	cfg *Config, list []protocol.Container, set *overrides.Set,
 	check func(key string) (protocol.RegistryCheck, bool),
-) (tags map[string]trackedTag, targets map[string]overrideTarget) {
+) (tags map[string]trackedTag, targets map[string]overrides.Target) {
 	tags = make(map[string]trackedTag, len(cfg.Containers))
-	targets = make(map[string]overrideTarget, len(cfg.Containers))
+	targets = make(map[string]overrides.Target, len(cfg.Containers))
 
 	for i := range list {
 		c := &list[i]
@@ -92,13 +95,13 @@ func enrichContainers(
 		c.Owners = protocol.CleanOwners(m.Owners)
 		c.Client = m.Client
 		c.Overridable = m.overridable()
-		c.Override = target.report(c, set.entry(c.Name))
+		c.Override = target.Report(c, set.Entry(c.Name))
 
-		if !isTagReference(c.Image) {
+		if !imageref.IsTag(c.Image) {
 			continue
 		}
 
-		key := NormalizeReference(c.Image)
+		key := imageref.Normalize(c.Image)
 
 		t := tags[key]
 		if t.ref == "" {
@@ -114,11 +117,11 @@ func enrichContainers(
 
 		// The image the container is to move to is followed too, and
 		// pulled: no container runs it yet.
-		if next := NormalizeReference(target.image); next != key && !target.inSync &&
-			target.err == "" && isTagReference(target.image) {
+		if next := imageref.Normalize(target.Image); next != key && !target.InSync &&
+			target.Err == "" && imageref.IsTag(target.Image) {
 			t := tags[next]
 			if t.ref == "" {
-				t.ref = target.image
+				t.ref = target.Image
 			}
 
 			t.running = append(t.running, "")
@@ -152,20 +155,20 @@ func withMissing(cfg *Config, list []protocol.Container) []protocol.Container {
 	return out
 }
 
-// overridesTarget is targetOf for the overrides as last read. While the file
-// cannot be read nothing is applied and nothing put back: what a container
-// runs is left alone, and said.
-func overridesTarget(m *ManagedContainer, c *protocol.Container, set *overrideSet) overrideTarget {
+// overridesTarget is overrides.TargetOf for the overrides as last read. While
+// the file cannot be read nothing is applied and nothing put back: what a
+// container runs is left alone, and said.
+func overridesTarget(m *ManagedContainer, c *protocol.Container, set *overrides.Set) overrides.Target {
 	if set == nil {
-		set = noOverrides()
+		set = overrides.NewSet()
 	}
 
-	target := targetOf(m, c, set.entry(c.Name))
+	target := overrides.TargetOf(m.Image, m.Command, c, set.Entry(c.Name))
 
-	if !set.known && !target.inSync {
-		return overrideTarget{
-			image: c.Image, command: slices.Clone(c.Command), inSync: true,
-			err: "the overrides file cannot be read (" + set.err + "); nothing is changed",
+	if !set.Known && !target.InSync {
+		return overrides.Target{
+			Image: c.Image, Command: slices.Clone(c.Command), InSync: true,
+			Err: "the overrides file cannot be read (" + set.Err + "); nothing is changed",
 		}
 	}
 
@@ -179,25 +182,26 @@ func overridesTarget(m *ManagedContainer, c *protocol.Container, set *overrideSe
 // than the container was created with, it is a spec need that hosts share a
 // rollout of; otherwise an override need of the host's own.
 func overrideNeed(
-	c *protocol.Container, target *overrideTarget,
+	c *protocol.Container, target *overrides.Target,
 	check func(key string) (protocol.RegistryCheck, bool),
 ) (protocol.Need, bool) {
-	if target.inSync || target.err != "" || !isTagReference(target.image) {
+	if target.InSync || target.Err != "" || !imageref.IsTag(target.Image) {
 		return protocol.Need{}, false
 	}
 
-	rc, ok := check(NormalizeReference(target.image))
+	rc, ok := check(imageref.Normalize(target.Image))
 	if !ok || rc.Digest == "" || !rc.Pulled {
 		return protocol.Need{}, false
 	}
 
-	if target.spec {
+	if target.Spec {
 		s := &protocol.SpecNeed{
-			Container: c.Name, Key: target.specKey(c, rc.Digest), Image: target.image,
-			FromDigest: c.Digest, ToDigest: rc.Digest, ToRevision: rc.Revision, Flags: target.flags,
+			Container: c.Name, Client: c.Client, Key: target.SpecKey(c, rc.Digest),
+			Image: target.Image, FromDigest: c.Digest, ToDigest: rc.Digest,
+			ToRevision: rc.Revision, Flags: target.Flags,
 		}
 
-		if !SameReference(c.Image, target.image) {
+		if !imageref.Same(c.Image, target.Image) {
 			s.FromImage = c.Image
 		}
 
@@ -205,17 +209,17 @@ func overrideNeed(
 	}
 
 	n := &protocol.OverrideNeed{
-		Container: c.Name, Image: target.image, FromDigest: c.Digest,
+		Container: c.Name, Image: target.Image, FromDigest: c.Digest,
 		ToDigest: rc.Digest, ToRevision: rc.Revision,
-		Flags: target.flags, Restore: target.restore,
+		Flags: target.Flags, Restore: target.Restore,
 	}
 
-	if !SameReference(c.Image, target.image) {
+	if !imageref.Same(c.Image, target.Image) {
 		n.FromImage = c.Image
 	}
 
 	return protocol.Need{
-		ID:       protocol.OverrideNeedID(c.Name, target.key(rc.Digest)),
+		ID:       protocol.OverrideNeedID(c.Name, target.Key(rc.Digest)),
 		Kind:     protocol.NeedOverride,
 		Local:    true,
 		Override: n,
@@ -231,7 +235,7 @@ func rollable(cfg *Config, c *protocol.Container, name string) (reason string, r
 		return "container " + name + " is not managed", true
 	case c == nil:
 		return "container " + name + " does not exist", false
-	case !isTagReference(c.Image):
+	case !imageref.IsTag(c.Image):
 		return "container " + name + " is pinned to a digest", true
 	default:
 		return "", false
@@ -239,7 +243,7 @@ func rollable(cfg *Config, c *protocol.Container, name string) (reason string, r
 }
 
 // rebootReasons returns why the host wants a reboot, from the OS state.
-func rebootReasons(sys *SystemStatus) []string {
+func rebootReasons(sys *hostapi.SystemStatus) []string {
 	if sys == nil {
 		return nil
 	}
@@ -261,7 +265,7 @@ func rebootReasons(sys *SystemStatus) []string {
 // blockedChanges returns the pending upgrades of configured blocked
 // packages, sorted by name. Anything the system reports outside the
 // configured set is dropped: the configuration bounds the verb.
-func blockedChanges(cfg *Config, sys *SystemStatus) []protocol.PackageChange {
+func blockedChanges(cfg *Config, sys *hostapi.SystemStatus) []protocol.PackageChange {
 	if sys == nil {
 		return nil
 	}
@@ -319,7 +323,7 @@ func computeNeeds(cfg *Config, obs *observation, manual []protocol.Need) []proto
 
 			// A container that is not what agent.yaml and the overrides file
 			// say moves there first; its tag is followed again once it is.
-			if t, ok := obs.targets[c.Name]; ok && !t.inSync && c.Managed {
+			if t, ok := obs.targets[c.Name]; ok && !t.InSync && c.Managed {
 				if n, ok := overrideNeed(c, &t, obs.registryCheck); ok {
 					needs = append(needs, n)
 				}
@@ -377,6 +381,7 @@ func imageNeed(c *protocol.Container) (protocol.Need, bool) {
 		Kind: protocol.NeedImage,
 		Image: &protocol.ImageNeed{
 			Container:  c.Name,
+			Client:     c.Client,
 			Image:      c.Image,
 			FromDigest: c.Digest,
 			ToDigest:   rc.Digest,
@@ -416,7 +421,7 @@ func reconcileManualNeeds(
 				continue
 			}
 
-			if !SameReference(c.Image, n.Image.Image) {
+			if !imageref.Same(c.Image, n.Image.Image) {
 				dropped[n.ID] = "container " + c.Name + " moved to another tag"
 
 				continue

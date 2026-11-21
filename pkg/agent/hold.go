@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"strings"
-	"unicode"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/atomicfile"
+	"github.com/ethpandaops/upgradoor/pkg/agent/auditlog"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -16,9 +16,6 @@ import (
 // directory. It is a file of its own, not part of state.json, so that a
 // damaged state file never lifts a hold.
 const controllerHoldFile = "controller-hold"
-
-// maxHoldReason bounds the reported reason of a hold.
-const maxHoldReason = 512
 
 // holds reads and writes the two holds of a host.
 //
@@ -66,7 +63,7 @@ func (h *holds) SetController(reason string) error {
 		return fmt.Errorf("create state dir: %w", err)
 	}
 
-	if err := writeFileAtomic(h.controllerFile, []byte(firstLine(reason)+"\n"), 0o600); err != nil {
+	if err := atomicfile.Write(h.controllerFile, []byte(auditlog.Line(reason)+"\n"), 0o600); err != nil {
 		return fmt.Errorf("set controller hold: %w", err)
 	}
 
@@ -80,7 +77,7 @@ func (h *holds) ReleaseController() error {
 		return fmt.Errorf("release controller hold: %w", err)
 	}
 
-	return syncDir(filepath.Dir(h.controllerFile))
+	return atomicfile.SyncDir(filepath.Dir(h.controllerFile))
 }
 
 // SetLocal creates the local hold file for a person who asked for it on the
@@ -95,7 +92,7 @@ func (h *holds) SetLocal(reason string) error {
 		return fmt.Errorf("create the directory of the hold file: %w", err)
 	}
 
-	if err := writeFileAtomic(h.localFile, []byte(firstLine(reason)+"\n"), 0o644); err != nil {
+	if err := atomicfile.Write(h.localFile, []byte(auditlog.Line(reason)+"\n"), 0o644); err != nil {
 		return fmt.Errorf("set local hold: %w", err)
 	}
 
@@ -130,25 +127,7 @@ func readFlagFile(path string) (reason string, present bool, err error) {
 
 	// A directory or an unreadable file still is a hold; only the reason is
 	// lost.
-	line, _ := bufio.NewReaderSize(f, maxHoldReason*2).ReadString('\n')
+	line, _ := bufio.NewReaderSize(f, auditlog.MaxLine*2).ReadString('\n')
 
-	return firstLine(line), true, nil
-}
-
-func firstLine(s string) string {
-	s, _, _ = strings.Cut(s, "\n")
-	s = strings.Map(func(r rune) rune {
-		if unicode.IsControl(r) {
-			return ' '
-		}
-
-		return r
-	}, strings.ToValidUTF8(s, "?"))
-	s = strings.TrimSpace(s)
-
-	if len(s) > maxHoldReason {
-		s = strings.ToValidUTF8(s[:maxHoldReason], "")
-	}
-
-	return s
+	return auditlog.Line(line), true, nil
 }

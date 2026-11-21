@@ -554,6 +554,10 @@ func TestSearchPackages(t *testing.T) {
 // TestSearchPackagesAtFleetSize checks search on a database the size of a
 // real devnet: 30 hosts with a full Debian package list each.
 func TestSearchPackagesAtFleetSize(t *testing.T) {
+	if testing.Short() {
+		t.Skip("fleet size")
+	}
+
 	const (
 		hosts   = 30
 		perHost = 1500

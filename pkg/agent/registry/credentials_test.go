@@ -12,7 +12,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
 func b64(s string) string { return base64.StdEncoding.EncodeToString([]byte(s)) }
@@ -135,7 +135,7 @@ func TestLoadLoginsAliasPrecedence(t *testing.T) {
 		{
 			"exact host over the legacy index url",
 			[]string{entry("https://index.docker.io/v1/", "legacy"), entry("docker.io", "exact")},
-			agent.DockerHubHost, "exact", "docker.io", []string{"https://index.docker.io/v1/"},
+			imageref.DockerHubHost, "exact", "docker.io", []string{"https://index.docker.io/v1/"},
 		},
 		{
 			"exact host over a bare alias over a url",
@@ -144,17 +144,17 @@ func TestLoadLoginsAliasPrecedence(t *testing.T) {
 				entry("registry-1.docker.io", "alias"),
 				entry("docker.io", "exact"),
 			},
-			agent.DockerHubHost, "exact", "docker.io", []string{"registry-1.docker.io", "https://index.docker.io/v1/"},
+			imageref.DockerHubHost, "exact", "docker.io", []string{"registry-1.docker.io", "https://index.docker.io/v1/"},
 		},
 		{
 			"bare alias over a url",
 			[]string{entry("https://index.docker.io/v1/", "legacy"), entry("registry-1.docker.io", "alias")},
-			agent.DockerHubHost, "alias", "registry-1.docker.io", []string{"https://index.docker.io/v1/"},
+			imageref.DockerHubHost, "alias", "registry-1.docker.io", []string{"https://index.docker.io/v1/"},
 		},
 		{
 			"equal rank: the key that sorts first",
 			[]string{entry("registry-1.docker.io", "api"), entry("index.docker.io", "index")},
-			agent.DockerHubHost, "index", "index.docker.io", []string{"registry-1.docker.io"},
+			imageref.DockerHubHost, "index", "index.docker.io", []string{"registry-1.docker.io"},
 		},
 		{
 			"urls of one host",
@@ -164,7 +164,7 @@ func TestLoadLoginsAliasPrecedence(t *testing.T) {
 		{
 			"an entry without a login does not shadow one with",
 			[]string{`"docker.io": {}`, entry("https://index.docker.io/v1/", "legacy")},
-			agent.DockerHubHost, "legacy", "", nil,
+			imageref.DockerHubHost, "legacy", "", nil,
 		},
 	}
 

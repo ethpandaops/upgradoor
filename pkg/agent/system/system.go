@@ -20,7 +20,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -49,7 +49,7 @@ type Options struct {
 	Runner CommandRunner
 }
 
-// System implements agent.System on a Debian-like host.
+// System implements hostapi.System on a Debian-like host.
 type System struct {
 	log     logrus.FieldLogger
 	root    string
@@ -72,7 +72,7 @@ type System struct {
 	nextRefresh time.Time
 }
 
-var _ agent.System = (*System)(nil)
+var _ hostapi.System = (*System)(nil)
 
 // snapshot is one collected inventory with what Status derives from it. It
 // is immutable once stored.
@@ -125,7 +125,7 @@ func New(log logrus.FieldLogger, opts Options) *System {
 // counts, blocked packages and the inventory hash come from the cached
 // inventory, which is collected on the first call and again once it is older
 // than inventoryInterval; everything else is read on every call.
-func (s *System) Status(ctx context.Context) (*agent.SystemStatus, error) {
+func (s *System) Status(ctx context.Context) (*hostapi.SystemStatus, error) {
 	status, err := s.status(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("system status: %w", err)
@@ -134,7 +134,7 @@ func (s *System) Status(ctx context.Context) (*agent.SystemStatus, error) {
 	return status, nil
 }
 
-func (s *System) status(ctx context.Context) (*agent.SystemStatus, error) {
+func (s *System) status(ctx context.Context) (*hostapi.SystemStatus, error) {
 	bootID, err := s.readBootID()
 	if err != nil {
 		return nil, err
@@ -177,7 +177,7 @@ func (s *System) status(ctx context.Context) (*agent.SystemStatus, error) {
 
 	installed := sortKernelReleases(bootKernels, snap.kernelPackages)
 
-	return &agent.SystemStatus{
+	return &hostapi.SystemStatus{
 		BootID: bootID,
 		Uptime: uptime,
 		OS: protocol.OSSummary{

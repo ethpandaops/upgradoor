@@ -3,7 +3,7 @@ package docker
 import (
 	"slices"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
 const (
@@ -16,7 +16,7 @@ const (
 // "docker.io/library/alpine@sha256:..." and "index.docker.io/library/alpine"
 // all give "docker.io/library/alpine".
 func repositoryOf(ref string) (string, error) {
-	parsed, err := agent.ParseReference(ref)
+	parsed, err := imageref.Parse(ref)
 	if err != nil {
 		return "", err
 	}
@@ -31,7 +31,7 @@ func repositoryDigests(repo string, repoDigests []string) []string {
 	var out []string
 
 	for _, entry := range repoDigests {
-		parsed, err := agent.ParseReference(entry)
+		parsed, err := imageref.Parse(entry)
 		if err != nil || parsed.Digest == "" || parsed.Repository() != repo {
 			continue
 		}

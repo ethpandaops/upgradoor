@@ -7,4 +7,5 @@ node_modules/
 web/dist/
 .worktrees/
 .tmp/
+.cache/
 .claude/

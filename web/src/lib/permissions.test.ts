@@ -1,4 +1,4 @@
-// The table of pkg/controller/api/authz_test.go, for the page's copy of the
+// The table of pkg/controller/userapi/actions_test.go, for the page's copy of the
 // rule: every action against every kind of login, and what the team twins
 // cover.
 

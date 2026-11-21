@@ -192,7 +192,7 @@ func TestBrokenHostGoesFirst(t *testing.T) {
 // The host that failed in the superseded rollout has no validators. It is
 // repaired first all the same.
 func TestBrokenHostWithoutValidatorsGoesFirst(t *testing.T) {
-	key := imageKey(imgLighthouse, digestB)
+	key := imageKey("", imgLighthouse, digestB)
 
 	// Case 1: all three hosts report the new digest.
 	t.Run("everybody reports", func(t *testing.T) {
@@ -266,7 +266,7 @@ func TestBrokenHostStaysFirstThroughStateChanges(t *testing.T) {
 	b.w.Settings.Paused = true
 	b.step()
 
-	key := imageKey(imgLighthouse, digestB)
+	key := imageKey("", imgLighthouse, digestB)
 	require.Equal(t, fleet.StageRepair, b.mustRollout(key).Host("h3").Stage)
 	require.Equal(t, fleet.HostPending, b.mustRollout(key).Host("h3").State)
 
@@ -312,7 +312,7 @@ func TestBrokenHostStaysFirstThroughAChainOfSupersedes(t *testing.T) {
 	seesDigestB(b, "h1", "h2", "h3")
 	b.step()
 
-	second := b.mustRollout(imageKey(imgLighthouse, digestB))
+	second := b.mustRollout(imageKey("", imgLighthouse, digestB))
 	require.Equal(t, []string{"h3"}, b.leasedHosts())
 	require.Equal(t, fleet.StageRepair, second.Host("h3").Stage)
 
@@ -325,7 +325,7 @@ func TestBrokenHostStaysFirstThroughAChainOfSupersedes(t *testing.T) {
 	b.report("h3", protocol.PhaseApplying, true)
 
 	out := b.step()
-	third := b.mustRollout(imageKey(imgLighthouse, digestC))
+	third := b.mustRollout(imageKey("", imgLighthouse, digestC))
 
 	assert.Equal(t, []string{"h3"}, b.leasedHosts())
 	assert.Equal(t, map[string]string{"h1": "after h3", "h2": "after h3"}, queueReasons(out.Plan))
@@ -360,7 +360,7 @@ func TestBrokenHostStaysFirstThroughAChainOfSupersedes(t *testing.T) {
 		b.w.Settings.Paused = false
 		b.step()
 
-		third := b.mustRollout(imageKey(imgLighthouse, digestC))
+		third := b.mustRollout(imageKey("", imgLighthouse, digestC))
 		assert.Equal(t, []string{"h3"}, b.leasedHosts())
 		assert.Equal(t, fleet.StageRepair, third.Host("h3").Stage)
 	})
@@ -371,7 +371,7 @@ func TestBrokenHostStaysFirstThroughAChainOfSupersedes(t *testing.T) {
 // first when it joins.
 func TestBrokenHostThatJoinsTheNextRolloutLateGoesFirst(t *testing.T) {
 	b := failedOnDigestA(t, "h3", map[string]uint64{"h1": 10, "h2": 10, "h3": 10})
-	key := imageKey(imgLighthouse, digestB)
+	key := imageKey("", imgLighthouse, digestB)
 
 	// Somebody swaps h3's image by hand: it is no host of the image now.
 	b.get("h3").Status.Containers[0].Image = "someone/debug:build"

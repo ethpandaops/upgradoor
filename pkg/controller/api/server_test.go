@@ -10,12 +10,16 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
+	"github.com/ethpandaops/upgradoor/pkg/controller/controllertest"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
+	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
+	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
+	"github.com/ethpandaops/upgradoor/pkg/controller/views"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -24,16 +28,16 @@ func TestNewValidatesOptions(t *testing.T) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 
-	signer, err := identity.DeriveSignerKey([]byte(testSeed), testNetwork)
+	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed), controllertest.Network)
 	require.NoError(t, err)
 
 	valid := func() Options {
 		return Options{
-			Network:         testNetwork,
-			Verifier:        identity.NewVerifier(identity.PublicKey(signer), testNetwork),
-			Store:           newFakeStore(),
-			Scheduler:       newFakeScheduler(),
-			Beacon:          &fakeBeacon{},
+			Network:         controllertest.Network,
+			Verifier:        identity.NewVerifier(identity.PublicKey(signer), controllertest.Network),
+			Store:           controllertest.NewStore(),
+			Scheduler:       controllertest.NewScheduler(),
+			Beacon:          &controllertest.Beacon{},
 			DefaultSettings: fleet.DefaultSettings(),
 		}
 	}
@@ -129,7 +133,7 @@ func TestHealthz(t *testing.T) {
 
 	rec := h.get("/healthz")
 	require.Equal(t, http.StatusOK, rec.Code)
-	assert.Equal(t, contentTypeJSON, rec.Header().Get("Content-Type"))
+	assert.Equal(t, httpjson.ContentTypeJSON, rec.Header().Get("Content-Type"))
 	assert.JSONEq(t, `{"status":"ok"}`, rec.Body.String())
 
 	rec = h.sendJSON(http.MethodPost, "/healthz", "{}")
@@ -141,13 +145,14 @@ func TestAPIHeaders(t *testing.T) {
 
 	for _, path := range []string{
 		"/api/v1/config", "/api/v1/public/hosts", "/api/v1/hosts", "/api/v1/nope", "/healthz",
+		"/api/v1/public/events",
 	} {
-		req := httptest.NewRequest(http.MethodGet, testBaseURL+path, http.NoBody)
+		req := httptest.NewRequest(http.MethodGet, controllertest.BaseURL+path, http.NoBody)
 		// A cross-origin caller gets no CORS grant.
 		req.Header.Set("Origin", "https://evil.example")
 
 		rec := h.serve(req)
-		assert.Equal(t, contentTypeJSON, rec.Header().Get("Content-Type"), path)
+		assert.Equal(t, httpjson.ContentTypeJSON, rec.Header().Get("Content-Type"), path)
 		assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"), path)
 		assert.Equal(t, "no-store", rec.Header().Get("Cache-Control"), path)
 
@@ -157,7 +162,7 @@ func TestAPIHeaders(t *testing.T) {
 	}
 
 	// A CORS preflight is not answered as one.
-	req := httptest.NewRequest(http.MethodOptions, testBaseURL+"/api/v1/actions/roll", http.NoBody)
+	req := httptest.NewRequest(http.MethodOptions, controllertest.BaseURL+"/api/v1/actions/roll", http.NoBody)
 	req.Header.Set("Origin", "https://evil.example")
 	req.Header.Set("Access-Control-Request-Method", "POST")
 
@@ -201,21 +206,21 @@ func TestWebUI(t *testing.T) {
 		},
 		{
 			name: "unknown api path is json, not the UI", path: "/api/v1/nope", status: 404,
-			ctype: contentTypeJSON, body: `{"error":"not found"}` + "\n",
+			ctype: httpjson.ContentTypeJSON, body: `{"error":"not found"}` + "\n",
 		},
 		{
 			// In the agent protocol's error shape, see TestAgentUnknownPath.
 			name: "unknown agent api path", path: "/api/agent/v2/sync", status: 404,
-			ctype: contentTypeJSON,
+			ctype: httpjson.ContentTypeJSON,
 			body:  `{"error":"not found"}` + "\n",
 		},
 		{
 			name: "api prefix alone", path: "/api/", status: 404,
-			ctype: contentTypeJSON, body: `{"error":"not found"}` + "\n",
+			ctype: httpjson.ContentTypeJSON, body: `{"error":"not found"}` + "\n",
 		},
 		{
 			name: "host detail without a name", path: "/api/v1/hosts/", status: 404,
-			ctype: contentTypeJSON, body: `{"error":"not found"}` + "\n",
+			ctype: httpjson.ContentTypeJSON, body: `{"error":"not found"}` + "\n",
 		},
 	}
 
@@ -237,7 +242,7 @@ func TestWebUI(t *testing.T) {
 	assert.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
 
 	// Nothing is injected into the page: the UI asks /api/v1/config.
-	assert.NotContains(t, rec.Body.String(), testNetwork)
+	assert.NotContains(t, rec.Body.String(), controllertest.Network)
 
 	// Without a UI: the placeholder.
 	h = newHarness(t, nil)
@@ -251,12 +256,12 @@ func TestWebUI(t *testing.T) {
 func metricsFixture(t *testing.T, h *harness) {
 	t.Helper()
 
-	leakFixture(t, h)
+	controllertest.LeakFixture(t, h.store, h.sched, h.beacon)
 
-	h.store.hosts["lighthouse-geth-2"].LastSeen = testEpoch.Add(-10 * time.Minute)
-	h.store.leases = append(h.store.leases,
+	h.store.Hosts["lighthouse-geth-2"].LastSeen = controllertest.Epoch.Add(-10 * time.Minute)
+	h.store.Leases = append(h.store.Leases,
 		&fleet.Lease{ID: "l-open", Host: "lighthouse-geth-2", State: fleet.LeaseRunning})
-	h.store.rollouts = []*fleet.Rollout{
+	h.store.Rollouts = []*fleet.Rollout{
 		{ID: "r1", State: fleet.RolloutActive},
 		{ID: "r2", State: fleet.RolloutActive},
 		{ID: "r3", State: fleet.RolloutCompleted},
@@ -269,22 +274,22 @@ func TestMetrics(t *testing.T) {
 
 	// The fixture knows the host at generation 3; an older certificate would
 	// be rejected.
-	agent := validatorAgentGeneration(t, 3)
+	agent := controllertest.ValidatorAgent(t, 3)
 
 	// One good sync (which also refreshes the host) and one rejected one.
-	req := validatorSyncRequest()
+	req := controllertest.ValidatorSyncRequest()
 	req.OS.RebootRequired = true
 	req.Pending.Security = 4
 
 	require.Equal(t, http.StatusOK,
-		h.agentPost(agent, protocol.PathSync, req, agentCallOpts{}).Code)
+		h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{}).Code)
 	require.Equal(t, http.StatusUnauthorized,
-		h.agentPost(agent, protocol.PathSync, req, agentCallOpts{
+		h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{
 			ProofURL: "https://elsewhere.example" + protocol.PathSync,
 		}).Code)
 	require.Equal(t, http.StatusBadRequest,
 		h.agentPost(agent, protocol.PathInventory, map[string]string{"hash": "x"},
-			agentCallOpts{}).Code)
+			controllertest.CallOpts{}).Code)
 
 	rec := h.get("/metrics")
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -315,22 +320,22 @@ func TestMetrics(t *testing.T) {
 	// or hashes.
 	assert.NotContains(t, body, "host=")
 
-	for _, secret := range leakSecrets {
+	for _, secret := range controllertest.LeakSecrets {
 		assert.NotContains(t, body, secret)
 	}
 
 	// A gate that is open reads 1.
-	h.sched.set(func(f *fakeScheduler) {
-		plan := *f.plan
+	h.sched.Set(func(f *controllertest.Scheduler) {
+		plan := *f.CurrentPlan
 		plan.Gate.OK = true
-		f.plan = &plan
+		f.CurrentPlan = &plan
 	})
 	assert.Contains(t, h.get("/metrics").Body.String(), "upgradoor_network_gate_ok 1\n")
 }
 
 func TestMetricsBeforeFirstPlanAndOnStoreError(t *testing.T) {
 	h := newHarness(t, nil)
-	h.beacon.health = fleet.NetworkHealth{FinalityLagEpochs: 4, Tracked: 10, Live: 5}
+	h.beacon.Network = fleet.NetworkHealth{FinalityLagEpochs: 4, Tracked: 10, Live: 5}
 
 	body := h.get("/metrics").Body.String()
 	assert.Contains(t, body, "upgradoor_hosts 0\n")
@@ -340,7 +345,7 @@ func TestMetricsBeforeFirstPlanAndOnStoreError(t *testing.T) {
 	assert.NotContains(t, body, "upgradoor_budget_allowed_weight")
 
 	// A failing store drops its groups; the scrape itself still works.
-	h.store.setErr(assert.AnError)
+	h.store.SetErr(assert.AnError)
 
 	rec := h.get("/metrics")
 	require.Equal(t, http.StatusOK, rec.Code)
@@ -349,20 +354,193 @@ func TestMetricsBeforeFirstPlanAndOnStoreError(t *testing.T) {
 	assert.Contains(t, rec.Body.String(), "upgradoor_network_gate_ok 0\n")
 }
 
-func TestMetricNames(t *testing.T) {
+// TestEveryUserRouteIsGuarded walks the routes the server registered behind
+// the user authentication, not a list kept in the tests: without a token
+// every one answers 401; with a token that has basic access only, every
+// reading route answers and every other route answers 403, whatever its body.
+func TestEveryUserRouteIsGuarded(t *testing.T) {
+	h, provider := authHarness(t, true)
+	controllertest.OwnershipFixture(h.store)
+
+	routes := h.srv.userRoutes
+	require.NotEmpty(t, routes)
+
+	basic := map[string]string{
+		"no services claim":       provider.Grant(t, ""),
+		"basic":                   provider.Grant(t, "+upgradoor"),
+		"basic, in a team":        provider.Grant(t, "-all,+upgradoor", "geth", "lighthouse"),
+		"features of another one": provider.Grant(t, "+spamoor:all", "geth"),
+	}
+	staff := provider.Grant(t, controllertest.StaffServices)
+
+	mutating := 0
+
+	for _, route := range routes {
+		t.Run(route, func(t *testing.T) {
+			rec := h.serve(routeRequest(route, ""))
+			require.Equal(t, http.StatusUnauthorized, rec.Code, rec.Body.String())
+			assert.Equal(t, `Bearer realm="upgradoor"`, rec.Header().Get("WWW-Authenticate"))
+
+			read := strings.HasPrefix(route, http.MethodGet+" ")
+			if !read {
+				mutating++
+			}
+
+			for name, authorization := range basic {
+				got := h.serve(routeRequest(route, authorization))
+
+				if read {
+					// Some need a query; none refuses the login.
+					assert.NotContains(t, []int{http.StatusUnauthorized, http.StatusForbidden},
+						got.Code, "%s: %s", name, got.Body.String())
+
+					continue
+				}
+
+				require.Equal(t, http.StatusForbidden, got.Code, "%s: %s", name, got.Body.String())
+				assert.True(t, strings.HasPrefix(controllertest.DecodeJSON[httpjson.ErrorBody](t, got).Error,
+					"forbidden: this login lacks the feature upgradoor:"), got.Body.String())
+			}
+
+			// The same request by a login with every feature is not refused
+			// for what the login may do.
+			rec = h.serve(routeRequest(route, staff))
+			assert.NotContains(t, []int{http.StatusUnauthorized, http.StatusForbidden}, rec.Code,
+				rec.Body.String())
+		})
+	}
+
+	// The eleven actions and the settings.
+	assert.Equal(t, len(actionNames(h))+1, mutating)
+
+	for _, name := range actionNames(h) {
+		assert.Contains(t, routes, "POST /api/v1/actions/"+name)
+	}
+
+	// Nothing a basic login sent reached the scheduler; what did was the
+	// staff login's (most of its empty bodies fail validation).
+	for _, call := range h.sched.Recorded() {
+		assert.Equal(t, scheduler.Authorization{By: authz.FeatureAdmin}, call.Auth, call.Name)
+	}
+
+	assert.Empty(t, h.store.AuditEntries())
+}
+
+// TestOwnersFromAgentToViews: what an agent reports as owners reaches the
+// authenticated host views, cleaned, and no public view.
+func TestOwnersFromAgentToViews(t *testing.T) {
+	h, provider, _ := realHarness(t)
+
+	const hidden = "qq-hidden-team"
+
+	syncOwned(t, h, controllertest.HostMixed,
+		// Out of order, twice, and with names no team can have.
+		controllertest.Owned("geth", "panda", hidden, "geth", "panda", "Not A Team", "geth:all", ""),
+		protocol.Container{
+			Name: "lighthouse", Image: "sigp/lighthouse:unstable", Digest: "sha256:c1", State: "running",
+			Managed: true, Kind: protocol.KindCL, Owners: []string{"lighthouse"},
+		},
+		// Nine owners: one too many.
+		controllertest.Owned("many", "i", "h", "g", "f", "e", "d", "c", "b", "a"),
+		// Not managed: it has no owners, whatever the agent says.
+		protocol.Container{Name: "debug", State: "running", Owners: []string{"lighthouse"}},
+		controllertest.Owned("nobody"),
+	)
+
+	// An agent built before the field existed sends none.
+	old := controllertest.NewAgent(t, identity.CertificateSpec{Hostname: controllertest.HostUnowned})
+	body := `{"protocolVersion":1,"agentVersion":"agent-0.9.0","sentAt":"2026-11-14T12:00:00Z",` +
+		`"bootId":"boot-1","verbs":["roll"],"containers":[{"name":"bootnode","id":"1",` +
+		`"image":"ethpandaops/bootnode:latest","imageId":"sha256:1","state":"running",` +
+		`"restartCount":0,"startedAt":"2026-11-14T11:00:00Z","managed":true,"kind":"other"}]}`
+	rec := h.serve(h.agentRequest(old, protocol.PathSync, []byte(body), controllertest.CallOpts{}))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	reader := provider.Grant(t, "")
+
+	owners := func(host views.HostListing) map[string][]string {
+		out := make(map[string][]string, len(host.Containers))
+		for _, c := range host.Containers {
+			out[string(c.Name)] = c.Owners
+		}
+
+		return out
+	}
+
+	want := map[string][]string{
+		"geth":       {"geth", "panda", hidden},
+		"lighthouse": {"lighthouse"},
+		"many":       {"a", "b", "c", "d", "e", "f", "g", "h"},
+		"debug":      nil,
+		"nobody":     nil,
+	}
+
+	rec = h.serve(userRoute{method: http.MethodGet, path: "/api/v1/hosts"}.request(reader))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	list := controllertest.DecodeJSON[views.Hosts](t, rec)
+	require.Len(t, list.Hosts, 2)
+	assert.Equal(t, controllertest.HostUnowned, list.Hosts[0].Name)
+	assert.Equal(t, map[string][]string{"bootnode": nil}, owners(list.Hosts[0]))
+	assert.Equal(t, want, owners(list.Hosts[1]))
+	assert.NotContains(t, rec.Body.String(), `"owners":[]`, "no owners is no field")
+	assert.NotContains(t, rec.Body.String(), `"owners":null`)
+
+	rec = h.serve(userRoute{
+		method: http.MethodGet, path: "/api/v1/hosts/" + controllertest.HostMixed,
+	}.request(reader))
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	summary := controllertest.DecodeJSON[views.HostDetail](t, rec).HostSummary
+	assert.Equal(t, want, owners(views.Listing(&summary)))
+
+	// The public views show the host and its images, and no owner.
+	for _, path := range []string{"/api/v1/public/hosts", "/api/v1/public/images"} {
+		rec := h.get(path)
+		require.Equal(t, http.StatusOK, rec.Code)
+		require.Contains(t, rec.Body.String(), "sigp/lighthouse:unstable")
+		assert.NotContains(t, rec.Body.String(), hidden, path)
+		assert.NotContains(t, rec.Body.String(), "owners", path)
+	}
+
+	// Without a token the authenticated view is closed.
+	require.Equal(t, http.StatusUnauthorized, h.get("/api/v1/hosts").Code)
+}
+
+// The service name is checked before anything is built.
+func TestAuthServiceName(t *testing.T) {
 	h := newHarness(t, nil)
-	metricsFixture(t, h)
 
-	require.Equal(t, http.StatusOK,
-		h.agentPost(validatorAgentGeneration(t, 3), protocol.PathSync, syncRequest(),
-			agentCallOpts{}).Code)
+	for _, bad := range []string{"Upgradoor", "upgradoor:all", "up*", "+upgradoor", "a,b", " ", "a.b"} {
+		opts := h.srv.opts
+		opts.AuthService = bad
+		opts.Registry = nil
 
-	problems, err := testutil.GatherAndLint(h.reg)
-	require.NoError(t, err)
+		_, err := New(h.srv.log, opts)
+		require.ErrorContains(t, err, "is not a service name", bad)
+	}
+}
 
-	assert.Empty(t, problems)
+func TestStartStop(t *testing.T) {
+	h := newHarness(t, nil)
 
-	count, err := testutil.GatherAndCount(h.reg)
-	require.NoError(t, err)
-	assert.Positive(t, count)
+	require.NoError(t, h.srv.Stop(), "stop before start is harmless")
+	require.NoError(t, h.srv.Start(t.Context()))
+	require.Error(t, h.srv.Start(t.Context()), "a second start is refused")
+	require.NoError(t, h.srv.Stop())
+	require.NoError(t, h.srv.Stop())
+}
+
+// A path or a method no handler serves is the web UI's: a JSON 404 under
+// /api/.
+func TestUnknownRoutes(t *testing.T) {
+	h := newHarness(t, nil)
+
+	// Unknown action.
+	rec := h.sendJSON(http.MethodPost, "/api/v1/actions/explode", `{}`)
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	assert.Equal(t, httpjson.ContentTypeJSON, rec.Header().Get("Content-Type"))
+
+	// Wrong method on a known action: no such route.
+	rec = h.get("/api/v1/actions/roll")
+	require.Equal(t, http.StatusNotFound, rec.Code)
 }

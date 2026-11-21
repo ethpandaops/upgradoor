@@ -10,16 +10,16 @@ import (
 	"github.com/moby/moby/api/types/registry"
 	"github.com/moby/moby/client"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
 // pullDigestPrefix starts the status line with which the daemon reports the
 // digest a pulled tag points at.
 const pullDigestPrefix = "Digest: "
 
-// Pull implements agent.ContainerRuntime.
+// Pull implements hostapi.ContainerRuntime.
 func (r *Runtime) Pull(ctx context.Context, ref string) (digest, revision string, err error) {
-	parsed, err := agent.ParseReference(ref)
+	parsed, err := imageref.Parse(ref)
 	if err != nil {
 		return "", "", err
 	}

@@ -1,5 +1,5 @@
 // The outages of a slot history, worked out the way the controller does
-// (pkg/controller/api/outages.go): the leases of the window are spans, the
+// (pkg/controller/userapi/outages.go): the leases of the window are spans, the
 // misses a lease does not explain make a span when a host missed in at least
 // OFF_SLOTS slots no further than an epoch apart, and more spans than an
 // answer carries are merged by kind.

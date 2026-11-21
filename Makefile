@@ -1,7 +1,7 @@
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo dev)
-LDFLAGS := -s -w -X main.version=$(VERSION)
+LDFLAGS := -s -w -buildid= -X main.version=$(VERSION)
 
-.PHONY: all build build-web ensure-web test test-go test-web test-docker test-system test-reboot lint lint-go lint-web e2e wire clean
+.PHONY: test-scale all build build-web ensure-web release test test-go test-web test-docker test-system test-reboot lint lint-go lint-web e2e wire clean
 
 all: build
 
@@ -9,6 +9,24 @@ all: build
 # binary serves a placeholder page, so go build / go test need no node.
 build: ensure-web
 	CGO_ENABLED=0 go build -tags=webui -trimpath -ldflags "$(LDFLAGS)" -o bin/upgradoor ./cmd/upgradoor
+
+# release: the reproducible release binaries dist/upgradoor-linux-<arch> and their manifest
+# dist/upgradoor-manifest.txt (VERSION must be exactly vX.Y.Z). Rebuilt from the tag, it gives
+# byte-identical files: the Go of go.mod (GOTOOLCHAIN), no VCS stamp, no build id, a web UI
+# built afresh from the lock file. CI adds the image's line before the maintainer signs
+# (docs/release.md).
+RELEASE_PLATFORMS := linux-amd64 linux-arm64
+GO_VERSION := $(shell sed -n 's/^go //p' go.mod)
+
+release: build-web
+	@rm -rf dist && mkdir -p dist
+	@for p in $(RELEASE_PLATFORMS); do \
+	  GOTOOLCHAIN=go$(GO_VERSION) CGO_ENABLED=0 GOOS=$${p%-*} GOARCH=$${p#*-} \
+	    go build -tags=webui -trimpath -buildvcs=false \
+	    -ldflags "-s -w -buildid= -X main.version=$(VERSION)" \
+	    -o dist/upgradoor-$$p ./cmd/upgradoor || exit 1; \
+	done
+	./scripts/release-manifest.sh write $(VERSION) dist
 
 # One npm ci per change of the lock file, however many web targets run.
 web/node_modules/.package-lock.json: web/package.json web/package-lock.json
@@ -29,10 +47,16 @@ web/dist/index.html: $(WEB_SOURCES)
 
 ensure-web: web/dist/index.html
 
-test: test-go test-web
+test:
+	$(MAKE) --no-print-directory -j2 test-go test-web
 
 test-go:
-	go test -race -timeout 10m ./...
+	go test -short -race -timeout 10m ./...
+
+# The fleet-size tests (1000 hosts and more) run without the race detector,
+# which makes them many times slower without finding more.
+test-scale:
+	go test -timeout 10m -run 'FleetSize|LargeFleet' ./...
 
 test-web: web/node_modules/.package-lock.json
 	cd web && npm run typecheck && npm test
@@ -66,7 +90,7 @@ e2e:
 # Rewrites the wire schema and golden file the web UI decodes against, from
 # the Go types. Run it after changing a type that travels on the stream.
 wire:
-	go test ./pkg/controller/api/ -run TestWireFiles -update-wire
+	go test ./pkg/controller/stream/ -run TestWireFiles -update-wire
 
 clean:
-	rm -rf bin web/dist
+	rm -rf bin dist web/dist

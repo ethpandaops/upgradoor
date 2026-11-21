@@ -11,7 +11,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -87,7 +87,7 @@ func TestRuntime(t *testing.T) {
 
 	// Recreate checks the digest before it touches anything.
 	err = h.Recreate(ctx, "geth", "sha256:ddd", time.Second, true)
-	require.ErrorIs(t, err, agent.ErrDigestMismatch)
+	require.ErrorIs(t, err, hostapi.ErrDigestMismatch)
 	assert.Empty(t, h.Calls())
 	assert.Equal(t, "sha256:aaa", h.Container("geth").Digest)
 

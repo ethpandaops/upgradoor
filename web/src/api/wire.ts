@@ -1,5 +1,5 @@
 // The wire encoding of the event streams, read side; mock/wireStream.ts
-// writes it for the mock. pkg/controller/api/wire.go defines it; the schema of every row is
+// writes it for the mock. pkg/controller/stream/wire.go defines it; the schema of every row is
 // read from wire.schema.json, which a Go test writes from the Go types, so
 // nothing about a row is written down here a second time.
 //

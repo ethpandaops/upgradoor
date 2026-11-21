@@ -17,7 +17,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -38,7 +38,7 @@ type Prober struct {
 	client  *http.Client
 }
 
-var _ agent.Prober = (*Prober)(nil)
+var _ hostapi.Prober = (*Prober)(nil)
 
 // New returns a prober. An empty URL disables that probe: its member of
 // the result stays nil.

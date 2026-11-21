@@ -1,5 +1,5 @@
 // What the login may do, decided the way the controller decides it
-// (pkg/controller/api/authz.go and the requirements in actions.go).
+// (pkg/controller/authz/authz.go and the requirements in userapi/actions.go).
 //
 // This is for what the page offers: a button the login cannot use is
 // disabled and says why. The controller verifies the token and stays the

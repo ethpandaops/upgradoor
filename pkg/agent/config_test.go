@@ -1,4 +1,4 @@
-package agent_test
+package agent
 
 import (
 	"os"
@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -45,7 +44,7 @@ func TestConfigControllerKeys(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			cfg := agent.Config{Controller: agent.ControllerConfig{
+			cfg := Config{Controller: ControllerConfig{
 				URL: "https://upgradoor.example", PublicKeys: tt.keys,
 				AllowUnsignedAnswers: tt.unsigned,
 			}}
@@ -72,13 +71,13 @@ func TestConfigOwners(t *testing.T) {
 			"containers:\n  - name: geth\n    kind: el\n    image: ethpandaops/geth:master\n" + owners
 	}
 
-	load := func(t *testing.T, content string) (*agent.Config, error) {
+	load := func(t *testing.T, content string) (*Config, error) {
 		t.Helper()
 
 		path := filepath.Join(t.TempDir(), "agent.yaml")
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 
-		return agent.LoadConfig(path)
+		return LoadConfig(path)
 	}
 
 	cfg, err := load(t, config(""))
@@ -121,13 +120,13 @@ func TestConfigClient(t *testing.T) {
 			client
 	}
 
-	load := func(t *testing.T, content string) (*agent.Config, error) {
+	load := func(t *testing.T, content string) (*Config, error) {
 		t.Helper()
 
 		path := filepath.Join(t.TempDir(), "agent.yaml")
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 
-		return agent.LoadConfig(path)
+		return LoadConfig(path)
 	}
 
 	cfg, err := load(t, config("cl", ""))
@@ -148,7 +147,7 @@ func TestConfigClient(t *testing.T) {
 }
 
 func TestConfigImpact(t *testing.T) {
-	load := func(t *testing.T, kind, extra string) (*agent.Config, error) {
+	load := func(t *testing.T, kind, extra string) (*Config, error) {
 		t.Helper()
 
 		content := "controller:\n  url: https://upgradoor.example\n  allowUnsignedAnswers: true\n" +
@@ -156,7 +155,7 @@ func TestConfigImpact(t *testing.T) {
 		path := filepath.Join(t.TempDir(), "agent.yaml")
 		require.NoError(t, os.WriteFile(path, []byte(content), 0o600))
 
-		return agent.LoadConfig(path)
+		return LoadConfig(path)
 	}
 
 	for kind, want := range map[string]protocol.Impact{
