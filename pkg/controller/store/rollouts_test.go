@@ -20,13 +20,14 @@ import (
 // given member hosts (pass them sorted: that is the order they are read in).
 func testRollout(id string, state fleet.RolloutState, sec int, hosts ...string) *fleet.Rollout {
 	r := &fleet.Rollout{
-		ID:        id,
-		Kind:      fleet.RolloutImage,
-		Key:       "image:ethpandaops/geth:master@sha256:" + id,
-		Title:     "geth master -> " + id,
-		Image:     "ethpandaops/geth:master",
-		Digest:    "sha256:" + id,
-		Revision:  "abcdef0",
+		ID:    id,
+		Kind:  fleet.RolloutGroup,
+		Key:   "group:execution#geth@" + id,
+		Title: "geth master -> " + id,
+		Group: "execution",
+		Targets: []fleet.RolloutTarget{
+			{Image: "ethpandaops/geth:master", Digest: "sha256:" + id, Revision: "abcdef0"},
+		},
 		State:     state,
 		Approved:  true,
 		Canary:    "node-1",
@@ -122,10 +123,14 @@ func directiveIDs(directives []*fleet.Directive) []string {
 }
 
 func TestRollouts(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			_, err := s.GetRollout(ctx, "nope")
@@ -139,7 +144,7 @@ func TestRollouts(t *testing.T) {
 			packages := testRollout("r-packages", fleet.RolloutHalted, 30, "node-1", "node-2")
 			packages.Kind = fleet.RolloutPackages
 			packages.Key = "packages:abc"
-			packages.Image, packages.Digest, packages.Revision = "", "", ""
+			packages.Group, packages.Targets = "", nil
 			packages.Packages = []protocol.PackageChange{{Name: "docker-ce", From: "1", To: "2"}}
 			packages.Reason = "node-2 failed: \"exit 1\""
 			packages.Paused, packages.Force, packages.IgnoreBudget = true, true, true
@@ -268,6 +273,8 @@ func walkTimes(v reflect.Value, fill bool, fn func(time.Time) time.Time) {
 // like the ones kept in the INTEGER millisecond columns - UTC, whole
 // milliseconds - so a reloaded object has one precision throughout.
 func TestCommitTimePrecision(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	// Nanoseconds and a zone other than UTC, a different instant per field.
@@ -309,6 +316,8 @@ func TestCommitTimePrecision(t *testing.T) {
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			require.NoError(t, s.Commit(ctx, &Changes{
@@ -376,6 +385,8 @@ func TestCommitTimePrecision(t *testing.T) {
 }
 
 func TestRolloutWithManyHosts(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	s := newFileStore(t)
 
@@ -407,10 +418,14 @@ func TestRolloutWithManyHosts(t *testing.T) {
 }
 
 func TestLeases(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			_, err := s.GetLease(ctx, "nope")
@@ -483,10 +498,14 @@ func TestLeases(t *testing.T) {
 }
 
 func TestDirectives(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			empty, err := s.ListDirectives(ctx, DirectiveFilter{})
@@ -563,10 +582,14 @@ func TestDirectives(t *testing.T) {
 }
 
 func TestCommit(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			require.NoError(t, s.Commit(ctx, nil))
@@ -608,6 +631,8 @@ func TestCommit(t *testing.T) {
 // of changes, at every position, and checks that nothing at all was written:
 // neither new rows nor updates of existing ones.
 func TestCommitAtomicity(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	duplicateHosts := testRollout("r-dup", fleet.RolloutActive, 5, "node-1", "node-1")
@@ -670,6 +695,8 @@ func TestCommitAtomicity(t *testing.T) {
 	for _, tt := range tests {
 		for _, backend := range backends {
 			t.Run(tt.name+"/"+backend.name, func(t *testing.T) {
+				t.Parallel()
+
 				s := backend.open(t)
 
 				// Existing state that the failing commit tries to change.

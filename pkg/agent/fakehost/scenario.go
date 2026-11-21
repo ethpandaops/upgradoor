@@ -72,6 +72,14 @@ type Container struct {
 	// Command is the container's command line (the arguments after the
 	// entrypoint), which a flag override changes.
 	Command []string `yaml:"command"`
+	// Group and Kind are the labels Ansible sets: the roll group
+	// (protocol.LabelGroup) and el, cl, vc or other (protocol.LabelKind). A
+	// container without a group is not managed.
+	Group string `yaml:"group"`
+	Kind  string `yaml:"kind"`
+	// Links plays a container created with links (--link), which the agent
+	// never rolls.
+	Links bool `yaml:"links"`
 }
 
 // Tag is the image the registry holds for one tag. Its revision is known to
@@ -108,7 +116,8 @@ func LoadScenario(path string) (*Scenario, error) {
 func (sc *Scenario) validate() error {
 	seen := make(map[string]struct{}, len(sc.Containers))
 
-	for _, c := range sc.Containers {
+	for i := range sc.Containers {
+		c := &sc.Containers[i]
 		if c.Name == "" || c.Image == "" {
 			return errors.New("containers need a name and an image")
 		}

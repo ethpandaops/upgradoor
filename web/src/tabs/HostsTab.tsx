@@ -23,7 +23,7 @@ import {
   type SortColumn,
   type SortDirection,
 } from '../components/primitives';
-import { ImageCell, OfflineBadge } from '../components/status';
+import { ImageCell, OfflineBadge, PullBadge } from '../components/status';
 import { absoluteTime, formatDuration, formatPercent, isZeroTime, plural } from '../lib/format';
 import { holdIntent } from '../lib/intents';
 import { HostDetailPanel } from './HostDetailPanel';
@@ -497,6 +497,7 @@ function PrivateCells({ row, summary: s }: { row: HostRow; summary: HostListing 
           title={needs.length > 0 ? `Open needs: ${needs.map(n => n.kind).join(', ')}` : undefined}
         >
           {state ? <Badge tone={state.tone}>{state.label}</Badge> : <span className="text-faint">up to date</span>}
+          <PullBadge pull={s.plan.pull} />
           <OfflineBadge mark={s.offline} />
           {s.hold.local && (
             <Badge tone="warning" title={`Local hold file${s.hold.localReason ? `: ${s.hold.localReason}` : ''}`}>

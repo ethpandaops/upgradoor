@@ -245,7 +245,17 @@ type Changes struct {
 	Holds      []HostHold
 	Offline    []HostOffline
 	Broken     []HostBroken
-	Audit      []fleet.AuditEntry
+	// Pulls set or end the pull windows of hosts; a host that does not exist
+	// is passed over.
+	Pulls []HostPull
+	Audit []fleet.AuditEntry
+}
+
+// HostPull is the pull window of one host (fleet.Host.Pull) as it is from
+// now on; nil ends it.
+type HostPull struct {
+	Host   string
+	Window *fleet.PullWindow
 }
 
 // HostBroken is the broken marks of one host (fleet.Host.Broken) as they are
@@ -270,11 +280,13 @@ type HostHold struct {
 	// feature, empty for every other writer. It is not kept for a hold that
 	// is lifted.
 	By string
+	// Actor is fleet.Host.HoldActor.
+	Actor string
 }
 
 // Empty reports whether there is nothing to commit.
 func (c *Changes) Empty() bool {
 	return len(c.Rollouts) == 0 && len(c.Leases) == 0 &&
 		len(c.Directives) == 0 && len(c.Holds) == 0 && len(c.Offline) == 0 &&
-		len(c.Broken) == 0 && len(c.Audit) == 0
+		len(c.Broken) == 0 && len(c.Pulls) == 0 && len(c.Audit) == 0
 }

@@ -7,44 +7,39 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// A host is broken for a group (the rollouts of one client's image reference, or the
-// packages rollouts) when its last lease for the group failed. The mark is
-// kept with the host (fleet.Host.Broken): set where a lease fails, cleared
-// where a lease is released with the group's steps done, gone with the host
-// when it is forgotten. A host that is broken for the group of a rollout goes
-// first in it, before the canary, and the other members wait for it.
+// A host is broken for a group (the rollouts of one roll group of one
+// client, GroupName, or the packages rollouts) when its last lease for the
+// group failed. The mark is kept with the host (fleet.Host.Broken): set where
+// a lease fails, cleared where a lease is released with the group's steps
+// done, gone with the host when it is forgotten. A host that is broken for
+// the group of a rollout goes first in it, before the canary, and the other
+// members wait for it.
 
 // reasonEndedByOperator is the failure reason of a lease that a person ended
 // (end-lease).
 const reasonEndedByOperator = "ended by operator"
 
 // needGroup names the group of rollouts that serve needs like this one: the
-// rollouts of its image reference, or of the packages kind. The need of a
-// manual directive and a reboot need belong to no group.
+// rollouts of its roll group, or of the packages kind. The need of a manual
+// directive and a reboot need belong to no group.
 func needGroup(n *protocol.Need) string {
 	switch {
 	case n.DirectiveID != "", isLocal(n):
 		return ""
-	case n.Kind == protocol.NeedImage && n.Image != nil:
-		return ImageGroup(n.Image.Client, n.Image.Image)
-	case n.Kind == protocol.NeedSpec && n.Spec != nil:
-		return specGroup(n.Spec.Client, n.Spec.Container)
 	case n.Kind == protocol.NeedPackages && n.Packages != nil:
 		return groupPackages
 	default:
-		return ""
+		return needGroupName(n)
 	}
 }
 
 // rolloutGroup names the rollouts that are about the same thing: those of one
-// image reference, whatever the digest, and those of the packages kind.
-// Reboot and manual rollouts belong to no group.
+// roll group, whatever the target, and those of the packages kind. Reboot and
+// manual rollouts belong to no group.
 func rolloutGroup(r *fleet.Rollout) string {
 	switch r.Kind {
-	case fleet.RolloutImage:
-		return ImageGroup(r.Client, r.Image)
-	case fleet.RolloutSpec:
-		return specGroup(r.Client, r.Container)
+	case fleet.RolloutGroup:
+		return rolloutGroupName(r)
 	case fleet.RolloutPackages:
 		return groupPackages
 	default:

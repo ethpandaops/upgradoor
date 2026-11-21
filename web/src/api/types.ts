@@ -99,8 +99,16 @@ export interface Container {
   command?: string[];
   /** override is the entry of the host's overrides file for the container, or what is left to undo of one. */
   override?: ContainerOverride;
-  /** overridable says what the agent configuration lets the controller override; absent when nothing. */
+  /** overridable says what the container's group lets anybody override; absent when nothing (tooling). */
   overridable?: Overridable;
+  /**
+   * group is the roll group of a managed container: its
+   * io.ethpandaops.upgradoor.group label, its entry in the name map of the
+   * host's agent.yaml, or "default".
+   */
+  group?: string;
+  /** notRolled says why the agent rolls this container to nothing (its updates are still reported). */
+  notRolled?: string;
 }
 
 /** protocol.ContainerOverride: the override of one managed container, as the host's overrides file states it. */
@@ -122,10 +130,9 @@ export interface ContainerOverride {
   error?: string;
 }
 
-/** protocol.Overridable */
+/** protocol.Overridable: what the container's group allows to override; absent for tooling. */
 interface Overridable {
-  /** The allowed image repository patterns; absent when image overrides are off. */
-  images?: string[];
+  image?: boolean;
   flags?: boolean;
 }
 
@@ -181,7 +188,9 @@ export type NeedKind = 'image' | 'override' | 'spec' | 'packages' | 'reboot';
 /** protocol.ImageNeed */
 interface ImageNeed {
   container: string;
-  /** The client the container runs; the image rollouts of each client are their own. */
+  /** The roll group of the container: the needs of one group and client are one rollout. */
+  group?: string;
+  /** The client the container runs; the group rollouts of each client are their own. */
   client?: string;
   image: string;
   fromDigest?: string;
@@ -211,7 +220,9 @@ interface OverrideNeed {
  */
 interface SpecNeed {
   container: string;
-  /** The client the container runs; the spec rollouts of each client are their own. */
+  /** The roll group of the container: the needs of one group and client are one rollout. */
+  group?: string;
+  /** The client the container runs; the group rollouts of each client are their own. */
   client?: string;
   key: string;
   image: string;
@@ -240,6 +251,12 @@ interface RebootNeed {
   reasons: List<string>;
 }
 
+/** protocol.PullImage: a tag reference at the digest a need waits for. */
+export interface PullImage {
+  ref: string;
+  digest: string;
+}
+
 /** protocol.Need */
 export interface Need {
   id: string;
@@ -247,6 +264,8 @@ export interface Need {
   directiveId?: string;
   /** local: the need was asked for on the host itself (every override need, a roll from the local command line). */
   local?: boolean;
+  /** The images the need waits for that are not local yet: the host pulls them in a pull window; until then the need is not granted. */
+  unpulled?: List<PullImage>;
   image?: ImageNeed;
   override?: OverrideNeed;
   spec?: SpecNeed;
@@ -362,13 +381,14 @@ export interface NetworkHealth {
   live: number;
 }
 
-/** fleet.RolloutKind */
 /**
- * fleet.RolloutKind. `local` is a rollout of one host for what was asked for
+ * fleet.RolloutKind. `group` moves the containers of one roll group of one
+ * client (a beacon node and its validator client, an execution client) onto
+ * what the hosts' image and spec needs of it ask for. `local` is a rollout of one host for what was asked for
  * on the host itself (an override, a roll from its command line): it has one
  * member, answers to no policy and has no canary.
  */
-export type RolloutKind = 'image' | 'spec' | 'packages' | 'reboot' | 'manual' | 'local';
+export type RolloutKind = 'group' | 'packages' | 'reboot' | 'manual' | 'local';
 
 /** fleet.RolloutState */
 export type RolloutState = 'active' | 'halted' | 'completed' | 'superseded' | 'aborted';
@@ -404,16 +424,31 @@ export interface RolloutHost {
   updatedAt: string;
 }
 
+/** fleet.RolloutTarget: one part of what a group rollout moves its group to. */
+export interface RolloutTarget {
+  /** The tag reference, and the digest and revision it moves to. */
+  image: string;
+  digest: string;
+  revision?: string;
+  /** The key of a soft deploy (SpecNeed.key); absent for a tag that moved. */
+  spec?: string;
+  /** The container a soft deploy was first reported for. */
+  container?: string;
+  /** The soft deploy changes the command line. */
+  flags?: boolean;
+}
+
 /** fleet.Rollout */
 export interface Rollout {
   id: string;
   kind: RolloutKind;
+  /** group:<group>#<client>@<hash of the targets> (group:default/<image>@<hash> for the default group), packages:<key>, reboot, manual:<id>, local:<host>:<hash>. */
   key: string;
   title: string;
-  image?: string;
-  digest?: string;
-  revision?: string;
-  /** The client whose image policy an image rollout answers to; absent when it answers to policyImage. */
+  /** The roll group a group rollout moves, and what it moves the group's containers to, sorted. */
+  group?: string;
+  targets?: List<RolloutTarget>;
+  /** The client whose image policy a group rollout answers to; absent when it answers to policyImage. */
   client?: string;
   packages?: PackageChange[];
   state: RolloutState;
@@ -524,6 +559,8 @@ export interface Settings {
   policyImage: Policy;
   policyPackages: Policy;
   policyReboot: Policy;
+  /** The policy of the default group's rollouts: one per image, of the containers no label or name map puts in a group. */
+  policyDefaultGroup: Policy;
   /**
    * The image policy per client ("geth": "manual"); always an object. The
    * image rollouts of a client that is listed answer to its entry, the
@@ -536,6 +573,10 @@ export interface Settings {
   pauseAfterCanaryReboot: boolean;
   /** Share (0–1) of the fleet's median peer count a client must have before a slot is released; 0, the default, is off. */
   readyPeerShare: number;
+  /** How often one host of those on a tag looks it up, for the whole devnet (Go duration). */
+  lookupInterval: string;
+  /** Share (0–100) of the hosts that may pull images at once, at least one. */
+  maxPullingPercent: number;
   paused: boolean;
 }
 
@@ -690,8 +731,8 @@ export interface Budget {
 }
 
 /**
- * scheduler.WaitKind: the class of a waiting reason. budget, host-limit and
- * order clear by themselves; working clears when the operation the host
+ * scheduler.WaitKind: the class of a waiting reason. budget, host-limit,
+ * order and pull (the host's images are not local yet) clear by themselves; working clears when the operation the host
  * works on without a lease is over; gate clears when the network recovers;
  * the rest needs somebody to act.
  */
@@ -701,6 +742,7 @@ export type WaitKind =
   | 'order'
   | 'gate'
   | 'verb'
+  | 'pull'
   | 'halted'
   | 'approval'
   | 'rollout-paused'
@@ -732,6 +774,13 @@ export interface QueueEntry {
 /** scheduler.SlotState */
 type SlotState = 'idle' | 'queued' | 'leased' | 'verifying' | 'failed' | 'held' | 'stale';
 
+/**
+ * The pull state of a host that waits in a rollout (scheduler.Pull*):
+ * waiting for a pull window, pulling inside its window, or its images pulled
+ * and waiting for a slot.
+ */
+export type PullState = 'waiting' | 'pulling' | 'pulled';
+
 /** scheduler.HostPlan */
 export interface HostPlan {
   slot: SlotState;
@@ -740,6 +789,7 @@ export interface HostPlan {
   liveKnown: boolean;
   leaseId?: string;
   reason?: string;
+  pull?: PullState;
 }
 
 /** scheduler.Plan */
@@ -900,7 +950,7 @@ interface SlotRows {
 /** api.ContainerListing: a container as the host list shows it. */
 export type ContainerListing = Pick<
   Container,
-  'name' | 'image' | 'digest' | 'revision' | 'state' | 'managed' | 'kind' | 'impact' | 'owners'
+  'name' | 'image' | 'digest' | 'revision' | 'state' | 'managed' | 'kind' | 'impact' | 'owners' | 'group'
 >;
 
 /**

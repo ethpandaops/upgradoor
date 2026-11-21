@@ -178,26 +178,14 @@ controller:
   syncInterval: 5s
 keyFile: .tmp/dev/$h/host.key
 certFile: .tmp/dev/$h/host.crt
-holdFile: .tmp/dev/$h/hold
 stateDir: .tmp/dev/$h/state
 overridesFile: .tmp/dev/$h/overrides.yaml
 socket: {path: .tmp/dev/$h/agent.sock}
 verbs: [roll, packages, reboot]
-containers:
-  - name: geth
-    kind: el
-    client: geth
-    image: "ethpandaops/geth:master"
-    stopTimeout: 5s
-    owners: [geth]
-    overrides: {images: ["ethpandaops/geth", "ethpandaops/geth-*"], flags: true}
-  - name: lighthouse
-    kind: cl
-    client: lighthouse
-    image: "sigp/lighthouse:latest"
-    stopTimeout: 5s
-    owners: [lighthouse]
-    overrides: {images: ["sigp/*"]}
+groups:
+  execution: {client: geth, owners: [geth], overrides: [image, flags], stopTimeout: 5s}
+  consensus: {client: lighthouse, owners: [lighthouse], overrides: [image], stopTimeout: 5s}
+  proxy: {stopTimeout: 5s}
 registry:
   pollInterval: 10s
 packages:
@@ -212,8 +200,13 @@ os: {id: debian, versionId: "13", prettyName: Debian GNU/Linux 13, arch: amd64}
 runningKernel: 6.12.41-amd64
 newestKernel: 6.12.41-amd64
 containers:
-  - {name: geth, image: "ethpandaops/geth:master", digest: "sha256:aaa", command: ["--http", "--maxpeers=50"]}
-  - {name: lighthouse, image: "sigp/lighthouse:latest", digest: "sha256:bbb", command: ["bn", "--http"]}
+  - {name: geth, image: "ethpandaops/geth:master", digest: "sha256:aaa", command: ["--http", "--maxpeers=50"],
+     group: execution, kind: el}
+  - {name: beacon, image: "sigp/lighthouse:latest", digest: "sha256:bbb", command: ["bn", "--http"],
+     group: consensus, kind: cl}
+  - {name: validator, image: "sigp/lighthouse:latest", digest: "sha256:bbb", command: ["vc"],
+     group: consensus, kind: vc}
+  - {name: nginx, image: "nginx:stable", digest: "sha256:ccc", group: proxy, kind: other}
 registry:
   "ethpandaops/geth:fix": {digest: "sha256:fff", revision: f1f1f1}
 packages:
@@ -282,9 +275,15 @@ done
 curl -s -X POST -d '{"required":true}' http://127.0.0.1:7771/reboot-required > /dev/null
 ```
 
-What to expect in the Rollouts tab within about a minute:
+What to expect within the lookup interval (5 minutes by default; start the
+controller with `--default-setting lookupInterval=1m` to see it sooner):
 
-- An image rollout opens. One host goes first as the canary (none of the
+- One host looks the tag up (the agent logs `tag points at a new digest`);
+  the controller tells the other two in their sync answers.
+- The hosts pull the new image one at a time, each in a pull window (the
+  host status says waiting for a pull window, pulling, pulled).
+- A group rollout of `consensus` opens: one lease per host recreates the
+  beacon node and the validator client together. One host goes first as the canary (none of the
   fake hosts has validators, so it is the first host that reports the new
   digest, or the first of those by name); when
   it is ready the other two follow one after the other (the host limit is 1
@@ -294,8 +293,8 @@ What to expect in the Rollouts tab within about a minute:
 
 Overrides and the host commands work on the fake hosts too. The **Clients**
 tab lists the hosts per client; "Image…" on a geth row sets an image override
-(`ethpandaops/geth:fix` is in the fake registry and in the host's allowed
-repositories), which the agent writes into the host's `overrides.yaml` and
+(`ethpandaops/geth:fix` is in the fake registry; the group `execution` allows
+image overrides), which the agent writes into the host's `overrides.yaml` and
 applies under a lease. On the "node", the same through the agent's socket:
 
 ```sh
@@ -303,7 +302,7 @@ alias h1='bin/upgradoor host --socket .tmp/dev/node-1/agent.sock'
 h1 init-overrides      # the generated block of .tmp/dev/node-1/overrides.yaml
 h1 list                # containers, images, flags, overrides
 h1 override set geth --add-flag --pprof --remove-flag --maxpeers --until 10m --reason "profiling"
-h1 roll lighthouse     # waits and prints: queued, recreated, verified, done
+h1 roll beacon         # waits and prints: queued, recreated, verified, done
 h1 override clear geth
 ```
 

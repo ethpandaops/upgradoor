@@ -251,7 +251,7 @@ func TestWireHostRowLeavesOutWhatTheClientPageServes(t *testing.T) {
 		c.Client = "geth"
 		c.Command = []string{"--http", "--syncmode=snap"}
 		c.Override = &protocol.ContainerOverride{Image: "me/geth:fix", By: "sam", Until: &until}
-		c.Overridable = &protocol.Overridable{Images: []string{"me/*"}, Flags: true}
+		c.Overridable = &protocol.Overridable{Image: true, Flags: true}
 	}))
 }
 

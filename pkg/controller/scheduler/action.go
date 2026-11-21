@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"slices"
+	"strconv"
 	"strings"
 	"time"
 
@@ -353,7 +354,7 @@ func (s *service) setHostHold(
 	}
 
 	return s.write(ctx, &store.Changes{
-		Holds: []store.HostHold{{Host: h.Name, Wanted: wanted, Reason: reason, By: by}},
+		Holds: []store.HostHold{{Host: h.Name, Wanted: wanted, Reason: reason, By: by, Actor: actor}},
 		Audit: []fleet.AuditEntry{s.entry(actor, action, h.Name, map[string]any{
 			keyBefore: holdDetail(h.HoldWanted, h.HoldReason, h.HoldBy, false),
 			keyAfter:  holdDetail(wanted, reason, by, h.HoldBy != "" && wanted),
@@ -792,19 +793,24 @@ func overrideRefusal(
 		return "host " + h.Name + " manages no container " + container
 	}
 
-	if !sets {
-		return ""
-	}
-
-	allowed := h.Status.Containers[i].Overridable
+	c := &h.Status.Containers[i]
+	allowed := c.Overridable
 
 	switch {
-	case inst.Part == protocol.OverrideImage && (allowed == nil || len(allowed.Images) == 0):
-		return "host " + h.Name + " does not allow image overrides of " + container +
-			" (overrides.images in its agent.yaml)"
-	case inst.Part == protocol.OverrideFlags && (allowed == nil || !allowed.Flags):
-		return "host " + h.Name + " does not allow flag overrides of " + container +
-			" (overrides.flags in its agent.yaml)"
+	case !sets:
+		// Taking an override away is always allowed: it brings the
+		// container back to what Ansible deployed.
+		return ""
+	case allowed == nil:
+		// Tooling: its group allows nothing.
+		return "container " + container + " on host " + h.Name + " cannot be overridden: its group " +
+			strconv.Quote(c.Group) + " allows no overrides"
+	case inst.Part == protocol.OverrideImage && !allowed.Image:
+		return "the group " + strconv.Quote(c.Group) + " of " + container + " on host " + h.Name +
+			" does not allow image overrides"
+	case inst.Part == protocol.OverrideFlags && !allowed.Flags:
+		return "the group " + strconv.Quote(c.Group) + " of " + container + " on host " + h.Name +
+			" does not allow flag overrides"
 	default:
 		return ""
 	}
@@ -866,15 +872,18 @@ func (s *service) SetClientPolicy(
 }
 
 // rolloutPolicy is the policy that governs a rollout: that of its kind, and
-// for an image rollout that of its client where one is set. Manual rollouts
-// are requested by a person and answer to no policy.
+// for an image rollout that of its client where one is set, or that of the
+// default group for one of its rollouts. Manual rollouts are requested by a
+// person and answer to no policy.
 func rolloutPolicy(settings *fleet.Settings, r *fleet.Rollout) fleet.Policy {
-	switch r.Kind {
-	case fleet.RolloutImage, fleet.RolloutSpec:
+	switch {
+	case r.Kind == fleet.RolloutGroup && r.Group == protocol.DefaultGroup:
+		return settings.PolicyDefaultGroup
+	case r.Kind == fleet.RolloutGroup:
 		return settings.ImagePolicy(r.Client)
-	case fleet.RolloutPackages:
+	case r.Kind == fleet.RolloutPackages:
 		return settings.PolicyPackages
-	case fleet.RolloutReboot:
+	case r.Kind == fleet.RolloutReboot:
 		return settings.PolicyReboot
 	default:
 		return fleet.PolicyAuto

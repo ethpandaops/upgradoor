@@ -18,7 +18,7 @@ import (
 // steps were done; an expired lease changes nothing.
 func TestLeaseEndSetsAndClearsTheBrokenMarks(t *testing.T) {
 	const (
-		image    = prefixImageKey + imgLighthouse
+		image    = prefixGroup + "g-" + imgLighthouse
 		packages = groupPackages
 		old      = "old"
 	)
@@ -186,7 +186,7 @@ func TestBrokenHostGoesFirst(t *testing.T) {
 	assert.Equal(t, fleet.StageRepair, r.Host("c").Stage, "the stage says how it was served")
 	assert.Empty(t, r.Canary, "the repair was the first success")
 	assert.Equal(t, []string{"a", "b"}, b.leasedHosts())
-	assert.Equal(t, map[string]string{prefixImageKey + imgLighthouse: "broke-b"}, b.get("b").Broken)
+	assert.Equal(t, map[string]string{prefixGroup + "g-" + imgLighthouse: "broke-b"}, b.get("b").Broken)
 }
 
 // The host that failed in the superseded rollout has no validators. It is
@@ -258,7 +258,7 @@ func TestBrokenHostWithoutValidatorsGoesFirst(t *testing.T) {
 // mark is the host's, whatever the member's state.
 func TestBrokenHostStaysFirstThroughStateChanges(t *testing.T) {
 	b := failedOnDigestA(t, "h3", map[string]uint64{"h1": 10, "h2": 10, "h3": 10})
-	require.Equal(t, map[string]string{prefixImageKey + imgLighthouse: b.lastLease("h3").ID}, b.get("h3").Broken)
+	require.Equal(t, map[string]string{prefixGroup + "g-" + imgLighthouse: b.lastLease("h3").ID}, b.get("h3").Broken)
 	b.advance(time.Minute)
 	seesDigestB(b, "h1", "h2", "h3")
 

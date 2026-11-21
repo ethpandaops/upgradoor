@@ -103,7 +103,7 @@ const (
 	// DirectiveHold puts the host on controller hold.
 	DirectiveHold DirectiveKind = "hold"
 	// DirectiveReleaseHold lifts a controller hold. It never lifts a local
-	// hold file.
+	// hold.
 	DirectiveReleaseHold DirectiveKind = "release-hold"
 	// DirectiveRoll creates an image need for Container at the digest its
 	// tag currently points at, even if the container already runs it.

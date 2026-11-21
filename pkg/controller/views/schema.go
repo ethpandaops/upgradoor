@@ -196,6 +196,9 @@ type ContainerListing struct {
 	Kind     protocol.ContainerKind `json:"kind,omitempty"`
 	Impact   protocol.Impact        `json:"impact,omitempty"`
 	Owners   []string               `json:"owners,omitempty"`
+	// Group is the roll group of a managed container (DefaultGroup for one
+	// that neither a label nor the name map puts in a group).
+	Group string `json:"group,omitempty"`
 }
 
 // NeedListing is an open need as the host list shows it.

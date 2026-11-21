@@ -15,6 +15,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/metrics"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
@@ -72,8 +73,10 @@ type Handler struct {
 	publicURLs []string
 	metrics    metrics.Metrics
 
-	syncSlots            chan struct{}
-	pacer                *pacer
+	syncSlots chan struct{}
+	pacer     *pacer
+	// lookups hands out the registry lookups and relays what they found.
+	lookups              discovery.Tracker
 	inventorySlots       chan struct{}
 	syncReadTimeout      time.Duration
 	inventoryReadTimeout time.Duration
@@ -103,6 +106,7 @@ func New(log logrus.FieldLogger, opts Options) *Handler {
 		metrics:        opts.Metrics,
 		syncSlots:      make(chan struct{}, maxConcurrentSyncs),
 		pacer:          newPacer(),
+		lookups:        discovery.NewTracker(),
 		inventorySlots: make(chan struct{}, maxConcurrentInventories),
 
 		syncReadTimeout:      syncReadTimeout,

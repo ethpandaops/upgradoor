@@ -22,11 +22,13 @@ CREATE TABLE hosts (
     -- otherwise. A hold set through a team feature is the only one a team
     -- feature lifts.
     hold_by          TEXT NOT NULL DEFAULT '',
+    -- The person who set the controller hold ('' when lifted).
+    hold_actor       TEXT NOT NULL DEFAULT '',
     -- A person's mark that the host is known offline, as a JSON
     -- fleet.OfflineMark; '' while unmarked.
     offline          TEXT NOT NULL DEFAULT '',
     -- What the host's last lease failed on, as a JSON object: the group of
-    -- rollouts (an image reference as 'image:<reference>', or 'packages') to
+    -- rollouts (a roll group as 'group:<group>#<client>', or 'packages') to
     -- the ID of the lease that failed. The scheduler writes it; a host that
     -- is broken for the group of a rollout goes first in it.
     broken           TEXT NOT NULL DEFAULT '{}',
@@ -37,7 +39,10 @@ CREATE TABLE hosts (
     -- The longest sync interval the controller asked of the host in its
     -- last answer, in milliseconds; the host counts as stale only after
     -- missing a couple of those (fleet.Host.StaleAfter).
-    sync_interval    INTEGER NOT NULL DEFAULT 0
+    sync_interval    INTEGER NOT NULL DEFAULT 0,
+    -- The host's pull window as a JSON fleet.PullWindow; '' while it has none.
+    -- The scheduler writes it.
+    pull             TEXT NOT NULL DEFAULT ''
 );
 
 -- OS and kernel part of the last inventory; packages and upgradable are

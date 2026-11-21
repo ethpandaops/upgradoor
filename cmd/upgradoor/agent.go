@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/config"
 	"github.com/ethpandaops/upgradoor/pkg/agent/docker"
 	"github.com/ethpandaops/upgradoor/pkg/agent/fakehost"
 	"github.com/ethpandaops/upgradoor/pkg/agent/probe"
@@ -37,14 +38,14 @@ func newAgentCmd(log *logrus.Logger) *cobra.Command {
 		},
 	}
 
-	cmd.Flags().StringVar(&configFile, "config", agent.DefaultConfigFile, "agent configuration file")
+	cmd.Flags().StringVar(&configFile, "config", config.DefaultFile, "agent configuration file")
 	cmd.Flags().StringVar(&fakeFile, "fake", "", "fake host scenario file (development only)")
 
 	return cmd
 }
 
 func runAgent(ctx context.Context, log *logrus.Logger, configFile, fakeFile string) error {
-	cfg, err := agent.LoadConfig(configFile)
+	cfg, err := config.Load(configFile)
 	if err != nil {
 		return err
 	}
@@ -87,7 +88,7 @@ func runAgent(ctx context.Context, log *logrus.Logger, configFile, fakeFile stri
 	return svc.Stop()
 }
 
-func loadCredentials(cfg *agent.Config) (*identity.Credentials, error) {
+func loadCredentials(cfg *config.Config) (*identity.Credentials, error) {
 	rawKey, err := os.ReadFile(cfg.KeyFile)
 	if err != nil {
 		return nil, fmt.Errorf("read host key: %w", err)
@@ -112,7 +113,7 @@ func loadCredentials(cfg *agent.Config) (*identity.Credentials, error) {
 }
 
 // realDeps wires Docker, the registry resolver and the OS layer.
-func realDeps(log *logrus.Logger, cfg *agent.Config, deps *agent.Deps) (func(), error) {
+func realDeps(log *logrus.Logger, cfg *config.Config, deps *agent.Deps) (func(), error) {
 	// One set of logins for the registry lookups and the pulls.
 	logins, err := registry.LoadLogins(log, cfg.Registry.AuthFile)
 	if err != nil {

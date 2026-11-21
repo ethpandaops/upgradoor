@@ -11,8 +11,11 @@ type RolloutKind string
 
 // Rollout kinds.
 const (
-	// RolloutImage: one image reference moving to one digest.
-	RolloutImage RolloutKind = "image"
+	// RolloutGroup: the containers of one roll group of one client moving to
+	// one target: the new digests of their tags and what a soft deploy
+	// changed (the deployed block of the overrides file). One lease per host
+	// serves the whole group.
+	RolloutGroup RolloutKind = "group"
 	// RolloutPackages: one set of blocked package target versions.
 	RolloutPackages RolloutKind = "packages"
 	// RolloutReboot: hosts that report a reboot need.
@@ -24,11 +27,23 @@ const (
 	// something else than a container runs, or a roll was requested on the
 	// host. It has one member, the host.
 	RolloutLocal RolloutKind = "local"
-	// RolloutSpec: one container moving to what agent.yaml now says (image,
-	// command line) on every host that reports the same spec: the soft
-	// deploy of a change Ansible made.
-	RolloutSpec RolloutKind = "spec"
 )
+
+// RolloutTarget is one part of the target of a group rollout: a tag that
+// moved to a digest, or a container that a soft deploy moves to another
+// image or command line.
+type RolloutTarget struct {
+	// Image is the tag reference; Digest and Revision what it moves to.
+	Image    string `json:"image"`
+	Digest   string `json:"digest"`
+	Revision string `json:"revision,omitempty"`
+	// Spec is the key of a soft deploy (protocol.SpecNeed.Key); empty for a
+	// tag that moved. Container names the container it was first reported
+	// for, Flags that its command line changes.
+	Spec      string `json:"spec,omitempty"`
+	Container string `json:"container,omitempty"`
+	Flags     bool   `json:"flags,omitempty"`
+}
 
 // RolloutState is the lifecycle state of a rollout.
 type RolloutState string
@@ -67,7 +82,7 @@ type Rollout struct {
 	Kind RolloutKind `json:"kind"`
 	// Key identifies the cause. At most one non-terminal rollout exists per
 	// key:
-	//   image:<image ref>@<to digest>
+	//   group:<group>#<client>@<digest of the targets>
 	//   packages:<protocol.PackagesKey>
 	//   reboot
 	//   manual:<rollout id>
@@ -76,16 +91,13 @@ type Rollout struct {
 	// Title is a one-line description for people.
 	Title string `json:"title"`
 
-	// Container is the container a spec rollout moves.
-	Container string `json:"container,omitempty"`
-	// Image, Digest and Revision are set for image rollouts, and for spec
-	// rollouts the image the container is recreated from.
-	Image    string `json:"image,omitempty"`
-	Digest   string `json:"digest,omitempty"`
-	Revision string `json:"revision,omitempty"`
-	// Client is the client whose image policy an image rollout answers to:
-	// the client of the container that first reported the need. Empty when
-	// that container has none; the rollout then answers to policyImage.
+	// Group is the roll group a group rollout moves; Targets what it moves
+	// the group's containers to, sorted.
+	Group   string          `json:"group,omitempty"`
+	Targets []RolloutTarget `json:"targets,omitempty"`
+	// Client is the client whose image policy a group rollout answers to:
+	// the client of the group. Empty when the group has none; the rollout
+	// then answers to policyImage.
 	Client string `json:"client,omitempty"`
 	// Packages is set for packages rollouts.
 	Packages []protocol.PackageChange `json:"packages,omitempty"`

@@ -1240,7 +1240,10 @@ function ContainerLine({ container: c }: { container: Container }) {
 
   return (
     <span className="flex h-5 items-center gap-2">
-      <span className={cx(KIND_WIDTH, 'font-semibold text-muted uppercase')} title={`container ${c.name}`}>
+      <span
+        className={cx(KIND_WIDTH, 'font-semibold text-muted uppercase')}
+        title={`container ${c.name}${c.group ? `, group ${c.group}` : ''}`}
+      >
         {c.kind ?? '–'}
       </span>
       <span className={cx(IMAGE_WIDTH, 'flex items-center gap-1.5')}>
@@ -1273,6 +1276,11 @@ function ContainerLine({ container: c }: { container: Container }) {
         <CopyValue value={c.revision} short={shortRevision(c.revision)} label="revision" />
       ) : (
         <span className="text-faint">–</span>
+      )}
+      {c.group && (
+        <span className="truncate text-muted" title="The roll group: its containers are rolled together, by one lease">
+          group {c.group}
+        </span>
       )}
     </span>
   );

@@ -47,7 +47,7 @@ describe('the client table of the mock', () => {
     expect(await state('lodestar', 'lodestar-reth-3')).toMatchObject({ state: 'held' });
     expect(await state('prysm', 'prysm-geth-1')).toMatchObject({ state: 'overridden' });
     expect(await state('reth', 'lodestar-reth-2')).toMatchObject({ state: 'overridden' });
-    // agent.yaml names another image than the one it runs: a spec need, so behind.
+    // The deployed block names another image than the one it runs: a spec need, so behind.
     expect(await state('erigon', 'grandine-erigon-2')).toMatchObject({ state: 'pending' });
     expect(await state('lighthouse', 'lighthouse-geth-2')).toMatchObject({ state: 'rolling', reason: 'verifying' });
     expect(await state('lighthouse', 'lighthouse-geth-3')).toMatchObject({ state: 'pending' });

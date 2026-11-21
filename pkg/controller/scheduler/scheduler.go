@@ -113,6 +113,11 @@ type Assignment struct {
 	// Ended is the host's newest lease when it is over and the host holds
 	// none: how it ended, for the host's own status.
 	Ended *protocol.EndedLease
+	// Pull is the host's pull window, if it has one.
+	Pull *protocol.PullWindow
+	// LookupInterval is the setting of the same name: how often one host of
+	// those on a tag looks it up.
+	LookupInterval time.Duration
 }
 
 // RollRequest is the body of POST /api/v1/actions/roll.
@@ -370,6 +375,7 @@ type WaitKind string
 // need somebody to act.
 const (
 	WaitBudget        WaitKind = "budget"
+	WaitPull          WaitKind = "pull"
 	WaitHostLimit     WaitKind = "host-limit"
 	WaitOrder         WaitKind = "order"
 	WaitGate          WaitKind = "gate"
@@ -410,4 +416,7 @@ type HostPlan struct {
 	LeaseID string `json:"leaseId,omitempty"`
 	// Reason is the waiting reason when queued.
 	Reason string `json:"reason,omitempty"`
+	// Pull is the host's pull state while it waits in a rollout: waiting
+	// (for a pull window), pulling (it has one) or pulled; empty otherwise.
+	Pull string `json:"pull,omitempty"`
 }

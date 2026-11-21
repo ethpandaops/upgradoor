@@ -81,6 +81,25 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: 'Share of the hosts that may update independent containers (exporters, sidecars) at once, at least one. That work has no gate and no validator budget, and counts for no other limit.',
   },
   {
+    key: 'lookupInterval',
+    label: 'Lookup interval',
+    kind: 'duration',
+    min: 30_000,
+    range: 'a duration like 5m, 30s to 24h',
+    hint: 'How often a tag is looked up at its registry, for the whole devnet: each time one host that runs it, in turn. The controller tells every other host on the tag what it points at.',
+  },
+  {
+    key: 'maxPullingPercent',
+    label: 'Max pulling',
+    kind: 'percent',
+    unit: '%',
+    min: 0.5,
+    max: 100,
+    step: 0.5,
+    range: 'above 0 to 100 %',
+    hint: 'Share of the hosts that may pull images at once, at least one. A host pulls only in a pull window: the images its needs wait for, hosts near their slot first, and for a rollout of a manual policy only once it is approved.',
+  },
+  {
     key: 'minParticipationPercent',
     label: 'Min participation',
     kind: 'percent',
@@ -157,6 +176,12 @@ export const FIELDS: readonly FieldSpec[] = [
   { key: 'policyImage', label: 'Policy: images', kind: 'policy', hint: POLICY_HINT },
   { key: 'policyPackages', label: 'Policy: packages', kind: 'policy', hint: POLICY_HINT },
   { key: 'policyReboot', label: 'Policy: reboots', kind: 'policy', hint: POLICY_HINT },
+  {
+    key: 'policyDefaultGroup',
+    label: 'Policy: default group',
+    kind: 'policy',
+    hint: `What the scheduler does with a new rollout of the default group: a new digest of a container that neither a label nor the name map of agent.yaml puts in a group, on the hosts that roll it. ${POLICIES.map(p => `${p}: ${POLICY_MEANING[p]}`).join('; ')}.`,
+  },
   { key: 'pauseAfterCanaryImage', label: 'Pause after canary: images', kind: 'switch', hint: CANARY_HINT },
   { key: 'pauseAfterCanaryPackages', label: 'Pause after canary: packages', kind: 'switch', hint: CANARY_HINT },
   { key: 'pauseAfterCanaryReboot', label: 'Pause after canary: reboots', kind: 'switch', hint: CANARY_HINT },
@@ -218,7 +243,7 @@ export interface GroupSpec {
 
 /**
  * The groups of the settings page, in display order. Every setting is in
- * exactly one. The first is a strip over the whole width; the three below
+ * exactly one. The first two are strips over the whole width; the three below
  * it have three lines each, so they are of one height side by side.
  */
 export const GROUPS: readonly GroupSpec[] = [
@@ -228,8 +253,15 @@ export const GROUPS: readonly GroupSpec[] = [
     about:
       'The switch for everything, how many hosts may update independent containers at once, and what happens to a new rollout of each kind.',
     wide: true,
-    keys: ['paused', 'maxIndependentPercent'],
+    keys: ['paused', 'maxIndependentPercent', 'policyDefaultGroup'],
     kinds: ROLLOUT_KINDS,
+  },
+  {
+    id: 'images',
+    title: 'Image lookups and pulls',
+    about: 'How often the devnet asks a registry where a tag points, and how many hosts may pull at once.',
+    wide: true,
+    keys: ['lookupInterval', 'maxPullingPercent'],
   },
   {
     id: 'limits',
@@ -361,10 +393,13 @@ export function fromForm(form: SettingsForm): FormSettings {
     policyImage: form.policyImage as Policy,
     policyPackages: form.policyPackages as Policy,
     policyReboot: form.policyReboot as Policy,
+    policyDefaultGroup: form.policyDefaultGroup as Policy,
     pauseAfterCanaryImage: form.pauseAfterCanaryImage === 'true',
     pauseAfterCanaryPackages: form.pauseAfterCanaryPackages === 'true',
     pauseAfterCanaryReboot: form.pauseAfterCanaryReboot === 'true',
     readyPeerShare: Number(form.readyPeerShare),
+    lookupInterval: duration('lookupInterval'),
+    maxPullingPercent: Number(form.maxPullingPercent),
     paused: form.paused === 'true',
   };
 }

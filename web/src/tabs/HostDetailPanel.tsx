@@ -10,7 +10,7 @@ import { OverrideButtons, OverrideSummary } from '../components/Overrides';
 import { IntentAction } from '../components/SelectionBar';
 import { RelTime } from '../components/RelTime';
 import { Badge, Dash, Empty, ErrorBanner, Loading, Section, Table, Td, Th, cx } from '../components/primitives';
-import { ImpactBadge, NeedLine } from '../components/status';
+import { ImpactBadge, NeedLine, PullBadge } from '../components/status';
 import { percentOf, shortRevision } from '../lib/format';
 import { holdIntent, offlineIntent } from '../lib/intents';
 import { hostOwners, rollableContainers } from './hostRows';
@@ -131,6 +131,11 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
                 </span>
               )}
             </Fact>
+            {h.plan.pull && (
+              <Fact label="images">
+                <PullBadge pull={h.plan.pull} />
+              </Fact>
+            )}
             {h.broken && Object.keys(h.broken).length > 0 && (
               <Fact label="broken">
                 <span className="flex flex-wrap gap-1">
@@ -140,7 +145,7 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
                       tone="danger"
                       title={`Lease ${lease} failed on it: the host goes first in the next rollout of it`}
                     >
-                      {group.replace(/^image:/, '')}
+                      {group.replace(/^group:/, '')}
                     </Badge>
                   ))}
                 </span>
@@ -399,6 +404,11 @@ function ClientContainer({
           {c.client}
           {c.kind ? ` · ${c.kind.toUpperCase()}` : ''}
         </span>
+        {c.group && (
+          <span className="text-muted" title="The roll group: its containers are rolled together, by one lease">
+            group <span className="font-medium text-foreground">{c.group}</span>
+          </span>
+        )}
         {c.impact && <ImpactBadge impact={c.impact} />}
         <span role="group" aria-label={`Overrides of ${c.name}`} className="flex shrink-0 items-center gap-1.5">
           <OverrideButtons host={host} containers={[c]} stale={stale} onAction={onAction} />
@@ -432,6 +442,7 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
         <tr>
           <Th>Name</Th>
           <Th>Kind</Th>
+          <Th title="The roll group of a managed container: its containers are rolled together, by one lease">Group</Th>
           <Th title="The teams that own the container: their members may roll it">Owners</Th>
           <Th>Image</Th>
           <Th>State</Th>
@@ -458,11 +469,22 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
                   </span>
                 )}
               </Td>
+              <Td>
+                <span className="inline-flex items-center gap-1.5">
+                  {c.group || <Dash />}
+                  {c.notRolled && (
+                    <Badge title={`The agent rolls this container to nothing: ${c.notRolled}`}>not rolled</Badge>
+                  )}
+                </span>
+              </Td>
               <Td>{list(c.owners).length > 0 ? list(c.owners).join(', ') : <Dash />}</Td>
               <Td>
                 <span className="font-mono">{c.image}</span>
                 {c.managed && c.configuredImage && c.configuredImage !== c.image && !c.override && (
-                  <span className="text-muted" title="agent.yaml names another image: the container is rolled onto it">
+                  <span
+                    className="text-muted"
+                    title="the deployed block of overrides.yaml names another image: the container is rolled onto it"
+                  >
                     {' '}
                     (configured: <span className="font-mono">{c.configuredImage}</span>)
                   </span>

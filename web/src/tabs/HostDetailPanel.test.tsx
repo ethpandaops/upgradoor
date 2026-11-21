@@ -29,9 +29,11 @@ describe('HostDetailPanel, the containers of a client', () => {
       .getAllByRole('listitem')
       .filter(li => li.querySelector('details'));
     expect(rows.map(li => li.textContent.split('command line')[0])).toEqual([
-      expect.stringMatching(/^gethgeth · ELno override/) as string,
-      expect.stringMatching(/^prysmprysm · CLapplied.*by alice@example.org.*add --verbosity=debug/) as string,
-      expect.stringMatching(/^prysm-validatorprysm · VCno override/) as string,
+      expect.stringMatching(/^gethgeth · ELgroup executionno override/) as string,
+      expect.stringMatching(
+        /^prysmprysm · CLgroup consensusapplied.*by alice@example.org.*add --verbosity=debug/
+      ) as string,
+      expect.stringMatching(/^prysm-validatorprysm · VCgroup consensusno override/) as string,
     ]);
 
     // The command line is there and closed until it is asked for.
@@ -48,6 +50,36 @@ describe('HostDetailPanel, the containers of a client', () => {
     const dialog = await screen.findByRole('dialog', { name: 'Image override on prysm-geth-1' });
     expect(within(dialog).queryByRole('combobox')).not.toBeInTheDocument();
     expect(dialog).toHaveTextContent('Containergeth');
+  });
+
+  it('names the roll group of every managed container, tooling of a group of its own too', async () => {
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<Panel name="rpc-1" />, h);
+
+    const table = await screen.findByRole('table', { name: 'Containers' });
+    const group = (name: string) => {
+      const cells = within(table)
+        .getAllByRole('row')
+        .map(row => within(row).queryAllByRole('cell'))
+        .find(row => row[0]?.textContent === name);
+      return cells?.[2]?.textContent;
+    };
+    expect(group('geth')).toBe('execution');
+    expect(group('lighthouse')).toBe('consensus');
+    expect(group('nginx')).toBe('proxy');
+    expect(group('node-exporter')).toBe('–');
+    // The proxy has no client: it is not among the containers that may be overridden.
+    expect(screen.queryByRole('group', { name: 'Overrides of nginx' })).not.toBeInTheDocument();
+  });
+
+  it('says where a host stands with the images its needs wait for', async () => {
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<Panel name="lighthouse-geth-4" />, h);
+
+    // One host pulls at a time: the one ahead of it in the queue has the window.
+    expect(await screen.findByText('waiting for a pull window')).toBeInTheDocument();
+    const needs = (await screen.findByRole('heading', { name: /^Open needs/ })).closest('section') as HTMLElement;
+    expect(within(needs).getAllByText('not pulled')).toHaveLength(2);
   });
 
   it('lists no client section for a host without client containers', async () => {

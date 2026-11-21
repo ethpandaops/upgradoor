@@ -37,6 +37,7 @@ import {
   type PublicImage,
   type PublicImageRef,
   type PublicImages,
+  type PullImage,
   type QueueEntry,
   type RebootRequest,
   type RollRequest,
@@ -52,7 +53,7 @@ import {
 import { WIRE_VERSION, without } from '../api/wire';
 import { applyFlags, validateFlags } from '../lib/flags';
 import { formatPercent } from '../lib/format';
-import { imageAllowed, validateImageRef } from '../lib/imageRef';
+import { validateImageRef } from '../lib/imageRef';
 import { parseGoDuration } from '../lib/goDuration';
 import { TEAM_PREFIX, TWINNED, can, type Login, type PermissionCall } from '../lib/permissions';
 import { FIELDS, toForm, validateField } from '../lib/settingsForm';
@@ -185,10 +186,14 @@ function waitKind(reason: string): WaitKind {
   if (reason.startsWith('rollout halted')) return 'halted';
   if (reason.startsWith('network gate')) return 'gate';
   if (reason.startsWith('verb not allowed')) return 'verb';
+  if (reason === REASON_PULL) return 'pull';
   if (reason.startsWith('after ')) return 'order';
   if (reason.startsWith('budget ')) return 'budget';
   return 'host-limit';
 }
+
+/** The waiting reason of a host whose needs wait for images (reasonPull). */
+const REASON_PULL = 'waiting for its images to be pulled';
 
 /** The stage of fleet.Stage that the mock gives every member it adds. */
 const STAGE_REST = 3;
@@ -813,9 +818,10 @@ export class MockController {
   private policy(r: Rollout): Settings['policyImage'] {
     const s = this.data.settings;
     switch (r.kind) {
-      case 'image':
-      case 'spec':
-        // An image or spec rollout answers to the policy of its client where one is set.
+      case 'group':
+        // A group rollout answers to the image policy of its client where one
+        // is set; one of the default group to the default group's policy.
+        if (r.group === 'default') return s.policyDefaultGroup;
         return imagePolicy(s, r.client);
       case 'packages':
         return s.policyPackages;
@@ -864,10 +870,43 @@ export class MockController {
 
   /** hasVerb: the agent allows the verb of a need it reports for the rollout. */
   private hasVerb(r: Rollout, host: HostDetail): boolean {
-    const kinds = r.kind === 'manual' || r.kind === 'local' ? list(host.needs).map(n => n.kind) : [r.kind];
+    const kinds = this.rolloutNeeds(r, host).map(n => n.kind);
     return kinds.some(kind =>
       list(host.verbs).includes(kind === 'image' || kind === 'override' || kind === 'spec' ? 'roll' : kind)
     );
+  }
+
+  /**
+   * rolloutNeeds are the needs of a host that a rollout serves: for a group
+   * rollout those of its group and client, for another the need its member
+   * names, for a manual or local one every need of the host.
+   */
+  private rolloutNeeds(r: Rollout, host: HostDetail): readonly Need[] {
+    const needs = list(host.needs);
+    switch (r.kind) {
+      case 'group':
+        return needs.filter(n => {
+          const of = n.image ?? n.spec;
+          return !n.directiveId && !n.local && of?.group === r.group && (of?.client ?? '') === (r.client ?? '');
+        });
+      case 'manual':
+      case 'local':
+        return needs;
+      default: {
+        const id = list(r.hosts).find(m => m.host === host.name)?.needId;
+        return needs.filter(n => n.id === id || (r.kind === n.kind && !n.directiveId));
+      }
+    }
+  }
+
+  /** grantable: the rollout may be served (pullWants): active, not paused, approved where its policy is manual. */
+  private grantable(r: Rollout): boolean {
+    return r.state === 'active' && !r.paused && (this.policy(r) !== 'manual' || r.approved);
+  }
+
+  /** unpulled are the images the host's needs in a rollout wait for. */
+  private unpulled(r: Rollout, host: HostDetail): PullImage[] {
+    return this.rolloutNeeds(r, host).flatMap(n => list(n.unpulled));
   }
 
   /**
@@ -899,8 +938,12 @@ export class MockController {
     // Every member rollout is halted.
     if (approved.length === 0) return `rollout halted: ${memberOf[0]?.reason ?? 'a host failed'}`;
 
-    const able = approved.filter(r => this.hasVerb(r, host));
-    if (able.length === 0) return 'verb not allowed by the agent';
+    const allowed = approved.filter(r => this.hasVerb(r, host));
+    if (allowed.length === 0) return 'verb not allowed by the agent';
+
+    // The images come first, in a pull window.
+    const able = allowed.filter(r => this.unpulled(r, host).length === 0);
+    if (able.length === 0) return REASON_PULL;
 
     const ignoresBudget = able.some(r => r.ignoreBudget);
     const throughGate = !gate.ok && !ignoresBudget;
@@ -1008,6 +1051,8 @@ export class MockController {
       hosts[host.name] = plan;
     }
 
+    this.pulls(open, order, hosts);
+
     // The queue is the hosts that wait, with what they wait for.
     for (const name of order) {
       const plan = hosts[name];
@@ -1026,6 +1071,36 @@ export class MockController {
     }
 
     return { computedAt: this.iso(this.now() - 1000), paused: this.data.settings.paused, gate, budget, queue, hosts };
+  }
+
+  /**
+   * pulls notes each host's pull state in the plan, the way the scheduler
+   * grants pull windows: hosts whose needs in a rollout that may be served
+   * wait for images pull, at most maxPullingPercent of the hosts at once, in
+   * serving order; a host that waits in such a rollout with its images on it
+   * has pulled.
+   */
+  private pulls(open: Rollout[], order: readonly string[], hosts: Record<string, HostPlan>): void {
+    const limit = Math.max(1, Math.floor((this.data.settings.maxPullingPercent * this.data.hosts.size) / 100 + 1e-9));
+    const servable = open.filter(r => this.grantable(r));
+    let busy = 0;
+
+    for (const name of order) {
+      const host = this.data.hosts.get(name);
+      const plan = hosts[name];
+      if (!host || !plan) continue;
+
+      const memberOf = servable.filter(r => list(r.hosts).some(m => m.host === name && m.state === 'pending'));
+      if (memberOf.length === 0) continue;
+
+      if (memberOf.some(r => this.unpulled(r, host).length > 0)) {
+        const pulls = busy < limit && plan.slot !== 'held' && plan.slot !== 'stale';
+        plan.pull = pulls ? 'pulling' : 'waiting';
+        if (pulls) busy++;
+      } else if (!plan.leaseId) {
+        plan.pull = 'pulled';
+      }
+    }
   }
 
   // -------------------------------------------------------------- views
@@ -1400,7 +1475,7 @@ export class MockController {
     const c = list(host.containers).find(x => x.name === req.container);
     if (!c?.managed) throw new HttpError(409, `${host.name} does not manage a container ${req.container}`);
 
-    const allowed = what === 'image' ? list(c.overridable?.images).length > 0 : c.overridable?.flags === true;
+    const allowed = what === 'image' ? c.overridable?.image === true : c.overridable?.flags === true;
     if (!allowed) throw new HttpError(409, `${host.name} does not allow ${what} overrides of ${c.name}`);
 
     return c;
@@ -1469,12 +1544,6 @@ export class MockController {
     if (req.image !== '') {
       const problem = validateImageRef(req.image);
       if (problem) throw new HttpError(400, `image ${problem}`);
-      if (!imageAllowed(req.image, list(c.overridable?.images))) {
-        throw new HttpError(
-          409,
-          `image ${req.image} is not in a repository ${req.host} allows for ${c.name} (${list(c.overridable?.images).join(', ')})`
-        );
-      }
     }
 
     const until = req.image === '' ? undefined : this.overrideEnd(req.until);
@@ -1802,7 +1871,14 @@ export class MockController {
             id: `manual/${directive}/${c.name}`,
             kind: 'image',
             directiveId: directive,
-            image: { container: c.name, client: c.client, image: c.image, fromDigest: c.digest, toDigest: to },
+            image: {
+              container: c.name,
+              group: c.group,
+              client: c.client,
+              image: c.image,
+              fromDigest: c.digest,
+              toDigest: to,
+            },
           });
         }
       }

@@ -56,6 +56,10 @@ type Host struct {
 	// set it with a team feature, empty for every other hold. A team feature
 	// lifts only a hold that was set through one.
 	HoldBy string `json:"holdBy,omitempty"`
+	// HoldActor is the person who set the controller hold, as the audit log
+	// names them; the agent writes them into the hold entry of its overrides
+	// file.
+	HoldActor string `json:"holdActor,omitempty"`
 
 	// Offline is a person's mark that the host is known offline, for example
 	// a client kept broken on purpose for debugging; nil while unmarked. While
@@ -64,17 +68,33 @@ type Host struct {
 	Offline *OfflineMark `json:"offline,omitempty"`
 
 	// Broken says what the host's last lease failed on: per group of rollouts
-	// (an image reference as "image:<reference>", or "packages") the ID of the
+	// (a roll group as "group:<group>#<client>", or "packages") the ID of the
 	// lease that failed. A host that is broken for the group of a rollout goes
 	// first in it. The scheduler sets the mark where a lease fails and clears
 	// it where a lease is released with the group's steps done; it goes with
 	// the host when the host is forgotten.
 	Broken map[string]string `json:"broken,omitempty"`
+	// Pull is the host's pull window: the images the scheduler lets it pull
+	// now. Nil while it may pull nothing.
+	Pull *PullWindow `json:"pull,omitempty"`
 
 	// SyncInterval is the longest sync interval the controller asked of the
 	// host in its last answer. StaleAfter allows for it.
 	SyncInterval time.Duration `json:"syncInterval,omitempty"`
 }
+
+// PullWindow is a host's permission to pull the images its needs wait for.
+type PullWindow struct {
+	Images    []protocol.PullImage `json:"images"`
+	GrantedAt time.Time            `json:"grantedAt"`
+	// EndedAt is when the scheduler ended the window. It is no longer
+	// offered, and counts for the limit until the agent synced after it
+	// without pulling.
+	EndedAt *time.Time `json:"endedAt,omitempty"`
+}
+
+// Open reports whether the window is offered to the agent.
+func (w *PullWindow) Open() bool { return w != nil && w.EndedAt == nil }
 
 // HoldByTeam is Host.HoldBy for a hold set through a team feature.
 const HoldByTeam = "team"

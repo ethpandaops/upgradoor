@@ -276,7 +276,18 @@ func (r *Runtime) describe(
 		out.Image = ctr.Config.Image
 		out.Command = slices.Clone(ctr.Config.Cmd)
 		out.Base = overrides.BaseFromLabels(ctr.Config.Labels)
+
+		if group := ctr.Config.Labels[protocol.LabelGroup]; group != "" {
+			out.Group = group
+			out.Kind = protocol.ParseKind(ctr.Config.Labels[protocol.LabelKind])
+		}
+
+		if ctr.Config.StopTimeout != nil && *ctr.Config.StopTimeout > 0 {
+			out.StopTimeout = time.Duration(*ctr.Config.StopTimeout) * time.Second
+		}
 	}
+
+	out.Linked = ctr.HostConfig != nil && hasLinks(ctr)
 
 	if ctr.State != nil {
 		out.State = string(ctr.State.Status)

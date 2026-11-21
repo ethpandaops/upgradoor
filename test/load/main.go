@@ -39,6 +39,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/config"
 	"github.com/ethpandaops/upgradoor/pkg/agent/fakehost"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -278,29 +279,28 @@ func (w *world) newAgent(i int) (agent.Service, *fakehost.Host, error) {
 		OS:            fakehost.OS{ID: "debian", VersionID: "13", PrettyName: "Debian 13", Arch: "amd64"},
 		RunningKernel: "6.12.57-amd64", NewestKernel: "6.12.57-amd64",
 		Containers: []fakehost.Container{
-			{Name: "execution", Image: gethImage, Digest: gethOld},
-			{Name: "beacon", Image: clImage, Digest: clDigest},
+			{Name: "geth", Image: gethImage, Digest: gethOld, Group: "execution", Kind: "el"},
+			{Name: "beacon", Image: clImage, Digest: clDigest, Group: "consensus", Kind: "cl"},
 		},
 	})
 	if err != nil {
 		return nil, nil, err
 	}
 
-	cfg := &agent.Config{
-		Controller: agent.ControllerConfig{
+	cfg := &config.Config{
+		Controller: config.Controller{
 			URL: w.ctlURL, AllowInsecure: true, PublicKeys: []string{w.controller},
 		},
-		HoldFile:      filepath.Join(dir, "hold"),
 		StateDir:      filepath.Join(dir, "state"),
 		OverridesFile: filepath.Join(dir, "home", "overrides.yaml"),
-		Socket:        agent.SocketConfig{Path: filepath.Join(w.o.dir, "s", strconv.Itoa(i))},
+		Socket:        config.Socket{Path: filepath.Join(w.o.dir, "s", strconv.Itoa(i))},
 		Verbs:         []protocol.Verb{protocol.VerbRoll},
-		Containers: []agent.ManagedContainer{
-			{Name: "execution", Kind: protocol.KindEL, Image: gethImage},
-			{Name: "beacon", Kind: protocol.KindCL, Image: clImage},
+		Groups: map[string]config.Group{
+			"execution": {Client: "geth"},
+			"consensus": {Client: "lighthouse"},
 		},
-		Registry: agent.RegistryConfig{PollInterval: 30 * time.Second},
-		Verify:   agent.VerifyConfig{Window: time.Second, Timeout: 30 * time.Second},
+		Registry: config.Registry{PollInterval: 30 * time.Second},
+		Verify:   config.Verify{Window: time.Second, Timeout: 30 * time.Second},
 	}
 	cfg.ApplyDefaults()
 
@@ -396,7 +396,7 @@ func (w *world) updated() int {
 	n := 0
 
 	for _, h := range w.hosts {
-		if c := h.Container("execution"); c != nil && c.Digest == gethNew {
+		if c := h.Container("geth"); c != nil && c.Digest == gethNew {
 			n++
 		}
 	}

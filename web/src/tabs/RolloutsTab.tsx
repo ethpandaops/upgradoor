@@ -8,6 +8,7 @@ import {
   type QueueEntry,
   type Rollout,
   type RolloutHost,
+  type RolloutTarget,
   type Settings,
 } from '../api/types';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
@@ -38,13 +39,14 @@ const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'bas
 
 /**
  * policyFor mirrors the scheduler's rolloutPolicy: the policy of the kind,
- * and for an image rollout that of its client where one is set. Manual
- * rollouts have no policy.
+ * and for a group rollout the image policy of its client where one is set,
+ * or the default group's policy. Manual rollouts have no policy.
  */
 export function policyFor(settings: Settings | undefined, rollout: Rollout): Policy | undefined {
   if (!settings) return undefined;
   switch (rollout.kind) {
-    case 'image':
+    case 'group':
+      if (rollout.group === 'default') return settings.policyDefaultGroup;
       return (rollout.client ? settings.policyClients[rollout.client] : undefined) ?? settings.policyImage;
     case 'packages':
       return settings.policyPackages;
@@ -382,19 +384,14 @@ export function RolloutCard({
         <span>
           id <ShortId value={r.id} label="rollout" />
         </span>
-        {r.image && (
+        {r.group && (
           <span>
-            image <span className="font-mono text-foreground">{r.image}</span>
+            group <span className="font-medium text-foreground">{r.group}</span>
           </span>
         )}
-        {r.digest && (
+        {r.client && (
           <span>
-            to <Digest value={r.digest} />
-          </span>
-        )}
-        {r.revision && (
-          <span>
-            revision <span className="font-mono">{shortRevision(r.revision)}</span>
+            client <span className="font-medium text-foreground">{r.client}</span>
           </span>
         )}
         {list(r.packages).length > 0 && (
@@ -413,6 +410,8 @@ export function RolloutCard({
           opened by {r.createdBy} <RelTime fixed value={r.createdAt} />
         </span>
       </div>
+
+      {list(r.targets).length > 0 && <RolloutTargets targets={list(r.targets)} label={`Targets of ${r.title}`} />}
 
       {r.reason && (
         <p
@@ -486,6 +485,44 @@ export function RolloutCard({
   );
 }
 
+/**
+ * RolloutTargets lists what a group rollout moves its group to: each tag at
+ * the digest it moves to, and for a soft deploy the container it was reported
+ * for and whether its command line changes.
+ */
+export function RolloutTargets({ targets, label }: { targets: readonly RolloutTarget[]; label: string }) {
+  return (
+    <ul aria-label={label} className="flex flex-col text-xs/5">
+      {targets.map(t => (
+        <li key={`${t.spec ?? ''} ${t.image}`} className="flex flex-wrap items-center gap-x-1.5">
+          {t.spec && (
+            <>
+              <Badge
+                title={`Ansible's soft deploy ${t.spec}: the deployed block of overrides.yaml names another image or command line`}
+              >
+                spec
+              </Badge>
+              {t.container && <span className="font-medium">{t.container}</span>}
+              <span className="text-muted" aria-hidden="true">
+                →
+              </span>
+            </>
+          )}
+          <span className="font-mono">{t.image}</span>
+          <span className="text-muted">@</span>
+          <Digest value={t.digest} />
+          {t.revision && (
+            <span className="text-muted">
+              revision <span className="font-mono">{shortRevision(t.revision)}</span>
+            </span>
+          )}
+          {t.flags && <span className="text-warning">command line changed</span>}
+        </li>
+      ))}
+    </ul>
+  );
+}
+
 export function RecentRollouts({
   rollouts,
   leases,
@@ -517,7 +554,9 @@ export function RecentRollouts({
           return (
             <tr key={r.id} className="hover:bg-surface-hover">
               <Td className="font-medium">{r.title}</Td>
-              <Td>{r.kind === 'local' ? 'host request' : r.kind}</Td>
+              <Td>
+                {r.kind === 'local' ? 'host request' : r.kind === 'group' && r.group ? `group ${r.group}` : r.kind}
+              </Td>
               <Td>
                 <RolloutStateBadge state={r.state} />
               </Td>

@@ -59,6 +59,22 @@ overrides:
 `))
 	require.NoError(t, err)
 
+	// The deployed block is read back as written.
+	assert.Equal(t, &Deployed{
+		Image: "ethpandaops/geth:master", Command: []string{"--http", "--a=b c"}, HasCommand: true,
+	}, set.DeployedOf("geth"))
+	assert.Equal(t, &Deployed{Image: "sigp/lighthouse:latest", Command: []string{}, HasCommand: true},
+		set.DeployedOf("beacon"))
+	assert.Nil(t, set.DeployedOf("nginx"))
+
+	// What Ansible writes: an entry without a command keeps the container's.
+	own, err := Parse([]byte("deployed:\n  geth:\n    image: \"a/geth:1\"\n"))
+	require.NoError(t, err)
+	assert.Equal(t, &Deployed{Image: "a/geth:1"}, own.DeployedOf("geth"))
+
+	_, err = Parse([]byte("deployed:\n  geth:\n    command: []\n"))
+	require.ErrorContains(t, err, "names no image")
+
 	geth := set.Entry("geth")
 	require.NotNil(t, geth)
 	assert.Equal(t, Entry{

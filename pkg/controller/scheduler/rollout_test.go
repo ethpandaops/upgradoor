@@ -496,7 +496,7 @@ func TestCanaryPauseKindOfARollout(t *testing.T) {
 		r    fleet.Rollout
 		want protocol.NeedKind
 	}{
-		{fleet.Rollout{Kind: fleet.RolloutImage}, protocol.NeedImage},
+		{fleet.Rollout{Kind: fleet.RolloutGroup}, protocol.NeedImage},
 		{fleet.Rollout{Kind: fleet.RolloutPackages}, protocol.NeedPackages},
 		{fleet.Rollout{Kind: fleet.RolloutReboot}, protocol.NeedReboot},
 		{fleet.Rollout{Kind: fleet.RolloutManual, ID: "m-roll"}, protocol.NeedImage},
@@ -521,9 +521,9 @@ func TestRolloutOpensPerCause(t *testing.T) {
 	require.Len(t, b.w.Rollouts, 3)
 
 	img := b.mustRollout(imageKey("", imgLighthouse, digestA))
-	assert.Equal(t, fleet.RolloutImage, img.Kind)
-	assert.Equal(t, imgLighthouse, img.Image)
-	assert.Equal(t, digestA, img.Digest)
+	assert.Equal(t, fleet.RolloutGroup, img.Kind)
+	assert.Equal(t, imgLighthouse, img.Targets[0].Image)
+	assert.Equal(t, digestA, img.Targets[0].Digest)
 	assert.Equal(t, fleet.RolloutActive, img.State)
 	assert.Equal(t, actorScheduler, img.CreatedBy)
 	assert.Len(t, img.Hosts, 2)
@@ -1276,7 +1276,7 @@ func TestHoldDirectives(t *testing.T) {
 	assert.Equal(t, fleet.DirectiveAccepted, b.w.Directives[len(b.w.Directives)-1].State)
 
 	// Unhold: release-hold until the agent reports the hold gone. A local
-	// hold file is not the controller's business.
+	// hold is not the controller's business.
 	h.HoldWanted = false
 	h.Status.Hold.Local = true
 	b.step()

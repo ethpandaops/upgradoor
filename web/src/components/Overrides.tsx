@@ -12,7 +12,7 @@ import { useApp } from '../appContext';
 import { describeCall } from '../lib/actionRequests';
 import { FLAG_HELP, applyFlags, parseFlags, validateFlags } from '../lib/flags';
 import { absoluteTime } from '../lib/format';
-import { imageAllowed, validateImageRef } from '../lib/imageRef';
+import { validateImageRef } from '../lib/imageRef';
 import type { ActionIntent } from './ActionDialog';
 import { ActionShell, Field } from './ActionShell';
 import { Digest } from './Digest';
@@ -37,7 +37,7 @@ function byKind(containers: readonly Container[]): Container[] {
 
 /** allows reports whether the agent configuration of the host lets the controller override this on the container. */
 export function allows(c: Container, kind: OverrideKind): boolean {
-  return kind === 'image-override' ? list(c.overridable?.images).length > 0 : c.overridable?.flags === true;
+  return kind === 'image-override' ? c.overridable?.image === true : c.overridable?.flags === true;
 }
 
 const WHAT: Record<OverrideKind, string> = { 'image-override': 'image', 'flag-override': 'flag' };
@@ -380,18 +380,11 @@ interface DialogProps {
 function ImageOverrideDialog({ intent, onClose, onDone }: DialogProps) {
   const form = useOverrideForm(intent, onDone);
   const c = form.container;
-  const patterns = list(c?.overridable?.images);
   const [image, setImage] = useState('');
   const ref = image.trim();
 
   const problem =
-    ref === ''
-      ? null
-      : validateImageRef(ref) !== null
-        ? `The image ${validateImageRef(ref) ?? ''}.`
-        : patterns.length > 0 && !imageAllowed(ref, patterns)
-          ? `The image is not in a repository this host allows for ${form.name}.`
-          : null;
+    ref === '' ? null : validateImageRef(ref) !== null ? `The image ${validateImageRef(ref) ?? ''}.` : null;
 
   const body = { host: intent.host, container: form.name };
 
@@ -438,14 +431,8 @@ function ImageOverrideDialog({ intent, onClose, onDone }: DialogProps) {
             setImage(e.target.value);
           }}
           className={cx(INPUT_CLASS, 'font-mono')}
-          placeholder={patterns[0] ? `${patterns[0].replace(/\*/g, 'name')}:tag` : 'repository:tag'}
+          placeholder="repository:tag"
         />
-        {patterns.length > 0 && (
-          <span className="text-muted">
-            A tag of an allowed repository: <span className="font-mono break-all">{patterns.join(', ')}</span>. The
-            agent of the host decides.
-          </span>
-        )}
       </label>
     </Shell>
   );

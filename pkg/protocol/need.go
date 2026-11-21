@@ -19,9 +19,9 @@ const (
 	// file: onto an override, or back off one.
 	NeedOverride NeedKind = "override"
 	// NeedSpec brings a container in line with what Ansible deployed it as
-	// (the image and command line in agent.yaml), overrides applied: the
-	// soft deploy. Hosts that move the same container to the same spec share
-	// one rollout.
+	// (the image and command line in the deployed block of the overrides
+	// file), overrides applied: the soft deploy. It is rolled in the rollout
+	// of the container's group.
 	NeedSpec NeedKind = "spec"
 )
 
@@ -55,6 +55,10 @@ type Need struct {
 	// with the local command line. The controller serves them in a rollout
 	// of the host's own, under the budget and the gate like any other.
 	Local bool `json:"local,omitempty"`
+	// Unpulled are the images the need waits for (tag references at the
+	// need's target digest) that are not local yet. The host pulls them in a
+	// pull window; a need with any is not granted.
+	Unpulled []PullImage `json:"unpulled,omitempty"`
 
 	Image    *ImageNeed    `json:"image,omitempty"`
 	Override *OverrideNeed `json:"override,omitempty"`
@@ -68,6 +72,9 @@ type Need struct {
 // is then recreated on the same image.
 type ImageNeed struct {
 	Container string `json:"container"`
+	// Group is the roll group of the container: the needs of one group and
+	// client on a host are served together.
+	Group string `json:"group,omitempty"`
 	// Client is the client the container runs (Container.Client); the image
 	// rollouts of each client are their own.
 	Client string `json:"client,omitempty"`
@@ -115,12 +122,14 @@ func (n *Need) Container() string {
 }
 
 // SpecNeed asks to recreate one managed container with the image and the
-// command line its agent configuration names now, overrides applied: Ansible
-// changed them and left the restart to the agent. Like an override need it
+// command line the deployed block of the overrides file names now, overrides
+// applied: Ansible changed them and left the restart to the agent. Like an override need it
 // names the target for people; the agent takes the image and the command
 // line from its own files when it serves the lease.
 type SpecNeed struct {
 	Container string `json:"container"`
+	// Group is the roll group of the container (ImageNeed.Group).
+	Group string `json:"group,omitempty"`
 	// Client is the client the container runs (Container.Client); the spec
 	// rollouts of each client are their own.
 	Client string `json:"client,omitempty"`

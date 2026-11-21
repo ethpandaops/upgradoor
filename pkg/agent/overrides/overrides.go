@@ -1,19 +1,24 @@
 // Package overrides is the host's overrides file and what it asks of a
 // container.
 //
-// The overrides file is the one place where an override of a managed
-// container lives: another image, added and removed flags, for a while. It
-// is a file in the home directory of the entry user so that whoever has SSH
-// can read and edit it; the controller stores no override and learns of them
-// from the agent's report.
+// The overrides file is the only image and flag state on the host: what
+// Ansible deployed every managed container as, and the overrides of them:
+// another image, added and removed flags, for a while. It is a file in the
+// home directory of the entry user so that whoever has SSH can read and edit
+// it; the controller stores no override and learns of them from the agent's
+// report. What a container is to run is the deployed entry with the override
+// applied; a managed container without a deployed entry counts as deployed
+// with what it was created with.
 //
 // Three writers share the file, so it has two parts:
 //
-//	# >>> upgradoor generated block ... >>>      written by Ansible (or by
-//	# ...                                          'upgradoor host
-//	# <<< upgradoor generated block <<<            init-overrides'); comments
-//	                                               only; the agent keeps it
-//	                                               byte for byte
+//	# >>> upgradoor generated block ... >>>      written by Ansible on every
+//	# (how-to)                                     run (or by 'upgradoor host
+//	deployed:                                      init-overrides'); the agent
+//	  geth:                                        keeps it byte for byte
+//	    image: "ethpandaops/geth:master"
+//	    command: ["--http"]
+//	# <<< upgradoor generated block <<<
 //	overrides:                                    written by people and by
 //	  # [geth] 2026-11-20T16:00:00Z sam: ...       the agent
 //	  geth:
@@ -51,10 +56,6 @@ import (
 )
 
 const (
-	// FileName is the name of the overrides file in the entry user's home
-	// directory.
-	FileName = "overrides.yaml"
-
 	// overridesBegin and overridesEnd are the first and the last line of the
 	// generated block. Only the part before the colon is compared.
 	overridesBegin = "# >>> upgradoor generated block"
@@ -64,6 +65,7 @@ const (
 	overridesEndLine   = overridesEnd + " <<<"
 
 	keyOverrides = "overrides"
+	keyDeployed  = "deployed"
 
 	// maxHistory bounds the comment lines the agent keeps per
 	// container.
@@ -87,10 +89,10 @@ const (
 // that the container itself says what it was before. A container without
 // them is in the form the inventory gave it.
 const (
-	// LabelImage holds the configured image reference of a container
-	// that runs an override image: what agent.yaml said when the override was
-	// applied. A container whose label (or, without one, image) differs from
-	// what agent.yaml says now is moved there with a spec need.
+	// LabelImage holds the deployed image reference of a container that
+	// runs an override image: what the deployed block said when the override
+	// was applied. A container whose label (or, without one, image) differs
+	// from what the block says now is moved there with a spec need.
 	LabelImage = "io.ethpandaops.upgradoor.override.image"
 	// LabelCommand holds the command line the container had before a
 	// flag override changed it, as a JSON array of strings.
@@ -124,6 +126,22 @@ type entryYAML struct {
 	Until  *time.Time `yaml:"until"`
 }
 
+// Deployed is what Ansible deployed one container as: its entry in the
+// deployed block.
+type Deployed struct {
+	Image string
+	// Command is the command line (the arguments after the entrypoint) when
+	// HasCommand; without it the container keeps the one it was created with.
+	Command    []string
+	HasCommand bool
+}
+
+// deployedYAML is a deployed entry as it is written in the block.
+type deployedYAML struct {
+	Image   string    `yaml:"image"`
+	Command *[]string `yaml:"command"`
+}
+
 // Set is the overrides file as last read.
 type Set struct {
 	// Known is false when the file exists and cannot be read or understood.
@@ -134,6 +152,23 @@ type Set struct {
 	Err string
 	// Entries are the entries by container name.
 	Entries map[string]Entry
+	// Deployed are the entries of the deployed block by container name.
+	Deployed map[string]Deployed
+	// Holds are the holds by source (HoldLocal, HoldController).
+	Holds map[string]Hold
+}
+
+// DeployedOf returns the deployed entry of a container, or nil.
+func (s *Set) DeployedOf(name string) *Deployed {
+	if s == nil {
+		return nil
+	}
+
+	if d, ok := s.Deployed[name]; ok {
+		return &d
+	}
+
+	return nil
 }
 
 // Entry returns the override of a container, or nil.
@@ -151,7 +186,7 @@ func (s *Set) Entry(name string) *Entry {
 
 // NewSet is the set of a host without an overrides file.
 func NewSet() *Set {
-	return &Set{Known: true, Entries: map[string]Entry{}}
+	return &Set{Known: true, Entries: map[string]Entry{}, Deployed: map[string]Deployed{}, Holds: map[string]Hold{}}
 }
 
 // Read reads the overrides file. A file that does not exist, is
@@ -210,7 +245,9 @@ func readFile(file string) ([]byte, error) {
 // Parse reads the content of an overrides file.
 func Parse(raw []byte) (*Set, error) {
 	var doc struct {
-		Overrides map[string]*entryYAML `yaml:"overrides"`
+		Deployed  map[string]*deployedYAML `yaml:"deployed"`
+		Overrides map[string]*entryYAML    `yaml:"overrides"`
+		Hold      map[string]*holdYAML     `yaml:"hold"`
 	}
 
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
@@ -221,6 +258,23 @@ func Parse(raw []byte) (*Set, error) {
 	}
 
 	set := NewSet()
+
+	if err := parseHolds(set, doc.Hold); err != nil {
+		return nil, err
+	}
+
+	for name, y := range doc.Deployed {
+		if y == nil || strings.TrimSpace(y.Image) == "" {
+			return nil, fmt.Errorf("overrides file: deployed entry %q names no image", name)
+		}
+
+		d := Deployed{Image: strings.TrimSpace(y.Image)}
+		if y.Command != nil {
+			d.Command, d.HasCommand = nonNilStrings(*y.Command), true
+		}
+
+		set.Deployed[name] = d
+	}
 
 	for name, y := range doc.Overrides {
 		if y == nil {

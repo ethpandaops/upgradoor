@@ -192,7 +192,9 @@ func (s *fakeStore) recordSync(h *fleet.Host) (adopted bool) {
 		c.HoldWanted = old.HoldWanted
 		c.HoldReason = old.HoldReason
 		c.HoldBy = old.HoldBy
+		c.HoldActor = old.HoldActor
 		c.Broken = old.Broken
+		c.Pull = old.Pull
 	} else {
 		c.FirstSeen = h.LastSeen
 
@@ -469,10 +471,10 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 	for _, hold := range ch.Holds {
 		s.hosts[hold.Host].HoldWanted = hold.Wanted
 		s.hosts[hold.Host].HoldReason = hold.Reason
-		s.hosts[hold.Host].HoldBy = ""
+		s.hosts[hold.Host].HoldBy, s.hosts[hold.Host].HoldActor = "", ""
 
 		if hold.Wanted {
-			s.hosts[hold.Host].HoldBy = hold.By
+			s.hosts[hold.Host].HoldBy, s.hosts[hold.Host].HoldActor = hold.By, hold.Actor
 		}
 	}
 
@@ -487,6 +489,12 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 	for _, marks := range ch.Broken {
 		if h := s.hosts[marks.Host]; h != nil {
 			h.Broken = viaJSON(&marks).Marks
+		}
+	}
+
+	for _, pull := range ch.Pulls {
+		if h := s.hosts[pull.Host]; h != nil {
+			h.Pull = viaJSON(&pull).Window
 		}
 	}
 
@@ -986,6 +994,16 @@ func applyOutcome(w *World, out *Outcome) {
 			}
 		}
 	}
+
+	for _, pull := range out.Pulls {
+		for i, h := range w.Hosts {
+			if h.Name == pull.Host {
+				c := *h
+				c.Pull = pull.Window
+				w.Hosts[i] = &c
+			}
+		}
+	}
 }
 
 // rollout returns the open rollout with the key.
@@ -1144,12 +1162,22 @@ func queueReasons(p *Plan) map[string]string {
 	return out
 }
 
+// testGroup is the roll group the tests put the containers of an image in:
+// one group per image.
+func testGroup(image string) string { return "g-" + image }
+
+// imageKey is the key of the group rollout of one tag that moved, for the
+// needs of containers without a group.
+func imageKey(client, image, digest string) string {
+	return groupKey(testGroup(image), client, []fleet.RolloutTarget{{Image: image, Digest: digest}})
+}
+
 func imageNeed(container, image, to string) protocol.Need {
 	return protocol.Need{
 		ID:   protocol.ImageNeedID(container, to),
 		Kind: protocol.NeedImage,
 		Image: &protocol.ImageNeed{
-			Container: container, Image: image, FromDigest: digestOld, ToDigest: to,
+			Container: container, Group: testGroup(image), Image: image, FromDigest: digestOld, ToDigest: to,
 		},
 	}
 }
@@ -1182,7 +1210,7 @@ func rebootNeed() protocol.Need {
 func container(name, image, running, registryDigest string, checked time.Time) protocol.Container {
 	return protocol.Container{
 		Name: name, Image: image, Digest: running, State: "running",
-		Managed: true, ConfiguredImage: image,
+		Managed: true, ConfiguredImage: image, Group: testGroup(image),
 		Registry: &protocol.RegistryCheck{Digest: registryDigest, CheckedAt: checked, Pulled: true},
 	}
 }

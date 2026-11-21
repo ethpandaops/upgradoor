@@ -394,6 +394,17 @@ func (s *service) Assignment(ctx context.Context, host string) (*Assignment, err
 		a.Directives = append(a.Directives, d.Directive)
 	}
 
+	if h, hostErr := st.GetHost(ctx, host); hostErr == nil && h.Pull.Open() {
+		a.Pull = &protocol.PullWindow{Images: slices.Clone(h.Pull.Images)}
+	}
+
+	settings, err := s.Settings(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	a.LookupInterval = settings.LookupInterval.Std()
+
 	if len(leases) == 0 {
 		// One row by the index on (host, granted_at): the newest lease.
 		last, err := st.ListLeases(ctx, store.LeaseFilter{Host: host, Limit: 1})

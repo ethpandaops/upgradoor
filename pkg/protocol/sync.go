@@ -74,6 +74,9 @@ type SyncRequest struct {
 
 	// Needs are all currently open needs of the host.
 	Needs []Need `json:"needs"`
+	// Pulling are the tag references the agent is pulling right now, inside
+	// the pull window the controller granted.
+	Pulling []string `json:"pulling,omitempty"`
 	// Operation is the lease the agent is working on or has just finished.
 	Operation *Operation `json:"operation,omitempty"`
 	// DirectiveAcks answer directives received in earlier responses.
@@ -82,10 +85,11 @@ type SyncRequest struct {
 
 // Hold is the agent's hold state.
 type Hold struct {
-	// Local is true when /etc/upgradoor/hold exists. Only a person on the
+	// Local is true when the overrides file holds a local hold (or cannot be
+	// read). Only a person on the
 	// host can lift it; the controller cannot.
 	Local bool `json:"local"`
-	// LocalReason is the first line of the hold file, if any.
+	// LocalReason is the reason of the local hold.
 	LocalReason string `json:"localReason,omitempty"`
 	// Controller is true when a hold directive from the controller is in
 	// effect. A release-hold directive lifts it.
@@ -170,6 +174,48 @@ func (i Impact) Heavier(o Impact) Impact {
 	return i
 }
 
+// The labels Ansible sets on a container that upgradoor rolls. The agent
+// finds its containers by them; a recreate keeps a container's labels.
+//
+// A container without the labels is in the group its name has in agent.yaml
+// (the name map, for containers deployed before the labels; the next
+// recreate adds them), or else in DefaultGroup.
+const (
+	// LabelGroup marks a managed container; its value is the roll group.
+	// GroupNone leaves the container out of everything.
+	LabelGroup = "io.ethpandaops.upgradoor.group"
+	// LabelKind is the container's kind: el, cl, vc or other.
+	LabelKind = "io.ethpandaops.upgradoor.kind"
+)
+
+// The group names with a meaning of their own.
+const (
+	// DefaultGroup is the group of every container that neither a label nor
+	// the name map puts in one: kind other, impact independent, admin-only,
+	// nothing overridable. Its containers follow their tag only where the
+	// host's agent.yaml says so (defaultGroup.roll); all hosts' needs of one
+	// image are one rollout.
+	DefaultGroup = "default"
+	// GroupNone as the value of LabelGroup leaves a container out of
+	// everything: it is neither managed nor in the default group.
+	GroupNone = "none"
+)
+
+// ReservedGroup reports whether name is a group name that agent.yaml cannot
+// configure (DefaultGroup, GroupNone).
+func ReservedGroup(name string) bool { return name == DefaultGroup || name == GroupNone }
+
+// ParseKind reads the value of a LabelKind label: other for anything that
+// is not el, cl or vc.
+func ParseKind(v string) ContainerKind {
+	switch k := ContainerKind(v); k {
+	case KindEL, KindCL, KindVC:
+		return k
+	default:
+		return KindOther
+	}
+}
+
 // Docker container states.
 const (
 	StateRunning    = "running"
@@ -208,13 +254,29 @@ type Container struct {
 	RestartCount int       `json:"restartCount"`
 	StartedAt    time.Time `json:"startedAt"`
 
-	// Managed is true for containers listed in the agent configuration.
-	Managed bool          `json:"managed"`
-	Kind    ContainerKind `json:"kind,omitempty"`
-	// Impact is the container's impact class from the agent configuration;
-	// absent for unmanaged containers.
+	// Managed is true for every container the agent looks after: one in a
+	// group by its label or the name map of agent.yaml, or in DefaultGroup.
+	// A container labelled GroupNone, or left out of the default group by
+	// agent.yaml, is not managed.
+	Managed bool `json:"managed"`
+	// Group is the roll group of a managed container (its LabelGroup label,
+	// its entry in the name map, or DefaultGroup): the containers of one
+	// group on a host are rolled together, under one lease.
+	Group string `json:"group,omitempty"`
+	// Kind is the kind of a managed container: its LabelKind label or the
+	// name map's kind (other when absent or unknown, and in DefaultGroup).
+	Kind ContainerKind `json:"kind,omitempty"`
+	// NotRolled says why the agent rolls this managed container to nothing:
+	// it is pinned to a digest, it has links, or it is in DefaultGroup on a
+	// host that does not roll that group. Its updates are still reported.
+	// Absent for a container the agent rolls.
+	NotRolled string `json:"notRolled,omitempty"`
+	// Impact is the impact class of the container's group; absent for
+	// unmanaged containers.
 	Impact Impact `json:"impact,omitempty"`
-	// ConfiguredImage is the image reference from the agent configuration.
+	// ConfiguredImage is the image Ansible deployed the container with: its
+	// entry in the deployed block of the overrides file or, without one, the
+	// image it was created with.
 	ConfiguredImage string `json:"configuredImage,omitempty"`
 
 	// Registry is the last registry check for Image; nil for unmanaged
@@ -250,6 +312,24 @@ type Container struct {
 	// changed it. It is not part of the wire format: the agent's container
 	// runtime fills it for the agent.
 	Base *OverrideBase `json:"-"`
+	// StopTimeout is the stop grace period the container was created with;
+	// zero when it names none. Not part of the wire format.
+	StopTimeout time.Duration `json:"-"`
+	// Linked is true for a container created with links (--link), which a
+	// recreate cannot keep. Not part of the wire format.
+	Linked bool `json:"-"`
+	// Unlabelled is true for a managed container that the name map of
+	// agent.yaml puts in its group: the next recreate adds the labels. Not
+	// part of the wire format.
+	Unlabelled bool `json:"-"`
+}
+
+// GroupLabels are the labels that put a container in its group and kind,
+// for a recreate to set.
+func (c *Container) GroupLabels() map[string]*string {
+	group, kind := c.Group, string(c.Kind)
+
+	return map[string]*string{LabelGroup: &group, LabelKind: &kind}
 }
 
 // OverrideBase is a container's form before an override, as its labels
@@ -289,12 +369,13 @@ type ContainerOverride struct {
 	Error string `json:"error,omitempty"`
 }
 
-// Overridable is what the agent configuration lets the controller override
-// on a container.
+// Overridable is what the container's group lets anybody override: the
+// controller, the local commands and a hand edit of the overrides file
+// alike. A container of a group that allows nothing is tooling: it runs
+// exactly what Ansible deployed.
 type Overridable struct {
-	// Images are the allowed image repository patterns; empty when image
-	// overrides are off.
-	Images []string `json:"images,omitempty"`
+	// Image is true when image overrides are on.
+	Image bool `json:"image,omitempty"`
 	// Flags is true when flag overrides are on.
 	Flags bool `json:"flags,omitempty"`
 }
@@ -442,6 +523,39 @@ type SyncResponse struct {
 	// while the host has something to do. The agent keeps it within its
 	// local bounds.
 	NextSyncMillis int64 `json:"nextSyncMillis"`
+
+	// Lookups are the tags (references as the agent reported them) this
+	// host is to look up at the registry now: the controller hands the duty
+	// for each tag to one host at a time, in turn.
+	Lookups []string `json:"lookups,omitempty"`
+	// Digests are what the tags this host follows point at, as another host
+	// saw it: a signal for the agent, which then looks at its local images.
+	// The controller never asks a registry itself.
+	Digests []TagDigest `json:"digests,omitempty"`
+	// Pull is the host's pull window: the images it may pull now, those of
+	// its needs in the rollouts it waits in. Absent: pull nothing.
+	Pull *PullWindow `json:"pull,omitempty"`
+	// LookupFallbackSeconds is how long the agent goes without an answer
+	// before it looks up its tags itself again (three lookup intervals).
+	LookupFallbackSeconds int64 `json:"lookupFallbackSeconds,omitempty"`
+}
+
+// TagDigest is what one tag points at, by the newest lookup of any host.
+type TagDigest struct {
+	Ref       string    `json:"ref"`
+	Digest    string    `json:"digest"`
+	CheckedAt time.Time `json:"checkedAt"`
+}
+
+// PullWindow names the images a host may pull.
+type PullWindow struct {
+	Images []PullImage `json:"images"`
+}
+
+// PullImage is one image of a pull window: a tag at a digest.
+type PullImage struct {
+	Ref    string `json:"ref"`
+	Digest string `json:"digest"`
 }
 
 // EndedLease says how a lease ended.

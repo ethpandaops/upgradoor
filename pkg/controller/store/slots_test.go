@@ -13,10 +13,14 @@ import (
 )
 
 func TestSlotParticipation(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			empty, err := s.ListSlotParticipation(ctx, 0)
@@ -109,10 +113,14 @@ func TestSlotParticipation(t *testing.T) {
 // Runs are found in the database: rows of a host no more than the gap apart
 // are one run, and the hosts asked for come slot by slot.
 func TestSumHostSlotRuns(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			missed := func(slot uint64, hosts ...string) fleet.SlotParticipation {
@@ -152,6 +160,8 @@ func TestSumHostSlotRuns(t *testing.T) {
 // and the rest miss a slot now and then: the runs are a few hundred rows,
 // not the 200 000 the window holds.
 func TestSumHostSlotRunsOfALargeFleet(t *testing.T) {
+	t.Parallel()
+
 	if testing.Short() {
 		t.Skip("large fleet")
 	}

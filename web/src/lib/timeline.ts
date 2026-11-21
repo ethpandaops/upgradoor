@@ -6,7 +6,7 @@ import { list, type NeedKind, type QueueEntry, type WaitKind } from '../api/type
 /** WorkKind is what a lease does to a host; the timeline colours by it. */
 type WorkKind = 'image' | 'packages' | 'reboot';
 
-const AUTO_WAITS: ReadonlySet<WaitKind> = new Set(['budget', 'host-limit', 'order']);
+const AUTO_WAITS: ReadonlySet<WaitKind> = new Set(['budget', 'host-limit', 'order', 'pull']);
 
 /** clearsByItself: the host is served without anybody acting, as the rollout proceeds. */
 export function clearsByItself(wait: WaitKind): boolean {

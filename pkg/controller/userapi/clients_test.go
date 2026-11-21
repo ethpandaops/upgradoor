@@ -79,7 +79,7 @@ func clientFixture(h *harness) {
 		}}
 	})
 	host("n-broken", func(host *fleet.Host) {
-		host.Broken = map[string]string{scheduler.ImageGroup("geth", geth): "lease-1"}
+		host.Broken = map[string]string{scheduler.GroupName("", "geth"): "lease-1"}
 	})
 	host("n-rolling", nil)
 	host("n-plain", func(host *fleet.Host) {

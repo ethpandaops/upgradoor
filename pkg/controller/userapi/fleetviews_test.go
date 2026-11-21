@@ -276,7 +276,7 @@ func TestRollouts(t *testing.T) {
 	}
 	for i, state := range states {
 		h.store.Rollouts = append(h.store.Rollouts, &fleet.Rollout{
-			ID: fmt.Sprintf("r%d", i), Kind: fleet.RolloutImage, State: state,
+			ID: fmt.Sprintf("r%d", i), Kind: fleet.RolloutGroup, State: state,
 			Hosts: []fleet.RolloutHost{},
 		})
 	}

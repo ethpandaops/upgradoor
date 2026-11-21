@@ -19,7 +19,7 @@ import (
 
 const hostColumns = `name, cert_hash, generation, validators_start, validators_end, roles,
 	first_seen, last_seen, remote_addr, status, inventory_hash, hold_wanted, hold_reason, hold_by,
-	offline, broken, sync_interval, status_hash`
+	offline, broken, sync_interval, status_hash, pull, hold_actor`
 
 // RecordSync upserts the host named by the certificate subject. first_seen
 // is kept for a known host. With a nil Request only the identity, last_seen
@@ -398,15 +398,22 @@ func (s *sqliteStore) scanHost(row rowScanner) (*fleet.Host, error) {
 		firstSeen, lastSeen int64
 		status              sql.NullString
 		broken, offline     string
+		pull                string
 		syncInterval        int64
 	)
 
 	err := row.Scan(&host.Name, &host.CertHash, &generation, &valStart, &valEnd, &roles,
 		&firstSeen, &lastSeen, &host.RemoteAddr, &status, &host.InventoryHash,
 		&host.HoldWanted, &host.HoldReason, &host.HoldBy, &offline, &broken, &syncInterval,
-		&host.StatusHash)
+		&host.StatusHash, &pull, &host.HoldActor)
 	if err != nil {
 		return nil, err
+	}
+
+	if pull != "" {
+		if err := json.Unmarshal([]byte(pull), &host.Pull); err != nil {
+			return nil, fmt.Errorf("decode pull window of %s: %w", host.Name, err)
+		}
 	}
 
 	if offline != "" {
@@ -533,15 +540,15 @@ func setHostOffline(ctx context.Context, tx *sql.Tx, name string, mark *fleet.Of
 // setHostHold writes the hold switch of a host. by is fleet.Host.HoldBy; a
 // host that is not held has none.
 func setHostHold(
-	ctx context.Context, tx *sql.Tx, name string, wanted bool, reason, by string,
+	ctx context.Context, tx *sql.Tx, name string, wanted bool, reason, by, actor string,
 ) error {
 	if !wanted {
-		by = ""
+		by, actor = "", ""
 	}
 
 	res, err := tx.ExecContext(ctx,
-		`UPDATE hosts SET hold_wanted = ?, hold_reason = ?, hold_by = ? WHERE name = ?`,
-		wanted, reason, by, name)
+		`UPDATE hosts SET hold_wanted = ?, hold_reason = ?, hold_by = ?, hold_actor = ? WHERE name = ?`,
+		wanted, reason, by, actor, name)
 	if err != nil {
 		return err
 	}
@@ -562,6 +569,25 @@ func setHostBroken(ctx context.Context, tx *sql.Tx, name string, marks map[strin
 	}
 
 	_, err = tx.ExecContext(ctx, `UPDATE hosts SET broken = ? WHERE name = ?`, string(raw), name)
+
+	return err
+}
+
+// setHostPull sets or ends the pull window of a host. A host that does not
+// exist has none: nothing is written and nothing fails.
+func setHostPull(ctx context.Context, tx *sql.Tx, name string, window *fleet.PullWindow) error {
+	raw := ""
+
+	if window != nil {
+		b, err := json.Marshal(window)
+		if err != nil {
+			return fmt.Errorf("encode pull window: %w", err)
+		}
+
+		raw = string(b)
+	}
+
+	_, err := tx.ExecContext(ctx, `UPDATE hosts SET pull = ? WHERE name = ?`, raw, name)
 
 	return err
 }

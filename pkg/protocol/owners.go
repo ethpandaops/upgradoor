@@ -47,3 +47,7 @@ func CleanOwners(owners []string) []string {
 // ValidClient reports whether name is a client name in normal form: the same
 // form as a team name, so "geth" and "lighthouse" are and "Geth" is not.
 func ValidClient(name string) bool { return ownerPattern.MatchString(name) }
+
+// ValidGroup reports whether name is a roll group name in normal form (the
+// form of a team name).
+func ValidGroup(name string) bool { return ownerPattern.MatchString(name) }

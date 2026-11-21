@@ -1,6 +1,7 @@
 package overrides
 
 import (
+	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -10,12 +11,12 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// Target is what a managed container is to run, by the agent
-// configuration and the overrides file, and how the container that is there
+// Target is what a managed container is to run, by the overrides file (its
+// deployed entry and its override), and how the container that is there
 // compares.
 type Target struct {
-	// Spec: agent.yaml names another image or command line than the one the
-	// container was created with (before an override changed it).
+	// Spec: the deployed block names another image or command line than the
+	// one the container was created with (before an override changed it).
 	Spec bool
 	// Image and Command are what the container is to run.
 	Image   string
@@ -30,14 +31,21 @@ type Target struct {
 	// Restore: there is no entry (any more) and the container still runs
 	// what one said.
 	Restore bool
-	// Err says why the entry cannot be applied.
+	// Err says why the entry cannot be applied; nothing is changed then.
 	Err string
+	// Refused says why the entry is not applied: the container's group does
+	// not permit it. The container is brought back to what was deployed.
+	Refused string
 }
 
-// TargetOf compares a managed container with what it is to run. image and
-// command are what agent.yaml says the container runs; a nil command keeps
-// the one the container was created with.
-func TargetOf(image string, command []string, c *protocol.Container, entry *Entry) Target {
+// TargetOf compares a managed container with what it is to run. deployed is
+// its entry in the deployed block; nil counts as deployed with what the
+// container was created with. An entry that the container's group does not
+// permit (policy) is not applied: the container runs what was deployed, and
+// the target says why.
+func TargetOf(
+	deployed *Deployed, c *protocol.Container, entry *Entry, policy Policy, group string,
+) Target {
 	if entry.Empty() {
 		entry = nil
 	}
@@ -55,17 +63,32 @@ func TargetOf(image string, command []string, c *protocol.Container, entry *Entr
 		}
 	}
 
-	// What agent.yaml says it is: its image, and its command line where it
-	// names one.
-	baseCommand := createdCommand
-	if command != nil {
-		baseCommand = command
+	// What Ansible deployed: the deployed entry's image, and its command line
+	// where it names one.
+	image, baseCommand := createdImage, createdCommand
+
+	if deployed != nil {
+		image = deployed.Image
+
+		if deployed.HasCommand {
+			baseCommand = deployed.Command
+		}
 	}
 
 	t := Target{
 		Image: image, Command: slices.Clone(baseCommand),
 		Spec: !imageref.Same(createdImage, image) || !slices.Equal(createdCommand, baseCommand),
 	}
+
+	var refused string
+
+	if entry != nil {
+		if err := policy.Permits(c.Name, group, entry); err != nil {
+			refused, entry = err.Error(), nil
+		}
+	}
+
+	t.Refused = refused
 
 	if entry != nil {
 		if err := entry.Validate(); err != nil {
@@ -186,7 +209,7 @@ func (t *Target) NeedID(c *protocol.Container, digest string) string {
 }
 
 // Report is what the sync says about a container's override; nil when the
-// container runs what the configuration says and no entry asks otherwise.
+// container runs what was deployed and no entry asks otherwise.
 func (t *Target) Report(c *protocol.Container, entry *Entry) *protocol.ContainerOverride {
 	if entry.Empty() {
 		if !t.Restore {
@@ -204,6 +227,7 @@ func (t *Target) Report(c *protocol.Container, entry *Entry) *protocol.Container
 	return &protocol.ContainerOverride{
 		Image: entry.Image, AddFlags: slices.Clone(entry.Add), RemoveFlags: slices.Clone(entry.Remove),
 		By: entry.By, Reason: entry.Reason, Until: entry.Until,
-		Applied: t.InSync && t.Err == "", Error: t.Err,
+		Applied: t.InSync && t.Err == "" && t.Refused == "", Restoring: t.Restore,
+		Error: cmp.Or(t.Err, t.Refused),
 	}
 }

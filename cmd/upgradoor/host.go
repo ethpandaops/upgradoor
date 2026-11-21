@@ -12,7 +12,7 @@ import (
 
 	"github.com/spf13/cobra"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent"
+	"github.com/ethpandaops/upgradoor/pkg/agent/config"
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
 	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -36,7 +36,7 @@ func newHostCmd() *cobra.Command {
 
 	def := os.Getenv(envSocket)
 	if def == "" {
-		def = agent.DefaultSocketFile
+		def = config.DefaultSocketFile
 	}
 
 	cmd.PersistentFlags().StringVar(&socket, "socket", def, "the agent's socket ($"+envSocket+")")
@@ -85,6 +85,11 @@ func printContainers(w io.Writer, st *local.Status) {
 		c := &st.Containers[i]
 
 		fmt.Fprintf(w, "%s  (%s%s, %s)\n", c.Name, c.Kind, clientOf(c), c.State)
+		fmt.Fprintf(w, "  group:    %s\n", groupOf(c))
+
+		if c.NotRolled != "" {
+			fmt.Fprintf(w, "  rolled:   no, %s\n", c.NotRolled)
+		}
 
 		image := c.Image
 		if c.Override != nil && c.Override.Image != "" && c.Image != c.ConfiguredImage {
@@ -111,6 +116,18 @@ func printContainers(w io.Writer, st *local.Status) {
 	}
 
 	fmt.Fprintf(w, "overrides file: %s\n", st.OverridesFile)
+}
+
+// groupOf is the container's group and where it comes from.
+func groupOf(c *local.Container) string {
+	switch {
+	case c.Group == protocol.DefaultGroup:
+		return c.Group + " (no label, not in the name map)"
+	case c.Unlabelled:
+		return c.Group + " (name map of agent.yaml; the next recreate adds the labels)"
+	default:
+		return c.Group
+	}
 }
 
 func clientOf(c *local.Container) string {

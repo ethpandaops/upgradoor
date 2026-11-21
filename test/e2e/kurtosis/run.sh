@@ -160,6 +160,7 @@ mkdir -p "$work"
 
 make -s build
 go build -o "$work/authstub" ./test/e2e/authstub
+go build -o "$work/relabel" ./test/e2e/relabel
 cp bin/upgradoor "$work/upgradoor"
 docker build -q -t "$prefix-host" -f test/e2e/kurtosis/Dockerfile.host "$work" >/dev/null
 pass "controller, agent image and auth stub built"
@@ -244,6 +245,8 @@ for i in $(seq 1 $nodes); do
     cl=$(container "cl-$i-lighthouse-geth")
     vc=$(container "vc-$i-geth-lighthouse")
     [ -n "$el" ] && [ -n "$cl" ] && [ -n "$vc" ] || die "containers of node $i not found"
+    # Kurtosis created them: give them the labels Ansible would set.
+    "$work/relabel" "$el=execution/el" "$cl=consensus/cl" "$vc=consensus/vc" || die "relabel node $i"
 
     start=$(((i - 1) * validators))
     "$work/upgradoor" keygen host-key --network "$network" --hostname "node-$i" >"$dir/host.key"
@@ -266,10 +269,10 @@ verbs: [roll]
 # The host's validator range. A devnet deployed with Ansible reads it from the
 # marker file of the validator_keys role instead (validators.markerFile).
 validators: {start: $start, end: $((start + validators))}
-containers:
-  - {name: "$el", kind: el, image: "ethereum/client-go:v1.17.6", stopTimeout: 30s, owners: [geth]}
-  - {name: "$cl", kind: cl, image: "$image", stopTimeout: 30s, owners: [lighthouse]}
-  - {name: "$vc", kind: vc, image: "$image", stopTimeout: 30s, owners: [lighthouse]}
+# The containers carry the group and kind labels (relabel above).
+groups:
+  execution: {client: geth, owners: [geth], stopTimeout: 30s}
+  consensus: {client: lighthouse, owners: [lighthouse], stopTimeout: 30s}
 registry:
   pollInterval: 10s
   plainHttp: ["$registry"]

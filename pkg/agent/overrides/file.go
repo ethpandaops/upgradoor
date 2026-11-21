@@ -89,19 +89,20 @@ func (t *Text) blockEnd(start, indent int) int {
 	return end
 }
 
-// located is where the overrides mapping and the entry of one container are
-// in the text.
+// located is where a top-level mapping (overrides, hold) and one entry of it
+// are in the text.
 type located struct {
-	// key is the line of "overrides:"; -1 when there is none.
+	// key is the line of the mapping's key; -1 when there is none.
 	key int
-	// childIndent is the indentation of the container names.
+	// childIndent is the indentation of the entries' names.
 	childIndent int
-	// entry is the line of the container's name; -1 when it has no entry.
+	// entry is the line of the entry's name; -1 when there is none.
 	entry int
 }
 
-// locate finds the overrides mapping and the entry of a container.
-func (t *Text) locate(container string) (located, error) {
+// locate finds the mapping of key and its entry child, below the generated
+// block.
+func (t *Text) locate(key, child string) (located, error) {
 	loc := located{key: -1, entry: -1, childIndent: 2}
 
 	var doc yaml.Node
@@ -122,7 +123,7 @@ func (t *Text) locate(container string) (located, error) {
 
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		k, v := root.Content[i], root.Content[i+1]
-		if k.Value != keyOverrides {
+		if k.Value != key {
 			continue
 		}
 
@@ -132,11 +133,10 @@ func (t *Text) locate(container string) (located, error) {
 		case v.Kind == yaml.MappingNode && v.Style&yaml.FlowStyle != 0 && len(v.Content) > 0,
 			v.Kind != yaml.MappingNode && v.Kind != yaml.ScalarNode,
 			v.Kind == yaml.ScalarNode && v.Tag != "!!null":
-			return loc, errors.New("overrides file: write the overrides as an indented block, " +
-				"one container per entry")
+			return loc, fmt.Errorf("overrides file: write %q as an indented block, one entry per name", key)
 		case v.Kind != yaml.MappingNode || len(v.Content) == 0:
 			// "overrides:", "overrides: {}", "overrides: null".
-			t.lines[loc.key] = strings.Repeat(" ", k.Column-1) + keyOverrides + ":"
+			t.lines[loc.key] = strings.Repeat(" ", k.Column-1) + key + ":"
 
 			return loc, nil
 		}
@@ -144,7 +144,7 @@ func (t *Text) locate(container string) (located, error) {
 		loc.childIndent = v.Content[0].Column - 1
 
 		for j := 0; j+1 < len(v.Content); j += 2 {
-			if v.Content[j].Value == container {
+			if v.Content[j].Value == child {
 				loc.entry = t.body + v.Content[j].Line - 1
 			}
 		}
@@ -153,15 +153,35 @@ func (t *Text) locate(container string) (located, error) {
 	return loc, nil
 }
 
-// historyPattern matches the comment lines the agent wrote for a container.
-func historyPattern(container string) *regexp.Regexp {
-	return regexp.MustCompile(`^\s*# \[` + regexp.QuoteMeta(container) + `\] `)
+// historyPattern matches the comment lines the agent wrote under a tag (a
+// container's name, or hold:<source>).
+func historyPattern(tag string) *regexp.Regexp {
+	return regexp.MustCompile(`^\s*# \[` + regexp.QuoteMeta(tag) + `\] `)
 }
 
 // Set replaces the entry of a container (or removes it, with entry nil) and
 // adds a history line saying note. Everything else stays as it is.
 func (t *Text) Set(container string, entry *Entry, at time.Time, who, note string) error {
-	loc, err := t.locate(container)
+	err := t.setEntry(keyOverrides, container, container, at, who, note, func(pad string) []string {
+		if entry == nil {
+			return nil
+		}
+
+		return renderOverride(container, entry, pad)
+	})
+	if err != nil {
+		return err
+	}
+
+	return t.check(container, entry)
+}
+
+// setEntry replaces the entry child of the mapping key (or removes it, when
+// render returns nothing) and adds a history line under tag saying note.
+func (t *Text) setEntry(
+	key, child, tag string, at time.Time, who, note string, render func(pad string) []string,
+) error {
+	loc, err := t.locate(key, child)
 	if err != nil {
 		return err
 	}
@@ -171,16 +191,12 @@ func (t *Text) Set(container string, entry *Entry, at time.Time, who, note strin
 			t.lines = append(t.lines, "")
 		}
 
-		t.lines = append(t.lines, keyOverrides+":")
+		t.lines = append(t.lines, key+":")
 		loc.key = len(t.lines) - 1
 	}
 
 	pad := strings.Repeat(" ", loc.childIndent)
-
-	var rendered []string
-	if entry != nil {
-		rendered = renderOverride(container, entry, pad)
-	}
+	rendered := render(pad)
 
 	// Where the entry is, or where a new one goes: the end of the mapping.
 	start, end := loc.entry, 0
@@ -193,11 +209,11 @@ func (t *Text) Set(container string, entry *Entry, at time.Time, who, note strin
 
 	t.lines = slices.Concat(t.lines[:start], rendered, t.lines[end:])
 
-	// The history line goes after the container's last one, or right above
-	// where its entry is (or was).
-	history := historyPattern(container)
+	// The history line goes after the entry's last one, or right above
+	// where the entry is (or was).
+	history := historyPattern(tag)
 	line := fmt.Sprintf("%s# [%s] %s %s: %s",
-		pad, container, at.UTC().Format(time.RFC3339), auditlog.Line(who), auditlog.Line(note))
+		pad, tag, at.UTC().Format(time.RFC3339), auditlog.Line(who), auditlog.Line(note))
 	insert := start
 
 	for i := t.body; i < len(t.lines); i++ {
@@ -223,7 +239,7 @@ func (t *Text) Set(container string, entry *Entry, at time.Time, who, note strin
 		}
 	}
 
-	return t.check(container, entry)
+	return nil
 }
 
 // check reads the changed text back: it must hold the entry as it was
@@ -258,26 +274,7 @@ func (t *Text) check(container string, want *Entry) error {
 // renderOverride writes one entry. Strings are written as JSON strings,
 // which are YAML strings too, so nothing in them can be read as YAML.
 func renderOverride(container string, o *Entry, pad string) []string {
-	quote := func(s string) string {
-		var buf bytes.Buffer
-
-		enc := json.NewEncoder(&buf)
-		enc.SetEscapeHTML(false)
-		// Encoding a string cannot fail.
-		_ = enc.Encode(s)
-
-		return strings.TrimSuffix(buf.String(), "\n")
-	}
-
-	list := func(items []string) string {
-		quoted := make([]string, 0, len(items))
-		for _, item := range items {
-			quoted = append(quoted, quote(item))
-		}
-
-		return "[" + strings.Join(quoted, ", ") + "]"
-	}
-
+	quote, list := jsonString, jsonList
 	in := pad + "  "
 	out := []string{pad + quote(container) + ":"}
 
@@ -320,7 +317,7 @@ func (t *Text) SetGeneratedBlock(block []string) {
 }
 
 // GeneratedContainer is one managed container in the generated block: what
-// the inventory deploys.
+// Ansible deploys.
 type GeneratedContainer struct {
 	Name    string
 	Image   string
@@ -328,14 +325,20 @@ type GeneratedContainer struct {
 }
 
 // GeneratedBlock renders the generated block of the overrides file: the
-// how-to, the local commands and, for every managed container, the default
-// image and command line as commented YAML. The Ansible role writes exactly
-// this; 'upgradoor host init-overrides' writes it where the role is not used.
+// how-to, the local commands and the deployed block: for every managed
+// container the image and command line Ansible deploys. The Ansible role
+// writes the same block; 'upgradoor host init-overrides' writes it where the
+// role is not used.
 func GeneratedBlock(containers []GeneratedContainer) []string {
 	out := []string{
 		overridesBeginLine,
 		"#",
-		"# Temporary overrides of the containers upgradoor manages on this host.",
+		"# What Ansible deployed the containers upgradoor manages on this host as",
+		"# (\"deployed:\" below), and their temporary overrides.",
+		"#",
+		"# Ansible rewrites this block on every run. A soft deploy changes the image",
+		"# or command line here and leaves the restart to upgradoor, which rolls the",
+		"# containers staggered across the devnet. Do not edit the block.",
 		"#",
 		"# Add an entry under \"overrides:\" below this block (by hand, with the commands",
 		"# below, or from the upgradoor page). The agent notices a change within a",
@@ -343,6 +346,7 @@ func GeneratedBlock(containers []GeneratedContainer) []string {
 		"# puts the container back when the entry is removed or its \"until\" has",
 		"# passed. Everything outside this block is yours: the agent only ever",
 		"# changes the entry it is asked to change and adds a comment line above it.",
+		"# What may be overridden is up to the container's group in agent.yaml.",
 		"#",
 		"#   upgradoor host list                      containers, images, flags, overrides",
 		"#   upgradoor host override set <container> [--image REF] [--add-flag F]...",
@@ -365,27 +369,58 @@ func GeneratedBlock(containers []GeneratedContainer) []string {
 		"#     reason: <why>",
 		"#     until: 2030-01-31T12:00:00Z",
 		"#",
-		"# What the inventory deploys on this host:",
+		"# A hold keeps upgradoor off this host: no needs, no work. \"local\" is yours",
+		"# (by hand or with upgradoor host hold); the controller cannot lift it.",
+		"# \"controller\" is written by the agent on the controller's hold:",
+		"#",
+		"# hold:",
+		"#   local:",
+		"#     by: <you>",
+		"#     reason: <why>",
+		"#     until: 2030-01-31T12:00:00Z     # optional",
+		"#",
 	}
 
-	for _, c := range containers {
-		out = append(out, "#", "#   "+c.Name+":", "#     image: "+c.Image)
+	sorted := slices.Clone(containers)
+	slices.SortFunc(sorted, func(a, b GeneratedContainer) int { return strings.Compare(a.Name, b.Name) })
 
-		if len(c.Command) == 0 {
-			out = append(out, "#     command: []")
-
-			continue
-		}
-
-		out = append(out, "#     command:")
-
-		for _, arg := range c.Command {
-			raw, _ := json.Marshal(arg)
-			out = append(out, "#       - "+string(raw))
-		}
+	if len(sorted) == 0 {
+		out = append(out, keyDeployed+": {}")
+	} else {
+		out = append(out, keyDeployed+":")
 	}
 
-	return append(out, "#", overridesEndLine)
+	for _, c := range sorted {
+		out = append(out,
+			"  "+jsonString(c.Name)+":",
+			"    image: "+jsonString(c.Image),
+			"    command: "+jsonList(c.Command))
+	}
+
+	return append(out, overridesEndLine)
+}
+
+// jsonString writes a string as a JSON string, which is a YAML string too:
+// nothing in it can be read as YAML.
+func jsonString(s string) string {
+	var buf bytes.Buffer
+
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	// Encoding a string cannot fail.
+	_ = enc.Encode(s)
+
+	return strings.TrimSuffix(buf.String(), "\n")
+}
+
+// jsonList writes a list of strings as a JSON list.
+func jsonList(items []string) string {
+	quoted := make([]string, 0, len(items))
+	for _, item := range items {
+		quoted = append(quoted, jsonString(item))
+	}
+
+	return "[" + strings.Join(quoted, ", ") + "]"
 }
 
 // File reads and changes the overrides file of the host. Changes

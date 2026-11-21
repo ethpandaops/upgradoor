@@ -63,14 +63,14 @@ function needContainer(n: Need): string {
   return n.image?.container ?? n.override?.container ?? n.spec?.container ?? '';
 }
 
-/** scheduler.ImageGroup: the image rollouts of one client on one reference. */
-function imageGroup(client: string | undefined, image: string): string {
-  return client ? `image:${image}#${client}` : `image:${image}`;
+/** scheduler.GroupName: the group rollouts of one roll group of one client. */
+function groupName(group: string | undefined, client: string | undefined): string {
+  return client ? `group:${group ?? ''}#${client}` : `group:${group ?? ''}`;
 }
 
 function failure(sum: HostSummary, containers: readonly Container[]): string {
   for (const c of containers) {
-    if (sum.broken && imageGroup(c.client, c.image) in sum.broken) return `the last lease for ${c.image} failed`;
+    if (sum.broken && groupName(c.group, c.client) in sum.broken) return `the last lease for ${c.image} failed`;
     if (c.state !== 'running' && shouldRun(c)) return `container ${c.name} is ${c.state}`;
   }
 

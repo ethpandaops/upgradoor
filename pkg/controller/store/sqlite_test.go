@@ -343,6 +343,8 @@ func TestLifecycle(t *testing.T) {
 }
 
 func TestRestartPersistence(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	path := filepath.Join(t.TempDir(), "upgradoor.db")
 
@@ -445,6 +447,8 @@ func TestSchemaVersion(t *testing.T) {
 }
 
 func TestEscapeLike(t *testing.T) {
+	t.Parallel()
+
 	tests := []struct{ in, want string }{
 		{"libc6", "libc6"},
 		{"100%", `100\%`},
@@ -461,6 +465,8 @@ func TestEscapeLike(t *testing.T) {
 // TestConcurrentUse runs writers and readers of every kind against one store
 // at once; with -race it also checks the store for data races.
 func TestConcurrentUse(t *testing.T) {
+	t.Parallel()
+
 	const (
 		writers = 6
 		readers = 6
@@ -469,6 +475,8 @@ func TestConcurrentUse(t *testing.T) {
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
@@ -648,6 +656,8 @@ func fillHistory(t *testing.T, s Store, ended int) {
 // finds its rows through an index, so a tick costs what is open, however
 // long the controller has run and however large the fleet is.
 func TestTickQueriesDoNotScanTheHistory(t *testing.T) {
+	t.Parallel()
+
 	tick := []struct {
 		name  string
 		table string
@@ -684,6 +694,8 @@ func TestTickQueriesDoNotScanTheHistory(t *testing.T) {
 	for _, filled := range []bool{false, true} {
 		for _, backend := range backends {
 			t.Run(fmt.Sprintf("%s/filled=%t", backend.name, filled), func(t *testing.T) {
+				t.Parallel()
+
 				s := backend.open(t)
 
 				if filled {
@@ -707,10 +719,14 @@ func TestTickQueriesDoNotScanTheHistory(t *testing.T) {
 
 // The open states of the queries are the ones Terminal does not name.
 func TestOpenQueriesReturnExactlyTheOpenRows(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 			fillHistory(t, s, 30)
 
@@ -763,10 +779,14 @@ func containsState(states []fleet.LeaseState, state fleet.LeaseState) bool {
 // A commit sets holds in the transaction of its leases: either both are
 // stored or neither.
 func TestCommitHolds(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			_, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-1"), Request: testRequest(), At: at(0)})

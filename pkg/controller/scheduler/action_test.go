@@ -1472,7 +1472,7 @@ func TestClientOverride(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a", "b"}, res.Hosts)
 	assert.Equal(t, map[string]string{
-		"c":     "host c does not allow flag overrides of teku (overrides.flags in its agent.yaml)",
+		"c":     `the group "" of teku on host c does not allow flag overrides`,
 		"d":     "host d runs no cl container of teku",
 		"ghost": "unknown host",
 	}, res.Rejected)
@@ -1512,7 +1512,7 @@ func TestOverrideActions(t *testing.T) {
 	h.addHost("a", 0)
 	h.sync("a", func(st *protocol.SyncRequest) {
 		st.Containers = []protocol.Container{
-			{Name: "geth", Managed: true, Overridable: &protocol.Overridable{Images: []string{"ethpandaops/*"}}},
+			{Name: "geth", Managed: true, Overridable: &protocol.Overridable{Image: true}},
 			{Name: "beacon", Managed: true, Overridable: &protocol.Overridable{Flags: true}},
 			{Name: "plain", Managed: true},
 			{Name: "debug"},
@@ -1557,12 +1557,12 @@ func TestOverrideActions(t *testing.T) {
 			_, callErr := h.svc.ImageOverride(ctx, "sam", ImageOverrideRequest{Host: "a", Container: "plain", Image: "x/y:z"})
 
 			return callErr
-		}, "does not allow image overrides of plain"},
+		}, "container plain on host a cannot be overridden"},
 		"the host allows no flag override of it": {func() error {
 			_, callErr := h.svc.FlagOverride(ctx, "sam", FlagOverrideRequest{Host: "a", Container: "geth", AddFlags: []string{"--x"}})
 
 			return callErr
-		}, "does not allow flag overrides of geth"},
+		}, "of geth on host a does not allow flag overrides"},
 		"not a managed container": {func() error {
 			_, callErr := h.svc.ImageOverride(ctx, "sam", ImageOverrideRequest{Host: "a", Container: "debug", Image: "x/y:z"})
 

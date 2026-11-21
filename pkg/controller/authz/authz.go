@@ -440,7 +440,9 @@ func OwnershipOf(hosts []*fleet.Host) map[string]*hostOwnership {
 
 			for i := range host.Status.Containers {
 				if c := &host.Status.Containers[i]; c.Managed {
-					own.containers = append(own.containers, containerOwners{name: c.Name, owners: c.Owners})
+					own.containers = append(own.containers, containerOwners{
+						name: c.Name, owners: c.Owners, notRolled: c.NotRolled != "",
+					})
 				}
 			}
 		}
@@ -465,6 +467,10 @@ type hostOwnership struct {
 type containerOwners struct {
 	name   string
 	owners []string
+	// notRolled: the host rolls the container to nothing (pinned, linked, or
+	// of the default group on a host that does not roll it), so a roll of
+	// the whole host does not touch it.
+	notRolled bool
 }
 
 // ownedBy reports whether one of the teams is among the owners. Names are
@@ -513,7 +519,7 @@ func UncoveredOn(teams []string, host string, own *hostOwnership, t *Targets) st
 		}
 
 		for _, c := range own.containers {
-			if !ownedBy(teams, c.owners) {
+			if !c.notRolled && !ownedBy(teams, c.owners) {
 				return uncoveredContainer(c.name, host, c.owners)
 			}
 		}

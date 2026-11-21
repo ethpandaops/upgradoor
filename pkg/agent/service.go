@@ -3,286 +3,26 @@ package agent
 import (
 	"context"
 	"errors"
-	"fmt"
 	"slices"
-	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent/auditlog"
-	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
-	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
+	"github.com/ethpandaops/upgradoor/pkg/agent/journal"
+	"github.com/ethpandaops/upgradoor/pkg/agent/local"
+	"github.com/ethpandaops/upgradoor/pkg/agent/needs"
+	"github.com/ethpandaops/upgradoor/pkg/agent/operation"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// Deps are the host-facing parts of the agent.
-type Deps struct {
-	// Runtime, Registry and System are required.
-	Runtime  hostapi.ContainerRuntime
-	Registry hostapi.Registry
-	System   hostapi.System
-	// Prober checks the local nodes; nil reports no node health.
-	Prober hostapi.Prober
-	// Now is the clock (default time.Now).
-	Now func() time.Time
-	// Version is the agent version reported to the controller (default
-	// "dev").
-	Version string
-}
-
-// service is the agent: a sync loop, an image watcher and, while a lease is
-// open, one operation.
-type service struct {
-	log     logrus.FieldLogger
-	cfg     *Config
-	deps    Deps
-	now     func() time.Time
-	version string
-
-	// host and network are the names of the certificate.
-	host    string
-	network string
-
-	client  *controllerClient
-	holds   *holds
-	watcher *imageWatcher
-	// audit is the host's audit log.
-	audit auditlog.Log
-	// overridesFile is the host's overrides file; overrideMu serializes its
-	// readers and writers (the loop, the local socket). seenOverrides and
-	// overridesErr are what the loop last saw of it.
-	overridesFile *overrides.File
-	overrideMu    sync.Mutex
-	seenOverrides map[string]overrides.Entry
-	overridesErr  string
-	// localState is what the local socket serves.
-	localState localState
-	// store is opened by Start.
-	store *stateStore
-
-	mu      sync.Mutex
-	started bool
-	cancel  context.CancelFunc
-	wg      sync.WaitGroup
-
-	// asked is the interval the controller's last answer asked for; zero
-	// after a failed sync. Only the loop touches it.
-	asked time.Duration
-
-	// kick asks the loop for a sync now (an operation changed phase).
-	kick chan struct{}
-	// inventoryTimeout bounds one hostapi.System.Inventory call.
-	inventoryTimeout time.Duration
-	// opActive is true while the operation goroutine runs.
-	opActive atomic.Bool
-
-	// The fields below belong to the loop goroutine.
-
-	// lastContainers and lastSys are the last good observations.
-	lastContainers []protocol.Container
-	lastSys        *hostapi.SystemStatus
-	// repeated are the directive IDs of the last response.
-	repeated     []string
-	pendingRolls map[string]pendingRoll
-	// lastQueue and ignoredLease only keep the log quiet.
-	lastQueue    protocol.Queue
-	ignoredLease string
-	syncFailing  bool
-	// answerRefused is true while the controller's answers fail
-	// verification; it keeps that to one log line per episode.
-	answerRefused bool
-	// lastValidators is the validator range last reported, to log changes.
-	lastValidators *protocol.Validators
-}
-
-var _ Service = (*service)(nil)
-
-// New returns the agent. Start opens the state directory and begins to
-// observe and sync.
-//
-//nolint:gocritic // hugeParam: Deps is passed by value once, at construction
-func New(
-	log logrus.FieldLogger, cfg *Config, creds *identity.Credentials, deps Deps,
-) (Service, error) {
-	switch {
-	case log == nil:
-		return nil, errors.New("agent: no logger")
-	case cfg == nil:
-		return nil, errors.New("agent: no configuration")
-	case creds == nil:
-		return nil, errors.New("agent: no credentials")
-	case deps.Runtime == nil || deps.Registry == nil || deps.System == nil:
-		return nil, errors.New("agent: container runtime, registry and system are required")
-	}
-
-	if err := cfg.Validate(); err != nil {
-		return nil, fmt.Errorf("agent: configuration: %w", err)
-	}
-
-	if cfg.StateDir == "" || cfg.Controller.SyncInterval <= 0 ||
-		cfg.Controller.LeaseSyncInterval <= 0 || cfg.Controller.MinSyncInterval <= 0 ||
-		cfg.Controller.MaxSyncInterval < cfg.Controller.MinSyncInterval || cfg.Registry.PollInterval <= 0 ||
-		cfg.Verify.Window <= 0 || cfg.Verify.Timeout <= 0 {
-		return nil, errors.New("agent: configuration without defaults (call ApplyDefaults)")
-	}
-
-	if deps.Now == nil {
-		deps.Now = time.Now
-	}
-
-	if deps.Version == "" {
-		deps.Version = "dev"
-	}
-
-	log = log.WithField("package", "agent")
-
-	claims, err := identity.UnverifiedClaims(creds.Certificate())
-	if err != nil {
-		return nil, fmt.Errorf("agent: host certificate: %w", err)
-	}
-
-	log = log.WithFields(logrus.Fields{"host": claims.Subject, "network": claims.Network})
-
-	answers, err := newAnswerVerifier(log, cfg, claims)
-	if err != nil {
-		return nil, err
-	}
-
-	return &service{
-		log:           log,
-		cfg:           cfg,
-		deps:          deps,
-		now:           deps.Now,
-		version:       deps.Version,
-		host:          claims.Subject,
-		network:       claims.Network,
-		client:        newControllerClient(cfg.Controller.URL, creds, answers, deps.Now),
-		holds:         newHolds(cfg),
-		audit:         auditlog.New(log, cfg.AuditLog, deps.Now),
-		overridesFile: overrides.NewFile(cfg.OverridesFile),
-		// Without the roll verb the tags are still looked up, for the report,
-		// but nothing is pulled: this host never rolls, and a pulled image
-		// would be picked up by whoever recreates the container next.
-		watcher: newImageWatcher(
-			log, deps.Runtime, deps.Registry, cfg.Registry.PollInterval, deps.Now,
-			cfg.Allows(protocol.VerbRoll)),
-		kick:             make(chan struct{}, 1),
-		inventoryTimeout: inventoryTimeout,
-		pendingRolls:     make(map[string]pendingRoll, 4),
-	}, nil
-}
-
-// newAnswerVerifier builds the check of the controller's answers from the
-// configured controller keys, for the host and network of the certificate.
-// Without keys (controller.allowUnsignedAnswers) there is none, and it says
-// so loudly.
-func newAnswerVerifier(
-	log logrus.FieldLogger, cfg *Config, claims *identity.Claims,
-) (*identity.AnswerVerifier, error) {
-	keys, err := cfg.Controller.ControllerKeys()
-	if err != nil {
-		return nil, fmt.Errorf("agent: configuration: %w", err)
-	}
-
-	if len(keys) == 0 {
-		log.Warn("INSECURE: controller.allowUnsignedAnswers is set and no controller " +
-			"public key is configured. The controller's answers are NOT verified: this " +
-			"host acts on whatever answers under controller.url. Development only.")
-
-		return nil, nil //nolint:nilnil // no verifier and no error is the opt-out
-	}
-
-	answers, err := identity.NewAnswerVerifier(keys, claims.Network, claims.Subject)
-	if err != nil {
-		return nil, fmt.Errorf("agent: controller keys: %w", err)
-	}
-
-	prints := make([]string, 0, len(keys))
-	for _, key := range keys {
-		prints = append(prints, identity.KeyFingerprint(key))
-	}
-
-	log.WithField("controller_keys_sha256", prints).
-		Info("acting only on answers signed by one of the configured controller keys")
-
-	return answers, nil
-}
-
-// Start opens the state file and starts the sync loop and the image
-// watcher. An operation found in the state file is continued. The loop and
-// the watcher stop when ctx ends or Stop is called; an operation first
-// finishes its disruptive steps (see Stop, which waits for it).
-func (s *service) Start(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	if s.started {
-		return errors.New("agent: already started")
-	}
-
-	store, err := openStateStore(s.log, s.cfg.StateDir)
-	if err != nil {
-		return fmt.Errorf("agent: %w", err)
-	}
-
-	s.store = store
-	s.started = true
-
-	runCtx, cancel := context.WithCancel(ctx)
-	s.cancel = cancel
-
-	s.log.WithFields(logrus.Fields{
-		"controller": s.cfg.Controller.URL,
-		"verbs":      s.cfg.Verbs,
-		"containers": len(s.cfg.Containers),
-		"version":    s.version,
-	}).Info("agent started")
-
-	s.startLocal(runCtx)
-
-	s.wg.Go(func() { s.watcher.run(runCtx) })
-	s.wg.Go(func() { s.loop(runCtx) })
-
-	return nil
-}
-
-// Stop ends the loop and the watcher and waits for them and for a running
-// operation.
-//
-// An operation is not cut short in its draining and applying phases: a
-// recreate or a package upgrade in flight, the steps after it and the reboot
-// are carried through first, each bounded by its own timeout, and Stop
-// returns only then. That can take as long as the stop timeouts of the
-// containers plus a package upgrade, so the unit's TimeoutStopSec should
-// allow for it; a process killed before that resumes the operation as
-// failed. An operation that is waiting (for the reboot, for containers to
-// start or to stay up) ends at once, stays in the state file and is
-// continued by the next Start.
-func (s *service) Stop() error {
-	s.mu.Lock()
-	cancel := s.cancel
-	s.cancel = nil
-	s.mu.Unlock()
-
-	if cancel == nil {
-		return nil
-	}
-
-	cancel()
-
-	if s.opActive.Load() {
-		s.log.Info("stopping: waiting for the open operation to finish its disruptive steps")
-	}
-
-	s.wg.Wait()
-
-	s.log.Info("agent stopped")
-
-	return nil
-}
+// Bounds of the single calls of a cycle.
+const (
+	observeTimeout = 30 * time.Second
+	statusTimeout  = 30 * time.Second
+	// inventoryTimeout bounds the collection of the package inventory.
+	inventoryTimeout = 2 * time.Minute
+)
 
 // loop syncs until ctx ends: when the controller's last answer asked, kept
 // within MinSyncInterval and MaxSyncInterval; without such an answer every
@@ -294,7 +34,7 @@ func (s *service) loop(ctx context.Context) {
 		s.ensureOperation(ctx)
 
 		soon := s.cycle(ctx)
-		wait := s.interval()
+		wait := s.client.Interval(s.busy())
 
 		if soon {
 			wait = min(wait, s.cfg.Controller.LeaseSyncInterval, time.Second)
@@ -312,17 +52,10 @@ func (s *service) loop(ctx context.Context) {
 	}
 }
 
-// interval is the time to the next regular sync.
-func (s *service) interval() time.Duration {
-	if s.asked > 0 {
-		return min(max(s.asked, s.cfg.Controller.MinSyncInterval), s.cfg.Controller.MaxSyncInterval)
-	}
-
-	if s.store.Snapshot().Current != nil || len(s.pendingRolls) > 0 || s.localRollsOpen() {
-		return s.cfg.Controller.LeaseSyncInterval
-	}
-
-	return s.cfg.Controller.SyncInterval
+// busy reports whether a lease or a roll is open: the loop then syncs at the
+// pace of a lease until the controller says otherwise.
+func (s *service) busy() bool {
+	return s.store.Snapshot().Current != nil || s.directives.Pending() || s.local.RollsOpen()
 }
 
 // cycle observes the host and syncs once. It reports whether another sync
@@ -333,8 +66,18 @@ func (s *service) cycle(ctx context.Context) bool {
 		return false
 	}
 
-	s.takeLocalRolls(obs)
-	s.resolvePendingRolls(obs)
+	// The rolls asked for on the host since the last cycle wait for the
+	// registry lookup and the pull of their image like a roll directive.
+	requests := s.local.TakeRequests()
+
+	for i := range requests {
+		roll := &requests[i]
+		if reason := s.directives.AwaitLocalRoll(roll.ID, roll.Container, obs); reason != "" {
+			s.local.SetRoll(roll.ID, local.RollRejected, reason)
+		}
+	}
+
+	s.directives.Resolve(obs)
 	s.reconcileManual(obs)
 
 	st := s.store.Snapshot()
@@ -342,9 +85,8 @@ func (s *service) cycle(ctx context.Context) bool {
 
 	resp, err := s.client.Sync(ctx, req)
 	if err != nil {
-		s.asked = 0
-		s.followLocalRolls(&st, nil)
-		s.publishLocal(obs, req, &st)
+		s.local.Follow(&st, nil)
+		s.local.Publish(obs, req, &st, s.lastQueue, s.syncFailing)
 
 		if ctx.Err() != nil {
 			return false
@@ -372,6 +114,12 @@ func (s *service) cycle(ctx context.Context) bool {
 		s.syncFailing = true
 		s.answerRefused = refused
 
+		// Not heard from the controller for a while: the tags are looked
+		// up on the agent's own, slow schedule.
+		if s.lastAnswer.IsZero() || s.now().Sub(s.lastAnswer) > s.lookupFallback {
+			s.watcher.SetFallback(true)
+		}
+
 		return false
 	}
 
@@ -382,13 +130,24 @@ func (s *service) cycle(ctx context.Context) bool {
 		s.answerRefused = false
 	}
 
-	s.asked = time.Duration(resp.NextSyncMillis) * time.Millisecond
+	s.lastAnswer = s.now()
+
+	if resp.LookupFallbackSeconds > 0 {
+		s.lookupFallback = time.Duration(resp.LookupFallbackSeconds) * time.Second
+	}
+
+	// The controller coordinates the lookups: the tags this host is to look
+	// up, what other hosts saw, and what this host may pull.
+	s.watcher.SetFallback(false)
+	s.watcher.Relay(resp.Digests)
+	s.watcher.Lookup(resp.Lookups)
+	s.watcher.SetWindow(resp.Pull)
 
 	s.logQueue(resp.Queue)
-	s.followLocalRolls(&st, resp)
-	s.publishLocal(obs, req, &st)
+	s.local.Follow(&st, resp)
+	s.local.Publish(obs, req, &st, s.lastQueue, s.syncFailing)
 
-	soon := s.handleDirectives(resp.Directives, obs)
+	soon := s.directives.Handle(resp.Directives, obs)
 
 	if s.handleLease(ctx, resp.Lease, req.Operation) {
 		soon = true
@@ -403,10 +162,8 @@ func (s *service) cycle(ctx context.Context) bool {
 
 // observe looks at the host. A part that cannot be read is logged and the
 // last good value is reported instead.
-func (s *service) observe(ctx context.Context) *observation {
-	s.cfg.Reload(s.log)
-
-	obs := &observation{hold: s.holds.Read()}
+func (s *service) observe(ctx context.Context) *needs.Observation {
+	obs := &needs.Observation{Hold: s.overrides.Hold()}
 
 	cctx, cancel := context.WithTimeout(ctx, observeTimeout)
 	containers, err := s.deps.Runtime.Observe(cctx)
@@ -418,21 +175,21 @@ func (s *service) observe(ctx context.Context) *observation {
 
 		containers = slices.Clone(s.lastContainers)
 	} else {
-		obs.containersFresh = true
+		obs.ContainersFresh = true
 		s.lastContainers = slices.Clone(containers)
 	}
 
-	tags, targets := enrichContainers(s.cfg, containers, s.refreshOverrides(), s.watcher.Check)
-	obs.containers = containers
-	obs.targets = targets
-	obs.check = s.watcher.Check
+	tags, targets := needs.Enrich(s.cfg, containers, s.overrides.Refresh(), s.watcher.Check)
+	obs.Containers = containers
+	obs.Targets = targets
+	obs.Check = s.watcher.Check
 
-	if obs.containersFresh {
+	if obs.ContainersFresh {
 		s.watcher.Track(tags)
 	}
 
 	if s.deps.Prober != nil {
-		obs.node = s.deps.Prober.Probe(ctx)
+		obs.Node = s.deps.Prober.Probe(ctx)
 	}
 
 	cctx, cancel = context.WithTimeout(ctx, statusTimeout)
@@ -447,27 +204,27 @@ func (s *service) observe(ctx context.Context) *observation {
 		s.lastSys = sys
 	}
 
-	obs.sys = s.lastSys
+	obs.Sys = s.lastSys
 
 	return obs
 }
 
 // reconcileManual drops manual needs that stopped qualifying and lets
 // manual image needs follow their tag.
-func (s *service) reconcileManual(obs *observation) {
+func (s *service) reconcileManual(obs *needs.Observation) {
 	st := s.store.Snapshot()
 	if len(st.ManualNeeds) == 0 {
 		return
 	}
 
-	kept, dropped, changed := reconcileManualNeeds(s.cfg, obs, st.ManualNeeds)
+	kept, dropped, changed := needs.Reconcile(s.cfg, obs, st.ManualNeeds)
 	if !changed {
 		return
 	}
 
 	// The operation goroutine may close manual needs at the same time, so
 	// the change is applied to whatever is stored now.
-	err := s.store.Update(func(st *persistedState) {
+	err := s.store.Update(func(st *journal.State) {
 		next := make([]protocol.Need, 0, len(st.ManualNeeds))
 
 		for _, n := range st.ManualNeeds {
@@ -497,21 +254,22 @@ func (s *service) reconcileManual(obs *observation) {
 }
 
 // buildRequest restates the complete state of the host.
-func (s *service) buildRequest(obs *observation, st *persistedState) *protocol.SyncRequest {
+func (s *service) buildRequest(obs *needs.Observation, st *journal.State) *protocol.SyncRequest {
 	req := &protocol.SyncRequest{
 		ProtocolVersion: protocol.Version,
 		AgentVersion:    s.version,
 		SentAt:          s.now().UTC(),
 		Verbs:           append([]protocol.Verb{}, s.cfg.Verbs...),
-		Hold:            obs.hold,
-		Containers:      withMissing(s.cfg, obs.containers),
-		Node:            obs.node,
-		Needs:           computeNeeds(s.cfg, obs, st.ManualNeeds),
-		DirectiveAcks:   s.directiveAcks(st),
+		Hold:            obs.Hold,
+		Containers:      slices.Clone(obs.Containers),
+		Node:            obs.Node,
+		Needs:           needs.Compute(s.cfg, obs, st.ManualNeeds),
+		DirectiveAcks:   s.directives.Acks(st),
+		Pulling:         s.watcher.Pulling(),
 		Validators:      s.validators(),
 	}
 
-	if sys := obs.sys; sys != nil {
+	if sys := obs.Sys; sys != nil {
 		req.BootID = sys.BootID
 		req.UptimeSeconds = int64(sys.Uptime / time.Second)
 		req.OS = sys.OS
@@ -531,7 +289,7 @@ func (s *service) buildRequest(obs *observation, st *persistedState) *protocol.S
 // validators reads the host's validator range for a sync and logs it when it
 // differs from the one reported last.
 func (s *service) validators() *protocol.Validators {
-	v := s.cfg.Validators.report()
+	v := needs.Validators(&s.cfg.Validators)
 
 	switch {
 	case v == nil && s.lastValidators == nil:
@@ -596,7 +354,7 @@ func (s *service) handleLease(
 			return false
 		}
 
-		err := s.store.Update(func(st *persistedState) { st.Current = nil })
+		err := s.store.Update(func(st *journal.State) { st.Current = nil })
 		if err != nil {
 			s.log.WithError(err).Error("cannot drop the finished operation")
 
@@ -622,7 +380,7 @@ func (s *service) handleLease(
 func (s *service) withdrawLease(id string) {
 	withdrawn := false
 
-	err := s.store.Update(func(st *persistedState) {
+	err := s.store.Update(func(st *journal.State) {
 		cur := st.Current
 		if cur == nil || cur.Lease.ID != id || cur.Started || cur.Withdrawn {
 			return
@@ -651,7 +409,7 @@ func (s *service) withdrawLease(id string) {
 func (s *service) cancelLease(id string) {
 	cancelled := false
 
-	err := s.store.Apply(func(st *persistedState) {
+	err := s.store.Apply(func(st *journal.State) {
 		cur := st.Current
 		if cur == nil || cur.Lease.ID != id || cur.Cancelled || cur.Operation.Phase.Terminal() {
 			return
@@ -697,7 +455,7 @@ func (s *service) acceptLease(ctx context.Context, lease *protocol.Lease) bool {
 		return false
 	}
 
-	rec := &operationRecord{
+	rec := &journal.Record{
 		Lease:    *lease,
 		Deadline: leaseDeadline(lease, s.now()),
 		Operation: protocol.Operation{
@@ -705,7 +463,7 @@ func (s *service) acceptLease(ctx context.Context, lease *protocol.Lease) bool {
 			Steps:   make([]protocol.Step, 0, len(lease.Needs)),
 		},
 	}
-	rec.Lease.Needs = cloneNeeds(lease.Needs)
+	rec.Lease.Needs = needs.Clone(lease.Needs)
 
 	for i := range lease.Needs {
 		rec.Operation.Steps = append(rec.Operation.Steps, protocol.Step{
@@ -713,7 +471,7 @@ func (s *service) acceptLease(ctx context.Context, lease *protocol.Lease) bool {
 		})
 	}
 
-	if err := s.store.Update(func(st *persistedState) { st.Current = rec }); err != nil {
+	if err := s.store.Update(func(st *journal.State) { st.Current = rec }); err != nil {
 		// Not persisted, not acted on. The controller restates the lease.
 		log.WithError(err).Error("cannot persist the lease; not acting on it")
 
@@ -755,24 +513,24 @@ func (s *service) ensureOperation(ctx context.Context) {
 		return
 	}
 
-	op := &operation{
-		log:      s.log.WithField("component", "operation"),
-		cfg:      s.cfg,
-		runtime:  s.deps.Runtime,
-		registry: s.deps.Registry,
-		system:   s.deps.System,
-		holds:    s.holds,
-		store:    s.store,
-		now:      s.now,
-		poll:     s.pollInterval(),
-		notify:   s.requestSync,
-		audit:    s.audit,
-	}
+	op := operation.New(&operation.Deps{
+		Log:      s.log.WithField("component", "operation"),
+		Config:   s.cfg,
+		Runtime:  s.deps.Runtime,
+		Registry: s.deps.Registry,
+		System:   s.deps.System,
+		Holds:    s.overrides,
+		Store:    s.store,
+		Now:      s.now,
+		Poll:     s.pollInterval(),
+		Notify:   s.requestSync,
+		Audit:    s.audit,
+	})
 
 	s.wg.Go(func() {
 		defer s.opActive.Store(false)
 
-		op.run(ctx)
+		op.Run(ctx)
 	})
 }
 

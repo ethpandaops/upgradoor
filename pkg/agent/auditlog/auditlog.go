@@ -88,6 +88,11 @@ const MaxLine = 512
 // "refused: " prefix.
 var ErrRefused = errors.New(Refused)
 
+// Refusal is an ErrRefused with the reason the format says.
+func Refusal(format string, args ...any) error {
+	return fmt.Errorf("%w: %s", ErrRefused, fmt.Sprintf(format, args...))
+}
+
 // Line is free text as the agent keeps it in a record, a hold or the
 // overrides file: its first line, control characters as blanks, valid
 // UTF-8, trimmed and at most MaxLine bytes.

@@ -732,10 +732,13 @@
     "policyPackages": "auto",
     "policyReboot": "manual",
     "policyClients": {},
+    "policyDefaultGroup": "auto",
     "pauseAfterCanaryImage": false,
     "pauseAfterCanaryPackages": false,
     "pauseAfterCanaryReboot": false,
     "readyPeerShare": 0,
+    "lookupInterval": "5m0s",
+    "maxPullingPercent": 10,
     "paused": false
    },
    "defaults": {
@@ -752,10 +755,13 @@
     "policyPackages": "auto",
     "policyReboot": "manual",
     "policyClients": {},
+    "policyDefaultGroup": "auto",
     "pauseAfterCanaryImage": false,
     "pauseAfterCanaryPackages": false,
     "pauseAfterCanaryReboot": false,
     "readyPeerShare": 0,
+    "lookupInterval": "5m0s",
+    "maxPullingPercent": 10,
     "paused": false
    }
   }
@@ -870,7 +876,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "0acf0d79c302"
+  "v": "295c746b8efc"
  },
  "user": {
   "a": {
@@ -913,6 +919,7 @@
          0,
          0,
          0,
+         0,
          [
           [
            [
@@ -926,6 +933,7 @@
         [
          "reboot",
          "reboot",
+         0,
          0,
          0,
          0,
@@ -1035,7 +1043,9 @@
          2,
          1794654000,
          1,
+         0,
          "el",
+         0,
          0,
          "ethereum/client-go:stable",
          [
@@ -1063,7 +1073,9 @@
          0,
          1794654000,
          1,
+         0,
          "cl",
+         0,
          0,
          "sigp/lighthouse:unstable",
          [
@@ -1090,7 +1102,9 @@
          0,
          0,
          1,
+         0,
          "vc",
+         0,
          0,
          "sigp/zz-validator:unstable"
         ],
@@ -1162,6 +1176,7 @@
          0,
          0,
          0,
+         0,
          [
           [
            [
@@ -1175,6 +1190,7 @@
         [
          "reboot",
          "reboot",
+         0,
          0,
          0,
          0,
@@ -1466,6 +1482,7 @@
        0,
        0,
        0,
+       0,
        [
         [
          [
@@ -1479,6 +1496,7 @@
       [
        "reboot",
        35,
+       0,
        0,
        0,
        0,
@@ -1604,8 +1622,6 @@
      0,
      0,
      0,
-     0,
-     0,
      41,
      0,
      1,
@@ -1698,7 +1714,16 @@
       52,
       [
        {}
-      ]
+      ],
+      51,
+      0,
+      0,
+      0,
+      0,
+      [
+       "5m0s"
+      ],
+      10
      ],
      [
       10,
@@ -1721,7 +1746,16 @@
       52,
       [
        {}
-      ]
+      ],
+      51,
+      0,
+      0,
+      0,
+      0,
+      [
+       "5m0s"
+      ],
+      10
      ]
     ]
    ]
@@ -1744,7 +1778,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "0acf0d79c302"
+  "v": "295c746b8efc"
  },
  "patch": {
   "h": {

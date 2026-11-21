@@ -370,7 +370,7 @@ func (s *sqliteStore) Commit(ctx context.Context, changes *Changes) error {
 		}
 
 		for _, hold := range changes.Holds {
-			if err := setHostHold(ctx, tx, hold.Host, hold.Wanted, hold.Reason, hold.By); err != nil {
+			if err := setHostHold(ctx, tx, hold.Host, hold.Wanted, hold.Reason, hold.By, hold.Actor); err != nil {
 				return fmt.Errorf("hold of %s: %w", hold.Host, err)
 			}
 		}
@@ -384,6 +384,12 @@ func (s *sqliteStore) Commit(ctx context.Context, changes *Changes) error {
 		for _, marks := range changes.Broken {
 			if err := setHostBroken(ctx, tx, marks.Host, marks.Marks); err != nil {
 				return fmt.Errorf("broken marks of %s: %w", marks.Host, err)
+			}
+		}
+
+		for _, pull := range changes.Pulls {
+			if err := setHostPull(ctx, tx, pull.Host, pull.Window); err != nil {
+				return fmt.Errorf("pull window of %s: %w", pull.Host, err)
 			}
 		}
 

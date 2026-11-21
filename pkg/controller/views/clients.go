@@ -287,7 +287,7 @@ func clientFailure(sum *HostSummary, containers []protocol.Container) string {
 	for i := range containers {
 		c := &containers[i]
 
-		if _, broken := sum.Broken[scheduler.ImageGroup(c.Client, c.Image)]; broken {
+		if _, broken := sum.Broken[scheduler.ContainerGroupName(c)]; broken {
 			return "the last lease for " + c.Image + " failed"
 		}
 

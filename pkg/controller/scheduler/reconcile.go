@@ -30,15 +30,12 @@ func operatorSkipped(m *fleet.RolloutHost) bool {
 }
 
 // needKey is the key of the rollout an observed need belongs to; empty for
-// the need of a manual directive.
+// the need of a manual directive, a local need and a group need (which
+// belongs to its group's rollout when that holds it: assignGroupNeeds).
 func needKey(n *protocol.Need) string {
 	switch {
-	case n.DirectiveID != "", isLocal(n):
+	case n.DirectiveID != "", isLocal(n), isGroupNeed(n):
 		return ""
-	case n.Kind == protocol.NeedImage && n.Image != nil:
-		return imageKey(n.Image.Client, n.Image.Image, n.Image.ToDigest)
-	case n.Kind == protocol.NeedSpec && n.Spec != nil:
-		return specKey(n.Spec.Client, n.Spec.Container, n.Spec.Key)
 	case n.Kind == protocol.NeedPackages && n.Packages != nil:
 		return prefixPackages + protocol.PackagesKey(n.Packages.Packages)
 	case n.Kind == protocol.NeedReboot:
@@ -86,8 +83,10 @@ type Outcome struct {
 	// Broken are the broken marks of the hosts on which a lease failed or
 	// was released in this pass, as they are from now on.
 	Broken []store.HostBroken
-	Audit  []fleet.AuditEntry
-	Plan   *Plan
+	// Pulls are the pull windows that were granted, changed or ended.
+	Pulls []store.HostPull
+	Audit []fleet.AuditEntry
+	Plan  *Plan
 }
 
 // Changes returns the outcome as one store transaction.
@@ -97,6 +96,7 @@ func (o *Outcome) Changes() *store.Changes {
 		Leases:     o.Leases,
 		Directives: o.Directives,
 		Broken:     o.Broken,
+		Pulls:      o.Pulls,
 		Audit:      o.Audit,
 	}
 }
@@ -113,7 +113,11 @@ func Reconcile(w *World) *Outcome {
 
 	plan := p.grant()
 
-	return p.outcome(plan)
+	pulls := p.pulls(plan)
+	out := p.outcome(plan)
+	out.Pulls = pulls
+
+	return out
 }
 
 // hostView is one host with what the pass derives about it.

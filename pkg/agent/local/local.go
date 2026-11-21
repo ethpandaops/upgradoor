@@ -84,6 +84,9 @@ type Container struct {
 	// Target is the image the container is to run, when that is not the one
 	// it runs.
 	Target string `json:"target,omitempty"`
+	// Unlabelled is true when the name map of agent.yaml puts the container
+	// in its group: the next recreate adds the labels.
+	Unlabelled bool `json:"unlabelled,omitempty"`
 }
 
 // Roll is one roll requested through the socket, and how far it got.

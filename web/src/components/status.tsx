@@ -9,6 +9,7 @@ import {
   type Need,
   type OfflineMark,
   type PublicImageRef,
+  type PullState,
   type RolloutKind,
   type RolloutState,
   type Stage,
@@ -42,15 +43,16 @@ const ROLLOUT_TONE: Record<RolloutState, Tone> = {
 };
 
 /**
- * RolloutKindBadge names the kind of a rollout. A local rollout is what a
- * host asked for itself (an override, a roll from its command line): one
- * host, no policy, no canary.
+ * RolloutKindBadge names the kind of a rollout. A group rollout moves the
+ * containers of one roll group of one client. A local rollout is what a host
+ * asked for itself (an override, a roll from its command line): one host, no
+ * policy, no canary.
  */
 export function RolloutKindBadge({ kind }: { kind: RolloutKind }) {
-  if (kind === 'spec') {
+  if (kind === 'group') {
     return (
-      <Badge title="agent.yaml names another image or command line for a container: Ansible's soft deploy, rolled under the image policy">
-        spec
+      <Badge title="Moves the containers of one roll group of one client together, by one lease per host: the new digests of the group's tags and Ansible's soft deploys of its containers, under the image policy">
+        group
       </Badge>
     );
   }
@@ -281,6 +283,16 @@ export function NeedLine({ need }: { need: Need }) {
           </span>
         ))}
       {need.kind === 'reboot' && <span>{list(need.reboot?.reasons).join(', ')}</span>}
+      {list(need.unpulled).length > 0 && (
+        <Badge
+          tone="neutral"
+          title={`Not on the host yet: ${list(need.unpulled)
+            .map(i => `${i.ref}@${shortDigest(i.digest)}`)
+            .join(', ')}`}
+        >
+          not pulled
+        </Badge>
+      )}
       {need.directiveId && <Badge title={`directive ${need.directiveId}`}>manual</Badge>}
     </span>
   );
@@ -297,6 +309,37 @@ export function WorkTag({ kind }: { kind: keyof typeof WORK_LABEL }) {
       {WORK_LABEL[kind]}
     </span>
   );
+}
+
+const PULL: Record<PullState, { tone: Tone; label: string; title: string }> = {
+  waiting: {
+    tone: 'neutral',
+    label: 'waiting for a pull window',
+    title:
+      'Its needs wait for images that are not on the host yet; only a share of the hosts pulls at once (Max pulling)',
+  },
+  pulling: {
+    tone: 'accent',
+    label: 'pulling',
+    title: 'The host has a pull window and pulls the images its needs wait for',
+  },
+  pulled: { tone: 'success', label: 'pulled', title: 'The images are on the host; it waits for a slot' },
+};
+
+/** PullBadge says where a host that waits in a rollout stands with the images its needs wait for. */
+export function PullBadge({ pull }: { pull: PullState | undefined }) {
+  if (!pull) return null;
+  const p = PULL[pull];
+  return (
+    <Badge tone={p.tone} title={p.title}>
+      {p.label}
+    </Badge>
+  );
+}
+
+/** pullLabel names a pull state as its badge does. */
+export function pullLabel(pull: PullState): string {
+  return PULL[pull].label;
 }
 
 /** OfflineBadge says that a host is marked known offline, with why and until when. */

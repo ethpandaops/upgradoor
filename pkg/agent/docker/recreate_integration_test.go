@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,8 +18,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/config"
 	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
+	"github.com/ethpandaops/upgradoor/pkg/agent/needs"
 	"github.com/ethpandaops/upgradoor/pkg/agent/overrides"
+	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -852,4 +856,151 @@ func TestIntegrationRecreateAs(t *testing.T) {
 	assert.Equal(t, original.Config.Labels, now.Config.Labels)
 	assert.Equal(t, original.Config.Entrypoint, now.Config.Entrypoint)
 	assert.Nil(t, observed(t, r, name).Base)
+}
+
+// TestIntegrationSoftDeployViaTheBlock plays a soft deploy: Ansible wrote
+// another image and command line into the deployed block of the overrides
+// file and left the labelled container alone. The container is recreated
+// onto what the block says, with its own configuration and its labels.
+func TestIntegrationSoftDeployViaTheBlock(t *testing.T) {
+	env.cleanup(t, "soft")
+
+	ctx := t.Context()
+	r := env.newRuntime(t)
+	name := env.prefix + "soft"
+	v1, v2 := env.repoRef("soft-v1"), env.repoRef("soft-v2")
+
+	env.publish(t, v1, variantEntryOne)
+	v2Digest := env.publish(t, v2, variantEntryTwo)
+
+	for _, ref := range []string{v1, v2} {
+		_, _, err := r.Pull(ctx, ref)
+		require.NoError(t, err)
+	}
+
+	labels := map[string]string{protocol.LabelGroup: "consensus", protocol.LabelKind: "cl", "own": "yes"}
+	_, err := env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+		Name:   name,
+		Config: &container.Config{Image: v1, Cmd: []string{"--http"}, Env: []string{"OWN=1"}, Labels: labels},
+	})
+	require.NoError(t, err)
+	require.NoError(t, r.Start(ctx, name))
+
+	block := strings.Join(overrides.GeneratedBlock([]overrides.GeneratedContainer{
+		{Name: name, Image: v2, Command: []string{"--http", "--new-flag"}},
+	}), "\n") + "\n"
+	set, err := overrides.Parse([]byte(block))
+	require.NoError(t, err)
+
+	seen := observed(t, r, name)
+	require.Equal(t, "consensus", seen.Group, "found by its label")
+
+	target := overrides.TargetOf(set.DeployedOf(name), &seen, nil, overrides.Policy{}, seen.Group)
+	require.True(t, target.Spec, "the block names another image and command line")
+	require.False(t, target.InSync)
+
+	require.NoError(t, r.RecreateAs(ctx, name, v2Digest, 5*time.Second, true, hostapi.Recreation{
+		Image: target.Image, Command: target.Command, SetCommand: true, Labels: target.Labels,
+	}))
+
+	now := env.inspect(t, name)
+	assert.True(t, now.State.Running)
+	assert.Equal(t, v2, now.Config.Image)
+	assert.Equal(t, []string{"--http", "--new-flag"}, now.Config.Cmd)
+	assert.Contains(t, now.Config.Env, "OWN=1", "its own configuration")
+	for k, v := range labels {
+		assert.Equal(t, v, now.Config.Labels[k], "its labels stay: %s", k)
+	}
+
+	assert.NotContains(t, now.Config.Labels, overrides.LabelImage, "no override label")
+	assert.NotContains(t, now.Config.Labels, overrides.LabelCommand, "no override label")
+
+	seen = observed(t, r, name)
+	assert.True(t, overrides.TargetOf(set.DeployedOf(name), &seen, nil, overrides.Policy{}, seen.Group).InSync)
+}
+
+// TestIntegrationRecreateLabelsMappedContainer plays a host deployed before
+// the labels: agent.yaml puts a container in its group by name, and the
+// recreate that rolls it adds the labels (the agent passes them as the
+// operation does). A container labelled none and one the default group
+// excludes are left out: not managed, not followed, never recreated.
+func TestIntegrationRecreateLabelsMappedContainer(t *testing.T) {
+	env.cleanup(t, "mapped")
+
+	ctx := t.Context()
+	r := env.newRuntime(t)
+	ref := env.repoRef("mapped")
+	digest := env.publish(t, ref, variantOne)
+
+	_, _, err := r.Pull(ctx, ref)
+	require.NoError(t, err)
+
+	mapped, none, excluded := env.prefix+"mapped", env.prefix+"mapped-none", env.prefix+"mapped-tmp"
+	for name, labels := range map[string]map[string]string{
+		mapped: {"own": "yes"}, none: {protocol.LabelGroup: protocol.GroupNone}, excluded: nil,
+	} {
+		_, err := env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
+			Name: name, Config: &container.Config{Image: ref, Labels: labels},
+		})
+		require.NoError(t, err)
+		require.NoError(t, r.Start(ctx, name))
+	}
+
+	cfg := &config.Config{
+		Containers:   map[string]config.MappedContainer{mapped: {Group: "execution", Kind: protocol.KindEL}},
+		DefaultGroup: config.DefaultGroup{Roll: true, Exclude: []string{env.prefix + "mapped-tmp*"}},
+	}
+	enriched := func() map[string]protocol.Container {
+		all, err := r.Observe(ctx)
+		require.NoError(t, err)
+
+		tags, _ := needs.Enrich(cfg, all, overrides.NewSet(), func(string) (protocol.RegistryCheck, bool) {
+			return protocol.RegistryCheck{}, false
+		})
+		assert.Len(t, tags[imageref.Normalize(ref)].Running, 1, "only the mapped container follows the tag")
+
+		out := make(map[string]protocol.Container, 3)
+
+		for _, c := range all {
+			if c.Name == mapped || c.Name == none || c.Name == excluded {
+				out[c.Name] = c
+			}
+		}
+
+		return out
+	}
+
+	before := enriched()
+	require.True(t, before[mapped].Managed)
+	assert.True(t, before[mapped].Unlabelled)
+	assert.Equal(t, "execution", before[mapped].Group)
+	assert.False(t, before[none].Managed, "the label none")
+	assert.False(t, before[excluded].Managed, "defaultGroup.exclude")
+
+	for _, name := range []string{none, excluded} {
+		c := before[name]
+		reason, refused := needs.Rollable(&c, name)
+		assert.True(t, refused, reason)
+	}
+
+	ids := map[string]string{none: env.inspect(t, none).ID, excluded: env.inspect(t, excluded).ID}
+
+	c := before[mapped]
+	require.NoError(t, r.RecreateAs(ctx, mapped, digest, 5*time.Second, true,
+		hostapi.Recreation{Labels: c.GroupLabels()}))
+
+	now := env.inspect(t, mapped)
+	assert.True(t, now.State.Running)
+	assert.Equal(t, "execution", now.Config.Labels[protocol.LabelGroup])
+	assert.Equal(t, "el", now.Config.Labels[protocol.LabelKind])
+	assert.Equal(t, "yes", now.Config.Labels["own"], "its own labels stay")
+
+	after := enriched()
+	assert.False(t, after[mapped].Unlabelled, "labelled now")
+	assert.Equal(t, "execution", after[mapped].Group)
+	assert.Equal(t, protocol.KindEL, after[mapped].Kind)
+
+	for name, id := range ids {
+		assert.Equal(t, id, env.inspect(t, name).ID, "%s is left alone", name)
+	}
 }

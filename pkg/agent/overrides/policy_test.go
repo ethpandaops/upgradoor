@@ -2,36 +2,52 @@ package overrides
 
 import (
 	"testing"
+	"time"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
-func TestImageAllowed(t *testing.T) {
-	patterns := []string{"ethpandaops/geth", "ghcr.io/ethereum/*", "registry.example:5000/team/*-debug"}
+func TestPolicyPermits(t *testing.T) {
+	image := &Entry{Image: "ethpandaops/geth:fix"}
+	flags := &Entry{Add: []string{"--verbosity=4"}}
 
-	for ref, want := range map[string]bool{
-		"ethpandaops/geth:fix":                    true,
-		"docker.io/ethpandaops/geth:fix":          true,
-		"index.docker.io/ethpandaops/geth":        true,
-		"ethpandaops/geth-debug:fix":              false,
-		"ethpandaops/besu:fix":                    false,
-		"ghcr.io/ethereum/go-ethereum:x":          true,
-		"ghcr.io/ethereum/a/b:x":                  false,
-		"ghcr.io/other/go-ethereum:x":             false,
-		"registry.example:5000/team/geth-debug:1": true,
-		"registry.example:5000/team/geth:1":       false,
-		"evil.example/ethpandaops/geth:fix":       false,
-		"not a reference":                         false,
+	for _, tc := range []struct {
+		name   string
+		policy Policy
+		entry  *Entry
+		ok     bool
+	}{
+		{"tooling refuses an image", Policy{}, image, false},
+		{"tooling refuses flags", Policy{}, flags, false},
+		{"tooling takes an empty entry", Policy{}, &Entry{}, true},
+		{"image only", Policy{Image: true}, image, true},
+		{"image only refuses flags", Policy{Image: true}, flags, false},
+		{"flags only refuses an image", Policy{Flags: true}, image, false},
+		{"both", Policy{Image: true, Flags: true}, &Entry{Image: image.Image, Add: flags.Add}, true},
 	} {
-		assert.Equal(t, want, imageAllowed(patterns, ref), ref)
+		t.Run(tc.name, func(t *testing.T) {
+			err := tc.policy.Permits("geth", "execution", tc.entry)
+			if tc.ok {
+				require.NoError(t, err)
+			} else {
+				require.Error(t, err)
+			}
+		})
+	}
+}
+
+func TestPolicyAllows(t *testing.T) {
+	now := time.Date(2026, 11, 20, 12, 0, 0, 0, time.UTC)
+	p := Policy{Image: true, Flags: true}
+	at := func(d time.Duration) *time.Time {
+		u := now.Add(d)
+
+		return &u
 	}
 
-	assert.False(t, imageAllowed(nil, "ethpandaops/geth:fix"), "no pattern allows nothing")
-	assert.True(t, imageAllowed([]string{"nginx"}, "nginx:1"), "an official image")
-
-	require.NoError(t, validateRepositoryPattern("registry.example:5000/team/*"))
-	require.Error(t, validateRepositoryPattern("ethpandaops/geth:master"))
-	require.Error(t, validateRepositoryPattern("ethpandaops/[geth"))
-	require.Error(t, validateRepositoryPattern(""))
+	require.NoError(t, p.Allows("geth", "execution", &Entry{Image: "a/b:c", Until: at(time.Hour)}, now))
+	require.Error(t, p.Allows("geth", "execution", &Entry{Image: "a/b:c"}, now), "no end")
+	require.Error(t, p.Allows("geth", "execution", &Entry{Image: "a/b:c", Until: at(-time.Hour)}, now))
+	require.Error(t, p.Allows("geth", "execution", &Entry{Image: "a/b:c", Until: at(8 * 24 * time.Hour)}, now))
+	require.Error(t, (&Policy{}).Allows("geth", "execution", &Entry{Image: "a/b:c", Until: at(time.Hour)}, now))
 }

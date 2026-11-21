@@ -535,10 +535,19 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 		resp.WantInventory = req.InventoryHash != result.Host.InventoryHash
 	}
 
+	interval := fleet.DefaultSettings().LookupInterval.Std()
+	if assignment != nil && assignment.LookupInterval > 0 {
+		interval = assignment.LookupInterval
+	}
+
+	resp.Lookups, resp.Digests = s.lookups.Sync(cert.Subject, &req, now, interval)
+	resp.LookupFallbackSeconds = int64(3 * interval / time.Second)
+
 	if assignment != nil {
 		resp.Directives = assignment.Directives
 		resp.Queue = assignment.Queue
 		resp.Ended = assignment.Ended
+		resp.Pull = assignment.Pull
 
 		if assignment.Lease != nil {
 			// TTLSeconds is defined as the time left when the response is

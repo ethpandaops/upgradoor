@@ -95,6 +95,11 @@ type Settings struct {
 	// of every other client, and of containers without a client, to
 	// PolicyImage.
 	PolicyClients ClientPolicies `json:"policyClients"`
+	// PolicyDefaultGroup is the policy of the rollouts of the default group
+	// (protocol.DefaultGroup): the new digests of the tags of containers that
+	// neither a label nor a name map puts in a group, on the hosts that roll
+	// them (defaultGroup.roll in agent.yaml).
+	PolicyDefaultGroup Policy `json:"policyDefaultGroup"`
 
 	// PauseAfterCanaryImage, PauseAfterCanaryPackages and
 	// PauseAfterCanaryReboot pause a rollout that serves needs of that kind
@@ -109,6 +114,15 @@ type Settings struct {
 	// limit than the others would never be ready with a share above what that
 	// limit allows.
 	ReadyPeerShare float64 `json:"readyPeerShare"`
+
+	// LookupInterval is how often one host of those that run a tag looks it
+	// up at the registry, in turn: for the whole devnet, not per host. The
+	// controller tells every other host what the tag points at.
+	LookupInterval Duration `json:"lookupInterval"`
+	// MaxPullingPercent is the share of hosts (0-100) that may pull images
+	// at once, at least one host: each host pulls only inside a pull window
+	// the controller grants.
+	MaxPullingPercent float64 `json:"maxPullingPercent"`
 
 	// Paused is the global pause: nothing new is granted.
 	Paused bool `json:"paused"`
@@ -129,8 +143,17 @@ func DefaultSettings() Settings {
 		PolicyImage:             PolicyAuto,
 		PolicyPackages:          PolicyAuto,
 		PolicyReboot:            PolicyManual,
+		PolicyDefaultGroup:      PolicyAuto,
+		LookupInterval:          Duration(5 * time.Minute),
+		MaxPullingPercent:       10,
 	}
 }
+
+// MinLookupInterval and MaxLookupInterval bound Settings.LookupInterval.
+const (
+	MinLookupInterval = 30 * time.Second
+	MaxLookupInterval = 24 * time.Hour
+)
 
 // ClientPolicies is an image policy per client. In JSON it is always an
 // object: none is {}, never null.
@@ -256,7 +279,15 @@ func (s *Settings) Validate() error {
 		return errors.New("readinessTimeout must be at least 1m")
 	}
 
-	for _, p := range []Policy{s.PolicyImage, s.PolicyPackages, s.PolicyReboot} {
+	if s.LookupInterval.Std() < MinLookupInterval || s.LookupInterval.Std() > MaxLookupInterval {
+		return errors.New("lookupInterval must be between 30s and 24h")
+	}
+
+	if !(s.MaxPullingPercent > 0 && s.MaxPullingPercent <= 100) {
+		return errors.New("maxPullingPercent must be above 0 and at most 100")
+	}
+
+	for _, p := range []Policy{s.PolicyImage, s.PolicyPackages, s.PolicyReboot, s.PolicyDefaultGroup} {
 		if p != PolicyAuto && p != PolicyManual {
 			return fmt.Errorf("invalid policy %q", p)
 		}

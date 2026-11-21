@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/ethpandaops/service-authenticatoor/pkg/auth"
+	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 	"github.com/stretchr/testify/assert"
 )
@@ -61,4 +62,22 @@ func TestFeatureNames(t *testing.T) {
 	for _, name := range []string{"geth", "a.b_c-d", "0x", "Geth", "", "-a", "a b", "a:b", "a*"} {
 		assert.Equal(t, auth.ValidTeam(name), protocol.ValidOwner(name), "%q", name)
 	}
+}
+
+// A roll of the whole host is a team's when the team owns every container
+// the roll touches: one the host rolls to nothing (a default-group container
+// on a host that does not roll its default group) does not count.
+func TestUncoveredOnSkipsContainersNotRolled(t *testing.T) {
+	host := &fleet.Host{Name: "h", Status: &protocol.SyncRequest{Containers: []protocol.Container{
+		{Name: "geth", Managed: true, Owners: []string{"geth"}},
+		{Name: "cadvisor", Managed: true, Group: protocol.DefaultGroup, NotRolled: "not rolled"},
+	}}}
+	own := OwnershipOf([]*fleet.Host{host})["h"]
+	whole := ContainerTargets([]string{"h"}, false, nil)
+
+	assert.Empty(t, UncoveredOn([]string{"geth"}, "h", own, whole))
+
+	host.Status.Containers[1].NotRolled = ""
+	own = OwnershipOf([]*fleet.Host{host})["h"]
+	assert.Contains(t, UncoveredOn([]string{"geth"}, "h", own, whole), "cadvisor")
 }

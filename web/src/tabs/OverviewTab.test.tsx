@@ -112,7 +112,8 @@ describe('OverviewTab, logged in', () => {
       .getAllByRole('listitem')
       .map(li => li.textContent);
     expect(hosts).toHaveLength(3);
-    expect(hosts[0]).toMatch(/^1lighthouse-nethermind-1Image rollwaits: budget [\d.]+% of 10%$/);
+    // Its images come first: a pull window is granted without anybody acting.
+    expect(hosts[0]).toMatch(/^1lighthouse-nethermind-1Image rollwaits: waiting for its images to be pulled$/);
     // A bootnode costs the budget nothing and waits for nothing: the queue does not hold it.
     expect(next).not.toHaveTextContent('bootnode-1');
     expect(next).not.toHaveTextContent('teku-besu-1');
@@ -174,9 +175,18 @@ describe('OverviewTab, logged in', () => {
     expect(first).toHaveTextContent('The network gate is closed');
 
     // A host holds a lease, so the closed gate lets nobody pass: every host
-    // that could be served waits for it.
-    expect(first).toHaveTextContent(/\d+ hosts wait for it to open/);
-    expect(screen.getByRole('region', { name: 'Up next' })).toHaveTextContent('Nothing will start by itself');
+    // that could be served waits for it. The gate holds back no pull: the
+    // hosts whose images are not there yet are the only ones up next.
+    expect(first).toHaveTextContent(/\d+ hosts? waits? for it to open/);
+    const next = screen.getByRole('region', { name: 'Up next' });
+    expect(
+      within(next)
+        .getAllByRole('listitem')
+        .map(li => li.textContent)
+    ).toEqual([
+      '1lighthouse-nethermind-1Image rollwaits: waiting for its images to be pulled',
+      '2lighthouse-geth-4Image rollwaits: waiting for its images to be pulled',
+    ]);
   });
 
   it('speaks of hosts, not validators, on a fleet without validators', async () => {

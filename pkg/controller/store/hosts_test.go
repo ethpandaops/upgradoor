@@ -16,10 +16,14 @@ import (
 )
 
 func TestRecordSync(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			validators := &identity.ValidatorRange{Start: 100, End: 200}
@@ -99,10 +103,14 @@ func TestRecordSync(t *testing.T) {
 // A sync that restates the stored row writes only the time, the uptime and
 // the asked interval; any other difference goes the full way.
 func TestRecordSyncConfirms(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			sync := func(sec int, req *protocol.SyncRequest) *SyncResult {
@@ -146,10 +154,14 @@ func TestRecordSyncConfirms(t *testing.T) {
 // sync with an older certificate that reached the store anyway does not lower
 // it.
 func TestRecordSyncNeverLowersGeneration(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			cert := func(generation uint64) *identity.Certificate {
@@ -192,6 +204,8 @@ func TestRecordSyncNeverLowersGeneration(t *testing.T) {
 // A host that reports a controller hold when the controller sees it for the
 // first time keeps the hold: the row is created with the hold wanted.
 func TestRecordSyncAdoptsControllerHold(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	held := func(controller, local bool) *protocol.SyncRequest {
@@ -203,6 +217,8 @@ func TestRecordSyncAdoptsControllerHold(t *testing.T) {
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			res, err := s.RecordSync(ctx, &HostSync{
@@ -234,7 +250,7 @@ func TestRecordSyncAdoptsControllerHold(t *testing.T) {
 			assert.False(t, res.Host.HoldWanted)
 			assert.Empty(t, res.Host.HoldReason)
 
-			// A local hold file is not the controller's hold.
+			// A local hold is not the controller's hold.
 			res, err = s.RecordSync(ctx, &HostSync{
 				Cert: testCert("local"), Request: held(false, true), At: at(0),
 			})
@@ -264,6 +280,8 @@ func TestRecordSyncAdoptsControllerHold(t *testing.T) {
 }
 
 func TestRecordSyncWithoutValidators(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	s := newFileStore(t)
 
@@ -378,6 +396,8 @@ func TestRecordSyncEdgeCases(t *testing.T) {
 }
 
 func TestStatusCache(t *testing.T) {
+	t.Parallel()
+
 	var c statusCache
 
 	first, err := c.decode("node-1", `{"uptimeSeconds":1}`)
@@ -400,10 +420,14 @@ func TestStatusCache(t *testing.T) {
 }
 
 func TestGetAndListHosts(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			_, err := s.GetHost(ctx, "nope")
@@ -438,6 +462,8 @@ func TestGetAndListHosts(t *testing.T) {
 }
 
 func TestCommitHoldsSwitch(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	s := newFileStore(t)
 
@@ -475,10 +501,14 @@ func TestCommitHoldsSwitch(t *testing.T) {
 }
 
 func TestDeleteHost(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			require.ErrorIs(t, s.DeleteHost(ctx, "nope"), ErrNotFound)
@@ -557,6 +587,8 @@ func TestDeleteHost(t *testing.T) {
 // The range counted for a host follows what the host reports: a range, none,
 // or "I do not know", which keeps what was counted.
 func TestRecordSyncCountsTheReportedValidators(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	s := newFileStore(t)
 
@@ -618,6 +650,8 @@ func TestRecordSyncCountsTheReportedValidators(t *testing.T) {
 
 // No validator is counted for two hosts, whatever they report.
 func TestRecordSyncCountsOverlappingValidatorsOnce(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	s := newFileStore(t)
 
@@ -722,6 +756,8 @@ func setHold(ctx context.Context, s Store, name string, wanted bool, reason stri
 // The broken marks are the host's: a commit replaces them, a sync leaves them
 // and they go with the host. A host that does not exist has none.
 func TestCommitBrokenMarks(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	s := newFileStore(t)
 
@@ -766,10 +802,14 @@ func TestCommitBrokenMarks(t *testing.T) {
 // Changes.Holds entry without By: the scheduler, the end of a lease) makes it
 // a hold of staff, also over a team's hold. A lifted hold remembers nothing.
 func TestHoldBy(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 			addHost(t, s, "node-1", nil)
 
@@ -824,10 +864,14 @@ func TestHoldBy(t *testing.T) {
 // the host, also after the store was read again from its row, and are gone
 // when a later sync reports none.
 func TestContainerOwnersAreStored(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			req := testRequest()

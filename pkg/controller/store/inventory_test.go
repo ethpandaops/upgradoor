@@ -92,10 +92,14 @@ func testInventory(n int) *protocol.Inventory {
 }
 
 func TestInventoryRoundTrip(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			addHost(t, s, "node-1", nil)
@@ -239,6 +243,8 @@ func TestInventoryHashSurvives(t *testing.T) {
 }
 
 func TestInventoryContent(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	s := newFileStore(t)
 
@@ -422,6 +428,8 @@ func hostRange(from, to int) []string {
 }
 
 func TestSearchPackages(t *testing.T) {
+	t.Parallel()
+
 	const (
 		hosts   = 30
 		perHost = 150
@@ -431,6 +439,8 @@ func TestSearchPackages(t *testing.T) {
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			rows := searchFixture(t, s, hosts, perHost)
@@ -621,10 +631,14 @@ func TestSearchPackagesAtFleetSize(t *testing.T) {
 // The package list is read page by page: every name once, in order, however
 // the pages are cut, with the number of names on the first page.
 func TestListPackages(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 			searchFixture(t, s, 6, 40)
 
@@ -697,8 +711,12 @@ func TestListPackages(t *testing.T) {
 // A page of the unfiltered list is a range of the name index, and a search
 // walks that index, not the table.
 func TestListPackagesUsesTheNameIndex(t *testing.T) {
+	t.Parallel()
+
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 			searchFixture(t, s, 3, 20)
 

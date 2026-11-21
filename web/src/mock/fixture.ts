@@ -1,9 +1,11 @@
 // The mock fleet: a devnet with 24 hosts in the states an operator meets.
 //
-//   - an image rollout in progress (lighthouse): the canary and a host
-//     without validators are done, one host is verifying, the rest waits;
-//   - a halted image rollout (nethermind) with a failed host, which is
-//     broken for the image;
+//   - a group rollout in progress (lighthouse's consensus group): the canary
+//     and a host without validators are done, one host is verifying, the
+//     rest waits: one with the new image pulled, one pulling it and one
+//     waiting for a pull window (one host pulls at a time);
+//   - a halted group rollout (nethermind's execution group) with a failed
+//     host, which is broken for the group;
 //   - a reboot rollout that waits for approval (policy manual);
 //   - a stale host, a host on local hold and a host with a custom image.
 //
@@ -21,6 +23,7 @@ import type {
   Package,
   Rollout,
   RolloutHost,
+  RolloutTarget,
   Settings,
   Upgradable,
 } from '../api/types';
@@ -117,6 +120,8 @@ interface HostSpec {
   overrides?: Record<string, Omit<ContainerOverride, 'until'> & { until?: number }>;
   /** fixed: the agent configuration lets the controller override nothing on this host. */
   fixed?: boolean;
+  /** unpulled: the images the host's image needs wait for are not on the host yet. */
+  unpulled?: boolean;
 }
 
 function pair(cl: string, el: string, count: number): HostSpec[] {
@@ -151,8 +156,8 @@ function specs(): HostSpec[] {
   };
 
   patch('lighthouse-geth-3', { behind: [LIGHTHOUSE_IMAGE] });
-  patch('lighthouse-geth-4', { behind: [LIGHTHOUSE_IMAGE] });
-  patch('lighthouse-nethermind-1', { behind: [LIGHTHOUSE_IMAGE, NETHERMIND_IMAGE] });
+  patch('lighthouse-geth-4', { behind: [LIGHTHOUSE_IMAGE], unpulled: true });
+  patch('lighthouse-nethermind-1', { behind: [LIGHTHOUSE_IMAGE, NETHERMIND_IMAGE], unpulled: true });
   patch('bootnode-1', { behind: [LIGHTHOUSE_IMAGE] });
   patch('nimbus-nethermind-1', { failedEL: true });
   patch('nimbus-nethermind-2', { behind: [NETHERMIND_IMAGE] });
@@ -335,11 +340,14 @@ export function defaultSettings(): Settings {
     policyImage: 'auto',
     policyPackages: 'auto',
     policyReboot: 'manual',
+    policyDefaultGroup: 'auto',
     policyClients: {},
     pauseAfterCanaryImage: false,
     pauseAfterCanaryPackages: false,
     pauseAfterCanaryReboot: false,
     readyPeerShare: 0,
+    lookupInterval: '5m0s',
+    maxPullingPercent: 10,
     paused: false,
   };
 }
@@ -348,7 +356,7 @@ function container(
   host: string,
   spec: ImageSpec,
   at: (secondsAgo: number) => string,
-  o: { behind: boolean; name?: string; image?: string; kind?: ContainerKind; fixed?: boolean }
+  o: { behind: boolean; name?: string; image?: string; kind?: ContainerKind; fixed?: boolean; group?: string }
 ): Container {
   const image = o.image ?? spec.image;
   const cur = currentDigest(image);
@@ -357,6 +365,7 @@ function container(
   // A container's client is the client software it runs; a validator client
   // carries the client of its consensus client.
   const client = spec.kind === 'el' || spec.kind === 'cl' ? spec.container : undefined;
+  const kind = o.kind ?? spec.kind;
 
   return {
     name,
@@ -371,7 +380,10 @@ function container(
     restartCount: 0,
     startedAt: at(o.behind ? 3 * 86400 + (hash(host) % 40000) : 1800 + (hash(host + name) % 5000)),
     managed: true,
-    kind: o.kind ?? spec.kind,
+    // The roll group Ansible labels the container with: a beacon node with its
+    // validator client, an execution client, a tool of its own.
+    group: o.group ?? (kind === 'el' ? 'execution' : kind === 'cl' || kind === 'vc' ? 'consensus' : name),
+    kind,
     configuredImage: image,
     registry: {
       digest: cur,
@@ -385,8 +397,8 @@ function container(
     // What follows is in a host's details and in the rows of a client's host
     // list; the rows of the host table do not carry it (MockController.summary).
     client,
-    command: client ? baseCommand(o.kind ?? spec.kind, name) : undefined,
-    overridable: client && !o.fixed ? { images: [image.replace(/:[^:/]*$/, '')], flags: true } : undefined,
+    command: client ? baseCommand(kind, name) : undefined,
+    overridable: client && !o.fixed ? { image: true, flags: true } : undefined,
   };
 }
 
@@ -436,12 +448,21 @@ function unmanaged(host: string, name: string, image: string, at: (s: number) =>
   };
 }
 
-function imageNeed(c: Container): Need {
+function imageNeed(c: Container, unpulled = false): Need {
   const to = currentDigest(c.image);
   return {
     id: `image/${c.name}/${to}`,
     kind: 'image',
-    image: { container: c.name, image: c.image, fromDigest: c.digest, toDigest: to, toRevision: revision(to) },
+    ...(unpulled ? { unpulled: [{ ref: c.image, digest: to }] } : {}),
+    image: {
+      container: c.name,
+      group: c.group,
+      client: c.client,
+      image: c.image,
+      fromDigest: c.digest,
+      toDigest: to,
+      toRevision: revision(to),
+    },
   };
 }
 
@@ -453,7 +474,16 @@ function specNeed(c: Container): Need {
   return {
     id: `spec/${c.name}/${key}`,
     kind: 'spec',
-    spec: { container: c.name, key, image, fromImage: c.image, toDigest: to, toRevision: revision(to) },
+    spec: {
+      container: c.name,
+      group: c.group,
+      client: c.client,
+      key,
+      image,
+      fromImage: c.image,
+      toDigest: to,
+      toRevision: revision(to),
+    },
   };
 }
 
@@ -499,6 +529,16 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
     }
   }
 
+  // An RPC host has a proxy in front of its nodes: tooling of a group of its own, which nobody may override.
+  if (spec.roles.includes('rpc')) {
+    containers.push(
+      container(spec.name, { container: 'nginx', image: 'nginx:1.27-alpine', kind: 'other' }, at, {
+        behind: false,
+        group: 'proxy',
+      })
+    );
+  }
+
   if (!el && !cl) {
     containers.push(
       container(spec.name, { container: 'dora', image: 'ethpandaops/dora:master', kind: 'other' }, at, {
@@ -529,7 +569,10 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
   if (!spec.localHold) {
     for (const c of containers) {
       if (c.managed && c.configuredImage && c.image !== c.configuredImage) needs.push(specNeed(c));
-      else if (c.managed && c.digest !== c.registry?.digest) needs.push(imageNeed(c));
+      else if (c.managed && c.digest !== c.registry?.digest) {
+        needs.push(imageNeed(c, spec.unpulled));
+        if (spec.unpulled && c.registry) c.registry.pulled = false;
+      }
     }
     if (spec.reboot) needs.push({ id: 'reboot', kind: 'reboot', reboot: { reasons: ['flag', 'kernel'] } });
   }
@@ -688,6 +731,30 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
   };
 }
 
+/** A group rollout's key and title, as the scheduler writes them (groupKey, groupTitle). */
+function groupRollout(
+  group: string,
+  client: string,
+  targets: RolloutTarget[]
+): Pick<Rollout, 'kind' | 'key' | 'title' | 'group' | 'client' | 'targets'> {
+  const parts = targets.map(t => {
+    const part = `${t.image} to ${t.digest.slice(7, 19)}`;
+    if (!t.spec) return part;
+    return `${t.container ?? ''} to ${part}${t.flags ? ', command line changed' : ''}`;
+  });
+  return {
+    kind: 'group',
+    key: `group:${group}#${client}@${hex(JSON.stringify(targets), 16)}`,
+    title: `${client} ${group}: ${parts.join('; ')}`,
+    group,
+    client,
+    targets,
+  };
+}
+
+/** imageTarget is the target of a tag that moved. */
+const imageTarget = (image: string, to: string): RolloutTarget => ({ image, digest: to, revision: revision(to) });
+
 function member(
   host: string,
   state: RolloutHost['state'],
@@ -731,6 +798,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     kind: 'image',
     image: {
       container: c,
+      group: 'consensus',
+      client: 'lighthouse',
       image: LIGHTHOUSE_IMAGE,
       fromDigest: previousDigest(LIGHTHOUSE_IMAGE),
       toDigest: lhDigest,
@@ -742,6 +811,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     kind: 'image',
     image: {
       container: 'nethermind',
+      group: 'execution',
+      client: 'nethermind',
       image: NETHERMIND_IMAGE,
       fromDigest: previousDigest(NETHERMIND_IMAGE),
       toDigest: nmDigest,
@@ -755,6 +826,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     kind: 'image',
     image: {
       container: c,
+      group: 'consensus',
+      client: 'grandine',
       image: GRANDINE_IMAGE,
       fromDigest: previousDigest(GRANDINE_IMAGE),
       toDigest: grDigest,
@@ -778,7 +851,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
 
   // The lease that failed on nimbus-nethermind-1 left its mark on the host.
   const brokenHost = hosts.get('nimbus-nethermind-1');
-  if (brokenHost) brokenHost.broken = { [`image:${NETHERMIND_IMAGE}#nethermind`]: leaseFailed };
+  if (brokenHost) brokenHost.broken = { 'group:execution#nethermind': leaseFailed };
 
   const withLease = (m: RolloutHost, leaseId: string, needId: string): RolloutHost => ({ ...m, leaseId, needId });
   const pending = (host: string, stage: RolloutHost['stage'], prefix: string, ago: number): RolloutHost => ({
@@ -789,13 +862,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
   const rollouts: Rollout[] = [
     {
       id: lighthouseRollout,
-      kind: 'image',
-      key: `image:${LIGHTHOUSE_IMAGE}#lighthouse@${lhDigest}`,
-      title: `${LIGHTHOUSE_IMAGE} → ${lhDigest.slice(7, 19)}`,
-      image: LIGHTHOUSE_IMAGE,
-      client: 'lighthouse',
-      digest: lhDigest,
-      revision: revision(lhDigest),
+      ...groupRollout('consensus', 'lighthouse', [imageTarget(LIGHTHOUSE_IMAGE, lhDigest)]),
       state: 'active',
       paused: false,
       approved: false,
@@ -817,13 +884,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     },
     {
       id: nethermindRollout,
-      kind: 'image',
-      key: `image:${NETHERMIND_IMAGE}#nethermind@${nmDigest}`,
-      title: `${NETHERMIND_IMAGE} → ${nmDigest.slice(7, 19)}`,
-      image: NETHERMIND_IMAGE,
-      client: 'nethermind',
-      digest: nmDigest,
-      revision: revision(nmDigest),
+      ...groupRollout('execution', 'nethermind', [imageTarget(NETHERMIND_IMAGE, nmDigest)]),
       state: 'halted',
       reason: 'nimbus-nethermind-1: container nethermind restarted 14 times while verifying',
       paused: false,
@@ -850,13 +911,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       // The canary is done and ready; with pauseAfterCanaryImage on, the
       // rollout waits for a person before the second host goes.
       id: grandineRollout,
-      kind: 'image',
-      key: `image:${GRANDINE_IMAGE}#grandine@${grDigest}`,
-      title: `${GRANDINE_IMAGE} → ${grDigest.slice(7, 19)}`,
-      image: GRANDINE_IMAGE,
-      client: 'grandine',
-      digest: grDigest,
-      revision: revision(grDigest),
+      ...groupRollout('consensus', 'grandine', [imageTarget(GRANDINE_IMAGE, grDigest)]),
       state: 'active',
       paused: true,
       pauseReason: 'paused after the canary; resume to continue',
@@ -921,14 +976,9 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     },
     {
       id: oldLighthouseRollout,
-      kind: 'image',
-      key: `image:${LIGHTHOUSE_IMAGE}#lighthouse@${previousDigest(LIGHTHOUSE_IMAGE)}x`,
-      title: `${LIGHTHOUSE_IMAGE} → ${digest('lighthouse/older').slice(7, 19)}`,
-      image: LIGHTHOUSE_IMAGE,
-      client: 'lighthouse',
-      digest: digest('lighthouse/older'),
+      ...groupRollout('consensus', 'lighthouse', [{ image: LIGHTHOUSE_IMAGE, digest: digest('lighthouse/older') }]),
       state: 'superseded',
-      reason: `the tag moved to ${previousDigest(LIGHTHOUSE_IMAGE).slice(7, 19)}`,
+      reason: `the group's target changed: consensus: ${LIGHTHOUSE_IMAGE} to ${previousDigest(LIGHTHOUSE_IMAGE).slice(7, 19)}`,
       paused: false,
       approved: false,
       force: false,
@@ -1162,8 +1212,9 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
   log(8 * 3600, 'alice@example.org', 'action.hold', 'grandine-erigon-2', { reason: 'testing a debug build' });
   log(7 * 3600, 'alice@example.org', 'action.unhold', 'grandine-erigon-2', { reason: 'custom image is enough' });
   log(3 * 3600 + 12 * 60, 'scheduler', 'rollout.created', nethermindRollout, {
-    image: NETHERMIND_IMAGE,
-    digest: nmDigest,
+    group: 'execution',
+    client: 'nethermind',
+    targets: [imageTarget(NETHERMIND_IMAGE, nmDigest)],
   });
   log(3 * 3600 + 10 * 60, 'scheduler', 'lease.granted', 'nimbus-nethermind-1', {
     lease: leaseFailed,
@@ -1180,7 +1231,11 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     before: { ...defaults },
     after: { ...defaults, pauseAfterCanaryImage: true, readyPeerShare: 0.25 },
   });
-  log(95 * 60, 'scheduler', 'rollout.created', grandineRollout, { image: GRANDINE_IMAGE, digest: grDigest });
+  log(95 * 60, 'scheduler', 'rollout.created', grandineRollout, {
+    group: 'consensus',
+    client: 'grandine',
+    targets: [imageTarget(GRANDINE_IMAGE, grDigest)],
+  });
   log(93 * 60, 'scheduler', 'lease.granted', 'grandine-erigon-1', {
     lease: leaseGrandine,
     rollout: grandineRollout,
@@ -1194,7 +1249,11 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     reason: 'paused after the canary; resume to continue',
     lease: leaseGrandine,
   });
-  log(47 * 60, 'scheduler', 'rollout.created', lighthouseRollout, { image: LIGHTHOUSE_IMAGE, digest: lhDigest });
+  log(47 * 60, 'scheduler', 'rollout.created', lighthouseRollout, {
+    group: 'consensus',
+    client: 'lighthouse',
+    targets: [imageTarget(LIGHTHOUSE_IMAGE, lhDigest)],
+  });
   log(46 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-1', {
     lease: leaseCanary,
     rollout: lighthouseRollout,
@@ -1230,7 +1289,14 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     quiet: fleet === 'quiet',
     audit,
     // One client has an image policy of its own; no rollout of it is open.
-    settings: { ...defaults, pauseAfterCanaryImage: true, readyPeerShare: 0.25, policyClients: { besu: 'manual' } },
+    // One host of the two dozen pulls at a time.
+    settings: {
+      ...defaults,
+      pauseAfterCanaryImage: true,
+      readyPeerShare: 0.25,
+      maxPullingPercent: 5,
+      policyClients: { besu: 'manual' },
+    },
     defaults,
     gateFailing: false,
     offline:
@@ -1294,7 +1360,14 @@ function largeFleet(
   const need: Need = {
     id: 'image/geth/large',
     kind: 'image',
-    image: { container: 'geth', image: 'ethpandaops/geth:master', fromDigest: 'sha256:0ld', toDigest: 'sha256:new' },
+    image: {
+      container: 'geth',
+      group: 'execution',
+      client: 'geth',
+      image: 'ethpandaops/geth:master',
+      fromDigest: 'sha256:0ld',
+      toDigest: 'sha256:new',
+    },
   };
   for (let wave = 0; wave < WAVES; wave++) {
     // A wave every twenty minutes; the last one is running.

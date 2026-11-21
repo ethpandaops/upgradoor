@@ -45,7 +45,7 @@ async function bench(
 const sent = (h: Harness, action: string) => h.calls.find(c => c.path === `/api/v1/actions/${action}`)?.body;
 
 describe('the image override dialog', () => {
-  it('asks for a tag of an allowed repository, an end and a reason, and sends one request', async () => {
+  it('asks for a tag, an end and a reason, and sends one request', async () => {
     const user = userEvent.setup();
     const h = await bench('rpc-1', ['geth']);
 
@@ -55,18 +55,14 @@ describe('the image override dialog', () => {
     const input = within(dialog).getByRole('textbox', { name: 'Image' });
 
     expect(dialog).toHaveTextContent('configuredethpandaops/geth:master');
-    expect(dialog).toHaveTextContent('A tag of an allowed repository: ethpandaops/geth.');
     expect(within(dialog).queryByRole('button', { name: /Clear/ })).not.toBeInTheDocument();
     expect(confirm).toBeDisabled();
 
-    // Not a tag, a digest, another repository: each says why and blocks the request.
+    // Not a tag, a digest: each says why and blocks the request.
     await user.type(input, 'ethpandaops/geth');
     expect(within(dialog).getByRole('alert')).toHaveTextContent('must name a tag');
     await user.type(input, '@sha256:00');
     expect(within(dialog).getByRole('alert')).toHaveTextContent('not a digest');
-    await user.clear(input);
-    await user.type(input, 'ghcr.io/somebody/geth:fix');
-    expect(within(dialog).getByRole('alert')).toHaveTextContent('not in a repository this host allows for geth');
     expect(confirm).toBeDisabled();
 
     await user.clear(input);

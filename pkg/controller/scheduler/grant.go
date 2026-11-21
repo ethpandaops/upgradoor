@@ -64,6 +64,7 @@ const (
 	rankApproval
 	rankHalted
 	rankVerb
+	rankPull
 	rankGate
 	rankOrder
 	rankBudget
@@ -80,6 +81,7 @@ var waitKinds = map[int]WaitKind{
 	rankApproval:      WaitApproval,
 	rankHalted:        WaitHalted,
 	rankVerb:          WaitVerb,
+	rankPull:          WaitPull,
 	rankGate:          WaitGate,
 	rankOrder:         WaitOrder,
 	rankBudget:        WaitBudget,
@@ -396,6 +398,12 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 		return verdict{rank: rankVerb, reason: reasonVerb}, nil, false
 	}
 
+	// The images come first, in a pull window: the slot is spent on the
+	// restart alone. A group waits for all of its images.
+	if unpulled(needs) {
+		return verdict{rank: rankPull, reason: reasonPull}, nil, false
+	}
+
 	// Independent containers touch neither the node nor the network: the
 	// gate does not hold them back.
 	if !r.IgnoreBudget && !g.gate.OK && needsImpact(hv.h, needs) != protocol.ImpactIndependent {
@@ -414,7 +422,9 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 	}
 
 	if v = g.orderVerdict(r, hv); v.rank != rankGrantable {
-		return v, nil, false
+		// The needs go with the verdict: they may ride along with a lease
+		// the host is granted anyway.
+		return v, needs, false
 	}
 
 	return verdict{}, needs, false
@@ -453,8 +463,12 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 	var (
 		best                  verdict
 		normal, exempt, indep []part
-		excepted              bool
-		impact                = protocol.ImpactIndependent
+		// waiting are the parts that wait only for their place in their
+		// rollout's order: they ride along with a lease the host is granted
+		// anyway.
+		waiting  []part
+		excepted bool
+		impact   = protocol.ImpactIndependent
 	)
 
 	for _, r := range rollouts {
@@ -462,6 +476,12 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 		excepted = excepted || viaException
 
 		switch {
+		case rv.rank == rankOrder:
+			waiting = append(waiting, part{r, needs})
+
+			if rv.rank > best.rank {
+				best, about = rv, r.ID
+			}
 		case rv.rank != rankGrantable:
 			if rv.rank > best.rank {
 				best, about = rv, r.ID
@@ -499,9 +519,31 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 		return best, about
 	}
 
-	g.lease(hv, parts, excepted)
+	g.lease(hv, slices.Concat(parts, rideAlong(hv, slices.Concat(normal, indep), waiting)), excepted)
 
 	return verdict{}, ""
+}
+
+// rideAlong returns the parts that go with a lease the host is granted
+// anyway: needs of rollouts that are active, not paused and approved where
+// their policy asks for it, that wait only for their place in the order
+// (a canary, a broken host), and whose work is of the lease's class or
+// lighter. The host goes down once; the lease costs nothing more.
+func rideAlong(hv *hostView, granted, waiting []part) []part {
+	impact := protocol.ImpactIndependent
+	for _, pt := range granted {
+		impact = impact.Heavier(needsImpact(hv.h, pt.needs))
+	}
+
+	out := make([]part, 0, len(waiting))
+
+	for _, pt := range waiting {
+		if impact.Heavier(needsImpact(hv.h, pt.needs)) == impact && !pt.r.IgnoreBudget {
+			out = append(out, pt)
+		}
+	}
+
+	return out
 }
 
 // lease creates the lease for one host and books it. excepted: the grant

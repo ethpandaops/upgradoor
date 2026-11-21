@@ -146,7 +146,7 @@ func Listing(sum *HostSummary) HostListing {
 		c := &sum.Containers[i]
 		out.Containers = append(out.Containers, ContainerListing{
 			Name: ContainerName(c.Name), Image: c.Image, Digest: c.Digest, Revision: c.Revision,
-			State: c.State, Managed: c.Managed, Kind: c.Kind, Impact: c.Impact, Owners: c.Owners,
+			State: c.State, Managed: c.Managed, Kind: c.Kind, Impact: c.Impact, Owners: c.Owners, Group: c.Group,
 		})
 	}
 

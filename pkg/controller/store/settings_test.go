@@ -36,11 +36,15 @@ func storedSettings(t *testing.T, s Store) map[string]string {
 }
 
 func TestSettings(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 	defaults := fleet.DefaultSettings()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			got, err := s.LoadSettings(ctx, defaults)
@@ -148,6 +152,8 @@ func TestLoadSettingsRefusesBadRows(t *testing.T) {
 }
 
 func TestSettingsFieldsCoverEveryField(t *testing.T) {
+	t.Parallel()
+
 	defaults := fleet.DefaultSettings()
 
 	fields, err := settingsFields(&defaults)
@@ -158,8 +164,9 @@ func TestSettingsFieldsCoverEveryField(t *testing.T) {
 	assert.ElementsMatch(t, []string{
 		"maxUnavailablePercent", "maxIndependentPercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyEpochs", "minPeers",
 		"leaseTtl", "hostStaleAfter", "readinessTimeout",
-		"policyImage", "policyPackages", "policyReboot", "paused",
+		"policyImage", "policyPackages", "policyReboot", "policyDefaultGroup", "paused",
 		"pauseAfterCanaryImage", "pauseAfterCanaryPackages", "pauseAfterCanaryReboot", "readyPeerShare",
+		"lookupInterval", "maxPullingPercent",
 		"policyClients",
 	}, keysOf(fields))
 }

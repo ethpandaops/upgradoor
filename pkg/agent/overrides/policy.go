@@ -3,49 +3,60 @@ package overrides
 import (
 	"errors"
 	"fmt"
-	"path"
-	"strings"
 	"time"
 
-	"github.com/ethpandaops/upgradoor/pkg/imageref"
+	"github.com/ethpandaops/upgradoor/pkg/agent/config"
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// Policy is the host's own bound on overrides that arrive from the
-// controller: one per managed container, in agent.yaml.
+// Policy is what may be overridden on a container: what its group in
+// agent.yaml allows. It bounds the controller, the local commands and a hand
+// edit of the file alike; a container whose group allows nothing (tooling)
+// runs what Ansible deployed.
 type Policy struct {
-	// Images are the image repositories an image override may name
-	// ("ethpandaops/geth", "ghcr.io/ethereum/*"; "*" stands for any run of
-	// characters without a slash). Empty: no image overrides.
-	Images []string `yaml:"images"`
+	// Image allows image overrides.
+	Image bool
 	// Flags allows flag overrides.
-	Flags bool `yaml:"flags"`
+	Flags bool
 }
 
-// Validate checks the policy as agent.yaml states it.
-func (p *Policy) Validate() error {
-	for _, pattern := range p.Images {
-		if err := validateRepositoryPattern(pattern); err != nil {
-			return fmt.Errorf("overrides.images: %w", err)
-		}
+// PolicyOf is what a group of agent.yaml lets anybody override.
+func PolicyOf(g *config.Group) Policy {
+	return Policy{
+		Image: g.MayOverride(protocol.OverrideImage),
+		Flags: g.MayOverride(protocol.OverrideFlags),
+	}
+}
+
+// None reports whether the policy allows nothing.
+func (p *Policy) None() bool { return !p.Image && !p.Flags }
+
+// Permits checks the parts of an entry against the policy.
+func (p *Policy) Permits(container, group string, entry *Entry) error {
+	switch {
+	case group == protocol.DefaultGroup && !entry.Empty():
+		return fmt.Errorf("container %s cannot be overridden: it is in the default group, "+
+			"which allows no overrides", container)
+	case p.None() && !entry.Empty():
+		return fmt.Errorf("container %s cannot be overridden: its group %q allows no overrides "+
+			"(groups.%s.overrides in agent.yaml)", container, group, group)
+	case entry.Image != "" && !p.Image:
+		return fmt.Errorf("the group %q of container %s does not allow image overrides", group, container)
+	case len(entry.Add)+len(entry.Remove) > 0 && !p.Flags:
+		return fmt.Errorf("the group %q of container %s does not allow flag overrides", group, container)
+	default:
+		return nil
+	}
+}
+
+// Allows applies the policy to an override the controller asks for: the
+// parts the group allows and an end within MaxDuration.
+func (p *Policy) Allows(container, group string, entry *Entry, now time.Time) error {
+	if err := p.Permits(container, group, entry); err != nil {
+		return err
 	}
 
-	return nil
-}
-
-// Allows applies the policy of container to an override the controller asks
-// for: the opt-in for image overrides with its allowed repositories, the
-// opt-in for flag overrides, and an end within MaxDuration.
-func (p *Policy) Allows(container string, entry *Entry, now time.Time) error {
 	switch {
-	case entry.Image != "" && len(p.Images) == 0:
-		return fmt.Errorf("this host does not allow image overrides of container %s "+
-			"(no overrides.images in its agent.yaml)", container)
-	case entry.Image != "" && !imageAllowed(p.Images, entry.Image):
-		return fmt.Errorf("image %s is not in a repository this host allows for container %s (%v)",
-			entry.Image, container, p.Images)
-	case len(entry.Add)+len(entry.Remove) > 0 && !p.Flags:
-		return fmt.Errorf("this host does not allow flag overrides of container %s "+
-			"(no overrides.flags in its agent.yaml)", container)
 	case entry.Until == nil:
 		return errors.New("an override from the controller needs an end")
 	case !entry.Until.After(now):
@@ -55,57 +66,4 @@ func (p *Policy) Allows(container string, entry *Entry, now time.Time) error {
 	default:
 		return nil
 	}
-}
-
-// imageAllowed reports whether patterns allow the repository of ref. A
-// pattern is a repository ("ethpandaops/geth", "ghcr.io/ethereum/*") in which
-// "*" stands for any run of characters without a slash; it is compared with
-// the canonical repository of the reference (docker.io/ethpandaops/geth), so
-// a pattern without a registry host means Docker Hub, as a reference does.
-func imageAllowed(patterns []string, ref string) bool {
-	parsed, err := imageref.Parse(ref)
-	if err != nil {
-		return false
-	}
-
-	for _, p := range patterns {
-		if ok, err := path.Match(normalizeRepositoryPattern(p), parsed.Repository()); err == nil && ok {
-			return true
-		}
-	}
-
-	return false
-}
-
-// normalizeRepositoryPattern adds the registry host (and library/) that a
-// reference without one gets.
-func normalizeRepositoryPattern(p string) string {
-	p = strings.ToLower(strings.TrimSpace(p))
-
-	first, rest, more := strings.Cut(p, "/")
-	if !more {
-		return imageref.DockerHubHost + "/library/" + p
-	}
-
-	if strings.ContainsAny(first, ".:") || first == "localhost" {
-		return imageref.RegistryHost(first) + "/" + rest
-	}
-
-	return imageref.DockerHubHost + "/" + p
-}
-
-// validateRepositoryPattern checks one entry of a container's allowed image
-// repositories.
-func validateRepositoryPattern(p string) error {
-	last := p[strings.LastIndex(p, "/")+1:]
-
-	if p == "" || strings.ContainsAny(p, " \t@") || strings.Contains(last, ":") {
-		return fmt.Errorf("%q is not an image repository pattern (a repository, no tag or digest)", p)
-	}
-
-	if _, err := path.Match(normalizeRepositoryPattern(p), "x"); err != nil {
-		return fmt.Errorf("%q is not a pattern: %w", p, err)
-	}
-
-	return nil
 }

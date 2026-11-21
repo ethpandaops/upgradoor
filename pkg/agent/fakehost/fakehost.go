@@ -55,6 +55,8 @@ type Host struct {
 	upgradable []protocol.Upgradable
 
 	failures map[string]error
+	// resolves counts the registry lookups.
+	resolves int
 	calls    []string
 	onCall   func(call string)
 }
@@ -91,7 +93,8 @@ func New(sc *Scenario) (*Host, error) {
 	}
 	h.bootedAt = time.Now()
 
-	for _, c := range sc.Containers {
+	for i := range sc.Containers {
+		c := &sc.Containers[i]
 		h.created++
 
 		key := imageref.Normalize(c.Image)
@@ -106,6 +109,9 @@ func New(sc *Scenario) (*Host, error) {
 			State:     cmp.Or(c.State, protocol.StateRunning),
 			StartedAt: h.bootedAt,
 			Command:   slices.Clone(c.Command),
+			Group:     c.Group,
+			Kind:      kindLabel(c.Group, c.Kind),
+			Linked:    c.Links,
 		})
 
 		// The image a container runs is local and, unless the scenario says
@@ -291,6 +297,12 @@ func (h *Host) RecreateAs(
 
 	h.relabel(name, change.Labels)
 	c.Base = overrides.BaseFromLabels(h.labels[name])
+
+	if group, ok := h.labels[name][protocol.LabelGroup]; ok {
+		c.Group = group
+		c.Kind = kindLabel(group, h.labels[name][protocol.LabelKind])
+	}
+
 	c.Digest = local.Digest
 	c.ImageID = imageID(local.Digest)
 	c.Revision = local.Revision
@@ -304,6 +316,16 @@ func (h *Host) RecreateAs(
 	}
 
 	return nil
+}
+
+// kindLabel is the kind the runtime reads off the labels: none without a
+// group label.
+func kindLabel(group, kind string) protocol.ContainerKind {
+	if group == "" {
+		return ""
+	}
+
+	return protocol.ParseKind(kind)
 }
 
 // relabel applies a recreation's label changes to a container's override
@@ -378,6 +400,14 @@ func (h *Host) Start(ctx context.Context, name string) error {
 	return nil
 }
 
+// Resolves returns how many registry lookups the host answered.
+func (h *Host) Resolves() int {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.resolves
+}
+
 // Resolve implements hostapi.Registry.
 func (h *Host) Resolve(ctx context.Context, ref string) (string, error) {
 	if err := h.begin(ctx, "resolve:"+ref, ""); err != nil {
@@ -386,6 +416,8 @@ func (h *Host) Resolve(ctx context.Context, ref string) (string, error) {
 
 	h.mu.Lock()
 	defer h.mu.Unlock()
+
+	h.resolves++
 
 	tag, ok := h.registry[imageref.Normalize(ref)]
 	if !ok {

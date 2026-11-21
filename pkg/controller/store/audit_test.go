@@ -23,10 +23,14 @@ func auditIDs(entries []fleet.AuditEntry) []int64 {
 }
 
 func TestAppendAudit(t *testing.T) {
+	t.Parallel()
+
 	ctx := context.Background()
 
 	for _, backend := range backends {
 		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
 			s := backend.open(t)
 
 			empty, err := s.ListAudit(ctx, AuditFilter{})

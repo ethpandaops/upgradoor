@@ -1,5 +1,5 @@
 {
- "version": "0acf0d79c302",
+ "version": "295c746b8efc",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -304,8 +304,18 @@
     "t": "b"
    },
    {
+    "n": "group",
+    "t": "s",
+    "omit": true
+   },
+   {
     "n": "kind",
     "t": "r",
+    "omit": true
+   },
+   {
+    "n": "notRolled",
+    "t": "s",
     "omit": true
    },
    {
@@ -392,6 +402,11 @@
    {
     "n": "owners",
     "t": "l",
+    "omit": true
+   },
+   {
+    "n": "group",
+    "t": "s",
     "omit": true
    }
   ],
@@ -505,6 +520,11 @@
     "n": "reason",
     "t": "r",
     "omit": true
+   },
+   {
+    "n": "pull",
+    "t": "s",
+    "omit": true
    }
   ],
   "HostSlotParticipation": [
@@ -525,6 +545,11 @@
    {
     "n": "container",
     "t": "s"
+   },
+   {
+    "n": "group",
+    "t": "s",
+    "omit": true
    },
    {
     "n": "client",
@@ -733,6 +758,12 @@
     "omit": true
    },
    {
+    "n": "unpulled",
+    "t": "a",
+    "of": "PullImage",
+    "omit": true
+   },
+   {
     "n": "image",
     "t": "o",
     "of": "ImageNeed",
@@ -890,8 +921,8 @@
   ],
   "Overridable": [
    {
-    "n": "images",
-    "t": "l",
+    "n": "image",
+    "t": "b",
     "omit": true
    },
    {
@@ -1044,6 +1075,16 @@
     "omit": true
    }
   ],
+  "PullImage": [
+   {
+    "n": "ref",
+    "t": "s"
+   },
+   {
+    "n": "digest",
+    "t": "r"
+   }
+  ],
   "QueueEntry": [
    {
     "n": "host",
@@ -1125,23 +1166,14 @@
     "t": "s"
    },
    {
-    "n": "container",
+    "n": "group",
     "t": "s",
     "omit": true
    },
    {
-    "n": "image",
-    "t": "r",
-    "omit": true
-   },
-   {
-    "n": "digest",
-    "t": "r",
-    "omit": true
-   },
-   {
-    "n": "revision",
-    "t": "r",
+    "n": "targets",
+    "t": "a",
+    "of": "RolloutTarget",
     "omit": true
    },
    {
@@ -1251,6 +1283,36 @@
     "t": "t"
    }
   ],
+  "RolloutTarget": [
+   {
+    "n": "image",
+    "t": "r"
+   },
+   {
+    "n": "digest",
+    "t": "r"
+   },
+   {
+    "n": "revision",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "spec",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "container",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "flags",
+    "t": "b",
+    "omit": true
+   }
+  ],
   "Settings": [
    {
     "n": "maxUnavailablePercent",
@@ -1305,6 +1367,10 @@
     "t": "j"
    },
    {
+    "n": "policyDefaultGroup",
+    "t": "r"
+   },
+   {
     "n": "pauseAfterCanaryImage",
     "t": "b"
    },
@@ -1318,6 +1384,14 @@
    },
    {
     "n": "readyPeerShare",
+    "t": "n"
+   },
+   {
+    "n": "lookupInterval",
+    "t": "j"
+   },
+   {
+    "n": "maxPullingPercent",
     "t": "n"
    },
    {
@@ -1379,6 +1453,11 @@
    {
     "n": "container",
     "t": "s"
+   },
+   {
+    "n": "group",
+    "t": "s",
+    "omit": true
    },
    {
     "n": "client",
