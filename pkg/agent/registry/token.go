@@ -31,7 +31,7 @@ type token struct {
 }
 
 // cachedToken returns the usable bearer token for a repository, or "".
-func (r *Resolver) cachedToken(key string) string {
+func (r *resolver) cachedToken(key string) string {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -50,7 +50,7 @@ func (r *Resolver) cachedToken(key string) string {
 }
 
 // storeToken caches a bearer token for a repository.
-func (r *Resolver) storeToken(key string, tok token) {
+func (r *resolver) storeToken(key string, tok token) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -58,7 +58,7 @@ func (r *Resolver) storeToken(key string, tok token) {
 }
 
 // dropToken forgets the cached token of a repository if it is still value.
-func (r *Resolver) dropToken(key, value string) {
+func (r *resolver) dropToken(key, value string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 
@@ -70,7 +70,7 @@ func (r *Resolver) dropToken(key, value string) {
 // fetchToken follows a Bearer challenge as the distribution token
 // specification describes. The scope asked for is always pull on the one
 // repository, whatever the challenge suggests.
-func (r *Resolver) fetchToken(ctx context.Context, ref imageref.Reference, challenge map[string]string) (token, error) {
+func (r *resolver) fetchToken(ctx context.Context, ref imageref.Reference, challenge map[string]string) (token, error) {
 	realm, err := url.Parse(challenge["realm"])
 	if err != nil || realm.Host == "" {
 		return token{}, fmt.Errorf("registry: %s sent an unusable bearer realm", apiHost(ref))
@@ -145,8 +145,8 @@ func (r *Resolver) fetchToken(ctx context.Context, ref imageref.Reference, chall
 	return tok, nil
 }
 
-// scrubURLError removes the URL from a transport error: a token realm's query
-// is not secret, but there is no reason to repeat it in every log line.
+// scrubURLError removes the URL from a transport error, keeping token realm
+// queries out of the logs.
 func scrubURLError(err error) error {
 	var urlErr *url.Error
 	if errors.As(err, &urlErr) {

@@ -3,10 +3,11 @@
 # signature covers (docs/release.md):
 #
 #   scripts/release-manifest.sh write vX.Y.Z DIR [IMAGE_DIGEST]
-#       DIR/upgradoor-<os>-<arch> -> DIR/upgradoor-manifest.txt, plus the controller image's
-#       line when IMAGE_DIGEST (sha256:<hex> or <hex>, the multi-platform index) is given
+#       DIR/upgradoor-<os>-<arch> and DIR/upgradoor-controller-<os>-<arch> ->
+#       DIR/upgradoor-manifest.txt, plus the controller image's line when IMAGE_DIGEST
+#       (sha256:<hex> or <hex>, the multi-platform index) is given
 #   scripts/release-manifest.sh check vX.Y.Z FILE [--binaries-only]
-#       FILE is in canonical form for vX.Y.Z: every platform's binary, the image's line
+#       FILE is in canonical form for vX.Y.Z: both binaries of every platform, the image's line
 #       (unless --binaries-only), one seq derived from the tag, sorted, nothing else
 #   scripts/release-manifest.sh seq vX.Y.Z
 #       prints the tag's seq
@@ -15,11 +16,16 @@
 #   image <seq> ethpandaops/upgradoor <sha256 hex of the image index>
 #   upgradoor <seq> linux-amd64 <sha256 hex>
 #   upgradoor <seq> linux-arm64 <sha256 hex>
+#   upgradoor-controller <seq> linux-amd64 <sha256 hex>
+#   upgradoor-controller <seq> linux-arm64 <sha256 hex>
+# upgradoor is the host binary, upgradoor-controller the one in the image.
 # seq is X*1000000 + Y*1000 + Z for vX.Y.Z; a host never installs a lower one than it has.
 set -euo pipefail
 
 MANIFEST=upgradoor-manifest.txt
 PLATFORMS="linux-amd64 linux-arm64"
+BINARIES="upgradoor upgradoor-controller"
+LINE_RE='^(image|upgradoor|upgradoor-controller) ([1-9][0-9]*) ([a-z0-9/._-]+) ([0-9a-f]{64})$'
 IMAGE=ethpandaops/upgradoor
 export LC_ALL=C
 
@@ -37,12 +43,14 @@ sha() { sha256sum < "$1" | cut -d' ' -f1; }
 
 # the canonical manifest for the binaries in $2 (and the image digest $3), on stdout
 render() {
-  local seq=$1 dir=$2 digest=${3:-} p
+  local seq=$1 dir=$2 digest=${3:-} b p
   {
     [ -z "$digest" ] || echo "image $seq $IMAGE ${digest#sha256:}"
-    for p in $PLATFORMS; do
-      [ -s "$dir/upgradoor-$p" ] || die "$dir/upgradoor-$p is missing"
-      echo "upgradoor $seq $p $(sha "$dir/upgradoor-$p")"
+    for b in $BINARIES; do
+      for p in $PLATFORMS; do
+        [ -s "$dir/$b-$p" ] || die "$dir/$b-$p is missing"
+        echo "$b $seq $p $(sha "$dir/$b-$p")"
+      done
     done
   } | sort
 }
@@ -79,10 +87,12 @@ case "$cmd" in
     sort -c "$file" 2>/dev/null || die "$file is not sorted"
     expected=""
     [ -z "$want_image" ] || expected="image $IMAGE"$'\n'
-    for p in $PLATFORMS; do expected+="upgradoor $p"$'\n'; done
+    for b in $BINARIES; do
+      for p in $PLATFORMS; do expected+="$b $p"$'\n'; done
+    done
     got=""
     while IFS= read -r line; do
-      [[ "$line" =~ ^(image|upgradoor)\ ([1-9][0-9]*)\ ([a-z0-9/._-]+)\ ([0-9a-f]{64})$ ]] ||
+      [[ "$line" =~ $LINE_RE ]] ||
         die "not a manifest line: $line"
       [ "${BASH_REMATCH[2]}" = "$seq" ] ||
         die "seq ${BASH_REMATCH[2]} is not $2's ($seq): $line"

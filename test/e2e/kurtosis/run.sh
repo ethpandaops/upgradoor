@@ -162,6 +162,7 @@ make -s build
 go build -o "$work/authstub" ./test/e2e/authstub
 go build -o "$work/relabel" ./test/e2e/relabel
 cp bin/upgradoor "$work/upgradoor"
+cp bin/upgradoor-controller "$work/upgradoor-controller"
 docker build -q -t "$prefix-host" -f test/e2e/kurtosis/Dockerfile.host "$work" >/dev/null
 pass "controller, agent image and auth stub built"
 
@@ -200,11 +201,11 @@ done
 say "controller and agents"
 seed=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 export UPGRADOOR_SEED=$seed
-signer=$("$work/upgradoor" keygen signer-pubkey --network "$network")
+signer=$("$work/upgradoor-controller" keygen signer-pubkey --network "$network")
 # The controller signs its answers with a key it derives from the controller
 # seed, a secret of its own; the agents accept only that key.
 (umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$work/controller.seed")
-controller_pub=$("$work/upgradoor" keygen controller-pubkey --network "$network" \
+controller_pub=$("$work/upgradoor-controller" keygen controller-pubkey --network "$network" \
     --controller-seed-file "$work/controller.seed")
 
 "$work/authstub" --listen "127.0.0.1:$auth_port" >"$work/authstub.log" 2>&1 &
@@ -212,7 +213,7 @@ echo $! >"$work/authstub.pid"
 wait_until "auth stub up" 20 curl -fsS "$auth/jwks.json"
 
 mkdir -p "$work/data"
-"$work/upgradoor" controller \
+"$work/upgradoor-controller" run \
     --listen "127.0.0.1:$port" --data-dir "$work/data" \
     --network "$network" --signer-public-key "$signer" \
     --controller-seed-file "$work/controller.seed" \
@@ -249,8 +250,9 @@ for i in $(seq 1 $nodes); do
     "$work/relabel" "$el=execution/el" "$cl=consensus/cl" "$vc=consensus/vc" || die "relabel node $i"
 
     start=$(((i - 1) * validators))
-    "$work/upgradoor" keygen host-key --network "$network" --hostname "node-$i" >"$dir/host.key"
-    "$work/upgradoor" keygen host-cert --network "$network" --hostname "node-$i" \
+    "$work/upgradoor-controller" keygen host-key --network "$network" --hostname "node-$i" \
+        >"$dir/host.key"
+    "$work/upgradoor-controller" keygen host-cert --network "$network" --hostname "node-$i" \
         --role ethereum_node >"$dir/host.crt"
 
     cat >"$dir/agent.yaml" <<EOF

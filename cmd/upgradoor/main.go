@@ -1,4 +1,4 @@
-// Command upgradoor is the upgradoor agent, controller and key tool.
+// Command upgradoor is the upgradoor agent and its on-host commands.
 package main
 
 import (
@@ -13,6 +13,12 @@ import (
 
 // version is set at build time.
 var version = "dev"
+
+// Command groups of the root command.
+const (
+	groupHost   = "host"
+	groupDaemon = "daemon"
+)
 
 func main() {
 	log := logrus.New()
@@ -34,8 +40,13 @@ func newRootCmd(log *logrus.Logger) *cobra.Command {
 	)
 
 	root := &cobra.Command{
-		Use:           "upgradoor",
-		Short:         "Staged, health-gated image rolls, package upgrades and reboots for devnet hosts",
+		Use:   "upgradoor",
+		Short: "Staged, health-gated image rolls, package upgrades and reboots for devnet hosts",
+		Long: "Staged, health-gated image rolls, package upgrades and reboots for devnet hosts.\n\n" +
+			"list, status, roll, override, hold, release and init-overrides talk to the\n" +
+			"running agent over its local socket (root and the entry user's group). Nothing\n" +
+			"they ask for happens at once: an override and a roll are served under a lease\n" +
+			"of the controller, like every other change.",
 		Version:       version,
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -58,10 +69,26 @@ func newRootCmd(log *logrus.Logger) *cobra.Command {
 	root.PersistentFlags().StringVar(&logLevel, "log-level", "info", "log level")
 	root.PersistentFlags().StringVar(&logFormat, "log-format", "text", "log format: text or json")
 
-	root.AddCommand(newKeygenCmd())
-	root.AddCommand(newAgentCmd(log))
-	root.AddCommand(newControllerCmd(log))
-	root.AddCommand(newHostCmd())
+	root.AddGroup(
+		&cobra.Group{ID: groupHost, Title: "On-host commands:"},
+		&cobra.Group{ID: groupDaemon, Title: "Daemons:"},
+	)
+
+	onHost := []*cobra.Command{
+		newListCmd(), newStatusCmd(), newRollCmd(), newOverrideCmd(),
+		newHoldCmd(), newReleaseCmd(), newInitOverridesCmd(), newVerifyCertCmd(),
+	}
+	for _, cmd := range onHost {
+		cmd.GroupID = groupHost
+	}
+
+	daemons := []*cobra.Command{newAgentCmd(log)}
+	for _, cmd := range daemons {
+		cmd.GroupID = groupDaemon
+	}
+
+	root.AddCommand(onHost...)
+	root.AddCommand(daemons...)
 
 	return root
 }

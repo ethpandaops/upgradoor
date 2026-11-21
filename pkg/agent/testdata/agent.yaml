@@ -1,0 +1,57 @@
+controller:
+  url: https://upgradoor.testnet-0.example
+  syncInterval: 20s
+  leaseSyncInterval: 3s
+  minSyncInterval: 2s
+  maxSyncInterval: 5m
+  allowInsecure: false
+  publicKeys:
+    - 1i53B0uYPMETWigkP4L189HNPmVdGghJFBa6ZYfz3fnv-sMt7qkcQxiXUnMqYYz103HdzoJvV88hFFdCCOILPr9-xXUd3EFe4OcKuL7JI8dRDHORitZyhBUnEE_fe5FjU0ZdnRK3NIkmQ0uvzUJk_slAXMXo2EDCYKqPVOOHyBlQn-YWwpYSmFUH3U9Yzh2xjLn_2ywKZPRUBAHz3PZcsodkDkKypuR8m69V0RZaL5sF9ibhVzcgviueO8DAx9_e6jNVsN80EjVoY8351COJ0_GSNpZm_sNIR3FwSdgfoRVEMVulsqp8YUKA77HWGz0uVAFPWVP73_op-dcDy5Yzz2f_mlnkZZ9PzfpfbO-TXOI9rYAqWvqjl5Fhh8kjxnyEsPoYoEr-sxJTyQHYLd26vVcSlS9zYhuTFH3_aOadf67YIyATtnMUsrNdiNSZUWVHvJvClZ_1-pdbpwJmZ53cVjF1_XGQv49EOJjToGBwsDL_yLPpBXwySr4Ntyyt95O6S1h67XojFl1nk-BIiVUFfSxLfsxAt3acFtW7DlcTvgQo4vyK8qBSpxTTKPWZ3SvtQ1LVRGkMMUCX1vb2jjXvfd14on2rrvHdzRymX1USdBwZEK2Q7VuvjYdKNNN_9TY8rkC8RyQfIZKriCuELT4UNCkhU6-BgLe3KefOx5iW4c541CeU4SfcIa0iCS9mi9SFv21Wa7pYlj5AjlL5Efcund_nWpyna5Utucrmyl3IAk3zzp621oWn6gxXhAcAleaLNN7tQy-jAajpPMOQaShgo0KvK5gOI0FHIwWIg3uhtjy-1HwKNXUU9mCGCopPNBfjsap0KOQKoVqtFe49uJgffGFsSSQKywCeWWQnlwkCLY0NMUPzpO_gT2RdSnDyGwth0JPuSGBE9hz3TpRuKH-r6hsccpvxkSfuYDnVyoflfd0tm4yBpgllXjSncByv8amqhzLVVVHRS2kIU33I_pV1v79EOcXBwGGKecGmxnIFdSJvTTgfu0xwbkUjCmOAJb7LNppDn9j4coP-Hen3EnWGtCnN9hGjOL2CKu4Qdo08W9QGd7jOyKHHifQ5gIo5v1IDgMPs098yoXSLSRaJDLRcXkHVNdLSKVNRVcfrMGi286wIhjpIwM_PfNJ_ZjwbfbiXFwu2rHLC-N3D9yja743vpeXdC4w8vQVXV-UxxnOdaNtuE31l7mtpcVAR1QwaQd3sDbbljdYjh9mdZI77AlOzQ9xt4KrAyYQavAMDUTGlGHr53HkSweG82aXMSf-hUC8d_n8X6Wn_yZ0p051sf17jifExIduvJXu_TZuXcMgt5ndl47MShvXytCllLnr4r1T_PsYGnKXQ8jLDQmD_BdYLkXuuUsisdQwOCtvVyVDtCCXv0q5XEZU4wBp9d0CaK-q31IsUyp-Hh-gCwGEYA60Fx2AlmmATZvw54NM4bIwHRI4uulK8lUYLV0SF_N9HlbwZr--9W686DY-Q4C7hCarBZZmHIktzGsNH2g27Q-dX0yJ38_t4t1zcDeLMEls-HxgEy-wjHsIb5Ie-LBKaxW_isJSrC9g9p5CwWrfiJ0kETehC7wutMOZP3RUcfGtxJuMr_ifHfl_3GhfX3qgwDLEcR7P-KZrXPzSXV9jg41Ah2GZFaNjzH6uBUd1s1VX5vhIhZQp-hSVUMW1_SBtEfs21wvsHhLwY5PzWk6dQ037Ip1PfF9RqAQHd2ZlugMkwhwyshbCiRYeQ6Bw6OKvVixLBbQ
+  allowUnsignedAnswers: false
+keyFile: /etc/upgradoor/test.key
+certFile: /etc/upgradoor/test.crt
+stateDir: /var/lib/upgradoor-test
+entryUser: ops
+overridesFile: /home/ops/custom-overrides.yaml
+socket:
+  path: /run/upgradoor/test.sock
+  group: ops
+auditLog:
+  file: /var/log/upgradoor/audit.log
+  maxSizeBytes: 2097152
+  maxFiles: 3
+verbs: [roll, packages, reboot]
+groups:
+  execution:
+    client: geth
+    owners: [geth, panda]
+    overrides: [image, flags]
+    impact: node
+    stopTimeout: 600s
+  tooling:
+    impact: independent
+containers:
+  execution: {group: execution, kind: el}
+  exporter: {group: tooling}
+defaultGroup:
+  roll: true
+  exclude: [tmp-*, debug]
+packages:
+  blocked: [docker-ce, containerd.io]
+docker:
+  host: unix:///run/docker-test.sock
+probes:
+  el: http://127.0.0.1:8545
+  cl: http://127.0.0.1:5052
+validators:
+  markerFile: /data/.validator_keyrange
+  start: 0
+  end: 0
+registry:
+  pollInterval: 15m
+  authFile: /root/.docker/test.json
+  plainHttp: [registry.local:5000]
+  caFile: /etc/ssl/registry-ca.pem
+verify:
+  window: 30s
+  timeout: 5m

@@ -70,7 +70,7 @@ func TestTokenFlow(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	f.set(func(f *fakeRegistry) { f.bearer = testToken })
 
-	r := newResolver(t, f, func(o *Options) { o.Logins = loginFor(f.host(), testBasic) })
+	r := newResolver(t, f, loginFor(f.host(), testBasic))
 
 	for range 3 {
 		digest, err := r.Resolve(t.Context(), f.ref(tagMulti))
@@ -166,8 +166,7 @@ func TestAnnouncedTokenExpiry(t *testing.T) {
 	resolve()
 	require.Equal(t, 1, f.tokens(), "still valid")
 
-	// Within the slack before the announced expiry the token is not used any
-	// more: the request goes out without it and is challenged again.
+	// Within the slack before expiry the token is dropped and challenged again.
 	now = now.Add(time.Second)
 
 	require.Empty(t, r.cachedToken(f.host()+"/"+repoPath))
@@ -205,7 +204,7 @@ func TestBasicAuthRegistry(t *testing.T) {
 		f.challenge = `Basic realm="registry"`
 	})
 
-	r := newResolver(t, f, func(o *Options) { o.Logins = loginFor(f.host(), testBasic) })
+	r := newResolver(t, f, loginFor(f.host(), testBasic))
 
 	digest, err := r.Resolve(t.Context(), f.ref(tagMulti))
 	require.NoError(t, err)
@@ -217,7 +216,7 @@ func TestBasicAuthRegistry(t *testing.T) {
 
 	// Wrong and missing credentials end in a 401 without any token request.
 	for _, logins := range []Logins{loginFor(f.host(), "user:wrong"), nil} {
-		r = newResolver(t, f, func(o *Options) { o.Logins = logins })
+		r = newResolver(t, f, logins)
 
 		_, err = r.Resolve(t.Context(), f.ref(tagMulti))
 		require.ErrorAs(t, err, &status)
@@ -228,7 +227,7 @@ func TestBasicAuthRegistry(t *testing.T) {
 	require.Equal(t, 0, f.tokens())
 
 	// Credentials for another host are not sent here.
-	r = newResolver(t, f, func(o *Options) { o.Logins = loginFor("other.example", testBasic) })
+	r = newResolver(t, f, loginFor("other.example", testBasic))
 
 	_, err = r.Resolve(t.Context(), f.ref(tagMulti))
 	require.ErrorAs(t, err, &status)
@@ -268,7 +267,7 @@ func TestTokenEndpointFailures(t *testing.T) {
 				c.set(f)
 			})
 
-			r := newResolver(t, f, func(o *Options) { o.Logins = loginFor(f.host(), testBasic) })
+			r := newResolver(t, f, loginFor(f.host(), testBasic))
 
 			_, err := r.Resolve(t.Context(), f.ref(tagMulti))
 			require.ErrorContains(t, err, c.want)
@@ -298,8 +297,7 @@ func TestStatusErrorFromTokenEndpoint(t *testing.T) {
 }
 
 func TestPlainHTTPRealmNeedsAPlainHTTPRegistry(t *testing.T) {
-	// A TLS registry that points at an http token service: credentials would
-	// leave the encrypted channel, so the realm is refused.
+	// A TLS registry's http realm is refused: credentials would leave TLS.
 	f := newFakeRegistry(t, true)
 	realm := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		t.Error("the plain-http realm must not be contacted")
@@ -312,13 +310,9 @@ func TestPlainHTTPRealmNeedsAPlainHTTPRegistry(t *testing.T) {
 		f.challenge = `Bearer realm="` + realm.URL + `/token"`
 	})
 
-	r, err := New(testLogger(), Options{
-		CAFile: caFileFor(t, f.srv),
-		Logins: loginFor(f.host(), testBasic),
-	})
-	require.NoError(t, err)
+	r := buildResolver(t, Config{CAFile: caFileFor(t, f.srv)}, loginFor(f.host(), testBasic))
 
-	_, err = r.Resolve(t.Context(), f.ref(tagMulti))
+	_, err := r.Resolve(t.Context(), f.ref(tagMulti))
 	require.ErrorContains(t, err, "not https")
 
 	// The same registry with its own https realm works.

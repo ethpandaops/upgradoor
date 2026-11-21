@@ -5,26 +5,31 @@ LDFLAGS := -s -w -buildid= -X main.version=$(VERSION)
 
 all: build
 
-# The web UI is embedded with the "webui" build tag. Without the tag the
-# binary serves a placeholder page, so go build / go test need no node.
+# bin/upgradoor runs on the hosts; bin/upgradoor-controller embeds the web UI
+# with the "webui" build tag. Without the tag the controller serves a
+# placeholder page, so go build / go test need no node.
 build: ensure-web
-	CGO_ENABLED=0 go build -tags=webui -trimpath -ldflags "$(LDFLAGS)" -o bin/upgradoor ./cmd/upgradoor
+	CGO_ENABLED=0 go build -trimpath -ldflags "$(LDFLAGS)" -o bin/upgradoor ./cmd/upgradoor
+	CGO_ENABLED=0 go build -tags=webui -trimpath -ldflags "$(LDFLAGS)" \
+	  -o bin/upgradoor-controller ./cmd/upgradoor-controller
 
-# release: the reproducible release binaries dist/upgradoor-linux-<arch> and their manifest
+# release: the reproducible release binaries dist/upgradoor-linux-<arch> (hosts) and
+# dist/upgradoor-controller-linux-<arch> (the controller image), and their manifest
 # dist/upgradoor-manifest.txt (VERSION must be exactly vX.Y.Z). Rebuilt from the tag, it gives
 # byte-identical files: the Go of go.mod (GOTOOLCHAIN), no VCS stamp, no build id, a web UI
 # built afresh from the lock file. CI adds the image's line before the maintainer signs
 # (docs/release.md).
 RELEASE_PLATFORMS := linux-amd64 linux-arm64
 GO_VERSION := $(shell sed -n 's/^go //p' go.mod)
+RELEASE_GO = GOTOOLCHAIN=go$(GO_VERSION) CGO_ENABLED=0 GOOS=$${p%-*} GOARCH=$${p\#*-} \
+	go build -trimpath -buildvcs=false -ldflags "-s -w -buildid= -X main.version=$(VERSION)"
 
 release: build-web
 	@rm -rf dist && mkdir -p dist
 	@for p in $(RELEASE_PLATFORMS); do \
-	  GOTOOLCHAIN=go$(GO_VERSION) CGO_ENABLED=0 GOOS=$${p%-*} GOARCH=$${p#*-} \
-	    go build -tags=webui -trimpath -buildvcs=false \
-	    -ldflags "-s -w -buildid= -X main.version=$(VERSION)" \
-	    -o dist/upgradoor-$$p ./cmd/upgradoor || exit 1; \
+	  $(RELEASE_GO) -o dist/upgradoor-$$p ./cmd/upgradoor || exit 1; \
+	  $(RELEASE_GO) -tags=webui -o dist/upgradoor-controller-$$p ./cmd/upgradoor-controller || \
+	    exit 1; \
 	done
 	./scripts/release-manifest.sh write $(VERSION) dist
 
@@ -63,7 +68,7 @@ test-web: web/node_modules/.package-lock.json
 
 # Needs a Docker daemon: container recreate against real containers.
 test-docker:
-	go test -race -timeout 15m -tags=docker_integration ./pkg/agent/docker/...
+	go test -race -timeout 15m -tags=docker_integration ./pkg/agent/host/docker/... ./pkg/agent/
 
 # Needs Docker: runs the package upgrade and reboot paths inside a throwaway
 # systemd container. Never touches this machine's packages.

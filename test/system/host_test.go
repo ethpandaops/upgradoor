@@ -17,7 +17,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent/system"
+	"github.com/ethpandaops/upgradoor/pkg/agent/host"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -88,12 +88,24 @@ func stateDir() string {
 	return defaultStateDir
 }
 
-func newSystem() *system.System {
+// newSystem returns the machine as the agent sees it. Only its OS part is
+// used: the Docker client is created without connecting.
+func newSystem(t *testing.T) host.Host {
+	t.Helper()
+
 	log := logrus.New()
 	log.SetOutput(os.Stderr)
 	log.SetLevel(logrus.DebugLevel)
 
-	return system.New(log, system.Options{Blocked: blocked})
+	cfg := &host.Config{}
+	cfg.ApplyDefaults()
+
+	h, err := host.New(log, cfg, blocked, nil)
+	require.NoError(t, err)
+
+	t.Cleanup(func() { _ = h.Close() })
+
+	return h
 }
 
 func testContext(t *testing.T) context.Context {
@@ -192,7 +204,7 @@ func TestPreReboot(t *testing.T) {
 	requireThrowawayHost(t)
 
 	ctx := testContext(t)
-	sys := newSystem()
+	sys := newSystem(t)
 
 	var initialHash string
 
@@ -245,13 +257,13 @@ func TestPreReboot(t *testing.T) {
 		initialHash = inv.Hash
 
 		// A second, independent collection of the same system: same hash.
-		again, err := newSystem().Inventory(ctx)
+		again, err := newSystem(t).Inventory(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, inv.Hash, again.Hash)
 	})
 
 	t.Run("status of the fresh host", func(t *testing.T) {
-		status, err := sys.Status(ctx)
+		status, err := sys.System(ctx)
 		require.NoError(t, err)
 
 		assert.Regexp(t, bootIDPattern, status.BootID)
@@ -286,12 +298,12 @@ func TestPreReboot(t *testing.T) {
 			{},
 		} {
 			err := sys.UpgradePackages(ctx, names)
-			require.ErrorIs(t, err, system.ErrPackageNotAllowed, "%v", names)
+			require.ErrorContains(t, err, "package not allowed", "%v", names)
 		}
 
 		// Nothing ran: not the upgrades, and not apt-get update either,
 		// which would have made upgradoor-late 2.0 visible.
-		inv, err := newSystem().Inventory(ctx)
+		inv, err := newSystem(t).Inventory(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, initialHash, inv.Hash)
 
@@ -306,7 +318,7 @@ func TestPreReboot(t *testing.T) {
 		require.NoError(t, sys.UpgradePackages(ctx, []string{pkgRegex}))
 
 		// Nothing ran: no upgrade, and no apt-get update either.
-		inv, err := newSystem().Inventory(ctx)
+		inv, err := newSystem(t).Inventory(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, initialHash, inv.Hash)
 		assert.Equal(t, "1.0", installedVersions(t, inv)[pkgDummy])
@@ -365,7 +377,7 @@ func TestPreReboot(t *testing.T) {
 			dummyUpgradable(pkgSecfix, "1.0+deb13u1", originSecurity, false, true),
 		}, inv.Upgradable)
 
-		status, err := sys.Status(ctx)
+		status, err := sys.System(ctx)
 		require.NoError(t, err)
 		assert.Equal(t, protocol.Pending{Upgradable: 3, Security: 1, Blocked: 1}, status.Pending)
 		assert.Equal(t, []protocol.PackageChange{{Name: pkgBroken, From: "1.0", To: "2.0"}},
@@ -377,11 +389,8 @@ func TestPreReboot(t *testing.T) {
 		err := sys.UpgradePackages(ctx, []string{pkgBroken})
 		require.Error(t, err)
 
-		var cmdErr *system.CommandError
-
-		require.ErrorAs(t, err, &cmdErr)
-		assert.Equal(t, "apt-get", cmdErr.Name)
-		assert.Equal(t, 100, cmdErr.ExitCode)
+		assert.Contains(t, err.Error(), "apt-get")
+		assert.Contains(t, err.Error(), "exit status 100")
 		assert.Contains(t, err.Error(), "upgradoor-broken: preinst refuses the upgrade")
 
 		inv, err := sys.Inventory(ctx)
@@ -395,7 +404,7 @@ func TestPreReboot(t *testing.T) {
 		require.NoError(t, os.WriteFile(rebootRequiredPkgs,
 			[]byte("libc6\nlinux-image-6.12.117+deb13-amd64\nlibc6\n"), 0o644))
 
-		status, err := sys.Status(ctx)
+		status, err := sys.System(ctx)
 		require.NoError(t, err)
 		assert.True(t, status.OS.RebootRequired)
 		assert.Equal(t, []string{"libc6", "linux-image-6.12.117+deb13-amd64"},
@@ -410,9 +419,9 @@ func TestReboot(t *testing.T) {
 	requireThrowawayHost(t)
 
 	ctx := testContext(t)
-	sys := newSystem()
+	sys := newSystem(t)
 
-	status, err := sys.Status(ctx)
+	status, err := sys.System(ctx)
 	require.NoError(t, err)
 	require.True(t, status.OS.RebootRequired, "TestPreReboot left the flag")
 
@@ -429,7 +438,7 @@ func TestPostReboot(t *testing.T) {
 	requireThrowawayHost(t)
 
 	ctx := testContext(t)
-	sys := newSystem()
+	sys := newSystem(t)
 
 	before := strings.TrimSpace(readFile(t, filepath.Join(stateDir(), bootIDFile)))
 	require.Regexp(t, bootIDPattern, before)
@@ -438,7 +447,7 @@ func TestPostReboot(t *testing.T) {
 	_, err := time.Parse(time.RFC3339Nano, accepted)
 	require.NoError(t, err, "Reboot returned without error before the host went down")
 
-	status, err := sys.Status(ctx)
+	status, err := sys.System(ctx)
 	require.NoError(t, err)
 
 	assert.Regexp(t, bootIDPattern, status.BootID)

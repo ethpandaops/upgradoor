@@ -1,4 +1,4 @@
-// Command load runs a fleet of fake agents (pkg/agent/fakehost) against a
+// Command load runs a fleet of agents on in-memory hosts (agenttest) against a
 // local controller with answer signing on, rolls one image out over the
 // fleet, and reports what the controller cost: its CPU, the sync latency
 // it measured, the growth of its database and the bytes one viewer of the
@@ -39,8 +39,12 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent"
-	"github.com/ethpandaops/upgradoor/pkg/agent/config"
-	"github.com/ethpandaops/upgradoor/pkg/agent/fakehost"
+	"github.com/ethpandaops/upgradoor/pkg/agent/agenttest"
+	"github.com/ethpandaops/upgradoor/pkg/agent/lease"
+	"github.com/ethpandaops/upgradoor/pkg/agent/link"
+	"github.com/ethpandaops/upgradoor/pkg/agent/local"
+	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
+	"github.com/ethpandaops/upgradoor/pkg/agent/registry"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -93,7 +97,7 @@ type world struct {
 	beacon     *exec.Cmd
 	seed       []byte
 	controller string
-	hosts      []*fakehost.Host
+	hosts      []*agenttest.Host
 	log        *logrus.Logger
 }
 
@@ -133,7 +137,9 @@ func run(ctx context.Context, o *options) error {
 // start builds and starts the fake beacon node and the controller.
 func (w *world) start(ctx context.Context) error {
 	bin := filepath.Join(w.o.dir, "bin")
-	for name, pkg := range map[string]string{"upgradoor": "./cmd/upgradoor", "fakebeacon": "./test/e2e/fakebeacon"} {
+	for name, pkg := range map[string]string{
+		"upgradoor-controller": "./cmd/upgradoor-controller", "fakebeacon": "./test/e2e/fakebeacon",
+	} {
 		build := exec.CommandContext(ctx, "go", "build", "-o", filepath.Join(bin, name), pkg) //nolint:gosec // fixed packages
 		build.Stdout, build.Stderr = os.Stdout, os.Stderr
 
@@ -175,7 +181,7 @@ func (w *world) start(ctx context.Context) error {
 
 	w.controller = identity.EncodePublicKey(identity.PublicKey(ctlKey))
 
-	args := []string{"controller", "--listen", ctlAddr, "--data-dir", filepath.Join(w.o.dir, "data"),
+	args := []string{"run", "--listen", ctlAddr, "--data-dir", filepath.Join(w.o.dir, "data"),
 		"--network", network, "--signer-public-key", identity.EncodePublicKey(identity.PublicKey(signer)),
 		"--controller-seed-file", seedFile, "--allow-insecure-agent-http",
 		"--beacon-endpoint", "http://" + beaconAddr,
@@ -186,7 +192,8 @@ func (w *world) start(ctx context.Context) error {
 		fmt.Printf("pprof at http://127.0.0.1:%s/debug/pprof/\n", ports[2])
 	}
 
-	w.ctl, err = startProcess(filepath.Join(w.o.dir, "controller.log"), filepath.Join(bin, "upgradoor"), args...)
+	w.ctl, err = startProcess(filepath.Join(w.o.dir, "controller.log"),
+		filepath.Join(bin, "upgradoor-controller"), args...)
 	if err != nil {
 		return err
 	}
@@ -223,7 +230,7 @@ func (w *world) startAgents(ctx context.Context) ([]agent.Service, error) {
 	w.log.SetLevel(logrus.WarnLevel)
 
 	agents := make([]agent.Service, 0, w.o.hosts)
-	w.hosts = make([]*fakehost.Host, 0, w.o.hosts)
+	w.hosts = make([]*agenttest.Host, 0, w.o.hosts)
 	gap := w.o.rampUp / time.Duration(max(w.o.hosts, 1))
 
 	for i := range w.o.hosts {
@@ -249,7 +256,7 @@ func (w *world) startAgents(ctx context.Context) ([]agent.Service, error) {
 	return agents, nil
 }
 
-func (w *world) newAgent(i int) (agent.Service, *fakehost.Host, error) {
+func (w *world) newAgent(i int) (agent.Service, *agenttest.Host, error) {
 	name := fmt.Sprintf("load-%04d", i)
 	dir := filepath.Join(w.o.dir, "hosts", name)
 
@@ -274,38 +281,42 @@ func (w *world) newAgent(i int) (agent.Service, *fakehost.Host, error) {
 		return nil, nil, err
 	}
 
-	host, err := fakehost.New(&fakehost.Scenario{
+	host, err := agenttest.NewHost(&agenttest.Scenario{
 		BootID:        name,
-		OS:            fakehost.OS{ID: "debian", VersionID: "13", PrettyName: "Debian 13", Arch: "amd64"},
+		OS:            agenttest.OS{ID: "debian", VersionID: "13", PrettyName: "Debian 13", Arch: "amd64"},
 		RunningKernel: "6.12.57-amd64", NewestKernel: "6.12.57-amd64",
-		Containers: []fakehost.Container{
+		Containers: []agenttest.Container{
 			{Name: "geth", Image: gethImage, Digest: gethOld, Group: "execution", Kind: "el"},
 			{Name: "beacon", Image: clImage, Digest: clDigest, Group: "consensus", Kind: "cl"},
 		},
-	})
+	}, nil)
 	if err != nil {
 		return nil, nil, err
 	}
 
-	cfg := &config.Config{
-		Controller: config.Controller{
+	cfg := &agent.Config{
+		Controller: link.Config{
 			URL: w.ctlURL, AllowInsecure: true, PublicKeys: []string{w.controller},
 		},
-		StateDir:      filepath.Join(dir, "state"),
-		OverridesFile: filepath.Join(dir, "home", "overrides.yaml"),
-		Socket:        config.Socket{Path: filepath.Join(w.o.dir, "s", strconv.Itoa(i))},
-		Verbs:         []protocol.Verb{protocol.VerbRoll},
-		Groups: map[string]config.Group{
-			"execution": {Client: "geth"},
-			"consensus": {Client: "lighthouse"},
+		StateDir: filepath.Join(dir, "state"),
+		Local: local.Config{
+			OverridesFile: filepath.Join(dir, "home", "overrides.yaml"),
+			Socket:        local.Socket{Path: filepath.Join(w.o.dir, "s", strconv.Itoa(i))},
 		},
-		Registry: config.Registry{PollInterval: 30 * time.Second},
-		Verify:   config.Verify{Window: time.Second, Timeout: 30 * time.Second},
+		Policy: plan.Policy{
+			Verbs: []protocol.Verb{protocol.VerbRoll},
+			Groups: map[string]plan.Group{
+				"execution": {Client: "geth"},
+				"consensus": {Client: "lighthouse"},
+			},
+		},
+		Registry: registry.Config{PollInterval: 30 * time.Second},
+		Verify:   lease.Config{Window: time.Second, Timeout: 30 * time.Second},
 	}
 	cfg.ApplyDefaults()
 
-	svc, err := agent.New(w.log, cfg, creds, agent.Deps{
-		Runtime: host, Registry: host, System: host, Version: "load",
+	svc, err := agent.New(w.log, cfg, creds, &agent.Deps{
+		Host: host, Resolver: host, Version: "load",
 	})
 
 	return svc, host, err

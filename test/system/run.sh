@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# System test of pkg/agent/system (make test-system).
+# System test of the OS part of pkg/agent/host (make test-system).
 #
 # Boots a throwaway Debian 13 container with systemd as PID 1 and a local
 # apt repository, copies in a test binary built from this directory

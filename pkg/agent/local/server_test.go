@@ -1,4 +1,4 @@
-package local_test
+package local
 
 import (
 	"context"
@@ -10,70 +10,90 @@ import (
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
-	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent/auditlog"
-	"github.com/ethpandaops/upgradoor/pkg/agent/local"
+	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
 )
 
-// fakeService records what the socket asked and answers with err.
-type fakeService struct {
+// fakeAgent records what the socket asked and answers with err.
+type fakeAgent struct {
+	mu    sync.Mutex
 	err   error
 	calls []string
 }
 
-func (f *fakeService) Status() local.Status {
-	return local.Status{Host: "host-1", Rolls: []local.Roll{{ID: "r1", State: local.RollQueued}}}
-}
+func (f *fakeAgent) record(call string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
-func (f *fakeService) Override(user string, req *local.OverrideRequest) (string, error) {
-	f.calls = append(f.calls, fmt.Sprintf("override %s %s clear=%t", user, req.Container, req.Clear))
-
-	return "image " + req.Image, f.err
-}
-
-func (f *fakeService) Hold(user string, req *local.HoldRequest) error {
-	f.calls = append(f.calls, fmt.Sprintf("hold %s %q release=%t", user, req.Reason, req.Release))
+	f.calls = append(f.calls, call)
 
 	return f.err
 }
 
-func (f *fakeService) Roll(user, container string) (*local.Roll, error) {
-	f.calls = append(f.calls, "roll "+user+" "+container)
-
-	if f.err != nil {
-		return nil, f.err
-	}
-
-	return &local.Roll{ID: "roll-1", Container: container}, nil
+func (f *fakeAgent) Status() Status {
+	return Status{Host: "host-1", Rolls: []Roll{{ID: "r1", State: RollQueued}}}
 }
 
-func (f *fakeService) InitOverrides(user string) (string, error) {
-	f.calls = append(f.calls, "init "+user)
+func (f *fakeAgent) Override(user string, req *OverrideRequest) (string, error) {
+	return "image " + req.Image, f.record(fmt.Sprintf("override %s %s clear=%t", user, req.Container, req.Clear))
+}
 
-	return "/home/devops/overrides.yaml", f.err
+func (f *fakeAgent) Hold(user string, req *HoldRequest) error {
+	return f.record(fmt.Sprintf("hold %s %q release=%t", user, req.Reason, req.Release))
+}
+
+func (f *fakeAgent) Roll(user, container string) (*Roll, error) {
+	if err := f.record("roll " + user + " " + container); err != nil {
+		return nil, err
+	}
+
+	return &Roll{ID: "roll-1", Container: container}, nil
+}
+
+func (f *fakeAgent) InitOverrides(user string) (string, error) {
+	return "/home/devops/overrides.yaml", f.record("init " + user)
+}
+
+// maxSocketPath is the longest path a unix socket address holds.
+const maxSocketPath = 107
+
+// socketPath is a socket path in a short directory of its own.
+func socketPath(t *testing.T) string {
+	t.Helper()
+
+	dir, err := os.MkdirTemp(os.TempDir(), "s")
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+
+	path := filepath.Join(dir, "agent.sock")
+	require.LessOrEqual(t, len(path), maxSocketPath,
+		"the socket path %s is too long for a unix socket: set TMPDIR to a shorter directory", path)
+
+	return path
 }
 
 // serve starts a server on a socket in a temporary directory.
-func serve(t *testing.T, svc local.Service) (string, *local.Client) {
+func serve(t *testing.T, cfg *Config, agent Agent) (string, Client) {
 	t.Helper()
 
-	path := filepath.Join(t.TempDir(), "agent.sock")
-	srv := local.NewServer(logrus.New(), local.Socket{Path: path, EntryUser: "nobody-here"}, svc)
+	cfg.Socket.Path = socketPath(t)
+	srv := NewServer(quiet(), cfg, agent)
 	require.NoError(t, srv.Start(t.Context()))
 
 	t.Cleanup(func() {
 		require.NoError(t, srv.Stop())
+		require.NoError(t, srv.Stop(), "a second Stop is fine")
 
-		_, err := os.Stat(path)
+		_, err := os.Stat(cfg.Socket.Path)
 		assert.ErrorIs(t, err, os.ErrNotExist, "the socket file is removed")
 	})
 
-	return path, local.NewClient(path)
+	return cfg.Socket.Path, NewClient(cfg.Socket.Path)
 }
 
 // post sends a raw request to the socket and returns the status code.
@@ -100,47 +120,43 @@ func post(t *testing.T, path, route, body string) int {
 	return resp.StatusCode
 }
 
+// The caller's name comes from the kernel.
 func TestServer(t *testing.T) {
-	svc := &fakeService{}
-	path, c := serve(t, svc)
+	agent := &fakeAgent{}
+	_, c := serve(t, &Config{EntryUser: "nobody-here"}, agent)
 
 	me, err := user.Current()
 	require.NoError(t, err)
 
 	who := "local:" + me.Username
 
-	info, err := os.Stat(path)
-	require.NoError(t, err)
-	assert.Equal(t, os.ModeSocket, info.Mode()&os.ModeSocket)
-	assert.Equal(t, os.FileMode(0o600), info.Mode().Perm(), "no group: root only")
-
 	st, err := c.Status(t.Context())
 	require.NoError(t, err)
 	assert.Equal(t, "host-1", st.Host)
 	assert.Equal(t, "r1", st.Rolls[0].ID)
 
-	answer, err := c.Override(t.Context(), &local.OverrideRequest{Container: "geth", Image: "a/b:c"})
+	answer, err := c.Override(t.Context(), &OverrideRequest{Container: "geth", Image: "a/b:c"})
 	require.NoError(t, err)
 	assert.Equal(t, "override of geth set (image a/b:c); the container follows under the next lease",
 		answer.Message)
 
-	answer, err = c.Override(t.Context(), &local.OverrideRequest{Container: "geth", Clear: true})
+	answer, err = c.Override(t.Context(), &OverrideRequest{Container: "geth", Clear: true})
 	require.NoError(t, err)
 	assert.Equal(t, "override of geth cleared; the container is put back under the next lease",
 		answer.Message)
 
-	answer, err = c.Hold(t.Context(), &local.HoldRequest{Reason: "disk"})
+	answer, err = c.Hold(t.Context(), &HoldRequest{Reason: "disk"})
 	require.NoError(t, err)
 	assert.Equal(t, "host held: the agent reports no needs and refuses all work until it is released",
 		answer.Message)
 
-	answer, err = c.Hold(t.Context(), &local.HoldRequest{Release: true})
+	answer, err = c.Hold(t.Context(), &HoldRequest{Release: true})
 	require.NoError(t, err)
 	assert.Equal(t, "local hold released", answer.Message)
 
 	answer, err = c.Roll(t.Context(), "geth")
 	require.NoError(t, err)
-	assert.Equal(t, local.Answer{Roll: "roll-1", Message: "roll of geth requested"}, *answer)
+	assert.Equal(t, Answer{Roll: "roll-1", Message: "roll of geth requested"}, *answer)
 
 	answer, err = c.InitOverrides(t.Context())
 	require.NoError(t, err)
@@ -153,36 +169,93 @@ func TestServer(t *testing.T) {
 		"hold " + who + ` "" release=true`,
 		"roll " + who + " geth",
 		"init " + who,
-	}, svc.calls)
+	}, agent.calls)
 }
 
 func TestServerFailures(t *testing.T) {
-	svc := &fakeService{}
-	path, c := serve(t, svc)
+	agent := &fakeAgent{}
+	path, c := serve(t, &Config{EntryUser: "nobody-here"}, agent)
 
-	// A request the server cannot read reaches nobody.
-	assert.Equal(t, http.StatusBadRequest, post(t, path, local.PathRolls, `{"container":"geth","x":1}`))
-	assert.Equal(t, http.StatusBadRequest, post(t, path, local.PathHold, `{`))
-	assert.Empty(t, svc.calls)
+	assert.Equal(t, http.StatusBadRequest, post(t, path, PathHold, `{`))
+	assert.Empty(t, agent.calls)
 
 	_, err := c.Roll(t.Context(), "geth")
 	require.NoError(t, err)
 
-	// A refusal of the host's rules is a conflict, its message without the
-	// prefix.
-	svc.err = fmt.Errorf("%w: verb roll is not allowed on this host", auditlog.ErrRefused)
-	assert.Equal(t, http.StatusConflict, post(t, path, local.PathRolls, `{"container":"geth"}`))
+	// A refusal is a conflict, its message without the prefix.
+	agent.err = plan.Refusal("verb roll is not allowed on this host")
+	assert.Equal(t, http.StatusConflict, post(t, path, PathRolls, `{"container":"geth"}`))
 
 	_, err = c.Roll(t.Context(), "geth")
 	require.EqualError(t, err, "verb roll is not allowed on this host")
 
-	// Anything else is the agent's own failure.
-	svc.err = errors.New("disk full")
-	assert.Equal(t, http.StatusInternalServerError, post(t, path, local.PathHold, `{"reason":"x"}`))
+	agent.err = errors.New("disk full")
+	assert.Equal(t, http.StatusInternalServerError, post(t, path, PathHold, `{"reason":"x"}`))
 
 	_, err = c.InitOverrides(t.Context())
 	require.EqualError(t, err, "disk full")
 
-	_, err = c.Override(t.Context(), &local.OverrideRequest{Container: "geth"})
+	_, err = c.Override(t.Context(), &OverrideRequest{Container: "geth"})
 	require.EqualError(t, err, "disk full")
+}
+
+// Socket requests are bounded to 64 KiB, and unknown fields are errors.
+func TestServerRefusesUnknownAndLargeBodies(t *testing.T) {
+	agent := &fakeAgent{}
+	path, _ := serve(t, &Config{EntryUser: "nobody-here"}, agent)
+
+	assert.Equal(t, http.StatusBadRequest, post(t, path, PathRolls, `{"container":"geth","x":1}`))
+	assert.Equal(t, http.StatusBadRequest,
+		post(t, path, PathHold, `{"reason":"`+strings.Repeat("x", maxBody)+`"}`))
+	assert.Empty(t, agent.calls)
+}
+
+// The socket is for root and one group.
+func TestServerSocketMode(t *testing.T) {
+	path, _ := serve(t, &Config{EntryUser: "nobody-here"}, &fakeAgent{})
+
+	info, err := os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.ModeSocket, info.Mode()&os.ModeSocket)
+	assert.Equal(t, os.FileMode(rootOnlyMode), info.Mode().Perm(), "no group: root only")
+
+	me, err := user.Current()
+	require.NoError(t, err)
+
+	g, err := user.LookupGroupId(me.Gid)
+	require.NoError(t, err)
+
+	path, _ = serve(t, &Config{Socket: Socket{Group: g.Name}}, &fakeAgent{})
+
+	info, err = os.Stat(path)
+	require.NoError(t, err)
+	assert.Equal(t, os.FileMode(socketMode), info.Mode().Perm())
+
+	// A stale socket file is replaced.
+	stale := &Config{EntryUser: "nobody-here"}
+	stale.Socket.Path = socketPath(t)
+
+	var lc net.ListenConfig
+
+	l, err := lc.Listen(t.Context(), "unix", stale.Socket.Path)
+	require.NoError(t, err)
+
+	ul, ok := l.(*net.UnixListener)
+	require.True(t, ok)
+	ul.SetUnlinkOnClose(false)
+	require.NoError(t, ul.Close())
+	require.FileExists(t, stale.Socket.Path)
+
+	srv := NewServer(quiet(), stale, &fakeAgent{})
+	require.NoError(t, srv.Start(t.Context()))
+	require.NoError(t, srv.Stop())
+}
+
+func TestServerStopAfterFailedStart(t *testing.T) {
+	cfg := &Config{}
+	cfg.Socket.Path = filepath.Join(t.TempDir(), "missing", "\x00", "agent.sock")
+
+	srv := NewServer(quiet(), cfg, &fakeAgent{})
+	require.Error(t, srv.Start(t.Context()))
+	require.NoError(t, srv.Stop())
 }

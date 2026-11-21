@@ -12,16 +12,37 @@ import (
 	"time"
 )
 
-// Client talks to the running agent over its local socket: what the
-// 'upgradoor host' commands use.
-type Client struct {
+// Client talks to the running agent over its socket for the on-host
+// commands. An answer that is not 200 is an error with the agent's message.
+type Client interface {
+	// Status returns what the agent last saw of the host.
+	Status(ctx context.Context) (*Status, error)
+	// Override sets or clears the override of one container.
+	Override(ctx context.Context, req *OverrideRequest) (*Answer, error)
+	// Hold sets or releases the local hold.
+	Hold(ctx context.Context, req *HoldRequest) (*Answer, error)
+	// Roll requests a roll of one container.
+	Roll(ctx context.Context, container string) (*Answer, error)
+	// InitOverrides writes the generated block of the overrides file.
+	InitOverrides(ctx context.Context) (*Answer, error)
+}
+
+const (
+	clientTimeout = 30 * time.Second
+
+	maxAnswer = 8 << 20
+)
+
+type client struct {
 	http *http.Client
 }
 
+var _ Client = (*client)(nil)
+
 // NewClient returns a client for the agent's socket file.
-func NewClient(socket string) *Client {
-	return &Client{http: &http.Client{
-		Timeout: 30 * time.Second,
+func NewClient(socket string) Client {
+	return &client{http: &http.Client{
+		Timeout: clientTimeout,
 		Transport: &http.Transport{
 			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
 				var d net.Dialer
@@ -32,8 +53,8 @@ func NewClient(socket string) *Client {
 	}}
 }
 
-// Status returns what the agent last saw of the host.
-func (c *Client) Status(ctx context.Context) (*Status, error) {
+// Status implements Client.
+func (c *client) Status(ctx context.Context) (*Status, error) {
 	var out Status
 	if err := c.call(ctx, http.MethodGet, PathStatus, nil, &out); err != nil {
 		return nil, err
@@ -42,27 +63,27 @@ func (c *Client) Status(ctx context.Context) (*Status, error) {
 	return &out, nil
 }
 
-// Override sets or clears the override of one container.
-func (c *Client) Override(ctx context.Context, req *OverrideRequest) (*Answer, error) {
+// Override implements Client.
+func (c *client) Override(ctx context.Context, req *OverrideRequest) (*Answer, error) {
 	return c.post(ctx, PathOverrides, req)
 }
 
-// Hold sets or releases the local hold.
-func (c *Client) Hold(ctx context.Context, req *HoldRequest) (*Answer, error) {
+// Hold implements Client.
+func (c *client) Hold(ctx context.Context, req *HoldRequest) (*Answer, error) {
 	return c.post(ctx, PathHold, req)
 }
 
-// Roll requests a roll of one container.
-func (c *Client) Roll(ctx context.Context, container string) (*Answer, error) {
+// Roll implements Client.
+func (c *client) Roll(ctx context.Context, container string) (*Answer, error) {
 	return c.post(ctx, PathRolls, &RollRequest{Container: container})
 }
 
-// InitOverrides writes the generated block of the overrides file.
-func (c *Client) InitOverrides(ctx context.Context) (*Answer, error) {
+// InitOverrides implements Client.
+func (c *client) InitOverrides(ctx context.Context) (*Answer, error) {
 	return c.post(ctx, PathInit, struct{}{})
 }
 
-func (c *Client) post(ctx context.Context, path string, body any) (*Answer, error) {
+func (c *client) post(ctx context.Context, path string, body any) (*Answer, error) {
 	var out Answer
 	if err := c.call(ctx, http.MethodPost, path, body, &out); err != nil {
 		return nil, err
@@ -71,7 +92,7 @@ func (c *Client) post(ctx context.Context, path string, body any) (*Answer, erro
 	return &out, nil
 }
 
-func (c *Client) call(ctx context.Context, method, path string, body, out any) error {
+func (c *client) call(ctx context.Context, method, path string, body, out any) error {
 	var reader io.Reader
 
 	if body != nil {
@@ -97,7 +118,7 @@ func (c *Client) call(ctx context.Context, method, path string, body, out any) e
 
 	defer func() { _ = resp.Body.Close() }()
 
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 8<<20))
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxAnswer))
 	if err != nil {
 		return fmt.Errorf("read answer: %w", err)
 	}

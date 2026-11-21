@@ -11,17 +11,13 @@ import (
 // dockerHubAPIHost is the host that serves Docker Hub's registry API.
 const dockerHubAPIHost = "registry-1.docker.io"
 
-// errDigestReference is returned for a reference pinned to a digest: there
-// is no tag to resolve.
 var errDigestReference = errors.New("registry: reference is pinned to a digest")
 
-// digestPattern is algorithm:hex. Only hex encodings are accepted, which
-// covers every algorithm registries use and keeps a digest safe to put in a
-// URL path.
+// digestPattern is algorithm:hex; hex only keeps a digest safe in a URL path.
 var digestPattern = regexp.MustCompile(`^[a-z0-9]+(?:[+._-][a-z0-9]+)*:[a-f0-9]{32,128}$`)
 
-// parseTagReference parses [host/]path[:tag]. A reference with a digest is
-// refused with errDigestReference.
+// parseTagReference parses [host/]path[:tag]; a digest is refused with
+// errDigestReference.
 func parseTagReference(ref string) (imageref.Reference, error) {
 	parsed, err := imageref.Parse(ref)
 	if err != nil {

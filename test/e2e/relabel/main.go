@@ -17,8 +17,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
-	"github.com/ethpandaops/upgradoor/pkg/agent/docker"
-	"github.com/ethpandaops/upgradoor/pkg/agent/hostapi"
+	"github.com/ethpandaops/upgradoor/pkg/agent/host"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -37,20 +36,21 @@ func run(args []string) error {
 	log := logrus.New()
 	log.SetLevel(logrus.WarnLevel)
 
-	host := os.Getenv("DOCKER_HOST")
-	if host == "" {
-		host = "unix:///var/run/docker.sock"
-	}
+	cfg := &host.Config{}
+	cfg.Docker.Host = os.Getenv("DOCKER_HOST")
+	cfg.ApplyDefaults()
 
-	rt, err := docker.New(log, host, nil)
+	machine, err := host.New(log, cfg, nil, nil)
 	if err != nil {
 		return err
 	}
 
+	defer func() { _ = machine.Close() }()
+
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
 	defer cancel()
 
-	list, err := rt.Observe(ctx)
+	list, err := machine.Containers(ctx)
 	if err != nil {
 		return err
 	}
@@ -75,11 +75,9 @@ func run(args []string) error {
 			return fmt.Errorf("container %s: not found or its image has no registry digest", name)
 		}
 
-		change := hostapi.Recreation{Labels: map[string]*string{
-			protocol.LabelGroup: &group, protocol.LabelKind: &kind,
-		}}
+		change := &host.Change{Group: group, Kind: protocol.ContainerKind(kind)}
 
-		if err := rt.RecreateAs(ctx, name, digest, 30*time.Second, true, change); err != nil {
+		if err := machine.Recreate(ctx, name, digest, 30*time.Second, true, change); err != nil {
 			return fmt.Errorf("container %s: %w", name, err)
 		}
 	}

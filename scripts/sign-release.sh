@@ -4,11 +4,13 @@
 #
 #   scripts/sign-release.sh vX.Y.Z [--no-rebuild] [--no-image-check]
 #
-# 1. downloads the draft release's upgradoor-manifest.txt and binaries (gh release download);
+# 1. downloads the draft release's upgradoor-manifest.txt and binaries, upgradoor-linux-<arch>
+#    (hosts) and upgradoor-controller-linux-<arch> (the image) (gh release download);
 # 2. checks the manifest: canonical form, every binary and the image, the seq of vX.Y.Z (a wrong
 #    one would freeze every host at that number, or never reach them); every binary matches;
 # 3. checks the image the manifest names: exactly linux/amd64 and linux/arm64, each holding
-#    the manifest's binary (--no-image-check skips this: then CI alone vouches for the image);
+#    the manifest's upgradoor-controller as /usr/local/bin/upgradoor-controller
+#    (--no-image-check skips this: then CI alone vouches for the image);
 # 4. rebuilds the binaries in a fresh worktree of the tag (make release) and demands identical
 #    lines (--no-rebuild skips this: then CI alone vouches for the build);
 # 5. prints the manifest and its hash, signs it with one touch of the key (ssh-keygen -Y sign,
@@ -69,18 +71,20 @@ cd "$work"
 
 mkdir dl
 if [ -n "$LOCAL" ]; then
-  cp "$LOCAL/$MANIFEST" "$LOCAL"/upgradoor-linux-* dl/
+  cp "$LOCAL/$MANIFEST" "$LOCAL"/upgradoor-linux-* "$LOCAL"/upgradoor-controller-linux-* dl/
 else
-  gh release download "$VERSION" --dir dl --pattern "$MANIFEST" --pattern 'upgradoor-linux-*'
+  gh release download "$VERSION" --dir dl --pattern "$MANIFEST" --pattern 'upgradoor-linux-*' \
+    --pattern 'upgradoor-controller-linux-*'
 fi
 [ -s "dl/$MANIFEST" ] || die "no $MANIFEST in release $VERSION (did CI build it?)"
 
 "$CHECK" check "$VERSION" "dl/$MANIFEST" >/dev/null || die "the release manifest is not signable"
 
 while read -r artifact _ platform sum; do
-  [ "$artifact" = upgradoor ] || continue
-  [ -s "dl/upgradoor-$platform" ] || die "upgradoor-$platform is missing from the release"
-  [ "$(sha "dl/upgradoor-$platform")" = "$sum" ] || die "upgradoor-$platform does not match its manifest line"
+  [ "$artifact" != image ] || continue
+  bin=$artifact-$platform
+  [ -s "dl/$bin" ] || die "$bin is missing from the release"
+  [ "$(sha "dl/$bin")" = "$sum" ] || die "$bin does not match its manifest line"
 done < "dl/$MANIFEST"
 echo "every binary of the draft matches the manifest"
 
@@ -95,11 +99,15 @@ if [ -n "$IMAGE_CHECK" ]; then
   for arch in amd64 arm64; do
     m=$(jq -r --arg a "$arch" '.manifests[] | select(.platform.architecture == $a) | .digest' index.json)
     cid=$(docker create --quiet "$PULL@$m")
-    docker cp --quiet "$cid:/usr/local/bin/upgradoor" "image-$arch" || { docker rm "$cid" >/dev/null; die "no upgradoor in $ref for $arch"; }
+    docker cp --quiet "$cid:/usr/local/bin/upgradoor-controller" "image-$arch" || {
+      docker rm "$cid" >/dev/null
+      die "no upgradoor-controller in $ref for $arch"
+    }
     docker rm "$cid" >/dev/null
-    cmp -s "image-$arch" "dl/upgradoor-linux-$arch" || die "$ref for $arch holds another upgradoor than the manifest's"
+    cmp -s "image-$arch" "dl/upgradoor-controller-linux-$arch" ||
+      die "$ref for $arch holds another upgradoor-controller than the manifest's"
   done
-  echo "the image holds the manifest's binaries"
+  echo "the image holds the manifest's upgradoor-controller binaries"
 else
   echo "note: the image was not checked (--no-image-check): you sign the digest CI pushed" >&2
 fi

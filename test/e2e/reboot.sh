@@ -81,6 +81,7 @@ e2e_state() {
 
 mkdir -p "$work"
 (cd "$repo" && CGO_ENABLED=0 go build -o "$work/upgradoor" ./cmd/upgradoor &&
+    CGO_ENABLED=0 go build -o "$work/upgradoor-controller" ./cmd/upgradoor-controller &&
     CGO_ENABLED=0 go build -o "$work/fakebeacon" ./test/e2e/fakebeacon)
 sysbox_build_image
 docker pull -q busybox:stable >/dev/null
@@ -95,20 +96,21 @@ docker run -d --name "$id-beacon" --network "$net" --label upgradoor.test=reboot
 
 seed=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 export UPGRADOOR_SEED=$seed
-signer=$("$work/upgradoor" keygen signer-pubkey --network "$network")
+signer=$("$work/upgradoor-controller" keygen signer-pubkey --network "$network")
 # The controller signs its answers with a key it derives from the controller
 # seed, a secret of its own; the agents accept only that key. The file is
 # read by another user inside the container, and this is a test seed.
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$work/controller.seed"
 chmod 0444 "$work/controller.seed"
-controller_pub=$("$work/upgradoor" keygen controller-pubkey --network "$network" \
+controller_pub=$("$work/upgradoor-controller" keygen controller-pubkey --network "$network" \
     --controller-seed-file "$work/controller.seed")
 
 # Open API (no auth provider): this is a closed test network.
 docker run -d --name "$id-controller" --network "$net" --label upgradoor.test=reboot \
     -p "127.0.0.1:$ctl_port:8080" --tmpfs /data \
-    -v "$work/upgradoor:/upgradoor:ro" -v "$work/controller.seed:/controller.seed:ro" \
-    debian:13-slim /upgradoor controller \
+    -v "$work/upgradoor-controller:/upgradoor-controller:ro" \
+    -v "$work/controller.seed:/controller.seed:ro" \
+    debian:13-slim /upgradoor-controller run \
     --listen :8080 --data-dir /data --network "$network" --signer-public-key "$signer" \
     --controller-seed-file /controller.seed \
     --allow-insecure-agent-http --beacon-endpoint "http://$id-beacon:5052" \
@@ -133,8 +135,10 @@ for h in "${hosts[@]}"; do
         --label io.ethpandaops.upgradoor.group=app --label io.ethpandaops.upgradoor.kind=other --restart unless-stopped \
         busybox:stable sleep 1000000 >/dev/null
 
-    "$work/upgradoor" keygen host-key --network "$network" --hostname "$h" >"$dir/host.key"
-    "$work/upgradoor" keygen host-cert --network "$network" --hostname "$h" >"$dir/host.crt"
+    "$work/upgradoor-controller" keygen host-key --network "$network" --hostname "$h" \
+        >"$dir/host.key"
+    "$work/upgradoor-controller" keygen host-cert --network "$network" --hostname "$h" \
+        >"$dir/host.crt"
 
     cat >"$dir/agent.yaml" <<EOF
 controller:

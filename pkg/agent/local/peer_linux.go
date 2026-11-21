@@ -5,8 +5,8 @@ import (
 	"syscall"
 )
 
-// peerUID returns the Unix user at the other end of a connection of the
-// local socket, as the kernel states it.
+// peerUID is the user the kernel names at the other end of a Unix socket
+// connection (SO_PEERCRED).
 func peerUID(c net.Conn) (int, bool) {
 	uc, ok := c.(*net.UnixConn)
 	if !ok {

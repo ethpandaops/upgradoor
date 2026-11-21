@@ -34,7 +34,7 @@ one place to see which host runs what.
 ```
  host (Debian + Docker)                     service cluster (k8s, per devnet)
  ┌───────────────────────────┐              ┌──────────────────────────────┐
- │ upgradoor agent (systemd) │  HTTPS poll  │ upgradoor controller         │
+ │ upgradoor agent (systemd) │  HTTPS poll  │ upgradoor-controller run     │
  │  - docker socket          │ ───────────> │  - scheduler / leases        │
  │  - registry checks        │  cert+proof  │  - SQLite on a PVC           │
  │  - apt / kernel / reboot  │ <─────────── │  - beacon liveness + gate    │
@@ -44,8 +44,11 @@ one place to see which host runs what.
                                    in-cluster beacon node   authenticatoor JWKS
 ```
 
-- One Go module, one binary: `upgradoor agent`, `upgradoor controller` and
-  `upgradoor keygen`.
+- One Go module, two binaries: `upgradoor` on every host (`upgradoor agent`
+  and the on-host commands `upgradoor list`, `status`, `roll`, `override`,
+  `hold`, …) and `upgradoor-controller` in the cluster
+  (`upgradoor-controller run`, `upgradoor-controller keygen`). The host binary
+  links nothing of the controller.
 - The agent opens no port. Every exchange is an outbound HTTPS request from the
   agent to `https://upgradoor.<network_subdomain>`: a sync every 30 s, every
   5 s while it holds a lease.
@@ -93,11 +96,15 @@ one place to see which host runs what.
   controller cannot widen that set.
 - **Digest verification.** A roll happens only if the locally pulled image for
   the container's own tag has exactly the digest named in the lease.
-- **Hold file.** `touch /etc/upgradoor/hold` on a host and the agent requests
-  nothing and refuses all work. Nothing the controller sends can remove that
-  file.
-- **Custom images are left alone.** A managed container that runs another image
-  reference than the configured one is reported as `custom` and never rolled.
+- **Local hold.** `upgradoor hold "<reason>"` on a host (or a `hold: local:`
+  entry in the overrides file) and the agent requests nothing and refuses all
+  work. Nothing the controller sends can lift it; `upgradoor release` does.
+- **The host decides what is managed.** The agent manages the containers
+  Ansible labelled with a roll group; what a group allows (verbs, overrides,
+  owners) is in the host's `agent.yaml`. A container pinned to a digest is
+  never rolled. The overrides file is read only as a regular file with one
+  name, not through a symbolic link, in a directory that no user other than
+  root could replace.
 - **Public vs authenticated data.** Without a login the API serves host names,
   the EL and CL image of each host (tag, digest, revision), an update-pending
   marker and chain health. Kernels, OS details, package versions, addresses,
@@ -122,13 +129,14 @@ one place to see which host runs what.
 Needs Go 1.27 or newer (`crypto/mldsa`). The web UI needs Node 24.
 
 ```sh
-make build        # bin/upgradoor with the web UI embedded (rebuilds web/dist when a web source changed)
+make build        # bin/upgradoor (hosts) and bin/upgradoor-controller with the web UI embedded
+                  # (rebuilds web/dist when a web source changed)
 make test         # go test -race ./... and the web UI tests
 make lint         # golangci-lint and eslint + prettier
 make wire         # regenerates web/src/api/wire.schema.json and wire.golden.json from the Go types
 ```
 
-`go build ./cmd/upgradoor` and `go test ./...` work without Node: without the
+`go build ./...` and `go test ./...` work without Node: without the
 `webui` build tag the controller serves a placeholder page instead of the UI.
 
 More suites need Docker: `make test-docker` (container recreate against real
@@ -140,8 +148,8 @@ runs it nightly and on pull requests labelled `e2e`).
 ## Quick start for local development
 
 This runs a controller and three agents against **fake hosts**, plus a fake
-beacon node. With `--fake` the agent works on an in-memory host described by a
-scenario file. It does not talk to Docker, apt or systemd and touches nothing
+beacon node. `test/fakeagent` runs the agent on an in-memory host described by
+a scenario file. It does not talk to Docker, apt or systemd and touches nothing
 on the machine.
 
 Run everything from the repository root. All files go to `.tmp/dev`, which is
@@ -153,22 +161,23 @@ mkdir -p .tmp/dev/data
 
 # A throwaway seed. keygen reads it from the environment, never from a flag.
 export UPGRADOOR_SEED=$(openssl rand -hex 32)
-bin/upgradoor keygen signer-pubkey --network dev > .tmp/dev/signer.pub
+bin/upgradoor-controller keygen signer-pubkey --network dev > .tmp/dev/signer.pub
 
 # The controller seed is a second secret, not the seed above. The controller
 # derives the key it signs its answers with from it at start. The agents get
 # the public half and act on nothing that is not signed with it.
 (umask 077 && openssl rand -hex 32 > .tmp/dev/controller.seed)
-controller_pub=$(bin/upgradoor keygen controller-pubkey --network dev \
+controller_pub=$(bin/upgradoor-controller keygen controller-pubkey --network dev \
     --controller-seed-file .tmp/dev/controller.seed)
 
-port=7771
 for h in node-1 node-2 bootnode-1; do
   mkdir -p .tmp/dev/$h
   role=ethereum_node; [ $h = bootnode-1 ] && role=bootnode
 
-  bin/upgradoor keygen host-key  --network dev --hostname $h > .tmp/dev/$h/host.key
-  bin/upgradoor keygen host-cert --network dev --hostname $h --role $role > .tmp/dev/$h/host.crt
+  bin/upgradoor-controller keygen host-key  --network dev --hostname $h \
+      > .tmp/dev/$h/host.key
+  bin/upgradoor-controller keygen host-cert --network dev --hostname $h --role $role \
+      > .tmp/dev/$h/host.crt
 
   cat > .tmp/dev/$h/agent.yaml <<EOF
 controller:
@@ -213,9 +222,7 @@ packages:
   blocked: [docker-ce]
   installed:
     - {name: docker-ce, version: "28.0", arch: amd64}
-control: 127.0.0.1:$port
 EOF
-  port=$((port + 1))
 done
 unset UPGRADOOR_SEED
 ```
@@ -228,7 +235,7 @@ go run ./test/e2e/fakebeacon --listen 127.0.0.1:5052
 ```
 
 ```sh
-bin/upgradoor controller \
+bin/upgradoor-controller run \
     --listen 127.0.0.1:8080 --data-dir .tmp/dev/data \
     --network dev --signer-public-key "$(cat .tmp/dev/signer.pub)" \
     --controller-seed-file .tmp/dev/controller.seed \
@@ -237,15 +244,18 @@ bin/upgradoor controller \
 ```
 
 ```sh
-bin/upgradoor agent --config .tmp/dev/node-1/agent.yaml --fake .tmp/dev/node-1/host.yaml
+go run ./test/fakeagent --config .tmp/dev/node-1/agent.yaml --scenario .tmp/dev/node-1/host.yaml \
+    --control 127.0.0.1:7771
 ```
 
 ```sh
-bin/upgradoor agent --config .tmp/dev/node-2/agent.yaml --fake .tmp/dev/node-2/host.yaml
+go run ./test/fakeagent --config .tmp/dev/node-2/agent.yaml --scenario .tmp/dev/node-2/host.yaml \
+    --control 127.0.0.1:7772
 ```
 
 ```sh
-bin/upgradoor agent --config .tmp/dev/bootnode-1/agent.yaml --fake .tmp/dev/bootnode-1/host.yaml
+go run ./test/fakeagent --config .tmp/dev/bootnode-1/agent.yaml --scenario .tmp/dev/bootnode-1/host.yaml \
+    --control 127.0.0.1:7773
 ```
 
 `allowInsecure` and `--allow-insecure-agent-http` only permit plain http on
@@ -291,19 +301,19 @@ controller with `--default-setting lookupInterval=1m` to see it sooner):
 - A reboot rollout opens for `node-1` and waits: `waiting for approval (policy
   manual)`. Approve it on the rollout card to see a (simulated) reboot.
 
-Overrides and the host commands work on the fake hosts too. The **Clients**
+Overrides and the on-host commands work on the fake hosts too. The **Clients**
 tab lists the hosts per client; "Image…" on a geth row sets an image override
 (`ethpandaops/geth:fix` is in the fake registry; the group `execution` allows
 image overrides), which the agent writes into the host's `overrides.yaml` and
 applies under a lease. On the "node", the same through the agent's socket:
 
 ```sh
-alias h1='bin/upgradoor host --socket .tmp/dev/node-1/agent.sock'
-h1 init-overrides      # the generated block of .tmp/dev/node-1/overrides.yaml
-h1 list                # containers, images, flags, overrides
-h1 override set geth --add-flag --pprof --remove-flag --maxpeers --until 10m --reason "profiling"
-h1 roll beacon         # waits and prints: queued, recreated, verified, done
-h1 override clear geth
+export UPGRADOOR_SOCKET=.tmp/dev/node-1/agent.sock
+bin/upgradoor init-overrides   # the generated block of .tmp/dev/node-1/overrides.yaml
+bin/upgradoor list             # containers, images, flags, overrides
+bin/upgradoor override set geth --add-flag --pprof --remove-flag --maxpeers --until 10m --reason "profiling"
+bin/upgradoor roll beacon      # waits and prints: resolving, queued, recreated, verified, done
+bin/upgradoor override clear geth
 ```
 
 Editing `.tmp/dev/node-1/overrides.yaml` by hand does the same; the agent

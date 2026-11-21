@@ -1,0 +1,125 @@
+package system
+
+import (
+	"cmp"
+	"strings"
+)
+
+// compareVersions compares two Debian package versions as
+// "dpkg --compare-versions" does and returns -1, 0 or +1. Malformed input
+// never fails: an epoch that is not a number is part of the upstream version.
+func compareVersions(a, b string) int {
+	ea, ua, ra := splitVersion(a)
+	eb, ub, rb := splitVersion(b)
+
+	if c := compareNumeric(ea, eb); c != 0 {
+		return c
+	}
+
+	if c := compareVersionPart(ua, ub); c != 0 {
+		return c
+	}
+
+	return compareVersionPart(ra, rb)
+}
+
+// splitVersion cuts [epoch:]upstream[-revision] at the first colon and the last hyphen.
+func splitVersion(v string) (epoch, upstream, revision string) {
+	v = strings.TrimSpace(v)
+
+	if i := strings.IndexByte(v, ':'); i >= 0 && isDigits(v[:i]) {
+		epoch, v = v[:i], v[i+1:]
+	}
+
+	if i := strings.LastIndexByte(v, '-'); i >= 0 {
+		return epoch, v[:i], v[i+1:]
+	}
+
+	return epoch, v, ""
+}
+
+func isDigits(s string) bool {
+	for i := range len(s) {
+		if !isDigit(s[i]) {
+			return false
+		}
+	}
+
+	return true
+}
+
+func isDigit(c byte) bool {
+	return c >= '0' && c <= '9'
+}
+
+func isLetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// compareNumeric compares two digit strings of any length by value; empty is zero.
+func compareNumeric(a, b string) int {
+	a = strings.TrimLeft(a, "0")
+	b = strings.TrimLeft(b, "0")
+
+	if c := cmp.Compare(len(a), len(b)); c != 0 {
+		return c
+	}
+
+	return cmp.Compare(a, b)
+}
+
+// versionCharOrder is dpkg's order(): the weight of one character inside a
+// non-digit run. Digits and the end of the string weigh 0.
+func versionCharOrder(s string, i int) int {
+	if i >= len(s) {
+		return 0
+	}
+
+	c := s[i]
+
+	switch {
+	case c == '~':
+		return -1
+	case isDigit(c):
+		return 0
+	case isLetter(c):
+		return int(c)
+	default:
+		return int(c) + 256
+	}
+}
+
+// compareVersionPart is dpkg's verrevcmp() for one upstream version or revision.
+func compareVersionPart(a, b string) int {
+	i, j := 0, 0
+
+	for i < len(a) || j < len(b) {
+		// Non-digit runs, character by character.
+		for (i < len(a) && !isDigit(a[i])) || (j < len(b) && !isDigit(b[j])) {
+			if c := cmp.Compare(versionCharOrder(a, i), versionCharOrder(b, j)); c != 0 {
+				return c
+			}
+
+			i++
+			j++
+		}
+
+		// Digit runs, by value.
+		startA := i
+		for i < len(a) && isDigit(a[i]) {
+			i++
+		}
+
+		startB := j
+		for j < len(b) && isDigit(b[j]) {
+			j++
+		}
+
+		if c := compareNumeric(a[min(startA, len(a)):min(i, len(a))],
+			b[min(startB, len(b)):min(j, len(b))]); c != 0 {
+			return c
+		}
+	}
+
+	return 0
+}

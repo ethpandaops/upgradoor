@@ -43,8 +43,8 @@ jobs:
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
           password: ${{ secrets.DOCKERHUB_TOKEN }}
-      # The image holds exactly the manifest's binaries (target release). Pushed by digest
-      # only: nothing points at it until the signed release is published.
+      # The image holds exactly the manifest's upgradoor-controller (target release). Pushed by
+      # digest only: nothing points at it until the signed release is published.
       - name: Controller image, by digest
         id: image
         uses: docker/build-push-action@v6
@@ -67,7 +67,8 @@ jobs:
         run: |
           gh release create "$GITHUB_REF_NAME" --draft --title "$GITHUB_REF_NAME" \
             --notes "Sign the manifest (scripts/sign-release.sh $GITHUB_REF_NAME), then publish: publishing tags the signed image." \
-            dist/upgradoor-manifest.txt dist/upgradoor-linux-amd64 dist/upgradoor-linux-arm64
+            dist/upgradoor-manifest.txt dist/upgradoor-linux-amd64 dist/upgradoor-linux-arm64 \
+            dist/upgradoor-controller-linux-amd64 dist/upgradoor-controller-linux-arm64
 
   # Publishing: the signature over the release's manifest must verify against the
   # deploy/allowed_signers of the tag, the binaries must match it; only then is the signed
@@ -85,7 +86,7 @@ jobs:
           set -eu
           mkdir -p .cache/release
           gh release download "$TAG" --dir .cache/release --pattern 'upgradoor-*'
-          ./scripts/verify-release.sh "$TAG" .cache/release
+          ./scripts/verify-release.sh "$TAG" .cache/release --require-all
           digest=$(awk '$1 == "image" { print $4 }' .cache/release/upgradoor-manifest.txt)
           echo "DIGEST=sha256:$digest" >> "$GITHUB_ENV"
       - uses: docker/setup-buildx-action@v3
