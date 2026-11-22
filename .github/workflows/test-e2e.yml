@@ -21,6 +21,34 @@ env:
   GOTOOLCHAIN: local
 
 jobs:
+  test_docker_classic:
+    # The classic image store diffs layers without native overlay diff on the runners: ~6 min.
+    name: "Test container recreate (real Docker, classic store)"
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e') }}
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+
+    - name: Select the Docker image store
+      env:
+        CONTAINERD_STORE: false
+      run: |
+        sudo mkdir -p /etc/docker
+        [ -s /etc/docker/daemon.json ] || echo '{}' | sudo tee /etc/docker/daemon.json >/dev/null
+        sudo jq --argjson on "$CONTAINERD_STORE" '.features["containerd-snapshotter"] = $on' \
+          /etc/docker/daemon.json > daemon.json
+        sudo mv daemon.json /etc/docker/daemon.json
+        sudo systemctl restart docker
+        docker info --format '{{ .ServerVersion }} {{ .Driver }} {{ json .DriverStatus }}'
+
+    - name: Run docker tests
+      run: make test-docker
+
   test_e2e:
     name: "End to end (Kurtosis)"
     if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e') }}

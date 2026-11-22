@@ -72,12 +72,8 @@ jobs:
       run: make lint
 
   test_docker:
-    name: Test container recreate (real Docker, ${{ matrix.store }} store)
+    name: Test container recreate (real Docker, containerd store)
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        store: [containerd, classic]
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
@@ -88,7 +84,7 @@ jobs:
 
     - name: Select the Docker image store
       env:
-        CONTAINERD_STORE: ${{ matrix.store == 'containerd' }}
+        CONTAINERD_STORE: true
       run: |
         sudo mkdir -p /etc/docker
         [ -s /etc/docker/daemon.json ] || echo '{}' | sudo tee /etc/docker/daemon.json >/dev/null
