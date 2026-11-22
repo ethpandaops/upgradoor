@@ -9,6 +9,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
@@ -31,9 +32,9 @@ type Options struct {
 	Scheduler scheduler.Service
 	Beacon    views.Beacon
 	Views     *views.Views
-	// DefaultSettings are the settings from flags, shown next to the
-	// effective ones.
-	DefaultSettings fleet.Settings
+	// Access is how much of the hosts a login reads; nil reduces every login
+	// but the open one.
+	Access func(u *authz.User) views.Access
 	// Now is the clock.
 	Now func() time.Time
 }
@@ -54,8 +55,6 @@ type Handler struct {
 }
 
 // New returns the streams over opts.
-//
-//nolint:gocritic // hugeParam: Options by value, like the other handlers of the controller.
 func New(log logrus.FieldLogger, opts Options) *Handler {
 	return &Handler{
 		log:   log,
@@ -66,6 +65,18 @@ func New(log logrus.FieldLogger, opts Options) *Handler {
 		streamMinInterval: streamMinInterval,
 		streamDebounce:    streamDebounce,
 		streamHeartbeat:   streamHeartbeat,
+	}
+}
+
+// access is how much of the hosts u reads.
+func (s *Handler) access(u *authz.User) views.Access {
+	switch {
+	case s.opts.Access != nil:
+		return s.opts.Access(u)
+	case u.Open:
+		return views.Access{Full: true}
+	default:
+		return views.Access{}
 	}
 }
 

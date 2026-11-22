@@ -1,4 +1,4 @@
-import { Fragment, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState } from 'react';
 
 import { list, type HostListing } from '../api/types';
 import { useApp, useAuthState, usePrivateAccess } from '../appContext';
@@ -9,6 +9,7 @@ import { useLive } from '../components/Live';
 import { BulkAction, SelectionBar } from '../components/SelectionBar';
 import { RelTime, useSharedNow } from '../components/RelTime';
 import { useKept } from '../hooks/useKept';
+import { useSearchParam } from '../hooks/useSearchParam';
 import {
   Button,
   Badge,
@@ -26,10 +27,11 @@ import {
   type SortDirection,
 } from '../components/primitives';
 import { ImageCell, OfflineBadge } from '../components/status';
+import { FleetUsage, UsageCell, usageLabel } from '../components/Usage';
 import { absoluteTime, formatDuration, formatPercent, isZeroTime, plural } from '../lib/format';
 import { hostActionIntent } from '../lib/hostActions';
 import { holdIntent } from '../lib/intents';
-import { HostDetailPanel } from './HostDetailPanel';
+import { HostDrawer } from './HostDetailPanel';
 import {
   attestingShare,
   hostOwners,
@@ -47,8 +49,8 @@ const HOST_PAGE_SIZE = 100;
 /**
  * HostsTab is the fleet table. Logged out it shows only the public data
  * (name, EL / CL image, update marker); logged in the same table gains the
- * host's state, and a row opens to the host's details and actions. Actions on
- * several hosts go through the selection.
+ * host's state, and a row opens the host's details and actions in a drawer
+ * (?host=<name>). Actions on several hosts go through the selection.
  */
 export function HostsTab() {
   const { auth } = useApp();
@@ -63,11 +65,11 @@ export function HostsTab() {
   const [filter, setFilter] = useKept('hosts.filter', '');
   const [sort, setSort] = useState<{ key: SortKey; direction: SortDirection }>({ key: 'name', direction: 'asc' });
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set());
-  const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
+  const [openHost, setOpenHost] = useSearchParam('host');
   const [page, setPage] = useState(0);
 
   const actions = useActions();
-  const { login } = usePermissions();
+  const { login, hostDetails } = usePermissions();
 
   const allRows = useMemo(
     () => mergeHostRows(list(publicHosts.data?.hosts), list(hosts.data?.hosts), list(plan.data?.queue)),
@@ -119,6 +121,25 @@ export function HostsTab() {
   });
 
   const visibleNames = rows.map(r => r.name);
+  const openIndex = openHost ? visibleNames.indexOf(openHost) : -1;
+  const closeHost = useCallback(() => {
+    setOpenHost('');
+  }, [setOpenHost]);
+  const stepTo = (index: number) => {
+    const name = visibleNames[index];
+    if (name === undefined) return undefined;
+    return () => {
+      setOpenHost(name);
+      setPage(Math.floor(index / HOST_PAGE_SIZE));
+    };
+  };
+
+  // The open host stays in view when the drawer steps through the list.
+  useEffect(() => {
+    if (openHost)
+      document.querySelector(`tr[data-host="${CSS.escape(openHost)}"]`)?.scrollIntoView({ block: 'nearest' });
+  }, [openHost]);
+
   // Bulk actions act on the whole selection, also on hosts the filter hides
   // right now: the toolbar and the confirmation dialog say so.
   const hiddenSelection = useMemo(() => {
@@ -126,7 +147,7 @@ export function HostsTab() {
     return selection.filter(n => !visible.has(n));
   }, [rows, selection]);
   const allVisibleSelected = visibleNames.length > 0 && visibleNames.every(n => selected.has(n));
-  const columnCount = priv ? 11 : 4;
+  const columnCount = priv ? (hostDetails ? 12 : 7) : 4;
   const rollSelection: ActionIntent = {
     kind: 'roll',
     hosts: selection,
@@ -185,37 +206,6 @@ export function HostsTab() {
           </div>
         )}
 
-        {priv && (
-          <div role="group" aria-label="Fleet actions" className="ml-auto flex flex-wrap items-center gap-1">
-            <BulkAction
-              icon="roll"
-              label="Roll all hosts…"
-              check={{
-                kind: 'roll',
-                hosts: [],
-                all: true,
-                containerChoices: rollableContainers(list(hosts.data?.hosts)),
-              }}
-              run={() => {
-                actions.request({
-                  kind: 'roll',
-                  hosts: [],
-                  all: true,
-                  containerChoices: rollableContainers(list(hosts.data?.hosts)),
-                });
-              }}
-            />
-            <BulkAction
-              icon="reboot"
-              label="Reboot all hosts…"
-              check={{ kind: 'reboot', hosts: [], all: true }}
-              run={() => {
-                actions.request({ kind: 'reboot', hosts: [], all: true });
-              }}
-            />
-          </div>
-        )}
-
         {!priv && authEnabled && (
           <span className="text-xs/5 text-muted">Log in for host details, rollouts and actions.</span>
         )}
@@ -268,7 +258,7 @@ export function HostsTab() {
           ))}
           <BulkAction
             icon="action"
-            label="Action…"
+            label="Run host action…"
             blocked={selection.length === 0 ? 'Select hosts first' : ''}
             check={actionSelection}
             run={() => {
@@ -276,6 +266,17 @@ export function HostsTab() {
             }}
           />
         </SelectionBar>
+      )}
+
+      {priv && hostDetails && (
+        <FleetUsage
+          hosts={list(hosts.data?.hosts)}
+          filter={filter}
+          onFilter={next => {
+            setFilter(next);
+            setPage(0);
+          }}
+        />
       )}
 
       {actions.notice}
@@ -292,22 +293,17 @@ export function HostsTab() {
           <thead>
             <tr>
               {priv && (
-                <>
-                  <Th tight className="w-6 text-center">
-                    <input
-                      type="checkbox"
-                      aria-label="Select all hosts the filter shows, on every page"
-                      checked={allVisibleSelected}
-                      onChange={() => {
-                        setSelected(allVisibleSelected ? new Set() : new Set(visibleNames));
-                      }}
-                      className="accent-accent"
-                    />
-                  </Th>
-                  <Th tight className="w-6 text-center">
-                    <span className="sr-only">Expand</span>
-                  </Th>
-                </>
+                <Th tight className="w-6 text-center">
+                  <input
+                    type="checkbox"
+                    aria-label="Select all hosts the filter shows, on every page"
+                    checked={allVisibleSelected}
+                    onChange={() => {
+                      setSelected(allVisibleSelected ? new Set() : new Set(visibleNames));
+                    }}
+                    className="accent-accent"
+                  />
+                </Th>
               )}
               <SortTh columns={[sortColumn('name', 'Host')]} />
               <SortTh columns={[sortColumn('el', 'Execution')]} />
@@ -318,9 +314,15 @@ export function HostsTab() {
                   <SortTh
                     columns={[sortColumn('attesting', 'Attesting', 'Validators live in the last complete epoch')]}
                   />
-                  <SortTh columns={[sortColumn('kernel', 'Kernel')]} />
-                  <SortTh className="hidden xl:table-cell" columns={[sortColumn('uptime', 'Uptime')]} />
-                  <SortTh columns={[sortColumn('security', 'Updates', 'Pending package updates')]} />
+                  {hostDetails && (
+                    <>
+                      <SortTh columns={[sortColumn('cpu', 'CPU', 'CPU busy since the previous sync')]} />
+                      <SortTh columns={[sortColumn('memory', 'Memory', 'Memory not available')]} />
+                      <SortTh columns={[sortColumn('kernel', 'Kernel')]} />
+                      <SortTh className="hidden xl:table-cell" columns={[sortColumn('uptime', 'Uptime')]} />
+                      <SortTh columns={[sortColumn('security', 'Updates', 'Pending package updates')]} />
+                    </>
+                  )}
                   <SortTh
                     className="hidden 2xl:table-cell"
                     columns={[sortColumn('lastSeen', 'Seen', 'When the agent last synced')]}
@@ -339,35 +341,36 @@ export function HostsTab() {
                 </Td>
               </tr>
             )}
-            {pageRows.map(row => {
-              const isOpen = expanded.has(row.name);
-              return (
-                <Fragment key={row.name}>
-                  <HostTableRow
-                    row={row}
-                    priv={priv}
-                    selected={selected.has(row.name)}
-                    expanded={isOpen}
-                    onSelect={() => {
-                      setSelected(prev => toggle(prev, row.name));
-                    }}
-                    onExpand={() => {
-                      setExpanded(prev => toggle(prev, row.name));
-                    }}
-                    onAction={actions.request}
-                  />
-                  {priv && isOpen && (
-                    <tr>
-                      <td colSpan={columnCount} className="border-b border-border-strong bg-background p-4">
-                        <HostDetailPanel name={row.name} onAction={actions.request} />
-                      </td>
-                    </tr>
-                  )}
-                </Fragment>
-              );
-            })}
+            {pageRows.map(row => (
+              <HostTableRow
+                key={row.name}
+                row={row}
+                priv={priv}
+                details={hostDetails}
+                selected={selected.has(row.name)}
+                open={openHost === row.name}
+                onSelect={() => {
+                  setSelected(prev => toggle(prev, row.name));
+                }}
+                onOpen={() => {
+                  setOpenHost(openHost === row.name ? '' : row.name);
+                }}
+                onAction={actions.request}
+              />
+            ))}
           </tbody>
         </Table>
+      )}
+
+      {priv && openHost && (
+        <HostDrawer
+          name={openHost}
+          row={allRows.find(r => r.name === openHost)}
+          onClose={closeHost}
+          onPrevious={openIndex > 0 ? stepTo(openIndex - 1) : undefined}
+          onNext={openIndex >= 0 ? stepTo(openIndex + 1) : undefined}
+          onAction={actions.request}
+        />
       )}
 
       {actions.dialog}
@@ -378,61 +381,69 @@ export function HostsTab() {
 function HostTableRow({
   row,
   priv,
+  details,
   selected,
-  expanded,
+  open,
   onSelect,
-  onExpand,
+  onOpen,
   onAction,
 }: {
   row: HostRow;
   priv: boolean;
+  details: boolean;
   selected: boolean;
-  expanded: boolean;
+  open: boolean;
   onSelect: () => void;
-  onExpand: () => void;
+  onOpen: () => void;
   onAction: (intent: ActionIntent) => void;
 }) {
   const s = row.summary;
 
   return (
     <tr
-      className={cx('hover:bg-surface-hover', selected && 'bg-surface-selected', priv && 'cursor-pointer')}
+      data-host={row.name}
+      aria-current={open || undefined}
+      className={cx(
+        'hover:bg-surface-hover',
+        selected && 'bg-surface-selected',
+        open && 'bg-surface-hover',
+        priv && 'cursor-pointer'
+      )}
       onClick={
         priv
           ? e => {
               // A click on a control inside the row is that control's.
-              if (!(e.target as HTMLElement).closest('button, input, a')) onExpand();
+              if (!(e.target as HTMLElement).closest('button, input, a')) onOpen();
             }
           : undefined
       }
     >
       {priv && (
-        <>
-          <Td tight className="pl-3 text-center">
-            <input
-              type="checkbox"
-              aria-label={`Select ${row.name}`}
-              checked={selected}
-              onChange={onSelect}
-              className="accent-accent"
-            />
-          </Td>
-          <Td tight className="text-center">
-            <button
-              type="button"
-              aria-expanded={expanded}
-              aria-label={`${expanded ? 'Collapse' : 'Expand'} ${row.name}`}
-              onClick={onExpand}
-              className="rounded-xs px-1 text-muted hover:text-foreground"
-            >
-              {expanded ? '▾' : '▸'}
-            </button>
-          </Td>
-        </>
+        <Td tight className="pl-3 text-center">
+          <input
+            type="checkbox"
+            aria-label={`Select ${row.name}`}
+            checked={selected}
+            onChange={onSelect}
+            className="accent-accent"
+          />
+        </Td>
       )}
       <Td>
         <span className="flex items-center gap-2">
-          <span className="text-sm/6 font-medium">{row.name}</span>
+          {priv ? (
+            <button
+              type="button"
+              aria-expanded={open}
+              aria-label={`Open ${row.name}`}
+              onClick={onOpen}
+              className={cx('text-left text-sm/6 font-medium hover:underline', open && 'text-accent')}
+            >
+              {row.name}
+            </button>
+          ) : (
+            <span className="text-sm/6 font-medium">{row.name}</span>
+          )}
           {s &&
             list(s.roles)
               .filter(role => role !== 'ethereum_node')
@@ -468,7 +479,12 @@ function HostTableRow({
           )}
         </Td>
       )}
-      {priv && (s ? <PrivateCells row={row} summary={s} onAction={onAction} /> : <MissingCells />)}
+      {priv &&
+        (s ? (
+          <PrivateCells row={row} summary={s} details={details} onAction={onAction} />
+        ) : (
+          <MissingCells details={details} />
+        ))}
     </tr>
   );
 }
@@ -491,9 +507,9 @@ function Uptime({ host }: { host: HostListing }) {
   );
 }
 
-function MissingCells() {
+function MissingCells({ details }: { details: boolean }) {
   return (
-    <Td colSpan={6} className="text-faint">
+    <Td colSpan={details ? 8 : 3} className="text-faint">
       no details yet
     </Td>
   );
@@ -502,10 +518,13 @@ function MissingCells() {
 function PrivateCells({
   row,
   summary: s,
+  details,
   onAction,
 }: {
   row: HostRow;
   summary: HostListing;
+  /** details: the login reads the system of the hosts (details). */
+  details: boolean;
   onAction: (intent: ActionIntent) => void;
 }) {
   const share = attestingShare(s);
@@ -521,7 +540,13 @@ function PrivateCells({
           className="flex w-60 items-center gap-2 2xl:w-96"
           title={needs.length > 0 ? `Open needs: ${needs.map(n => n.kind).join(', ')}` : undefined}
         >
-          {state ? <Badge tone={state.tone}>{state.label}</Badge> : <span className="text-faint">up to date</span>}
+          {state ? (
+            <Badge tone={state.tone} title={state.title}>
+              {state.label}
+            </Badge>
+          ) : (
+            <span className="text-faint">up to date</span>
+          )}
           <OfflineBadge mark={s.offline} />
           {s.hold.local && (
             <Badge tone="warning" title={`Local hold file${s.hold.localReason ? `: ${s.hold.localReason}` : ''}`}>
@@ -565,40 +590,55 @@ function PrivateCells({
           </span>
         )}
       </Td>
-      <Td>
-        <span className="flex items-baseline gap-2" title={`${s.os.prettyName} (${s.os.arch})`}>
-          <span className="font-mono">{s.os.runningKernel || <Dash />}</span>
-          {kernelBehind && (
-            <span className="text-warning" title={`A newer kernel is installed: ${s.os.newestKernel}`}>
-              ↑
+      {details && (
+        <>
+          <Td>
+            <UsageCell value={s.usage?.cpu} label={usageLabel('cpu', s.name)} />
+          </Td>
+          <Td>
+            <UsageCell value={s.usage?.memory} label={usageLabel('memory', s.name)} />
+          </Td>
+          <Td>
+            <span className="flex items-baseline gap-2" title={`${s.os.prettyName} (${s.os.arch})`}>
+              <span className="font-mono">{s.os.runningKernel || <Dash />}</span>
+              {kernelBehind && (
+                <span className="text-warning" title={`A newer kernel is installed: ${s.os.newestKernel}`}>
+                  ↑
+                </span>
+              )}
+              <span className="hidden text-faint 2xl:inline">
+                {s.os.id} {s.os.versionId}
+              </span>
             </span>
-          )}
-          <span className="hidden text-faint 2xl:inline">
-            {s.os.id} {s.os.versionId}
-          </span>
-        </span>
-      </Td>
-      <Td className="hidden xl:table-cell">
-        <Uptime host={s} />
-      </Td>
-      <Td title={`${s.pending.upgradable} upgradable, ${s.pending.security} security, ${s.pending.blocked} blocked`}>
-        <span className="flex items-center gap-2">
-          {s.pending.security > 0 ? (
-            <span className="font-medium text-danger">{s.pending.security} security</span>
-          ) : s.pending.upgradable > 0 ? (
-            <span className="text-muted">{s.pending.upgradable}</span>
-          ) : (
-            <span className="text-faint">–</span>
-          )}
-          {s.pending.blocked > 0 && <span className="text-warning">{s.pending.blocked} blocked</span>}
-          {s.os.rebootRequired && (
-            <Badge tone="warning" title={`Reboot required by: ${list(s.os.rebootPackages).join(', ') || 'unknown'}`}>
-              reboot
-            </Badge>
-          )}
-          <SecurityUpdates host={s} onAction={onAction} />
-        </span>
-      </Td>
+          </Td>
+          <Td className="hidden xl:table-cell">
+            <Uptime host={s} />
+          </Td>
+          <Td
+            title={`${s.pending.upgradable} upgradable, ${s.pending.security} security, ${s.pending.blocked} blocked`}
+          >
+            <span className="flex items-center gap-2">
+              {s.pending.security > 0 ? (
+                <span className="font-medium text-danger">{s.pending.security} security</span>
+              ) : s.pending.upgradable > 0 ? (
+                <span className="text-muted">{s.pending.upgradable}</span>
+              ) : (
+                <span className="text-faint">–</span>
+              )}
+              {s.pending.blocked > 0 && <span className="text-warning">{s.pending.blocked} blocked</span>}
+              {s.os.rebootRequired && (
+                <Badge
+                  tone="warning"
+                  title={`Reboot required by: ${list(s.os.rebootPackages).join(', ') || 'unknown'}`}
+                >
+                  reboot
+                </Badge>
+              )}
+              <SecurityUpdates host={s} onAction={onAction} />
+            </span>
+          </Td>
+        </>
+      )}
       <Td className="hidden 2xl:table-cell">
         {/* A host that syncs is "live": when exactly it last did is not sent. A silent one says since when. */}
         {s.stale ? (

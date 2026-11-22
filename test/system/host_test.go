@@ -28,7 +28,7 @@ const (
 	guardEnv = "UPGRADOOR_SYSTEM_TEST"
 
 	stateDirEnv     = "UPGRADOOR_STATE_DIR"
-	defaultStateDir = "/var/lib/upgradoor"
+	defaultStateDir = "/data/upgradoor"
 
 	bootIDFile        = "boot-id-before-reboot"
 	rebootMarkerFile  = "reboot-accepted"

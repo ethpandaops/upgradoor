@@ -205,8 +205,8 @@ func TestLocalHoldThroughTheSocket(t *testing.T) {
 
 	req := e.ctrl.Await("the hold", func(req *protocol.SyncRequest) bool { return req.Hold.Local })
 	assert.Equal(t, "debugging", req.Hold.LocalReason)
-	assert.Equal(t, me(t), field(t, e.stateOnDisk(), "holds", "local", "by"), "the hold says who set it")
-	assert.Empty(t, req.Needs, "a held host reports no needs")
+	assert.Equal(t, me(t), field(t, e.stateOnDisk(), "holds", "host", "by"), "the hold says who set it")
+	assert.True(t, hasNeed(&req, protocol.ImageNeedID("geth", agenttest.GethV2)), "a held host still reports its needs")
 
 	_, err = c.Roll(t.Context(), "geth")
 	require.ErrorContains(t, err, "debugging")
@@ -230,8 +230,8 @@ func TestLocalStatusFollowsTheWritesAtOnce(t *testing.T) {
 	c := local.NewClient(e.cfg.Local.Socket.Path)
 	awaitLocal(t, c, "the containers", func(st *local.Status) bool { return len(st.Containers) == 3 })
 
-	e.ctrl.Direct(protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Reason: "maintenance"})
-	e.ctrl.Await("the controller hold", func(req *protocol.SyncRequest) bool { return req.Hold.Controller })
+	e.ctrl.Direct(protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff, Reason: "maintenance"})
+	e.ctrl.Await("the controller hold", func(req *protocol.SyncRequest) bool { return req.Hold.Of(protocol.HolderStaff) != nil })
 
 	// From here on no sync is answered.
 	var (
@@ -261,7 +261,11 @@ func TestLocalStatusFollowsTheWritesAtOnce(t *testing.T) {
 
 	_, err := c.Hold(t.Context(), &local.HoldRequest{Reason: "debugging"})
 	require.NoError(t, err)
-	assert.Equal(t, protocol.Hold{Local: true, LocalReason: "debugging", Controller: true}, status().Hold)
+	held := status().Hold
+	assert.True(t, held.Local)
+	assert.Equal(t, []string{protocol.HolderHost, protocol.HolderStaff}, held.Holders())
+	assert.Equal(t, "debugging", held.Of(protocol.HolderHost).Reason)
+	assert.Equal(t, "maintenance", held.Of(protocol.HolderStaff).Reason)
 
 	until := e.now().Add(time.Hour).UTC().Truncate(time.Second)
 	_, err = c.Override(t.Context(), &local.OverrideRequest{Container: "geth", Image: agenttest.FixImage, Until: &until})
@@ -273,11 +277,12 @@ func TestLocalStatusFollowsTheWritesAtOnce(t *testing.T) {
 
 	_, err = c.Hold(t.Context(), &local.HoldRequest{Release: true})
 	require.NoError(t, err)
-	assert.Equal(t, protocol.Hold{Controller: true}, status().Hold)
+	assert.Equal(t, []string{protocol.HolderStaff}, status().Hold.Holders())
+	assert.False(t, status().Hold.Local)
 
 	_, err = c.Hold(t.Context(), &local.HoldRequest{Release: true})
-	require.ErrorContains(t, err, "there is no local hold; the host is on controller hold")
-	assert.Contains(t, err.Error(), "(maintenance), which is lifted on the controller")
+	require.ErrorContains(t, err, "there is no local hold; the host is held by staff by ")
+	assert.Contains(t, err.Error(), "(maintenance), lifted on the controller")
 
 	assert.Equal(t, []string{
 		"hold.set accepted", "hold.set accepted", "override.set accepted", "hold.release accepted",
@@ -291,7 +296,7 @@ func TestLocalRoll(t *testing.T) {
 
 	e := newEnv(t, agenttest.BaseScenario())
 	e.ctrl.Set(func(c *agenttest.Controller) {
-		c.Queue = &protocol.Queue{Position: 2, Reason: "budget 10% of 10%"}
+		c.Queue = &protocol.Queue{Position: 2, Reason: "validators down: 10% now, 15% with this host, limit 10%"}
 	})
 	e.start()
 
@@ -314,7 +319,7 @@ func TestLocalRoll(t *testing.T) {
 
 		return r != nil && r.State == local.RollQueued && r.Position == 2
 	})
-	assert.Equal(t, "budget 10% of 10%", rollOf(st, id).Detail)
+	assert.Equal(t, "validators down: 10% now, 15% with this host, limit 10%", rollOf(st, id).Detail)
 	assert.Equal(t, "local:"+me(t), rollOf(st, id).RequestedBy)
 
 	needs := awaitNeeds(t, e, protocol.LocalNeedID(id))

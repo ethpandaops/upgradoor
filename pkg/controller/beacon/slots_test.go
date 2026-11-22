@@ -286,7 +286,8 @@ func slotRoot(slot uint64, fork string) string {
 	return fmt.Sprintf("0x%04x%s", slot, fork)
 }
 
-// slotChain grows a chain on the harness's node.
+// slotChain grows a chain on the harness's nodes: every node serves every
+// block.
 type slotChain struct {
 	h *harness
 	// tip is the head: its root and slot.
@@ -301,14 +302,16 @@ func newSlotChain(t *testing.T, h *harness, from, to uint64) *slotChain {
 
 	chain := &slotChain{h: h, tip: "0x00"}
 
-	h.node.set(func(n *fakeNode) {
-		n.blocks = make(map[string]fakeBlock, 32)
-		n.committees = make(map[uint64][][]uint64, 64)
+	for _, node := range h.nodes {
+		node.set(func(n *fakeNode) {
+			n.blocks = make(map[string]fakeBlock, 32)
+			n.committees = make(map[uint64][][]uint64, 64)
 
-		for slot := uint64(0); slot < 20*testSlotsPerEpoch; slot++ {
-			n.committees[slot] = slotCommittees(slot)
-		}
-	})
+			for slot := uint64(0); slot < 20*testSlotsPerEpoch; slot++ {
+				n.committees[slot] = slotCommittees(slot)
+			}
+		})
+	}
 
 	for slot := from; slot <= to; slot++ {
 		chain.add(slot, "", vote(slot-1, true, true))
@@ -322,17 +325,36 @@ func (c *slotChain) add(slot uint64, fork string, votes ...map[string]any) {
 	c.addOn(c.tip, slot, fork, votes...)
 }
 
-// addOn puts a block on parent and makes it the head.
+// addOn puts a block on parent and makes it the head of every node.
 func (c *slotChain) addOn(parent string, slot uint64, fork string, votes ...map[string]any) {
+	root := c.serve(parent, slot, fork, votes...)
+
+	for _, node := range c.h.nodes {
+		setHead(node, root, slot)
+	}
+
+	c.tip, c.tipSlot = root, slot
+}
+
+// serve puts a block on parent without making it a head.
+func (c *slotChain) serve(parent string, slot uint64, fork string, votes ...map[string]any) string {
 	root := slotRoot(slot, fork)
 
-	c.h.node.set(func(n *fakeNode) {
-		n.blocks[root] = fakeBlock{slot: slot, parent: parent, attestations: votes}
+	for _, node := range c.h.nodes {
+		node.set(func(n *fakeNode) {
+			n.blocks[root] = fakeBlock{slot: slot, parent: parent, attestations: votes}
+		})
+	}
+
+	return root
+}
+
+// setHead makes the node report root of slot as its head.
+func setHead(node *fakeNode, root string, slot uint64) {
+	node.set(func(n *fakeNode) {
 		n.headRoot = root
 		n.headSlot = slot
 	})
-
-	c.tip, c.tipSlot = root, slot
 }
 
 // pollAt sets the clock to the middle of slot and polls.
@@ -388,7 +410,6 @@ func TestSlotsFollowTheChain(t *testing.T) {
 	committeesPath := "/eth/v1/beacon/states/head/committees?epoch="
 	assert.Equal(t, 1, h.node.count(committeesPath+"9"))
 	assert.Equal(t, 1, h.node.count(committeesPath+"10"))
-	assert.Zero(t, h.node.count("/eth/v1/node/syncing"), "not asked while blocks arrive")
 
 	h.store.set(func(s *fakeStore) {
 		assert.Equal(t, 1, s.slotSaves[75], "a slot that did not change is not stored again")
@@ -484,42 +505,28 @@ func TestSlotsReorg(t *testing.T) {
 }
 
 func TestSlotsWithoutNewBlocks(t *testing.T) {
-	tests := []struct {
-		name    string
-		syncing bool
-		// newest is the newest slot with a row when the clock is in slot 86.
-		newest uint64
-	}{
-		{name: "the chain stands still", syncing: false, newest: 84},
-		{name: "the node is behind", syncing: true, newest: 81},
+	h := newHarness(t, 1, slotHosts(), nil)
+	chain := newSlotChain(t, h, 70, 82)
+
+	// The node is in sync and has nothing after slot 82: the chain stands
+	// still, and the slots up to two before the clock are stored.
+	chain.pollAt(t, 86)
+
+	row, _ := h.store.slot(81)
+	assert.Equal(t, full(81), row)
+
+	for slot := uint64(82); slot <= 86; slot++ {
+		row, ok := h.store.slot(slot)
+		require.Equal(t, slot <= 84, ok, "slot %d", slot)
+
+		if ok {
+			assert.Equal(t, slot == 82, row.Proposed)
+			assert.Equal(t, uint64(2), row.Assigned)
+			assert.Zero(t, row.Included, "nothing came after slot %d", slot)
+		}
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, 1, slotHosts(), nil)
-			chain := newSlotChain(t, h, 70, 82)
-
-			h.node.set(func(n *fakeNode) { n.syncing = tt.syncing })
-			chain.pollAt(t, 86)
-
-			row, _ := h.store.slot(81)
-			assert.Equal(t, full(81), row)
-
-			for slot := uint64(82); slot <= 86; slot++ {
-				row, ok := h.store.slot(slot)
-				require.Equal(t, slot <= tt.newest, ok, "slot %d", slot)
-
-				if ok {
-					assert.Equal(t, slot == 82, row.Proposed)
-					assert.Equal(t, uint64(2), row.Assigned)
-					assert.Zero(t, row.Included, "nothing came after slot %d", slot)
-				}
-			}
-
-			assert.Equal(t, 1, h.node.count("/eth/v1/node/syncing"))
-			assert.Equal(t, 1, h.node.count(blockPrefix+slotRoot(82, "")))
-		})
-	}
+	assert.Equal(t, 1, h.node.count(blockPrefix+slotRoot(82, "")))
 }
 
 func TestSlotsCommitteesOfAnOlderEpochNotServed(t *testing.T) {

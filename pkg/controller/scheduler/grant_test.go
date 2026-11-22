@@ -2,6 +2,8 @@ package scheduler
 
 import (
 	"fmt"
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -135,7 +137,7 @@ func TestBudgetAdmit(t *testing.T) {
 			name:   "one validator too many",
 			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 5, leased: 1, maxLeased: 3},
 			cost:   6,
-			want:   "budget 5% of 10%",
+			want:   "validators down: 5% now, 11% with this host, limit 10%",
 		},
 		{
 			name:   "heavy host goes alone when nothing is unavailable",
@@ -146,13 +148,13 @@ func TestBudgetAdmit(t *testing.T) {
 			name:   "heavy host waits while a host without validators holds a lease",
 			budget: budgetState{total: 100, percent: 10, allowed: 10, leased: 1, maxLeased: 3},
 			cost:   40,
-			want:   "budget 0% of 10%",
+			want:   "validators down: 0% now, 40% with this host, limit 10%",
 		},
 		{
 			name:   "heavy host waits while one validator is down elsewhere",
 			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 1, maxLeased: 3},
 			cost:   40,
-			want:   "budget 1% of 10%",
+			want:   "validators down: 1% now, 41% with this host, limit 10%",
 		},
 		{
 			name:   "already-down host is free",
@@ -163,7 +165,7 @@ func TestBudgetAdmit(t *testing.T) {
 			name:   "zero maxUnavailable never lets a live validator go",
 			budget: budgetState{total: 100, maxLeased: 1},
 			cost:   1,
-			want:   "budget 0% of 0%",
+			want:   "validators down: 0% now, 1% with this host, limit 0%",
 		},
 		{
 			name:   "zero maxUnavailable still serves a host that costs nothing",
@@ -174,13 +176,13 @@ func TestBudgetAdmit(t *testing.T) {
 			name:   "host limit",
 			budget: budgetState{total: 100, percent: 10, allowed: 10, leased: 2, maxLeased: 2},
 			cost:   0,
-			want:   "host limit 2 of 2",
+			want:   "hosts at once: 2 of 2 busy",
 		},
 		{
 			name:   "budget is named before the host limit",
 			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 10, leased: 2, maxLeased: 2},
 			cost:   1,
-			want:   "budget 10% of 10%",
+			want:   "validators down: 10% now, 11% with this host, limit 10%",
 		},
 		{
 			name:   "fractional percent",
@@ -191,7 +193,7 @@ func TestBudgetAdmit(t *testing.T) {
 			name:   "percent is rounded down in the reason",
 			budget: budgetState{total: 3, percent: 12.5, allowed: 0.375, unavailable: 1, maxLeased: 1},
 			cost:   1,
-			want:   "budget 33.3% of 12.5%",
+			want:   "validators down: 33.3% now, 66.7% with this host, limit 12.5%",
 		},
 	}
 
@@ -257,7 +259,7 @@ func TestBudgetHeavyHostGoesAlone(t *testing.T) {
 	assert.Equal(t, uint64(39), b.lease("mid").Charged)
 
 	out = b.step()
-	assert.Equal(t, map[string]string{"big": "budget 39% of 10%"}, queueReasons(out.Plan))
+	assert.Equal(t, map[string]string{"big": "validators down: 39% now, 99% with this host, limit 10%"}, queueReasons(out.Plan))
 
 	b.serve("mid")
 	require.Equal(t, []string{"big"}, b.leasedHosts())
@@ -288,7 +290,7 @@ func TestBudgetAlreadyDownHostIsFree(t *testing.T) {
 	b.wants("up", rebootNeed())
 
 	out = b.step()
-	assert.Equal(t, "budget 20% of 10%", queueReasons(out.Plan)["up"])
+	assert.Equal(t, "validators down: 20% now, 40% with this host, limit 10%", queueReasons(out.Plan)["up"])
 }
 
 func TestBudgetZeroMaxUnavailable(t *testing.T) {
@@ -319,7 +321,7 @@ func TestBudgetZeroMaxUnavailable(t *testing.T) {
 
 	out = b.step()
 	assert.Empty(t, b.leasedHosts())
-	assert.Equal(t, map[string]string{"val": "budget 0% of 0%"}, queueReasons(out.Plan))
+	assert.Equal(t, map[string]string{"val": "validators down: 0% now, 100% with this host, limit 0%"}, queueReasons(out.Plan))
 }
 
 // TestHostsThatCostNothingPassAFullBudget: in the rest, a host without
@@ -344,7 +346,7 @@ func TestHostsThatCostNothingPassAFullBudget(t *testing.T) {
 
 	out := b.step()
 	assert.Equal(t, []string{"tool1", "tool2"}, b.leasedHosts())
-	assert.Equal(t, map[string]string{"heavy": "budget 20% of 50%"}, queueReasons(out.Plan))
+	assert.Equal(t, map[string]string{"heavy": "validators down: 20% now, 65% with this host, limit 50%"}, queueReasons(out.Plan))
 }
 
 func TestHostLimitBoundsHostsWithoutValidators(t *testing.T) {
@@ -363,7 +365,7 @@ func TestHostLimitBoundsHostsWithoutValidators(t *testing.T) {
 	out := b.step()
 	assert.Equal(t, []string{"t2", "t3"}, b.leasedHosts())
 	assert.Equal(t, 2, out.Plan.Budget.MaxLeasedHosts)
-	assert.Equal(t, "host limit 2 of 2", queueReasons(out.Plan)["t4"])
+	assert.Equal(t, "hosts at once: 2 of 2 busy", queueReasons(out.Plan)["t4"])
 	assert.Equal(t, 1, out.Plan.Queue[0].Position)
 	assert.Equal(t, "t4", out.Plan.Queue[0].Host)
 	assert.Equal(t, WaitHostLimit, out.Plan.Queue[0].Wait)
@@ -382,11 +384,11 @@ func TestHostLimitAndBudgetAreIndependent(t *testing.T) {
 	}{
 		{
 			name: "host limit", unavailable: 100, leased: 25,
-			wantLeased: []string{"h2", "h3"}, wantMax: 2, wantReason: "host limit 2 of 2",
+			wantLeased: []string{"h2", "h3"}, wantMax: 2, wantReason: "hosts at once: 2 of 2 busy",
 		},
 		{
 			name: "budget", unavailable: 25, leased: 100,
-			wantLeased: []string{"h2", "h3"}, wantMax: 8, wantReason: "budget 25% of 25%",
+			wantLeased: []string{"h2", "h3"}, wantMax: 8, wantReason: "validators down: 25% now, 37.5% with this host, limit 25%",
 		},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
@@ -460,6 +462,13 @@ func TestGate(t *testing.T) {
 				b.w.Health.FinalityLagEpochs = 5
 			},
 			want: []string{"finality lag 5 epochs > 3"},
+		},
+		{
+			name: "network split",
+			setup: func(b *worldBuilder) {
+				b.w.Health.Split = "2 chains, 2/4 and 2/4 endpoints"
+			},
+			want: []string{"network split: 2 chains, 2/4 and 2/4 endpoints"},
 		},
 		{
 			name: "the node answers and its chain timing is invalid",
@@ -598,9 +607,21 @@ func TestWaitingReasons(t *testing.T) {
 		want  string
 	}{
 		{
-			name:  "held",
-			setup: func(b *worldBuilder) { b.get("h").HoldWanted = true },
-			want:  "held",
+			name: "held",
+			setup: func(b *worldBuilder) {
+				b.get("h").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}, {Holder: "geth"}}
+			},
+			want: "held by staff, geth",
+		},
+		{
+			name: "hold requested",
+			setup: func(b *worldBuilder) {
+				b.w.Directives = append(b.w.Directives, &fleet.Directive{
+					Directive: protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: "geth"},
+					Host:      "h", State: fleet.DirectivePending,
+				})
+			},
+			want: "hold requested, waiting for the host",
 		},
 		{
 			name:  "agent silent",
@@ -657,18 +678,18 @@ func TestWaitingReasons(t *testing.T) {
 				b.live(b.w.Health.LivenessEpoch, "sick", 82) // 8 of 100 down
 				b.w.Settings.MinParticipationPercent = 50
 			},
-			want: "budget 8% of 10%",
+			want: "validators down: 8% now, 18% with this host, limit 10%",
 		},
 		{
 			name: "held wins over everything else",
 			setup: func(b *worldBuilder) {
-				b.get("h").Status.Hold.Local = true
+				b.get("h").Status.Hold = protocol.Hold{Local: true, Holds: []protocol.HostHold{{Holder: protocol.HolderHost}}}
 				b.get("h").LastSeen = b.w.Now.Add(-3 * time.Minute)
 				b.w.Settings.Paused = true
 				b.w.Settings.PolicyPackages = fleet.PolicyManual
 				b.w.Health.FinalityLagEpochs = 5
 			},
-			want: "held",
+			want: "held by the host",
 		},
 		{
 			name: "agent silent wins over paused",
@@ -780,7 +801,7 @@ func TestWaitingReasonShowsTheNeedClosestToAGrant(t *testing.T) {
 
 	// The reboot waits for approval, the packages for the budget: the host
 	// is told about the budget.
-	assert.Equal(t, "budget 8% of 10%", queueReasons(out.Plan)["h"])
+	assert.Equal(t, "validators down: 8% now, 18% with this host, limit 10%", queueReasons(out.Plan)["h"])
 	assert.Len(t, out.Plan.Queue[0].Rollouts, 2)
 	assert.Empty(t, out.Plan.Queue[0].Rollout, "the budget is about no rollout")
 }
@@ -940,7 +961,7 @@ func TestForceStillAnswersToBudgetAndGate(t *testing.T) {
 
 	out := b.step()
 	assert.Equal(t, []string{"v1"}, b.leasedHosts())
-	assert.Equal(t, "budget 50% of 10%", queueReasons(out.Plan)["v2"])
+	assert.Equal(t, "validators down: 50% now, 100% with this host, limit 10%", queueReasons(out.Plan)["v2"])
 
 	b.healthMod = func(n *fleet.NetworkHealth) { n.FinalityLagEpochs = 9 }
 	b.refreshHealth()
@@ -978,6 +999,52 @@ func TestIgnoreBudget(t *testing.T) {
 
 		assert.Empty(t, b.leasedHosts())
 		assert.Equal(t, "paused", queueReasons(out.Plan)["v1"])
+	})
+}
+
+// A rollout a person let pass the gate passes it for any reason, missing
+// data included; the order and the budget still apply, and the other
+// rollouts keep waiting at the gate.
+func TestIgnoreGate(t *testing.T) {
+	for name, mod := range map[string]func(n *fleet.NetworkHealth){
+		"finality":         func(n *fleet.NetworkHealth) { n.FinalityLagEpochs = 9 },
+		"beacon node down": func(n *fleet.NetworkHealth) { n.UpdatedAt = time.Time{} },
+		"no liveness":      func(n *fleet.NetworkHealth) { n.LivenessKnown = false },
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newWorldBuilder(t)
+			b.healthMod = mod
+			b.refreshHealth()
+			b.host("v1", 10)
+			b.host("v2", 20)
+			b.host("v3", 30)
+			b.manualRollout("m1", false, false, "v1", "v2").IgnoreGate = true
+			b.wants("v3", packagesNeed("2.0"))
+
+			out := b.step()
+
+			assert.Equal(t, []string{"v1"}, b.leasedHosts())
+			assert.Equal(t, "after canary v1", queueReasons(out.Plan)["v2"])
+			assert.True(t, strings.HasPrefix(queueReasons(out.Plan)["v3"], ReasonGatePrefix), queueReasons(out.Plan)["v3"])
+
+			granted := slices.IndexFunc(out.Audit, func(e fleet.AuditEntry) bool { return e.Action == "lease.granted" })
+			require.GreaterOrEqual(t, granted, 0)
+			assert.Equal(t, true, out.Audit[granted].Detail["ignoredGate"])
+		})
+	}
+
+	t.Run("the budget still applies", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.healthMod = func(n *fleet.NetworkHealth) { n.FinalityLagEpochs = 9 }
+		b.refreshHealth()
+		b.host("v1", 50)
+		b.host("v2", 50)
+		b.manualRollout("m1", true, false, "v1", "v2").IgnoreGate = true
+
+		out := b.step()
+
+		assert.Equal(t, []string{"v1"}, b.leasedHosts())
+		assert.Equal(t, "validators down: 50% now, 100% with this host, limit 10%", queueReasons(out.Plan)["v2"])
 	})
 }
 
@@ -1021,7 +1088,7 @@ func TestIndependentWorkNeitherWaitsNorBlocks(t *testing.T) {
 
 	out = b.step()
 	assert.Equal(t, []string{"x2", "x3"}, b.leasedHosts())
-	assert.Equal(t, "independent limit 2 of 2", queueReasons(out.Plan)["x4"])
+	assert.Equal(t, "independent hosts at once: 2 of 2 busy", queueReasons(out.Plan)["x4"])
 
 	b.healthMod = nil
 	b.refreshHealth()
@@ -1102,7 +1169,7 @@ func TestLocalRolloutsGoFirst(t *testing.T) {
 
 	out := b.step()
 	assert.Equal(t, []string{"b"}, b.leasedHosts())
-	assert.Equal(t, "budget 50% of 10%", queueReasons(out.Plan)["a"])
+	assert.Equal(t, "validators down: 50% now, 100% with this host, limit 10%", queueReasons(out.Plan)["a"])
 }
 
 // A need that waits for its rollout's canary is not granted with a lease the
@@ -1143,7 +1210,7 @@ func TestOrderWaitsDoNotRideAlong(t *testing.T) {
 	require.Len(t, b.lease("c").Needs, 1)
 	assert.Equal(t, protocol.NeedReboot, b.lease("c").Needs[0].Kind)
 	assert.Equal(t, fleet.HostPending, geth.Host("c").State)
-	assert.Equal(t, "budget 40% of 40%", queueReasons(out.Plan)["d"])
+	assert.Equal(t, "validators down: 40% now, 60% with this host, limit 40%", queueReasons(out.Plan)["d"])
 }
 
 // Validators without an attestation duty (exited, pending, beyond the

@@ -86,12 +86,21 @@ func (a *agent) applyDirective(d *protocol.Directive, view *plan.View) bool {
 	)
 
 	switch d.Kind {
-	case protocol.DirectiveHold:
-		hold := plan.ControllerHold(d.Reason, d.By)
-		err = a.state.SetHold(plan.HoldSource(plan.FromController), &hold)
-		a.refreshHold(view)
-	case protocol.DirectiveReleaseHold:
-		err = a.state.SetHold(plan.HoldSource(plan.FromController), nil)
+	case protocol.DirectiveHold, protocol.DirectiveReleaseHold:
+		if !protocol.ValidHolder(d.Holder) {
+			reject = fmt.Sprintf("holder %q is not staff or a team", plan.Line(d.Holder))
+
+			break
+		}
+
+		var hold *plan.Hold
+
+		if d.Kind == protocol.DirectiveHold {
+			h := plan.DirectedHold(d, a.now())
+			hold = &h
+		}
+
+		err = a.state.SetHold(d.Holder, hold)
 		a.refreshHold(view)
 	case protocol.DirectiveReboot:
 		n, why := plan.ManualReboot(&a.cfg.Policy, view, d.ID)
@@ -314,7 +323,7 @@ func (a *agent) auditDirective(d *protocol.Directive, reject string) {
 	rec := &local.Record{
 		Action: action, Source: local.SourceController, User: who.User, Teams: who.Teams,
 		Feature: who.Feature, Directive: d.ID, Container: d.Container, HostAction: plan.Line(d.Action),
-		Reason: d.Reason, Result: local.Accepted,
+		Holder: d.Holder, Reason: d.Reason, Result: local.Accepted,
 	}
 
 	if reject != "" {

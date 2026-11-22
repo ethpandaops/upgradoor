@@ -8,9 +8,7 @@ import { createHarness, renderWithApp, PRIMARY } from '../test/harness';
 import { HostsTab } from './HostsTab';
 
 const PUBLIC_COLUMNS = ['Host', 'Execution', 'Consensus', 'State'];
-// The selection checkbox column has no text; the expander column has a screen-reader label.
-const LEADING_COLUMNS = ['Expand'];
-const PRIVATE_COLUMNS = ['Attesting', 'Kernel', 'Uptime', 'Updates', 'Seen'];
+const PRIVATE_COLUMNS = ['Attesting', 'CPU', 'Memory', 'Kernel', 'Uptime', 'Updates', 'Seen'];
 
 function columnNames(table: HTMLElement): string[] {
   return within(table)
@@ -20,8 +18,7 @@ function columnNames(table: HTMLElement): string[] {
 }
 
 function rowOf(table: HTMLElement, host: string): HTMLElement {
-  const cell = within(table).getByText(host, { selector: 'span' });
-  const row = cell.closest('tr');
+  const row = table.querySelector<HTMLElement>(`tr[data-host="${host}"]`);
   if (!row) throw new Error(`no row for ${host}`);
   return row;
 }
@@ -79,7 +76,7 @@ describe('HostsTab, logged in', () => {
     const table = await screen.findByRole('table', { name: 'Hosts' });
     await within(table).findByRole('columnheader', { name: /Kernel/ });
 
-    expect(columnNames(table)).toEqual([...LEADING_COLUMNS, ...PUBLIC_COLUMNS, ...PRIVATE_COLUMNS]);
+    expect(columnNames(table)).toEqual([...PUBLIC_COLUMNS, ...PRIVATE_COLUMNS]);
     expect(screen.getByRole('group', { name: 'Actions on the selected hosts' })).toBeInTheDocument();
 
     // Everything on the page came over the one authenticated event stream.
@@ -96,7 +93,7 @@ describe('HostsTab, logged in', () => {
     const reboot = rowOf(table, 'teku-besu-1');
     expect(reboot).toHaveTextContent('6.12.48+deb13-amd64');
     expect(within(reboot).getByText('reboot')).toBeInTheDocument();
-    expect(within(reboot).getByText(/^queued #\d+$/)).toBeInTheDocument();
+    expect(within(reboot).getByText(/^(next|#\d+ in line)$/)).toBeInTheDocument();
     expect(reboot).toHaveTextContent('waiting for approval (policy manual)');
 
     const failed = rowOf(table, 'nimbus-nethermind-1');
@@ -111,12 +108,48 @@ describe('HostsTab, logged in', () => {
     expect(within(rowOf(table, 'lighthouse-geth-2')).getByText('verifying')).toBeInTheDocument();
     expect(within(rowOf(table, 'lodestar-reth-3')).getByText('held')).toBeInTheDocument();
     expect(within(rowOf(table, 'lodestar-reth-3')).getByText('local hold')).toBeInTheDocument();
+    expect(rowOf(table, 'lodestar-reth-3')).toHaveTextContent('held by the host');
     expect(within(rowOf(table, 'prysm-geth-1')).getByText('up to date')).toBeInTheDocument();
     expect(rowOf(table, 'teku-reth-1')).toHaveTextContent('debian 13');
-    expect(rowOf(table, 'lighthouse-geth-3')).toHaveTextContent(/budget [\d.]+% of 10%/);
+    expect(rowOf(table, 'lighthouse-geth-3')).toHaveTextContent(
+      /validators down: [\d.]+% now, [\d.]+% with this host, limit 10%/
+    );
 
     // A host whose last lease could not pull its image waits to try again.
     expect(rowOf(table, 'lighthouse-geth-4')).toHaveTextContent('waiting to pull its image again after a failed pull');
+  });
+
+  it('sums up CPU and memory of the fleet, and a tile keeps the busy hosts', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'auth', loggedIn: true });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+
+    const tiles = await screen.findByRole('group', { name: 'Fleet resources' });
+    const cpu = within(tiles).getByRole('button', { name: /^CPU/ });
+    const busy = Number(/(\d+) ≥80%/.exec(cpu.textContent)?.[1]);
+    expect(busy).toBeGreaterThan(0);
+    expect(cpu).toHaveTextContent(/worst\s*\S+\s*9\d(\.\d)?%/);
+
+    await user.click(cpu);
+    expect(screen.getByRole('searchbox', { name: 'Filter hosts' })).toHaveValue('cpu>=80');
+    expect(within(table).getAllByRole('row')).toHaveLength(1 + busy);
+    for (const meter of within(table).getAllByRole('meter', { name: /^CPU of / })) {
+      expect(Number(meter.getAttribute('aria-valuenow'))).toBeGreaterThanOrEqual(80);
+    }
+
+    await user.click(cpu);
+    expect(screen.getByRole('searchbox', { name: 'Filter hosts' })).toHaveValue('');
+  });
+
+  it('shows a login without details no resource use', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: true, profile: 'reader' });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Attesting/ });
+
+    expect(within(table).queryByRole('columnheader', { name: /CPU/ })).not.toBeInTheDocument();
+    expect(screen.queryByRole('group', { name: 'Fleet resources' })).not.toBeInTheDocument();
   });
 
   it('filters by name, image and role, and sorts by a column', async () => {
@@ -207,35 +240,41 @@ describe('HostsTab, logged in', () => {
     expect(post?.body).toStrictEqual({ hosts: ['bootnode-1'], reason: '' });
   });
 
-  it('expands a row to containers, needs, packages, leases and history', async () => {
+  it('opens a host in the drawer, linkable, and steps through the list with the arrow keys', async () => {
     const user = userEvent.setup();
     const h = await createHarness({ mode: 'auth', loggedIn: true });
     renderWithApp(<HostsTab />, h);
     const table = await screen.findByRole('table', { name: 'Hosts' });
     await within(table).findByRole('columnheader', { name: /Kernel/ });
 
-    await user.click(screen.getByRole('button', { name: 'Expand lighthouse-geth-2' }));
-
-    const containers = await screen.findByRole('table', { name: 'Containers' });
-    expect(within(containers).getAllByRole('row')).toHaveLength(1 + 4);
-    expect(within(containers).getByText('lighthouse-validator')).toBeInTheDocument();
-    expect(within(containers).getByText('unmanaged')).toBeInTheDocument();
-
-    expect(screen.getByRole('table', { name: 'Leases of lighthouse-geth-2' })).toHaveTextContent('verifying');
-    expect(screen.getByRole('table', { name: 'History of lighthouse-geth-2' })).toHaveTextContent('lease.granted');
+    await user.click(within(table).getByRole('button', { name: 'Open lighthouse-geth-2' }));
+    const drawer = await screen.findByRole('complementary', { name: 'Host lighthouse-geth-2' });
+    expect(window.location.search).toBe('?host=lighthouse-geth-2');
+    expect(rowOf(table, 'lighthouse-geth-2')).toHaveAttribute('aria-current', 'true');
+    // The table stays.
+    expect(table).toBeInTheDocument();
+    await within(drawer).findByRole('tablist');
     // The details come over the stream, which is reopened to ask for them.
     expect(h.calls.at(-1)?.path).toBe('/api/v1/events?host=lighthouse-geth-2');
     expect(h.calls.every(c => c.path.startsWith('/api/v1/events'))).toBe(true);
 
-    // The validators the inventory assigns, and how many are active.
-    expect(screen.getByRole('group', { name: 'Actions for lighthouse-geth-2' }).parentElement).toHaveTextContent(
-      /128 assigned, 128 active/
-    );
+    await user.keyboard('{ArrowDown}');
+    expect(await screen.findByRole('complementary', { name: 'Host lighthouse-geth-3' })).toBeInTheDocument();
+    await user.keyboard('{ArrowUp}{ArrowUp}');
+    expect(await screen.findByRole('complementary', { name: 'Host lighthouse-geth-1' })).toBeInTheDocument();
+    expect(window.location.search).toBe('?host=lighthouse-geth-1');
 
-    await user.click(screen.getByRole('button', { name: 'Expand prysm-erigon-1' }));
-    const upgradable = await screen.findByRole('table', { name: 'Upgradable packages' });
-    expect(upgradable).toHaveTextContent('openssl');
-    expect(within(upgradable).getAllByText('security')).toHaveLength(3);
+    await user.keyboard('{Escape}');
+    expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
+    expect(window.location.search).toBe('');
+  });
+
+  it('opens the host the URL names', async () => {
+    window.history.replaceState(null, '', '/?host=rpc-1');
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<HostsTab />, h);
+
+    expect(await screen.findByRole('complementary', { name: 'Host rpc-1' })).toBeInTheDocument();
   });
 });
 
@@ -247,7 +286,7 @@ describe('HostsTab, open mode', () => {
     const table = await screen.findByRole('table', { name: 'Hosts' });
     await within(table).findByRole('columnheader', { name: /Kernel/ });
 
-    expect(columnNames(table)).toEqual([...LEADING_COLUMNS, ...PUBLIC_COLUMNS, ...PRIVATE_COLUMNS]);
+    expect(columnNames(table)).toEqual([...PUBLIC_COLUMNS, ...PRIVATE_COLUMNS]);
     expect(h.calls.every(c => c.authorization === null)).toBe(true);
     expect(screen.queryByText(/Log in for host details/)).not.toBeInTheDocument();
   });
@@ -262,12 +301,12 @@ describe('HostsTab rows', () => {
     await within(table).findByRole('columnheader', { name: /Kernel/ });
 
     await user.click(within(table).getByRole('checkbox', { name: 'Select rpc-1' }));
-    expect(screen.queryByRole('group', { name: 'Actions for rpc-1' })).not.toBeInTheDocument();
+    expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
 
-    await user.click(within(table).getByText('rpc-1'));
+    await user.click(within(rowOf(table, 'rpc-1')).getByText('geth:master'));
     const actions = await screen.findByRole('group', { name: 'Actions for rpc-1' });
     expect(within(actions).getByRole('button', { name: 'Roll…' })).toBeInTheDocument();
-    expect(within(table).getByRole('button', { name: 'Collapse rpc-1' })).toHaveAttribute('aria-expanded', 'true');
+    expect(within(table).getByRole('button', { name: 'Open rpc-1' })).toHaveAttribute('aria-expanded', 'true');
   });
 
   it('filters by the state the table shows', async () => {
@@ -281,7 +320,7 @@ describe('HostsTab rows', () => {
       within(table)
         .getAllByRole('row')
         .slice(1)
-        .map(r => r.querySelector('td:nth-child(3) span span')?.textContent);
+        .map(r => r.querySelector('td:nth-child(2) button')?.textContent);
 
     await user.type(filter, 'silent');
     expect(hosts()).toEqual(['prysm-geth-3']);
@@ -341,22 +380,26 @@ describe('HostsTab, host actions on the selection', () => {
     await user.click(within(table).getByRole('checkbox', { name: 'Select prysm-erigon-1' }));
     await user.click(within(table).getByRole('checkbox', { name: 'Select tooling-1' }));
     const bulk = screen.getByRole('group', { name: 'Actions on the selected hosts' });
-    await user.click(within(bulk).getByRole('button', { name: 'Action…' }));
+    await user.click(within(bulk).getByRole('button', { name: 'Run host action…' }));
 
-    // Each host offers another action: the choice says on how many of them.
-    const dialog = screen.getByRole('dialog', { name: 'Run an action' });
-    const choice = within(dialog).getByRole('combobox');
-    expect(
-      within(choice)
-        .getAllByRole('option')
-        .map(o => o.textContent)
-    ).toEqual(['docker-prune (1 of 2)', 'security-upgrades (1 of 2)']);
-    await user.selectOptions(choice, 'security-upgrades');
+    // Each host offers another action: the choice says on how many of them, and none is picked.
+    const dialog = screen.getByRole('dialog', { name: 'Run a host action' });
+    const radios = within(dialog).getAllByRole('radio');
+    expect(radios.map(r => r.closest('label')?.textContent)).toEqual([
+      expect.stringMatching(/^docker-prune.*available on 1 of 2 selectedRemove unused Docker images$/) as string,
+      expect.stringMatching(/^security-upgrades.*available on 1 of 2 selected/) as string,
+    ]);
+    expect(radios.some(r => (r as HTMLInputElement).checked)).toBe(false);
+    expect(within(dialog).getByRole('button', { name: 'Run … on 2 hosts' })).toBeDisabled();
+    // The gate is open: nothing to override.
+    expect(within(dialog).queryByRole('checkbox', { name: /Roll despite network state/ })).not.toBeInTheDocument();
+
+    await user.click(within(dialog).getByRole('radio', { name: /^security-upgrades/ }));
     expect(within(dialog).getByRole('note')).toHaveTextContent('1 selected host does not offer security-upgrades');
 
     await user.click(within(dialog).getByText('Advanced options'));
     await user.click(within(dialog).getByRole('checkbox', { name: /Pause after the canary/ }));
-    await user.click(within(dialog).getByRole('button', { name: 'Start' }));
+    await user.click(within(dialog).getByRole('button', { name: 'Run security-upgrades on 2 hosts' }));
 
     await vi.waitFor(() => {
       expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
@@ -375,5 +418,39 @@ describe('HostsTab, host actions on the selection', () => {
     expect(within(notice).getByRole('list', { name: 'Hosts not sent' })).toHaveTextContent(
       'tooling-1: the host does not report the action security-upgrades'
     );
+  });
+
+  it('runs despite a closed network gate only when asked to', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    h.controller.setGateFailing(true);
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+
+    await user.click(within(table).getByRole('checkbox', { name: 'Select prysm-erigon-1' }));
+    await user.click(
+      within(screen.getByRole('group', { name: 'Actions on the selected hosts' })).getByRole('button', {
+        name: 'Run host action…',
+      })
+    );
+    const dialog = screen.getByRole('dialog', { name: 'Run a host action on prysm-erigon-1' });
+    await user.click(within(dialog).getByRole('radio', { name: /^security-upgrades/ }));
+
+    const ignore = within(dialog).getByRole('checkbox', { name: /Roll despite network state/ });
+    expect(ignore).not.toBeChecked();
+    expect(ignore.closest('label')).toHaveTextContent('The network gate is closed:');
+    await user.click(ignore);
+    await user.click(within(dialog).getByRole('button', { name: 'Run security-upgrades on 1 host' }));
+
+    await vi.waitFor(() => {
+      expect(h.calls.find(c => c.method === 'POST')).toBeDefined();
+    });
+    expect(h.calls.find(c => c.method === 'POST')?.body).toStrictEqual({
+      action: 'security-upgrades',
+      hosts: ['prysm-erigon-1'],
+      ignoreGate: true,
+      reason: '',
+    });
   });
 });

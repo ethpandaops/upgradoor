@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"math"
 	"slices"
+	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -76,7 +77,7 @@ func (p *pass) advanceGranted(l *fleet.Lease, hv *hostView, op *protocol.Operati
 		// the agent does not start it: there is nothing to wait for. An agent
 		// that started it in that very moment works without a lease from its
 		// next sync on (hostView.working), which the budget counts.
-		p.failLease(l, reasonEndedByOperator)
+		p.cancelLease(l)
 	case p.now.Before(deadline):
 	case !hv.h.LastSeen.Before(deadline):
 		p.expireLease(l, reasonNeverStarted)
@@ -97,6 +98,10 @@ func (p *pass) advanceRunning(l *fleet.Lease, hv *hostView, op *protocol.Operati
 		p.chargeHost(l)
 	case op != nil:
 		p.applyOperation(l, hv, op)
+	case hv.h.Status != nil && l.Cancelled != nil:
+		// The agent dropped the operation of a lease a person ended.
+		p.cancelLease(l)
+		p.chargeHost(l)
 	case hv.h.Status != nil:
 		// The status is replaced on every sync, so one without the operation
 		// is newer than the one that reported it.
@@ -112,7 +117,13 @@ func (p *pass) applyOperation(l *fleet.Lease, hv *hostView, op *protocol.Operati
 
 	switch op.Phase {
 	case protocol.PhaseFailed:
-		p.failLease(l, cmpOr(op.Error, reasonAgentFailed))
+		// An agent that stopped because a person ended the lease cancelled
+		// it; a step that failed is a failure all the same.
+		if l.Cancelled != nil && !stepFailed(l) {
+			p.cancelLease(l)
+		} else {
+			p.failLease(l, cmpOr(op.Error, reasonAgentFailed))
+		}
 
 		if op.Disrupted {
 			p.chargeHost(l)
@@ -147,13 +158,14 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 		// the same (the cancel came too late), or the lease was being verified
 		// when it was ended. The lease ends here: nobody waits for the
 		// readiness of a host that a person took out of the rollout.
-		p.failLease(l, reasonEndedByOperator)
+		p.cancelLease(l)
 		p.chargeHost(l)
 
 		return
 	}
 
-	if l.Force {
+	// A person approved the lease: released now, whatever the check says.
+	if l.Force || l.Approved != nil {
 		p.releaseLease(l)
 
 		return
@@ -194,8 +206,7 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 	}
 
 	// Counted from the scheduler's start at the earliest: while the controller
-	// was down nobody looked, and a host with validators cannot be ready
-	// before the beacon service has settled an epoch again.
+	// was down nobody looked, and the attestations seen before are gone.
 	if timeout := p.set.ReadinessTimeout.Std(); p.now.Sub(later(*l.AgentDoneAt, p.w.Since)) > timeout {
 		p.failLease(l, fmt.Sprintf("not ready after %s: %s", timeout, note))
 		p.chargeHost(l)
@@ -231,21 +242,17 @@ func (p *pass) stillReported(l *fleet.Lease, hv *hostView) string {
 
 // Readiness notes.
 const (
-	noteEpochTiming = "epoch timing unknown"
+	noteChainTiming = "chain timing unknown"
 	noteNodeReady   = "node at head with peers"
 	noteNoProbe     = "no node probe configured"
 	noteAttesting   = "validators attesting"
-	// noteAwaitLiveness is the readiness note of a host with validators
-	// while the beacon node has not said yet whether they attest.
-	noteAwaitLiveness = "waiting for attestation data from the beacon node"
-	noteReadyPrefix   = "ready: "
+	noteReadyPrefix = "ready: "
 )
 
 // ready evaluates the readiness check for a verifying lease and returns a
 // one-line note saying what is still missing. The node must be back at head
 // with peers, and the probe of every other kind the lease rolled healthy; a
-// host with validators must also attest again: while the beacon service has
-// no settled epoch yet, it is not ready.
+// host with validators must also attest again.
 func (p *pass) ready(l *fleet.Lease, hv *hostView) (ready bool, note string) {
 	// An independent container has nothing of the node to wait for: the
 	// agent's verify window, which it ran through, is its readiness.
@@ -254,8 +261,8 @@ func (p *pass) ready(l *fleet.Lease, hv *hostView) (ready bool, note string) {
 	}
 
 	// Validators that attest prove the node is back; the run of healthy syncs
-	// only has to span readyEpochs where there are no attestations to go by:
-	// the host has no active validators.
+	// only has to last readyStableFor where there are no attestations to go
+	// by: the host has no active validators.
 	noAttestations := hv.weight == 0
 
 	// Always evaluated: it keeps the run of healthy syncs.
@@ -268,18 +275,16 @@ func (p *pass) ready(l *fleet.Lease, hv *hostView) (ready bool, note string) {
 		return false, missing
 	}
 
-	switch {
-	case noAttestations:
+	if noAttestations {
 		return true, noteReadyPrefix + nodeNote
-	case !p.w.Health.LivenessKnown:
-		return false, noteAwaitLiveness
 	}
 
-	if attesting, attestNote := p.validatorsReady(l, hv); !attesting {
+	attesting, attestNote := p.validatorsReady(l, hv)
+	if !attesting {
 		return false, attestNote
 	}
 
-	return true, noteReadyPrefix + nodeNote + ", " + noteAttesting
+	return true, noteReadyPrefix + nodeNote + ", " + attestNote
 }
 
 // kindsMissing says which probe of a kind whose container the lease rolled
@@ -324,63 +329,57 @@ func (p *pass) minPeers() int {
 	return p.peers
 }
 
-// validatorsReady: for readyEpochs consecutive complete epochs that started
-// after the agent's done time, enough of the host's validators that had a
-// duty in the epoch attested.
+// validatorsReady: the host's validators have attestations included on the
+// canonical chain for readyAttestations distinct slots after the one the
+// agent reported done in, or for one slot per validator where it has fewer.
 func (p *pass) validatorsReady(l *fleet.Lease, hv *hostView) (ready bool, note string) {
-	epochs := p.set.ReadyEpochs
-	if epochs == 0 {
-		return true, noteAttesting
+	first, placed := p.firstSlotAfter(*l.AgentDoneAt)
+	if !placed {
+		return false, noteChainTiming
 	}
 
-	run := uint64(0)
+	slots := p.w.Attested[l.Host]
+	i, _ := slices.BinarySearch(slots, first)
+	seen := uint64(len(slots) - i)
+	since := l.AgentDoneAt.UTC().Format(time.TimeOnly)
 
-	if p.haveRows {
-		for e := p.newestEpoch; ; e-- {
-			// An epoch that cannot be placed in time proves nothing.
-			start, placed := p.w.Health.EpochStart(e)
-			if !placed {
-				return false, noteEpochTiming
-			}
-
-			row, ok := p.rows[l.Host][e]
-
-			if start.Before(*l.AgentDoneAt) || !ok ||
-				row.Live < attestationBar(p.set.MinParticipationPercent, min(row.Total, hv.weight)) {
-				break
-			}
-
-			run++
-
-			if e == 0 {
-				break
-			}
-		}
+	if seen == 0 {
+		return false, "waiting for the first attestation since " + since
 	}
 
-	note = fmt.Sprintf("%s: %d of %d epochs with at least %d of %d",
-		noteAttesting, min(run, epochs), epochs,
-		attestationBar(p.set.MinParticipationPercent, hv.duty), hv.duty)
+	want := min(p.set.ReadyAttestations, hv.weight)
 
-	return run >= epochs, note
+	return seen >= want, fmt.Sprintf("%s: %d of %d slots since %s", noteAttesting, min(seen, want), want, since)
 }
 
-// attestationBar is the smallest number of validators that is at least
-// percent of weight, and at least 1.
-func attestationBar(percent float64, weight uint64) uint64 {
-	return max(uint64(math.Ceil(percent*float64(weight)/100-budgetEpsilon)), 1)
+// firstSlotAfter returns the first slot after the one containing at; before
+// the chain's first known slot, that slot.
+func (p *pass) firstSlotAfter(at time.Time) (slot uint64, placed bool) {
+	n := &p.w.Health
+
+	start, known := n.TimingStart()
+	if !known {
+		return 0, false
+	}
+
+	if at.Before(start) {
+		return n.Phases[0].Epoch * n.SlotsPerEpoch, true
+	}
+
+	slot, placed = n.SlotAt(at)
+
+	return slot + 1, placed
 }
 
 // nodeReady: the agent's probes report the node at head with enough peers in
 // its newest sync. With span, that also held on every sync of an unbroken run
-// that spans readyEpochs epochs: the newest
-// sync of the run, which is the host's last one, came at least that long
-// after the first. A run is unbroken when every sync in it was healthy, no
-// two consecutive ones lie more than hostStaleAfter apart, and all of it
-// lies after the scheduler's start: a bad sync, silence and a controller
-// restart each end it, and the next healthy sync starts a new one. A host
-// with no probe configured is ready after such a run of syncs. Of a run that
-// began before genesis only the part from genesis on is measured.
+// that lasts readyStableFor: the newest sync of the run, which is the host's
+// last one, came at least that long after the first. A run is unbroken when
+// every sync in it was healthy, no two consecutive ones lie more than
+// hostStaleAfter apart, and all of it lies after the scheduler's start: a bad
+// sync, silence and a controller restart each end it, and the next healthy
+// sync starts a new one. A host with no probe configured is ready after such
+// a run of syncs.
 func (p *pass) nodeReady(l *fleet.Lease, hv *hostView, span bool) (ready bool, note string) {
 	seen := hv.h.LastSeen
 
@@ -431,25 +430,13 @@ func (p *pass) nodeReady(l *fleet.Lease, hv *hostView, span bool) (ready bool, n
 		note, wait = noteNoProbe, "%s, waiting %s"
 	}
 
-	if !span || p.set.ReadyEpochs == 0 {
+	window := p.set.ReadyStableFor.Std()
+	if !span || window <= 0 {
 		return true, note
 	}
 
-	// A run that began before the chain did (before the first slot phase)
-	// counts from there: no epoch begins earlier, so the readyEpochs epochs are
-	// the chain's first ones.
-	began := *l.SyncedSince
-	if first, known := p.w.Health.TimingStart(); known {
-		began = later(began, first)
-	}
-
-	window, placed := p.w.Health.EpochSpan(began, p.set.ReadyEpochs)
-	if !placed {
-		return false, noteEpochTiming
-	}
-
-	if seen.Sub(began) < window {
-		readyAt := began.Add(window)
+	if seen.Sub(*l.SyncedSince) < window {
+		readyAt := l.SyncedSince.Add(window)
 		l.ReadyAt = &readyAt
 
 		return false, fmt.Sprintf(wait, note, window)
@@ -682,11 +669,11 @@ func (p *pass) leaseRollouts(l *fleet.Lease) []*fleet.Rollout {
 }
 
 // expireLease ends a lease that cost no availability; its hosts wait again.
-// A lease that a person ended does not expire: it fails, so that its host is
-// not offered the same work the moment the lease is gone.
+// A lease that a person ended does not expire: it is cancelled, so that its
+// host is not offered the same work the moment the lease is gone.
 func (p *pass) expireLease(l *fleet.Lease, reason string) {
 	if l.Cancelled != nil {
-		p.failLease(l, reasonEndedByOperator)
+		p.cancelLease(l)
 
 		return
 	}
@@ -722,10 +709,10 @@ func (p *pass) releaseLease(l *fleet.Lease) {
 	p.repairHost(l)
 
 	// Node work released through the full readiness check proves the host
-	// back. A forced lease, and any lease while readyEpochs is 0, proves
-	// nothing: the host's charge, if it has one, stays.
+	// back. A forced or approved lease proves nothing: the host's charge, if
+	// it has one, stays.
 	if hv := p.hosts[l.Host]; hv != nil && leaseImpact(l) == protocol.ImpactNode &&
-		!l.Force && p.set.ReadyEpochs > 0 {
+		!l.Force && l.Approved == nil {
 		hv.unproven = nil
 	}
 
@@ -750,11 +737,17 @@ func (p *pass) releaseLease(l *fleet.Lease) {
 		p.setMember(m, unserved(r))
 	}
 
-	p.record("lease.released", l.Host, map[string]any{
+	detail := map[string]any{
 		keyLease: l.ID, keyForce: l.Force,
 		// What the controller saw before it gave the slot back.
 		"readiness": l.Readiness,
-	})
+	}
+
+	if l.Approved != nil {
+		detail["approvedBy"] = l.Approved.By
+	}
+
+	p.record("lease.released", l.Host, detail)
 }
 
 // failLease ends a lease as failed, marks its host broken for what the lease
@@ -790,7 +783,7 @@ func (p *pass) failLease(l *fleet.Lease, reason string) {
 			r.Reason = l.Host + ": " + reason
 
 			p.record("rollout.halted", r.ID, map[string]any{
-				"host": l.Host, keyLease: l.ID, keyReason: reason,
+				keyHost: l.Host, keyLease: l.ID, keyReason: reason,
 			})
 		}
 	}
@@ -799,6 +792,44 @@ func (p *pass) failLease(l *fleet.Lease, reason string) {
 		keyLease: l.ID, keyReason: reason, keyRollouts: halted,
 	})
 }
+
+// cancelLease ends a lease a person ended once it is over. It is no failure:
+// the host gets no broken mark, and each member waits as cancelled for a
+// retry (which rechecks the readiness of a lease that did its steps, like
+// that of a failed one). An active rollout pauses with the reason.
+func (p *pass) cancelLease(l *fleet.Lease) {
+	p.endLease(l, fleet.LeaseCancelled)
+
+	by := l.Cancelled.By
+	paused := make([]string, 0, len(l.Rollouts))
+
+	for _, r := range p.leaseRollouts(l) {
+		m := p.member(r, l.Host)
+		p.setMember(m, fleet.HostCancelled)
+		m.Error = reasonEndedByOperator
+
+		if r.State == fleet.RolloutActive && !r.Paused {
+			r.Paused = true
+			r.PauseReason = cancelPauseReason(l.Host, by)
+			paused = append(paused, r.ID)
+
+			p.record("rollout.paused", r.ID, map[string]any{keyHost: l.Host, keyLease: l.ID, keyReason: r.PauseReason})
+		}
+	}
+
+	p.record("lease.cancelled", l.Host, map[string]any{
+		keyLease: l.ID, keyBy: by, keyRollouts: paused,
+	})
+}
+
+// cancelPauseReason is Rollout.PauseReason of a rollout paused because a
+// person ended the lease of a member.
+func cancelPauseReason(host, by string) string {
+	return host + " " + cancelPauseMark + " " + by
+}
+
+// cancelPauseMark is what a pause reason of cancelPauseReason says.
+const cancelPauseMark = "cancelled by"
 
 // stepsDone reports whether the agent reported done for every need the lease
 // serves for the rollout.

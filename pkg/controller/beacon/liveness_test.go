@@ -117,3 +117,69 @@ func TestLivenessKeepsABoundedHistory(t *testing.T) {
 	assert.Equal(t, uint64(livenessEpochs+4), svc.Health().LivenessEpoch)
 	assert.Len(t, svc.Liveness(1000), livenessEpochs)
 }
+
+// span returns the slots [from, to].
+func span(from, to uint64) []uint64 {
+	out := make([]uint64, 0, to-from+1)
+	for slot := from; slot <= to; slot++ {
+		out = append(out, slot)
+	}
+
+	return out
+}
+
+func TestAttestedSlotsFollowTheChain(t *testing.T) {
+	h := newHarness(t, 1, livenessHosts(), nil)
+	chain := newSlotChain(t, h, 70, 82)
+
+	assert.Nil(t, h.svc.AttestedSlots(), "nothing before the first poll")
+
+	chain.add(83, "", vote(82, true, true))
+	chain.pollAt(t, 84)
+
+	// From the start of the previous epoch (slot 72) to the newest settled
+	// slot; host idle has no duties.
+	before := h.svc.AttestedSlots()
+	assert.Equal(t, map[string][]uint64{"a": span(72, 82), "b": span(72, 82)}, before)
+
+	// The blocks of slots 82 and 83 lose against a branch on top of slot 81
+	// whose block of slot 84 carries host a's attestation of slot 81 only.
+	chain.addOn(slotRoot(81, ""), 84, "ff", vote(81, true, false))
+	chain.add(85, "ff", vote(84, true, true))
+	chain.pollAt(t, 85)
+
+	assert.Equal(t, map[string][]uint64{"a": span(72, 81), "b": span(72, 80)}, h.svc.AttestedSlots(),
+		"what only the orphaned blocks included is gone")
+	assert.Equal(t, span(72, 82), before["a"], "a published map is not changed afterwards")
+
+	// Only the newest slots are kept, also of slots that left the window.
+	for slot := uint64(86); slot <= 130; slot++ {
+		chain.add(slot, "ff", vote(slot-1, true, slot%2 == 0))
+		chain.pollAt(t, slot)
+	}
+
+	got := h.svc.AttestedSlots()
+	assert.Equal(t, span(128-fleet.MaxReadyAttestations+1, 128), got["a"])
+	require.Len(t, got["b"], fleet.MaxReadyAttestations)
+	assert.Equal(t, []uint64{123, 125, 127}, got["b"][len(got["b"])-3:], "b attests in odd slots only")
+}
+
+func TestAttestedSlotsOfAHostThatLeaves(t *testing.T) {
+	tracker := newSlotTracker()
+	duty := func(host string, included uint64) fleet.HostSlotParticipation {
+		return fleet.HostSlotParticipation{Host: host, Assigned: 1, Included: included}
+	}
+
+	tracker.noteAttested(5, nil, []fleet.HostSlotParticipation{duty("a", 1), duty("b", 0)})
+	tracker.noteAttested(3, nil, []fleet.HostSlotParticipation{duty("a", 1), duty("b", 1)})
+	assert.Equal(t, map[string][]uint64{"a": {3, 5}, "b": {3}}, tracker.attested)
+
+	// A recount of slot 3 that finds b's attestation no longer included.
+	tracker.noteAttested(3, []fleet.HostSlotParticipation{duty("a", 1), duty("b", 1)},
+		[]fleet.HostSlotParticipation{duty("a", 1), duty("b", 0)})
+	assert.Equal(t, map[string][]uint64{"a": {3, 5}}, tracker.attested)
+
+	tracker.setHosts([]trackedHost{{name: "b", start: 0, end: 1}}, 1)
+	assert.Empty(t, tracker.attested, "a is no longer tracked")
+	assert.True(t, tracker.attestedChanged)
+}

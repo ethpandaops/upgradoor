@@ -22,8 +22,10 @@ type HostActionRequest struct {
 	Client string   `json:"client"`
 	All    bool     `json:"all"`
 	// PauseAfterCanary pauses the rollout at its first success.
-	PauseAfterCanary bool   `json:"pauseAfterCanary"`
-	Reason           string `json:"reason"`
+	PauseAfterCanary bool `json:"pauseAfterCanary"`
+	// IgnoreGate passes a closed network gate (RollRequest.IgnoreGate).
+	IgnoreGate bool   `json:"ignoreGate"`
+	Reason     string `json:"reason"`
 	// Basis is what permits the person on each selected host (admin,
 	// feature, team or open), set by the API; a host without one is refused.
 	Basis map[string]string `json:"-"`
@@ -72,6 +74,7 @@ func (s *service) HostAction(ctx context.Context, actor string, req HostActionRe
 		State:            fleet.RolloutActive,
 		Approved:         true,
 		PauseAfterCanary: req.PauseAfterCanary,
+		IgnoreGate:       req.IgnoreGate,
 		CreatedBy:        actorName(actor),
 		CreatedAt:        now,
 		UpdatedAt:        now,
@@ -125,7 +128,7 @@ func (s *service) HostAction(ctx context.Context, actor string, req HostActionRe
 
 	changes.Audit = []fleet.AuditEntry{s.entry(actor, "action.host-action", r.ID, map[string]any{
 		"action": req.Action, keyHosts: res.Hosts, "rejected": res.Rejected, "basis": basis,
-		"pauseAfterCanary": req.PauseAfterCanary, keyReason: req.Reason,
+		"pauseAfterCanary": req.PauseAfterCanary, keyIgnoreGate: req.IgnoreGate, keyReason: req.Reason,
 	})}
 
 	if err := s.commit(ctx, changes); err != nil {
@@ -153,7 +156,7 @@ func hostActionRefusal(
 	case h.KnownOffline(now):
 		return reasonOffline
 	case h.Held():
-		return reasonHeld
+		return h.HeldReason()
 	case hostStale(h, now, since, settings.HostStaleAfter.Std()):
 		return reasonAgentSilent
 	default:

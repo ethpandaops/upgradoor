@@ -18,6 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/agenttest"
+	"github.com/ethpandaops/upgradoor/pkg/agent/host"
 	"github.com/ethpandaops/upgradoor/pkg/agent/lease"
 	"github.com/ethpandaops/upgradoor/pkg/agent/link"
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
@@ -66,7 +67,7 @@ func TestCycle(t *testing.T) {
 	stub.sync = func(context.Context) (*protocol.SyncResponse, error) {
 		return &protocol.SyncResponse{
 			Lease:      e.lease("lease-1", agenttest.RebootNeed()),
-			Directives: []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold}},
+			Directives: []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff}},
 		}, nil
 	}
 
@@ -170,7 +171,7 @@ func TestHoldAndLeaseInOneAnswer(t *testing.T) {
 	needs := awaitNeeds(t, e, protocol.RebootNeedID)
 
 	e.ctrl.Set(func(c *agenttest.Controller) {
-		c.Directives = []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold, Reason: "maintenance"}}
+		c.Directives = []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff, Reason: "maintenance"}}
 		c.Lease = e.lease("lease-held", needs...)
 	})
 
@@ -180,7 +181,7 @@ func TestHoldAndLeaseInOneAnswer(t *testing.T) {
 
 	for _, s := range op.Steps {
 		assert.Equal(t, protocol.StepRefused, s.Status)
-		assert.Contains(t, s.Error, "controller hold")
+		assert.Contains(t, s.Error, "on hold by staff")
 	}
 
 	assert.Empty(t, agenttest.Disruptive(e.host.Calls()))
@@ -195,6 +196,15 @@ func TestSyncReportsTheHost(t *testing.T) {
 	e := newEnv(t, sc)
 	// Spelled differently from the container's reference on purpose.
 	e.deploy(map[string]plan.Deployed{"geth": {Image: "docker.io/" + agenttest.GethImage}})
+
+	busy := 12.5
+	e.host.SetResources(&host.Resources{
+		Host: protocol.Resources{
+			CPU:    protocol.CPUStats{Cores: 8, Busy: &busy},
+			Memory: protocol.MemoryStats{Total: 1 << 34},
+		},
+		Containers: map[string]protocol.ContainerStats{"geth": {CPU: &busy, Memory: 1 << 30}},
+	})
 	e.start()
 
 	req := e.ctrl.Await("registry checks", func(req *protocol.SyncRequest) bool {
@@ -217,8 +227,12 @@ func TestSyncReportsTheHost(t *testing.T) {
 	assert.NotEmpty(t, req.InventoryHash)
 	assert.Nil(t, req.Operation)
 	assert.Nil(t, req.Node.EL, "no probe, no node health")
+	assert.Equal(t, 8, req.Resources.CPU.Cores)
+	assert.Equal(t, uint64(1<<34), req.Resources.Memory.Total)
 
 	geth := agenttest.ContainerOf(t, &req, "geth")
+	require.NotNil(t, geth.Stats)
+	assert.Equal(t, uint64(1<<30), geth.Stats.Memory)
 	assert.True(t, geth.Managed)
 	assert.Equal(t, protocol.KindEL, geth.Kind)
 	assert.Equal(t, protocol.ImpactNode, geth.Impact)
@@ -235,6 +249,7 @@ func TestSyncReportsTheHost(t *testing.T) {
 	assert.False(t, dora.Managed)
 	assert.Empty(t, dora.Kind)
 	assert.Nil(t, dora.Registry)
+	assert.Nil(t, dora.Stats)
 	assert.Empty(t, dora.Team)
 
 	assert.Equal(t, agenttest.TeamGeth, geth.Team)
@@ -409,7 +424,7 @@ func TestLocalHold(t *testing.T) {
 
 	st, err := lease.OpenState(e.log, e.cfg.StateDir)
 	require.NoError(t, err)
-	require.NoError(t, st.SetHold(plan.HoldLocal, &plan.Hold{By: "pk", Reason: "debugging geth, ask pk"}))
+	require.NoError(t, st.SetHold(protocol.HolderHost, &plan.Hold{By: "pk", Reason: "debugging geth, ask pk"}))
 
 	e.start()
 
@@ -418,12 +433,17 @@ func TestLocalHold(t *testing.T) {
 
 		return c.Registry != nil && !c.Registry.Pulled && c.Registry.Digest == agenttest.GethV2
 	})
-	assert.Equal(t, protocol.Hold{Local: true, LocalReason: "debugging geth, ask pk"}, req.Hold)
-	assert.Empty(t, req.Needs)
+	assert.Equal(t, protocol.Hold{Local: true, LocalReason: "debugging geth, ask pk", Holds: []protocol.HostHold{
+		{Holder: protocol.HolderHost, By: "pk", Reason: "debugging geth, ask pk"},
+	}}, req.Hold)
+
+	need := agenttest.ImageNeedFor("geth", agenttest.GethImage, agenttest.GethV1, agenttest.GethV2)
+	held := e.ctrl.Await("the needs under hold", func(req *protocol.SyncRequest) bool { return len(req.Needs) == 2 })
+	assert.Equal(t, []string{need.ID, protocol.RebootNeedID}, agenttest.NeedIDs(&held), "a hold hides no need")
 
 	// The controller can neither lift a local hold nor work around it.
 	e.ctrl.Direct(
-		protocol.Directive{ID: "d-release", Kind: protocol.DirectiveReleaseHold},
+		protocol.Directive{ID: "d-release", Kind: protocol.DirectiveReleaseHold, Holder: protocol.HolderStaff},
 		protocol.Directive{ID: "d-reboot", Kind: protocol.DirectiveReboot},
 		protocol.Directive{ID: "d-roll", Kind: protocol.DirectiveRoll, Container: "geth"},
 	)
@@ -433,15 +453,14 @@ func TestLocalHold(t *testing.T) {
 			agenttest.AckOf(req, "d-roll") != nil
 	})
 	assert.True(t, req.Hold.Local, "release-hold does not lift the local hold")
-	assert.Equal(t, "pk", field(t, e.stateOnDisk(), "holds", "local", "by"))
+	assert.Equal(t, "pk", field(t, e.stateOnDisk(), "holds", "host", "by"))
 	assert.Equal(t, protocol.DirectiveAccepted, agenttest.AckOf(&req, "d-release").Status)
 	assert.Equal(t, protocol.DirectiveRejected, agenttest.AckOf(&req, "d-reboot").Status)
 	assert.Contains(t, agenttest.AckOf(&req, "d-reboot").Error, "local hold: debugging geth, ask pk")
 	assert.Equal(t, protocol.DirectiveRejected, agenttest.AckOf(&req, "d-roll").Status)
-	assert.Empty(t, req.Needs)
+	assert.Equal(t, []string{need.ID, protocol.RebootNeedID}, agenttest.NeedIDs(&req), "no manual need")
 	e.ctrl.Direct()
 
-	need := agenttest.ImageNeedFor("geth", agenttest.GethImage, agenttest.GethV1, agenttest.GethV2)
 	e.ctrl.Grant(e.lease("lease-held", need, agenttest.RebootNeed()))
 
 	op := e.ctrl.AwaitFinished("lease-held")
@@ -455,12 +474,11 @@ func TestLocalHold(t *testing.T) {
 
 	assert.Empty(t, agenttest.Disruptive(e.host.Calls()))
 
-	// Lifted on the host, the needs come back.
+	// Lifted on the host, the needs stay.
 	_, err = local.NewClient(e.cfg.Local.Socket.Path).Hold(t.Context(), &local.HoldRequest{Release: true})
 	require.NoError(t, err)
 
-	req = e.ctrl.Await("needs after the hold", func(req *protocol.SyncRequest) bool { return len(req.Needs) == 2 })
-	assert.False(t, req.Hold.Active())
+	req = e.ctrl.Await("released", func(req *protocol.SyncRequest) bool { return !req.Hold.Active() })
 	assert.Equal(t, []string{need.ID, protocol.RebootNeedID}, agenttest.NeedIDs(&req))
 }
 
@@ -476,15 +494,20 @@ func TestControllerHold(t *testing.T) {
 	e.ctrl.Await("reboot need", func(req *protocol.SyncRequest) bool { return hasNeed(req, protocol.RebootNeedID) })
 
 	e.ctrl.Direct(protocol.Directive{
-		ID: "d-hold", Kind: protocol.DirectiveHold, Reason: "maintenance",
+		ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff, Reason: "maintenance",
 		By: &protocol.Actor{User: "sam@example.org", Feature: "staff"},
 	})
 
-	req := e.ctrl.Await("held", func(req *protocol.SyncRequest) bool { return req.Hold.Controller })
+	req := e.ctrl.Await("held", func(req *protocol.SyncRequest) bool { return req.Hold.Of(protocol.HolderStaff) != nil })
 	assert.False(t, req.Hold.Local)
-	assert.Empty(t, req.Needs)
-	assert.Equal(t, map[string]any{"by": "sam@example.org", "reason": "maintenance", "feature": "staff"},
-		field(t, e.stateOnDisk(), "holds", "controller"))
+	assert.Equal(t, []string{protocol.RebootNeedID}, agenttest.NeedIDs(&req), "a hold hides no need")
+	assert.Equal(t, "sam@example.org", field(t, e.stateOnDisk(), "holds", "staff", "by"))
+	assert.Equal(t, "maintenance", field(t, e.stateOnDisk(), "holds", "staff", "reason"))
+	require.Len(t, req.Hold.Holds, 1, "the agent reports its holds")
+	assert.NotZero(t, req.Hold.Holds[0].At)
+	req.Hold.Holds[0].At = time.Time{}
+	assert.Equal(t, protocol.HostHold{Holder: protocol.HolderStaff, By: "sam@example.org", Reason: "maintenance"},
+		req.Hold.Holds[0])
 
 	// The hold outlives the directive and the agent process.
 	e.ctrl.Direct()
@@ -492,8 +515,8 @@ func TestControllerHold(t *testing.T) {
 	e.start()
 
 	req = e.ctrl.AwaitSyncs(3)
-	assert.True(t, req.Hold.Controller)
-	assert.Empty(t, req.Needs)
+	assert.True(t, req.Hold.Of(protocol.HolderStaff) != nil)
+	assert.Equal(t, []string{protocol.RebootNeedID}, agenttest.NeedIDs(&req))
 
 	e.ctrl.Grant(e.lease("lease-held", agenttest.RebootNeed()))
 
@@ -501,10 +524,10 @@ func TestControllerHold(t *testing.T) {
 	assert.Equal(t, protocol.PhaseDone, op.Phase)
 	assert.False(t, op.Disrupted)
 	assert.Equal(t, protocol.StepRefused, op.Steps[0].Status)
-	assert.Contains(t, op.Steps[0].Error, "controller hold")
+	assert.Contains(t, op.Steps[0].Error, "on hold by staff")
 	assert.Empty(t, e.host.Calls())
 
-	e.ctrl.Direct(protocol.Directive{ID: "d-release", Kind: protocol.DirectiveReleaseHold})
+	e.ctrl.Direct(protocol.Directive{ID: "d-release", Kind: protocol.DirectiveReleaseHold, Holder: protocol.HolderStaff})
 
 	req = e.ctrl.Await("released", func(req *protocol.SyncRequest) bool {
 		return !req.Hold.Active() && hasNeed(req, protocol.RebootNeedID)
@@ -976,7 +999,7 @@ func TestRefusedAnswersAreNotActedOn(t *testing.T) {
 			e.ctrl.Set(func(c *agenttest.Controller) {
 				c.Forge = forge(t)
 				c.Lease = e.lease("lease-1", agenttest.RebootNeed())
-				c.Directives = []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold, Reason: "forged"}}
+				c.Directives = []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff, Reason: "forged"}}
 				c.WantInventory = true
 			})
 			e.start()
@@ -986,7 +1009,7 @@ func TestRefusedAnswersAreNotActedOn(t *testing.T) {
 			for _, req := range e.ctrl.Syncs() {
 				require.Nil(t, req.Operation, "no lease is taken")
 				require.Empty(t, req.DirectiveAcks, "no directive is answered")
-				require.False(t, req.Hold.Controller, "no directive is applied")
+				require.False(t, req.Hold.Of(protocol.HolderStaff) != nil, "no directive is applied")
 			}
 
 			assert.Empty(t, agenttest.Disruptive(e.host.Calls()))
@@ -1015,7 +1038,7 @@ func TestSignedAnswersAreRefusedWithoutControllerKeys(t *testing.T) {
 	e.cfg.Controller.AllowUnsignedAnswers = true
 
 	e.ctrl.Set(func(c *agenttest.Controller) {
-		c.Directives = []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold}}
+		c.Directives = []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff}}
 	})
 	e.start()
 
@@ -1023,7 +1046,7 @@ func TestSignedAnswersAreRefusedWithoutControllerKeys(t *testing.T) {
 
 	for _, req := range e.ctrl.Syncs() {
 		require.Empty(t, req.DirectiveAcks, "no directive is answered")
-		require.False(t, req.Hold.Controller, "no directive is applied")
+		require.False(t, req.Hold.Of(protocol.HolderStaff) != nil, "no directive is applied")
 	}
 
 	assert.NotContains(t, e.readOverridesIfAny(), "controller:")

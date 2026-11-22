@@ -17,6 +17,8 @@ import {
   type Need,
   type Settings,
 } from '../api/types';
+import { isHeld } from '../lib/format';
+import { hostUsage } from '../lib/usage';
 import { hex } from './fixture';
 
 /** The page size of a client's host list, and its bounds (clients.go). */
@@ -93,7 +95,13 @@ function hostState(sum: HostSummary, containers: readonly Container[]): { state:
   if (sum.plan.slot === 'leased' || sum.plan.slot === 'verifying') return { state: 'rolling', reason: sum.plan.slot };
 
   if (sum.hold.local) return { state: 'held', reason: sum.hold.localReason || 'held on the host' };
-  if (sum.holdWanted || sum.hold.controller) return { state: 'held', reason: sum.holdReason ?? '' };
+  if (isHeld(sum))
+    return {
+      state: 'held',
+      reason: list(sum.hold.holds)
+        .map(h => (h.reason ? `${h.holder}: ${h.reason}` : h.holder))
+        .join('; '),
+    };
 
   if (containers.some(c => c.override)) return { state: 'overridden', reason: sum.plan.reason ?? '' };
   if (pending(sum, containers)) return { state: 'pending', reason: sum.plan.reason ?? '' };
@@ -112,6 +120,7 @@ function clientHost(sum: HostSummary, client: string): ClientHost {
     ...(sum.stale ? { stale: true } : {}),
     slot: sum.plan.slot,
     containers,
+    ...(sum.resources ? { usage: hostUsage(sum.resources) } : {}),
   };
 }
 
@@ -121,7 +130,14 @@ const KIND_ORDER: readonly ContainerKind[] = ['el', 'cl', 'vc'];
 function images(rows: readonly ClientHost[]): ClientImage[] {
   const groups = new Map<
     string,
-    { image: ClientImage; checked: number; digests: string[]; commands: Map<string, number> }
+    {
+      image: ClientImage;
+      checked: number;
+      digests: string[];
+      commands: Map<string, number>;
+      args: Map<string, number>;
+      voted: number;
+    }
   >();
 
   for (const row of rows) {
@@ -138,6 +154,8 @@ function images(rows: readonly ClientHost[]): ClientImage[] {
           checked: 0,
           digests: [],
           commands: new Map(),
+          args: new Map(),
+          voted: 0,
         };
         groups.set(key, g);
       }
@@ -149,6 +167,8 @@ function images(rows: readonly ClientHost[]): ClientImage[] {
         if (!o || list(o.addFlags).length + list(o.removeFlags).length === 0) {
           const joined = list(c.command).join('\u0000');
           g.commands.set(joined, (g.commands.get(joined) ?? 0) + 1);
+          g.voted++;
+          for (const arg of new Set(list(c.command))) g.args.set(arg, (g.args.get(arg) ?? 0) + 1);
         }
         // A container on another reference (overridden, or rolling onto agent.yaml's) says nothing about this tag.
         if (c.image === configured) g.digests.push(c.digest ?? '');
@@ -170,6 +190,7 @@ function images(rows: readonly ClientHost[]): ClientImage[] {
     .map(g => ({
       ...g.image,
       ...commonCommand(g.commands),
+      commonArgs: commonArgs(g.args, g.voted),
       behind: g.image.digest ? g.digests.filter(d => d !== g.image.digest).length : 0,
     }))
     .sort((a, b) => KIND_ORDER.indexOf(a.kind) - KIND_ORDER.indexOf(b.kind) || compare(a.image, b.image));
@@ -185,6 +206,12 @@ function commonCommand(counts: ReadonlyMap<string, number>): { command?: string[
   return best === '' ? { commandHosts: hosts } : { command: best.split('\u0000'), commandHosts: hosts };
 }
 
+/** commonArgs are the arguments more than half of the hosts report, in first-seen order (argVotes.common). */
+function commonArgs(counts: ReadonlyMap<string, number>, hosts: number): string[] | undefined {
+  const out = [...counts].filter(([, n]) => n * 2 > hosts).map(([arg]) => arg);
+  return out.length > 0 ? out : undefined;
+}
+
 /** overrideParts reports whether a container of the row has an image override, a flag override (overrideParts). */
 function overrideParts(row: ClientHost): { image: boolean; flags: boolean } {
   const all = list(row.containers).flatMap(c => (c.override ? [c.override] : []));
@@ -196,9 +223,11 @@ function overrideParts(row: ClientHost): { image: boolean; flags: boolean } {
 
 /** version is a digest of a client's host list: it differs whenever a page of the list would (clientVersion). */
 function version(rows: readonly ClientHost[]): string {
-  // The time of the registry check moves with every sync without saying anything new.
+  // The time of the registry check and the resource use move with every sync without saying anything new.
   return hex(
-    JSON.stringify(rows, (key, value: unknown) => (key === 'checkedAt' ? undefined : value)),
+    JSON.stringify(rows, (key, value: unknown) =>
+      key === 'checkedAt' || key === 'usage' || key === 'stats' ? undefined : value
+    ),
     16
   );
 }
@@ -232,6 +261,7 @@ export function clientIndex(hosts: readonly HostSummary[], settings: Settings): 
       layer: consensus ? 'consensus' : 'execution',
       policy: imagePolicy(settings, name),
       policySet: name in settings.policyClients,
+      defaultPolicy: settings.policyImage,
       images: images(rows),
       hosts: rows.length,
       current: count('current'),

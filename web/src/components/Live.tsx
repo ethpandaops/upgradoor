@@ -7,7 +7,8 @@ import { errorText } from '../api/client';
 import { LiveStore, MAX_LIVE_HOSTS, type LiveState, type LiveStatus } from '../api/live';
 import type { HostDetail, LiveView, LiveViews } from '../api/types';
 import { useApp, usePrivateAccess } from '../appContext';
-import { cx } from './primitives';
+import { hasUnsavedWork } from '../hooks/useUnsavedWork';
+import { Button, cx } from './primitives';
 
 const LiveContext = createContext<LiveStore | null>(null);
 
@@ -108,6 +109,7 @@ const STATE_LABEL: Record<LiveState, string> = {
   reconnecting: 'reconnecting',
   paused: 'paused',
   stopped: 'offline',
+  outdated: 'outdated',
 };
 
 /**
@@ -124,9 +126,11 @@ export function LiveIndicator() {
     ? 'Updates arrive as they happen'
     : status.state === 'paused'
       ? 'Updates are paused while the page is in the background'
-      : status.error !== undefined
-        ? `No updates right now: ${errorText(status.error)}. Trying again.`
-        : 'Opening the update stream';
+      : status.state === 'outdated'
+        ? 'upgradoor was updated: reload the page'
+        : status.error !== undefined
+          ? `No updates right now: ${errorText(status.error)}. Trying again.`
+          : 'Opening the update stream';
 
   return (
     <span
@@ -138,10 +142,85 @@ export function LiveIndicator() {
         aria-hidden="true"
         className={cx(
           'size-2 shrink-0 rounded-full',
-          live ? 'bg-success' : waiting ? 'animate-pulse bg-warning' : 'bg-border-strong'
+          live
+            ? 'bg-success'
+            : waiting
+              ? 'animate-pulse bg-warning'
+              : status.state === 'outdated'
+                ? 'bg-danger'
+                : 'bg-border-strong'
         )}
       />
       {STATE_LABEL[status.state]}
     </span>
+  );
+}
+
+/** A stream that is not live for this long gets the stale banner. */
+export const STALE_AFTER_MS = 10_000;
+
+/** LiveBanner warns under the header when the views are not current. */
+export function LiveBanner() {
+  return <LiveNotice status={useLiveStatus()} reload={reloadPage} />;
+}
+
+function reloadPage(): void {
+  location.reload();
+}
+
+/**
+ * LiveNotice reloads the page once the controller speaks another wire
+ * version, unless that loses unsaved input; then it asks for the reload.
+ * A stream that has been reconnecting for STALE_AFTER_MS says since when the
+ * views are old.
+ */
+export function LiveNotice({ status, reload }: { status: LiveStatus; reload: () => void }) {
+  const outdated = status.state === 'outdated';
+  const { lostAt, waitingSince } = status;
+  const [overdue, setOverdue] = useState<number | undefined>(undefined);
+
+  useEffect(() => {
+    if (outdated && !hasUnsavedWork()) reload();
+  }, [outdated, reload]);
+
+  useEffect(() => {
+    if (waitingSince === undefined) return;
+    const timer = setTimeout(
+      () => {
+        setOverdue(waitingSince);
+      },
+      Math.max(0, waitingSince + STALE_AFTER_MS - Date.now())
+    );
+    return () => {
+      clearTimeout(timer);
+    };
+  }, [waitingSince]);
+
+  if (outdated) {
+    return (
+      <div
+        role="alert"
+        className="flex flex-wrap items-center gap-2 border-b border-danger bg-danger-subtle px-4 py-2 text-sm/6 text-danger"
+      >
+        <span className="font-medium">upgradoor was updated. Reload to see current data.</span>
+        <Button variant="primary" onClick={reload}>
+          Reload
+        </Button>
+      </div>
+    );
+  }
+
+  if (lostAt === undefined || waitingSince === undefined || overdue !== waitingSince) return null;
+
+  return (
+    <div
+      role="alert"
+      className="flex flex-wrap items-center gap-x-2 border-b border-warning bg-warning-subtle px-4 py-2 text-sm/6 text-warning"
+    >
+      <span className="font-medium">
+        Not live since {new Date(lostAt).toLocaleTimeString([], { hour12: false })} — showing the last known state.
+      </span>
+      {status.error !== undefined && <span>{errorText(status.error)}</span>}
+    </div>
   );
 }

@@ -26,8 +26,8 @@ const (
 	maxErrorMessage = 200
 )
 
-// errNotServed marks a request that no configured endpoint serves: every
-// endpoint answered that the route does not exist or is switched off.
+// errNotServed marks a request that no endpoint asked serves: every one
+// answered that the route does not exist or is switched off.
 var errNotServed = errors.New("not served by the beacon node")
 
 // statusError is a non-2xx answer of a beacon node.
@@ -70,33 +70,63 @@ type endpoint struct {
 	label string
 }
 
+// EndpointState is how an endpoint stands against the others in the last
+// poll.
+type EndpointState string
+
+// The endpoint states. Only ok endpoints serve blocks and committees.
+const (
+	// EndpointOK is in sync, on the followed chain and up to date.
+	EndpointOK EndpointState = "ok"
+	// EndpointBehind is on the followed chain more than behindSlots slots
+	// below its head.
+	EndpointBehind EndpointState = "behind"
+	// EndpointSyncing says it is syncing or that its execution client is
+	// offline.
+	EndpointSyncing EndpointState = "syncing"
+	// EndpointForked has a head that is not on the followed chain.
+	EndpointForked EndpointState = "forked"
+	// EndpointDown did not answer.
+	EndpointDown EndpointState = "down"
+)
+
 // EndpointStatus is what the service saw of one beacon endpoint.
 type EndpointStatus struct {
 	// Label is the endpoint's scheme and host, without credentials or path.
-	Label string `json:"label"`
-	// Active marks the endpoint that is tried first.
-	Active bool `json:"active"`
+	Label string        `json:"label"`
+	State EndpointState `json:"state"`
+	// HeadSlot, HeadRoot and FinalizedEpoch are what the endpoint last
+	// reported; absent before.
+	HeadSlot       *uint64 `json:"headSlot,omitempty"`
+	HeadRoot       string  `json:"headRoot,omitempty"`
+	FinalizedEpoch *uint64 `json:"finalizedEpoch,omitempty"`
 	// SuccessAt is the last answer of the endpoint.
 	SuccessAt time.Time `json:"successAt,omitzero"`
-	// HeadSlot is the head slot the endpoint last reported; absent before.
-	HeadSlot *uint64 `json:"headSlot,omitempty"`
 	// Error is why the last failed request failed, at ErrorAt.
 	Error   string    `json:"error,omitempty"`
 	ErrorAt time.Time `json:"errorAt,omitzero"`
 }
 
-// nodeClient talks to the beacon API. Endpoints are tried in order starting
-// with the one that worked last. Requests are made by one goroutine at a
-// time; Status may be called from any.
+// probe is what one endpoint said about its chain in one poll.
+type probe struct {
+	head      headRef
+	finalized uint64
+	syncing   bool
+	err       error
+}
+
+// nodeClient talks to the beacon API. The poll goroutine makes the requests;
+// Status may be called from any goroutine.
 type nodeClient struct {
 	log       logrus.FieldLogger
 	http      *http.Client
 	now       func() time.Time
 	endpoints []endpoint
+	// all is every endpoint in the configured order.
+	all []int
 
-	// mu guards active and status; status is per endpoint.
+	// mu guards status, one per endpoint.
 	mu     sync.Mutex
-	active int
 	status []EndpointStatus
 }
 
@@ -132,11 +162,16 @@ func newNodeClient(
 	}
 
 	status := make([]EndpointStatus, len(endpoints))
+	all := make([]int, len(endpoints))
+
 	for i := range endpoints {
-		status[i].Label = endpoints[i].label
+		status[i] = EndpointStatus{Label: endpoints[i].label, State: EndpointDown}
+		all[i] = i
 	}
 
-	return &nodeClient{log: log, http: client, now: now, endpoints: endpoints, status: status}, nil
+	return &nodeClient{
+		log: log, http: client, now: now, endpoints: endpoints, all: all, status: status,
+	}, nil
 }
 
 // Status returns what was seen of every endpoint, in the configured order.
@@ -147,22 +182,47 @@ func (c *nodeClient) Status() []EndpointStatus {
 	out := make([]EndpointStatus, len(c.status))
 	for i := range c.status {
 		out[i] = c.status[i]
-		out[i].Active = i == c.active
 
 		if slot := c.status[i].HeadSlot; slot != nil {
 			out[i].HeadSlot = new(*slot)
+		}
+
+		if epoch := c.status[i].FinalizedEpoch; epoch != nil {
+			out[i].FinalizedEpoch = new(*epoch)
 		}
 	}
 
 	return out
 }
 
-// noteHead records the head slot the active endpoint reported.
-func (c *nodeClient) noteHead(slot uint64) {
+// setStates records the probes and the states the poll gave the endpoints.
+// A change of state is logged.
+func (c *nodeClient) setStates(probes []probe, states []EndpointState) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.status[c.active].HeadSlot = new(slot)
+	for i := range c.status {
+		st := &c.status[i]
+
+		if p := &probes[i]; p.err == nil {
+			st.HeadSlot = new(p.head.slot)
+			st.HeadRoot = p.head.root
+			st.FinalizedEpoch = new(p.finalized)
+		}
+
+		if st.State == states[i] {
+			continue
+		}
+
+		fields := logrus.Fields{"endpoint": st.Label, "state": states[i], "was": st.State}
+		if states[i] == EndpointOK {
+			c.log.WithFields(fields).Info("Beacon endpoint is usable")
+		} else {
+			c.log.WithFields(fields).Warn("Beacon endpoint is not usable")
+		}
+
+		st.State = states[i]
+	}
 }
 
 // noteResult records the outcome of a request to endpoint idx.
@@ -181,42 +241,104 @@ func (c *nodeClient) noteResult(idx int, err error) {
 	st.ErrorAt = c.now()
 }
 
-// activeIndex returns the endpoint that is tried first.
-func (c *nodeClient) activeIndex() int {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+// probeAll asks every endpoint at once for its head, whether it is in sync
+// and its finality.
+func (c *nodeClient) probeAll(ctx context.Context) []probe {
+	probes := make([]probe, len(c.endpoints))
 
-	return c.active
+	var wg sync.WaitGroup
+
+	for i := range c.endpoints {
+		wg.Go(func() { probes[i] = c.probe(ctx, i) })
+	}
+
+	wg.Wait()
+
+	return probes
+}
+
+// probe asks one endpoint for its head, sync state and finality.
+func (c *nodeClient) probe(ctx context.Context, idx int) probe {
+	target := c.endpoints[idx]
+
+	fetch := func(path, what string, out any) error {
+		if err := c.request(ctx, target, path, out); err != nil {
+			c.noteResult(idx, fmt.Errorf("%s %s: %w", http.MethodGet, path, err))
+
+			return fmt.Errorf("reading %s: %w", what, err)
+		}
+
+		return nil
+	}
+
+	var (
+		head     headResponse
+		syncing  syncingResponse
+		finality finalityResponse
+	)
+
+	if err := fetch("/eth/v1/beacon/headers/head", "head", &head); err != nil {
+		return probe{err: err}
+	}
+
+	if err := fetch("/eth/v1/node/syncing", "sync state", &syncing); err != nil {
+		return probe{err: err}
+	}
+
+	err := fetch("/eth/v1/beacon/states/head/finality_checkpoints", "finality", &finality)
+	if err != nil {
+		return probe{err: err}
+	}
+
+	var invalid string
+
+	switch {
+	case head.Data.Header.Message.Slot == nil:
+		invalid = "reading head: answer has no slot"
+	case !plausibleRoot(head.Data.Root):
+		invalid = "reading head: answer has no valid root"
+	case syncing.Data.IsSyncing == nil:
+		invalid = "reading sync state: answer has no is_syncing"
+	case finality.Data.Finalized.Epoch == nil:
+		invalid = "reading finality: answer has no finalized epoch"
+	}
+
+	if invalid != "" {
+		err := errors.New(invalid)
+		c.noteResult(idx, err)
+
+		return probe{err: err}
+	}
+
+	c.noteResult(idx, nil)
+
+	return probe{
+		head:      headRef{root: head.Data.Root, slot: uint64(*head.Data.Header.Message.Slot)},
+		finalized: uint64(*finality.Data.Finalized.Epoch),
+		syncing:   *syncing.Data.IsSyncing || syncing.Data.ELOffline,
+	}
 }
 
 // get performs a GET and decodes the JSON answer into out. It tries the
-// endpoints in order, starting with the active one, and makes the first that
-// answers the active one.
-func (c *nodeClient) get(ctx context.Context, path string, out any) error {
+// endpoints of order one after the other until one answers.
+func (c *nodeClient) get(ctx context.Context, order []int, path string, out any) error {
 	const method = http.MethodGet
 
+	if len(order) == 0 {
+		return fmt.Errorf("%s %s: no usable beacon endpoint", method, path)
+	}
+
 	var (
-		errs      = make([]error, 0, len(c.endpoints))
+		errs      = make([]error, 0, len(order))
 		notServed = 0
 	)
 
-	active := c.activeIndex()
-
-	for i := range c.endpoints {
-		idx := (active + i) % len(c.endpoints)
+	for _, idx := range order {
 		target := c.endpoints[idx]
 
 		err := c.request(ctx, target, path, out)
 		if err == nil {
 			c.noteResult(idx, nil)
-
-			if idx != active {
-				c.log.WithField("endpoint", target.label).Info("Switched beacon endpoint")
-
-				c.mu.Lock()
-				c.active = idx
-				c.mu.Unlock()
-			}
 
 			return nil
 		}
@@ -244,7 +366,7 @@ func (c *nodeClient) get(ctx context.Context, path string, out any) error {
 	}
 
 	joined := errors.Join(errs...)
-	if notServed == len(c.endpoints) {
+	if notServed == len(order) {
 		return fmt.Errorf("%s %s: %w: %w", method, path, errNotServed, joined)
 	}
 

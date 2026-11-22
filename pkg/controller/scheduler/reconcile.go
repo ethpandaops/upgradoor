@@ -59,9 +59,12 @@ type World struct {
 	Since    time.Time
 	Settings fleet.Settings
 	Health   fleet.NetworkHealth
-	// Liveness holds the rows of the newest stored epochs (at least
-	// readyEpochs + 2 of them when available).
+	// Liveness holds the rows of the newest stored epochs.
 	Liveness []fleet.Liveness
+	// Attested holds per host the newest slots, ascending, for which a
+	// canonical block carries an attestation of its validators. Reconcile
+	// does not change it.
+	Attested map[string][]uint64
 	// Hosts are all known hosts with their last sync.
 	Hosts []*fleet.Host
 	// Rollouts are the non-terminal rollouts, and the aborted ones that an
@@ -83,7 +86,9 @@ type World struct {
 // Outcome is the result of one reconcile: the rows to write and the plan.
 type Outcome struct {
 	// Rollouts, Leases and Directives are the new and changed rows.
-	Rollouts   []*fleet.Rollout
+	Rollouts []*fleet.Rollout
+	// Dropped are the rollouts deleted because every member left them.
+	Dropped    []string
 	Leases     []*fleet.Lease
 	Directives []*fleet.Directive
 	// Broken are the broken marks of the hosts on which a lease failed or
@@ -100,6 +105,7 @@ type Outcome struct {
 func (o *Outcome) Changes() *store.Changes {
 	return &store.Changes{
 		Rollouts:   o.Rollouts,
+		Dropped:    o.Dropped,
 		Leases:     o.Leases,
 		Directives: o.Directives,
 		Broken:     o.Broken,
@@ -136,10 +142,12 @@ type hostView struct {
 	duty      uint64
 	live      uint64
 	liveKnown bool
-	// held: a hold, or a known-offline mark (offline), keeps the host from
-	// every lease.
-	held    bool
-	offline bool
+	// held: a hold, a hold the host was asked for and has not answered
+	// (holdRequested), or a known-offline mark (offline), keeps the host
+	// from every lease.
+	held          bool
+	holdRequested bool
+	offline       bool
 	// stale: no sync for hostStaleAfter, measured from World.Since at the
 	// earliest.
 	stale bool
@@ -150,6 +158,16 @@ type hostView struct {
 	broken map[string]string
 	// unproven is fleet.Host.Unproven as the pass leaves it.
 	unproven *time.Time
+}
+
+// heldReason says what holds the host: its holds, else the hold it was
+// asked for.
+func (hv *hostView) heldReason() string {
+	if !hv.h.Held() && hv.holdRequested {
+		return reasonHoldRequested
+	}
+
+	return hv.h.HeldReason()
 }
 
 func (hv *hostView) allows(verb protocol.Verb) bool {
@@ -217,6 +235,8 @@ type pass struct {
 	rollouts     []*fleet.Rollout
 	rolloutByID  map[string]*fleet.Rollout
 	origRollouts map[string]*fleet.Rollout
+	// dropped are the IDs of the stored rollouts this pass deleted.
+	dropped []string
 
 	leases     []*fleet.Lease
 	origLeases map[string]*fleet.Lease
@@ -339,6 +359,10 @@ func newPass(w *World) *pass {
 		c := *d
 		p.addDirective(&c)
 		p.origDirectives[c.ID] = d
+
+		if hv := p.hosts[d.Host]; hv != nil && d.State == fleet.DirectivePending && d.Kind == protocol.DirectiveHold {
+			hv.held, hv.holdRequested = true, true
+		}
 	}
 
 	return p
@@ -460,11 +484,15 @@ func (p *pass) setMember(m *fleet.RolloutHost, state fleet.HostState) {
 	if state == fleet.HostDone || state == fleet.HostExpected {
 		m.Error = ""
 	}
+
+	if state == fleet.HostLeased {
+		m.Served = true
+	}
 }
 
 // outcome collects what changed against the world.
 func (p *pass) outcome(plan *Plan) *Outcome {
-	out := &Outcome{Audit: p.audit, Plan: plan}
+	out := &Outcome{Audit: p.audit, Plan: plan, Dropped: p.dropped}
 
 	for _, name := range p.names {
 		if p.marked[name] && !maps.Equal(p.hosts[name].broken, p.hosts[name].h.Broken) {

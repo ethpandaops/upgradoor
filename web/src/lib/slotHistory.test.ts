@@ -216,6 +216,19 @@ describe('liveOutages', () => {
     expect(outages.map(o => o.work)).toEqual(['action']);
   });
 
+  it('counts a deploy on the host as an image roll and marks it deployed; a cancelled lease has ended', () => {
+    const deployed: Lease = {
+      ...lease('l4', 'd', 'cancelled', 101, 104),
+      needs: [
+        { id: 'spec/beacon', kind: 'spec' },
+        { id: 'image/validator', kind: 'image' },
+      ],
+    };
+    const { outages } = liveOutages({ ...input, history: base([]), rows: [], leases: [deployed] });
+
+    expect(outages.map(o => [o.work, o.deployed, o.open])).toEqual([['image', true, undefined]]);
+  });
+
   it('opens a span for a host that keeps missing, extends the one it has, and leaves a host that is being worked on alone', () => {
     const off: Outage = {
       hosts: 1,

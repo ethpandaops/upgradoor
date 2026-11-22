@@ -10,7 +10,7 @@ controller:
 keyFile: /etc/upgradoor/test.key
 certFile: /etc/upgradoor/test.crt
 roles: [ethereum_node, rpc]
-stateDir: /var/lib/upgradoor-test
+stateDir: /data/upgradoor-test
 entryUser: ops
 overridesFile: /home/ops/custom-overrides.yaml
 managedFile: /etc/upgradoor/test-managed.yaml

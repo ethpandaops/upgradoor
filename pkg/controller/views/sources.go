@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/beacon"
+	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/validators"
 )
 
@@ -14,8 +15,21 @@ import (
 // endpoints and the validator ranges inventory as the controller sees them.
 // It carries no credentials.
 type DataSources struct {
-	Beacon          []beacon.EndpointStatus `json:"beacon"`
-	ValidatorRanges ValidatorRangesSource   `json:"validatorRanges"`
+	Beacon []beacon.EndpointStatus `json:"beacon"`
+	// Chain is what the beacon service makes of the endpoints when it fails.
+	Chain           ChainErrors           `json:"chain"`
+	ValidatorRanges ValidatorRangesSource `json:"validatorRanges"`
+}
+
+// ChainErrors are the error texts of the beacon service, which the other
+// views carry as fixed texts (PublicGate).
+type ChainErrors struct {
+	// Error is why the last refresh failed, TimingError why the chain's
+	// timing is invalid, LivenessError why the last count of the
+	// participation failed.
+	Error         string `json:"error,omitempty"`
+	TimingError   string `json:"timingError,omitempty"`
+	LivenessError string `json:"livenessError,omitempty"`
 }
 
 // ValidatorRangesSource is the validator ranges inventory.
@@ -76,7 +90,8 @@ type ValidatorRangesRefresh struct {
 // NewDataSources builds the view; known reports whether upgradoor knows a
 // host.
 func NewDataSources(
-	endpoints []beacon.EndpointStatus, ranges *validators.Status, known func(host string) bool,
+	endpoints []beacon.EndpointStatus, health *fleet.NetworkHealth, ranges *validators.Status,
+	known func(host string) bool,
 ) DataSources {
 	src := ValidatorRangesSource{
 		URL: ranges.URL, AttemptAt: ranges.AttemptAt, SuccessAt: ranges.SuccessAt,
@@ -119,7 +134,11 @@ func NewDataSources(
 		endpoints = []beacon.EndpointStatus{}
 	}
 
-	return DataSources{Beacon: endpoints, ValidatorRanges: src}
+	chain := ChainErrors{
+		Error: health.Error, TimingError: health.TimingError, LivenessError: health.LivenessError,
+	}
+
+	return DataSources{Beacon: endpoints, Chain: chain, ValidatorRanges: src}
 }
 
 // NewValidatorRangesRefresh is the answer of a refresh request.

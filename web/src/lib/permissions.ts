@@ -6,31 +6,29 @@
 // enforcement; a wrong answer here costs a 403, never an action.
 
 import type { ActionCall } from '../api/client';
-import type { ActionInfo } from '../api/types';
+import type { ActionInfo, Need, RolloutKind } from '../api/types';
 import { approvalBasis, hostActionVerdict, type RolloutAction } from './hostActions';
 
 /** The features of the controller's service, as a grant of the authenticatoor spells them. */
 export const FEATURE = {
-  /** roll: the action roll. Twin team_roll: containers a team of the login owns. */
-  roll: 'roll',
-  /** reboot: the action reboot. Twin team_reboot: hosts on which a team of the login owns a container. */
-  reboot: 'reboot',
-  /** hold: the actions hold and unhold. Twin team_hold, which lifts only a hold one of the login's teams set. */
-  hold: 'hold',
-  /** recover: skip, retry with hosts, end-lease. Twin team_recover. */
-  recover: 'recover',
   /**
-   * supervise: pause, resume (approve) and abort of one rollout, retry without hosts. An abort is final.
-   * Twin team_supervise: pause and resume of a rollout of a client whose containers a team of the login all owns.
+   * details: the hosts in full (system, packages, unmanaged containers, internals, host actions) and the Packages
+   * tab. Twin team_details: hosts on which a team of the login owns a container. Not an action.
    */
-  supervise: 'supervise',
-  /** client_policy: the image policy of one client. Twin team_client_policy: a client whose containers a team of the login all owns. */
-  client_policy: 'client_policy',
-  /** image_override: the action image-override. Twin team_image_override: a container a team of the login owns. */
-  image_override: 'image_override',
-  /** flag_override: the action flag-override. Twin team_flag_override: a container a team of the login owns. */
-  flag_override: 'flag_override',
-  /** admin: forget, the global pause, the settings, the flags force and ignoreBudget, the selector all. No twin. */
+  details: 'details',
+  /**
+   * manage: roll, reboot, hold, unhold, mark-offline, unmark-offline, skip, retry, end-lease, client-policy, the
+   * decisions on one rollout (pause, resume, ignore-gate, approve-lease, abort), the image refresh, the flags force
+   * and ignoreBudget, the selector all, a roll now, and a host action that names no feature. Twin team_manage: the
+   * same on what a team of the login owns (its containers, rollouts, leases and members that only roll them, its
+   * client, its own hold); never reboot, mark-offline, unmark-offline or the image refresh.
+   */
+  manage: 'manage',
+  /** manage_image: image-override, client-override of the image. Twin team_manage_image: a container a team of the login owns. */
+  manage_image: 'manage_image',
+  /** manage_flags: flag-override, client-override of the flags. Twin team_manage_flags: a container a team of the login owns. */
+  manage_flags: 'manage_flags',
+  /** admin: forget, the global pause, the settings, the data sources. Includes every other feature. No twin. */
   admin: 'admin',
 } as const;
 
@@ -39,17 +37,17 @@ type Feature = (typeof FEATURE)[keyof typeof FEATURE];
 /** TEAM_PREFIX turns a feature into its team twin. */
 export const TEAM_PREFIX = 'team_';
 
-/** TWINNED are the features that have a team twin. */
-export const TWINNED: readonly Feature[] = [
-  FEATURE.roll,
-  FEATURE.reboot,
-  FEATURE.hold,
-  FEATURE.recover,
-  FEATURE.supervise,
-  FEATURE.client_policy,
-  FEATURE.image_override,
-  FEATURE.flag_override,
-];
+/**
+ * hasFeature reports whether the login holds a feature, as the controller decides it (authz.Implied): granted,
+ * through admin (every other feature) or through its plain form (a plain feature includes its twin).
+ */
+export function hasFeature(login: Pick<Login, 'hasFeature'>, feature: string): boolean {
+  if (login.hasFeature(feature) || login.hasFeature(FEATURE.admin)) return true;
+  return feature.startsWith(TEAM_PREFIX) && login.hasFeature(feature.slice(TEAM_PREFIX.length));
+}
+
+/** TWINNED are the action features that have a team twin. */
+export const TWINNED: readonly Feature[] = [FEATURE.manage, FEATURE.manage_image, FEATURE.manage_flags];
 
 /** Login is what the page knows about who is logged in. */
 export interface Login {
@@ -63,8 +61,6 @@ export interface Login {
    * is too old to know.
    */
   hasFeature: (feature: string) => boolean;
-  /** hasServiceFeature checks a feature of any service (a host action's feature); without it only service's own. */
-  hasServiceFeature?: (service: string, feature: string) => boolean;
   /** teams are the token's teams. */
   teams: readonly string[];
 }
@@ -81,9 +77,8 @@ interface OwnedContainer {
 export interface OwnedHost {
   name: string;
   containers?: readonly OwnedContainer[] | null;
-  /** holdWanted and holdBy ("team:<teams>" or "staff"): a team lifts only a hold one of its teams set. */
-  holdWanted?: boolean;
-  holdBy?: string;
+  /** holders are the holders of the host's controller holds: "staff" or a team. */
+  holders?: readonly string[] | null;
   /** actions are the host actions the host reports, for the rule of host-action. */
   actions?: readonly ActionInfo[] | null;
 }
@@ -101,8 +96,10 @@ export interface Ownership {
   hosts: readonly OwnedHost[];
   /** clients are the clients of the fleet, for the image policy of one. */
   clients?: readonly OwnedClient[];
-  /** leaseHost names the host of a lease; a lease it does not know has no owner. */
-  leaseHost?: (lease: string) => string | undefined;
+  /** leaseWork is the host and the needs of a lease; a lease it does not know has no owner. */
+  leaseWork?: (lease: string) => LeaseWork | undefined;
+  /** rolloutKind is the kind of a rollout; undefined for one the page does not know. */
+  rolloutKind?: (rollout: string) => RolloutKind | undefined;
   /**
    * rolloutClient names the client a rollout is for: empty for a rollout for
    * no client, undefined for one the page does not know.
@@ -112,6 +109,24 @@ export interface Ownership {
   rolloutAction?: (rollout: string) => RolloutAction | undefined;
 }
 
+/** LeaseWork is what a lease does: its host and needs. */
+export interface LeaseWork {
+  host: string;
+  needs: readonly Need[];
+}
+
+/** CallContext is what the page knows of the lease or rollout a call is about. */
+export interface CallContext {
+  /** lease is what the lease an end-lease call is about does. */
+  lease?: LeaseWork;
+  /** rolloutClient is the team of the rollout a call is about ("" for none). */
+  rolloutClient?: string;
+  /** rolloutKind is the kind of the rollout a skip or retry is about. */
+  rolloutKind?: RolloutKind;
+  /** rolloutAction is the action and members of an action rollout: who may run it everywhere may approve it. */
+  rolloutAction?: RolloutAction;
+}
+
 /** PermissionCall is an action call, or saving the settings. */
 export type PermissionCall = ActionCall | { action: 'settings' };
 
@@ -119,20 +134,14 @@ export interface Verdict {
   allowed: boolean;
   /** reason says what is missing, for a tooltip; empty when allowed. */
   reason: string;
-  /** by is what allows it, as the audit log will record it: "roll", "team_roll", "reboot,admin", "open". */
+  /** by is what allows it, as the audit log will record it: "manage", "team_manage", "open". */
   by: string;
-  /**
-   * staggered: the controller runs this roll or reboot staggered, whatever
-   * the request says. That is so for a request allowed through a team
-   * feature by a login without admin: "now" skips the order and the wait for
-   * readiness.
-   */
-  staggered: boolean;
 }
 
 /** Targets is what a request acts on, for the team twin of its feature. */
 type Targets =
-  | { rule: 'host'; hosts: readonly string[]; all: boolean; hold?: 'set' | 'lift' }
+  /** host: one owned container of each host; holders are the holds an unhold names. */
+  | { rule: 'host'; hosts: readonly string[]; all: boolean; holders?: readonly string[] }
   | {
       rule: 'container';
       hosts: readonly string[];
@@ -141,7 +150,10 @@ type Targets =
       /** one: the request is about exactly one container (an override). */
       one?: boolean;
     }
+  /** lease: every need of the lease rolls a container the login's teams own. */
   | { rule: 'lease'; lease: string }
+  /** members: the hosts as members of the rollout, which only rolls containers of the login's teams. */
+  | { rule: 'members'; rollout: string; hosts: readonly string[] }
   | { rule: 'client'; client: string }
   /** rollout: the client the rollout is for, by the rule of a client. */
   | { rule: 'rollout'; rollout: string }
@@ -150,21 +162,8 @@ type Targets =
 
 interface Requirement {
   feature: Feature;
-  /** team is set when the feature has a twin. */
+  /** team is set when the twin allows the request on the targets. */
   team?: Targets;
-  /** admin names the flag that needs admin on top; empty when none does. */
-  admin: string;
-  /** teamStaggered: through the twin alone the request is run staggered. */
-  teamStaggered?: boolean;
-  /** teamNow: the request is not staggered, which through the twin takes admin. */
-  teamNow?: boolean;
-}
-
-function adminReason(force: boolean, ignoreBudget: boolean, all: boolean): string {
-  if (force) return 'force';
-  if (ignoreBudget) return 'ignoreBudget';
-  if (all) return 'all';
-  return '';
 }
 
 /** requirement is what each request needs: the one table of this page, the mirror of actions.go. */
@@ -173,67 +172,49 @@ function requirement(call: Exclude<PermissionCall, { action: 'host-action' }>): 
     case 'roll': {
       const b = call.body;
       return {
-        feature: FEATURE.roll,
+        feature: FEATURE.manage,
         team: { rule: 'container', hosts: b.hosts, all: b.all, containers: b.containers },
-        admin: adminReason(b.force, b.ignoreBudget, b.all),
-        teamStaggered: true,
-        teamNow: !b.staggered,
       };
     }
-    case 'reboot': {
-      const b = call.body;
-      return {
-        feature: FEATURE.reboot,
-        team: { rule: 'host', hosts: b.hosts, all: b.all },
-        admin: adminReason(b.force, b.ignoreBudget, b.all),
-        teamStaggered: true,
-        teamNow: !b.staggered,
-      };
-    }
-    case 'hold':
-      return {
-        feature: FEATURE.hold,
-        team: { rule: 'host', hosts: call.body.hosts, all: false, hold: 'set' },
-        admin: '',
-      };
-    case 'unhold':
-      return {
-        feature: FEATURE.hold,
-        team: { rule: 'host', hosts: call.body.hosts, all: false, hold: 'lift' },
-        admin: '',
-      };
+    case 'reboot':
     case 'mark-offline':
     case 'unmark-offline':
-      // The controller lets team_hold change only a mark set through it.
-      return { feature: FEATURE.hold, team: { rule: 'host', hosts: call.body.hosts, all: false }, admin: '' };
+      return { feature: FEATURE.manage };
+    case 'hold':
+      return { feature: FEATURE.manage, team: { rule: 'host', hosts: call.body.hosts, all: false } };
+    case 'unhold':
+      return {
+        feature: FEATURE.manage,
+        team: { rule: 'host', hosts: call.body.hosts, all: false, holders: call.body.holders ?? [] },
+      };
     case 'forget':
-      return { feature: FEATURE.admin, admin: '' };
+      return { feature: FEATURE.admin };
     case 'end-lease':
-      return { feature: FEATURE.recover, team: { rule: 'lease', lease: call.body.lease }, admin: '' };
+      return { feature: FEATURE.manage, team: { rule: 'lease', lease: call.body.lease } };
     case 'pause':
     case 'resume':
+    case 'ignore-gate':
+    case 'approve-lease':
       // Without a rollout it is the global switch.
       return call.body.rollout === ''
-        ? { feature: FEATURE.admin, admin: '' }
-        : { feature: FEATURE.supervise, team: { rule: 'rollout', rollout: call.body.rollout }, admin: '' };
+        ? { feature: FEATURE.admin }
+        : { feature: FEATURE.manage, team: { rule: 'rollout', rollout: call.body.rollout } };
     case 'abort':
-      // An abort is final: no twin.
-      return { feature: FEATURE.supervise, admin: '' };
+      return { feature: FEATURE.manage, team: { rule: 'rollout', rollout: call.body.rollout } };
     case 'skip':
-      return { feature: FEATURE.recover, team: { rule: 'host', hosts: call.body.hosts, all: false }, admin: '' };
     case 'retry':
-      // Without hosts it reopens the rollout; otherwise it recovers the named hosts.
-      return call.body.hosts.length === 0
-        ? { feature: FEATURE.supervise, admin: '' }
-        : { feature: FEATURE.recover, team: { rule: 'host', hosts: call.body.hosts, all: false }, admin: '' };
+      // A retry without hosts reopens the rollout; otherwise both recover the named members.
+      return call.action === 'retry' && call.body.hosts.length === 0
+        ? { feature: FEATURE.manage, team: { rule: 'rollout', rollout: call.body.rollout } }
+        : { feature: FEATURE.manage, team: { rule: 'members', rollout: call.body.rollout, hosts: call.body.hosts } };
     case 'client-policy':
       // The policy of a client is its team's when the team owns every container of it.
-      return { feature: FEATURE.client_policy, team: { rule: 'client', client: call.body.client }, admin: '' };
+      return { feature: FEATURE.manage, team: { rule: 'client', client: call.body.client } };
     case 'image-override':
     case 'flag-override':
       // The rule of a roll of exactly that container on that host.
       return {
-        feature: call.action === 'image-override' ? FEATURE.image_override : FEATURE.flag_override,
+        feature: call.action === 'image-override' ? FEATURE.manage_image : FEATURE.manage_flags,
         team: {
           rule: 'container',
           hosts: [call.body.host],
@@ -241,18 +222,16 @@ function requirement(call: Exclude<PermissionCall, { action: 'host-action' }>): 
           containers: [call.body.container],
           one: true,
         },
-        admin: '',
       };
     case 'client-override':
       // Each host alone, by the rule of the single-host override: the controller lists the hosts the teams do not cover.
       return {
-        feature: call.body.part === 'image' ? FEATURE.image_override : FEATURE.flag_override,
+        feature: call.body.part === 'image' ? FEATURE.manage_image : FEATURE.manage_flags,
         team: { rule: 'someOf', client: call.body.client },
-        admin: '',
       };
     case 'settings':
       // The settings carry the global pause, the budget, the gate and the policies.
-      return { feature: FEATURE.admin, admin: '' };
+      return { feature: FEATURE.admin };
   }
 }
 
@@ -282,11 +261,15 @@ function managedContainers(host: OwnedHost | undefined): OwnedContainer[] {
   return (host?.containers ?? []).filter(c => c.managed);
 }
 
-/** holdSetBy says who set a hold that none of the teams set: "staff" or "team <teams>"; empty when one of them did. */
-function holdSetBy(holdBy: string | undefined, teams: readonly string[]): string {
-  if (!holdBy?.startsWith('team:') || holdBy === 'team:') return 'staff';
-  const holders = holdBy.slice('team:'.length).split(',');
-  return ownedBy(teams, holders) ? '' : `team ${echo(holders.join(', '))}`;
+/** STAFF is the holder of staff's hold. */
+export const STAFF = 'staff';
+
+/** ROLL_NEEDS are the kinds of need that roll a container. */
+const ROLL_NEEDS: readonly string[] = ['image', 'override', 'spec'];
+
+/** needContainer is the container a need is about. */
+function needContainer(n: Need): string {
+  return n.image?.container ?? n.override?.container ?? n.spec?.container ?? '';
 }
 
 /** uncoveredOn applies the target rule to one host; empty when the host is covered. */
@@ -301,12 +284,10 @@ function uncoveredOn(teams: readonly string[], name: string, host: OwnedHost | u
     // The any-owner rule of host-level actions.
     if (!ownedBy(teams, all)) return onHost;
 
-    // A hold that no team of the login set through the twin is not the
-    // twin's to lift, nor to set again as its own.
-    if (t.rule === 'host' && t.hold && host?.holdWanted === true) {
-      const by = holdSetBy(host.holdBy, teams);
-      const verb = t.hold === 'lift' ? 'lift' : 'change';
-      if (by !== '') return `does not ${verb} the hold on host ${echo(name)} (set by ${by})`;
+    // An unhold names only holds of the login's teams on the host.
+    if (t.rule === 'host') {
+      const foreign = (t.holders ?? []).find(h => h === STAFF || !teams.includes(h) || !all.includes(h));
+      if (foreign !== undefined) return `does not lift the hold of ${echo(foreign)} on host ${echo(name)}`;
     }
 
     return '';
@@ -340,16 +321,75 @@ function uncoveredClient(teams: readonly string[], name: string, ownership: Owne
   return ownedBy(teams, owners) ? '' : `does not cover client ${echo(name)} (owners: ${ownerList(owners)})`;
 }
 
+/** uncoveredLease applies the rule of a recovery through team_manage to a lease: it only rolls the teams' containers. */
+function uncoveredLease(teams: readonly string[], lease: string, ownership: Ownership): string {
+  const work = ownership.leaseWork?.(lease);
+  if (!work) return `does not cover lease ${echo(lease)} (owners: none)`;
+  if (work.needs.length === 0) return `does not cover lease ${echo(lease)}: it carries no need`;
+
+  const host = ownership.hosts.find(h => h.name === work.host);
+
+  for (const n of work.needs) {
+    if (!ROLL_NEEDS.includes(n.kind)) return `does not cover lease ${echo(lease)}: it carries a ${echo(n.kind)}`;
+    const reason = uncoveredOn(teams, work.host, host, {
+      rule: 'container',
+      hosts: [work.host],
+      all: false,
+      containers: [needContainer(n)],
+    });
+    if (reason !== '') return reason;
+  }
+
+  return '';
+}
+
+/**
+ * uncoveredMembers applies the rule of a recovery through team_manage to members of a rollout. The page does not know a manual
+ * roll's directives nor a host's own needs: a manual roll is judged by the team it records, a host's own roll by
+ * every managed container of the host. The controller judges the members' leases.
+ */
+function uncoveredMembers(
+  teams: readonly string[],
+  t: Extract<Targets, { rule: 'members' }>,
+  ownership: Ownership
+): string {
+  const kind = ownership.rolloutKind?.(t.rollout);
+  if (kind === undefined) return `does not cover rollout ${echo(t.rollout)} (owners: none)`;
+  if (t.hosts.length === 0) return 'needs a target that one of your teams owns, and the request names none';
+
+  switch (kind) {
+    case 'group':
+    case 'manual': {
+      const team = ownership.rolloutClient?.(t.rollout) ?? '';
+      if (team === '') return `does not cover rollout ${echo(t.rollout)}: it is for no team`;
+      return ownedBy(teams, [team]) ? '' : `does not cover rollout ${echo(t.rollout)} (owners: ${ownerList([team])})`;
+    }
+    case 'local': {
+      const byName = new Map(ownership.hosts.map(h => [h.name, h]));
+      for (const name of t.hosts) {
+        const reason = uncoveredOn(teams, name, byName.get(name), {
+          rule: 'container',
+          hosts: [name],
+          all: false,
+          containers: [],
+        });
+        if (reason !== '') return reason;
+      }
+      return '';
+    }
+    default:
+      return `does not cover rollout ${echo(t.rollout)}: it rolls no containers (${echo(kind)})`;
+  }
+}
+
 /** uncovered names the first target no team of the login owns; empty when all are covered. */
 function uncovered(teams: readonly string[], t: Targets, ownership: Ownership): string {
-  let names: string[];
-
   if (t.rule === 'client') return uncoveredClient(teams, t.client, ownership);
   if (t.rule === 'rollout') {
-    const client = ownership.rolloutClient?.(t.rollout);
-    if (client === undefined) return `does not cover rollout ${echo(t.rollout)} (owners: none)`;
-    if (client === '') return `does not cover rollout ${echo(t.rollout)}: it is for no team`;
-    return uncoveredClient(teams, client, ownership);
+    const team = ownership.rolloutClient?.(t.rollout);
+    if (team === undefined) return `does not cover rollout ${echo(t.rollout)} (owners: none)`;
+    if (team === '') return `does not cover rollout ${echo(t.rollout)}: it is for no team`;
+    return ownedBy(teams, [team]) ? '' : `does not cover rollout ${echo(t.rollout)} (owners: ${echo(team)})`;
   }
   if (t.rule === 'someOf') {
     const owners = clientOwners(t.client, ownership);
@@ -358,13 +398,10 @@ function uncovered(teams: readonly string[], t: Targets, ownership: Ownership): 
       : `does not cover any container of client ${echo(t.client)} (owners: ${ownerList(owners)})`;
   }
 
-  if (t.rule === 'lease') {
-    const host = ownership.leaseHost?.(t.lease);
-    if (host === undefined) return `does not cover lease ${echo(t.lease)} (owners: none)`;
-    names = [host];
-  } else {
-    names = t.all ? [...t.hosts, ...ownership.hosts.map(h => h.name)] : [...t.hosts];
-  }
+  if (t.rule === 'lease') return uncoveredLease(teams, t.lease, ownership);
+  if (t.rule === 'members') return uncoveredMembers(teams, t, ownership);
+
+  const names = t.all ? [...t.hosts, ...ownership.hosts.map(h => h.name)] : [...t.hosts];
 
   if (names.length === 0) return 'needs a target that one of your teams owns, and the request names none';
 
@@ -381,11 +418,13 @@ function uncovered(teams: readonly string[], t: Targets, ownership: Ownership): 
 function targetWords(t: Targets): string {
   switch (t.rule) {
     case 'lease':
-      return 'the host of this lease';
+      return 'every container this lease rolls';
+    case 'members':
+      return 'every container the rollout rolls on these hosts';
     case 'client':
       return 'every container of this client';
     case 'rollout':
-      return "every container of this rollout's client";
+      return 'this rollout';
     case 'someOf':
       return 'the containers of this client on the hosts';
     case 'container':
@@ -396,39 +435,44 @@ function targetWords(t: Targets): string {
   }
 }
 
-const denied = (reason: string): Verdict => ({ allowed: false, reason, by: '', staggered: false });
+const denied = (reason: string): Verdict => ({ allowed: false, reason, by: '' });
 
 /**
  * can decides whether the login may make a call. The rule is the
  * controller's: the plain feature allows it on any target; the team twin
- * allows it when a team of the login owns every target; a request with force,
- * ignoreBudget or all needs admin as well.
+ * allows it when a team of the login owns every target.
  */
 export function can(login: Login, call: PermissionCall, ownership: Ownership): Verdict {
-  if (login.open) return { allowed: true, reason: '', by: 'open', staggered: false };
+  if (login.open) return { allowed: true, reason: '', by: 'open' };
 
   // A host action has a rule of its own, per host: see hostActions.ts.
   if (call.action === 'host-action') return hostActionVerdict(login, call.body, ownership.hosts);
 
-  if (call.action === 'resume' && call.body.rollout !== '') return resumeVerdict(login, call, ownership);
+  if (isApproval(call)) return approvalVerdict(login, call, ownership);
 
   return featureVerdict(login, call, ownership);
 }
 
+/** ApprovalCall is a person's decision on one rollout: resume (which approves), ignore-gate, approve-lease. */
+type ApprovalCall = Extract<PermissionCall, { action: 'resume' | 'ignore-gate' | 'approve-lease' }>;
+
+function isApproval(call: PermissionCall): call is ApprovalCall {
+  return (
+    (call.action === 'resume' || call.action === 'ignore-gate' || call.action === 'approve-lease') &&
+    call.body.rollout !== ''
+  );
+}
+
 /**
- * resumeVerdict decides the resume (approval) of one rollout: supervise or its
+ * approvalVerdict decides a person's decision on one rollout: manage or its
  * twin, or, for an action rollout, the action on every member host.
  */
-function resumeVerdict(
-  login: Login,
-  call: Extract<PermissionCall, { action: 'resume' }>,
-  ownership: Ownership
-): Verdict {
-  const ra = login.hasFeature(FEATURE.supervise) ? undefined : ownership.rolloutAction?.(call.body.rollout);
+function approvalVerdict(login: Login, call: ApprovalCall, ownership: Ownership): Verdict {
+  const ra = hasFeature(login, FEATURE.manage) ? undefined : ownership.rolloutAction?.(call.body.rollout);
   if (!ra) return featureVerdict(login, call, ownership);
 
   const by = approvalBasis(login, ra, ownership.hosts);
-  if (by !== '') return { allowed: true, reason: '', by, staggered: false };
+  if (by !== '') return { allowed: true, reason: '', by };
 
   const verdict = featureVerdict(login, call, ownership);
   if (verdict.allowed) return verdict;
@@ -438,7 +482,7 @@ function resumeVerdict(
   );
 }
 
-/** featureVerdict applies the call's feature, its team twin and the admin it needs on top. */
+/** featureVerdict applies the call's feature and its team twin. */
 function featureVerdict(
   login: Login,
   call: Exclude<PermissionCall, { action: 'host-action' }>,
@@ -446,44 +490,28 @@ function featureVerdict(
 ): Verdict {
   const need = requirement(call);
   const feature = `${login.service}:${need.feature}`;
-  let by: string = need.feature;
-  let viaTeam = false;
+  if (hasFeature(login, need.feature)) return { allowed: true, reason: '', by: need.feature };
 
-  if (!login.hasFeature(need.feature)) {
-    const twin = TEAM_PREFIX + need.feature;
+  const twin = TEAM_PREFIX + need.feature;
 
-    if (!need.team) return denied(`Needs ${feature}`);
+  if (!need.team) return denied(`Needs ${feature}`);
 
-    if (!login.hasFeature(twin)) {
-      return denied(`Needs ${feature} or ${login.service}:${twin} for a team that owns ${targetWords(need.team)}`);
-    }
-
-    const reason = uncovered(login.teams, need.team, ownership);
-    if (reason !== '') return denied(`${login.service}:${twin} ${reason}`);
-
-    by = twin;
-    viaTeam = true;
+  if (!hasFeature(login, twin)) {
+    return denied(`Needs ${feature} or ${login.service}:${twin} for a team that owns ${targetWords(need.team)}`);
   }
 
-  const admin = login.hasFeature(FEATURE.admin);
+  const reason = uncovered(login.teams, need.team, ownership);
+  if (reason !== '') return denied(`${login.service}:${twin} ${reason}`);
 
-  if (need.admin !== '') {
-    if (!admin) return denied(`Needs ${login.service}:${FEATURE.admin} (for ${need.admin})`);
-    by += `,${FEATURE.admin}`;
-  } else if (viaTeam && admin && need.teamNow === true) {
-    // "Now" through a team feature is what admin permits: it is named for it.
-    by += `,${FEATURE.admin}`;
-  }
-
-  return { allowed: true, reason: '', by, staggered: viaTeam && !admin && need.teamStaggered === true };
+  return { allowed: true, reason: '', by: twin };
 }
 
 /** needsOwnership reports whether some verdict of this login depends on who owns what. */
 export function needsOwnership(login: Login): boolean {
-  return !login.open && TWINNED.some(f => !login.hasFeature(f) && login.hasFeature(TEAM_PREFIX + f));
+  return !login.open && TWINNED.some(f => !hasFeature(login, f) && hasFeature(login, TEAM_PREFIX + f));
 }
 
-/** needsActionHosts: without supervise the approval of an action rollout follows the action on its hosts. */
+/** needsActionHosts: without manage the approval of an action rollout follows the action on its hosts. */
 export function needsActionHosts(login: Login): boolean {
-  return !login.open && !login.hasFeature(FEATURE.supervise);
+  return !login.open && !hasFeature(login, FEATURE.manage);
 }

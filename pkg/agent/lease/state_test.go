@@ -366,17 +366,19 @@ func TestHoldsSurviveReopen(t *testing.T) {
 	assert.Empty(t, st.Holds())
 
 	until := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
-	controller := plan.Hold{By: "alice", Reason: "fork", Teams: []string{"geth"}, Until: &until}
-	require.NoError(t, st.SetHold(plan.HoldController, &controller))
-	require.NoError(t, st.SetHold(plan.HoldLocal, &plan.Hold{By: "ops", Reason: "debugging"}))
-	require.NoError(t, st.SetHold(plan.HoldLocal, nil))
+	staff := plan.Hold{By: "alice", Reason: "fork", At: until.Add(-time.Hour), Until: &until}
+	require.NoError(t, st.SetHold(protocol.HolderStaff, &staff))
+	require.NoError(t, st.SetHold("geth", &plan.Hold{By: "bob", Reason: "sync"}))
+	require.NoError(t, st.SetHold(protocol.HolderHost, &plan.Hold{By: "ops", Reason: "debugging"}))
+	require.NoError(t, st.SetHold(protocol.HolderHost, nil))
+	require.NoError(t, st.SetHold("geth", nil))
 
 	holds := st.Holds()
-	holds[plan.HoldController].Teams[0] = "changed"
+	delete(holds, protocol.HolderStaff)
 
 	reopened, err := openStore(quietLog(), dir)
 	require.NoError(t, err)
-	assert.Equal(t, map[string]plan.Hold{plan.HoldController: controller}, reopened.Holds())
+	assert.Equal(t, map[string]plan.Hold{protocol.HolderStaff: staff}, reopened.Holds(), "one hold per holder")
 }
 
 // After the rename memory follows the file, whatever the directory fsync says.

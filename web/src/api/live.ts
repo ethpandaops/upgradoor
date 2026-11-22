@@ -23,12 +23,36 @@ const HOSTS_SETTLE_MS = 150;
 /** A stream that the controller ended for an expired token is reopened at once, unless it was this short. */
 const EXPIRED_MIN_LIFE_MS = 5000;
 
-export type LiveState = 'connecting' | 'live' | 'reconnecting' | 'paused' | 'stopped';
+/** outdated: the controller speaks another wire version; only a reload of the page helps. */
+export type LiveState = 'connecting' | 'live' | 'reconnecting' | 'paused' | 'stopped' | 'outdated';
 
 export interface LiveStatus {
   state: LiveState;
   /** error is why the stream is not live, when it broke. */
   error: unknown;
+  /** lostAt is when the stream stopped being live; the views are as of then. */
+  lostAt?: number;
+  /** waitingSince is when the current connecting or reconnecting began. */
+  waitingSince?: number;
+}
+
+/** OutdatedError is a snapshot in a wire version this page does not read. */
+export class OutdatedError extends ApiError {
+  constructor() {
+    super(0, 'the controller was updated: reload the page');
+    this.name = 'OutdatedError';
+  }
+}
+
+const WAITING: LiveState[] = ['connecting', 'reconnecting'];
+
+/** nextStatus moves status to state, keeping when it stopped being live and when the waiting began. */
+function nextStatus(prev: LiveStatus, state: LiveState, error: unknown, now: number): LiveStatus {
+  if (state === 'live') return { state, error };
+
+  const lostAt = prev.state === 'live' ? now : prev.lostAt;
+  const waitingSince = WAITING.includes(state) ? (WAITING.includes(prev.state) ? prev.waitingSince : now) : undefined;
+  return { state, error, lostAt, waitingSince };
 }
 
 /** HostEntry is what the stream said last about one host's details. */
@@ -184,7 +208,7 @@ export class LiveStore {
 
   private setStatus(state: LiveState, error: unknown): void {
     if (this.status.state === state && this.status.error === error) return;
-    this.status = { state, error };
+    this.status = nextStatus(this.status, state, error, Date.now());
     this.emit();
   }
 
@@ -193,15 +217,17 @@ export class LiveStore {
 
     clearTimeout(this.settle);
     this.settle = setTimeout(() => {
-      if (this.started && this.status.state !== 'paused') this.open(true);
+      if (this.started && this.status.state !== 'paused' && this.status.state !== 'outdated') this.open(true);
     }, HOSTS_SETTLE_MS);
   }
 
   private onVisibility = (): void => {
     clearTimeout(this.hidden);
+    if (this.status.state === 'outdated') return;
 
     if (document.hidden) {
       this.hidden = setTimeout(() => {
+        if (this.status.state === 'outdated') return;
         this.close();
         this.setStatus('paused', undefined);
       }, HIDDEN_GRACE_MS);
@@ -224,6 +250,7 @@ export class LiveStore {
    * broke.
    */
   private open(quiet = false): void {
+    if (this.status.state === 'outdated') return;
     this.close();
     if (!quiet || this.status.state !== 'live') {
       this.setStatus(this.synced ? 'reconnecting' : 'connecting', undefined);
@@ -290,6 +317,13 @@ export class LiveStore {
       if (this.generation !== generation) return;
       clearTimeout(this.stall);
 
+      if (error instanceof OutdatedError) {
+        controller.abort();
+        this.abort = undefined;
+        this.setStatus('outdated', error);
+        return;
+      }
+
       // A token that ran out is replaced by the next request for one.
       if (seen.expired && Date.now() - opened >= EXPIRED_MIN_LIFE_MS) {
         this.setStatus('reconnecting', undefined);
@@ -313,14 +347,14 @@ export class LiveStore {
 
     if (event === 'snap') {
       // A controller that encodes differently was deployed after this page was loaded.
-      if (v !== WIRE_VERSION) throw new ApiError(0, 'the controller was updated: reload the page');
+      if (v !== WIRE_VERSION) throw new OutdatedError();
 
       this.doc = new WireDoc(this.priv ? '' : 'public');
       this.strings = strings ?? [''];
       this.version = i ?? 0;
       this.details = new Map();
       this.synced = true;
-      this.status = { state: 'live', error: undefined };
+      this.status = nextStatus(this.status, 'live', undefined, Date.now());
     } else {
       // A patch makes the version after the one it applies to. A gap means
       // that one was missed: start again from a snapshot.

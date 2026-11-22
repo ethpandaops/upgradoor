@@ -196,10 +196,9 @@ const (
 	tableSlots    = "sl" // fleet.SlotParticipation of the newest slots, by slot
 	tablePlan     = "pl" // one wirePlan
 	tableQueue    = "q"  // scheduler.QueueEntry, by host
-	tableRollouts = "ro" // fleet.Rollout without its hosts, by ID
+	tableRollouts = "ro" // views.RolloutView without its hosts, by ID
 	tableMembers  = "m"  // wireMember, by "<rollout>/<host>"
 	tableLeases   = "le" // fleet.Lease, by ID
-	tableSettings = "se" // one views.SettingsBody
 	tableAudit    = "a"  // one views.AuditHead
 	tableClients  = "c"  // views.ClientView, by name
 
@@ -213,12 +212,9 @@ const (
 // wireGate is the network gate on a stream. What follows from the clock is
 // not in it: see wireNetwork.
 type wireGate struct {
-	OK      bool     `json:"ok"`
-	Reasons []string `json:"reasons"`
-	// PublicReasons are the reasons of the public view when they differ
-	// (the beacon node's error text is not public). Authenticated stream only.
-	PublicReasons []string    `json:"publicReasons,omitempty"`
-	Network       wireNetwork `json:"network"`
+	OK      bool        `json:"ok"`
+	Reasons []string    `json:"reasons"`
+	Network wireNetwork `json:"network"`
 }
 
 // wireNetwork is fleet.NetworkHealth without what a clock that knows the
@@ -285,6 +281,7 @@ type wireDetail struct {
 	RemoteAddr   string    `json:"remoteAddr"`
 	Assigned     uint64    `json:"assignedValidators"`
 	HasInventory bool      `json:"hasInventory,omitempty"`
+	Reduced      bool      `json:"reduced,omitempty"`
 }
 
 // wireTables names the row schema of every table. Tables of a host's details
@@ -297,10 +294,9 @@ var wireTables = map[string]reflect.Type{
 	tableSlots:             reflect.TypeFor[fleet.SlotParticipation](),
 	tablePlan:              reflect.TypeFor[wirePlan](),
 	tableQueue:             reflect.TypeFor[scheduler.QueueEntry](),
-	tableRollouts:          reflect.TypeFor[fleet.Rollout](),
+	tableRollouts:          reflect.TypeFor[views.RolloutView](),
 	tableMembers:           reflect.TypeFor[wireMember](),
 	tableLeases:            reflect.TypeFor[fleet.Lease](),
-	tableSettings:          reflect.TypeFor[views.SettingsBody](),
 	tableAudit:             reflect.TypeFor[views.AuditHead](),
 	tableClients:           reflect.TypeFor[views.ClientView](),
 	"d." + tableDetail:     reflect.TypeFor[wireDetail](),
@@ -311,7 +307,7 @@ var wireTables = map[string]reflect.Type{
 
 // wireSingle lists the tables that hold one row, which has no key.
 var wireSingle = []string{
-	tableNetwork, tablePlan, tableSettings, tableAudit,
+	tableNetwork, tablePlan, tableAudit,
 	"d." + tableDetail, "d." + tableInventory,
 }
 
@@ -838,12 +834,32 @@ type hostRowKey struct {
 	stale      bool
 	lastSeen   time.Time
 	boot       time.Time
-	holdWanted bool
-	holdReason string
-	holdBy     string
 	offline    fleet.OfflineMark
-	plan       scheduler.HostPlan
-	unplanned  bool
+	// plan is the host's plan but its HoldRequests, which holdRequests has.
+	plan         planKey
+	holdRequests string
+	unplanned    bool
+}
+
+// planKey is a scheduler.HostPlan but its HoldRequests.
+type planKey struct {
+	slot         scheduler.SlotState
+	weight, live uint64
+	liveKnown    bool
+	leaseID      string
+	reason       string
+}
+
+// holdRequestsKey is the hold requests of a host's plan in a row key.
+func holdRequestsKey(reqs []scheduler.PendingHold) string {
+	var b strings.Builder
+
+	for i := range reqs {
+		fmt.Fprintf(&b, "%s\x00%t\x00%s\x00%s\x00%d\x00", reqs[i].Holder, reqs[i].Release, reqs[i].By,
+			reqs[i].Reason, reqs[i].At.UnixNano())
+	}
+
+	return b.String()
 }
 
 // cachedHostRow is the encoded row of a host and what it was made of.
@@ -866,8 +882,12 @@ func addHosts(
 		sum := &sums[i]
 		key := hostRowKey{
 			status: statusHashes[i], roles: strings.Join(sum.Roles, "\x00"), validators: sum.Validators,
-			stale: sum.Stale, boot: wireBoot(sum, boots), holdWanted: sum.HoldWanted,
-			holdReason: sum.HoldReason, holdBy: sum.HoldBy, plan: sum.Plan, unplanned: !planned(sum.Name),
+			stale: sum.Stale, boot: wireBoot(sum, boots),
+			plan: planKey{
+				slot: sum.Plan.Slot, weight: sum.Plan.Weight, live: sum.Plan.Live, liveKnown: sum.Plan.LiveKnown,
+				leaseID: sum.Plan.LeaseID, reason: sum.Plan.Reason,
+			},
+			holdRequests: holdRequestsKey(sum.Plan.HoldRequests), unplanned: !planned(sum.Name),
 		}
 
 		if sum.Stale {

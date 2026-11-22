@@ -223,13 +223,6 @@ func TestInstruct(t *testing.T) {
 
 const sha64 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
-// The local hold is the host's alone.
-func TestHoldSource(t *testing.T) {
-	assert.Equal(t, HoldLocal, HoldSource(FromLocal))
-	assert.Equal(t, HoldController, HoldSource(FromController))
-	assert.Equal(t, HoldController, HoldSource("anything else"))
-}
-
 func TestLocalEntry(t *testing.T) {
 	until := testNow.Add(time.Hour)
 	_, v := permitsView()
@@ -271,15 +264,14 @@ func TestLocalEntry(t *testing.T) {
 }
 
 func TestLocalHold(t *testing.T) {
-	assert.Equal(t, Hold{By: "pk", Reason: "held"}, LocalHold("local:pk", " "))
-	assert.Equal(t, Hold{By: "pk", Reason: "debugging"}, LocalHold("local:pk", "debugging\nmore"))
+	assert.Equal(t, Hold{By: "pk", Reason: "held", At: testNow}, LocalHold("local:pk", " ", testNow))
+	assert.Equal(t, Hold{By: "pk", Reason: "debugging", At: testNow}, LocalHold("local:pk", "debugging\nmore", testNow))
 }
 
-func TestControllerHold(t *testing.T) {
-	assert.Equal(t, Hold{By: "controller", Reason: "split\nmore"}, ControllerHold("split\nmore", nil),
-		"local cuts the text when it writes the hold")
-	assert.Equal(t, Hold{By: "pk@example.org", Reason: "split", Teams: []string{"geth", "lighthouse"}, Feature: "team_hold"},
-		ControllerHold("split", &protocol.Actor{
-			User: "pk@example.org", Teams: []string{"lighthouse", "geth", "Bad Team"}, Feature: "team_hold",
-		}))
+func TestDirectedHold(t *testing.T) {
+	d := &protocol.Directive{Kind: protocol.DirectiveHold, Holder: "geth", Reason: "split\nmore"}
+	assert.Equal(t, Hold{By: "controller", Reason: "split", At: testNow}, DirectedHold(d, testNow))
+
+	d.By = &protocol.Actor{User: "pk@example.org", Teams: []string{"geth"}, Feature: "team_manage"}
+	assert.Equal(t, Hold{By: "pk@example.org", Reason: "split", At: testNow}, DirectedHold(d, testNow))
 }

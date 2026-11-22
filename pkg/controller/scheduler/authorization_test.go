@@ -24,18 +24,18 @@ func TestStampAuthorization(t *testing.T) {
 	assert.Nil(t, entries[1].Detail)
 
 	teams := []string{"geth", "lighthouse"}
-	ctx := WithAuthorization(context.Background(), Authorization{By: "team_hold", Teams: teams})
+	ctx := WithAuthorization(context.Background(), Authorization{By: "team_manage", Teams: teams})
 
 	got, ok := AuthorizationFrom(ctx)
 	require.True(t, ok)
-	assert.Equal(t, Authorization{By: "team_hold", Teams: teams}, got)
+	assert.Equal(t, Authorization{By: "team_manage", Teams: teams}, got)
 
 	stampAuthorization(ctx, entries)
 
 	assert.Equal(t, map[string]any{
-		keyReason: "debugging", keyAuthorizedBy: "team_hold", keyTeams: teams,
+		keyReason: "debugging", keyAuthorizedBy: "team_manage", keyTeams: teams,
 	}, entries[0].Detail)
-	assert.Equal(t, map[string]any{keyAuthorizedBy: "team_hold", keyTeams: teams}, entries[1].Detail)
+	assert.Equal(t, map[string]any{keyAuthorizedBy: "team_manage", keyTeams: teams}, entries[1].Detail)
 
 	// The detail an action built is not written to, and the entry does not
 	// share the caller's team list.

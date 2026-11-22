@@ -355,7 +355,10 @@ func TestLoad(t *testing.T) {
 
 	_, _, err := tf.SetEntry("geth", "x", func(*plan.Entry) (*plan.Entry, error) { return nil, plan.Refusal("x") })
 	require.EqualError(t, err, files.Err)
-	assert.Equal(t, protocol.Hold{Local: true, LocalReason: files.Err}, plan.HoldState(&files, fileTime))
+	assert.Equal(t, protocol.Hold{
+		Local: true, LocalReason: files.Err,
+		Holds: []protocol.HostHold{{Holder: protocol.HolderHost, Reason: files.Err}},
+	}, plan.HoldState(&files, fileTime))
 
 	tf.write(t, "deployed: {}\n")
 	assert.Equal(t, "the overrides file cannot be read: "+errOldFormat.Error(), tf.Load().Err)

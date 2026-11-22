@@ -372,8 +372,9 @@ func TestEveryUserRouteIsGuarded(t *testing.T) {
 	}
 	staff := provider.Grant(t, controllertest.StaffServices)
 
-	// adminReads are the reading routes that need the feature admin.
-	adminReads := []string{"GET /api/v1/settings/sources"}
+	// adminReads are the reading routes that need a feature: admin, or
+	// details for the packages of the fleet.
+	adminReads := []string{"GET /api/v1/settings", "GET /api/v1/settings/sources", "GET /api/v1/packages"}
 	mutating := 0
 
 	for _, route := range routes {
@@ -462,7 +463,8 @@ func TestTeamFromAgentToViews(t *testing.T) {
 	rec := h.serve(h.agentRequest(old, protocol.PathSync, []byte(body), controllertest.CallOpts{}))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
-	reader := provider.Grant(t, "")
+	// The full view: the unmanaged containers are part of it.
+	reader := provider.Grant(t, "+upgradoor:details")
 
 	owners := func(host views.HostListing) map[string]string {
 		out := make(map[string]string, len(host.Containers))

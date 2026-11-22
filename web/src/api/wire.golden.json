@@ -32,6 +32,14 @@
       "revision": "rev-geth-1",
       "checkedAt": "2026-11-14T11:59:00Z",
       "pulled": true
+     },
+     "command": [
+      "--http",
+      "--zz-secret-flag=7"
+     ],
+     "stats": {
+      "memory": 3221225472,
+      "memoryLimit": 8589934592
      }
     },
     {
@@ -115,14 +123,39 @@
     "blocked": 1
    },
    "uptimeSeconds": 86400,
+   "resources": {
+    "cpu": {
+     "cores": 16,
+     "load1": 2.5,
+     "load5": 2,
+     "load15": 1.5,
+     "busy": 42.5
+    },
+    "memory": {
+     "total": 68719476736,
+     "available": 21474836480,
+     "swapTotal": 8589934592,
+     "swapUsed": 0
+    }
+   },
    "hold": {
     "local": true,
     "localReason": "zz debugging a consensus bug, ask sam",
-    "controller": false
+    "holds": [
+     {
+      "holder": "host",
+      "by": "pk",
+      "reason": "zz debugging a consensus bug, ask sam",
+      "at": "2026-11-14T12:00:00Z"
+     },
+     {
+      "holder": "staff",
+      "by": "alice@example.com",
+      "reason": "zz debugging a consensus bug, ask sam",
+      "at": "2026-11-14T12:00:00Z"
+     }
+    ]
    },
-   "holdWanted": true,
-   "holdReason": "zz debugging a consensus bug, ask sam",
-   "holdBy": "staff",
    "verbs": [
     "roll",
     "packages"
@@ -151,7 +184,12 @@
      }
     }
    ],
-   "actions": [],
+   "actions": [
+    {
+     "name": "zz-flush-caches",
+     "impact": "node"
+    }
+   ],
    "plan": {
     "slot": "held",
     "weight": 100,
@@ -237,6 +275,23 @@
      "grantedBy": "",
      "grantedAt": "0001-01-01T00:00:00Z",
      "expiresAt": "0001-01-01T00:00:00Z",
+     "operation": {
+      "leaseId": "lease-zz",
+      "phase": "failed",
+      "startedAt": "2026-11-14T12:00:00Z",
+      "updatedAt": "0001-01-01T00:00:00Z",
+      "steps": [
+       {
+        "needId": "action/1",
+        "status": "failed",
+        "action": {
+         "exitCode": 1,
+         "output": "zz flushed 3 caches on /dev/zzsda1"
+        }
+       }
+      ],
+      "disrupted": false
+     },
      "readiness": "zz EL peers 4, the fleet's median is 31 (needs 16)",
      "peerChecks": [
       {
@@ -290,10 +345,9 @@
      },
      "uptimeSeconds": 0,
      "hold": {
-      "local": false,
-      "controller": false
+      "local": false
      },
-     "holdWanted": false,
+     "holders": [],
      "verbs": [],
      "needs": [],
      "plan": {
@@ -367,14 +421,32 @@
       "blocked": 1
      },
      "uptimeSeconds": 86400,
+     "usage": {
+      "cpu": 43,
+      "memory": 69
+     },
      "hold": {
       "local": true,
       "localReason": "zz debugging a consensus bug, ask sam",
-      "controller": false
+      "holds": [
+       {
+        "holder": "host",
+        "by": "pk",
+        "reason": "zz debugging a consensus bug, ask sam",
+        "at": "2026-11-14T12:00:00Z"
+       },
+       {
+        "holder": "staff",
+        "by": "alice@example.com",
+        "reason": "zz debugging a consensus bug, ask sam",
+        "at": "2026-11-14T12:00:00Z"
+       }
+      ]
      },
-     "holdWanted": true,
-     "holdReason": "zz debugging a consensus bug, ask sam",
-     "holdBy": "staff",
+     "holders": [
+      "host",
+      "staff"
+     ],
      "verbs": [
       "roll",
       "packages"
@@ -395,7 +467,12 @@
       "leaseId": "lease-zz",
       "reason": "zz debugging a consensus bug, ask sam"
      },
-     "actions": []
+     "actions": [
+      {
+       "name": "zz-flush-caches",
+       "impact": "node"
+      }
+     ]
     },
     {
      "name": "lighthouse-geth-2",
@@ -460,24 +537,50 @@
       "blocked": 1
      },
      "uptimeSeconds": 86400,
+     "usage": {
+      "cpu": 43,
+      "memory": 69
+     },
      "hold": {
       "local": true,
       "localReason": "zz debugging a consensus bug, ask sam",
-      "controller": false
+      "holds": [
+       {
+        "holder": "host",
+        "by": "pk",
+        "reason": "zz debugging a consensus bug, ask sam",
+        "at": "2026-11-14T12:00:00Z"
+       },
+       {
+        "holder": "staff",
+        "by": "alice@example.com",
+        "reason": "zz debugging a consensus bug, ask sam",
+        "at": "2026-11-14T12:00:00Z"
+       }
+      ]
      },
-     "holdWanted": false,
+     "holders": [
+      "host",
+      "staff"
+     ],
      "verbs": [
       "roll",
       "packages"
      ],
      "needs": [],
      "plan": {
-      "slot": "idle",
+      "slot": "queued",
       "weight": 100,
-      "live": 0,
-      "liveKnown": false
+      "live": 100,
+      "liveKnown": true,
+      "reason": "network gate: beacon unavailable: Get \"http://zz-beacon.cluster.local:5052/eth/v1/node/syncing\": dial tcp 10.77.0.3:5052"
      },
-     "actions": []
+     "actions": [
+      {
+       "name": "zz-flush-caches",
+       "impact": "node"
+      }
+     ]
     }
    ]
   },
@@ -508,7 +611,8 @@
      "livenessKnown": true,
      "livenessEpoch": 224,
      "tracked": 200,
-     "live": 190
+     "live": 190,
+     "validatorRangesError": "the last fetch failed"
     }
    },
    "budget": {
@@ -527,6 +631,13 @@
      "reason": "zz debugging a consensus bug, ask sam",
      "wait": "",
      "rollouts": null
+    },
+    {
+     "host": "lighthouse-geth-2",
+     "position": 2,
+     "reason": "network gate: beacon unavailable: Get \"http://zz-beacon.cluster.local:5052/eth/v1/node/syncing\": dial tcp 10.77.0.3:5052",
+     "wait": "",
+     "rollouts": null
     }
    ],
    "hosts": {
@@ -537,6 +648,13 @@
      "liveKnown": true,
      "leaseId": "lease-zz",
      "reason": "zz debugging a consensus bug, ask sam"
+    },
+    "lighthouse-geth-2": {
+     "slot": "queued",
+     "weight": 100,
+     "live": 100,
+     "liveKnown": true,
+     "reason": "network gate: beacon unavailable: Get \"http://zz-beacon.cluster.local:5052/eth/v1/node/syncing\": dial tcp 10.77.0.3:5052"
     }
    }
   },
@@ -643,6 +761,7 @@
      "approved": false,
      "force": false,
      "ignoreBudget": false,
+     "ignoreGate": false,
      "createdBy": "",
      "createdAt": "0001-01-01T00:00:00Z",
      "updatedAt": "0001-01-01T00:00:00Z",
@@ -653,7 +772,8 @@
        "stage": 0,
        "updatedAt": "0001-01-01T00:00:00Z"
       }
-     ]
+     ],
+     "policy": "manual"
     }
    ],
    "recent": [],
@@ -694,6 +814,23 @@
      "grantedBy": "",
      "grantedAt": "0001-01-01T00:00:00Z",
      "expiresAt": "0001-01-01T00:00:00Z",
+     "operation": {
+      "leaseId": "lease-zz",
+      "phase": "failed",
+      "startedAt": "2026-11-14T12:00:00Z",
+      "updatedAt": "0001-01-01T00:00:00Z",
+      "steps": [
+       {
+        "needId": "action/1",
+        "status": "failed",
+        "action": {
+         "exitCode": 1,
+         "output": "zz flushed 3 caches on /dev/zzsda1"
+        }
+       }
+      ],
+      "disrupted": false
+     },
      "readiness": "zz EL peers 4, the fleet's median is 31 (needs 16)",
      "peerChecks": [
       {
@@ -714,7 +851,8 @@
     "maxIndependentPercent": 10,
     "minParticipationPercent": 90,
     "maxFinalityLagEpochs": 3,
-    "readyEpochs": 1,
+    "readyAttestations": 2,
+    "readyStableFor": "1m0s",
     "minPeers": 3,
     "leaseTtl": "30m0s",
     "hostStaleAfter": "2m0s",
@@ -737,7 +875,8 @@
     "maxIndependentPercent": 10,
     "minParticipationPercent": 90,
     "maxFinalityLagEpochs": 3,
-    "readyEpochs": 1,
+    "readyAttestations": 2,
+    "readyStableFor": "1m0s",
     "minPeers": 3,
     "leaseTtl": "30m0s",
     "hostStaleAfter": "2m0s",
@@ -813,7 +952,6 @@
      [
       1
      ],
-     0,
      [
       0,
       0,
@@ -832,6 +970,7 @@
       0,
       0,
       2,
+      0,
       1,
       224,
       0,
@@ -867,13 +1006,13 @@
    ]
   },
   "t": 1794657600,
-  "v": "9d8462f64f55"
+  "v": "e835fe10b14d"
  },
  "user": {
   "a": {
    "r": [
     [
-     1
+     3
     ]
    ]
   },
@@ -881,14 +1020,15 @@
    "r": [
     [
      "qq-stealth-cl-team",
-     49,
-     50,
+     57,
+     58,
      0,
+     58,
      [
       [
        16,
        13,
-       35,
+       40,
        0,
        2,
        1,
@@ -905,13 +1045,14 @@
      0,
      0,
      0,
-     51
+     59
     ],
     [
      "qq-stealth-el-team",
-     52,
-     50,
+     60,
+     58,
      0,
+     58,
      [
       [
        11,
@@ -920,8 +1061,15 @@
        9,
        2,
        0,
-       0,
-       2
+       [
+        61,
+        62
+       ],
+       2,
+       [
+        61,
+        62
+       ]
       ]
      ],
      2,
@@ -933,7 +1081,7 @@
      0,
      0,
      0,
-     53
+     63
     ]
    ]
   },
@@ -1010,7 +1158,24 @@
        0,
        0,
        0,
-       0,
+       [
+        "lease-zz",
+        "failed",
+        1794657600,
+        0,
+        0,
+        [
+         [
+          "action/1",
+          "failed",
+          0,
+          [
+           1,
+           "zz flushed 3 caches on /dev/zzsda1"
+          ]
+         ]
+        ]
+       ],
        "zz EL peers 4, the fleet's median is 31 (needs 16)",
        0,
        [
@@ -1105,6 +1270,17 @@
           1794657540,
           0,
           1
+         ],
+         [
+          "--http",
+          "--zz-secret-flag=7"
+         ],
+         0,
+         0,
+         [
+          0,
+          3221225472,
+          8589934592
          ]
         ],
         [
@@ -1200,12 +1376,39 @@
        ],
        86400,
        [
-        1,
-        "zz debugging a consensus bug, ask sam"
+        [
+         16,
+         2.5,
+         2,
+         1.5,
+         [
+          42.5
+         ]
+        ],
+        [
+         68719476736,
+         21474836480,
+         8589934592
+        ]
        ],
-       1,
-       "zz debugging a consensus bug, ask sam",
-       "staff",
+       [
+        1,
+        "zz debugging a consensus bug, ask sam",
+        [
+         [
+          "host",
+          "pk",
+          "zz debugging a consensus bug, ask sam",
+          1794657600
+         ],
+         [
+          "staff",
+          "alice@example.com",
+          "zz debugging a consensus bug, ask sam",
+          1794657600
+         ]
+        ]
+       ],
        0,
        0,
        [
@@ -1249,7 +1452,13 @@
          ]
         ]
        ],
-       [],
+       [
+        [
+         "zz-flush-caches",
+         0,
+         "node"
+        ]
+       ],
        [
         "held",
         100,
@@ -1284,10 +1493,9 @@
      [],
      [],
      0,
+     0,
      [],
-     0,
-     0,
-     0,
+     [],
      0,
      [],
      [],
@@ -1366,34 +1574,63 @@
      ],
      0,
      [
-      1,
-      30
-     ],
-     1,
-     30,
-     "staff",
-     0,
-     [
-      31,
-      32
-     ],
-     [
       [
-       32
+       43
       ],
       [
-       33
+       69
       ]
      ],
      [
-      34,
+      1,
+      30,
+      [
+       [
+        "host",
+        31,
+        30,
+        1794657600
+       ],
+       [
+        "staff",
+        32,
+        30,
+        1794657600
+       ]
+      ]
+     ],
+     [
+      33,
+      34
+     ],
+     0,
+     [
+      35,
+      36
+     ],
+     [
+      [
+       36
+      ],
+      [
+       37
+      ]
+     ],
+     [
+      38,
       100,
       90,
       1,
       "lease-zz",
       30
      ],
-     [],
+     [
+      [
+       "zz-flush-caches",
+       0,
+       39
+      ]
+     ],
      1794571200
     ],
     [
@@ -1420,8 +1657,8 @@
       [
        12,
        13,
-       35,
-       36,
+       40,
+       41,
        10,
        1,
        16,
@@ -1464,25 +1701,57 @@
      ],
      0,
      [
+      [
+       43
+      ],
+      [
+       69
+      ]
+     ],
+     [
       1,
-      30
+      30,
+      [
+       [
+        "host",
+        31,
+        30,
+        1794657600
+       ],
+       [
+        "staff",
+        32,
+        30,
+        1794657600
+       ]
+      ]
+     ],
+     [
+      33,
+      34
      ],
      0,
-     0,
-     0,
-     0,
      [
-      31,
-      32
+      35,
+      36
      ],
      [],
      [
-      3,
-      100
+      42,
+      100,
+      100,
+      1,
+      0,
+      43
      ],
-     [],
-     1794571200,
-     1
+     [
+      [
+       "zz-flush-caches",
+       0,
+       39
+      ]
+     ],
+     1794571200
     ]
    ]
   },
@@ -1496,8 +1765,8 @@
     ],
     [
      "cl sigp/lighthouse:unstable",
-     35,
-     36
+     40,
+     41
     ]
    ]
   },
@@ -1505,12 +1774,12 @@
    "r": [
     [
      "lease-zz",
-     38,
-     42,
+     45,
+     50,
      [
       [
        "packages/03cc7f406059e2fc",
-       32,
+       36,
        0,
        0,
        0,
@@ -1521,15 +1790,15 @@
         [
          [
           "zzdocker-ce",
-          43,
-          44
+          51,
+          52
          ]
         ]
        ]
       ],
       [
        "reboot",
-       33,
+       37,
        0,
        0,
        0,
@@ -1539,7 +1808,7 @@
        0,
        [
         [
-         45
+         53
         ]
        ]
       ]
@@ -1556,18 +1825,35 @@
      0,
      0,
      0,
-     0,
-     46,
+     [
+      "lease-zz",
+      50,
+      1794657600,
+      0,
+      0,
+      [
+       [
+        "action/1",
+        50,
+        0,
+        [
+         1,
+         "zz flushed 3 caches on /dev/zzsda1"
+        ]
+       ]
+      ]
+     ],
+     54,
      0,
      [
       [
-       47,
+       55,
        4,
        31,
        16
       ]
      ],
-     48
+     56
     ]
    ],
    "o": [
@@ -1583,8 +1869,8 @@
      "rollout-zz/lighthouse-geth-1",
      "rollout-zz",
      0,
-     38,
-     41
+     45,
+     49
     ]
    ]
   },
@@ -1595,7 +1881,6 @@
      [
       1
      ],
-     0,
      [
       0,
       0,
@@ -1614,12 +1899,13 @@
       0,
       0,
       2,
+      0,
       1,
       224,
       0,
       200,
       190,
-      0,
+      "the last fetch failed",
       1,
       5
      ]
@@ -1641,9 +1927,14 @@
   "q": {
    "r": [
     [
-     38,
+     45,
      1,
      30
+    ],
+    [
+     44,
+     2,
+     43
     ]
    ]
   },
@@ -1651,7 +1942,7 @@
    "r": [
     [
      "rollout-zz",
-     33,
+     37,
      "reboot",
      "reboot",
      0,
@@ -1660,10 +1951,21 @@
      0,
      0,
      0,
-     39,
+     46,
      0,
      1,
-     40
+     47,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     48
     ]
    ],
    "o": [
@@ -1705,16 +2007,24 @@
    "6.12.48+deb13-zzfix",
    "libzzfixture-crypto3",
    "zz debugging a consensus bug, ask sam",
+   "pk",
+   "alice@example.com",
+   "host",
+   "staff",
    "roll",
    "packages",
    "reboot",
    "held",
+   "node",
    "sha256:c2c2",
    "rev-lh-c2c2",
+   "queued",
+   "network gate: beacon unavailable: Get \"http://zz-beacon.cluster.local:5052/eth/v1/node/syncing\": dial tcp 10.77.0.3:5052",
    "lighthouse-geth-2",
    "lighthouse-geth-1",
    "active",
    "zz paused after the canary; resume to continue",
+   "manual",
    "pending",
    "failed",
    "5:28.0.0-zz1",
@@ -1725,85 +2035,12 @@
    "zz container exited 137",
    "consensus",
    "auto",
-   "f13f1da5dd40d8d4",
+   "def2b291bd9b76fc",
    "execution",
-   "79c41df8e43eb99f",
-   "manual"
+   "--http",
+   "--zz-secret-flag=7",
+   "09915cf85f4760b6"
   ],
-  "se": {
-   "r": [
-    [
-     [
-      10,
-      10,
-      10,
-      90,
-      3,
-      1,
-      3,
-      [
-       "30m0s"
-      ],
-      [
-       "2m0s"
-      ],
-      [
-       "30m0s"
-      ],
-      50,
-      50,
-      54,
-      [
-       {}
-      ],
-      [
-       {}
-      ],
-      0,
-      0,
-      0,
-      0,
-      [
-       "5m0s"
-      ]
-     ],
-     [
-      10,
-      10,
-      10,
-      90,
-      3,
-      1,
-      3,
-      [
-       "30m0s"
-      ],
-      [
-       "2m0s"
-      ],
-      [
-       "30m0s"
-      ],
-      50,
-      50,
-      54,
-      [
-       {}
-      ],
-      [
-       {}
-      ],
-      0,
-      0,
-      0,
-      0,
-      [
-       "5m0s"
-      ]
-     ]
-    ]
-   ]
-  },
   "sl": {
    "r": [
     [
@@ -1813,7 +2050,7 @@
      3,
      [
       [
-       37,
+       44,
        2,
        1
       ]
@@ -1822,25 +2059,61 @@
    ]
   },
   "t": 1794657600,
-  "v": "9d8462f64f55"
+  "v": "e835fe10b14d"
  },
  "patch": {
+  "c": {
+   "u": [
+    [
+     "qq-stealth-cl-team",
+     15,
+     67
+    ],
+    [
+     "qq-stealth-el-team",
+     15,
+     68
+    ]
+   ]
+  },
   "h": {
    "u": [
     [
      "lighthouse-geth-2",
      11,
-     1,
+     [
+      0,
+      0,
+      [
+       [
+        "staff",
+        64,
+        65,
+        1794657600
+       ],
+       [
+        "geth",
+        66,
+        0,
+        1794657600
+       ]
+      ]
+     ],
      12,
-     55,
-     13,
-     "staff"
+     [
+      34,
+      6
+     ]
     ]
    ]
   },
   "i": 2,
   "s": [
-   "golden"
+   "alice",
+   "golden",
+   "gina",
+   "4106a505fc633723",
+   "4ac2b2903954c76e"
   ]
  },
  "slotPatch": {
@@ -1893,10 +2166,9 @@
     },
     "uptimeSeconds": 0,
     "hold": {
-     "local": false,
-     "controller": false
+     "local": false
     },
-    "holdWanted": false,
+    "holders": [],
     "verbs": [],
     "needs": [],
     "plan": {
@@ -1970,14 +2242,32 @@
      "blocked": 1
     },
     "uptimeSeconds": 86400,
+    "usage": {
+     "cpu": 43,
+     "memory": 69
+    },
     "hold": {
      "local": true,
      "localReason": "zz debugging a consensus bug, ask sam",
-     "controller": false
+     "holds": [
+      {
+       "holder": "host",
+       "by": "pk",
+       "reason": "zz debugging a consensus bug, ask sam",
+       "at": "2026-11-14T12:00:00Z"
+      },
+      {
+       "holder": "staff",
+       "by": "alice@example.com",
+       "reason": "zz debugging a consensus bug, ask sam",
+       "at": "2026-11-14T12:00:00Z"
+      }
+     ]
     },
-    "holdWanted": true,
-    "holdReason": "zz debugging a consensus bug, ask sam",
-    "holdBy": "staff",
+    "holders": [
+     "host",
+     "staff"
+    ],
     "verbs": [
      "roll",
      "packages"
@@ -1998,7 +2288,12 @@
      "leaseId": "lease-zz",
      "reason": "zz debugging a consensus bug, ask sam"
     },
-    "actions": []
+    "actions": [
+     {
+      "name": "zz-flush-caches",
+      "impact": "node"
+     }
+    ]
    },
    {
     "name": "lighthouse-geth-2",
@@ -2063,26 +2358,48 @@
      "blocked": 1
     },
     "uptimeSeconds": 86400,
-    "hold": {
-     "local": true,
-     "localReason": "zz debugging a consensus bug, ask sam",
-     "controller": false
+    "usage": {
+     "cpu": 43,
+     "memory": 69
     },
-    "holdWanted": true,
-    "holdReason": "golden",
-    "holdBy": "staff",
+    "hold": {
+     "local": false,
+     "holds": [
+      {
+       "holder": "staff",
+       "by": "alice",
+       "reason": "golden",
+       "at": "2026-11-14T12:00:00Z"
+      },
+      {
+       "holder": "geth",
+       "by": "gina",
+       "at": "2026-11-14T12:00:00Z"
+      }
+     ]
+    },
+    "holders": [
+     "staff",
+     "geth"
+    ],
     "verbs": [
      "roll",
      "packages"
     ],
     "needs": [],
     "plan": {
-     "slot": "idle",
+     "slot": "queued",
      "weight": 100,
-     "live": 0,
-     "liveKnown": false
+     "live": 100,
+     "liveKnown": true,
+     "reason": "network gate: beacon unavailable: Get \"http://zz-beacon.cluster.local:5052/eth/v1/node/syncing\": dial tcp 10.77.0.3:5052"
     },
-    "actions": []
+    "actions": [
+     {
+      "name": "zz-flush-caches",
+      "impact": "node"
+     }
+    ]
    }
   ]
  }

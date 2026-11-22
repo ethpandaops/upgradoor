@@ -1,11 +1,10 @@
-import { render, screen, within } from '@testing-library/react';
+import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 
 import type { Rollout } from '../api/types';
-import { defaultSettings } from '../mock/fixture';
-import { createHarness, renderWithApp } from '../test/harness';
-import { RolloutTargets, RolloutsTab, policyFor } from './RolloutsTab';
+import { createHarness, PRIMARY, renderWithApp } from '../test/harness';
+import { RolloutTargets, RolloutsTab, waitsForApproval } from './RolloutsTab';
 
 const digest = (c: string) => `sha256:${c.repeat(64)}`;
 
@@ -20,10 +19,12 @@ function rollout(p: Partial<Rollout>): Rollout {
     approved: false,
     force: false,
     ignoreBudget: false,
+    ignoreGate: false,
     createdBy: 'scheduler',
     createdAt: '2026-11-20T10:00:00Z',
     updatedAt: '2026-11-20T10:00:00Z',
     hosts: [],
+    policy: 'auto',
     ...p,
   };
 }
@@ -50,6 +51,94 @@ describe('RolloutsTab', () => {
     expect(within(hosts).getByText('lighthouse-geth-4').closest('tr')).toHaveTextContent(
       'waiting to pull its image again after a failed pull'
     );
+  });
+});
+
+describe('RolloutsTab, a held member', () => {
+  it('names the holders instead of a plain pending, and counts the held members', async () => {
+    const h = await createHarness({ mode: 'open' });
+    await h.api.action({ action: 'hold', body: { hosts: ['lighthouse-geth-3'], reason: 'disk swap' } });
+    renderWithApp(<RolloutsTab />, h);
+
+    const card = await screen.findByRole('article', { name: /^lighthouse cl: / });
+    const row = within(within(card).getByRole('table', { name: /^Hosts of / }))
+      .getByText('lighthouse-geth-3')
+      .closest('tr') as HTMLElement;
+    expect(await within(row).findAllByText('held by staff')).toHaveLength(2);
+    expect(row).toHaveTextContent('not rolled while it lasts');
+    expect(row).not.toHaveTextContent('pending');
+    expect(within(card).getByRole('img', { name: /^\d+ hosts: / })).toHaveAccessibleName(
+      expect.stringMatching(/ waiting, 1 held/) as string
+    );
+  });
+});
+
+describe('RolloutsTab, decisions of a person', () => {
+  it('approves a verifying lease now, showing its readiness note', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<RolloutsTab />, h);
+
+    const card = await screen.findByRole('article', { name: /^lighthouse cl: / });
+    const row = within(within(card).getByRole('table', { name: /^Hosts of / }))
+      .getByText('lighthouse-geth-2')
+      .closest('tr') as HTMLElement;
+    await user.click(within(row).getByRole('button', { name: 'Approve now…' }));
+
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByRole('list', { name: 'Current state' })).toHaveTextContent(/^Readiness: .+/);
+    await user.click(within(dialog).getByRole('button', { name: 'Approve now' }));
+
+    await waitFor(() => {
+      expect(h.calls.some(c => c.path === '/api/v1/actions/approve-lease')).toBe(true);
+    });
+    expect(h.calls.find(c => c.path === '/api/v1/actions/approve-lease')?.body).toMatchObject({
+      host: 'lighthouse-geth-2',
+      reason: '',
+    });
+  });
+
+  it('ends a lease as cancelled: the rollout pauses and the host waits for a retry, not failed', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<RolloutsTab />, h);
+
+    const leases = await screen.findByRole('table', { name: 'Active leases' });
+    await user.click(within(leases).getByRole('button', { name: 'End the lease of lighthouse-geth-2' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'End the lease' }));
+
+    const card = await screen.findByRole('article', { name: /^lighthouse cl: / });
+    await waitFor(() => {
+      expect(card).toHaveTextContent('paused (lighthouse-geth-2 cancelled by anonymous)');
+    });
+    const row = within(within(card).getByRole('table', { name: /^Hosts of / }))
+      .getByText('lighthouse-geth-2')
+      .closest('tr') as HTMLElement;
+    expect(row).toHaveTextContent('cancelled');
+    expect(row).not.toHaveTextContent('failed');
+    expect(within(row).getByRole('button', { name: /^Retry lighthouse-geth-2/ })).toBeEnabled();
+  });
+
+  it('lets a rollout that waits at the closed gate pass it, and badges it', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    h.controller.setGateFailing(true);
+    renderWithApp(<RolloutsTab />, h);
+
+    const button = (await screen.findAllByRole('button', { name: 'Roll despite network state…' }))[0];
+    if (!button) throw new Error('no rollout waits at the gate');
+    const card = button.closest('article') as HTMLElement;
+    await user.click(button);
+
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByRole('list', { name: 'Current state' })).toHaveTextContent(/Network gate closed: /);
+    await user.click(within(dialog).getByRole('button', PRIMARY));
+
+    await waitFor(() => {
+      expect(within(card).getByText('ignores gate')).toBeInTheDocument();
+    });
+    expect(within(card).queryByRole('button', { name: 'Roll despite network state…' })).not.toBeInTheDocument();
+    expect(h.calls.some(c => c.path === '/api/v1/actions/ignore-gate')).toBe(true);
   });
 });
 
@@ -108,22 +197,10 @@ describe('RolloutTargets', () => {
   });
 });
 
-describe('policyFor', () => {
-  it('gives a group rollout the image policy of its team where one is set, policyImage without a team', () => {
-    const settings = { ...defaultSettings(), policyClients: { besu: 'manual' as const }, policyImage: 'auto' as const };
-    expect(policyFor(settings, rollout({ team: 'besu' }))).toBe('manual');
-    expect(policyFor(settings, rollout({ team: 'prysm' }))).toBe('auto');
-    expect(policyFor({ ...settings, policyImage: 'manual' }, rollout({ containerKind: 'snooper-el' }))).toBe('manual');
-    expect(policyFor(settings, rollout({ kind: 'local' }))).toBeUndefined();
-  });
-
-  it("gives a due host action its own policy, manual without one, and a person's start none", () => {
-    const settings = { ...defaultSettings(), actionPolicies: { 'security-upgrades': 'auto' as const } };
-    const due = (action: string) => rollout({ kind: 'action', key: `action:${action}`, action });
-    expect(policyFor(settings, due('security-upgrades'))).toBe('auto');
-    expect(policyFor(settings, due('docker-prune'))).toBe('manual');
-    expect(
-      policyFor(settings, rollout({ kind: 'action', key: 'manual:ro-1', action: 'docker-prune' }))
-    ).toBeUndefined();
+describe('waitsForApproval', () => {
+  it('holds a rollout on the manual policy until it is approved', () => {
+    expect(waitsForApproval(rollout({ policy: 'manual' }))).toBe(true);
+    expect(waitsForApproval(rollout({ policy: 'manual', approved: true }))).toBe(false);
+    expect(waitsForApproval(rollout({ policy: 'auto' }))).toBe(false);
   });
 });

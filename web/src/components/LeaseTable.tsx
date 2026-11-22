@@ -166,7 +166,7 @@ export function LeaseTable({
                     blocked={
                       ending ? 'This lease is ending: it stays open until the agent reports or the lease runs out' : ''
                     }
-                    intent={endLeaseIntent(l.id, l.host)}
+                    intent={endLeaseIntent(l)}
                     onAction={() => {
                       onEnd(l);
                     }}

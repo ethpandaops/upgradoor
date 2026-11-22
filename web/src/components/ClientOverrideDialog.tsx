@@ -128,7 +128,7 @@ export function ClientOverrideDialog({
 
   const verdicts = calls.map(c => permissions.can(c));
   const verdict = verdicts.find(v => !v.allowed) ??
-    verdicts[0] ?? { allowed: false, reason: 'Pick what to clear', by: '', staggered: false };
+    verdicts[0] ?? { allowed: false, reason: 'Pick what to clear', by: '' };
 
   const submit = async () => {
     setBusy(true);

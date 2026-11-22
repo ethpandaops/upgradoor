@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"maps"
 	"os"
 	"path/filepath"
 	"slices"
@@ -44,7 +45,7 @@ type content struct {
 	Manual []protocol.Need `json:"manualNeeds,omitempty"`
 	// Current is the lease the agent holds with its operation.
 	Current *Record `json:"current,omitempty"`
-	// Holds are the holds by source (plan.HoldLocal, plan.HoldController).
+	// Holds are the holds by holder (protocol.HolderHost for the local one).
 	Holds map[string]plan.Hold `json:"holds,omitempty"`
 }
 
@@ -106,8 +107,8 @@ type State interface {
 	ReconcileManual(kept []protocol.Need, dropped []string) error
 	// Holds returns a copy of the holds by source.
 	Holds() map[string]plan.Hold
-	// SetHold stores the hold of a source, or (h nil) takes it out.
-	SetHold(source string, h *plan.Hold) error
+	// SetHold stores the hold of a holder, or (h nil) takes it out.
+	SetHold(holder string, h *plan.Hold) error
 
 	// file is the store behind the interface, for the Runner.
 	file() *store
@@ -440,14 +441,14 @@ func (s *store) Holds() map[string]plan.Hold {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	return cloneHolds(s.cur.Holds)
+	return maps.Clone(s.cur.Holds)
 }
 
 // SetHold implements State.
-func (s *store) SetHold(source string, h *plan.Hold) error {
+func (s *store) SetHold(holder string, h *plan.Hold) error {
 	return s.update(func(c *content) {
 		if h == nil {
-			delete(c.Holds, source)
+			delete(c.Holds, holder)
 
 			return
 		}
@@ -456,21 +457,8 @@ func (s *store) SetHold(source string, h *plan.Hold) error {
 			c.Holds = make(map[string]plan.Hold, 2)
 		}
 
-		hold := *h
-		hold.Teams = slices.Clone(h.Teams)
-		c.Holds[source] = hold
+		c.Holds[holder] = *h
 	})
-}
-
-func cloneHolds(in map[string]plan.Hold) map[string]plan.Hold {
-	out := make(map[string]plan.Hold, len(in))
-
-	for source, h := range in {
-		h.Teams = slices.Clone(h.Teams)
-		out[source] = h
-	}
-
-	return out
 }
 
 // answer returns the remembered answer to a directive, or nil.
@@ -491,7 +479,7 @@ func (c *content) clone() *content {
 	out.Manual = plan.CloneNeeds(c.Manual)
 
 	if c.Holds != nil {
-		out.Holds = cloneHolds(c.Holds)
+		out.Holds = maps.Clone(c.Holds)
 	}
 
 	if c.Current != nil {

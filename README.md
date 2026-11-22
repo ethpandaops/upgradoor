@@ -21,9 +21,22 @@ upgradoor only recreates them on a newer digest of their tag (or an override).
 - Policies `auto` or `manual` per verb (`policyImage`, `policyPackages`,
   `policyReboot`) and per client (`policyClients`). Settings are edited in the
   UI; `--default-setting key=value` sets their defaults.
-- Web UI and API with logins from the devnet's authenticatoor. Actions need a
-  feature of the service `upgradoor` (`roll`, `reboot`, `hold`, `recover`,
-  `admin`, ...); client teams get `team_*` features for their own containers.
+- Web UI and API with logins from the devnet's authenticatoor. Every login
+  reads a reduced view; more needs a feature of the service `upgradoor`:
+
+  | feature | allows |
+  |---|---|
+  | `details` | host details: OS, kernel, packages, unmanaged containers, addresses, host actions |
+  | `manage` | roll, reboot, hold, mark-offline, skip, retry, end-lease, client policy, image refresh, pause/resume/approve/abort of a rollout, `force`, `ignoreBudget`, all hosts; host actions without a `feature:` |
+  | `manage_image` | image overrides |
+  | `manage_flags` | flag overrides |
+  | `admin` | all of the above, forget, global pause, settings, data sources |
+
+  Each except `admin` has a `team_` twin limited to what the token's teams
+  own (`team_manage`: no reboot, mark-offline or image refresh). A plain feature includes its twin; a
+  grant `manage*` covers all three `manage` features. A host action in
+  `agent.yaml` names its `feature:` (default `manage`); members of its
+  `teams:` may start it without one.
 
 ## Containers
 

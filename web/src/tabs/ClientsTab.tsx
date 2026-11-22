@@ -16,9 +16,10 @@ import {
 import { useApp, useAuthState, usePrivateAccess } from '../appContext';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { KIND_LABEL, clientKinds } from '../components/ClientOverrideDialog';
-import { CopyButton, CopyValue, Digest } from '../components/Digest';
+import { CopyValue, Digest } from '../components/Digest';
 import { ActionIcon, ActionMenu } from '../components/icons';
 import { useLive } from '../components/Live';
+import { useQuery } from '../hooks/useQuery';
 import { OverrideButtons, overrideState } from '../components/Overrides';
 import { ActionButton, usePermissions } from '../components/Permissions';
 import { RelTime } from '../components/RelTime';
@@ -38,14 +39,16 @@ import {
 } from '../components/primitives';
 import { BulkAction, IntentAction, SelectionBar } from '../components/SelectionBar';
 import { CLIENT_STATE_LABEL, CLIENT_STATE_MEANING, ClientStateBadge, OfflineBadge } from '../components/status';
+import { ContainerUsage, UsageCell, usageLabel } from '../components/Usage';
 import { useClientHosts } from '../hooks/useClientHosts';
 import { useDebounced } from '../hooks/useDebounced';
 import { useHashSub } from '../hooks/useHashTab';
 import { setKept, useKept } from '../hooks/useKept';
+import { commandDiff } from '../lib/flags';
 import { absoluteTime, displayImage, plural, shortRevision } from '../lib/format';
-import { clientPolicyIntent, holdIntent, scopeIntent } from '../lib/intents';
+import { approveIntent, clientPolicyIntent, holdIntent } from '../lib/intents';
 import { POLICIES, POLICY_MEANING } from '../lib/settingsForm';
-import { RecentRollouts, RolloutCard, policyFor, useRolloutData, waitsForApproval } from './RolloutsTab';
+import { RecentRollouts, RolloutCard, useRolloutData, waitsForApproval } from './RolloutsTab';
 
 /** The number of hosts on a page of a client's list. It is fixed, so the pages have one height. */
 export const CLIENT_PAGE_SIZE = 50;
@@ -79,10 +82,11 @@ export function defaultClient(clients: readonly ClientView[], teams: readonly st
  * #clients/geth/rollouts).
  */
 export function ClientsTab({ onOpenTab }: { onOpenTab: (tab: 'hosts') => void }) {
-  const { auth } = useApp();
+  const { auth, api } = useApp();
   const priv = usePrivateAccess();
   const teams = useAuthState(auth).teams;
   const live = useLive('clients', priv);
+  const { hostDetails } = usePermissions();
   const [sub, setSub] = useHashSub('clients');
   const [wanted, wantedView] = sub.split('/');
   const view: PageView = wantedView === 'rollouts' ? 'rollouts' : 'hosts';
@@ -92,7 +96,12 @@ export function ClientsTab({ onOpenTab }: { onOpenTab: (tab: 'hosts') => void })
 
   const clients = list(live.data?.clients);
   const selected = clients.find(c => c.name === wanted)?.name ?? defaultClient(clients, teams);
-  const client = clients.find(c => c.name === selected);
+  const shown = clients.find(c => c.name === selected);
+
+  // Without details the stream carries no command lines; the REST view has them for the login's own clients.
+  const own = !hostDetails && shown !== undefined && teams.includes(shown.name);
+  const rest = useQuery(s => api.clients(s), { key: `${shown?.name ?? ''} ${shown?.version ?? ''}`, enabled: own });
+  const client = own ? withCommands(shown, list(rest.data?.clients)) : shown;
 
   if (!priv) return <Empty>Log in to see the clients.</Empty>;
   if (live.error !== undefined) return <ErrorBanner error={live.error} what="the clients" />;
@@ -110,8 +119,8 @@ export function ClientsTab({ onOpenTab }: { onOpenTab: (tab: 'hosts') => void })
   return (
     <div className="flex min-w-0 flex-col gap-3">
       {/* One row: the consensus clients, then the execution clients; it scrolls sideways where it does not fit. */}
-      <nav aria-label="Clients" className="min-w-0 overflow-x-auto border-b border-border">
-        <div className="flex w-max min-w-full items-stretch">
+      <nav aria-label="Clients" className="min-w-0 overflow-x-auto">
+        <div className="flex w-max min-w-full items-stretch border-b border-border">
           {LAYERS.map((layer, i) => (
             <div key={layer.id} className={cx('flex items-stretch gap-1', i > 0 && 'ml-3 border-l border-border pl-3')}>
               <span
@@ -250,7 +259,7 @@ function ClientPage({
   const rollouts = useRolloutData();
   const open = list(rollouts.rollouts.data?.open).filter(r => r.team === client.name);
   const recent = list(rollouts.rollouts.data?.recent).filter(r => r.team === client.name);
-  const approvals = open.filter(r => waitsForApproval(r, policyFor(rollouts.settings, r)));
+  const approvals = open.filter(waitsForApproval);
 
   // Kept while another tab is shown, per client.
   const [place, setPlace] = useKept<Place>(`clients/${client.name}`, START);
@@ -287,6 +296,12 @@ function ClientPage({
   const pagePicked = rows.length > 0 && rows.every(r => isPicked(r.host));
 
   const summaries = useMemo(() => new Map(list(hostTable.data?.hosts).map(h => [h.name, h])), [hostTable.data]);
+
+  // The resource columns are for a login that reads the hosts' system: in full, or on the hosts its team owns.
+  const { hostDetails } = usePermissions();
+  const usage = hostDetails || rows.some(r => r.usage !== undefined);
+  const columns = usage ? 7 : 5;
+  const [expanded, setExpanded] = useState<ReadonlySet<string>>(new Set());
 
   // Names of a whole-filter selection come from the controller when an action is chosen.
   const [resolving, setResolving] = useState(false);
@@ -553,6 +568,16 @@ function ClientPage({
                     </Th>
                     <Th className="w-52">Host</Th>
                     <Th className="w-80">State</Th>
+                    {usage && (
+                      <>
+                        <Th className="w-24" title="CPU busy since the previous sync">
+                          CPU
+                        </Th>
+                        <Th className="w-24" title="Memory not available">
+                          Memory
+                        </Th>
+                      </>
+                    )}
                     <Th>
                       <span className="flex items-center gap-2">
                         <span className={KIND_WIDTH}>Kind</span>
@@ -569,7 +594,7 @@ function ClientPage({
                 <tbody>
                   {rows.length === 0 && (
                     <tr>
-                      <Td colSpan={5} className="py-4 text-center text-muted">
+                      <Td colSpan={columns} className="py-4 text-center text-muted">
                         No host of {client.name} matches the filter.
                       </Td>
                     </tr>
@@ -580,6 +605,16 @@ function ClientPage({
                       client={client}
                       row={row}
                       summary={summaries.get(row.host)}
+                      usage={usage}
+                      columns={columns}
+                      expanded={expanded.has(row.host)}
+                      onExpand={() => {
+                        setExpanded(prev => {
+                          const next = new Set(prev);
+                          if (!next.delete(row.host)) next.add(row.host);
+                          return next;
+                        });
+                      }}
                       selected={isPicked(row.host)}
                       onSelect={() => {
                         // Unticking one host of a whole-filter selection keeps the others of this page.
@@ -650,7 +685,7 @@ function ApprovalCallout({
                 icon={r.paused ? 'resume' : 'check'}
                 label={r.paused ? 'Resume and approve…' : 'Approve…'}
                 onAction={onAction}
-                intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.team)}
+                intent={approveIntent(`Approve rollout: ${r.title}`, r.id, r.team)}
               />
             </span>
           </li>
@@ -688,14 +723,7 @@ function ClientRollouts({
         ) : (
           <div className="flex flex-col gap-3">
             {open.map(r => (
-              <RolloutCard
-                key={r.id}
-                rollout={r}
-                policy={policyFor(data.settings, r)}
-                queue={data.queue}
-                leases={data.leases}
-                onAction={onAction}
-              />
+              <RolloutCard key={r.id} rollout={r} queue={data.queue} leases={data.leases} onAction={onAction} />
             ))}
           </div>
         )}
@@ -749,9 +777,9 @@ function StateChip({
 
 /**
  * ClientConfig is the client's configuration, first on its page: per kind
- * of container the image it follows (with what the tag points at) and the
- * flags its hosts report as their base; how many hosts deviate, as chips that
- * filter the list; the changes for every host of the client; the policy.
+ * of container the image it follows (with what the tag points at); how many
+ * hosts deviate, as chips that filter the list; the changes for every host
+ * of the client; the policy.
  */
 function ClientConfig({
   client,
@@ -873,14 +901,25 @@ function ClientConfig({
   );
 }
 
-/** KindConfig is the configuration of one kind of container of the client: image, tag target, flags. */
+/** withCommands takes the command lines of a client's images from the REST view of the clients. */
+function withCommands(client: ClientView, rest: readonly ClientView[] | undefined): ClientView {
+  const full = rest?.find(c => c.name === client.name);
+  if (!full) return client;
+  return {
+    ...client,
+    images: list(client.images).map(img => {
+      const same = list(full.images).find(i => i.kind === img.kind && i.image === img.image);
+      return same ? { ...img, command: same.command, commandHosts: same.commandHosts } : img;
+    }),
+  };
+}
+
+/** KindConfig is the configuration of one kind of container of the client: image and tag target. */
 function KindConfig({ kind, images }: { kind: ContainerKind; images: readonly ClientImage[] }) {
-  // The reference most hosts follow carries the flags; other references (a host configured apart) are listed under it.
-  const main = [...images].sort((a, b) => b.hosts - a.hosts)[0];
+  // The reference most hosts follow first; other references (a host configured apart) are listed under it.
+  const main = mainImage(images);
   if (!main) return null;
   const others = images.filter(i => i !== main);
-  const flags = list(main.command);
-  const differ = main.hosts - main.commandHosts;
 
   return (
     <div className="flex min-w-0 flex-col gap-2 rounded-sm bg-surface-raised px-3 py-2.5">
@@ -913,34 +952,6 @@ function KindConfig({ kind, images }: { kind: ContainerKind; images: readonly Cl
             also <span className="font-mono break-all">{o.image}</span> on {plural(o.hosts, 'host')}
           </span>
         ))}
-      </div>
-
-      <div className="flex flex-col gap-1">
-        <span className="flex items-center justify-between gap-2 text-xs/5 text-muted">
-          <span>
-            {flags.length === 0 ? 'No flags reported' : `Flags (${flags.length})`}
-            {differ > 0 && flags.length > 0 && (
-              <span className="text-warning"> · {plural(differ, 'host runs', 'hosts run')} other flags</span>
-            )}
-          </span>
-          {flags.length > 0 && (
-            <CopyButton value={flags.join(' ')} label={`Copy the flags of the ${KIND_LABEL[kind] ?? kind}`} />
-          )}
-        </span>
-        {flags.length > 0 && (
-          // A compact code block: the flags flow together, wrapping by whole flag (a flag longer than the
-          // line breaks anywhere); past its height the block scrolls instead of growing.
-          <ul
-            aria-label={`Flags of the ${KIND_LABEL[kind] ?? kind}`}
-            className="flex max-h-28 min-w-0 flex-wrap content-start gap-x-2.5 overflow-y-auto rounded-sm border border-border bg-surface px-2.5 py-1.5 font-mono text-xs/5"
-          >
-            {flags.map((flag, i) => (
-              <li key={`${i} ${flag}`} className="min-w-0 wrap-anywhere">
-                {flag}
-              </li>
-            ))}
-          </ul>
-        )}
       </div>
     </div>
   );
@@ -996,8 +1007,7 @@ const POLICY_LABEL: Record<Policy, string> = { auto: 'Automatic', manual: 'Manua
  */
 function PolicySetting({ client, onAction }: { client: ClientView; onAction: (intent: ActionIntent) => void }) {
   const permissions = usePermissions();
-  const settings = useLive('settings');
-  const fallback = settings.data?.settings.policyImage;
+  const fallback = client.defaultPolicy;
 
   const verdict = permissions.canIntent(clientPolicyIntent(client.name, client.policy));
 
@@ -1020,15 +1030,13 @@ function PolicySetting({ client, onAction }: { client: ClientView; onAction: (in
         }}
       />
       <span className="text-muted">
-        {client.policySet
-          ? 'set for this client'
-          : `the default for images${fallback ? ` (${POLICY_LABEL[fallback].toLowerCase()})` : ''}`}
+        {client.policySet ? 'set for this client' : `the default for images (${POLICY_LABEL[fallback].toLowerCase()})`}
         {' · '}
         {POLICY_MEANING[client.policy]}
       </span>
       {client.policySet && (
         <ActionButton dense variant="ghost" onAction={onAction} intent={clientPolicyIntent(client.name, '')}>
-          Use the default{fallback ? ` (${POLICY_LABEL[fallback].toLowerCase()})` : ''}…
+          Use the default ({POLICY_LABEL[fallback].toLowerCase()})…
         </ActionButton>
       )}
       {!verdict.allowed && <span className="text-muted">Read only: {verdict.reason}.</span>}
@@ -1037,6 +1045,18 @@ function PolicySetting({ client, onAction }: { client: ClientView; onAction: (in
 }
 
 // -------------------------------------------------------------------- rows
+
+/** mainImage is the reference most of the client's hosts follow for a kind. */
+function mainImage(images: readonly ClientImage[]): ClientImage | undefined {
+  return [...images].sort((a, b) => b.hosts - a.hosts)[0];
+}
+
+/** commonArgs are the arguments most hosts of the client run for the container's kind and image. */
+function commonArgs(client: ClientView, c: Container): readonly string[] | undefined {
+  const images = list(client.images).filter(i => i.kind === c.kind);
+  const image = images.find(i => i.image === (c.configuredImage || c.image)) ?? mainImage(images);
+  return image ? list(image.commonArgs) : undefined;
+}
 
 const KIND_WIDTH = 'w-6 shrink-0';
 const IMAGE_WIDTH = 'w-72 shrink-0';
@@ -1071,6 +1091,10 @@ function ClientHostRow({
   client,
   row,
   summary,
+  usage,
+  columns,
+  expanded,
+  onExpand,
   selected,
   onSelect,
   onOpenHost,
@@ -1080,105 +1104,204 @@ function ClientHostRow({
   row: ClientHost;
   /** summary is the host's row of the host table: its hold, and what the agent allows. */
   summary: HostListing | undefined;
+  /** usage: the table has the resource columns; columns is how many columns it has. */
+  usage: boolean;
+  columns: number;
+  /** expanded shows the host's command lines under the row. */
+  expanded: boolean;
+  onExpand: () => void;
   selected: boolean;
   onSelect: () => void;
   onOpenHost: (host: string) => void;
   onAction: (intent: ActionIntent) => void;
 }) {
   const containers = list(row.containers);
-  const held = summary ? summary.holdWanted || summary.hold.controller : row.state === 'held';
+  // A hold a person can lift: any but the host's own.
+  const held = summary ? list(summary.holders).some(holder => holder !== 'host') : row.state === 'held';
   const rollable = clientContainers([row]).length > 0;
   const mayRoll = summary === undefined || list(summary.verbs).includes('roll');
   const overridden = containers.some(c => c.override);
+  const expandable = containers.some(c => c.command !== undefined);
 
   return (
-    // One height for every row: two lines, whatever the state says and however many containers there are.
-    <tr className={cx('h-14 hover:bg-surface-hover', selected && 'bg-surface-selected')}>
-      <Td tight className="pl-3 text-center">
-        <input
-          type="checkbox"
-          aria-label={`Select ${row.host}`}
-          checked={selected}
-          onChange={onSelect}
-          className="accent-accent"
-        />
-      </Td>
-      <Td>
-        <button
-          type="button"
-          title={`Open ${row.host} on the Hosts tab`}
-          onClick={() => {
-            onOpenHost(row.host);
-          }}
-          className="block max-w-full truncate rounded-xs text-sm/6 font-medium hover:text-accent hover:underline"
-        >
-          {row.host}
-        </button>
-      </Td>
-      <Td>
-        <span className="flex items-center gap-2">
-          <HostStateCell row={row} />
-          <OfflineBadge mark={summary?.offline} />
-        </span>
-      </Td>
-      <Td>
-        <span className="flex flex-col">
-          {containers.map(c => (
-            <ContainerLine key={c.name} container={c} />
-          ))}
-        </span>
-      </Td>
-      <Td>
-        <span role="group" aria-label={`Actions for ${row.host}`} className="flex items-center justify-end gap-0.5">
-          <ActionIcon
-            icon="roll"
-            label={`Roll ${client.name} on ${row.host}`}
-            blocked={
-              !mayRoll
-                ? 'The agent does not allow the verb roll'
-                : rollable
-                  ? ''
-                  : 'No container of the client can be rolled'
-            }
-            onAction={onAction}
-            intent={rollIntent([row], summary ? new Map([[row.host, summary]]) : new Map())}
+    <>
+      {/* One height for every row: two lines, whatever the state says and however many containers there are. */}
+      <tr className={cx('h-14 hover:bg-surface-hover', selected && 'bg-surface-selected')}>
+        <Td tight className="pl-3 text-center">
+          <input
+            type="checkbox"
+            aria-label={`Select ${row.host}`}
+            checked={selected}
+            onChange={onSelect}
+            className="accent-accent"
           />
-          <ActionIcon
-            icon={held ? 'unhold' : 'hold'}
-            label={held ? `Unhold ${row.host}` : `Hold ${row.host}`}
-            onAction={onAction}
-            intent={holdIntent(held ? 'unhold' : 'hold', [row.host])}
-          />
-          <OverrideButtons host={row.host} containers={containers} stale={row.stale === true} onAction={onAction} />
-          <ActionMenu
-            label={`More actions for ${row.host}`}
-            onAction={onAction}
-            items={[
-              {
-                icon: 'open',
-                label: 'Open on the Hosts tab',
-                onSelect: () => {
-                  onOpenHost(row.host);
+        </Td>
+        <Td>
+          <span className="flex min-w-0 items-center gap-1">
+            {expandable && (
+              <button
+                type="button"
+                aria-expanded={expanded}
+                aria-label={`Command lines of ${row.host}`}
+                onClick={onExpand}
+                className="w-4 shrink-0 text-muted hover:text-foreground"
+              >
+                {expanded ? '▾' : '▸'}
+              </button>
+            )}
+            <button
+              type="button"
+              title={`Open ${row.host} on the Hosts tab`}
+              onClick={() => {
+                onOpenHost(row.host);
+              }}
+              className="block min-w-0 truncate rounded-xs text-sm/6 font-medium hover:text-accent hover:underline"
+            >
+              {row.host}
+            </button>
+          </span>
+        </Td>
+        <Td>
+          <span className="flex items-center gap-2">
+            <HostStateCell row={row} />
+            <OfflineBadge mark={summary?.offline} />
+          </span>
+        </Td>
+        {usage && (
+          <>
+            <Td>
+              <UsageCell value={row.usage?.cpu} label={usageLabel('cpu', row.host)} />
+            </Td>
+            <Td>
+              <UsageCell value={row.usage?.memory} label={usageLabel('memory', row.host)} />
+            </Td>
+          </>
+        )}
+        <Td>
+          <span className="flex flex-col">
+            {containers.map(c => (
+              <ContainerLine key={c.name} container={c} />
+            ))}
+          </span>
+        </Td>
+        <Td>
+          <span role="group" aria-label={`Actions for ${row.host}`} className="flex items-center justify-end gap-0.5">
+            <ActionIcon
+              icon="roll"
+              label={`Roll ${client.name} on ${row.host}`}
+              blocked={
+                !mayRoll
+                  ? 'The agent does not allow the verb roll'
+                  : rollable
+                    ? ''
+                    : 'No container of the client can be rolled'
+              }
+              onAction={onAction}
+              intent={rollIntent([row], summary ? new Map([[row.host, summary]]) : new Map())}
+            />
+            <ActionIcon
+              icon={held ? 'unhold' : 'hold'}
+              label={held ? `Unhold ${row.host}` : `Hold ${row.host}`}
+              onAction={onAction}
+              intent={holdIntent(held ? 'unhold' : 'hold', [row.host])}
+            />
+            <OverrideButtons host={row.host} containers={containers} stale={row.stale === true} onAction={onAction} />
+            <ActionMenu
+              label={`More actions for ${row.host}`}
+              onAction={onAction}
+              items={[
+                {
+                  icon: 'open',
+                  label: 'Open on the Hosts tab',
+                  onSelect: () => {
+                    onOpenHost(row.host);
+                  },
                 },
-              },
-              {
-                icon: 'reboot',
-                label: 'Reboot the host…',
-                intent: { kind: 'reboot', hosts: [row.host], all: false },
-                blocked:
-                  summary && !list(summary.verbs).includes('reboot') ? 'The agent does not allow the verb reboot' : '',
-              },
-              {
-                icon: 'clear',
-                label: 'Clear the override…',
-                intent: { kind: 'client-override', part: 'clear', client, hosts: [row.host] },
-                blocked: overridden ? '' : 'No container of the client has an override here',
-              },
-            ]}
-          />
-        </span>
-      </Td>
-    </tr>
+                {
+                  icon: 'reboot',
+                  label: 'Reboot the host…',
+                  intent: { kind: 'reboot', hosts: [row.host], all: false },
+                  blocked:
+                    summary && !list(summary.verbs).includes('reboot')
+                      ? 'The agent does not allow the verb reboot'
+                      : '',
+                },
+                {
+                  icon: 'clear',
+                  label: 'Clear the override…',
+                  intent: { kind: 'client-override', part: 'clear', client, hosts: [row.host] },
+                  blocked: overridden ? '' : 'No container of the client has an override here',
+                },
+              ]}
+            />
+          </span>
+        </Td>
+      </tr>
+      {expanded && (
+        <tr className="bg-background">
+          <Td colSpan={columns} className="whitespace-normal">
+            <NodeDetail client={client} row={row} />
+          </Td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+/**
+ * NodeDetail is what a host's row opens to: the command line of each
+ * container of the client, with the arguments that differ from what most
+ * hosts of the client run marked.
+ */
+function NodeDetail({ client, row }: { client: ClientView; row: ClientHost }) {
+  return (
+    <div className="flex flex-col gap-3 py-1">
+      {list(row.containers).map(c => {
+        if (c.command === undefined) return null;
+        const base = commonArgs(client, c);
+        const diff = commandDiff(c.command, base ?? c.command);
+
+        return (
+          <div key={c.name} className="flex flex-col gap-1">
+            <span className="flex items-center gap-2 text-xs/5 text-muted">
+              <span className="font-semibold uppercase">{KIND_LABEL[c.kind ?? ''] ?? c.kind ?? c.name}</span>
+              <span className="font-mono">{c.name}</span>
+              {c.stats && <ContainerUsage stats={c.stats} />}
+              {base !== undefined && (
+                <span>
+                  {diff.args.some(a => a.extra) || diff.missing.length > 0
+                    ? 'marked: differs from the other hosts'
+                    : 'as on the other hosts'}
+                </span>
+              )}
+            </span>
+            <ul
+              aria-label={`Command line of ${c.name} on ${row.host}`}
+              className="flex min-w-0 flex-wrap gap-x-2.5 rounded-sm border border-border bg-surface px-2.5 py-1.5 font-mono text-xs/5"
+            >
+              {diff.args.map(({ arg, extra }, i) => (
+                <li
+                  key={`${i} ${arg}`}
+                  title={extra ? 'Most hosts of the client do not run this' : undefined}
+                  className={cx('min-w-0 wrap-anywhere', extra && 'rounded-xs bg-warning-subtle px-1 text-warning')}
+                >
+                  {arg}
+                </li>
+              ))}
+              {diff.missing.map(arg => (
+                <li
+                  key={`missing ${arg}`}
+                  title="Most hosts of the client run this; this one does not"
+                  className="min-w-0 text-faint line-through wrap-anywhere"
+                >
+                  {arg}
+                </li>
+              ))}
+            </ul>
+          </div>
+        );
+      })}
+    </div>
   );
 }
 
@@ -1272,6 +1395,11 @@ function ContainerLine({ container: c }: { container: Container }) {
         <CopyValue value={c.revision} short={shortRevision(c.revision)} label="revision" />
       ) : (
         <span className="text-faint">–</span>
+      )}
+      {c.stats && (
+        <span className="ml-auto pl-2 text-muted">
+          <ContainerUsage stats={c.stats} />
+        </span>
       )}
     </span>
   );

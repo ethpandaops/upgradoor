@@ -22,6 +22,7 @@ const (
 	pathSpec     = "/eth/v1/config/spec"
 	pathHead     = "/eth/v1/beacon/headers/head"
 	pathFinality = "/eth/v1/beacon/states/head/finality_checkpoints"
+	pathSyncing  = "/eth/v1/node/syncing"
 )
 
 func TestPollPublishesChainView(t *testing.T) {
@@ -334,49 +335,6 @@ func TestSlotDurationNotWholeSeconds(t *testing.T) {
 	assert.Zero(t, whole.warnings(warning))
 }
 
-func TestEndpointFailoverIsSticky(t *testing.T) {
-	h := newHarness(t, 2, newFakeStore(host("a", 0, 4)), nil)
-	first, second := h.nodes[0], h.nodes[1]
-
-	first.set(func(n *fakeNode) { n.down = true })
-	h.svc.poll(t.Context())
-
-	got := h.svc.Health()
-	assert.Empty(t, got.Error)
-	assert.True(t, got.LivenessKnown)
-	assert.Equal(t, 1, first.totalRequests(), "the dead endpoint is tried once per outage")
-	assert.Positive(t, second.count(pathHead))
-
-	// The first endpoint is back, but the one that works stays in use.
-	first.set(func(n *fakeNode) { n.down = false })
-	h.clock.Advance(testEpoch)
-	h.svc.poll(t.Context())
-
-	assert.Empty(t, h.svc.Health().Error)
-	assert.Equal(t, 1, first.totalRequests())
-	assert.Equal(t, 2, second.count(pathHead))
-
-	// The second endpoint dies: back to the first.
-	secondBefore := second.totalRequests()
-
-	second.set(func(n *fakeNode) { n.down = true })
-	h.clock.Advance(testEpoch)
-	h.svc.poll(t.Context())
-
-	got = h.svc.Health()
-	assert.Empty(t, got.Error)
-	assert.Equal(t, h.clock.Now(), got.UpdatedAt)
-	assert.Equal(t, uint64(11), got.LivenessEpoch)
-	assert.Equal(t, secondBefore+1, second.totalRequests())
-	assert.Equal(t, 1, first.count(pathHead))
-
-	h.clock.Advance(testSlot)
-	h.svc.poll(t.Context())
-
-	assert.Equal(t, secondBefore+1, second.totalRequests(), "sticky on the first again")
-	assert.Equal(t, 2, first.count(pathHead))
-}
-
 func TestEndpointStatus(t *testing.T) {
 	h := newHarness(t, 2, newFakeStore(host("a", 0, 4)), func(o *Options) {
 		o.Endpoints[0] = strings.Replace(o.Endpoints[0], "http://", "http://user:secret@", 1)
@@ -387,24 +345,46 @@ func TestEndpointStatus(t *testing.T) {
 	assert.Nil(t, New(h.log, h.opts).Endpoints(), "nothing before Start")
 
 	first.set(func(n *fakeNode) { n.down = true })
+	second.set(func(n *fakeNode) { n.finalized = 9 })
 	h.svc.poll(t.Context())
 
 	got := h.svc.Endpoints()
 	require.Len(t, got, 2)
 
-	assert.Equal(t, label(first), got[0].Label, "no credentials")
-	assert.False(t, got[0].Active)
-	assert.True(t, got[0].SuccessAt.IsZero())
-	assert.Nil(t, got[0].HeadSlot)
-	assert.Contains(t, got[0].Error, "HTTP 503: beacon node is syncing")
-	assert.Equal(t, h.clock.Now(), got[0].ErrorAt)
+	assert.Equal(t, EndpointStatus{
+		Label:   label(first),
+		State:   EndpointDown,
+		Error:   "GET /eth/v1/beacon/headers/head: HTTP 503: beacon node is syncing",
+		ErrorAt: h.clock.Now(),
+	}, got[0], "no credentials")
 
-	assert.Equal(t, label(second), got[1].Label)
-	assert.True(t, got[1].Active)
-	assert.Equal(t, h.clock.Now(), got[1].SuccessAt)
-	require.NotNil(t, got[1].HeadSlot)
-	assert.Equal(t, uint64(82), *got[1].HeadSlot)
-	assert.Empty(t, got[1].Error)
+	assert.Equal(t, EndpointStatus{
+		Label:          label(second),
+		State:          EndpointOK,
+		HeadSlot:       new(uint64(82)),
+		HeadRoot:       "0x01",
+		FinalizedEpoch: new(uint64(9)),
+		SuccessAt:      h.clock.Now(),
+	}, got[1])
+
+	assert.Equal(t, uint64(9), h.svc.Health().FinalizedEpoch)
+
+	// The first endpoint is back: both are used. What it said last stays
+	// with the endpoint that stops answering.
+	first.set(func(n *fakeNode) { n.down = false })
+	second.set(func(n *fakeNode) { n.down = true })
+	h.clock.Advance(testSlot)
+	h.svc.poll(t.Context())
+
+	got = h.svc.Endpoints()
+	assert.Equal(t, EndpointOK, got[0].State)
+	assert.Equal(t, h.clock.Now(), got[0].SuccessAt)
+	assert.Equal(t, EndpointDown, got[1].State)
+	assert.Equal(t, new(uint64(82)), got[1].HeadSlot)
+
+	health := h.svc.Health()
+	assert.Empty(t, health.Error)
+	assert.Equal(t, uint64(8), health.FinalizedEpoch)
 
 	for _, e := range got {
 		assert.NotContains(t, e.Label+e.Error, "secret")
@@ -474,6 +454,11 @@ func TestMalformedAnswers(t *testing.T) {
 			wantErr: "not an unsigned integer"},
 		{name: "finality without epoch", path: pathFinality, body: `{"data":{"finalized":{}}}`,
 			wantErr: "no finalized epoch"},
+		{name: "sync state without is_syncing", path: pathSyncing, body: `{"data":{}}`,
+			wantErr: "no is_syncing"},
+		{name: "head root not a root", path: pathHead,
+			body:    `{"data":{"root":"/../x","header":{"message":{"slot":"1"}}}}`,
+			wantErr: "no valid root"},
 	}
 
 	for _, tt := range tests {

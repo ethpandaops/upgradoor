@@ -3,12 +3,14 @@ package agent
 import (
 	"context"
 	"fmt"
+	"maps"
 	"slices"
 	"strings"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 // deployIgnored are the docker_container comparisons Ansible leaves to the
@@ -108,10 +110,10 @@ func (l localAPI) Hold(user string, req *local.HoldRequest) error {
 			return plan.Refusal("%s", reason)
 		}
 
-		err = a.state.SetHold(plan.HoldSource(plan.FromLocal), nil)
+		err = a.state.SetHold(protocol.HolderHost, nil)
 	} else {
-		hold := plan.LocalHold(user, req.Reason)
-		err = a.state.SetHold(plan.HoldSource(plan.FromLocal), &hold)
+		hold := plan.LocalHold(user, req.Reason, a.now())
+		err = a.state.SetHold(protocol.HolderHost, &hold)
 	}
 
 	if err != nil {
@@ -127,29 +129,39 @@ func (l localAPI) Hold(user string, req *local.HoldRequest) error {
 	return err
 }
 
-// noLocalHold says why a release has nothing to release, naming the
-// controller's hold that stays; empty when there is a local hold.
+// noLocalHold says why a release has nothing to release, naming the holds
+// of the controller that stay; empty when there is a local hold.
 func noLocalHold(holds map[string]plan.Hold, now time.Time) string {
-	if _, ok := holds[plan.HoldLocal]; ok {
+	if _, ok := holds[protocol.HolderHost]; ok {
 		return ""
 	}
 
-	h, ok := holds[plan.HoldController]
-	if !ok || h.Expired(now) {
+	held := make([]string, 0, len(holds))
+
+	for _, holder := range slices.Sorted(maps.Keys(holds)) {
+		h := holds[holder]
+		if h.Expired(now) {
+			continue
+		}
+
+		part := holder
+		if h.By != "" {
+			part += " by " + h.By
+		}
+
+		if h.Reason != "" {
+			part += " (" + h.Reason + ")"
+		}
+
+		held = append(held, part)
+	}
+
+	if len(held) == 0 {
 		return "there is no local hold"
 	}
 
-	msg := "there is no local hold; the host is on controller hold"
-
-	if h.By != "" {
-		msg += " by " + h.By
-	}
-
-	if h.Reason != "" {
-		msg += " (" + h.Reason + ")"
-	}
-
-	return msg + ", which is lifted on the controller"
+	return "there is no local hold; the host is held by " + strings.Join(held, ", ") +
+		", lifted on the controller"
 }
 
 // Roll adds a roll unless plan.RollRefusal refuses it against the last view

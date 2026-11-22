@@ -237,8 +237,8 @@ pass "host-1 really rebooted (boot $boots -> $(sysbox_boot_count "$h1"))"
 [ "$(sysbox_boot_id "$h1")" != "$boot_id" ] || die "boot id did not change"
 
 sysbox_exec "$h1" jq -e --arg l "$lease" '.. | objects | select(.leaseId? == $l)' \
-    /var/lib/upgradoor/state.json >/dev/null 2>&1 ||
-    sysbox_exec "$h1" grep -q "$lease" /var/lib/upgradoor/state.json ||
+    /data/upgradoor/state.json >/dev/null 2>&1 ||
+    sysbox_exec "$h1" grep -q "$lease" /data/upgradoor/state.json ||
     die "the lease is not in the agent's state file after the reboot"
 pass "lease $lease is in the agent's state file after the reboot"
 

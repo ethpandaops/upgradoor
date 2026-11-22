@@ -1,14 +1,20 @@
 import { describe, expect, it } from 'vitest';
 
+import type { Hold } from '../api/types';
+
 import {
   absoluteTime,
   displayImage,
+  formatBytes,
   formatDuration,
   formatPercent,
+  heldBy,
+  isHeld,
   hostList,
   isZeroTime,
   percentOf,
   plural,
+  queuePlace,
   relativeTime,
   secondsBetween,
   shortDigest,
@@ -106,6 +112,15 @@ describe('absoluteTime and zero times', () => {
   });
 });
 
+describe('queuePlace', () => {
+  it.each([
+    [1, 'next'],
+    [3, '#3 in line'],
+  ])('queuePlace(%s) = %s', (position, want) => {
+    expect(queuePlace(position)).toBe(want);
+  });
+});
+
 describe('percent helpers', () => {
   it.each([
     [100, '100%'],
@@ -127,6 +142,19 @@ describe('percent helpers', () => {
   });
 });
 
+describe('formatBytes', () => {
+  it.each([
+    [0, '0 B'],
+    [1000, '1000 B'],
+    [512 * 2 ** 20, '512 MiB'],
+    [3.14 * 2 ** 30, '3.1 GiB'],
+    [12.6 * 2 ** 30, '13 GiB'],
+    [1.8 * 2 ** 40, '1.8 TiB'],
+  ])('formatBytes(%s) = %s', (bytes, want) => {
+    expect(formatBytes(bytes)).toBe(want);
+  });
+});
+
 describe('plural and hostList', () => {
   it('pluralises', () => {
     expect(plural(1, 'host')).toBe('1 host');
@@ -137,5 +165,26 @@ describe('plural and hostList', () => {
   it('truncates long host lists', () => {
     expect(hostList(['a', 'b'])).toBe('a, b');
     expect(hostList(['a', 'b', 'c', 'd'], 2)).toBe('a, b and 2 more');
+  });
+});
+
+describe('heldBy and isHeld', () => {
+  const host = (hold: Hold) => ({ hold });
+  const at = '2026-11-22T10:00:00Z';
+
+  it('names the holders as the scheduler does, the host first', () => {
+    const held = host({
+      local: true,
+      holds: [
+        { holder: 'host', at },
+        { holder: 'staff', at },
+        { holder: 'lighthouse', at },
+      ],
+    });
+    expect(heldBy(held)).toBe('held by the host, staff, lighthouse');
+    expect(isHeld(held)).toBe(true);
+    expect(heldBy(host({ local: false, holds: [{ holder: 'geth', at }] }))).toBe('held by geth');
+    expect(heldBy(host({ local: false }))).toBeUndefined();
+    expect(isHeld(host({ local: false }))).toBe(false);
   });
 });

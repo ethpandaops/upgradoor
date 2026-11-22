@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import { MAX_FLAGS, applyFlags, parseFlags, validateFlag, validateFlags } from './flags';
+import { MAX_FLAGS, applyFlags, commandDiff, parseFlags, validateFlag, validateFlags } from './flags';
 
 const CMD = ['--network=devnet', '--datadir', '/data', '--http', '--port', '8545', '--verbosity=3', '--port', '9000'];
 
@@ -61,5 +61,18 @@ describe('the flags of a text field', () => {
     const many = Array.from({ length: MAX_FLAGS / 2 }, (_, i) => `--f${i}`);
     expect(validateFlags(many, many)).toBeNull();
     expect(validateFlags([...many, '--one-more'], many)).toMatch(/more than 64/);
+  });
+});
+
+describe('commandDiff', () => {
+  it('marks what the base lacks and lists what the command line lacks', () => {
+    expect(commandDiff(['--http', '--port=2', '--debug'], ['--http', '--port=1'])).toEqual({
+      args: [
+        { arg: '--http', extra: false },
+        { arg: '--port=2', extra: true },
+        { arg: '--debug', extra: true },
+      ],
+      missing: ['--port=1'],
+    });
   });
 });

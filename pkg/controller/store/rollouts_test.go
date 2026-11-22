@@ -147,7 +147,7 @@ func TestRollouts(t *testing.T) {
 			packages.Team, packages.ContainerKind, packages.Targets = "", "", nil
 			packages.Packages = []protocol.PackageChange{{Name: "docker-ce", From: "1", To: "2"}}
 			packages.Reason = "node-2 failed: \"exit 1\""
-			packages.Paused, packages.Force, packages.IgnoreBudget = true, true, true
+			packages.Paused, packages.Force, packages.IgnoreBudget, packages.IgnoreGate = true, true, true, true
 			packages.Hosts[1].State = fleet.HostFailed
 			packages.Hosts[1].LeaseID = "l9"
 			packages.Hosts[1].Error = "exit 1"
@@ -513,15 +513,17 @@ func TestDirectives(t *testing.T) {
 			assert.NotNil(t, empty)
 			assert.Empty(t, empty)
 
+			// A hold directive carries its holder.
 			rejected := testDirective("d-rejected", "node-2", fleet.DirectiveRejected, 20)
-			rejected.Error = "local hold"
+			rejected.Kind, rejected.Holder = protocol.DirectiveHold, "geth"
+			rejected.Error = "holder is not staff or a team"
 
 			// An override directive carries who asked and what.
 			until := at(3600)
 			hold := testDirective("d-hold", "node-2", fleet.DirectivePending, 30)
 			hold.Directive = protocol.Directive{
 				ID: "d-hold", Kind: protocol.DirectiveOverride, Container: "geth",
-				By: &protocol.Actor{User: "sam@example.org", Teams: []string{"geth"}, Feature: "team_image_override"},
+				By: &protocol.Actor{User: "sam@example.org", Teams: []string{"geth"}, Feature: "team_manage_image"},
 				Override: &protocol.OverrideInstruction{
 					Part: protocol.OverrideImage, Image: "ethpandaops/geth:fix", Until: &until,
 				},
@@ -623,6 +625,20 @@ func TestCommit(t *testing.T) {
 			} {
 				assert.Equal(t, want, countRows(t, s, table), table)
 			}
+
+			served := testRollout("r1", fleet.RolloutActive, 0, "node-1")
+			served.Hosts[0].Served = true
+			require.NoError(t, s.Commit(ctx, &Changes{Rollouts: []*fleet.Rollout{served}}))
+
+			got, err := s.GetRollout(ctx, "r1")
+			require.NoError(t, err)
+			assert.True(t, got.Hosts[0].Served)
+
+			require.NoError(t, s.Commit(ctx, &Changes{Dropped: []string{"r1"}}))
+
+			_, err = s.GetRollout(ctx, "r1")
+			require.ErrorIs(t, err, ErrNotFound)
+			assert.Zero(t, countRows(t, s, "rollout_hosts"), "the members go with it")
 		})
 	}
 }

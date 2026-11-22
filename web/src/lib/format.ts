@@ -1,5 +1,7 @@
 // Formatting helpers for digests, times, durations and shares.
 
+import { list, type Hold } from '../api/types';
+
 const ZERO_TIME_PREFIX = '0001-01-01';
 
 /** isZeroTime reports whether an RFC 3339 string is absent or the Go zero time. */
@@ -81,6 +83,14 @@ export function secondsBetween(a: string | null | undefined, b: string | null | 
   return Number.isNaN(d) ? null : d;
 }
 
+/** QUEUE_PLACE_TITLE explains queuePlace. */
+export const QUEUE_PLACE_TITLE = "position in the scheduler's queue";
+
+/** queuePlace names a position in the plan queue: "next" or "#3 in line". */
+export function queuePlace(position: number): string {
+  return position <= 1 ? 'next' : `#${position} in line`;
+}
+
 /** formatPercent renders a 0-100 value: whole numbers bare, others with one decimal. */
 export function formatPercent(value: number): string {
   if (!Number.isFinite(value)) return '–';
@@ -92,6 +102,21 @@ export function formatPercent(value: number): string {
 export function percentOf(part: number, total: number): string {
   if (!total) return '–';
   return formatPercent((part / total) * 100);
+}
+
+const BYTE_UNITS = ['B', 'KiB', 'MiB', 'GiB', 'TiB', 'PiB'];
+
+/** formatBytes renders a size in binary units: "512 MiB", "3.1 GiB", "12 GiB". */
+export function formatBytes(bytes: number): string {
+  if (!Number.isFinite(bytes) || bytes < 0) return '–';
+  let unit = 0;
+  let v = bytes;
+  while (v >= 1024 && unit < BYTE_UNITS.length - 1) {
+    v /= 1024;
+    unit++;
+  }
+  const shown = unit > 0 && v < 10 ? (Math.round(v * 10) / 10).toString() : Math.round(v).toString();
+  return `${shown} ${BYTE_UNITS[unit] ?? 'B'}`;
 }
 
 /** plural renders "1 host" / "3 hosts". */
@@ -115,4 +140,19 @@ export function pauseLabel(pauseReason: string | null | undefined): string {
 export function hostList(hosts: readonly string[], max = 8): string {
   if (hosts.length <= max) return hosts.join(', ');
   return `${hosts.slice(0, max).join(', ')} and ${hosts.length - max} more`;
+}
+
+/** isHeld reports whether a hold is in effect: the agent reports one. */
+export function isHeld(s: { hold: Hold }): boolean {
+  return s.hold.local || list(s.hold.holds).length > 0;
+}
+
+/**
+ * heldBy says what holds the host as the scheduler's waiting reason does: "held
+ * by the host, staff, lighthouse". Undefined when nothing holds it.
+ */
+export function heldBy(s: { hold: Hold }): string | undefined {
+  const by = list(s.hold.holds).map(h => (h.holder === 'host' ? 'the host' : h.holder));
+  if (by.length > 0) return `held by ${by.join(', ')}`;
+  return s.hold.local ? 'held by the host' : undefined;
 }

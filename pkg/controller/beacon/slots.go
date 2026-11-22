@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"math"
 	"math/bits"
 	"slices"
 	"sort"
@@ -31,8 +32,8 @@ import (
 //     block). A validator counts once however many aggregates name it;
 //   - proposed: whether S has a canonical block.
 //
-// The canonical chain is followed by root: every poll starts at the head the
-// node reports and walks the parent roots back to a block it already knows.
+// The canonical chain is followed by root: every poll starts at the head
+// followed (endpoints.go) and walks the parent roots back to a block it already knows.
 // That is one request per new block, and it makes a reorg visible: the blocks
 // that are no longer on the chain are dropped with what they included and
 // the slots they touched are counted again.
@@ -45,8 +46,8 @@ import (
 // that epoch has ended (a reorg reaching further back than slotWindowEpochs
 // is not followed). A slot without a block is stored as not proposed with
 // what was included of it so far, which is nothing while the chain stands
-// still; a node that is merely behind (it says so) gets no rows for the slots
-// it has not seen.
+// still: the endpoints read from are in sync (endpoints.go), so a head that
+// does not move is a chain that does not.
 const (
 	// DefaultSlotRetention is how long slot rows are kept: the longest window
 	// the web UI offers (12 h) and a margin.
@@ -176,7 +177,13 @@ type chainBlock struct {
 	attestations []attestation
 }
 
-// headRef is the head the node reported in this poll.
+// first reports whether the block is the first of the chain: its parent
+// root is all zeros.
+func (b *chainBlock) first() bool {
+	return b.slot == 0 || strings.Trim(b.parent, "0x") == ""
+}
+
+// headRef is a head by root and slot.
 type headRef struct {
 	root string
 	slot uint64
@@ -196,8 +203,9 @@ type slotTracker struct {
 	// anchor is the root of the newest canonical block below blocks: where a
 	// walk ends when it has passed all of them.
 	anchor string
-	// fetched holds the blocks of a walk that did not finish, so a retry
-	// does not ask for them again.
+	// fetched holds blocks read by root that are not in blocks: of a walk
+	// that did not finish, or of a head that is not followed. They are kept
+	// until they leave the window, so no block is read twice.
 	fetched map[string]*chainBlock
 	// committees holds the attestation committees per epoch and slot, by
 	// committee index; noCommittees the epochs the node does not serve.
@@ -219,6 +227,11 @@ type slotTracker struct {
 	// the window that was counted with its committees (liveness.go).
 	written map[uint64]fleet.SlotParticipation
 	duties  map[uint64][]fleet.HostSlotParticipation
+	// attested holds the newest attested slots per host, ascending
+	// (liveness.go); attestedChanged is set when it changed since it was
+	// last published.
+	attested        map[string][]uint64
+	attestedChanged bool
 	// prunedBefore is the last prune boundary applied.
 	prunedBefore uint64
 	// lastError is the last failure logged as a warning.
@@ -233,6 +246,7 @@ func newSlotTracker() *slotTracker {
 		dirty:        make(map[uint64]struct{}, 64),
 		written:      make(map[uint64]fleet.SlotParticipation, 128),
 		duties:       make(map[uint64][]fleet.HostSlotParticipation, 128),
+		attested:     make(map[string][]uint64, 64),
 	}
 }
 
@@ -241,6 +255,8 @@ func (t *slotTracker) setHosts(hosts []trackedHost, epoch uint64) {
 	t.hosts = hosts
 	t.hostsEpoch = epoch
 	t.hostsRead = true
+
+	t.forgetAttested(hosts)
 }
 
 // indexOf returns the position of the block with root in blocks, or -1.
@@ -252,6 +268,45 @@ func (t *slotTracker) indexOf(root string) int {
 	}
 
 	return -1
+}
+
+// known returns a block by root, canonical or fetched; nil when it was not
+// read.
+func (t *slotTracker) known(root string) *chainBlock {
+	if block, ok := t.fetched[root]; ok {
+		return block
+	}
+
+	if i := t.indexOf(root); i >= 0 {
+		return t.blocks[i]
+	}
+
+	return nil
+}
+
+// descends reports whether the block of head is tip or an ancestor of it,
+// walking parent roots through the known blocks. known is false when the walk
+// ran out of known blocks before it reached the slot of head.
+func (t *slotTracker) descends(tip string, head headRef) (onChain, known bool) {
+	below := uint64(math.MaxUint64)
+
+	for root := tip; ; {
+		if root == head.root {
+			return true, true
+		}
+
+		block := t.known(root)
+		if block == nil || block.slot >= below {
+			return false, false
+		}
+
+		if block.slot <= head.slot {
+			return false, true
+		}
+
+		below = block.slot
+		root = block.parent
+	}
 }
 
 // touch marks the slots a block changes: its own and the ones it includes
@@ -303,6 +358,12 @@ func (t *slotTracker) forget(windowStart, firstEpoch uint64) {
 	if drop > 0 {
 		t.anchor = t.blocks[drop-1].root
 		t.blocks = slices.Delete(t.blocks, 0, drop)
+	}
+
+	for root, block := range t.fetched {
+		if block.slot < windowStart {
+			delete(t.fetched, root)
+		}
 	}
 
 	for epoch := range t.committees {
@@ -547,13 +608,6 @@ type (
 			Validators []beaconUint `json:"validators"`
 		} `json:"data"`
 	}
-
-	syncingResponse struct {
-		Data struct {
-			//nolint:tagliatelle // field name of the standard Beacon API
-			IsSyncing *bool `json:"is_syncing"`
-		} `json:"data"`
-	}
 )
 
 // trackSlots brings the per-slot participation up to date and publishes the
@@ -561,6 +615,8 @@ type (
 // epochs it holds up stays missing, and the scheduler's gate says why.
 func (s *service) trackSlots(ctx context.Context, now time.Time) {
 	settled, err := s.refreshSlots(ctx, now)
+	s.publishAttested()
+
 	if err == nil {
 		s.slots.lastError = ""
 		s.publishLiveness(settled, "")
@@ -620,7 +676,7 @@ func (s *service) refreshSlots(ctx context.Context, now time.Time) ([]epochLiven
 	tracked := tracker.hosts
 	first := max(tracker.base, firstEpoch*perSlot)
 
-	horizon, settled := s.settledSlot(ctx, now)
+	horizon, settled := s.settledSlot(now)
 	if !settled || horizon < first {
 		return nil, nil
 	}
@@ -647,7 +703,7 @@ func (s *service) refreshSlots(ctx context.Context, now time.Time) ([]epochLiven
 	return liveness, countErr
 }
 
-// followChain walks from the head the node reported back to a block that is
+// followChain walks from the followed head back to a block that is
 // known and makes the blocks on the way the end of the canonical chain.
 // Blocks that are no longer on it are dropped. With nothing to connect to it
 // starts over slotBackfillEpochs before the current epoch.
@@ -679,7 +735,7 @@ func (s *service) followChain(ctx context.Context, current uint64) error {
 			break
 		}
 
-		block, err := s.fetchBlock(ctx, root)
+		block, err := s.fetchBlock(ctx, root, s.usable)
 		if err != nil {
 			return err
 		}
@@ -697,9 +753,8 @@ func (s *service) followChain(ctx context.Context, current uint64) error {
 
 		fresh = append(fresh, block)
 
-		// The first block of a chain has no parent to read: its parent root
-		// is all zeros.
-		if block.slot == 0 || strings.Trim(block.parent, "0x") == "" {
+		// The first block of a chain has no parent to read.
+		if block.first() {
 			break
 		}
 
@@ -715,13 +770,17 @@ func (s *service) followChain(ctx context.Context, current uint64) error {
 	}
 
 	tracker.extend(fresh)
-	clear(tracker.fetched)
+
+	for _, block := range fresh {
+		delete(tracker.fetched, block.root)
+	}
 
 	return nil
 }
 
-// fetchBlock reads one block by root.
-func (s *service) fetchBlock(ctx context.Context, root string) (*chainBlock, error) {
+// fetchBlock reads one block by root from the first endpoint of order that
+// serves it.
+func (s *service) fetchBlock(ctx context.Context, root string, order []int) (*chainBlock, error) {
 	if block, ok := s.slots.fetched[root]; ok {
 		return block, nil
 	}
@@ -731,7 +790,7 @@ func (s *service) fetchBlock(ctx context.Context, root string) (*chainBlock, err
 	}
 
 	var answer blockResponse
-	if err := s.client.get(ctx, "/eth/v2/beacon/blocks/"+root, &answer); err != nil {
+	if err := s.client.get(ctx, order, "/eth/v2/beacon/blocks/"+root, &answer); err != nil {
 		return nil, fmt.Errorf("reading block %s: %w", root, err)
 	}
 
@@ -811,36 +870,14 @@ func decodeHex(text string) ([]byte, error) {
 }
 
 // settledSlot returns the newest slot that is stored in this poll: the one
-// slotSettleLag behind the clock. When the node has no block that recent,
-// either proposals were missed or the node is behind; a node that does not
-// say it is in sync is believed up to the slot before its head only.
-func (s *service) settledSlot(ctx context.Context, now time.Time) (uint64, bool) {
+// slotSettleLag behind the clock.
+func (s *service) settledSlot(now time.Time) (uint64, bool) {
 	clock := s.timing.slotAt(now)
 	if clock < slotSettleLag {
 		return 0, false
 	}
 
-	horizon := clock - slotSettleLag
-	if s.head.slot >= horizon {
-		return horizon, true
-	}
-
-	var answer syncingResponse
-
-	err := s.client.get(ctx, "/eth/v1/node/syncing", &answer)
-	if err == nil && answer.Data.IsSyncing != nil && !*answer.Data.IsSyncing {
-		return horizon, true
-	}
-
-	if err != nil {
-		s.log.WithError(err).Debug("Beacon node does not say whether it is in sync")
-	}
-
-	if s.head.slot == 0 {
-		return 0, false
-	}
-
-	return s.head.slot - 1, true
+	return clock - slotSettleLag, true
 }
 
 // storeSlots counts the dirty slots of [first, horizon] and stores the ones
@@ -881,6 +918,7 @@ func (s *service) storeSlots(
 			if !served {
 				// Nobody can say who had to attest: the slot gets no row, and
 				// its epoch no liveness.
+				tracker.noteAttested(slot, tracker.duties[slot], nil)
 				delete(tracker.duties, slot)
 
 				done = append(done, slot)
@@ -892,6 +930,7 @@ func (s *service) storeSlots(
 		}
 
 		row, duties, err := tracker.participation(slot, committees, tracked)
+		tracker.noteAttested(slot, tracker.duties[slot], duties)
 		tracker.duties[slot] = duties
 
 		if err != nil {
@@ -949,7 +988,7 @@ func (s *service) epochCommittees(
 	var answer committeesResponse
 
 	path := "/eth/v1/beacon/states/head/committees?epoch=" + strconv.FormatUint(epoch, 10)
-	if err := s.client.get(ctx, path, &answer); err != nil {
+	if err := s.client.get(ctx, s.usable, path, &answer); err != nil {
 		var status *statusError
 
 		if ctx.Err() == nil && epoch < current &&

@@ -16,6 +16,7 @@ package protocol
 
 import (
 	"fmt"
+	"strings"
 	"time"
 )
 
@@ -58,14 +59,15 @@ type SyncRequest struct {
 	Verbs []Verb `json:"verbs"`
 	// Roles are the host's roles from its configuration, at most MaxRoles.
 	Roles []string `json:"roles,omitempty"`
-	// Hold reports the hold state. While held the agent reports no needs and
-	// refuses leases.
+	// Hold reports the hold state. While held the agent still reports its
+	// needs and refuses all leases and work.
 	Hold Hold `json:"hold"`
 
 	Containers []Container `json:"containers"`
 	Node       NodeHealth  `json:"node"`
 	OS         OSSummary   `json:"os"`
 	Pending    Pending     `json:"pending"`
+	Resources  Resources   `json:"resources"`
 
 	// InventoryHash identifies the agent's current inventory. The controller
 	// answers WantInventory when it does not hold that inventory.
@@ -87,21 +89,89 @@ type SyncRequest struct {
 	Actions []ActionInfo `json:"actions,omitempty"`
 }
 
-// Hold is the agent's hold state.
+// Hold is the agent's hold state. The agent owns its holds: the controller
+// sets and lifts them by directive and keeps none of its own.
 type Hold struct {
 	// Local is true when the agent holds a local hold (or a file of the host
-	// cannot be read). Only a person on the
-	// host can lift it; the controller cannot.
+	// cannot be read). Only a person on the host can lift it; the controller
+	// cannot.
 	Local bool `json:"local"`
 	// LocalReason is the reason of the local hold.
 	LocalReason string `json:"localReason,omitempty"`
-	// Controller is true when a hold directive from the controller is in
-	// effect. A release-hold directive lifts it.
-	Controller bool `json:"controller"`
+	// Holds are the holds in effect in HoldOrder, the local one as
+	// HolderHost; at most MaxHolds.
+	Holds []HostHold `json:"holds,omitempty"`
 }
 
 // Active reports whether any hold is in effect.
-func (h Hold) Active() bool { return h.Local || h.Controller }
+func (h Hold) Active() bool { return h.Local || len(h.Holds) > 0 }
+
+// Of returns the hold of holder, or nil.
+func (h Hold) Of(holder string) *HostHold {
+	for i := range h.Holds {
+		if h.Holds[i].Holder == holder {
+			return &h.Holds[i]
+		}
+	}
+
+	return nil
+}
+
+// Holders are the holders of the holds, in order.
+func (h Hold) Holders() []string {
+	out := make([]string, 0, len(h.Holds))
+	for i := range h.Holds {
+		out = append(out, h.Holds[i].Holder)
+	}
+
+	return out
+}
+
+// HostHold is one hold of a host.
+type HostHold struct {
+	// Holder is HolderHost, HolderStaff or the team the hold is of.
+	Holder string `json:"holder"`
+	// By is who set it: the user on the host, or the person the controller
+	// named.
+	By     string    `json:"by,omitempty"`
+	Reason string    `json:"reason,omitempty"`
+	At     time.Time `json:"at"`
+}
+
+// Holders with a meaning of their own; every other holder is a team.
+const (
+	// HolderHost is the local hold, set and lifted on the host only.
+	HolderHost = "host"
+	// HolderStaff is the hold set through the plain hold feature.
+	HolderStaff = "staff"
+)
+
+// ValidHolder reports whether a directive may set or lift the hold of
+// holder: staff's or a team's, never the host's own.
+func ValidHolder(holder string) bool {
+	return holder != HolderHost && (holder == HolderStaff || ValidOwner(holder))
+}
+
+// HoldOrder sorts holds: the host's own first, then staff's, then the teams
+// by name.
+func HoldOrder(a, b HostHold) int {
+	rank := func(holder string) int {
+		switch holder {
+		case HolderHost:
+			return 0
+		case HolderStaff:
+			return 1
+		default:
+			return 2
+		}
+	}
+
+	if c := rank(a.Holder) - rank(b.Holder); c != 0 {
+		return c
+	}
+
+	return strings.Compare(a.Holder, b.Holder)
+}
 
 // ContainerKind is what a managed container is, by its LabelKind label: a
 // free-form name (ValidKind) such as el, cl, vc or snooper-el. An unlabelled
@@ -258,6 +328,9 @@ type Container struct {
 	// Overridable: the image and the command line may be overridden, on a
 	// host with overrides enabled, for a container with a team.
 	Overridable bool `json:"overridable,omitempty"`
+	// Stats is the resource use of a running managed container. Like the
+	// command line it is served to authenticated users only.
+	Stats *ContainerStats `json:"stats,omitempty"`
 
 	// Base is what the container's own labels say it was before an override
 	// changed it. It is not part of the wire format: the agent's container
@@ -269,6 +342,9 @@ type Container struct {
 	// Linked is true for a container created with links (--link), which a
 	// recreate cannot keep. Not part of the wire format.
 	Linked bool `json:"-"`
+	// PID is the host PID of the running container's first process, zero
+	// when it is not running. Not part of the wire format.
+	PID int `json:"-"`
 }
 
 // OverrideBase is a container's form before an override, as its labels
@@ -497,6 +573,9 @@ const MaxTags = 64
 
 // MaxRoles bounds SyncRequest.Roles.
 const MaxRoles = 32
+
+// MaxHolds bounds Hold.Holds: the host's own, staff's and one per team.
+const MaxHolds = MaxOwners + 2
 
 // TagDigest is what one tag points at, by the controller's newest lookup.
 type TagDigest struct {

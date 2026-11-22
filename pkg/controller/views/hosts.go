@@ -3,9 +3,9 @@ package views
 import (
 	"context"
 	"errors"
+	"math"
 	"time"
 
-	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
@@ -31,13 +31,13 @@ func (v *Views) HostDetail(ctx context.Context, name string) (*HostDetail, error
 		return nil, err
 	}
 
+	plan := v.Plan()
 	detail := &HostDetail{
-		HostSummary: Summarize(host, v.opts.Scheduler.Plan(), v.now(),
-			settings.HostStaleAfter.Std()),
-		CertHash:   host.CertHash,
-		FirstSeen:  host.FirstSeen,
-		RemoteAddr: host.RemoteAddr,
-		Assigned:   host.Weight(),
+		HostSummary: Summarize(host, &plan, v.now(), settings.HostStaleAfter.Std()),
+		CertHash:    host.CertHash,
+		FirstSeen:   host.FirstSeen,
+		RemoteAddr:  host.RemoteAddr,
+		Assigned:    host.Weight(),
 	}
 
 	inv, err := v.opts.Store.GetInventory(ctx, name)
@@ -84,9 +84,6 @@ func Summarize(
 		Validators: host.Weight(),
 		LastSeen:   host.LastSeen,
 		Stale:      host.Stale(now, staleAfter),
-		HoldWanted: host.HoldWanted,
-		HoldReason: host.HoldReason,
-		HoldBy:     HoldBy(host),
 		Offline:    offlineMark(host, now),
 		Broken:     host.Broken,
 		Containers: []protocol.Container{},
@@ -103,6 +100,8 @@ func Summarize(
 		sum.OS = status.OS
 		sum.Pending = status.Pending
 		sum.UptimeSeconds = status.UptimeSeconds
+		res := status.Resources
+		sum.Resources = &res
 		sum.Hold = status.Hold
 		sum.Verbs = NonNil(status.Verbs)
 		sum.Needs = NonNil(status.Needs)
@@ -125,8 +124,9 @@ func Listing(sum *HostSummary) HostListing {
 		Name: sum.Name, Roles: sum.Roles, Validators: sum.Validators, LastSeen: sum.LastSeen,
 		Stale: sum.Stale, AgentVersion: sum.AgentVersion,
 		Containers: make([]ContainerListing, 0, len(sum.Containers)),
-		OS:         sum.OS, Pending: sum.Pending, UptimeSeconds: sum.UptimeSeconds, Hold: sum.Hold,
-		HoldWanted: sum.HoldWanted, HoldReason: sum.HoldReason, HoldBy: sum.HoldBy, Offline: sum.Offline, Verbs: sum.Verbs,
+		OS:         sum.OS, Pending: sum.Pending, UptimeSeconds: sum.UptimeSeconds,
+		Usage: NewHostUsage(sum.Resources), Hold: sum.Hold,
+		Holders: NonNil(sum.Hold.Holders()), Offline: sum.Offline, Verbs: sum.Verbs,
 		Needs: make([]NeedListing, 0, len(sum.Needs)), Plan: sum.Plan, Actions: sum.Actions,
 	}
 
@@ -145,6 +145,36 @@ func Listing(sum *HostSummary) HostListing {
 	return out
 }
 
+// NewHostUsage is the brief of a host's resource use; nil for nil or when
+// nothing of it is known.
+func NewHostUsage(r *protocol.Resources) *HostUsage {
+	if r == nil {
+		return nil
+	}
+
+	var out HostUsage
+
+	if r.CPU.Busy != nil {
+		out.CPU = wholePercent(*r.CPU.Busy)
+	}
+
+	if mem, ok := r.Memory.UsedPercent(); ok {
+		out.Memory = wholePercent(mem)
+	}
+
+	if out == (HostUsage{}) {
+		return nil
+	}
+
+	return &out
+}
+
+func wholePercent(v float64) *int {
+	n := int(math.Round(v))
+
+	return &n
+}
+
 // offlineMark is the host's known-offline mark while it is in force.
 func offlineMark(host *fleet.Host, now time.Time) *fleet.OfflineMark {
 	if !host.KnownOffline(now) {
@@ -152,22 +182,6 @@ func offlineMark(host *fleet.Host, now time.Time) *fleet.OfflineMark {
 	}
 
 	return host.Offline
-}
-
-// HoldBy says for the host views who set the controller hold: "team:<teams>"
-// for a hold set through a team feature, "staff" for every other hold,
-// nothing for a host that is not held.
-func HoldBy(host *fleet.Host) string {
-	_, team := fleet.HoldTeams(host.HoldBy)
-
-	switch {
-	case !host.HoldWanted:
-		return ""
-	case team:
-		return host.HoldBy
-	default:
-		return authz.HoldByStaff
-	}
 }
 
 // NonNil returns an empty slice for nil, so JSON carries [] and not null.
@@ -182,6 +196,11 @@ func NonNil[T any](in []T) []T {
 // Rollouts builds the rollout view: everything open, and the newest limit
 // closed rollouts and leases.
 func (v *Views) Rollouts(ctx context.Context, limit int) (*Rollouts, error) {
+	settings, err := v.opts.Scheduler.Settings(ctx)
+	if err != nil {
+		return nil, err
+	}
+
 	open, err := v.opts.Store.ListRollouts(ctx, store.RolloutFilter{OpenOnly: true})
 	if err != nil {
 		return nil, err
@@ -206,16 +225,24 @@ func (v *Views) Rollouts(ctx context.Context, limit int) (*Rollouts, error) {
 		return nil, err
 	}
 
+	view := func(r *fleet.Rollout) *RolloutView {
+		return &RolloutView{Rollout: *r, Policy: settings.RolloutPolicy(r)}
+	}
+
 	out := &Rollouts{
-		Open:         NonNil(open),
-		Recent:       make([]*fleet.Rollout, 0, limit),
+		Open:         make([]*RolloutView, 0, len(open)),
+		Recent:       make([]*RolloutView, 0, limit),
 		Leases:       NonNil(openLeases),
 		RecentLeases: make([]*fleet.Lease, 0, limit),
 	}
 
+	for _, rollout := range open {
+		out.Open = append(out.Open, view(rollout))
+	}
+
 	for _, rollout := range newest {
 		if rollout.State.Terminal() && len(out.Recent) < limit {
-			out.Recent = append(out.Recent, rollout)
+			out.Recent = append(out.Recent, view(rollout))
 		}
 	}
 
@@ -229,23 +256,48 @@ func (v *Views) Rollouts(ctx context.Context, limit int) (*Rollouts, error) {
 }
 
 // Plan returns the last plan in the form the API serves it, or an empty one
-// around the current gate before the first reconcile.
+// around the current gate before the first reconcile. The error texts of
+// the beacon service are out of it, as out of the public gate (scrubGate):
+// from the gate and from the waiting reasons that quote it.
 func (v *Views) Plan() scheduler.Plan {
 	plan := v.opts.Scheduler.Plan()
 	if plan == nil {
+		gate := v.Gate()
+		scrubGate(&gate)
+
 		return scheduler.Plan{
-			Gate:  v.Gate(),
+			Gate:  gate,
 			Queue: []scheduler.QueueEntry{},
 			Hosts: map[string]scheduler.HostPlan{},
 		}
 	}
 
 	out := *plan
-	out.Gate.Reasons = NonNil(out.Gate.Reasons)
-	out.Queue = NonNil(out.Queue)
+	scrub := newScrubber(&plan.Gate.Network)
+	out.Gate.Reasons = append(make([]string, 0, len(plan.Gate.Reasons)), plan.Gate.Reasons...)
+	scrubGate(&out.Gate)
 
-	if out.Hosts == nil {
+	if scrub.none() {
+		out.Queue = NonNil(out.Queue)
+	} else {
+		out.Queue = make([]scheduler.QueueEntry, 0, len(plan.Queue))
+
+		for _, entry := range plan.Queue {
+			entry.Reason = scrub.waitReason(entry.Reason)
+			out.Queue = append(out.Queue, entry)
+		}
+	}
+
+	switch {
+	case plan.Hosts == nil:
 		out.Hosts = map[string]scheduler.HostPlan{}
+	case !scrub.none():
+		out.Hosts = make(map[string]scheduler.HostPlan, len(plan.Hosts))
+
+		for name, hp := range plan.Hosts {
+			hp.Reason = scrub.waitReason(hp.Reason)
+			out.Hosts[name] = hp
+		}
 	}
 
 	return out

@@ -47,11 +47,14 @@ const (
 	// HostGhost is not known to the controller.
 	HostGhost = "ghost-1"
 
-	// LeaseMixed is open on HostMixed, LeaseUnowned on HostUnowned, LeaseDone
-	// has ended on HostMixed, LeaseGhost does not exist.
+	// LeaseMixed is open on HostMixed and rolls lighthouse, LeaseUnowned on
+	// HostUnowned rolls bootnode, LeaseDone has ended on HostMixed after a
+	// roll of geth, LeaseReboot on HostMixed rolls geth and reboots;
+	// LeaseGhost does not exist.
 	LeaseMixed   = "lease-mixed"
 	LeaseUnowned = "lease-unowned"
 	LeaseDone    = "lease-done"
+	LeaseReboot  = "lease-reboot"
 	LeaseGhost   = "lease-ghost"
 )
 
@@ -87,17 +90,33 @@ func OwnershipFixture(st *Store) {
 	)}
 	st.Hosts[HostFresh] = &fleet.Host{Name: HostFresh, LastSeen: Epoch}
 
-	// r-1 is halted, r-aborted is aborted, r-lighthouse rolls the client
-	// lighthouse; r-ghost does not exist.
+	// r-1 is a halted manual roll of lighthouse on HostMixed and teku on
+	// HostTeku,
+	// r-aborted an aborted rollout of lighthouse, r-reboot a halted reboot,
+	// r-lighthouse rolls the client lighthouse; r-ghost does not exist.
 	st.Rollouts = []*fleet.Rollout{
-		{ID: "r-1", State: fleet.RolloutHalted},
-		{ID: "r-aborted", State: fleet.RolloutAborted},
+		{ID: "r-1", Kind: fleet.RolloutManual, State: fleet.RolloutHalted},
+		{ID: "r-aborted", Kind: fleet.RolloutGroup, ContainerKind: protocol.KindCL, Team: "lighthouse", State: fleet.RolloutAborted},
 		{ID: "r-lighthouse", Kind: fleet.RolloutGroup, ContainerKind: protocol.KindCL, Team: "lighthouse", State: fleet.RolloutActive},
+		{ID: "r-reboot", Kind: fleet.RolloutReboot, State: fleet.RolloutHalted},
 	}
 
+	st.Directives = []*fleet.Directive{
+		{Directive: protocol.Directive{ID: "d-1", Kind: protocol.DirectiveRoll, Container: "lighthouse"}, Host: HostMixed, RolloutID: "r-1"},
+		{Directive: protocol.Directive{ID: "d-2", Kind: protocol.DirectiveRoll, Container: "teku"}, Host: HostTeku, RolloutID: "r-1"},
+	}
+
+	roll := func(container string) protocol.Need {
+		return protocol.Need{
+			ID: "image/" + container, Kind: protocol.NeedImage, Image: &protocol.ImageNeed{Container: container},
+		}
+	}
+	reboot := protocol.Need{ID: protocol.RebootNeedID, Kind: protocol.NeedReboot, Reboot: &protocol.RebootNeed{}}
+
 	st.Leases = []*fleet.Lease{
-		{ID: LeaseMixed, Host: HostMixed, State: fleet.LeaseRunning},
-		{ID: LeaseUnowned, Host: HostUnowned, State: fleet.LeaseGranted},
-		{ID: LeaseDone, Host: HostMixed, State: fleet.LeaseReleased},
+		{ID: LeaseMixed, Host: HostMixed, State: fleet.LeaseRunning, Needs: []protocol.Need{roll("lighthouse")}},
+		{ID: LeaseUnowned, Host: HostUnowned, State: fleet.LeaseGranted, Needs: []protocol.Need{roll("bootnode")}},
+		{ID: LeaseDone, Host: HostMixed, State: fleet.LeaseReleased, Needs: []protocol.Need{roll("geth")}},
+		{ID: LeaseReboot, Host: HostMixed, State: fleet.LeaseRunning, Needs: []protocol.Need{roll("geth"), reboot}},
 	}
 }

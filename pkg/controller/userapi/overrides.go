@@ -18,7 +18,7 @@ import (
 // handleClientOverride serves POST /api/v1/actions/client-override: one part
 // of an override (image or flags) for the container of one kind of a client,
 // on many hosts at once. It is the single-host override for each host: the
-// same feature (image_override or flag_override), the same team twin, judged
+// same feature (manage_image or manage_flags), the same team twin, judged
 // per host, and the same checks in the scheduler. A host the login may not
 // act on is listed in the answer's Rejected with the reason, like a host the
 // scheduler refuses; the request is refused as a whole only when the login
@@ -31,9 +31,9 @@ func (s *Handler) handleClientOverride(w http.ResponseWriter, r *http.Request, u
 		return
 	}
 
-	feature := authz.FeatureImageOverride
+	feature := authz.FeatureManageImage
 	if req.Part == protocol.OverrideFlags {
-		feature = authz.FeatureFlagOverride
+		feature = authz.FeatureManageFlags
 	}
 
 	ctx, refused, ok := s.allowEach(w, r, u, feature, &req)

@@ -76,11 +76,10 @@ const clientJS = `(function () {
 // the controller and their team twins.
 func features() []string {
 	twinned := []string{
-		authz.FeatureRoll, authz.FeatureReboot, authz.FeatureHold, authz.FeatureRecover,
-		authz.FeatureClientPolicy, authz.FeatureImageOverride, authz.FeatureFlagOverride,
+		authz.FeatureDetails, authz.FeatureManage, authz.FeatureManageImage, authz.FeatureManageFlags,
 	}
-	out := make([]string, 0, 2+2*len(twinned))
-	out = append(out, authz.FeatureSupervise, authz.FeatureAdmin)
+	out := make([]string, 0, 1+2*len(twinned))
+	out = append(out, authz.FeatureAdmin)
 
 	for _, f := range twinned {
 		out = append(out, f, "team_"+f)

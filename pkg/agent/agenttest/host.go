@@ -61,7 +61,8 @@ type Host struct {
 	installed  []protocol.Package
 	upgradable []protocol.Upgradable
 
-	failures map[string]error
+	failures  map[string]error
+	resources host.Resources
 	// action is what RunAction returns; nil runs it with exit code 0.
 	action   *protocol.ActionResult
 	resolves int
@@ -621,6 +622,22 @@ func (h *Host) bootIDLocked() string {
 // Probe implements host.Host: no node health.
 func (h *Host) Probe(context.Context) protocol.NodeHealth {
 	return protocol.NodeHealth{}
+}
+
+// Resources implements host.Host: what SetResources set.
+func (h *Host) Resources(context.Context, []protocol.Container) host.Resources {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.resources
+}
+
+// SetResources sets what Resources returns.
+func (h *Host) SetResources(r *host.Resources) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.resources = *r
 }
 
 // Close implements host.Host.

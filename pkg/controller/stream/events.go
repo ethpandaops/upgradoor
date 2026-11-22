@@ -196,7 +196,14 @@ func (s *Handler) serveEvents(w http.ResponseWriter, r *http.Request, u *authz.U
 		return
 	}
 
-	sub, err := hub.subscribe(ctx, u != nil, hosts)
+	var access *views.Access
+
+	if u != nil {
+		a := s.access(u)
+		access = &a
+	}
+
+	sub, err := hub.subscribe(ctx, access, hosts)
 	if err != nil {
 		w.Header().Set("Retry-After", "5")
 		httpjson.Error(s.log, w, http.StatusServiceUnavailable, err.Error())
@@ -299,10 +306,44 @@ type subscriber struct {
 	// private is false for the public stream, which gets the public tables
 	// and nothing else.
 	private bool
+	// access is what a private stream reads of the hosts: the full tables
+	// or the reduced ones, and its host details as access.Detail makes
+	// them. accessKey is access.Key().
+	access    views.Access
+	accessKey string
 	// hosts are the hosts whose details the stream asked for.
 	hosts []string
 	// out carries the events, one batch per build. The hub closes it.
 	out chan [][]byte
+}
+
+// audience is the tables the subscriber is sent.
+func (sub *subscriber) audience(st *eventState) *audience {
+	switch {
+	case !sub.private:
+		return st.public
+	case sub.access.Full:
+		return st.private
+	default:
+		return st.reduced
+	}
+}
+
+// detail names the details of one host as one access sees them.
+func (sub *subscriber) detail(host string) detailKey {
+	return detailKey{host: host, access: sub.accessKey}
+}
+
+// detailKey names the details of one host for one access.
+type detailKey struct {
+	host   string
+	access string
+}
+
+// detailWant is the details of one host some stream asks for.
+type detailWant struct {
+	key    detailKey
+	access views.Access
 }
 
 // eventHub builds the tables when something changed and hands the
@@ -333,8 +374,9 @@ type eventHub struct {
 	state eventState
 }
 
-// audience is what the streams of one kind (public, authenticated) have been
-// sent: the tables, the strings and the version the next patch makes.
+// audience is what the streams of one kind (public, authenticated in full,
+// authenticated reduced) have been sent: the tables, the strings and the
+// version the next patch makes.
 type audience struct {
 	doc     wireDoc
 	strings *stringTable
@@ -357,20 +399,26 @@ type eventState struct {
 
 	public  *audience
 	private *audience
-	// details holds the tables of every host somebody asked for; nil for a
-	// host that does not exist.
-	details map[string]wireDoc
+	// reduced is the audience of the logins without the full view of the
+	// hosts (views.Access).
+	reduced *audience
+	// details holds the tables of every host somebody asked for, per
+	// access; nil for a host that does not exist.
+	details map[detailKey]wireDoc
 	// boots remembers the boot time sent for each host (newWireHost).
 	boots map[string]time.Time
-	// hostRows are the encoded host rows of the last build (addHosts).
-	hostRows map[string]cachedHostRow
+	// hostRows and reducedRows are the encoded host rows of the last build
+	// (addHosts), in full and reduced.
+	hostRows    map[string]cachedHostRow
+	reducedRows map[string]cachedHostRow
 }
 
 func newEventState() eventState {
 	return eventState{
 		public:  newAudience(),
 		private: newAudience(),
-		details: make(map[string]wireDoc, 2),
+		reduced: newAudience(),
+		details: make(map[detailKey]wireDoc, 2),
 		boots:   make(map[string]time.Time, 16),
 	}
 }
@@ -411,10 +459,12 @@ func (h *eventHub) notify() {
 	}
 }
 
-// subscribe registers a stream. The snapshot is the first batch on its
-// channel.
-func (h *eventHub) subscribe(ctx context.Context, private bool, hosts []string) (*subscriber, error) {
+// subscribe registers a stream; access is nil for a public one. The
+// snapshot is the first batch on its channel.
+func (h *eventHub) subscribe(ctx context.Context, access *views.Access, hosts []string) (*subscriber, error) {
+	private := access != nil
 	open, bound := &h.publicStreams, int32(maxPublicStreams)
+
 	if private {
 		open, bound = &h.streams, maxStreams
 	}
@@ -426,6 +476,9 @@ func (h *eventHub) subscribe(ctx context.Context, private bool, hosts []string) 
 	}
 
 	sub := &subscriber{private: private, hosts: hosts, out: make(chan [][]byte, streamBacklog)}
+	if private {
+		sub.access, sub.accessKey = *access, access.Key()
+	}
 
 	select {
 	case h.join <- sub:
@@ -562,9 +615,9 @@ func (h *eventHub) admit(ctx context.Context, staleAt *time.Timer, sub *subscrib
 	// A build that is recent enough is good for a snapshot; what it lacks
 	// follows with the next build.
 	if !h.state.built || (h.state.stale && time.Since(h.state.at) >= h.interval) {
-		h.rebuild(ctx, staleAt, sub.hosts)
+		h.rebuild(ctx, staleAt, sub)
 	} else {
-		h.addDetails(ctx, sub.hosts)
+		h.addDetails(ctx, sub)
 	}
 
 	h.subs[sub] = struct{}{}
@@ -597,16 +650,28 @@ func (h *eventHub) send(sub *subscriber, frames [][]byte) {
 	}
 }
 
-// wanted lists the hosts whose details the subscribers, and extra, ask for.
-func (h *eventHub) wanted(extra []string) []string {
-	out := slices.Clone(extra)
+// wanted lists the host details the subscribers, and extra, ask for.
+func (h *eventHub) wanted(extra *subscriber) []detailWant {
+	out := make([]detailWant, 0, 4)
+	add := func(sub *subscriber) {
+		if !sub.private {
+			return
+		}
 
-	for sub := range h.subs {
 		for _, name := range sub.hosts {
-			if !slices.Contains(out, name) {
-				out = append(out, name)
+			key := sub.detail(name)
+			if !slices.ContainsFunc(out, func(w detailWant) bool { return w.key == key }) {
+				out = append(out, detailWant{key: key, access: sub.access})
 			}
 		}
+	}
+
+	if extra != nil {
+		add(extra)
+	}
+
+	for sub := range h.subs {
+		add(sub)
 	}
 
 	return out
@@ -622,8 +687,8 @@ const (
 )
 
 // rebuild builds the tables and sends every subscriber what changed. extra
-// names host details a joining subscriber asks for.
-func (h *eventHub) rebuild(ctx context.Context, staleAt *time.Timer, extra []string) {
+// is a joining subscriber, whose host details are built too.
+func (h *eventHub) rebuild(ctx context.Context, staleAt *time.Timer, extra *subscriber) {
 	ctx, cancel := context.WithTimeout(ctx, streamBuildTimeout)
 	defer cancel()
 
@@ -638,7 +703,8 @@ func (h *eventHub) rebuild(ctx context.Context, staleAt *time.Timer, extra []str
 
 	// A string table that outgrew its bound starts again; so does everybody
 	// who holds indices into it.
-	if len(st.public.strings.list) > maxStreamStrings || len(st.private.strings.list) > maxStreamStrings {
+	if len(st.public.strings.list) > maxStreamStrings || len(st.private.strings.list) > maxStreamStrings ||
+		len(st.reduced.strings.list) > maxStreamStrings {
 		for sub := range h.subs {
 			h.drop(sub)
 		}
@@ -668,41 +734,39 @@ func (h *eventHub) rebuild(ctx context.Context, staleAt *time.Timer, extra []str
 		staleAt.Reset(built.nextStale)
 	}
 
-	public := st.public.advance(built.public)
-	private := st.private.advance(built.private)
+	bodies := map[*audience]map[string]any{
+		st.public:  st.public.advance(built.public),
+		st.private: st.private.advance(built.private),
+		st.reduced: st.reduced.advance(built.reduced),
+	}
 
-	changed := make(map[string]any, len(details))
+	changed := make(map[detailKey]any, len(details))
 
-	for name, doc := range built.details {
-		before, known := st.details[name]
+	for key, doc := range built.details {
+		before, known := st.details[key]
 
 		switch {
 		case doc == nil && (!known || before != nil):
-			changed[name] = 0
+			changed[key] = 0
 		case doc != nil && before == nil:
-			changed[name] = doc.full()
+			changed[key] = doc.full()
 		case doc != nil:
 			if patch := doc.diff(before); len(patch) > 0 {
-				changed[name] = patch
+				changed[key] = patch
 			}
 		}
 
-		st.details[name] = doc
+		st.details[key] = doc
 	}
 
-	for name := range st.details {
-		if !slices.Contains(details, name) {
-			delete(st.details, name)
+	for key := range st.details {
+		if _, ok := built.details[key]; !ok {
+			delete(st.details, key)
 		}
 	}
 
 	for sub := range h.subs {
-		body := public
-		if sub.private {
-			body = private
-		}
-
-		if frame, ok := h.patch(sub, body, changed); ok {
+		if frame, ok := h.patch(sub, bodies[sub.audience(st)], changed); ok {
 			h.send(sub, [][]byte{frame})
 		}
 	}
@@ -733,12 +797,12 @@ func (a *audience) advance(doc wireDoc) map[string]any {
 
 // patch builds the patch event of one subscriber: the changes of its
 // audience and of the host details it asked for.
-func (h *eventHub) patch(sub *subscriber, body, details map[string]any) ([]byte, bool) {
+func (h *eventHub) patch(sub *subscriber, body map[string]any, details map[detailKey]any) ([]byte, bool) {
 	var mine map[string]any
 
 	if sub.private {
 		for _, name := range sub.hosts {
-			if d, ok := details[name]; ok {
+			if d, ok := details[sub.detail(name)]; ok {
 				if mine == nil {
 					mine = make(map[string]any, len(sub.hosts))
 				}
@@ -766,11 +830,7 @@ func (h *eventHub) patch(sub *subscriber, body, details map[string]any) ([]byte,
 
 // snapshot is everything a new subscriber may see, from the state.
 func (h *eventHub) snapshot(sub *subscriber) ([]byte, bool) {
-	a := h.state.public
-	if sub.private {
-		a = h.state.private
-	}
-
+	a := sub.audience(&h.state)
 	out := a.doc.full()
 	out[wireKeySchema] = wire.schema.Version
 	out[wireKeyVersion] = a.version
@@ -781,7 +841,7 @@ func (h *eventHub) snapshot(sub *subscriber) ([]byte, bool) {
 		details := make(map[string]any, len(sub.hosts))
 
 		for _, name := range sub.hosts {
-			doc, known := h.state.details[name]
+			doc, known := h.state.details[sub.detail(name)]
 
 			switch {
 			case !known:
@@ -812,16 +872,27 @@ func (h *eventHub) event(name string, body map[string]any) ([]byte, bool) {
 
 // addDetails builds the host details a joining subscriber asks for and the
 // state does not hold.
-func (h *eventHub) addDetails(ctx context.Context, hosts []string) {
+func (h *eventHub) addDetails(ctx context.Context, sub *subscriber) {
+	if !sub.private {
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(ctx, streamBuildTimeout)
 	defer cancel()
 
-	for _, name := range hosts {
-		if _, ok := h.state.details[name]; ok {
+	for _, name := range sub.hosts {
+		key := sub.detail(name)
+		if _, ok := h.state.details[key]; ok {
 			continue
 		}
 
-		doc, err := h.srv.hostDetailDoc(ctx, name)
+		detail, err := h.srv.hostDetail(ctx, name)
+
+		var doc wireDoc
+		if err == nil {
+			doc, err = detailDoc(sub.access.Detail(detail))
+		}
+
 		if err != nil {
 			h.log.WithError(err).Warn("Cannot build a host detail for the event stream")
 
@@ -831,16 +902,17 @@ func (h *eventHub) addDetails(ctx context.Context, hosts []string) {
 			continue
 		}
 
-		h.state.details[name] = doc
+		h.state.details[key] = doc
 	}
 }
 
-// streamBuild is one build: the tables of both audiences and of the host
+// streamBuild is one build: the tables of the audiences and of the host
 // details asked for.
 type streamBuild struct {
 	public  wireDoc
 	private wireDoc
-	details map[string]wireDoc
+	reduced wireDoc
+	details map[detailKey]wireDoc
 	// nextStale is the time until the next host goes stale; zero when none
 	// will.
 	nextStale time.Duration
@@ -866,12 +938,12 @@ type streamViews struct {
 	// planned says whether the plan has an entry for a host.
 	planned  func(host string) bool
 	rollouts *views.Rollouts
-	settings views.SettingsBody
+	settings fleet.Settings
 	audit    views.AuditHead
 }
 
 // streamDocs reads the store once and builds every table from it.
-func (s *Handler) streamDocs(ctx context.Context, st *eventState, details []string) (*streamBuild, error) {
+func (s *Handler) streamDocs(ctx context.Context, st *eventState, details []detailWant) (*streamBuild, error) {
 	hosts, err := s.opts.Store.ListHosts(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("list hosts: %w", err)
@@ -890,7 +962,7 @@ func (s *Handler) streamDocs(ctx context.Context, st *eventState, details []stri
 		plan:         s.views.Plan(),
 		hosts:        make([]views.HostSummary, 0, len(hosts)),
 		statusHashes: make([]string, 0, len(hosts)),
-		settings:     views.SettingsBody{Settings: settings, Defaults: s.opts.DefaultSettings},
+		settings:     settings,
 	}
 
 	if slotErr := s.streamSlots(ctx, v); slotErr != nil {
@@ -910,24 +982,19 @@ func (s *Handler) streamDocs(ctx context.Context, st *eventState, details []stri
 		v.audit.LatestID = newest[0].ID
 	}
 
-	plan := s.opts.Scheduler.Plan()
 	now := v.now
 	staleAfter := settings.HostStaleAfter.Std()
 
 	v.planned = func(host string) bool {
-		if plan == nil {
-			return false
-		}
-
-		_, ok := plan.Hosts[host]
+		_, ok := v.plan.Hosts[host]
 
 		return ok
 	}
 
-	out := &streamBuild{details: make(map[string]wireDoc, len(details))}
+	out := &streamBuild{details: make(map[detailKey]wireDoc, len(details))}
 
 	for _, host := range hosts {
-		sum := views.Summarize(host, plan, now, staleAfter)
+		sum := views.Summarize(host, &v.plan, now, staleAfter)
 		v.hosts = append(v.hosts, sum)
 		v.statusHashes = append(v.statusHashes, host.StatusHash)
 
@@ -939,12 +1006,24 @@ func (s *Handler) streamDocs(ctx context.Context, st *eventState, details []stri
 		}
 	}
 
-	if out.public, out.private, err = v.docs(st); err != nil {
+	if out.public, out.private, out.reduced, err = v.docs(st); err != nil {
 		return nil, err
 	}
 
-	for _, name := range details {
-		if out.details[name], err = s.hostDetailDoc(ctx, name); err != nil {
+	// Each host is read once, whatever the accesses that ask for it.
+	read := make(map[string]*views.HostDetail, len(details))
+
+	for _, want := range details {
+		detail, ok := read[want.key.host]
+		if !ok {
+			if detail, err = s.hostDetail(ctx, want.key.host); err != nil {
+				return nil, err
+			}
+
+			read[want.key.host] = detail
+		}
+
+		if out.details[want.key], err = detailDoc(want.access.Detail(detail)); err != nil {
 			return nil, err
 		}
 	}
@@ -952,10 +1031,12 @@ func (s *Handler) streamDocs(ctx context.Context, st *eventState, details []stri
 	return out, nil
 }
 
-// docs encodes the views as the tables of the two audiences. The public
-// tables are built from the public views only: what is not in a Public*
-// type cannot get into them.
-func (v *streamViews) docs(st *eventState) (public, private wireDoc, err error) {
+// docs encodes the views as the tables of the audiences. The public tables
+// are built from the public views only: what is not in a Public* type
+// cannot get into them. The reduced tables are the authenticated ones as a
+// login without the full view of the hosts and without teams sees them
+// (views.Access): one stream for every such login, whatever its teams.
+func (v *streamViews) docs(st *eventState) (public, private, reduced wireDoc, err error) {
 	// Everybody.
 	pub := newDocBuilder(st.public.strings, "public.")
 	pub.one(tableNetwork, wireGate{
@@ -970,44 +1051,62 @@ func (v *streamViews) docs(st *eventState) (public, private wireDoc, err error) 
 	addImages(pub, &v.images)
 	addSlots(pub, v.slots, nil)
 
+	clients := views.NewClientIndex(v.hosts, &v.settings)
+
 	// A login.
 	priv := newDocBuilder(st.private.strings, "")
-	gate := wireGate{
+	full := views.Access{Full: true}
+	st.hostRows = v.loginDoc(priv, &full, v.hosts, clients, st.boots, st.hostRows)
+
+	// A login without the full view.
+	red := newDocBuilder(st.reduced.strings, "")
+	none := views.Access{}
+	sums := make([]views.HostSummary, 0, len(v.hosts))
+
+	for i := range v.hosts {
+		sums = append(sums, none.Summary(&v.hosts[i]))
+	}
+
+	st.reducedRows = v.loginDoc(red, &none, sums, clients, st.boots, st.reducedRows)
+
+	if err := errors.Join(pub.err, priv.err, red.err); err != nil {
+		return nil, nil, nil, err
+	}
+
+	return pub.doc, priv.doc, red.doc, nil
+}
+
+// loginDoc puts the tables of an authenticated audience, with the host rows
+// of sums and what access shows of the rest. It returns the host row cache
+// of the build (addHosts).
+func (v *streamViews) loginDoc(
+	b *docBuilder, access *views.Access, sums []views.HostSummary, clients *views.ClientIndex,
+	boots map[string]time.Time, rows map[string]cachedHostRow,
+) map[string]cachedHostRow {
+	b.one(tableNetwork, wireGate{
 		OK: v.plan.Gate.OK, Reasons: v.plan.Gate.Reasons, Network: newWireNetwork(v.plan.Gate.Network, v.now),
-	}
+	})
 
-	if !slices.Equal(gate.Reasons, v.publicGate.Reasons) {
-		gate.PublicReasons = v.publicGate.Reasons
-	}
+	rows = addHosts(b, sums, v.statusHashes, v.planned, boots, rows)
 
-	priv.one(tableNetwork, gate)
-
-	st.hostRows = addHosts(priv, v.hosts, v.statusHashes, v.planned, st.boots, st.hostRows)
-
-	addImages(priv, &v.images)
-	addSlots(priv, v.slots, v.slotHosts)
-	priv.one(tablePlan, wirePlan{Paused: v.plan.Paused, Budget: v.plan.Budget})
+	addImages(b, &v.images)
+	addSlots(b, v.slots, v.slotHosts)
+	b.one(tablePlan, wirePlan{Paused: v.plan.Paused, Budget: v.plan.Budget})
 
 	for i := range v.plan.Queue {
-		priv.add(tableQueue, v.plan.Queue[i])
+		b.add(tableQueue, v.plan.Queue[i])
 	}
 
-	addRollouts(priv, v.rollouts)
+	addRollouts(b, access.Rollouts(v.rollouts))
 
-	clients := views.NewClientIndex(v.hosts, &v.settings.Settings)
-
-	for i := range clients.Views {
-		priv.add(tableClients, clients.Views[i])
+	shown := access.Clients(clients.Views)
+	for i := range shown {
+		b.add(tableClients, shown[i])
 	}
 
-	priv.one(tableSettings, v.settings)
-	priv.one(tableAudit, v.audit)
+	b.one(tableAudit, v.audit)
 
-	if err := errors.Join(pub.err, priv.err); err != nil {
-		return nil, nil, err
-	}
-
-	return pub.doc, priv.doc, nil
+	return rows
 }
 
 // addImages puts the image references and the digest each points at.
@@ -1082,7 +1181,7 @@ func addSlots(b *docBuilder, slots []fleet.SlotParticipation, hosts []fleet.Host
 
 // addRollouts puts the rollouts, their members and the leases.
 func addRollouts(b *docBuilder, view *views.Rollouts) {
-	ids := func(list []*fleet.Rollout) []string {
+	ids := func(list []*views.RolloutView) []string {
 		out := make([]string, 0, len(list))
 
 		for _, r := range list {
@@ -1116,24 +1215,34 @@ func addRollouts(b *docBuilder, view *views.Rollouts) {
 	b.order(tableLeases, [][]string{leases(view.Leases), leases(view.RecentLeases)})
 }
 
-// hostDetailDoc builds the tables of one host's details; nil for a host
-// that does not exist. Its strings travel as they are: only the streams
-// that asked for the host get it, so it cannot use their shared table.
-func (s *Handler) hostDetailDoc(ctx context.Context, name string) (wireDoc, error) {
+// hostDetail reads the details of one host; nil for a host that does not
+// exist.
+func (s *Handler) hostDetail(ctx context.Context, name string) (*views.HostDetail, error) {
 	detail, err := s.views.HostDetail(ctx, name)
 
 	switch {
 	case errors.Is(err, store.ErrNotFound):
-		return nil, nil //nolint:nilnil // no document is the answer for an unknown host.
+		return nil, nil //nolint:nilnil // no detail is the answer for an unknown host.
 	case err != nil:
 		return nil, fmt.Errorf("host %s: %w", name, err)
+	}
+
+	return detail, nil
+}
+
+// detailDoc builds the tables of one host's details; nil for nil. Its
+// strings travel as they are: only the streams that asked for the host get
+// it, so it cannot use their shared table.
+func detailDoc(detail *views.HostDetail) (wireDoc, error) {
+	if detail == nil {
+		return nil, nil //nolint:nilnil // no document is the answer for an unknown host.
 	}
 
 	b := newDocBuilder(nil, "d.")
 	b.one(tableDetail, wireDetail{
 		HostSummary: detail.HostSummary, CertHash: detail.CertHash,
 		FirstSeen: detail.FirstSeen, RemoteAddr: detail.RemoteAddr,
-		Assigned: detail.Assigned, HasInventory: detail.Inventory != nil,
+		Assigned: detail.Assigned, HasInventory: detail.Inventory != nil, Reduced: detail.Reduced,
 	})
 
 	if detail.Inventory != nil {

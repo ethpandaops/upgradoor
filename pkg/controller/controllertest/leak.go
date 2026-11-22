@@ -42,6 +42,11 @@ const (
 	SecretPeerLayer     = "zzEL"
 	SecretPauseReason   = "zz paused after the canary; resume to continue"
 	SecretAuditActor    = "zz-admin@ethpandaops.io"
+	SecretRangesError   = `Get "https://zz-inventory.cluster.local/ranges.json": EOF`
+	SecretSettingsKey   = "zz-settings-only-action"
+	SecretFlag          = "--zz-secret-flag=7"
+	SecretActionName    = "zz-flush-caches"
+	SecretActionOutput  = "zz flushed 3 caches on /dev/zzsda1"
 	// Teams are team names; these two carry no "zz", so the catch-all below
 	// is not what finds them.
 	SecretOwnerEL = "qq-stealth-el-team"
@@ -56,7 +61,29 @@ var LeakSecrets = []string{
 	SecretHoldReason, SecretVCImage, SecretOtherImage, SecretContainerID, SecretImageID,
 	SecretProbeError, SecretRegistryError, SecretBeaconError, SecretLeaseError,
 	SecretReadiness, SecretPeerLayer, SecretPauseReason,
-	SecretAuditActor, SecretOwnerEL, SecretOwnerCL, "zz", "10.77.", "cluster.local",
+	SecretAuditActor, SecretFlag, SecretActionName, SecretActionOutput, SecretOwnerEL, SecretOwnerCL,
+	SecretRangesError, SecretSettingsKey, "zz", "10.77.", "cluster.local",
+}
+
+// AdminSecrets are the values of the leak fixture that only the admin pages
+// show: the error texts of the beacon service and of the validator ranges
+// inventory (the data sources), the settings a settings change did not
+// change (the settings). No event stream carries them.
+var AdminSecrets = []string{
+	SecretBeaconError, SecretRangesError, SecretSettingsKey, "zz-beacon", "zz-inventory", "10.77.0.3",
+}
+
+// HostDetailSecrets are the values of the leak fixture that a login reads
+// only with the full view of the host (views.Access): the system of the
+// host, its unmanaged containers, the internals of managed containers, its
+// identity, its resource use and its host actions. Of them, the command line of the
+// container geth belongs to the team SecretOwnerEL.
+var HostDetailSecrets = []string{
+	SecretKernelRunning, SecretKernelNewest, SecretOSPretty, SecretOSID, SecretOSVersion,
+	SecretArch, SecretAddr, SecretAddr6, SecretCertHash, SecretPkgName, SecretPkgVersion,
+	SecretPkgCandidate, SecretBlockedPkg, SecretBlockedTo, SecretAgentVersion, SecretBootID,
+	SecretOtherImage, SecretContainerID, SecretImageID, SecretProbeError, SecretFlag,
+	SecretActionName, SecretActionOutput,
 }
 
 // LeakFixture fills the fakes with a host that carries every kind of data
@@ -65,6 +92,7 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 	t.Helper()
 
 	checked := Epoch.Add(-time.Minute)
+	busy := 42.5
 
 	containers := func(clDigest string) []protocol.Container {
 		return []protocol.Container{
@@ -74,6 +102,8 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 				Version: "1.16.4", State: "running", Health: "healthy", RestartCount: 2,
 				StartedAt: Epoch.Add(-time.Hour), Managed: true, Kind: protocol.KindEL,
 				ConfiguredImage: "ethereum/client-go:stable", Team: SecretOwnerEL,
+				Command: []string{"--http", SecretFlag},
+				Stats:   &protocol.ContainerStats{Memory: 3 << 30, MemoryLimit: 8 << 30},
 				Registry: &protocol.RegistryCheck{
 					Digest: "sha256:e1e1", Revision: "rev-geth-1", CheckedAt: checked,
 					Pulled: true,
@@ -109,8 +139,12 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 			BootID:          SecretBootID,
 			UptimeSeconds:   86400,
 			Verbs:           []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages},
-			Hold:            protocol.Hold{Local: true, LocalReason: SecretHoldReason},
-			Containers:      containers(clDigest),
+			Actions:         []protocol.ActionInfo{{Name: SecretActionName, Impact: protocol.ImpactNode}},
+			Hold: protocol.Hold{Local: true, LocalReason: SecretHoldReason, Holds: []protocol.HostHold{
+				{Holder: protocol.HolderHost, By: "pk", Reason: SecretHoldReason, At: Epoch},
+				{Holder: protocol.HolderStaff, By: "alice@example.com", Reason: SecretHoldReason, At: Epoch},
+			}},
+			Containers: containers(clDigest),
 			Node: protocol.NodeHealth{
 				EL: &protocol.ELHealth{Error: SecretProbeError},
 				CL: &protocol.CLHealth{Reachable: true, Peers: 12, HeadSlot: 99},
@@ -121,7 +155,11 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 				NewestKernel: SecretKernelNewest, RebootRequired: true,
 				RebootPackages: []string{SecretPkgName},
 			},
-			Pending:       protocol.Pending{Upgradable: 9, Security: 4, Blocked: 1},
+			Pending: protocol.Pending{Upgradable: 9, Security: 4, Blocked: 1},
+			Resources: protocol.Resources{
+				CPU:    protocol.CPUStats{Cores: 16, Load1: 2.5, Load5: 2, Load15: 1.5, Busy: &busy},
+				Memory: protocol.MemoryStats{Total: 64 << 30, Available: 20 << 30, SwapTotal: 8 << 30},
+			},
 			InventoryHash: "inv-hash",
 			Needs:         needs,
 		}
@@ -146,7 +184,7 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 		Roles:      []string{"ethereum_node"},
 		FirstSeen:  Epoch.Add(-48 * time.Hour), LastSeen: Epoch,
 		RemoteAddr: SecretAddr, Status: status("sha256:c1c1", needs),
-		InventoryHash: "inv-hash", HoldWanted: true, HoldReason: SecretHoldReason,
+		InventoryHash: "inv-hash",
 	}
 	st.Hosts["lighthouse-geth-2"] = &fleet.Host{
 		Name: "lighthouse-geth-2", CertHash: SecretCertHash,
@@ -186,6 +224,13 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 		// What the last readiness check compared with the fleet.
 		Readiness:  SecretReadiness,
 		PeerChecks: []fleet.PeerCheck{{Layer: SecretPeerLayer, Peers: 4, Median: 31, Needs: 16}},
+		Operation: &protocol.Operation{
+			LeaseID: "lease-zz", Phase: protocol.PhaseFailed, StartedAt: Epoch,
+			Steps: []protocol.Step{{
+				NeedID: "action/1", Status: protocol.StepFailed,
+				Action: &protocol.ActionResult{ExitCode: 1, Output: SecretActionOutput},
+			}},
+		},
 	}}
 	// A rollout that the scheduler paused, with its reason.
 	st.Rollouts = []*fleet.Rollout{{
@@ -201,9 +246,20 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 			{Host: "lighthouse-geth-2", Assigned: 2, Included: 1},
 		},
 	}}
+	before := fleet.DefaultSettings()
+	before.ActionPolicies = map[string]fleet.Policy{SecretSettingsKey: fleet.PolicyAuto}
+	after := before
+	after.MaxUnavailablePercent = 20
+
 	st.Audit = []fleet.AuditEntry{{
 		ID: 1, Time: Epoch, Actor: SecretAuditActor, Action: "action.hold",
 		Target: "lighthouse-geth-1", Detail: map[string]any{"reason": SecretHoldReason},
+	}, {
+		ID: 2, Time: Epoch, Actor: SecretAuditActor, Action: "settings.update",
+		Target: "settings", Detail: map[string]any{"before": before, "after": after},
+	}, {
+		ID: 3, Time: Epoch, Actor: SecretAuditActor, Action: "sources.validator-ranges.refresh",
+		Target: "validator-ranges", Detail: map[string]any{"changed": false, "error": SecretRangesError},
 	}}
 
 	health := fleet.NetworkHealth{
@@ -212,7 +268,7 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 		SecondsPerSlot: 12, SlotsPerEpoch: 32, HeadSlot: 7200, CurrentEpoch: 225,
 		Phases:         fleet.SinglePhase(Epoch.Add(-24*time.Hour), 12*time.Second),
 		FinalizedEpoch: 223, FinalityLagEpochs: 2, LivenessKnown: true, LivenessEpoch: 224,
-		Tracked: 200, Live: 190,
+		Tracked: 200, Live: 190, ValidatorRangesError: SecretRangesError,
 	}
 
 	beacon.Network = health
@@ -225,11 +281,18 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 			Budget: scheduler.Budget{TotalWeight: 200, AllowedWeight: 20, UnavailableWeight: 10},
 			Queue: []scheduler.QueueEntry{{
 				Host: "lighthouse-geth-1", Position: 1, Reason: SecretHoldReason,
+			}, {
+				Host: "lighthouse-geth-2", Position: 2,
+				Reason: scheduler.ReasonGatePrefix + "beacon unavailable: " + SecretBeaconError,
 			}},
 			Hosts: map[string]scheduler.HostPlan{
 				"lighthouse-geth-1": {
 					Slot: scheduler.SlotHeld, Weight: 100, Live: 90, LiveKnown: true,
 					LeaseID: "lease-zz", Reason: SecretHoldReason,
+				},
+				"lighthouse-geth-2": {
+					Slot: scheduler.SlotQueued, Weight: 100, Live: 100, LiveKnown: true,
+					Reason: scheduler.ReasonGatePrefix + "beacon unavailable: " + SecretBeaconError,
 				},
 			},
 		}

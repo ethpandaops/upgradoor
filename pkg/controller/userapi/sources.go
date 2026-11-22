@@ -139,7 +139,9 @@ func (s *Handler) dataSources(ctx context.Context) (views.DataSources, error) {
 		known[h.Name] = struct{}{}
 	}
 
-	return views.NewDataSources(endpoints, &ranges, func(host string) bool {
+	health := s.opts.Beacon.Health()
+
+	return views.NewDataSources(endpoints, &health, &ranges, func(host string) bool {
 		_, ok := known[host]
 
 		return ok

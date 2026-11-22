@@ -38,7 +38,7 @@ export interface ActionInfo {
   name: string;
   description?: string;
   impact: Impact;
-  /** feature is the login feature ("<service>:<feature>") that allows starting the action, next to admin. */
+  /** feature is the controller feature that allows starting the action, next to admin; manage when unset. */
   feature?: string;
   /** teams are the teams whose members may start the action. */
   teams?: string[];
@@ -47,11 +47,21 @@ export interface ActionInfo {
   due?: boolean;
 }
 
-/** protocol.Hold */
+/** protocol.Hold: the holds the agent reports; it owns them. */
 export interface Hold {
   local: boolean;
   localReason?: string;
-  controller: boolean;
+  /** holds in order: the host's own ("host") first, then staff's, then the teams by name. */
+  holds?: List<HostHold>;
+}
+
+/** protocol.HostHold: one hold of a host. */
+export interface HostHold {
+  /** holder is "host" (the local hold), "staff" or the team the hold is of. */
+  holder: string;
+  by?: string;
+  reason?: string;
+  at: string;
 }
 
 /**
@@ -116,6 +126,38 @@ export interface Container {
   overridable?: boolean;
   /** notRolled says why the agent rolls this container to nothing (its updates are still reported). */
   notRolled?: string;
+  /** stats is the resource use of a running managed container; in a host's details and a client's host list. */
+  stats?: ContainerStats;
+}
+
+/** protocol.ContainerStats: one container's resource use, from its cgroup. */
+export interface ContainerStats {
+  /** Percentage of the host's CPU capacity since the agent's previous reading; absent on its first. */
+  cpu?: number;
+  /** Bytes in use without the inactive page cache. */
+  memory: number;
+  /** The memory limit in bytes; absent without one. */
+  memoryLimit?: number;
+}
+
+/** protocol.Resources: the host's resource use at its last sync. */
+export interface Resources {
+  cpu: {
+    cores: number;
+    load1: number;
+    load5: number;
+    load15: number;
+    /** Percentage of CPU time not idle since the agent's previous reading; absent on its first. */
+    busy?: number;
+  };
+  /** Bytes; total is 0 when unknown. */
+  memory: { total: number; available: number; swapTotal: number; swapUsed: number };
+}
+
+/** api.HostUsage: a host's resource use in whole percents. */
+export interface HostUsage {
+  cpu?: number;
+  memory?: number;
 }
 
 /** protocol.ContainerOverride: the override of one managed container, as the host's overrides file states it. */
@@ -414,6 +456,11 @@ export interface NetworkHealth {
   currentEpoch: number;
   finalizedEpoch: number;
   finalityLagEpochs: number;
+  /**
+   * How the in-sync beacon endpoints divide over chains when no chain has a
+   * strict majority ("2 chains, 3/5 and 2/5 endpoints"); the gate is closed while set.
+   */
+  split?: string;
   livenessKnown: boolean;
   livenessEpoch: number;
   /** Why the beacon service's last count of the per-slot data failed, if it did. */
@@ -437,7 +484,7 @@ export type RolloutKind = 'group' | 'packages' | 'reboot' | 'manual' | 'local' |
 export type RolloutState = 'active' | 'halted' | 'completed' | 'superseded' | 'aborted';
 
 /** fleet.HostState */
-export type HostState = 'expected' | 'pending' | 'leased' | 'done' | 'failed' | 'skipped' | 'aborted';
+export type HostState = 'expected' | 'pending' | 'leased' | 'done' | 'failed' | 'cancelled' | 'skipped' | 'aborted';
 
 /**
  * fleet.Stage, in serving order: 1 repair (a member whose host is broken for
@@ -482,7 +529,7 @@ export interface RolloutTarget {
   flags?: boolean;
 }
 
-/** fleet.Rollout */
+/** views.RolloutView: a fleet.Rollout with its policy. */
 export interface Rollout {
   id: string;
   kind: RolloutKind;
@@ -512,21 +559,25 @@ export interface Rollout {
   approved: boolean;
   force: boolean;
   ignoreBudget: boolean;
+  /** ignoreGate: a person let the rollout pass a closed network gate; budget, host limit and order still apply. */
+  ignoreGate: boolean;
   canary?: string;
   createdBy: string;
   createdAt: string;
   updatedAt: string;
   endedAt?: string;
   hosts: List<RolloutHost>;
+  /** views.RolloutView: the policy the rollout answers to (fleet.Settings.RolloutPolicy); manual waits for approval. */
+  policy: Policy;
 }
 
 /** fleet.LeaseState */
-export type LeaseState = 'granted' | 'running' | 'verifying' | 'released' | 'failed' | 'expired';
+export type LeaseState = 'granted' | 'running' | 'verifying' | 'released' | 'failed' | 'expired' | 'cancelled';
 
 /**
  * fleet.LeaseCancel: the mark of a lease that a person ended while it was
  * open (the end-lease action). The lease stays open and keeps its slot until
- * its agent reports or goes silent, and then ends as failed.
+ * its agent reports, and then ends as cancelled (failed when the agent goes silent).
  */
 interface LeaseCancel {
   at: string;
@@ -534,6 +585,16 @@ interface LeaseCancel {
   by: string;
   /** The state the lease was in when it was cancelled. For people: no rule reads it. */
   state: LeaseState;
+  reason?: string;
+}
+
+/**
+ * fleet.LeaseApproval: the mark of a verifying lease a person approved (the
+ * approve-lease action); the next reconcile releases it as ready.
+ */
+interface LeaseApproval {
+  at: string;
+  by: string;
   reason?: string;
 }
 
@@ -579,6 +640,8 @@ export interface Lease {
    * told with every sync and stops after the step in progress.
    */
   cancelled?: LeaseCancel;
+  /** Set once a person approved the verifying lease. */
+  approved?: LeaseApproval;
   /**
    * recheck marks a lease that only repeats the readiness check of a failed
    * lease whose steps the agent did, after a retry; the agent is not offered it.
@@ -606,7 +669,10 @@ export interface Settings {
   maxIndependentPercent: number;
   minParticipationPercent: number;
   maxFinalityLagEpochs: number;
-  readyEpochs: number;
+  /** Distinct slots after its operation for which a host's validators must have attestations included; fewer for a host with fewer validators. */
+  readyAttestations: number;
+  /** How long the node of a host without validators must stay at head with peers (Go duration); "0s" is its first healthy sync. */
+  readyStableFor: string;
   minPeers: number;
   leaseTtl: string;
   hostStaleAfter: string;
@@ -643,6 +709,8 @@ export interface RollRequest {
   staggered: boolean;
   force: boolean;
   ignoreBudget: boolean;
+  /** ignoreGate passes a closed network gate; budget, host limit and order still apply. */
+  ignoreGate?: boolean;
   reason: string;
 }
 
@@ -653,6 +721,7 @@ export interface RebootRequest {
   staggered: boolean;
   force: boolean;
   ignoreBudget: boolean;
+  ignoreGate?: boolean;
   reason: string;
 }
 
@@ -661,8 +730,6 @@ export interface OfflineMark {
   reason: string;
   /** until is when the mark ends by itself; absent: until a person lifts it. */
   until?: string;
-  /** by is "team" for a mark set through team_hold. */
-  by?: string;
 }
 
 /** scheduler.OfflineRequest: the body of mark-offline and unmark-offline. */
@@ -676,13 +743,15 @@ export interface OfflineRequest {
 export interface HoldRequest {
   hosts: string[];
   reason: string;
+  /** holders names the holds an unhold lifts ("staff" or teams); absent: the holds the login sets. */
+  holders?: string[];
 }
 
 /**
  * scheduler.EndLeaseRequest: the body of end-lease. The action is a request
  * to cancel an open lease (granted, running or verifying): the lease is
  * marked (Lease.cancelled) and stays open until the agent reports or the
- * lease runs out, and then ends as failed. No hold is set. Ending a lease
+ * lease runs out, and then ends as cancelled. No hold is set. Ending a lease
  * that is already cancelled changes nothing and succeeds; a lease that has
  * ended is answered 409.
  */
@@ -740,9 +809,16 @@ export interface ClientOverrideRequest {
   reason: string;
 }
 
-/** scheduler.ScopeRequest: the body of pause, resume and abort. */
+/** scheduler.ScopeRequest: the body of pause, resume, abort and ignore-gate. */
 export interface ScopeRequest {
   rollout: string;
+  reason: string;
+}
+
+/** scheduler.ApproveLeaseRequest: the body of approve-lease, the verifying lease of one member of a rollout. */
+export interface ApproveLeaseRequest {
+  rollout: string;
+  host: string;
   reason: string;
 }
 
@@ -764,6 +840,7 @@ export interface HostActionRequest {
   client?: string;
   all?: boolean;
   pauseAfterCanary?: boolean;
+  ignoreGate?: boolean;
   reason: string;
 }
 
@@ -849,6 +926,17 @@ export interface HostPlan {
   liveKnown: boolean;
   leaseId?: string;
   reason?: string;
+  /** holdRequests are the hold and release-hold directives the host has not answered yet, oldest first. */
+  holdRequests?: List<PendingHold>;
+}
+
+/** scheduler.PendingHold: a hold or release-hold directive that waits for the host. */
+export interface PendingHold {
+  holder: string;
+  release?: boolean;
+  by?: string;
+  reason?: string;
+  at: string;
 }
 
 /** scheduler.Plan */
@@ -983,6 +1071,8 @@ export interface Outage {
   rollout?: string;
   /** The lease failed or expired. */
   failed?: boolean;
+  /** The lease applies a deploy on the host (upgradoor deploy, e.g. from Ansible). */
+  deployed?: boolean;
   /** Attestations missed, and due, in the slots of the span in which the hosts missed some. */
   missed: number;
   assigned: number;
@@ -1029,19 +1119,13 @@ export interface HostListing {
   os: OSSummary;
   pending: Pending;
   uptimeSeconds: number;
+  /** The resource use in brief; absent when unknown and for a login without the full view of the host. */
+  usage?: HostUsage;
   /** When the host booted. Only a stream sets it (the uptime then follows from the clock); the REST view has uptimeSeconds. */
   bootTime?: string;
   hold: Hold;
-  holdWanted: boolean;
-  /** holdReason is the reason of the controller hold (holdWanted); left out when there is none. */
-  holdReason?: string;
-  /**
-   * holdBy says who set the controller hold: "team:<teams>" for a hold that
-   * these teams set through a team feature, which a team feature of one of
-   * them may lift again, "staff" for every other hold. Left out when the host
-   * is not held.
-   */
-  holdBy?: string;
+  /** holders are the holders of hold.holds: "host" first, then "staff", then the teams. */
+  holders: List<string>;
   /** offline is the known-offline mark while it is in force. */
   offline?: OfflineMark;
   verbs: List<Verb>;
@@ -1066,6 +1150,8 @@ export interface HostSummary extends HostListing {
    */
   broken?: Record<string, string>;
   needs: List<Need>;
+  /** The resource use by the last sync; absent before the first and for a login without the full view. */
+  resources?: Resources;
 }
 
 /** api.Hosts */
@@ -1083,6 +1169,11 @@ export interface HostDetail extends HostSummary {
   inventory?: Inventory;
   leases: List<Lease>;
   history: List<AuditEntry>;
+  /**
+   * reduced: the login lacks the feature details for this host. The system, the packages, the unmanaged
+   * containers, the internals of other teams' containers, the identity and the host actions are left out.
+   */
+  reduced?: boolean;
 }
 
 /** api.ClientLayer: which row of the Clients tab a client belongs to. */
@@ -1114,15 +1205,18 @@ export interface ClientImage {
   /** The command line most of these containers report without a flag override, and how many hosts report exactly it. */
   command?: List<string>;
   commandHosts: number;
+  /** The arguments more than half of those hosts report; one that differs on every host is not in it. */
+  commonArgs?: List<string>;
 }
 
 /** api.ClientView: one client, a row of GET /api/v1/clients and of the stream's client table. */
 export interface ClientView {
   name: string;
   layer: ClientLayer;
-  /** The image policy the client's rollouts answer to; policySet is false when that is policyImage. */
+  /** The image policy the client's rollouts answer to; policySet is false when that is defaultPolicy (policyImage). */
   policy: Policy;
   policySet: boolean;
+  defaultPolicy: Policy;
   images: List<ClientImage>;
   /** The hosts that run the client; the counts below are those hosts by their state and add up to it. */
   hosts: number;
@@ -1155,6 +1249,8 @@ export interface ClientHost {
   slot: SlotState;
   /** The host's containers of this client, with client, command, override and overridable. */
   containers: List<Container>;
+  /** The host's resource use, for a login with the full view of the host. */
+  usage?: HostUsage;
 }
 
 /** api.ClientHosts: one page of GET /api/v1/clients/{client}/hosts, ordered by host name. */
@@ -1215,14 +1311,22 @@ export interface ImagesRefresh {
   message: string;
 }
 
+/**
+ * beacon.EndpointState: ok follows the chain; behind is on it but lags its
+ * head; syncing says so (or its EL is offline); forked has a head off the
+ * followed chain; down did not answer.
+ */
+export type EndpointState = 'ok' | 'behind' | 'syncing' | 'forked' | 'down';
+
 /** beacon.EndpointStatus: what the controller saw of one beacon endpoint; label carries no credentials. */
 export interface BeaconEndpoint {
   label: string;
-  /** active: the endpoint that is tried first. */
-  active: boolean;
-  successAt?: string;
-  /** headSlot is the head the endpoint last reported; absent before. */
+  state: EndpointState;
+  /** headSlot, headRoot and finalizedEpoch are what the endpoint last reported; absent before. */
   headSlot?: number;
+  headRoot?: string;
+  finalizedEpoch?: number;
+  successAt?: string;
   error?: string;
   errorAt?: string;
 }
@@ -1260,9 +1364,17 @@ export interface ValidatorRangesSource {
   hosts: List<ValidatorHostTotal>;
 }
 
+/** views.ChainErrors: the error texts of the beacon service, which the other views carry as fixed texts. */
+export interface ChainErrors {
+  error?: string;
+  timingError?: string;
+  livenessError?: string;
+}
+
 /** views.DataSources: GET /api/v1/settings/sources (admin). */
 export interface DataSources {
   beacon: List<BeaconEndpoint>;
+  chain: ChainErrors;
   validatorRanges: ValidatorRangesSource;
 }
 
@@ -1328,11 +1440,10 @@ export interface LiveViews {
   clients: Clients;
   plan: Plan;
   rollouts: Rollouts;
-  settings: SettingsBody;
   audit: AuditHead;
 }
 
 export type LiveView = keyof LiveViews;
 
 /** PRIVATE_VIEWS are the views only the authenticated stream carries. */
-export const PRIVATE_VIEWS: readonly LiveView[] = ['hosts', 'clients', 'plan', 'rollouts', 'settings', 'audit'];
+export const PRIVATE_VIEWS: readonly LiveView[] = ['hosts', 'clients', 'plan', 'rollouts', 'audit'];

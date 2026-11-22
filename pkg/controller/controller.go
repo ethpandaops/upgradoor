@@ -169,6 +169,7 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Store:    c.store,
 		Health:   c.health,
 		Liveness: c.beacon.Liveness,
+		Attested: c.beacon.AttestedSlots,
 		Defaults: defaults,
 		NewID:    newID,
 		// The API is built after the scheduler, which is not running yet.

@@ -22,7 +22,8 @@ const authorizedByAction = "action"
 // handleHostAction serves POST /api/v1/actions/host-action: one configured
 // host action on named hosts, the hosts of a client or all hosts. A person
 // may start it on a host with admin, with the feature the host's agent.yaml
-// names for it, or as a member of one of its teams (authz.ActionBasis). A
+// names for it (manage when it names none), or as a member of one of its
+// teams (authz.ActionBasis). A
 // selection by client or all takes the permitted hosts that report the
 // action and leaves the others out; a named host that is not permitted is
 // rejected with the reason. The request is refused when no host is
@@ -196,13 +197,9 @@ func (s *Handler) handleResume(w http.ResponseWriter, r *http.Request, u *authz.
 		return
 	}
 
-	ctx, ok := s.allowActionApproval(r.Context(), u, req.Rollout)
+	ctx, ok := s.allowApproval(w, r, u, req.Rollout)
 	if !ok {
-		required := needScope(&req)
-
-		if ctx, ok = s.authz.Allow(w, r, u, &required); !ok {
-			return
-		}
+		return
 	}
 
 	if err := validateScope(false)(&req); err != nil {
@@ -226,7 +223,7 @@ func (s *Handler) handleResume(w http.ResponseWriter, r *http.Request, u *authz.
 // through the host action it runs: the rollout is one of a host action and
 // the login may start that action on each of its members.
 func (s *Handler) allowActionApproval(ctx context.Context, u *authz.User, id string) (context.Context, bool) {
-	if id == "" || u.Open || s.authz.HasFeature(u, authz.FeatureSupervise) {
+	if id == "" || u.Open || s.authz.HasFeature(u, authz.FeatureManage) {
 		return nil, false
 	}
 

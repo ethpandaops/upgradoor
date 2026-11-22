@@ -165,6 +165,20 @@ describe('Timeline', () => {
     expect(screen.getByRole('list', { name: 'Legend' })).toHaveTextContent('Host action');
   });
 
+  it('edges an image roll deployed on the host and keys it in the legend', () => {
+    const deployed: Outage[] = [{ ...(outages[0] as Outage), work: 'image', deployed: true }];
+    const { container } = render(
+      <>
+        <Timeline history={history} outages={deployed} now={NOW} rangeMs={10 * SLOT} />
+        <TimelineLegend lanes threshold={undefined} />
+      </>
+    );
+
+    expect(screen.getByRole('img', { name: 'b: image roll' })).toBeInTheDocument();
+    expect(container.querySelector('rect.fill-series-image.stroke-accent')).not.toBeNull();
+    expect(screen.getByRole('list', { name: 'Legend' })).toHaveTextContent('Image roll deployed on the host');
+  });
+
   it('has no bands without a login, and says so when there is nothing to draw', () => {
     render(
       <Timeline

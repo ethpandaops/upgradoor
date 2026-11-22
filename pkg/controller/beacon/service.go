@@ -38,8 +38,9 @@ type Store interface {
 
 // Options configure the beacon service.
 type Options struct {
-	// Endpoints are beacon API base URLs. They are tried in order; the one
-	// that answered last is tried first the next time.
+	// Endpoints are beacon API base URLs. Every poll asks all of them for
+	// their head; blocks and committees are read from the ones on the chain
+	// most of them follow (endpoints.go).
 	Endpoints []string
 	// Store holds the hosts and the per-slot participation rows.
 	Store Store
@@ -70,11 +71,13 @@ type service struct {
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
 
-	// healthMu guards health and liveness, the state shared with Health and
-	// Liveness callers. liveness holds the settled epochs, ascending.
+	// healthMu guards health, liveness and attested, the state shared with
+	// Health, Liveness and AttestedSlots callers. liveness holds the settled
+	// epochs, ascending.
 	healthMu sync.RWMutex
 	health   fleet.NetworkHealth
 	liveness []epochLiveness
+	attested map[string][]uint64
 
 	// Everything below belongs to the poll goroutine.
 	client *nodeClient
@@ -84,10 +87,14 @@ type service struct {
 	// timingWarned is the last warning about the chain timing that was
 	// logged: it is logged again when what it says changes.
 	timingWarned string
-	// head is the head the node reported in the last good poll; slots is the
+	// head is the followed head of the last good poll; slots is the
 	// per-slot participation that follows it (slots.go).
 	head  headRef
 	slots *slotTracker
+	// usable are the endpoints blocks and committees are read from, in the
+	// order they are tried; split is the last split that was logged.
+	usable []int
+	split  string
 }
 
 var _ Service = (*service)(nil)
@@ -251,6 +258,21 @@ func (s *service) setHealth(change func(h *fleet.NetworkHealth)) {
 	change(&s.health)
 }
 
+// logSplit logs a split when it starts or changes, and its end.
+func (s *service) logSplit(split string) {
+	if split == s.split {
+		return
+	}
+
+	if split == "" {
+		s.log.Info("Beacon endpoints follow one chain again")
+	} else {
+		s.log.WithField("split", split).Warn("Beacon endpoints are split over chains")
+	}
+
+	s.split = split
+}
+
 // beaconUint is an unsigned integer the beacon API encodes as a decimal
 // string.
 type beaconUint uint64
@@ -303,6 +325,15 @@ type (
 			} `json:"finalized"`
 		} `json:"data"`
 	}
+
+	syncingResponse struct {
+		Data struct {
+			//nolint:tagliatelle // field name of the standard Beacon API
+			IsSyncing *bool `json:"is_syncing"`
+			//nolint:tagliatelle // field name of the standard Beacon API
+			ELOffline bool `json:"el_offline"`
+		} `json:"data"`
+	}
 )
 
 // loadTiming fetches genesis and spec once; it is retried on every poll
@@ -313,7 +344,7 @@ func (s *service) loadTiming(ctx context.Context) error {
 	}
 
 	var genesis genesisResponse
-	if err := s.client.get(ctx, "/eth/v1/beacon/genesis", &genesis); err != nil {
+	if err := s.client.get(ctx, s.client.all, "/eth/v1/beacon/genesis", &genesis); err != nil {
 		return fmt.Errorf("reading genesis: %w", err)
 	}
 
@@ -322,7 +353,7 @@ func (s *service) loadTiming(ctx context.Context) error {
 	}
 
 	var spec specResponse
-	if err := s.client.get(ctx, "/eth/v1/config/spec", &spec); err != nil {
+	if err := s.client.get(ctx, s.client.all, "/eth/v1/config/spec", &spec); err != nil {
 		return fmt.Errorf("reading chain spec: %w", err)
 	}
 
@@ -375,8 +406,8 @@ func (s *service) checkTiming(current uint64, phases []fleet.SlotPhase) string {
 	return reason
 }
 
-// refreshChain reads head and finality and publishes the chain part of the
-// view.
+// refreshChain asks every endpoint for its head and finality, picks the
+// chain to follow and publishes the chain part of the view.
 func (s *service) refreshChain(ctx context.Context, now time.Time) error {
 	if err := s.loadTiming(ctx); err != nil {
 		return err
@@ -408,45 +439,28 @@ func (s *service) refreshChain(ctx context.Context, now time.Time) error {
 		h.TimingError = timingError
 	})
 
-	var head headResponse
-	if err := s.client.get(ctx, "/eth/v1/beacon/headers/head", &head); err != nil {
-		return fmt.Errorf("reading head: %w", err)
-	}
-
-	if head.Data.Header.Message.Slot == nil {
-		return errors.New("reading head: answer has no slot")
-	}
-
-	var finality finalityResponse
-
-	err := s.client.get(ctx, "/eth/v1/beacon/states/head/finality_checkpoints", &finality)
+	view, err := s.judge(ctx, current, s.client.probeAll(ctx))
 	if err != nil {
-		return fmt.Errorf("reading finality: %w", err)
+		return err
 	}
 
-	if finality.Data.Finalized.Epoch == nil {
-		return errors.New("reading finality: answer has no finalized epoch")
-	}
-
-	headSlot := uint64(*head.Data.Header.Message.Slot)
-	finalized := uint64(*finality.Data.Finalized.Epoch)
-
-	s.client.noteHead(headSlot)
-
-	s.head = headRef{root: head.Data.Root, slot: headSlot}
+	s.head = view.head
+	s.usable = view.usable
+	s.logSplit(view.split)
 
 	var lag uint64
-	if current > finalized {
-		lag = current - finalized
+	if current > view.finalized {
+		lag = current - view.finalized
 	}
 
 	s.setHealth(func(h *fleet.NetworkHealth) {
 		h.UpdatedAt = now
 		h.Error = ""
-		h.HeadSlot = headSlot
+		h.HeadSlot = view.head.slot
 		h.CurrentEpoch = current
-		h.FinalizedEpoch = finalized
+		h.FinalizedEpoch = view.finalized
 		h.FinalityLagEpochs = lag
+		h.Split = view.split
 	})
 
 	return nil

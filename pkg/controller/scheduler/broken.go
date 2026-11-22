@@ -15,7 +15,7 @@ import (
 // the group of a rollout goes first in it, before the canary, and the other
 // members wait for it.
 
-// reasonEndedByOperator is the failure reason of a lease that a person ended
+// reasonEndedByOperator is the error of a member whose lease a person ended
 // (end-lease).
 const reasonEndedByOperator = "ended by operator"
 

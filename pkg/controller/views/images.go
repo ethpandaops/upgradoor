@@ -101,12 +101,13 @@ type ImageVersion struct {
 	Hosts    []string `json:"hosts"`
 }
 
-// NewImages returns one page of the images of every container the hosts
-// report, managed or not. Without a query the references are in alphabetical
+// NewImages returns one page of the images of the containers the hosts
+// report: every one for a host the login sees in full, the managed ones on
+// the others. Without a query the references are in alphabetical
 // order; with one, the exact match comes first, then the references that
 // start with it, then the others that contain it. after is the Next of the
 // page before.
-func NewImages(hosts []*fleet.Host, query, after string, limit int) (Images, error) {
+func NewImages(hosts []*fleet.Host, query, after string, limit int, access *Access) (Images, error) {
 	needle := strings.ToLower(query)
 
 	rank := func(name string) int {
@@ -135,9 +136,11 @@ func NewImages(hosts []*fleet.Host, query, after string, limit int) (Images, err
 			continue
 		}
 
+		full := access.HostFull(host.Status.Containers)
+
 		for i := range host.Status.Containers {
 			c := &host.Status.Containers[i]
-			if c.Image == "" || !strings.Contains(strings.ToLower(c.Image), needle) {
+			if c.Image == "" || (!full && !c.Managed) || !strings.Contains(strings.ToLower(c.Image), needle) {
 				continue
 			}
 

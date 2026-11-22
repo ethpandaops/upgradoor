@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -107,11 +108,11 @@ func TestAcksFollowTheRepeatedDirectives(t *testing.T) {
 		}
 	}
 
-	e.ctrl.Direct(protocol.Directive{ID: "d-old", Kind: protocol.DirectiveReleaseHold})
+	e.ctrl.Direct(protocol.Directive{ID: "d-old", Kind: protocol.DirectiveReleaseHold, Holder: protocol.HolderStaff})
 	e.ctrl.Await("the old ack", onlyAck("d-old"))
 
-	e.ctrl.Direct(protocol.Directive{ID: "d-new", Kind: protocol.DirectiveReleaseHold},
-		protocol.Directive{ID: "d-new", Kind: protocol.DirectiveReleaseHold})
+	e.ctrl.Direct(protocol.Directive{ID: "d-new", Kind: protocol.DirectiveReleaseHold, Holder: protocol.HolderStaff},
+		protocol.Directive{ID: "d-new", Kind: protocol.DirectiveReleaseHold, Holder: protocol.HolderStaff})
 	e.ctrl.Await("the new ack", onlyAck("d-new"))
 
 	seen := 0
@@ -375,6 +376,53 @@ func TestWithdrawDirectiveDropsTheManualNeed(t *testing.T) {
 	assert.Empty(t, req.Needs, "the repeated reboot directive was answered: it creates nothing again")
 }
 
+// The agent keeps one hold per holder; a directive sets or lifts the hold of
+// staff or a team, never the host's own.
+func TestHoldDirectivesKeepOneHoldPerHolder(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.start()
+	e.ctrl.AwaitSyncs(2)
+
+	answered := func(ids ...string) func(req *protocol.SyncRequest) bool {
+		return func(req *protocol.SyncRequest) bool {
+			return !slices.ContainsFunc(ids, func(id string) bool { return agenttest.AckOf(req, id) == nil })
+		}
+	}
+
+	by := &protocol.Actor{User: "sam@example.org"}
+	e.ctrl.Direct(
+		protocol.Directive{ID: "d-staff", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff, Reason: "fork", By: by},
+		protocol.Directive{ID: "d-geth", Kind: protocol.DirectiveHold, Holder: "geth", Reason: "sync"},
+		protocol.Directive{ID: "d-host", Kind: protocol.DirectiveHold, Holder: protocol.HolderHost},
+	)
+
+	req := e.ctrl.Await("holds answered", answered("d-staff", "d-geth", "d-host"))
+	assert.Equal(t, protocol.DirectiveRejected, agenttest.AckOf(&req, "d-host").Status)
+	assert.Contains(t, agenttest.AckOf(&req, "d-host").Error, "is not staff or a team")
+
+	req = e.ctrl.Await("both held", func(req *protocol.SyncRequest) bool { return len(req.Hold.Holds) == 2 })
+	assert.Equal(t, []string{protocol.HolderStaff, "geth"}, req.Hold.Holders())
+	assert.Equal(t, "sam@example.org", req.Hold.Of(protocol.HolderStaff).By)
+	assert.Equal(t, "controller", req.Hold.Of("geth").By)
+	assert.False(t, req.Hold.Local)
+
+	e.ctrl.Direct(protocol.Directive{ID: "d-lift", Kind: protocol.DirectiveReleaseHold, Holder: protocol.HolderStaff})
+
+	req = e.ctrl.Await("staff's lifted", func(req *protocol.SyncRequest) bool { return len(req.Hold.Holds) == 1 })
+	assert.Equal(t, []string{"geth"}, req.Hold.Holders())
+
+	holders := make([]string, 0, 4)
+	for _, r := range e.auditRecords() {
+		holders = append(holders, r.Action+" "+r.Holder+" "+r.Result)
+	}
+
+	assert.Equal(t, []string{
+		"hold.set staff accepted", "hold.set geth accepted", "hold.set host refused", "hold.release staff accepted",
+	}, holders)
+}
+
 // Each directive sees what the ones before it in the same answer did.
 func TestDirectivesSeeTheHoldOfTheirOwnResponse(t *testing.T) {
 	t.Parallel()
@@ -396,7 +444,7 @@ func TestDirectivesSeeTheHoldOfTheirOwnResponse(t *testing.T) {
 	}
 
 	e.ctrl.Direct(
-		protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Reason: "maintenance"},
+		protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff, Reason: "maintenance"},
 		protocol.Directive{ID: "d-reboot-held", Kind: protocol.DirectiveReboot},
 	)
 
@@ -405,10 +453,10 @@ func TestDirectivesSeeTheHoldOfTheirOwnResponse(t *testing.T) {
 
 	ack := agenttest.AckOf(&req, "d-reboot-held")
 	assert.Equal(t, protocol.DirectiveRejected, ack.Status)
-	assert.Contains(t, ack.Error, "controller hold")
+	assert.Contains(t, ack.Error, "on hold by staff")
 
 	e.ctrl.Direct(
-		protocol.Directive{ID: "d-release", Kind: protocol.DirectiveReleaseHold},
+		protocol.Directive{ID: "d-release", Kind: protocol.DirectiveReleaseHold, Holder: protocol.HolderStaff},
 		protocol.Directive{ID: "d-reboot-free", Kind: protocol.DirectiveReboot},
 	)
 
@@ -439,7 +487,7 @@ func TestOverrideDirective(t *testing.T) {
 	e.ctrl.AwaitSyncs(2)
 
 	until := e.now().Add(time.Hour).UTC().Truncate(time.Second)
-	sam := &protocol.Actor{User: "sam@example.org", Teams: []string{"geth"}, Feature: "team_image_override"}
+	sam := &protocol.Actor{User: "sam@example.org", Teams: []string{"geth"}, Feature: "team_manage_image"}
 	image := func(id, container, ref string, end *time.Time) protocol.Directive {
 		return protocol.Directive{
 			ID: id, Kind: protocol.DirectiveOverride, Container: container, Reason: "sync", By: sam,
@@ -531,7 +579,7 @@ func TestOverrideDirective(t *testing.T) {
 		} else {
 			assert.Equal(t, "sam@example.org", rec.User, rec.Directive)
 			assert.Equal(t, []string{"geth"}, rec.Teams, rec.Directive)
-			assert.Equal(t, "team_image_override", rec.Feature, rec.Directive)
+			assert.Equal(t, "team_manage_image", rec.Feature, rec.Directive)
 		}
 
 		switch rec.Directive {
@@ -588,11 +636,11 @@ func TestDirectivesWhoseWriteFails(t *testing.T) {
 	require.NoError(t, os.Chmod(e.cfg.StateDir, 0o500))
 	t.Cleanup(func() { _ = os.Chmod(e.cfg.StateDir, 0o700) })
 
-	e.ctrl.Direct(override, protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Reason: "maintenance"})
+	e.ctrl.Direct(override, protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff, Reason: "maintenance"})
 
 	req = e.ctrl.AwaitSyncs(3)
 	assert.Nil(t, agenttest.AckOf(&req, "d-hold"), "a hold that is not written is not answered")
-	assert.False(t, req.Hold.Controller)
+	assert.False(t, req.Hold.Of(protocol.HolderStaff) != nil)
 
 	require.NoError(t, os.Chmod(e.cfg.StateDir, 0o700))
 
@@ -600,7 +648,7 @@ func TestDirectivesWhoseWriteFails(t *testing.T) {
 		return agenttest.AckOf(req, "d-hold") != nil
 	})
 	assert.Equal(t, protocol.DirectiveAccepted, agenttest.AckOf(&req, "d-hold").Status)
-	assert.True(t, req.Hold.Controller)
+	assert.True(t, req.Hold.Of(protocol.HolderStaff) != nil)
 	assert.Equal(t, protocol.DirectiveRejected, agenttest.AckOf(&req, "d-override").Status, "answered once")
 
 	assert.Contains(t, auditActions(e.auditRecords()), "override.set failed")

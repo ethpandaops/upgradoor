@@ -40,12 +40,14 @@ export function outageSpans(w: OutageWorld): Outage[] {
   const byHost = new Map<string, Outage[]>();
 
   for (const l of w.leases) {
-    const ended = ['released', 'failed', 'expired'].includes(l.state);
+    const ended = ['released', 'failed', 'expired', 'cancelled'].includes(l.state);
     const from = Date.parse(l.grantedAt);
     const to = l.endedAt ? Date.parse(l.endedAt) : ended ? from : w.nowMs;
     if (to <= start) continue;
 
-    const kinds = [...new Set(list(l.needs).map(n => n.kind as string))];
+    const kinds = [
+      ...new Set(list(l.needs).map(n => (n.kind === 'override' || n.kind === 'spec' ? 'image' : (n.kind as string)))),
+    ];
     const rollouts = Object.values(l.rollouts ?? {}).sort();
     const span: Outage = {
       hosts: 1,
@@ -58,6 +60,7 @@ export function outageSpans(w: OutageWorld): Outage[] {
       work: kinds.length === 1 ? kinds[0] : kinds.length === 0 ? 'image' : 'mixed',
       ...(rollouts[0] ? { rollout: rollouts[0] } : {}),
       ...(l.state === 'failed' || l.state === 'expired' ? { failed: true } : {}),
+      ...(list(l.needs).some(n => n.kind === 'spec') ? { deployed: true } : {}),
       missed: 0,
       assigned: 0,
       validators: w.validators(l.host) || l.weight,
@@ -135,6 +138,7 @@ export function capOutages(spans: Outage[], windowMs: number, limit = MAX_OUTAGE
         into.assigned += span.assigned;
         into.validators += span.validators;
         if (span.open) into.open = true;
+        if (span.deployed) into.deployed = true;
         if (Date.parse(span.to) > Date.parse(into.to)) into.to = span.to;
       } else {
         merged.push({ ...span });

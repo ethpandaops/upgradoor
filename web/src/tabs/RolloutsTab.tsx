@@ -4,12 +4,10 @@ import {
   list,
   type Lease,
   type Plan,
-  type Policy,
   type QueueEntry,
   type Rollout,
   type RolloutHost,
   type RolloutTarget,
-  type Settings,
 } from '../api/types';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { ActionRunView, leaseRun } from '../components/ActionRun';
@@ -34,9 +32,16 @@ import {
   cx,
 } from '../components/primitives';
 import { HostStateBadge, RolloutKindBadge, RolloutStateBadge, stageLabel } from '../components/status';
-import { pauseLabel, percentOf, plural, shortRevision } from '../lib/format';
+import { pauseLabel, percentOf, plural, QUEUE_PLACE_TITLE, queuePlace, shortRevision } from '../lib/format';
 import { rolloutActionOf } from '../lib/hostActions';
-import { endLeaseIntent, hostsIntent, scopeIntent } from '../lib/intents';
+import {
+  approveIntent,
+  approveLeaseIntent,
+  endLeaseIntent,
+  hostsIntent,
+  ignoreGateIntent,
+  scopeIntent,
+} from '../lib/intents';
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
@@ -46,46 +51,18 @@ export function unitLabel(r: Rollout): string {
   return r.team ? `${r.team} ${r.containerKind}` : r.containerKind;
 }
 
-/**
- * policyFor mirrors the scheduler's rolloutPolicy: the policy of the kind,
- * and for a group rollout the image policy of its team where one is set,
- * else policyImage. Manual rollouts have no policy.
- */
-export function policyFor(settings: Settings | undefined, rollout: Rollout): Policy | undefined {
-  if (!settings) return undefined;
-  switch (rollout.kind) {
-    case 'group':
-      return (rollout.team ? settings.policyClients[rollout.team] : undefined) ?? settings.policyImage;
-    case 'packages':
-      return settings.policyPackages;
-    case 'reboot':
-      return settings.policyReboot;
-    case 'manual':
-    case 'local':
-      // Asked for by a person, or on the host itself: no policy, no approval.
-      return undefined;
-    case 'action':
-      // A person's start (key manual:<id>) has no policy; a due action answers to its own, manual without one.
-      return rollout.key.startsWith('manual:')
-        ? undefined
-        : (settings.actionPolicies[rollout.action ?? ''] ?? 'manual');
-  }
-}
-
 /** waitsForApproval says whether a rollout waits for a person to approve it: its policy is manual. */
-export function waitsForApproval(rollout: Rollout, policy: Policy | undefined): boolean {
-  return policy === 'manual' && !rollout.approved;
+export function waitsForApproval(rollout: Rollout): boolean {
+  return rollout.policy === 'manual' && !rollout.approved;
 }
 
 /**
  * useRolloutData is what a rollout card needs from the stream: the rollouts,
- * the plan's queue by host, every lease the page knows by id, and the settings
- * that say the policy of a rollout.
+ * the plan's queue by host and every lease the page knows by id.
  */
 export function useRolloutData() {
   const rollouts = useLive('rollouts');
   const plan = useLive('plan');
-  const settings = useLive('settings');
 
   const queue = useMemo(() => new Map(list(plan.data?.queue).map(q => [q.host, q])), [plan.data]);
   const leases = useMemo(
@@ -93,7 +70,7 @@ export function useRolloutData() {
     [rollouts.data]
   );
 
-  return { rollouts, plan, settings: settings.data?.settings, queue, leases };
+  return { rollouts, plan, queue, leases };
 }
 
 /**
@@ -104,7 +81,7 @@ export function useRolloutData() {
 export function RolloutsTab() {
   const [leaseView, setLeaseView] = useState<'active' | 'recent'>('active');
 
-  const { rollouts, plan, settings, queue, leases } = useRolloutData();
+  const { rollouts, plan, queue, leases } = useRolloutData();
   const actions = useActions();
 
   if (rollouts.loading || plan.loading) return <Loading what="rollouts" />;
@@ -127,14 +104,7 @@ export function RolloutsTab() {
         ) : (
           <div className="flex flex-col gap-3">
             {open.map(r => (
-              <RolloutCard
-                key={r.id}
-                rollout={r}
-                policy={policyFor(settings, r)}
-                queue={queue}
-                leases={leases}
-                onAction={actions.request}
-              />
+              <RolloutCard key={r.id} rollout={r} queue={queue} leases={leases} onAction={actions.request} />
             ))}
           </div>
         )}
@@ -162,7 +132,7 @@ export function RolloutsTab() {
               leases={openLeases}
               label="Active leases"
               onEnd={l => {
-                actions.request(endLeaseIntent(l.id, l.host));
+                actions.request(endLeaseIntent(l));
               }}
             />
           )
@@ -226,20 +196,26 @@ const PIP: Record<RolloutHost['state'], string> = {
   done: 'bg-success',
   leased: 'animate-pulse bg-accent',
   failed: 'bg-danger-solid',
+  cancelled: 'bg-border-strong',
   pending: 'bg-border-strong',
   expected: 'bg-border',
   skipped: 'bg-border',
   aborted: 'bg-border',
 };
 
-/** HostPips draws one mark per host of a rollout, in serving order, coloured by its state. */
-function HostPips({ hosts }: { hosts: readonly RolloutHost[] }) {
-  const count = (state: RolloutHost['state']) => hosts.filter(h => h.state === state).length;
+/**
+ * HostPips draws one mark per host of a rollout, in serving order, coloured by its state; a waiting member that a
+ * hold keeps back (held) is counted as held, not as waiting.
+ */
+function HostPips({ hosts, held }: { hosts: readonly RolloutHost[]; held: ReadonlyMap<string, string> }) {
+  const count = (state: RolloutHost['state']) => hosts.filter(h => h.state === state && !held.has(h.host)).length;
   const summary = [
     `${count('done')} done`,
     count('leased') > 0 && `${count('leased')} in progress`,
     count('pending') + count('expected') > 0 && `${count('pending') + count('expected')} waiting`,
+    held.size > 0 && `${held.size} held`,
     count('failed') > 0 && `${count('failed')} failed`,
+    count('cancelled') > 0 && `${count('cancelled')} cancelled`,
     count('skipped') > 0 && `${count('skipped')} skipped`,
   ]
     .filter(Boolean)
@@ -248,16 +224,23 @@ function HostPips({ hosts }: { hosts: readonly RolloutHost[] }) {
   return (
     <span className="inline-flex items-center gap-2 text-xs/5 text-muted">
       <span role="img" aria-label={`${plural(hosts.length, 'host')}: ${summary}`} className="inline-flex gap-0.5">
-        {hosts.map(h => (
-          <span key={h.host} title={`${h.host}: ${h.state}`} className={cx('h-3 w-1.5 rounded-xs', PIP[h.state])} />
-        ))}
+        {hosts.map(h => {
+          const reason = held.get(h.host);
+          return (
+            <span
+              key={h.host}
+              title={`${h.host}: ${reason ?? h.state}`}
+              className={cx('h-3 w-1.5 rounded-xs', reason ? 'bg-warning' : PIP[h.state])}
+            />
+          );
+        })}
       </span>
       {summary}
     </span>
   );
 }
 
-const LEASE_ENDED: ReadonlySet<Lease['state']> = new Set(['released', 'failed', 'expired']);
+const LEASE_ENDED: ReadonlySet<Lease['state']> = new Set(['released', 'failed', 'expired', 'cancelled']);
 
 /**
  * memberState names the state of a member of a closed rollout. A member that
@@ -272,14 +255,41 @@ function memberState(h: RolloutHost, leases: ReadonlyMap<string, Lease>): string
   return LEASE_ENDED.has(lease.state) ? `lease ${lease.state}` : 'leased';
 }
 
+/**
+ * heldMembers are the waiting members of a rollout that a hold or a known-offline mark keeps back, with the reason
+ * the queue gives ("held by lighthouse", "hold requested, waiting for the host").
+ */
+export function heldMembers(
+  hosts: readonly RolloutHost[],
+  queue: ReadonlyMap<string, QueueEntry>
+): ReadonlyMap<string, string> {
+  const out = new Map<string, string>();
+  for (const h of hosts) {
+    const q = queue.get(h.host);
+    if (h.state === 'pending' && q?.wait === 'held') out.set(h.host, q.reason);
+  }
+  return out;
+}
+
 function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, leases: ReadonlyMap<string, Lease>) {
   switch (h.state) {
     case 'pending': {
       const q = queue.get(h.host);
       if (!q) return <span className="text-muted">not in the queue</span>;
+      if (q.wait === 'held') {
+        return (
+          <span>
+            <span className="text-warning">{q.reason}</span>
+            <span className="text-muted"> — not rolled while it lasts</span>
+          </span>
+        );
+      }
       return (
         <span>
-          <span className="text-faint">#{q.position}</span> {q.reason}
+          <span className="text-faint" title={QUEUE_PLACE_TITLE}>
+            {queuePlace(q.position)}:
+          </span>{' '}
+          {q.reason}
         </span>
       );
     }
@@ -300,12 +310,15 @@ function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, le
               — <Readiness lease={lease} />
             </span>
           )}
+          {lease.approved && <span className="text-muted"> — approved by {lease.approved.by}</span>}
           <PeerChecks checks={lease.peerChecks} />
         </span>
       );
     }
     case 'failed':
       return <span className="text-danger">{h.error || 'failed'}</span>;
+    case 'cancelled':
+      return <span className="text-muted">lease ended by a person; retry to roll it again</span>;
     case 'expected':
       return <span className="text-muted">has not reported the need yet</span>;
     case 'skipped':
@@ -321,13 +334,11 @@ function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, le
 
 export function RolloutCard({
   rollout: r,
-  policy,
   queue,
   leases,
   onAction,
 }: {
   rollout: Rollout;
-  policy: Policy | undefined;
   queue: ReadonlyMap<string, QueueEntry>;
   leases: ReadonlyMap<string, Lease>;
   onAction: (intent: ActionIntent) => void;
@@ -337,7 +348,15 @@ export function RolloutCard({
     [r.hosts]
   );
   const failed = hosts.filter(h => h.state === 'failed');
-  const waiting = waitsForApproval(r, policy);
+  const held = useMemo(() => heldMembers(hosts, queue), [hosts, queue]);
+  const waiting = waitsForApproval(r);
+  const gate = useLive('plan').data?.gate;
+  // A member waits at the closed gate for this rollout: a person may let it pass.
+  const atGate =
+    !r.ignoreGate &&
+    !r.ignoreBudget &&
+    hosts.some(h => queue.get(h.host)?.wait === 'gate' && queue.get(h.host)?.rollout === r.id);
+  const hostAction = rolloutActionOf(r);
 
   return (
     <article
@@ -355,7 +374,12 @@ export function RolloutCard({
         {waiting && <Badge tone="warning">waiting for approval</Badge>}
         {r.force && <Badge tone="warning">force</Badge>}
         {r.ignoreBudget && <Badge tone="danger">ignores budget</Badge>}
-        <HostPips hosts={hosts} />
+        {r.ignoreGate && !r.ignoreBudget && (
+          <Badge tone="warning" title="Passes a closed network gate; budget, host limit and canary still apply">
+            ignores gate
+          </Badge>
+        )}
+        <HostPips hosts={hosts} held={held} />
 
         <span className="ml-auto inline-flex flex-wrap gap-1">
           {waiting && !r.paused && (
@@ -363,7 +387,21 @@ export function RolloutCard({
               icon="check"
               label="Approve…"
               onAction={onAction}
-              intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.team, rolloutActionOf(r))}
+              intent={approveIntent(`Approve rollout: ${r.title}`, r.id, r.team, hostAction)}
+            />
+          )}
+          {atGate && (
+            <IntentAction
+              icon="action"
+              label="Roll despite network state…"
+              onAction={onAction}
+              intent={ignoreGateIntent(
+                `Roll despite network state: ${r.title}`,
+                r.id,
+                r.team,
+                hostAction,
+                list(gate?.reasons)
+              )}
             />
           )}
           {r.paused ? (
@@ -371,7 +409,7 @@ export function RolloutCard({
               icon="resume"
               label="Resume…"
               onAction={onAction}
-              intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.team, rolloutActionOf(r))}
+              intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.team, hostAction)}
             />
           ) : (
             <IntentAction
@@ -462,7 +500,9 @@ export function RolloutCard({
         </thead>
         <tbody>
           {hosts.map(h => {
+            const lease = h.state === 'leased' && h.leaseId ? leases.get(h.leaseId) : undefined;
             const run = r.kind === 'action' ? leaseRun(h.leaseId ? leases.get(h.leaseId) : undefined) : undefined;
+            const verifying = lease?.state === 'verifying' && !lease.approved && !lease.cancelled;
             return (
               <tr key={h.host} className="hover:bg-surface-hover">
                 <Td className="font-medium">
@@ -478,7 +518,13 @@ export function RolloutCard({
                 <Td>{r.kind === 'local' ? <Dash /> : stageLabel(h.stage)}</Td>
                 {/* State and actions keep their width from one state to the next. */}
                 <Td className="min-w-24">
-                  <HostStateBadge state={h.state} />
+                  {held.has(h.host) ? (
+                    <Badge tone="warning" title="The member waits; it is not rolled while the hold lasts">
+                      {held.get(h.host)}
+                    </Badge>
+                  ) : (
+                    <HostStateBadge state={h.state} />
+                  )}
                 </Td>
                 <Td className="whitespace-normal">
                   {/* A done member of an action rollout is its run; any other says what it waits for, then its run. */}
@@ -490,20 +536,31 @@ export function RolloutCard({
                 </Td>
                 <Td className="min-w-28">
                   <span className="inline-flex gap-1">
-                    {(h.state === 'pending' || h.state === 'expected' || h.state === 'failed') && (
-                      <ActionIcon
-                        icon="skip"
-                        label={`Skip ${h.host} in ${r.title}`}
+                    {verifying && (
+                      <IntentAction
+                        icon="check"
+                        label="Approve now…"
                         onAction={onAction}
-                        intent={hostsIntent('skip', `Skip ${h.host}`, r.id, [h.host])}
+                        intent={approveLeaseIntent(r.id, h.host, r.team, hostAction, lease.readiness)}
                       />
                     )}
-                    {h.state === 'failed' && (
+                    {(h.state === 'pending' ||
+                      h.state === 'expected' ||
+                      h.state === 'failed' ||
+                      h.state === 'cancelled') && (
+                      <IntentAction
+                        icon="skip"
+                        label="Skip…"
+                        onAction={onAction}
+                        intent={hostsIntent('skip', `Skip ${h.host}`, r.id, [h.host], r)}
+                      />
+                    )}
+                    {(h.state === 'failed' || h.state === 'cancelled') && (
                       <ActionIcon
                         icon="retry"
                         label={`Retry ${h.host} in ${r.title}`}
                         onAction={onAction}
-                        intent={hostsIntent('retry', `Retry ${h.host}`, r.id, [h.host])}
+                        intent={hostsIntent('retry', `Retry ${h.host}`, r.id, [h.host], r)}
                       />
                     )}
                   </span>

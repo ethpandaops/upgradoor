@@ -714,7 +714,7 @@ func TestSyncResponseAssembly(t *testing.T) {
 				{ID: "d-1", Kind: protocol.DirectiveReboot},
 				{ID: "d-2", Kind: protocol.DirectiveRoll, Container: "geth", Reason: "manual"},
 			},
-			Queue: &protocol.Queue{Position: 3, Reason: "budget 8% of 10%"},
+			Queue: &protocol.Queue{Position: 3, Reason: "validators down: 8% now, 12% with this host, limit 10%"},
 		}
 	})
 
@@ -734,7 +734,7 @@ func TestSyncResponseAssembly(t *testing.T) {
 	assert.Equal(t, int64(1800), lease.TTLSeconds, "the scheduler's lease is not modified")
 	require.Len(t, resp.Directives, 2)
 	assert.Equal(t, protocol.DirectiveRoll, resp.Directives[1].Kind)
-	assert.Equal(t, &protocol.Queue{Position: 3, Reason: "budget 8% of 10%"}, resp.Queue)
+	assert.Equal(t, &protocol.Queue{Position: 3, Reason: "validators down: 8% now, 12% with this host, limit 10%"}, resp.Queue)
 
 	// An expired lease is still restated, with no time left.
 	h.clock.Advance(20 * time.Minute)
@@ -850,39 +850,35 @@ func TestSyncAuditsIdentity(t *testing.T) {
 	assert.Equal(t, []string{"ethereum_node", "mev_relay"}, h.store.Host("lighthouse-geth-1").Roles)
 }
 
-// A host that the controller sees for the first time and that reports a
-// controller hold (the database was lost) keeps the hold, and the audit trail
-// says so.
-func TestSyncAdoptsControllerHoldOfANewHost(t *testing.T) {
+// The holds a host reports are what it holds: the controller keeps them as
+// reported, one per valid holder in order, and adds none of its own.
+func TestSyncKeepsTheHoldsTheHostReports(t *testing.T) {
 	h := newHarness(t, nil)
 	agent := validatorAgent(t)
 
 	req := controllertest.SyncRequest()
-	req.Hold.Controller = true
+	req.Hold.Holds = []protocol.HostHold{
+		{Holder: "geth", Reason: "sync"},
+		{Holder: "Bad Team"},
+		{Holder: fleet.HolderStaff, By: "alice", Reason: "fork"},
+		{Holder: "geth", Reason: "again"},
+		{Holder: protocol.HolderHost, By: "pk"},
+	}
 
 	require.Equal(t, http.StatusOK, h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{}).Code)
 
 	host := h.store.Host("lighthouse-geth-1")
-	assert.True(t, host.HoldWanted)
-	assert.Equal(t, "held on the agent before this controller knew the host", host.HoldReason)
+	assert.Equal(t, []protocol.HostHold{
+		{Holder: protocol.HolderHost, By: "pk"},
+		{Holder: fleet.HolderStaff, By: "alice", Reason: "fork"},
+		{Holder: "geth", Reason: "sync"},
+	}, host.Holds())
+	assert.Equal(t, "held by the host, staff, geth", host.HeldReason())
 
 	audit := h.store.AuditEntries()
 	require.Len(t, audit, 1)
 	assert.Equal(t, "host.registered", audit[0].Action)
-	assert.Equal(t, true, audit[0].Detail["holdAdopted"])
-
-	// A host without a controller hold: no such detail.
-	other := controllertest.NewAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1"})
-	local := controllertest.SyncRequest()
-	local.Hold.Local = true
-
-	require.Equal(t, http.StatusOK, h.agentPost(other, protocol.PathSync, local, controllertest.CallOpts{}).Code)
-
-	audit = h.store.AuditEntries()
-	require.Len(t, audit, 2)
-	assert.Equal(t, "host.registered", audit[1].Action)
-	assert.NotContains(t, audit[1].Detail, "holdAdopted")
-	assert.False(t, h.store.Host("prysm-besu-1").HoldWanted)
+	assert.NotContains(t, audit[0].Detail, "holdAdopted")
 }
 
 // A failed audit write does not fail the sync. The entries are logged and
@@ -1230,17 +1226,21 @@ func TestSyncAnswersTheDigestsOfTheHostsTags(t *testing.T) {
 }
 
 // What a host reports of its actions authorizes: it is kept only in the form
-// of names.
+// of names, and an unknown feature counts as admin.
 func TestCleanActions(t *testing.T) {
 	got := cleanActions([]protocol.ActionInfo{
-		{Name: "zeta", Impact: "host", Feature: "actions", Teams: []string{"Dev Ops", "devops"}, When: "always", Due: true},
-		{Name: "alpha", Impact: protocol.ImpactIndependent, Feature: "upgradoor:actions", When: protocol.ConditionSecurityUpdates, Due: true},
+		{Name: "zeta", Impact: "host", Feature: "upgradoor:manage", Teams: []string{"Dev Ops", "devops"}, When: "always", Due: true},
+		{Name: "alpha", Impact: protocol.ImpactIndependent, Feature: "details", When: protocol.ConditionSecurityUpdates, Due: true},
 		{Name: "alpha", Impact: protocol.ImpactNode},
+		{Name: "beta", Impact: protocol.ImpactNode, Feature: "team_manage"},
+		{Name: "gamma", Impact: protocol.ImpactNode},
 		{Name: "Bad Name", Impact: protocol.ImpactNode},
 	})
 
 	assert.Equal(t, []protocol.ActionInfo{
-		{Name: "alpha", Impact: protocol.ImpactIndependent, Feature: "upgradoor:actions", When: protocol.ConditionSecurityUpdates, Due: true},
-		{Name: "zeta", Impact: protocol.ImpactNode, Teams: []string{"devops"}},
+		{Name: "alpha", Impact: protocol.ImpactIndependent, Feature: "details", When: protocol.ConditionSecurityUpdates, Due: true},
+		{Name: "beta", Impact: protocol.ImpactNode, Feature: "admin"},
+		{Name: "gamma", Impact: protocol.ImpactNode},
+		{Name: "zeta", Impact: protocol.ImpactNode, Feature: "admin", Teams: []string{"devops"}},
 	}, got)
 }

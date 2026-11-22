@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"strings"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -32,6 +33,10 @@ const (
 	// agents report it due, or on a selection a person started it on.
 	RolloutAction RolloutKind = "action"
 )
+
+// KeyManualPrefix starts the key of a rollout that serves the needs of
+// directives: a manual roll or reboot, or a host action a person started.
+const KeyManualPrefix = "manual:"
 
 // RolloutTarget is one part of the target of a group rollout: a tag that
 // moved to a digest, or a container that a soft deploy moves to another
@@ -130,6 +135,10 @@ type Rollout struct {
 	// IgnoreBudget additionally skips the budget and the network gate. It
 	// can only be set explicitly by a person and is audited.
 	IgnoreBudget bool `json:"ignoreBudget"`
+	// IgnoreGate lets the rollout's leases pass a closed network gate, for
+	// any of its reasons. Budget, host limit and order still apply. Only a
+	// person sets it; audited.
+	IgnoreGate bool `json:"ignoreGate"`
 	// Canary is the host that goes alone until the rollout has its first
 	// success. Empty for a forced rollout and for a rollout with a single
 	// member. A rollout whose broken hosts went first has none until the
@@ -142,6 +151,18 @@ type Rollout struct {
 	EndedAt   *time.Time `json:"endedAt,omitempty"`
 
 	Hosts []RolloutHost `json:"hosts"`
+}
+
+// PassesGate reports whether the rollout's leases pass a closed network
+// gate: IgnoreGate, or IgnoreBudget, which implies it.
+func (r *Rollout) PassesGate() bool {
+	return r.IgnoreGate || r.IgnoreBudget
+}
+
+// Directed reports whether the rollout serves the needs of directives
+// (KeyManualPrefix).
+func (r *Rollout) Directed() bool {
+	return strings.HasPrefix(r.Key, KeyManualPrefix)
 }
 
 // Host returns the member entry for a host name, or nil.
@@ -167,12 +188,17 @@ const (
 	HostPending HostState = "pending"
 	// HostLeased: a lease that includes this rollout's need is open.
 	HostLeased HostState = "leased"
-	// HostDone: served and ready (LeaseID names the released lease), or the
-	// need disappeared by itself, or its step was done in a lease that failed
-	// on another step (both without LeaseID).
+	// HostDone: served and ready (LeaseID names the released lease), its need
+	// went away after a lease of the rollout served it, or its step was done
+	// in a lease that failed on another step (both without LeaseID). A member
+	// whose need goes away before any lease served it leaves the rollout.
 	HostDone HostState = "done"
 	// HostFailed: the lease failed.
 	HostFailed HostState = "failed"
+	// HostCancelled: a person ended the member's lease (end-lease). The
+	// member waits for a retry, which serves it again, or a skip; it is not
+	// granted until then and keeps the rollout open.
+	HostCancelled HostState = "cancelled"
 	// HostSkipped: the host is left out of this rollout: a person skipped it
 	// (RolloutHost.SkippedBy), the host was forgotten, or its agent rejected
 	// the directive of a manual rollout.
@@ -220,7 +246,9 @@ type RolloutHost struct {
 	// SkippedBy names the person who skipped the host; empty for a host the
 	// scheduler left out by itself. In a rollout of an observed cause such a
 	// skip keeps the rollout open while the host still has the need.
-	SkippedBy string    `json:"skippedBy,omitempty"`
+	SkippedBy string `json:"skippedBy,omitempty"`
+	// Served: a lease of the rollout was granted for the member.
+	Served    bool      `json:"-"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
@@ -246,6 +274,9 @@ const (
 	// LeaseExpired: the agent never started and the lease ran out, or it
 	// finished without disrupting anything. Not a failure.
 	LeaseExpired LeaseState = "expired"
+	// LeaseCancelled: a person ended the lease (Lease.Cancelled) and it is
+	// over. Not a failure.
+	LeaseCancelled LeaseState = "cancelled"
 )
 
 // OpenLeaseStates lists the states in which a lease holds a slot: the ones
@@ -256,12 +287,13 @@ func OpenLeaseStates() []LeaseState {
 
 // Terminal reports whether the lease no longer holds a slot.
 func (s LeaseState) Terminal() bool {
-	return s == LeaseReleased || s == LeaseFailed || s == LeaseExpired
+	return s == LeaseReleased || s == LeaseFailed || s == LeaseExpired || s == LeaseCancelled
 }
 
 // LeaseCancel is the mark of a lease that a person ended while it was open
 // (the end-lease action). The lease stays open and keeps its slot until its
-// agent reports or goes silent, and then ends as failed.
+// agent reports, and then ends as cancelled; an agent that goes silent fails
+// it.
 type LeaseCancel struct {
 	At time.Time `json:"at"`
 	// By is the person, as recorded in the audit log.
@@ -270,6 +302,16 @@ type LeaseCancel struct {
 	// people (audit, UI): no decision reads it.
 	State  LeaseState `json:"state"`
 	Reason string     `json:"reason,omitempty"`
+}
+
+// LeaseApproval is the mark of a verifying lease that a person approved (the
+// approve-lease action): the next reconcile releases it as ready, whatever
+// the readiness check says.
+type LeaseApproval struct {
+	At time.Time `json:"at"`
+	// By is the person, as recorded in the audit log.
+	By     string `json:"by"`
+	Reason string `json:"reason,omitempty"`
 }
 
 // PeerCheck is the comparison of one client's peer count with the fleet in
@@ -341,6 +383,8 @@ type Lease struct {
 	// open the agent is told with every sync (protocol.Lease.Cancel) and
 	// stops after the step in progress.
 	Cancelled *LeaseCancel `json:"cancelled,omitempty"`
+	// Approved is set once a person approved the verifying lease.
+	Approved *LeaseApproval `json:"approved,omitempty"`
 	// Recheck marks a lease that only repeats the readiness check of a
 	// failed lease whose steps the agent did, after a person retried its
 	// host. It starts verifying, carries that lease's needs and operation

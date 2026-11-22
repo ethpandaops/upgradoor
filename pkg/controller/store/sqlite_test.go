@@ -107,7 +107,10 @@ func testRequest(needs ...protocol.Need) *protocol.SyncRequest {
 		BootID:          "boot-1",
 		UptimeSeconds:   3600,
 		Verbs:           []protocol.Verb{protocol.VerbRoll, protocol.VerbReboot},
-		Hold:            protocol.Hold{Local: true, LocalReason: "debugging"},
+		Hold: protocol.Hold{
+			Local: true, LocalReason: "debugging",
+			Holds: []protocol.HostHold{{Holder: protocol.HolderHost, Reason: "debugging"}},
+		},
 		Containers: []protocol.Container{{
 			Name:      "geth",
 			ID:        "abc",
@@ -346,7 +349,6 @@ func TestRestartPersistence(t *testing.T) {
 	addHost(t, first, "node-1", &identity.ValidatorRange{Start: 0, End: 100})
 	inv := testInventory(20)
 	require.NoError(t, first.SaveInventory(ctx, "node-1", inv))
-	require.NoError(t, setHold(ctx, first, "node-1", true, "investigating"))
 	require.NoError(t, first.Commit(ctx, &Changes{
 		Rollouts:   []*fleet.Rollout{testRollout("r1", fleet.RolloutActive, 0, "node-1")},
 		Leases:     []*fleet.Lease{testLease("l1", "node-1", fleet.LeaseRunning, 0)},
@@ -366,8 +368,6 @@ func TestRestartPersistence(t *testing.T) {
 
 	host, err := second.GetHost(ctx, "node-1")
 	require.NoError(t, err)
-	assert.True(t, host.HoldWanted)
-	assert.Equal(t, "investigating", host.HoldReason)
 	assert.Equal(t, inv.Hash, host.InventoryHash)
 	assert.Equal(t, testRequest(), host.Status)
 	assert.Equal(t, uint64(100), host.Weight())
@@ -475,7 +475,7 @@ func TestConcurrentUse(t *testing.T) {
 							Audit: []fleet.AuditEntry{{Actor: "scheduler", Action: "lease.granted", Target: host}},
 						}))
 						report(s.AppendAudit(ctx, fleet.AuditEntry{Actor: "agent:" + host, Action: "sync"}))
-						report(setHold(ctx, s, host, i%2 == 0, "round"))
+						report(s.Commit(ctx, &Changes{Offline: []HostOffline{{Host: host, Mark: &fleet.OfflineMark{Reason: "round"}}}}))
 					}
 				}()
 			}
@@ -748,20 +748,16 @@ func TestCommitHolds(t *testing.T) {
 			lease.Cancelled = &fleet.LeaseCancel{
 				At: at(20).Add(1500 * 1000), By: "alice", State: fleet.LeaseRunning, Reason: "taken away",
 			}
+			lease.Approved = &fleet.LeaseApproval{At: at(21).Add(1500 * 1000), By: "bob", Reason: "network down"}
 
-			require.NoError(t, s.Commit(ctx, &Changes{
-				Leases: []*fleet.Lease{lease},
-				Holds:  []HostHold{{Host: "node-1", Wanted: true, Reason: "lease ended by operator"}},
-			}))
+			require.NoError(t, s.Commit(ctx, &Changes{Leases: []*fleet.Lease{lease}}))
 
 			host, err := s.GetHost(ctx, "node-1")
 			require.NoError(t, err)
-			assert.True(t, host.HoldWanted)
-			assert.Equal(t, "lease ended by operator", host.HoldReason)
 			assert.Nil(t, host.Offline)
 
 			until := at(90)
-			mark := &fleet.OfflineMark{Reason: "debugging", Until: &until, By: fleet.HoldByTeam}
+			mark := &fleet.OfflineMark{Reason: "debugging", Until: &until}
 			require.NoError(t, s.Commit(ctx, &Changes{Offline: []HostOffline{{Host: "node-1", Mark: mark}}}))
 
 			host, err = s.GetHost(ctx, "node-1")
@@ -769,7 +765,6 @@ func TestCommitHolds(t *testing.T) {
 			require.NotNil(t, host.Offline)
 			assert.Equal(t, "debugging", host.Offline.Reason)
 			assert.True(t, host.Offline.Until.Equal(until))
-			assert.Equal(t, fleet.HoldByTeam, host.Offline.By)
 
 			require.NoError(t, s.Commit(ctx, &Changes{Offline: []HostOffline{{Host: "node-1"}}}))
 
@@ -785,19 +780,23 @@ func TestCommitHolds(t *testing.T) {
 			assert.Equal(t, fleet.LeaseRunning, got.Cancelled.State)
 			assert.True(t, got.Cancelled.At.Equal(storedTime(lease.Cancelled.At)), "millisecond precision")
 			assert.True(t, lease.Cancelled.At.Equal(at(20).Add(1500*1000)), "the caller's lease is not changed")
+			require.NotNil(t, got.Approved)
+			assert.Equal(t, "bob", got.Approved.By)
+			assert.True(t, got.Approved.At.Equal(storedTime(lease.Approved.At)), "millisecond precision")
 
-			// A hold of a host that does not exist fails the whole commit.
+			// An offline mark of a host that does not exist fails the whole
+			// commit.
 			other := testLease("l2", "node-2", fleet.LeaseRunning, 30)
 			err = s.Commit(ctx, &Changes{
-				Leases: []*fleet.Lease{other},
-				Holds:  []HostHold{{Host: "node-2", Wanted: true, Reason: "x"}},
+				Leases:  []*fleet.Lease{other},
+				Offline: []HostOffline{{Host: "node-2", Mark: &fleet.OfflineMark{Reason: "x"}}},
 			})
 			require.ErrorIs(t, err, ErrNotFound)
 
 			_, err = s.GetLease(ctx, "l2")
 			require.ErrorIs(t, err, ErrNotFound)
 
-			assert.False(t, (&Changes{Holds: []HostHold{{Host: "node-1"}}}).Empty())
+			assert.False(t, (&Changes{Offline: []HostOffline{{Host: "node-1"}}}).Empty())
 		})
 	}
 }

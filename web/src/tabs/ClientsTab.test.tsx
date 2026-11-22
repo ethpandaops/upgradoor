@@ -24,7 +24,7 @@ const hostNames = (client: string) =>
   within(screen.getByRole('table', { name: `Hosts of ${client}` }))
     .getAllByRole('row')
     .slice(1)
-    .map(row => row.querySelector('td:nth-child(2)')?.textContent ?? '');
+    .map(row => row.querySelector('td:nth-child(2) button[title^="Open"]')?.textContent ?? '');
 const hostCalls = (h: Harness) => h.calls.map(c => c.path).filter(p => p.startsWith('/api/v1/clients/'));
 /** chip is the count on a filter chip of the host list. */
 const chip = (label: string) =>
@@ -50,27 +50,15 @@ describe('ClientsTab', () => {
       ['besu3', 'erigon3', 'geth9', 'nethermind4', 'reth4'],
     ]);
 
-    // The configuration first: per kind the image, what it points at, and the flags the hosts report as their base.
+    // The configuration first: per kind the image and what it points at; the flags are on each host's row.
     const config = screen.getByRole('region', { name: 'Client lighthouse' });
     expect(config).toHaveTextContent(/BEACON\s*7 hosts · 4 behind\s*sigp\/lighthouse:unstable/i);
-    const flags = within(config).getByRole('list', { name: 'Flags of the beacon' });
-    expect(
-      within(flags)
-        .getAllByRole('listitem')
-        .map(li => li.textContent)
-    ).toEqual([
-      '--network=mock-devnet-0',
-      '--datadir=/data',
-      '--execution-endpoint=http://execution:8551',
-      '--jwt-secret=/jwt/jwtsecret',
-      '--checkpoint-sync-url=https://checkpoint-sync.mock-devnet-0.ethpandaops.io',
-      '--http',
-      '--http-address=0.0.0.0',
-      '--metrics',
-      expect.stringMatching(/^--metrics-port=\d+$/),
-    ]);
-    expect(within(config).queryByRole('button', { name: /Show all/ })).not.toBeInTheDocument();
-    expect(within(config).getByRole('list', { name: 'Flags of the validator' })).toBeInTheDocument();
+    expect(within(config).queryByRole('list', { name: /Flags of/ })).not.toBeInTheDocument();
+
+    // The team owns the client: the resource use of its hosts.
+    const table = screen.getByRole('table', { name: 'Hosts of lighthouse' });
+    expect(within(table).getByRole('columnheader', { name: 'CPU' })).toBeInTheDocument();
+    expect(within(table).getByRole('meter', { name: 'Memory of lighthouse-geth-1' })).toBeInTheDocument();
 
     // How many hosts deviate, as chips that filter the list.
     expect(within(config).getByRole('group', { name: 'Hosts that deviate' })).toHaveTextContent(
@@ -111,6 +99,15 @@ describe('ClientsTab', () => {
     expect(row).toHaveTextContent(/until in 4h \d+m/);
     expect(row).toHaveTextContent('by alice@example.org');
     expect(within(table).getByRole('row', { name: /prysm-geth-3/ })).toHaveTextContent('silent');
+
+    // The row opens to the host's command line: the flag the override added is marked.
+    await user.click(within(row).getByRole('button', { name: 'Command lines of prysm-geth-1' }));
+    const command = within(table).getByRole('list', { name: 'Command line of prysm on prysm-geth-1' });
+    expect(within(command).getByText('--verbosity=debug')).toHaveAttribute(
+      'title',
+      'Most hosts of the client do not run this'
+    );
+    expect(within(command).getByText('--http')).not.toHaveAttribute('title');
 
     await user.click(screen.getByRole('tab', { name: /^reth/ }));
     expect(window.location.hash).toBe('#clients/reth');
@@ -281,7 +278,7 @@ describe('ClientsTab', () => {
 
     const policy = screen.getByRole('group', { name: 'Roll policy' });
     const reason =
-      'Needs upgradoor:client_policy or upgradoor:team_client_policy for a team that owns every container of this client';
+      'Needs upgradoor:manage or upgradoor:team_manage for a team that owns every container of this client';
     for (const name of ['Automatic', 'Manual']) {
       expect(within(policy).getByRole('button', { name })).toBeDisabled();
       expect(within(policy).getByRole('button', { name })).toHaveAttribute('title', reason);
@@ -301,7 +298,7 @@ describe('ClientsTab', () => {
     await screen.findByRole('table', { name: 'Hosts of geth' });
     const policy = screen.getByRole('group', { name: 'Roll policy' });
     expect(within(policy).getByRole('button', { name: 'Manual' })).toBeDisabled();
-    expect(policy).toHaveTextContent('upgradoor:team_client_policy does not cover client geth');
+    expect(policy).toHaveTextContent('upgradoor:team_manage does not cover client geth');
   });
 
   it("shows the client's rollouts, and calls for the approval of one that waits on the manual policy", async () => {
@@ -429,6 +426,28 @@ describe('ClientsTab: changes for a group of hosts', () => {
     });
   });
 
+  it('gives a team login without details the flags and the resource use of its own client only', async () => {
+    const user = userEvent.setup();
+    const h = await open('team', '#clients/lighthouse');
+    await screen.findByRole('table', { name: 'Hosts of lighthouse' });
+
+    // The stream carries no command lines for this login: the dialog's come from the REST view of the clients.
+    await waitFor(() => {
+      expect(h.calls.some(c => c.path === '/api/v1/clients')).toBe(true);
+    });
+
+    const header = screen.getByRole('group', { name: 'Change every host of lighthouse' });
+    await user.click(within(header).getByRole('button', { name: 'Change flags…' }));
+    const dialog = await screen.findByRole('dialog', { name: 'Change the flags of lighthouse' });
+    expect(within(dialog).getByRole('button', { name: '--http' })).toBeInTheDocument();
+    await user.click(within(dialog).getByRole('button', { name: 'Cancel' }));
+
+    // Another team's client: no resource use of its hosts.
+    await user.click(within(clientTabs()[1] as HTMLElement).getByRole('tab', { name: /^geth/ }));
+    const geth = await screen.findByRole('table', { name: 'Hosts of geth' });
+    expect(within(geth).queryByRole('columnheader', { name: 'CPU' })).not.toBeInTheDocument();
+  });
+
   it('disables the group changes, with the reason, for a login without the features', async () => {
     await open('reader', '#clients/lighthouse');
     await screen.findByRole('table', { name: 'Hosts of lighthouse' });
@@ -436,7 +455,7 @@ describe('ClientsTab: changes for a group of hosts', () => {
     const header = screen.getByRole('group', { name: 'Change every host of lighthouse' });
     const button = within(header).getByRole('button', { name: 'Change image…' });
     expect(button).toBeDisabled();
-    expect(button).toHaveAttribute('title', expect.stringMatching(/image_override/) as string);
+    expect(button).toHaveAttribute('title', expect.stringMatching(/manage_image/) as string);
   });
 });
 

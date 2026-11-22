@@ -53,7 +53,7 @@
 # Where state lives
 #   Survives a reboot:  the container's root filesystem (installed packages,
 #                       /etc, copied binaries) and the named volume mounted
-#                       at $SYSBOX_STATE_DIR (/var/lib/upgradoor), which is
+#                       at $SYSBOX_STATE_DIR (/data/upgradoor), which is
 #                       where the agent keeps state.json and the lease.
 #   Lost on a reboot:   /run (so /var/run/reboot-required), /tmp, every
 #                       process, the boot id.
@@ -69,7 +69,7 @@ SYSBOX_REPO=$(cd "$SYSBOX_DIR/../.." && pwd)
 : "${SYSBOX_WORKDIR:=$SYSBOX_REPO/.tmp/system-test}"
 # Set by sysbox_build_image: the id of the image this run built.
 : "${SYSBOX_IMAGE_ID:=}"
-: "${SYSBOX_STATE_DIR:=/var/lib/upgradoor}"
+: "${SYSBOX_STATE_DIR:=/data/upgradoor}"
 : "${SYSBOX_BOOT_TIMEOUT:=120}"
 # Optional: the Docker network to attach the host to (default: none) and
 # extra "docker run" arguments, for tests that need more than an isolated

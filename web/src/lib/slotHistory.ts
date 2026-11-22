@@ -176,8 +176,11 @@ const WORKS = ['image', 'packages', 'action', 'reboot'];
 
 /** leaseOutage is the span of a lease, as the controller makes it (outageSpans in outages.go). */
 function leaseOutage(lease: Lease, validators: number, nowMs: number): Outage {
-  const kinds = [...new Set(list(lease.needs).map(n => n.kind as string))];
-  const ended = ['released', 'failed', 'expired'].includes(lease.state);
+  // An override or spec need recreates a container like an image need (leaseWork).
+  const kinds = [
+    ...new Set(list(lease.needs).map(n => (n.kind === 'override' || n.kind === 'spec' ? 'image' : (n.kind as string)))),
+  ];
+  const ended = ['released', 'failed', 'expired', 'cancelled'].includes(lease.state);
   const rollouts = Object.values(lease.rollouts ?? {}).sort();
 
   return {
@@ -190,6 +193,7 @@ function leaseOutage(lease: Lease, validators: number, nowMs: number): Outage {
     work: kinds.length === 1 && WORKS.includes(kinds[0] ?? '') ? kinds[0] : kinds.length === 0 ? 'image' : 'mixed',
     ...(rollouts[0] ? { rollout: rollouts[0] } : {}),
     ...(lease.state === 'failed' || lease.state === 'expired' ? { failed: true } : {}),
+    ...(list(lease.needs).some(n => n.kind === 'spec') ? { deployed: true } : {}),
     missed: 0,
     assigned: 0,
     validators: validators || lease.weight,
@@ -361,6 +365,8 @@ export interface OutageBlock {
   outages: Outage[];
   hosts: number;
   failed: boolean;
+  /** deployed: a span of the block applies a deploy on the host. */
+  deployed: boolean;
   /** The work of the spans when they share one, else "mixed"; undefined for hosts that are off. */
   work: string | undefined;
   open: boolean;
@@ -484,6 +490,7 @@ export function packOutages(
         outages: d.outages,
         hosts: d.outages.reduce((n, o) => n + o.hosts, 0),
         failed: d.outages.some(o => o.failed),
+        deployed: group !== 'off' && d.outages.some(o => o.deployed),
         work: group === 'off' ? undefined : works.size === 1 ? [...works][0] : 'mixed',
         open: d.outages.some(o => o.open),
       });

@@ -196,30 +196,19 @@ func LocalEntry(view *View, req *LocalRequest, deployed *Deployed, now time.Time
 const defaultLocalHoldReason = "held"
 
 // LocalHold is the local hold a socket caller sets on the host.
-func LocalHold(user, reason string) Hold {
-	return Hold{By: bareUser(user), Reason: cmp.Or(Line(reason), defaultLocalHoldReason)}
+func LocalHold(user, reason string, now time.Time) Hold {
+	return Hold{By: bareUser(user), Reason: cmp.Or(Line(reason), defaultLocalHoldReason), At: now.UTC()}
 }
 
 func bareUser(user string) string {
 	return strings.TrimPrefix(user, string(FromLocal)+":")
 }
 
-// HoldSource is the one hold source an origin may write or lift; nothing
-// the controller sends reaches the local hold.
-func HoldSource(origin Origin) string {
-	if origin == FromLocal {
-		return HoldLocal
-	}
-
-	return HoldController
-}
-
-// ControllerHold is the controller hold a hold directive writes; local cuts
-// its fields to one line when writing it.
-func ControllerHold(reason string, by *protocol.Actor) Hold {
-	hold := Hold{By: "controller", Reason: reason}
-	if by != nil {
-		hold.By, hold.Teams, hold.Feature = by.User, protocol.CleanOwners(by.Teams), by.Feature
+// DirectedHold is the hold a hold directive writes for its holder.
+func DirectedHold(d *protocol.Directive, now time.Time) Hold {
+	hold := Hold{By: "controller", Reason: Line(d.Reason), At: now.UTC()}
+	if d.By != nil && d.By.User != "" {
+		hold.By = Line(d.By.User)
 	}
 
 	return hold

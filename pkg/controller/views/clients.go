@@ -84,6 +84,10 @@ type ClientImage struct {
 	// reference, without a flag override, run another one.
 	Command      []string `json:"command,omitempty"`
 	CommandHosts int      `json:"commandHosts"`
+	// CommonArgs are the arguments more than half of those hosts report, in
+	// the order they first appear. An argument only some hosts run, or one
+	// that differs on every host, is not in it.
+	CommonArgs []string `json:"commonArgs,omitempty"`
 }
 
 // ClientView is one client: a row of GET /api/v1/clients and of the stream.
@@ -91,9 +95,10 @@ type ClientView struct {
 	Name  string      `json:"name"`
 	Layer ClientLayer `json:"layer"`
 	// Policy is the image policy the client's rollouts answer to; PolicySet
-	// is false when that is the global default (policyImage).
-	Policy    fleet.Policy `json:"policy"`
-	PolicySet bool         `json:"policySet"`
+	// is false when that is the default, DefaultPolicy (policyImage).
+	Policy        fleet.Policy `json:"policy"`
+	PolicySet     bool         `json:"policySet"`
+	DefaultPolicy fleet.Policy `json:"defaultPolicy"`
 	// Images are the configured image references of the client's
 	// containers, by kind and reference.
 	Images []ClientImage `json:"images"`
@@ -135,6 +140,9 @@ type ClientHost struct {
 	Slot  scheduler.SlotState `json:"slot"`
 	// Containers are the host's containers of this client.
 	Containers []protocol.Container `json:"containers"`
+	// Usage is the host's resource use, for a login with the full view of
+	// the host.
+	Usage *HostUsage `json:"usage,omitempty"`
 }
 
 // ClientHosts is the body of GET /api/v1/clients/{client}/hosts.
@@ -190,10 +198,11 @@ func NewClientIndex(hosts []HostSummary, settings *fleet.Settings) *ClientIndex 
 		slices.SortFunc(rows, func(a, b ClientHost) int { return cmp.Compare(a.Host, b.Host) })
 
 		view := ClientView{
-			Name:   name,
-			Layer:  cmp.Or(layers[name], LayerExecution),
-			Policy: settings.ImagePolicy(name),
-			Hosts:  len(rows),
+			Name:          name,
+			Layer:         cmp.Or(layers[name], LayerExecution),
+			Policy:        settings.ImagePolicy(name),
+			DefaultPolicy: settings.PolicyImage,
+			Hosts:         len(rows),
 		}
 		_, view.PolicySet = settings.PolicyClients[name]
 
@@ -230,7 +239,9 @@ func hostClients(sum *HostSummary) []string {
 
 // newClientHost is the row of one host on the page of one client.
 func newClientHost(sum *HostSummary, client string) ClientHost {
-	row := ClientHost{Host: sum.Name, Stale: sum.Stale, Slot: sum.Plan.Slot}
+	row := ClientHost{
+		Host: sum.Name, Stale: sum.Stale, Slot: sum.Plan.Slot, Usage: NewHostUsage(sum.Resources),
+	}
 
 	for i := range sum.Containers {
 		if c := &sum.Containers[i]; c.Managed && c.Team == client {
@@ -259,8 +270,8 @@ func clientHostState(
 	switch {
 	case sum.Hold.Local:
 		return ClientHeld, cmp.Or(sum.Hold.LocalReason, "held on the host")
-	case sum.HoldWanted || sum.Hold.Controller:
-		return ClientHeld, sum.HoldReason
+	case sum.Hold.Active():
+		return ClientHeld, fleet.DescribeHolds(sum.Hold.Holds)
 	}
 
 	for i := range containers {
@@ -388,6 +399,7 @@ func clientImages(rows []ClientHost) []ClientImage {
 		checked  time.Time
 		digests  []string
 		commands map[string]int
+		args     argVotes
 	}
 
 	groups := make(map[key]*group, 2)
@@ -402,7 +414,11 @@ func clientImages(rows []ClientHost) []ClientImage {
 
 			g := groups[k]
 			if g == nil {
-				g = &group{ClientImage: ClientImage{Kind: k.kind, Image: k.image}, commands: map[string]int{}}
+				g = &group{
+					ClientImage: ClientImage{Kind: k.kind, Image: k.image},
+					commands:    make(map[string]int, 4),
+					args:        argVotes{count: make(map[string]int, 32)},
+				}
 				groups[k] = g
 			}
 
@@ -412,6 +428,7 @@ func clientImages(rows []ClientHost) []ClientImage {
 
 				if o := c.Override; o == nil || len(o.AddFlags)+len(o.RemoveFlags) == 0 {
 					g.commands[strings.Join(c.Command, "\x00")]++
+					g.args.add(c.Command)
 				}
 
 				// A container on another reference (overridden, or moving to agent.yaml's) says
@@ -437,6 +454,7 @@ func clientImages(rows []ClientHost) []ClientImage {
 
 	for _, g := range groups {
 		g.Command, g.CommandHosts = commonCommand(g.commands)
+		g.CommonArgs = g.args.common()
 
 		if g.Digest != "" {
 			for _, d := range g.digests {
@@ -453,6 +471,52 @@ func clientImages(rows []ClientHost) []ClientImage {
 		return cmp.Or(
 			cmp.Compare(kindOrder(a.Kind), kindOrder(b.Kind)), cmp.Compare(a.Image, b.Image))
 	})
+
+	return out
+}
+
+// argVotes counts, per argument, the hosts that report it.
+type argVotes struct {
+	count map[string]int
+	// order is the order the arguments were first seen.
+	order []string
+	hosts int
+}
+
+// add counts one host's command line; an argument it repeats counts once.
+func (v *argVotes) add(command []string) {
+	v.hosts++
+
+	seen := make(map[string]struct{}, len(command))
+
+	for _, arg := range command {
+		if _, dup := seen[arg]; dup {
+			continue
+		}
+
+		seen[arg] = struct{}{}
+
+		if v.count[arg] == 0 {
+			v.order = append(v.order, arg)
+		}
+
+		v.count[arg]++
+	}
+}
+
+// common returns the arguments more than half of the hosts report.
+func (v *argVotes) common() []string {
+	out := make([]string, 0, len(v.order))
+
+	for _, arg := range v.order {
+		if v.count[arg]*2 > v.hosts {
+			out = append(out, arg)
+		}
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
 
 	return out
 }
@@ -490,7 +554,11 @@ func clientVersion(rows []ClientHost) string {
 		row.Containers = slices.Clone(row.Containers)
 
 		// What moves with every sync without saying anything new.
+		row.Usage = nil
+
 		for j := range row.Containers {
+			row.Containers[j].Stats = nil
+
 			if reg := row.Containers[j].Registry; reg != nil {
 				c := *reg
 				c.CheckedAt = time.Time{}
@@ -518,12 +586,12 @@ func (v *Views) Clients(ctx context.Context) (*ClientIndex, error) {
 		return nil, err
 	}
 
-	plan := v.opts.Scheduler.Plan()
+	plan := v.Plan()
 	now := v.now()
 	sums := make([]HostSummary, 0, len(hosts))
 
 	for _, host := range hosts {
-		sums = append(sums, Summarize(host, plan, now, settings.HostStaleAfter.Std()))
+		sums = append(sums, Summarize(host, &plan, now, settings.HostStaleAfter.Std()))
 	}
 
 	return NewClientIndex(sums, &settings), nil

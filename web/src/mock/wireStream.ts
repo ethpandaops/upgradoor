@@ -15,7 +15,6 @@ import {
   type PublicHosts,
   type PublicImages,
   type Rollouts,
-  type SettingsBody,
   type SlotRow,
 } from '../api/types';
 import { fields, isSingle, schemaOf, slotAt, type Cell, type DocBody, type TableBody } from '../api/wire';
@@ -209,9 +208,8 @@ function wireNetwork(n: NetworkHealth, nowMs: number): object {
   };
 }
 
-function wireGate(gate: Gate, nowMs: number, publicReasons?: readonly string[]): object {
-  const differs = publicReasons !== undefined && JSON.stringify(publicReasons) !== JSON.stringify(gate.reasons);
-  return { ...gate, ...(differs ? { publicReasons } : {}), network: wireNetwork(gate.network, nowMs) };
+function wireGate(gate: Gate, nowMs: number): object {
+  return { ...gate, network: wireNetwork(gate.network, nowMs) };
 }
 
 /** wireHost takes out of a host row what moves with every sync (newWireHost in wire.go). */
@@ -259,21 +257,19 @@ export function publicTables(v: {
 /** privateTables are the tables of the authenticated stream. */
 export function privateTables(v: {
   now: number;
-  publicGate: Gate;
   plan: Plan;
   hosts: Hosts;
   clients: Clients;
   images: PublicImages;
   slots: readonly SlotRow[];
   rollouts: Rollouts;
-  settings: SettingsBody;
   latestAuditId: number;
 }): Tables {
   const all = [...list(v.rollouts.open), ...list(v.rollouts.recent)];
   const planned = v.plan.hosts ?? {};
 
   return {
-    n: { one: wireGate(v.plan.gate, v.now, list(v.publicGate.reasons)) },
+    n: { one: wireGate(v.plan.gate, v.now) },
     h: { rows: list(v.hosts.hosts).map(h => wireHost(h, h.name in planned)) },
     c: { rows: list(v.clients.clients) },
     ...sharedTables(v.images, v.slots),
@@ -292,7 +288,6 @@ export function privateTables(v: {
       rows: [...list(v.rollouts.leases), ...list(v.rollouts.recentLeases)],
       order: [list(v.rollouts.leases).map(l => l.id), list(v.rollouts.recentLeases).map(l => l.id)],
     },
-    se: { one: v.settings },
     a: { one: { latestId: v.latestAuditId } },
   };
 }

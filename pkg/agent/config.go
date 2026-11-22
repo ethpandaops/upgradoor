@@ -25,7 +25,7 @@ const (
 	DefaultConfigFile = "/etc/upgradoor/agent.yaml"
 	DefaultKeyFile    = "/etc/upgradoor/host.key"
 	DefaultCertFile   = "/etc/upgradoor/host.crt"
-	DefaultStateDir   = "/var/lib/upgradoor"
+	DefaultStateDir   = "/data/upgradoor"
 )
 
 // Config is agent.yaml. Each section is defined by the package that uses it;

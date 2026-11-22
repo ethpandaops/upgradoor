@@ -60,6 +60,9 @@ type Outage struct {
 	Work    string `json:"work,omitempty"`
 	Rollout string `json:"rollout,omitempty"`
 	Failed  bool   `json:"failed,omitempty"`
+	// Deployed: the lease applies what a deploy on the host (upgradoor
+	// deploy) set, for at least one of the hosts.
+	Deployed bool `json:"deployed,omitempty"`
 
 	// Missed and Assigned count the attestation duties in the slots of the
 	// span in which the hosts missed some; Missed equal to Assigned means
@@ -86,12 +89,19 @@ type outageInput struct {
 	validators map[string]uint64
 }
 
-// leaseWork names what a lease does.
+// leaseWork names what a lease does. An override or spec need recreates a
+// container like an image need does, so it counts as an image roll.
 func leaseWork(l *fleet.Lease) string {
 	work := ""
 
 	for i := range l.Needs {
 		kind := string(l.Needs[i].Kind)
+
+		switch l.Needs[i].Kind {
+		case protocol.NeedOverride, protocol.NeedSpec:
+			kind = string(protocol.NeedImage)
+		default:
+		}
 
 		switch {
 		case work == "":
@@ -107,6 +117,11 @@ func leaseWork(l *fleet.Lease) string {
 	}
 
 	return work
+}
+
+// leaseDeployed reports whether a lease applies a deploy on the host.
+func leaseDeployed(l *fleet.Lease) bool {
+	return slices.ContainsFunc(l.Needs, func(n protocol.Need) bool { return n.Kind == protocol.NeedSpec })
 }
 
 // leaseRollout is the rollout a lease belongs to: the smallest ID when it
@@ -158,6 +173,7 @@ func outageSpans(in *outageInput) []Outage {
 			FromStart: l.GrantedAt.Before(windowStart), Open: !l.State.Terminal(),
 			Lease: l.ID, Work: leaseWork(l), Rollout: leaseRollout(l),
 			Failed:     l.State == fleet.LeaseFailed || l.State == fleet.LeaseExpired,
+			Deployed:   leaseDeployed(l),
 			Validators: in.validators[l.Host],
 		}
 
@@ -347,6 +363,7 @@ func mergeOutages(spans []Outage, gap time.Duration) []Outage {
 			into.Assigned += span.Assigned
 			into.Validators += span.Validators
 			into.Open = into.Open || span.Open
+			into.Deployed = into.Deployed || span.Deployed
 
 			if span.To.After(into.To) {
 				into.To = span.To

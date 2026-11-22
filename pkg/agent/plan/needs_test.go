@@ -148,13 +148,15 @@ func TestNeeds(t *testing.T) {
 	}{
 		{name: "everything observed", verbs: allVerbs, want: []string{imageID, packagesID, protocol.RebootNeedID}},
 		{
-			name: "any hold: no needs at all", verbs: allVerbs,
+			name: "a local hold hides no need", verbs: allVerbs,
 			mutate: func(v *View) { v.Hold.Local = true },
-			manual: []protocol.Need{manualRoll, manualReboot}, want: []string{},
+			manual: []protocol.Need{manualRoll, manualReboot},
+			want:   []string{"manual/d-reboot", "manual/d-roll", packagesID},
 		},
 		{
-			name: "controller hold too", verbs: allVerbs,
-			mutate: func(v *View) { v.Hold.Controller = true }, want: []string{},
+			name: "a controller hold neither", verbs: allVerbs,
+			mutate: func(v *View) { v.Hold = staffHold },
+			want:   []string{imageID, packagesID, protocol.RebootNeedID},
 		},
 		{name: "only the allowed verbs", verbs: []protocol.Verb{protocol.VerbPackages}, want: []string{packagesID}},
 		{

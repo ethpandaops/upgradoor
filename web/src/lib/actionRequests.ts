@@ -3,6 +3,7 @@
 
 import type { ActionCall } from '../api/client';
 import type {
+  ApproveLeaseRequest,
   ClientPolicyRequest,
   EndLeaseRequest,
   HoldRequest,
@@ -29,6 +30,8 @@ interface DisruptiveOptions extends HostSelection {
   /** force only applies to a staggered action; "now" is forced by definition. */
   force: boolean;
   ignoreBudget: boolean;
+  /** ignoreGate passes a closed network gate; absent is false. */
+  ignoreGate?: boolean;
   reason: string;
 }
 
@@ -50,6 +53,7 @@ export function buildRollRequest(o: RollOptions): RollRequest {
     staggered: o.timing === 'staggered',
     force: o.timing === 'staggered' && o.force,
     ignoreBudget: o.ignoreBudget,
+    ignoreGate: o.ignoreGate === true,
     reason: o.reason.trim(),
   };
 }
@@ -62,13 +66,16 @@ export function buildRebootRequest(o: DisruptiveOptions): RebootRequest {
     staggered: o.timing === 'staggered',
     force: o.timing === 'staggered' && o.force,
     ignoreBudget: o.ignoreBudget,
+    ignoreGate: o.ignoreGate === true,
     reason: o.reason.trim(),
   };
 }
 
 /** buildHoldRequest builds the body of the hold, unhold and forget actions. */
-export function buildHoldRequest(hosts: readonly string[], reason: string): HoldRequest {
-  return { hosts: [...new Set(hosts)].sort(), reason: reason.trim() };
+export function buildHoldRequest(hosts: readonly string[], reason: string, holders?: readonly string[]): HoldRequest {
+  const body: HoldRequest = { hosts: [...new Set(hosts)].sort(), reason: reason.trim() };
+  if (holders && holders.length > 0) body.holders = [...holders];
+  return body;
 }
 
 /** buildOfflineRequest builds the body of mark-offline and unmark-offline. */
@@ -93,6 +100,11 @@ export function buildClientPolicyRequest(
 /** buildScopeRequest builds the body of pause, resume and abort; an empty rollout is the global scope. */
 export function buildScopeRequest(rollout: string, reason: string): ScopeRequest {
   return { rollout, reason: reason.trim() };
+}
+
+/** buildApproveLeaseRequest builds the body of approve-lease: the verifying lease of one member of a rollout. */
+export function buildApproveLeaseRequest(rollout: string, host: string, reason: string): ApproveLeaseRequest {
+  return { rollout, host, reason: reason.trim() };
 }
 
 /** buildRolloutHostsRequest builds the body of skip and retry. */
@@ -132,6 +144,13 @@ function timingText(o: DisruptiveOptions): string[] {
       'Staggered: a manual rollout: one host first as the canary, ' +
         `then all the others${budget ? ' as the availability budget allows' : ''}; ` +
         'the others start once the canary is back at head with peers and its validators attest again.'
+    );
+  }
+
+  if (o.ignoreGate === true && !o.ignoreBudget) {
+    lines.push(
+      'Despite the network state: the hosts pass a closed network gate, whatever its reason. ' +
+        'The budget, the host limit and the canary still apply. This is recorded in the audit log.'
     );
   }
 
@@ -214,10 +233,10 @@ export function describeCall(call: ActionCall): string[] {
       return [
         `End lease ${call.body.lease}. The agent begins no further step: it completes the step in progress ` +
           'and stops. A lease the agent has not started is not started.',
-        'The lease stays open and keeps its slot until the agent reports (or goes silent, or the lease runs ' +
-          'out); then it ends as failed, "ended by operator".',
-        'A failed lease halts its rollouts and marks the host: nothing more is granted there until somebody ' +
-          'retries, and the host goes first next time. No hold is set: hold the host if it is to be left alone.',
+        'The lease stays open and keeps its slot until the agent reports; then it ends as cancelled (as failed ' +
+          'when the agent goes silent or a step failed).',
+        'A cancelled lease pauses its rollouts: resume them to go on with the other hosts; this host waits ' +
+          'until somebody retries it. No hold is set: hold the host if it is to be left alone.',
       ];
     case 'client-policy': {
       const { client, policy } = call.body;
@@ -300,6 +319,19 @@ export function describeCall(call: ActionCall): string[] {
             `Resume rollout ${call.body.rollout}: lift its pause and approve it if it waits on a manual policy. ` +
               'Hosts are then granted under the normal rules.',
           ];
+    case 'ignore-gate':
+      return [
+        `Let rollout ${call.body.rollout} pass the network gate while it is closed, whatever its reason: ` +
+          'missing or stale data included.',
+        'The availability budget, the host limit and the canary still apply. Other rollouts keep waiting at the gate. ' +
+          'This is recorded in the audit log.',
+      ];
+    case 'approve-lease':
+      return [
+        `Approve the lease of ${call.body.host} in rollout ${call.body.rollout} now: it is released as ready ` +
+          'without waiting any longer for the node to be back at head and its validators to attest.',
+        'The host counts as served; the next hosts of the rollout may start. This is recorded in the audit log.',
+      ];
     case 'abort':
       return [
         `Abort rollout ${call.body.rollout}. A manual rollout is closed, and what it has not started is cancelled.`,

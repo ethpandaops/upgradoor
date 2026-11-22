@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
-	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -66,24 +65,24 @@ func TestSkipKeepsTheRolloutOpenWhileTheHostHasTheNeed(t *testing.T) {
 	h.restart()
 	stays(t)
 
-	// A held host reports no needs. That says nothing about the need.
-	h.sync("b", func(st *protocol.SyncRequest) {
-		st.Hold.Local = true
-		st.Needs = nil
-	})
+	// A held host still reports the need: the skip stays.
+	h.sync("b", func(st *protocol.SyncRequest) { st.Hold.Local = true })
 	h.tick()
 	assert.Equal(t, fleet.HostSkipped, h.rollout(id).Host("b").State)
 	assert.Equal(t, fleet.RolloutActive, h.rollout(id).State)
 
-	// The hold is lifted and the need is gone (somebody upgraded the host by
-	// hand): the member is done like a waiting one, and the rollout completes.
-	h.sync("b", func(st *protocol.SyncRequest) { st.Hold.Local = false })
+	// The need is gone (somebody upgraded the host by hand): the member that
+	// no lease served leaves the rollout like a waiting one, and the rollout
+	// completes.
+	h.sync("b", func(st *protocol.SyncRequest) {
+		st.Hold.Local = false
+		st.Needs = nil
+	})
 	h.tick()
 
 	r := h.rollout(id)
-	assert.Equal(t, fleet.HostDone, r.Host("b").State)
-	assert.Empty(t, r.Host("b").SkippedBy)
-	assert.Empty(t, r.Host("b").Error)
+	assert.Nil(t, r.Host("b"))
+	assert.Equal(t, fleet.HostDone, r.Host("a").State)
 	assert.Equal(t, fleet.RolloutCompleted, r.State)
 }
 
@@ -173,7 +172,7 @@ func TestCanaryThatCannotFitTheBudgetDoesNotStallTheRollout(t *testing.T) {
 
 		out = b.step()
 		assert.Empty(t, b.leasedHosts())
-		assert.Equal(t, map[string]string{"val": "budget 0% of 0%"}, queueReasons(out.Plan))
+		assert.Equal(t, map[string]string{"val": "validators down: 0% now, 100% with this host, limit 0%"}, queueReasons(out.Plan))
 	})
 
 	// B: a host outside the rollout is down for good and uses the budget up.
@@ -202,7 +201,8 @@ func TestCanaryThatCannotFitTheBudgetDoesNotStallTheRollout(t *testing.T) {
 		out = b.step()
 		assert.Empty(t, b.leasedHosts())
 		assert.Equal(t, map[string]string{
-			"val": "budget 10% of 10%", "val2": "budget 10% of 10%",
+			"val":  "validators down: 10% now, 60% with this host, limit 10%",
+			"val2": "validators down: 10% now, 50% with this host, limit 10%",
 		}, queueReasons(out.Plan))
 	})
 
@@ -221,7 +221,7 @@ func TestCanaryThatCannotFitTheBudgetDoesNotStallTheRollout(t *testing.T) {
 		assert.Empty(t, b.leasedHosts())
 		assert.Equal(t, "val2", b.mustRollout(key).Canary, "the lighter one")
 		assert.Equal(t, map[string]string{
-			"val2": "budget 10% of 10%", "val": "after canary val2",
+			"val2": "validators down: 10% now, 50% with this host, limit 10%", "val": "after canary val2",
 		}, queueReasons(out.Plan))
 
 		b.host("tool", 0)
@@ -562,13 +562,13 @@ func TestImageSupersedeCarriesFailedHostsFirst(t *testing.T) {
 	}
 
 	// "h3" would be the last candidate by name; make it the one that fails.
-	b.get("h1").HoldWanted = true
-	b.get("h2").HoldWanted = true
+	b.get("h1").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
+	b.get("h2").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
 	b.step()
 	require.Equal(t, []string{"h3"}, b.leasedHosts())
 	b.report("h3", protocol.PhaseFailed, true)
-	b.get("h1").HoldWanted = false
-	b.get("h2").HoldWanted = false
+	b.get("h1").Status.Hold.Holds = nil
+	b.get("h2").Status.Hold.Holds = nil
 	b.step()
 
 	first := b.mustRollout(imageKey("", imgLighthouse, digestA))
@@ -656,8 +656,8 @@ func TestPackagesSupersede(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.host("a", 0)
 	b.host("b", 0)
-	b.get("a").HoldWanted = true // keep both waiting
-	b.get("b").HoldWanted = true
+	b.get("a").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}} // keep both waiting
+	b.get("b").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
 	b.wants("a", packagesNeed("2.0"))
 	b.wants("b", packagesNeed("2.0"))
 	b.step()
@@ -681,26 +681,124 @@ func TestPackagesSupersede(t *testing.T) {
 	assert.Len(t, b.mustRollout(v3).Hosts, 2)
 }
 
-func TestPackagesRolloutCompletesWhenNeedsVanish(t *testing.T) {
+// A rollout whose every member resolved on its own (here a held host, which
+// still reports its needs) is dropped: deleted, with one audit entry.
+func TestRolloutOfSelfResolvedMembersIsDropped(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.host("a", 0)
-	b.get("a").HoldWanted = true
+	b.host("b", 0)
+	b.get("a").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
+	b.get("b").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
 	b.wants("a", packagesNeed("2.0"))
+	b.wants("b", packagesNeed("2.0"))
 	b.step()
 
+	id := b.mustRollout(packagesKey("2.0")).ID
+
 	b.get("a").Status.Needs = nil
+	b.step()
+	require.Len(t, b.mustRollout(packagesKey("2.0")).Hosts, 1)
+
+	b.get("b").Status.Needs = nil
 	out := b.step()
 
 	assert.Empty(t, b.w.Rollouts)
-	assert.Equal(t, fleet.RolloutCompleted, b.closed(packagesKey("2.0")).State)
-	assert.Equal(t, fleet.HostDone, b.closed(packagesKey("2.0")).Host("a").State)
-	assert.Contains(t, auditActions(out), "rollout.completed")
+	assert.Nil(t, b.closed(packagesKey("2.0")))
+	assert.Equal(t, []string{id}, out.Dropped)
+	assert.Equal(t, []string{"rollout.dropped"}, auditActions(out))
+	assert.Equal(t, id, out.Audit[0].Target)
+}
+
+// A member that a lease of the rollout served stays done when its need goes
+// away later, a member no lease served leaves: only the first counts, and the
+// rollout completes.
+func TestSelfResolvedMemberLeavesTheRollout(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.host("a", 0)
+	b.host("b", 0)
+	b.host("c", 0)
+	b.get("c").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
+	b.wants("a", packagesNeed("2.0"))
+	b.wants("b", packagesNeed("2.0"))
+	b.wants("c", packagesNeed("2.0"))
+	b.step()
+
+	require.Equal(t, []string{"a"}, b.leasedHosts(), "the canary goes first")
+
+	// b is granted a lease that expires unstarted, and is held meanwhile so
+	// that it is not granted again; its need goes away after.
+	b.serve("a")
+	require.Equal(t, []string{"b"}, b.leasedHosts())
+	b.get("b").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
+	b.advance(b.w.Settings.LeaseTTL.Std() + 2*leaseStartGrace)
+	b.step()
+	require.Equal(t, fleet.HostPending, b.mustRollout(packagesKey("2.0")).Host("b").State)
+
+	b.get("b").Status.Needs = nil
+	b.get("c").Status.Needs = nil
+	b.step()
+
+	r := b.closed(packagesKey("2.0"))
+	require.NotNil(t, r)
+	assert.Equal(t, fleet.RolloutCompleted, r.State)
+	assert.Equal(t, fleet.HostDone, r.Host("a").State)
+	assert.NotEmpty(t, r.Host("a").LeaseID)
+	assert.Equal(t, fleet.HostDone, r.Host("b").State)
+	assert.Nil(t, r.Host("c"))
+}
+
+// A member whose need rode along in the lease of another rollout was served:
+// it is done when its need goes away after the lease ended without it.
+func TestRideAlongMemberIsDoneWhenItsNeedGoes(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.host("a", 0)
+	b.wants("a", packagesNeed("2.0"), rebootNeed())
+	b.step()
+
+	require.Len(t, b.lease("a").Needs, 2, "the reboot rides along")
+
+	b.get("a").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
+	b.advance(b.w.Settings.LeaseTTL.Std() + 2*leaseStartGrace)
+	b.step()
+	require.Equal(t, fleet.HostPending, b.mustRollout(keyReboot).Host("a").State)
+
+	b.get("a").Status.Needs = []protocol.Need{packagesNeed("2.0")}
+	b.step()
+
+	r := b.closed(keyReboot)
+	require.NotNil(t, r)
+	assert.Equal(t, fleet.RolloutCompleted, r.State)
+	assert.Equal(t, fleet.HostDone, r.Host("a").State)
+}
+
+// A canary whose need goes away by itself leaves the rollout, and the next
+// member becomes the canary.
+func TestSelfResolvedCanaryIsReplaced(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.w.Settings.PolicyPackages = fleet.PolicyManual
+	b.host("a", 0)
+	b.host("b", 0)
+	b.host("c", 0)
+	b.wants("a", packagesNeed("2.0"))
+	b.wants("b", packagesNeed("2.0"))
+	b.wants("c", packagesNeed("2.0"))
+	b.step()
+
+	require.Equal(t, "a", b.mustRollout(packagesKey("2.0")).Canary)
+
+	b.get("a").Status.Needs = nil
+	b.step()
+
+	r := b.mustRollout(packagesKey("2.0"))
+	assert.Nil(t, r.Host("a"))
+	assert.Equal(t, "b", r.Canary)
+	assert.Equal(t, fleet.StageCanary, r.Host("b").Stage)
 }
 
 func TestMembership(t *testing.T) {
 	key := imageKey("", imgLighthouse, digestA)
 
-	t.Run("an expected host joins when it reports and is done when someone fixed it", func(t *testing.T) {
+	t.Run("an expected host joins when it reports and leaves when someone fixed it", func(t *testing.T) {
 		b := newWorldBuilder(t)
 		b.host("reporter", 0)
 		b.host("slow", 0)
@@ -729,7 +827,7 @@ func TestMembership(t *testing.T) {
 
 		r = b.mustRollout(key)
 		assert.Equal(t, fleet.HostPending, r.Host("slow").State)
-		assert.Equal(t, fleet.HostDone, r.Host("fixed").State)
+		assert.Nil(t, r.Host("fixed"), "no lease of the rollout served it")
 	})
 
 	t.Run("an expected host with validators is waited for as the canary only for hostStaleAfter", func(t *testing.T) {
@@ -779,37 +877,54 @@ func TestMembership(t *testing.T) {
 		}
 	})
 
-	t.Run("a held host leaves the queue and rejoins when the hold lifts", func(t *testing.T) {
-		b := newWorldBuilder(t)
-		b.w.Settings.PolicyImage = fleet.PolicyManual
-		b.w.Settings.PolicyPackages = fleet.PolicyManual
-		b.host("a", 0)
-		b.host("b", 0)
-		b.wantsImage("a", imgLighthouse, digestA)
-		b.wantsImage("b", imgLighthouse, digestA)
-		b.wants("a", packagesNeed("2.0"))
-		b.wants("b", packagesNeed("2.0"))
-		b.step()
+	t.Run("a held host stays pending and is granted once the hold lifts", func(t *testing.T) {
+		for _, tt := range []struct {
+			name   string
+			hold   func(h *fleet.Host, on bool)
+			reason string
+		}{
+			{
+				name: "controller hold", reason: "held by lighthouse",
+				hold: func(h *fleet.Host, on bool) {
+					h.Status.Hold.Holds = nil
+					if on {
+						h.Status.Hold.Holds = []protocol.HostHold{{Holder: "lighthouse"}}
+					}
+				},
+			},
+			{
+				name: "local hold", reason: "held by the host",
+				hold: func(h *fleet.Host, on bool) {
+					h.Status.Hold = protocol.Hold{}
+					if on {
+						h.Status.Hold = protocol.Hold{Local: true, Holds: []protocol.HostHold{{Holder: protocol.HolderHost}}}
+					}
+				},
+			},
+		} {
+			t.Run(tt.name, func(t *testing.T) {
+				b := newWorldBuilder(t)
+				b.w.Settings.PolicyPackages = fleet.PolicyAuto
+				b.host("a", 0)
+				b.wants("a", packagesNeed("2.0"))
+				tt.hold(b.get("a"), true)
 
-		// The agent of "a" obeys a hold: it reports no needs any more.
-		a := b.get("a")
-		needs := a.Status.Needs
-		a.Status.Hold.Local = true
-		a.Status.Needs = nil
-		out := b.step()
+				for range 2 {
+					out := b.step()
 
-		assert.Equal(t, fleet.HostExpected, b.mustRollout(key).Host("a").State,
-			"it still runs the old digest")
-		assert.Equal(t, fleet.HostDone, b.mustRollout(packagesKey("2.0")).Host("a").State)
-		assert.NotContains(t, queueReasons(out.Plan), "a")
-		assert.Equal(t, SlotHeld, out.Plan.Hosts["a"].Slot)
+					assert.Equal(t, fleet.HostPending, b.mustRollout(packagesKey("2.0")).Host("a").State)
+					assert.Empty(t, b.leasedHosts())
+					assert.Equal(t, tt.reason, queueReasons(out.Plan)["a"])
+					assert.Equal(t, SlotHeld, out.Plan.Hosts["a"].Slot)
+				}
 
-		a.Status.Hold.Local = false
-		a.Status.Needs = needs
-		b.step()
+				tt.hold(b.get("a"), false)
+				b.step()
 
-		assert.Equal(t, fleet.HostPending, b.mustRollout(key).Host("a").State)
-		assert.Equal(t, fleet.HostPending, b.mustRollout(packagesKey("2.0")).Host("a").State)
+				assert.Equal(t, fleet.HostLeased, b.mustRollout(packagesKey("2.0")).Host("a").State)
+				assert.Equal(t, []string{"a"}, b.leasedHosts())
+			})
+		}
 	})
 
 	t.Run("a forgotten host is skipped", func(t *testing.T) {
@@ -981,8 +1096,10 @@ func TestCanaryChoice(t *testing.T) {
 
 	t.Run("a validator host that cannot be served is not waited for", func(t *testing.T) {
 		for name, setup := range map[string]func(b *worldBuilder){
-			"silent":  func(b *worldBuilder) { b.get("val").LastSeen = b.w.Now.Add(-time.Hour) },
-			"held":    func(b *worldBuilder) { b.get("val").HoldWanted = true },
+			"silent": func(b *worldBuilder) { b.get("val").LastSeen = b.w.Now.Add(-time.Hour) },
+			"held": func(b *worldBuilder) {
+				b.get("val").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
+			},
 			"no verb": func(b *worldBuilder) { b.get("val").Status.Verbs = []protocol.Verb{protocol.VerbRoll} },
 		} {
 			t.Run(name, func(t *testing.T) {
@@ -1055,8 +1172,10 @@ func TestCanaryCandidates(t *testing.T) {
 
 	t.Run("a broken host that waits for a person holds nobody back", func(t *testing.T) {
 		for name, setup := range map[string]func(b *worldBuilder){
-			"silent":  func(b *worldBuilder) { b.get("broken").LastSeen = b.w.Now.Add(-time.Hour) },
-			"held":    func(b *worldBuilder) { b.get("broken").HoldWanted = true },
+			"silent": func(b *worldBuilder) { b.get("broken").LastSeen = b.w.Now.Add(-time.Hour) },
+			"held": func(b *worldBuilder) {
+				b.get("broken").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
+			},
 			"no verb": func(b *worldBuilder) { b.get("broken").Status.Verbs = []protocol.Verb{protocol.VerbRoll} },
 		} {
 			t.Run(name, func(t *testing.T) {
@@ -1102,7 +1221,7 @@ func TestCanaryCandidates(t *testing.T) {
 		out := b.step()
 		assert.Empty(t, b.leasedHosts())
 		assert.Equal(t, map[string]string{
-			"a": "budget 0% of 0%", "b": "after a", "tool": "after a",
+			"a": "validators down: 0% now, 50% with this host, limit 0%", "b": "after a", "tool": "after a",
 		}, queueReasons(out.Plan))
 	})
 
@@ -1122,7 +1241,7 @@ func TestCanaryCandidates(t *testing.T) {
 
 		// The lease expires unused, then a person skips the canary.
 		b.report("a", protocol.PhaseDone, false, protocol.StepRefused)
-		b.get("a").HoldWanted = true
+		b.get("a").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
 		b.step()
 
 		r := b.mustRollout(packagesKey("2.0"))
@@ -1228,71 +1347,14 @@ func TestCanaryCandidates(t *testing.T) {
 	})
 }
 
-func TestHoldDirectives(t *testing.T) {
+// The holds are the agents': the scheduler sends no hold or release-hold of
+// its own, whatever a host reports, and a host that comes back with a fresh
+// state and no holds is not held again. A hold directive a person asked for
+// is sent until the agent answers it.
+func TestTheSchedulerHoldsNoHostByItself(t *testing.T) {
 	b := newWorldBuilder(t)
 	h := b.host("a", 0)
-
-	pending := func() []protocol.DirectiveKind {
-		var kinds []protocol.DirectiveKind
-
-		for _, d := range b.w.Directives {
-			if d.State == fleet.DirectivePending {
-				kinds = append(kinds, d.Kind)
-			}
-		}
-
-		return kinds
-	}
-
-	b.step()
-	assert.Empty(t, pending(), "nothing to say while both sides agree")
-
-	h.HoldWanted = true
-	h.HoldReason = "debugging"
-	b.step()
-	b.step()
-	require.Equal(t, []protocol.DirectiveKind{protocol.DirectiveHold}, pending(), "issued once")
-	assert.Equal(t, "debugging", b.w.Directives[0].Reason)
-	assert.Equal(t, "a", b.w.Directives[0].Host)
-
-	// Wanted flips before the agent answered: the hold is withdrawn.
-	h.HoldWanted = false
-	b.step()
-	assert.Empty(t, pending())
-	assert.Equal(t, fleet.DirectiveCancelled, b.w.Directives[0].State)
-
-	h.HoldWanted = true
-	b.step()
-	require.Equal(t, []protocol.DirectiveKind{protocol.DirectiveHold}, pending())
-
-	// The agent agrees.
-	h.Status.Hold.Controller = true
-	b.step()
-	assert.Empty(t, pending())
-	assert.Equal(t, fleet.DirectiveAccepted, b.w.Directives[len(b.w.Directives)-1].State)
-
-	// Unhold: release-hold until the agent reports the hold gone. A local
-	// hold is not the controller's business.
-	h.HoldWanted = false
-	h.Status.Hold.Local = true
-	b.step()
-	require.Equal(t, []protocol.DirectiveKind{protocol.DirectiveReleaseHold}, pending())
-
-	h.Status.Hold.Controller = false
-	b.step()
-	assert.Empty(t, pending())
-}
-
-// A host that reported a controller hold when the controller first saw it
-// (the database was lost) has its row created with the hold wanted
-// (store.RecordSync). The scheduler then finds both sides in agreement: it
-// neither lifts the hold nor grants the host anything.
-func TestAdoptedControllerHoldIsNotReleased(t *testing.T) {
-	b := newWorldBuilder(t)
-	h := b.host("a", 0)
-	h.HoldWanted = true
-	h.HoldReason = store.HoldReasonAdopted
-	h.Status.Hold.Controller = true
+	h.Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff, By: "alice", Reason: "debugging"}}
 	b.host("b", 0)
 	b.wants("b", packagesNeed("2.0"))
 
@@ -1302,18 +1364,34 @@ func TestAdoptedControllerHoldIsNotReleased(t *testing.T) {
 		assert.Equal(t, SlotHeld, out.Plan.Hosts["a"].Slot)
 	}
 
-	assert.Empty(t, b.w.Directives)
 	assert.Equal(t, []string{"b"}, b.leasedHosts())
 
-	// What the adoption prevents: the same report on a row without the hold
-	// wanted is a hold to lift.
-	h.HoldWanted = false
-	h.HoldReason = ""
+	// Redeployed with a fresh state: no holds, and none sent back.
+	h.Status.Hold = protocol.Hold{}
+	b.wants("a", packagesNeed("2.0"))
 
 	out := b.step()
-	require.Len(t, out.Directives, 1)
-	assert.Equal(t, protocol.DirectiveReleaseHold, out.Directives[0].Kind)
-	assert.Equal(t, "a", out.Directives[0].Host)
+	assert.Empty(t, out.Directives)
+	assert.Equal(t, SlotQueued, out.Plan.Hosts["a"].Slot, "it waits for its turn, not for a hold")
+	assert.Empty(t, b.w.Directives)
+
+	// A requested hold waits for the agent's answer, and a rejection ends it.
+	d := &fleet.Directive{
+		Directive: protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: "geth"},
+		Host:      "b", State: fleet.DirectivePending,
+	}
+	b.w.Directives = append(b.w.Directives, d)
+	b.step()
+	assert.Equal(t, fleet.DirectivePending, b.w.Directives[0].State)
+	assert.Equal(t, []PendingHold{{Holder: "geth"}}, b.step().Plan.Hosts["b"].HoldRequests)
+
+	b.get("b").Status.DirectiveAcks = []protocol.DirectiveAck{
+		{ID: "d-hold", Status: protocol.DirectiveRejected, Error: "holder is not staff or a team"},
+	}
+	out = b.step()
+	assert.Equal(t, fleet.DirectiveRejected, b.w.Directives[0].State)
+	assert.Equal(t, "holder is not staff or a team", b.w.Directives[0].Error)
+	assert.Empty(t, out.Plan.Hosts["b"].HoldRequests)
 }
 
 func TestStaggeredManualRolloutHasACanary(t *testing.T) {
@@ -1445,7 +1523,7 @@ func TestLocalRollout(t *testing.T) {
 	require.NotNil(t, l, "no approval is waited for")
 	assert.Len(t, l.Needs, 2, "one lease serves both")
 	assert.Nil(t, b.lease("b"), "the host limit is one of two")
-	assert.Equal(t, "host limit 1 of 1", queueReasons(out.Plan)["b"])
+	assert.Equal(t, "hosts at once: 1 of 1 busy", queueReasons(out.Plan)["b"])
 
 	b.serve("a")
 	assert.Equal(t, fleet.RolloutCompleted, b.closed(key).State)

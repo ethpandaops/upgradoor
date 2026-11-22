@@ -23,8 +23,8 @@ import (
 const (
 	// defaultTickInterval is the reconcile period.
 	defaultTickInterval = 2 * time.Second
-	// minLivenessEpochs is the least number of liveness epochs asked for.
-	minLivenessEpochs = 6
+	// livenessEpochs is the number of liveness epochs asked for.
+	livenessEpochs = 6
 )
 
 // Store is the part of store.Store the scheduler uses.
@@ -57,6 +57,10 @@ type Options struct {
 	// settled epochs, newest first. Without it no host's validators count as
 	// attesting, and the gate stays closed while any host has validators.
 	Liveness func(epochs int) []fleet.Liveness
+	// Attested returns the beacon service's newest attested slots per host
+	// (beacon.Service.AttestedSlots). Without it no host with validators
+	// becomes ready by the readiness check.
+	Attested func() map[string][]uint64
 	// Defaults are the settings before the stored overrides.
 	Defaults fleet.Settings
 	// TickInterval is the reconcile period; 2s when zero.
@@ -116,6 +120,10 @@ func New(log logrus.FieldLogger, opts Options) Service { //nolint:gocritic // hu
 
 	if opts.Liveness == nil {
 		opts.Liveness = func(int) []fleet.Liveness { return nil }
+	}
+
+	if opts.Attested == nil {
+		opts.Attested = func() map[string][]uint64 { return nil }
 	}
 
 	return &service{
@@ -299,7 +307,8 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 		return nil, fmt.Errorf("scheduler: list hosts: %w", err)
 	}
 
-	w.Liveness = s.opts.Liveness(max(int(settings.ReadyEpochs)+3, minLivenessEpochs))
+	w.Liveness = s.opts.Liveness(livenessEpochs)
+	w.Attested = s.opts.Attested()
 
 	if w.Rollouts, err = st.ListRollouts(ctx, store.RolloutFilter{OpenOnly: true}); err != nil {
 		return nil, fmt.Errorf("scheduler: list open rollouts: %w", err)
@@ -343,11 +352,12 @@ var loggedEvents = map[string]string{
 	"rollout.created":   "Rollout opened",
 	"rollout.halted":    "Rollout halted",
 	"rollout.completed": "Rollout completed",
+	"rollout.dropped":   "Rollout dropped",
 	"action.abort":      "Rollout aborted",
 }
 
 // loggedDetail are the detail keys a logged event carries.
-var loggedDetail = []string{keyLease, keyRollouts, keyKey, "title", "host", keyReason}
+var loggedDetail = []string{keyLease, keyRollouts, keyKey, keyTitle, keyHost, keyReason}
 
 // logEvents logs the committed audit entries of loggedEvents, one line each.
 func (s *service) logEvents(entries []fleet.AuditEntry) {
@@ -425,7 +435,7 @@ func (s *service) loadDirectives(ctx context.Context, w *World) error {
 	manual := make([]string, 0, len(w.Rollouts))
 
 	for _, r := range w.Rollouts {
-		if directed(r) {
+		if r.Directed() {
 			manual = append(manual, r.ID)
 		}
 	}

@@ -206,6 +206,49 @@ func syncOwned(t *testing.T, st store.Store, host string, containers ...protocol
 	require.NoError(t, err)
 }
 
+// obeyHolds is the agent of host: it takes the hold and release-hold
+// directives that wait for it into the holds it reports, and the controller
+// takes its answers.
+func obeyHolds(t *testing.T, st store.Store, host string) {
+	t.Helper()
+
+	ctx := context.Background()
+
+	pending, err := st.ListDirectives(ctx, store.DirectiveFilter{Host: host, PendingOnly: true})
+	require.NoError(t, err)
+
+	h, err := st.GetHost(ctx, host)
+	require.NoError(t, err)
+
+	req := *h.Status
+	holds := slices.Clone(req.Hold.Holds)
+	answered := make([]*fleet.Directive, 0, len(pending))
+
+	for _, d := range pending {
+		if d.Kind != protocol.DirectiveHold && d.Kind != protocol.DirectiveReleaseHold {
+			continue
+		}
+
+		holds = slices.DeleteFunc(holds, func(x protocol.HostHold) bool { return x.Holder == d.Holder })
+		if d.Kind == protocol.DirectiveHold {
+			holds = append(holds, protocol.HostHold{Holder: d.Holder, By: d.By.User, Reason: d.Reason, At: d.CreatedAt})
+		}
+
+		d.State = fleet.DirectiveAccepted
+		answered = append(answered, d)
+	}
+
+	slices.SortFunc(holds, protocol.HoldOrder)
+	req.Hold.Holds = holds
+
+	_, err = st.RecordSync(ctx, &store.HostSync{
+		Cert:    &identity.Certificate{Subject: host, Network: controllertest.Network, Hash: h.CertHash},
+		Request: &req, At: controllertest.Epoch,
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.Commit(ctx, &store.Changes{Directives: answered}))
+}
+
 // teamsVerifier accepts every token and gives it the teams.
 type teamsVerifier struct {
 	teams []string
@@ -329,53 +372,63 @@ func actionSamples(t *testing.T) []actionSample {
 		{
 			action:  "roll",
 			body:    fmt.Sprintf(`{"hosts":[%q],"containers":["lighthouse"]}`, controllertest.HostMixed),
-			feature: authz.FeatureRoll, twin: true,
+			feature: authz.FeatureManage, twin: true,
 		},
-		{action: "reboot", body: hosts, feature: authz.FeatureReboot, twin: true},
-		{action: "hold", body: hosts, feature: authz.FeatureHold, twin: true},
-		{action: "unhold", body: hosts, feature: authz.FeatureHold, twin: true},
+		{
+			action:  "roll",
+			body:    fmt.Sprintf(`{"hosts":[%q],"containers":["lighthouse"],"force":true,"ignoreBudget":true}`, controllertest.HostMixed),
+			feature: authz.FeatureManage, twin: true,
+		},
+		{action: "reboot", body: hosts, feature: authz.FeatureManage},
+		{action: "hold", body: hosts, feature: authz.FeatureManage, twin: true},
+		{action: "unhold", body: hosts, feature: authz.FeatureManage, twin: true},
 		{
 			action:  "mark-offline",
 			body:    fmt.Sprintf(`{"hosts":[%q],"reason":"debugging a client"}`, controllertest.HostMixed),
-			feature: authz.FeatureHold, twin: true,
+			feature: authz.FeatureManage,
 		},
-		{action: "unmark-offline", body: hosts, feature: authz.FeatureHold, twin: true},
-		{action: "skip", body: rolloutHosts, feature: authz.FeatureRecover, twin: true},
-		{action: "retry", body: rolloutHosts, feature: authz.FeatureRecover, twin: true},
+		{action: "unmark-offline", body: hosts, feature: authz.FeatureManage},
+		{action: "skip", body: rolloutHosts, feature: authz.FeatureManage, twin: true},
+		{action: "retry", body: rolloutHosts, feature: authz.FeatureManage, twin: true},
 		{
 			action: "end-lease", body: fmt.Sprintf(`{"lease":%q}`, controllertest.LeaseMixed),
-			feature: authz.FeatureRecover, twin: true,
+			feature: authz.FeatureManage, twin: true,
 		},
 		{
 			action:  "image-override",
 			body:    fmt.Sprintf(`{"host":%q,"container":"lighthouse","image":"sigp/lighthouse:fix"}`, controllertest.HostMixed),
-			feature: authz.FeatureImageOverride, twin: true,
+			feature: authz.FeatureManageImage, twin: true,
 		},
 		{
 			action:  "flag-override",
 			body:    fmt.Sprintf(`{"host":%q,"container":"lighthouse","addFlags":["--debug-level=debug"]}`, controllertest.HostMixed),
-			feature: authz.FeatureFlagOverride, twin: true,
+			feature: authz.FeatureManageFlags, twin: true,
 		},
 		{
 			action: "client-override",
 			body: fmt.Sprintf(`{"client":"lighthouse","kind":"cl","hosts":[%q],"part":"image","image":"sigp/lighthouse:fix"}`,
 				controllertest.HostMixed),
-			feature: authz.FeatureImageOverride, twin: true,
+			feature: authz.FeatureManageImage, twin: true,
 		},
 		{
 			action: "client-override",
 			body: fmt.Sprintf(`{"client":"lighthouse","kind":"vc","hosts":[%q],"part":"flags","addFlags":["--debug"]}`,
 				controllertest.HostMixed),
-			feature: authz.FeatureFlagOverride, twin: true,
+			feature: authz.FeatureManageFlags, twin: true,
 		},
 		{
 			action: "client-policy", body: `{"client":"lighthouse","policy":"manual"}`,
-			feature: authz.FeatureClientPolicy, twin: true,
+			feature: authz.FeatureManage, twin: true,
 		},
-		{action: "pause", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureSupervise, twin: true},
-		{action: "resume", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureSupervise, twin: true},
-		{action: "abort", body: `{"rollout":"r-1"}`, feature: authz.FeatureSupervise},
-		{action: "retry", body: `{"rollout":"r-1"}`, feature: authz.FeatureSupervise},
+		{action: "pause", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},
+		{action: "resume", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},
+		{action: "ignore-gate", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},
+		{
+			action: "approve-lease", body: fmt.Sprintf(`{"rollout":"r-lighthouse","host":%q}`, controllertest.HostMixed),
+			feature: authz.FeatureManage, twin: true,
+		},
+		{action: "abort", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},
+		{action: "retry", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},
 		{action: "pause", body: `{}`, feature: authz.FeatureAdmin},
 		{action: "resume", body: `{"reason":"over"}`, feature: authz.FeatureAdmin},
 		{action: "forget", body: hosts, feature: authz.FeatureAdmin},

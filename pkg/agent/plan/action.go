@@ -30,8 +30,8 @@ type Action struct {
 	Impact  protocol.Impact `yaml:"impact"`
 	// Timeout ends the run; the run then fails.
 	Timeout time.Duration `yaml:"timeout"`
-	// Feature ("<service>:<feature>") and Teams allow a person to start the
-	// action, next to admin.
+	// Feature (a controller feature, protocol.DefaultActionFeature when
+	// empty) and Teams allow a person to start the action, next to admin.
 	Feature string   `yaml:"feature"`
 	Teams   []string `yaml:"teams"`
 	// When is the condition under which the action is due by itself; empty
@@ -66,8 +66,8 @@ func (a *Action) validate(name string) error {
 		return fmt.Errorf("impact: %q, want independent or node", a.Impact)
 	case a.Timeout < MinActionTimeout || a.Timeout > MaxActionTimeout:
 		return fmt.Errorf("timeout: %s, want %s to %s", a.Timeout, MinActionTimeout, MaxActionTimeout)
-	case a.Feature != "" && !protocol.ValidFeature(a.Feature):
-		return fmt.Errorf("feature: %q is not <service>:<feature>", a.Feature)
+	case a.Feature != "" && !protocol.ValidActionFeature(a.Feature):
+		return fmt.Errorf("feature: unknown %q (details, manage, manage_image, manage_flags or admin)", a.Feature)
 	case len(a.Teams) > protocol.MaxOwners:
 		return fmt.Errorf("teams: %d, at most %d", len(a.Teams), protocol.MaxOwners)
 	case a.When != "" && !a.When.Valid():

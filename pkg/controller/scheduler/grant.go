@@ -17,8 +17,10 @@ const budgetEpsilon = 1e-9
 
 // Waiting reasons.
 const (
-	reasonHeld    = "held"
 	reasonOffline = "known offline"
+	// reasonHoldRequested is why a host waits that was asked for a hold and
+	// has not answered yet.
+	reasonHoldRequested = "hold requested, waiting for the host"
 	// reasonWorking is why a host that works on an operation without a lease
 	// is granted nothing.
 	reasonWorking       = "working on an operation without a lease"
@@ -36,9 +38,11 @@ const (
 	reasonHaltedPrefix = "rollout halted: "
 	reasonVerb         = "verb not allowed by the agent"
 	reasonPull         = "waiting to pull its image again after a failed pull"
-	reasonGatePrefix   = "network gate: "
-	reasonAfter        = "after "
-	reasonAfterCanary  = "after canary "
+	// ReasonGatePrefix starts the waiting reason of a host that waits for
+	// the network gate; the gate's first reason follows.
+	ReasonGatePrefix  = "network gate: "
+	reasonAfter       = "after "
+	reasonAfterCanary = "after canary "
 )
 
 // Gate reasons.
@@ -177,7 +181,7 @@ func hostLimit(percent float64, hosts int) int {
 // about independent containers alone.
 func (b *budgetState) admitIndependent() verdict {
 	if b.independent >= b.maxIndependent {
-		return verdict{rank: rankHostLimit, reason: fmt.Sprintf("independent limit %d of %d",
+		return verdict{rank: rankHostLimit, reason: fmt.Sprintf("independent hosts at once: %d of %d busy",
 			b.independent, b.maxIndependent)}
 	}
 
@@ -196,16 +200,19 @@ func (b *budgetState) fits(cost uint64) bool {
 // host that costs cost.
 func (b *budgetState) admit(cost uint64) verdict {
 	if !b.fits(cost) {
-		used := 0.0
+		now, with := 0.0, 0.0
 		if b.total > 0 {
-			used = float64(b.unavailable) * 100 / float64(b.total)
+			now = float64(b.unavailable) * 100 / float64(b.total)
+			with = float64(b.unavailable+cost) * 100 / float64(b.total)
 		}
 
-		return verdict{rank: rankBudget, reason: "budget " + percent(used) + " of " + percent(b.percent)}
+		return verdict{rank: rankBudget, reason: "validators down: " + percent(now) + " now, " +
+			percentUp(with) + " with this host, limit " + percent(b.percent)}
 	}
 
 	if b.leased >= b.maxLeased {
-		return verdict{rank: rankHostLimit, reason: fmt.Sprintf("host limit %d of %d", b.leased, b.maxLeased)}
+		return verdict{rank: rankHostLimit, reason: fmt.Sprintf("hosts at once: %d of %d busy",
+			b.leased, b.maxLeased)}
 	}
 
 	return verdict{}
@@ -227,6 +234,12 @@ func (b *budgetState) take(cost uint64, impact protocol.Impact) {
 // percent formats a percentage with at most one decimal, rounded down.
 func percent(v float64) string {
 	return strconv.FormatFloat(math.Floor(v*10+budgetEpsilon)/10, 'f', -1, 64) + "%"
+}
+
+// percentUp formats a percentage with at most one decimal, rounded up, so a
+// share over the limit never reads as the limit.
+func percentUp(v float64) string {
+	return strconv.FormatFloat(math.Ceil(v*10-budgetEpsilon)/10, 'f', -1, 64) + "%"
 }
 
 // fallbackEpoch is the epoch length the age of the beacon view is measured in
@@ -275,6 +288,10 @@ func (p *pass) gate() (g Gate, trusted bool) {
 			n.FinalityLagEpochs, p.set.MaxFinalityLagEpochs))
 	}
 
+	if n.Split != "" {
+		g.Reasons = append(g.Reasons, "network split: "+n.Split)
+	}
+
 	// Participation is judged among the hosts that are not occupied: a host
 	// that holds a lease, works without one or is charged is down because of
 	// an operation, so a rollout does not close the gate on itself. It is the
@@ -320,7 +337,7 @@ func (p *pass) policyVerdict(r *fleet.Rollout) verdict {
 		// A rollout that is halted says so, paused or not: the failure is what
 		// a person must look at first. Its pause shows once it is retried.
 		return verdict{rank: rankRolloutPaused, reason: cmpOr(r.PauseReason, reasonRolloutPaused)}
-	case rolloutPolicy(p.set, r) == fleet.PolicyManual && !r.Approved:
+	case p.set.RolloutPolicy(r) == fleet.PolicyManual && !r.Approved:
 		return verdict{rank: rankApproval, reason: reasonApproval}
 	case r.State != fleet.RolloutActive:
 		return verdict{rank: rankHalted, reason: reasonHaltedPrefix + r.Reason}
@@ -421,10 +438,11 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 	}
 
 	// Independent containers touch neither the node nor the network: the
-	// gate does not hold them back.
-	if !r.IgnoreBudget && !g.gate.OK && needsImpact(hv.h, needs) != protocol.ImpactIndependent {
+	// gate does not hold them back. Nor does it hold back a rollout a person
+	// let pass it.
+	if !r.PassesGate() && !g.gate.OK && needsImpact(hv.h, needs) != protocol.ImpactIndependent {
 		if !g.passesClosedGate(hv) {
-			return verdict{rank: rankGate, reason: reasonGatePrefix + g.gate.Reasons[0]}, nil, false
+			return verdict{rank: rankGate, reason: ReasonGatePrefix + g.gate.Reasons[0]}, nil, false
 		}
 
 		excepted = true
@@ -485,7 +503,7 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 	case hv.offline:
 		return verdict{rank: rankHeld, reason: reasonOffline}, ""
 	case hv.held:
-		return verdict{rank: rankHeld, reason: reasonHeld}, ""
+		return verdict{rank: rankHeld, reason: hv.heldReason()}, ""
 	case hv.stale:
 		return verdict{rank: rankSilent, reason: reasonAgentSilent}, ""
 	case hv.working():
@@ -567,7 +585,7 @@ func (g *granter) lease(hv *hostView, parts []part, excepted bool) {
 	}
 
 	ids := make([]string, 0, len(parts))
-	ignoreBudget := false
+	ignoreBudget, ignoredGate := false, false
 	impact := protocol.ImpactIndependent
 
 	for _, pt := range parts {
@@ -592,9 +610,10 @@ func (g *granter) lease(hv *hostView, parts []part, excepted bool) {
 
 		l.Force = l.Force && r.Force
 		ignoreBudget = ignoreBudget || r.IgnoreBudget
+		ignoredGate = ignoredGate || (!g.gate.OK && r.IgnoreGate)
 		ids = append(ids, r.ID)
 
-		if !directed(r) || r.CreatedBy != l.GrantedBy {
+		if !r.Directed() || r.CreatedBy != l.GrantedBy {
 			l.GrantedBy = actorScheduler
 		}
 	}
@@ -621,6 +640,7 @@ func (g *granter) lease(hv *hostView, parts []part, excepted bool) {
 		"allowed":      g.budget.allowed,
 		keyForce:       l.Force,
 		"ignoreBudget": ignoreBudget,
+		"ignoredGate":  ignoredGate,
 		"closedGate":   excepted,
 	})
 }
@@ -790,8 +810,32 @@ func (p *pass) grant() *Plan {
 			hp.Reason = reason
 		}
 
+		hp.HoldRequests = p.holdRequests(name)
 		plan.Hosts[name] = hp
 	}
 
 	return plan
+}
+
+// holdRequests are the unanswered hold and release-hold directives of a host.
+func (p *pass) holdRequests(host string) []PendingHold {
+	var out []PendingHold
+
+	for _, d := range p.byHost[host] {
+		if d.State != fleet.DirectivePending ||
+			(d.Kind != protocol.DirectiveHold && d.Kind != protocol.DirectiveReleaseHold) {
+			continue
+		}
+
+		req := PendingHold{
+			Holder: d.Holder, Release: d.Kind == protocol.DirectiveReleaseHold, Reason: d.Reason, At: d.CreatedAt,
+		}
+		if d.By != nil {
+			req.By = d.By.User
+		}
+
+		out = append(out, req)
+	}
+
+	return out
 }

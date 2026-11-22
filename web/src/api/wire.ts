@@ -31,7 +31,6 @@ import {
   type QueueEntry,
   type Rollout,
   type RolloutHost,
-  type SettingsBody,
   type SlotRow,
 } from './types';
 import schemaFile from './wire.schema.json';
@@ -56,8 +55,6 @@ const SCHEMA = schemaFile as {
 export const WIRE_VERSION = SCHEMA.version;
 
 const ZERO_TIME = '0001-01-01T00:00:00Z';
-/** The public view's text for a beacon node error (beaconErrorPublic in public.go). */
-const BEACON_ERROR_PUBLIC = 'beacon node unavailable';
 
 export function fields(schema: string): Field[] {
   const f = SCHEMA.schemas[schema];
@@ -283,7 +280,6 @@ export function beaconSeen(network: NetworkHealth): { at: string | undefined; si
 
 // ------------------------------------------------------------------ views
 
-type WireGate = Gate & { publicReasons?: string[] };
 type WireHost = HostListing & { bootTime: string; unplanned?: boolean };
 type WireMember = RolloutHost & { key?: string; rolloutId?: string; index?: number };
 type WireDetail = HostDetail & { hasInventory?: boolean };
@@ -366,19 +362,11 @@ function ordered<T extends { id: string }>(rows: readonly T[], ids: readonly str
 export function buildViews(doc: WireDoc, strings: readonly string[], priv: boolean, ms: number): Partial<LiveViews> {
   const out: Partial<LiveViews> = {};
 
-  const gate = doc.one<WireGate>('n', strings);
+  const gate = doc.one<Gate>('n', strings);
   if (gate) {
-    const { publicReasons } = gate;
-    const network = chainAt(gate.network, ms);
-    const full: Gate = { ...without(gate, 'publicReasons'), network };
-
-    out['public-network'] = priv
-      ? {
-          ...full,
-          reasons: publicReasons ?? full.reasons,
-          network: network.error ? { ...network, error: BEACON_ERROR_PUBLIC } : network,
-        }
-      : full;
+    // The controller's error texts are fixed texts on every stream; the public gate leaves the inventory out.
+    const full: Gate = { ...gate, network: chainAt(gate.network, ms) };
+    out['public-network'] = priv ? { ...full, network: without(full.network, 'validatorRangesError') } : full;
 
     if (priv) {
       const hostRows = doc.rows<WireHost>('h', strings);
@@ -455,9 +443,6 @@ export function buildViews(doc: WireDoc, strings: readonly string[], priv: boole
       a.layer !== b.layer ? (a.layer === 'consensus' ? -1 : 1) : byName(a, b)
     ),
   };
-
-  const settings = doc.one<SettingsBody>('se', strings);
-  if (settings) out.settings = settings;
 
   const audit = doc.one<AuditHead>('a', strings);
   if (audit) out.audit = audit;

@@ -45,6 +45,24 @@ describe('the ready peer share field', () => {
   });
 });
 
+describe('the readiness fields', () => {
+  const attestations = fieldSpec('readyAttestations');
+  const stable = fieldSpec('readyStableFor');
+
+  it('take 1 to 32 slots and 0 to 30m', () => {
+    for (const text of ['1', '2', '32']) expect(validateField(attestations, text), text).toBeNull();
+    for (const text of ['0', '33', '1.5']) expect(validateField(attestations, text), text).not.toBeNull();
+
+    for (const text of ['0', '0s', '90s', '30m']) expect(validateField(stable, text), text).toBeNull();
+    for (const text of ['30m1s', '1h', 'soon']) expect(validateField(stable, text), text).not.toBeNull();
+  });
+
+  it('send 0 as a Go duration', () => {
+    const form = { ...toForm(defaultSettings()), readyStableFor: '0' };
+    expect(fromForm(form).readyStableFor).toBe('0s');
+  });
+});
+
 describe('the groups of the settings page', () => {
   // The settings as the controller answers them (written by TestWireFiles in
   // pkg/controller/userapi): a setting the controller gains and the page does not

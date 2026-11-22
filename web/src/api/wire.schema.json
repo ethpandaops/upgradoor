@@ -1,5 +1,5 @@
 {
- "version": "9d8462f64f55",
+ "version": "e835fe10b14d",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -15,14 +15,12 @@
   "pl": "wirePlan",
   "public.h": "PublicHost",
   "q": "QueueEntry",
-  "ro": "Rollout",
-  "se": "SettingsBody",
+  "ro": "RolloutView",
   "sl": "SlotParticipation"
  },
  "single": [
   "n",
   "pl",
-  "se",
   "a",
   "d.x",
   "d.v"
@@ -208,6 +206,29 @@
     "omit": true
    }
   ],
+  "CPUStats": [
+   {
+    "n": "cores",
+    "t": "n"
+   },
+   {
+    "n": "load1",
+    "t": "n"
+   },
+   {
+    "n": "load5",
+    "t": "n"
+   },
+   {
+    "n": "load15",
+    "t": "n"
+   },
+   {
+    "n": "busy",
+    "t": "j",
+    "omit": true
+   }
+  ],
   "ClientImage": [
    {
     "n": "kind",
@@ -243,6 +264,11 @@
    {
     "n": "commandHosts",
     "t": "n"
+   },
+   {
+    "n": "commonArgs",
+    "t": "l",
+    "omit": true
    }
   ],
   "ClientView": [
@@ -261,6 +287,10 @@
    {
     "n": "policySet",
     "t": "b"
+   },
+   {
+    "n": "defaultPolicy",
+    "t": "r"
    },
    {
     "n": "images",
@@ -412,6 +442,12 @@
     "n": "overridable",
     "t": "b",
     "omit": true
+   },
+   {
+    "n": "stats",
+    "t": "o",
+    "of": "ContainerStats",
+    "omit": true
    }
   ],
   "ContainerListing": [
@@ -503,6 +539,22 @@
     "omit": true
    }
   ],
+  "ContainerStats": [
+   {
+    "n": "cpu",
+    "t": "j",
+    "omit": true
+   },
+   {
+    "n": "memory",
+    "t": "n"
+   },
+   {
+    "n": "memoryLimit",
+    "t": "n",
+    "omit": true
+   }
+  ],
   "ELHealth": [
    {
     "n": "reachable",
@@ -537,8 +589,30 @@
     "omit": true
    },
    {
-    "n": "controller",
-    "t": "b"
+    "n": "holds",
+    "t": "a",
+    "of": "HostHold",
+    "omit": true
+   }
+  ],
+  "HostHold": [
+   {
+    "n": "holder",
+    "t": "s"
+   },
+   {
+    "n": "by",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "reason",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "at",
+    "t": "t"
    }
   ],
   "HostPlan": [
@@ -567,6 +641,12 @@
     "n": "reason",
     "t": "r",
     "omit": true
+   },
+   {
+    "n": "holdRequests",
+    "t": "a",
+    "of": "PendingHold",
+    "omit": true
    }
   ],
   "HostSlotParticipation": [
@@ -581,6 +661,18 @@
    {
     "n": "included",
     "t": "n"
+   }
+  ],
+  "HostUsage": [
+   {
+    "n": "cpu",
+    "t": "j",
+    "omit": true
+   },
+   {
+    "n": "memory",
+    "t": "j",
+    "omit": true
    }
   ],
   "ImageNeed": [
@@ -781,8 +873,29 @@
     "omit": true
    },
    {
+    "n": "approved",
+    "t": "o",
+    "of": "LeaseApproval",
+    "omit": true
+   },
+   {
     "n": "recheck",
     "t": "b",
+    "omit": true
+   }
+  ],
+  "LeaseApproval": [
+   {
+    "n": "at",
+    "t": "t"
+   },
+   {
+    "n": "by",
+    "t": "r"
+   },
+   {
+    "n": "reason",
+    "t": "r",
     "omit": true
    }
   ],
@@ -803,6 +916,24 @@
     "n": "reason",
     "t": "r",
     "omit": true
+   }
+  ],
+  "MemoryStats": [
+   {
+    "n": "total",
+    "t": "n"
+   },
+   {
+    "n": "available",
+    "t": "n"
+   },
+   {
+    "n": "swapTotal",
+    "t": "n"
+   },
+   {
+    "n": "swapUsed",
+    "t": "n"
    }
   ],
   "Need": [
@@ -958,11 +1089,6 @@
     "n": "until",
     "t": "t",
     "omit": true
-   },
-   {
-    "n": "by",
-    "t": "r",
-    "omit": true
    }
   ],
   "Operation": [
@@ -1103,6 +1229,31 @@
     "t": "n"
    }
   ],
+  "PendingHold": [
+   {
+    "n": "holder",
+    "t": "s"
+   },
+   {
+    "n": "release",
+    "t": "b",
+    "omit": true
+   },
+   {
+    "n": "by",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "reason",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "at",
+    "t": "t"
+   }
+  ],
   "PublicHost": [
    {
     "n": "name",
@@ -1209,7 +1360,87 @@
     "omit": true
    }
   ],
-  "Rollout": [
+  "Resources": [
+   {
+    "n": "cpu",
+    "t": "o",
+    "of": "CPUStats"
+   },
+   {
+    "n": "memory",
+    "t": "o",
+    "of": "MemoryStats"
+   }
+  ],
+  "RolloutHost": [
+   {
+    "n": "host",
+    "t": "r"
+   },
+   {
+    "n": "state",
+    "t": "r"
+   },
+   {
+    "n": "stage",
+    "t": "n"
+   },
+   {
+    "n": "needId",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "leaseId",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "error",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "skippedBy",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "updatedAt",
+    "t": "t"
+   }
+  ],
+  "RolloutTarget": [
+   {
+    "n": "image",
+    "t": "r"
+   },
+   {
+    "n": "digest",
+    "t": "r"
+   },
+   {
+    "n": "revision",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "spec",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "container",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "flags",
+    "t": "b",
+    "omit": true
+   }
+  ],
+  "RolloutView": [
    {
     "n": "id",
     "t": "s"
@@ -1289,6 +1520,10 @@
     "t": "b"
    },
    {
+    "n": "ignoreGate",
+    "t": "b"
+   },
+   {
     "n": "canary",
     "t": "s",
     "omit": true
@@ -1314,172 +1549,10 @@
     "n": "hosts",
     "t": "a",
     "of": "RolloutHost"
-   }
-  ],
-  "RolloutHost": [
+   },
    {
-    "n": "host",
+    "n": "policy",
     "t": "r"
-   },
-   {
-    "n": "state",
-    "t": "r"
-   },
-   {
-    "n": "stage",
-    "t": "n"
-   },
-   {
-    "n": "needId",
-    "t": "s",
-    "omit": true
-   },
-   {
-    "n": "leaseId",
-    "t": "s",
-    "omit": true
-   },
-   {
-    "n": "error",
-    "t": "r",
-    "omit": true
-   },
-   {
-    "n": "skippedBy",
-    "t": "s",
-    "omit": true
-   },
-   {
-    "n": "updatedAt",
-    "t": "t"
-   }
-  ],
-  "RolloutTarget": [
-   {
-    "n": "image",
-    "t": "r"
-   },
-   {
-    "n": "digest",
-    "t": "r"
-   },
-   {
-    "n": "revision",
-    "t": "r",
-    "omit": true
-   },
-   {
-    "n": "spec",
-    "t": "s",
-    "omit": true
-   },
-   {
-    "n": "container",
-    "t": "s",
-    "omit": true
-   },
-   {
-    "n": "flags",
-    "t": "b",
-    "omit": true
-   }
-  ],
-  "Settings": [
-   {
-    "n": "maxUnavailablePercent",
-    "t": "n"
-   },
-   {
-    "n": "maxLeasedPercent",
-    "t": "n"
-   },
-   {
-    "n": "maxIndependentPercent",
-    "t": "n"
-   },
-   {
-    "n": "minParticipationPercent",
-    "t": "n"
-   },
-   {
-    "n": "maxFinalityLagEpochs",
-    "t": "n"
-   },
-   {
-    "n": "readyEpochs",
-    "t": "n"
-   },
-   {
-    "n": "minPeers",
-    "t": "n"
-   },
-   {
-    "n": "leaseTtl",
-    "t": "j"
-   },
-   {
-    "n": "hostStaleAfter",
-    "t": "j"
-   },
-   {
-    "n": "readinessTimeout",
-    "t": "j"
-   },
-   {
-    "n": "policyImage",
-    "t": "r"
-   },
-   {
-    "n": "policyPackages",
-    "t": "r"
-   },
-   {
-    "n": "policyReboot",
-    "t": "r"
-   },
-   {
-    "n": "policyClients",
-    "t": "j"
-   },
-   {
-    "n": "actionPolicies",
-    "t": "j"
-   },
-   {
-    "n": "pauseAfterCanaryImage",
-    "t": "b"
-   },
-   {
-    "n": "pauseAfterCanaryPackages",
-    "t": "b"
-   },
-   {
-    "n": "pauseAfterCanaryReboot",
-    "t": "b"
-   },
-   {
-    "n": "readyPeerShare",
-    "t": "n"
-   },
-   {
-    "n": "lookupInterval",
-    "t": "j"
-   },
-   {
-    "n": "paused",
-    "t": "b"
-   }
-  ],
-  "SettingsBody": [
-   {
-    "n": "settings",
-    "t": "o",
-    "of": "Settings"
-   },
-   {
-    "n": "defaults",
-    "t": "o",
-    "of": "Settings"
    }
   ],
   "SlotParticipation": [
@@ -1669,23 +1742,15 @@
     "t": "n"
    },
    {
+    "n": "resources",
+    "t": "o",
+    "of": "Resources",
+    "omit": true
+   },
+   {
     "n": "hold",
     "t": "o",
     "of": "Hold"
-   },
-   {
-    "n": "holdWanted",
-    "t": "b"
-   },
-   {
-    "n": "holdReason",
-    "t": "r",
-    "omit": true
-   },
-   {
-    "n": "holdBy",
-    "t": "s",
-    "omit": true
    },
    {
     "n": "offline",
@@ -1737,6 +1802,11 @@
     "n": "hasInventory",
     "t": "b",
     "omit": true
+   },
+   {
+    "n": "reduced",
+    "t": "b",
+    "omit": true
    }
   ],
   "wireGate": [
@@ -1747,11 +1817,6 @@
    {
     "n": "reasons",
     "t": "l"
-   },
-   {
-    "n": "publicReasons",
-    "t": "l",
-    "omit": true
    },
    {
     "n": "network",
@@ -1804,23 +1869,19 @@
     "t": "n"
    },
    {
+    "n": "usage",
+    "t": "o",
+    "of": "HostUsage",
+    "omit": true
+   },
+   {
     "n": "hold",
     "t": "o",
     "of": "Hold"
    },
    {
-    "n": "holdWanted",
-    "t": "b"
-   },
-   {
-    "n": "holdReason",
-    "t": "r",
-    "omit": true
-   },
-   {
-    "n": "holdBy",
-    "t": "s",
-    "omit": true
+    "n": "holders",
+    "t": "l"
    },
    {
     "n": "offline",
@@ -1971,6 +2032,11 @@
    {
     "n": "finalityLagEpochs",
     "t": "n"
+   },
+   {
+    "n": "split",
+    "t": "s",
+    "omit": true
    },
    {
     "n": "livenessKnown",

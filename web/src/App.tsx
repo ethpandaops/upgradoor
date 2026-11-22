@@ -5,7 +5,7 @@ import type { Config } from './api/types';
 import { AppContext, useAuthState, type AppServices } from './appContext';
 import { canViewPrivate, type AuthStore } from './auth/authStore';
 import { Header } from './components/Header';
-import { LiveIndicator, LiveProvider } from './components/Live';
+import { LiveBanner, LiveIndicator, LiveProvider } from './components/Live';
 import { DEFAULT_SERVICE, PermissionsProvider } from './components/Permissions';
 import { NowProvider } from './components/RelTime';
 import { Button, Loading, cx } from './components/primitives';
@@ -18,9 +18,10 @@ import { HostsTab } from './tabs/HostsTab';
 import { OverviewTab } from './tabs/OverviewTab';
 import { PackagesTab } from './tabs/PackagesTab';
 import { RolloutsTab } from './tabs/RolloutsTab';
+import { DataSourcesTab } from './tabs/DataSourcesTab';
 import { SettingsTab } from './tabs/SettingsTab';
 
-export const TABS = ['overview', 'hosts', 'clients', 'rollouts', 'packages', 'settings', 'audit'] as const;
+export const TABS = ['overview', 'hosts', 'clients', 'rollouts', 'packages', 'settings', 'sources', 'audit'] as const;
 type TabId = (typeof TABS)[number];
 
 const TAB_LABEL: Record<TabId, string> = {
@@ -30,22 +31,36 @@ const TAB_LABEL: Record<TabId, string> = {
   rollouts: 'Rollouts',
   packages: 'Packages',
   settings: 'Settings',
+  sources: 'Data sources',
   audit: 'Audit',
 };
 
+/** Settings and data sources need the feature admin. */
+const ADMIN_TABS: ReadonlySet<TabId> = new Set(['settings', 'sources']);
+
+/** Packages needs the feature details. */
+const DETAIL_TABS: ReadonlySet<TabId> = new Set(['packages']);
+
 /** Overview and Hosts have a public view; the rest needs a login. */
-const PRIVATE_TABS: ReadonlySet<TabId> = new Set(['clients', 'rollouts', 'packages', 'settings', 'audit']);
+const PRIVATE_TABS: ReadonlySet<TabId> = new Set(['clients', 'rollouts', 'packages', 'settings', 'sources', 'audit']);
 
 /**
  * visibleTabs are the tabs the login can use; the others are not in the menu.
  * The rules are the controller's: without a login only the public views
  * exist, and the settings can only be changed with the feature admin, so for
  * every other login the Settings tab would be a page of controls it cannot
- * use. Without an auth provider (open mode) everything is shown. This only
- * decides what is offered: the controller decides what each request may do.
+ * use; the data sources are served to admin only. Without an auth provider
+ * (open mode) everything is shown. This only decides what is offered: the
+ * controller decides what each request may do.
  */
-export function visibleTabs(access: { priv: boolean; admin: boolean }): TabId[] {
-  return TABS.filter(id => (id === 'settings' ? access.admin : !PRIVATE_TABS.has(id) || access.priv));
+export function visibleTabs(access: { priv: boolean; admin: boolean; hostDetails: boolean }): TabId[] {
+  return TABS.filter(id =>
+    ADMIN_TABS.has(id)
+      ? access.admin
+      : DETAIL_TABS.has(id)
+        ? access.priv && access.hostDetails
+        : !PRIVATE_TABS.has(id) || access.priv
+  );
 }
 
 /** MockControls lets the mock mode flip the network gate and, with a fake auth client, the login from the UI. */
@@ -123,7 +138,9 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
   const services = useMemo<AppServices>(() => ({ api, auth, config }), [api, auth, config]);
   const authState = useAuthState(auth);
   const { preference, setPreference } = useTheme();
-  const [wanted, setTab] = useHashTab<TabId>(TABS, 'overview');
+  // A link to a host (?host=<name>) without a tab opens the Hosts tab.
+  const [linkedHost] = useState(() => new URLSearchParams(window.location.search).has('host'));
+  const [wanted, setTab] = useHashTab<TabId>(TABS, linkedHost ? 'hosts' : 'overview');
   const [gateFailing, setGateFailing] = useState(() => mock?.gateFailing() ?? false);
   const [mockLogin, setMockLogin] = useState(() => mock?.login?.current() ?? '');
   const tabRefs = useRef(new Map<TabId, HTMLButtonElement>());
@@ -136,7 +153,8 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
   const service = config.authService || DEFAULT_SERVICE;
   // Open mode has no login and no features: everything may be done.
   const admin = !authState.enabled || (priv && auth.hasFeature(service, FEATURE.admin));
-  const tabs = useMemo(() => visibleTabs({ priv, admin }), [priv, admin]);
+  const hostDetails = !authState.enabled || (priv && auth.hasFeature(service, FEATURE.details));
+  const tabs = useMemo(() => visibleTabs({ priv, admin, hostDetails }), [priv, admin, hostDetails]);
 
   // A tab that is not in the menu is not shown either: its URL, and the tab a
   // login was on when it ended, lead to the overview. The panel is the
@@ -181,6 +199,9 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
       break;
     case 'settings':
       panel = <SettingsTab />;
+      break;
+    case 'sources':
+      panel = <DataSourcesTab />;
       break;
     case 'audit':
       panel = <AuditTab />;
@@ -277,6 +298,7 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
                 </div>
               }
             />
+            <LiveBanner />
 
             <main id="tab-panel" role="tabpanel" aria-labelledby={`tab-${tab}`} className="grow p-4">
               <PermissionsProvider>{panel}</PermissionsProvider>

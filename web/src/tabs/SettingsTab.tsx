@@ -18,8 +18,8 @@ import {
   cx,
 } from '../components/primitives';
 import { useQuery } from '../hooks/useQuery';
+import { useUnsavedWork } from '../hooks/useUnsavedWork';
 import { ActionPolicies } from './ActionPolicies';
-import { DataSourcesCard } from './DataSourcesCard';
 import {
   GROUPS,
   POLICIES,
@@ -72,7 +72,6 @@ export function SettingsTab() {
       ) : (
         <ErrorBanner error={loaded.error} what="the settings" onRetry={loaded.refresh} />
       )}
-      <DataSourcesCard />
     </div>
   );
 }
@@ -110,6 +109,7 @@ function SettingsEditor({
   const errors = useMemo(() => validateForm(form), [form]);
   const dirty = useMemo(() => dirtyKeys(form, body.settings), [form, body.settings]);
   const invalid = Object.keys(errors).length > 0;
+  useUnsavedWork(dirty.length > 0);
 
   const field = (key: SettingKey): FieldState => ({
     value: form[key],
@@ -301,17 +301,16 @@ function InfoText({ spec, fallback }: { spec: FieldSpec; fallback: string }) {
 }
 
 /**
- * Mark stands in the line of a setting, between its label and its control,
- * so it takes no room when there is nothing to say and moves nothing when
- * there is: that the value is changed and not saved, and that it differs from
- * the default, with the default. The default is a button that puts it back.
+ * Mark is a line under a setting, only while there is something to say: that
+ * the value is changed and not saved, and that it differs from the default,
+ * with the default. The default is a button that puts it back.
  */
 function Mark({ spec, state, what }: { spec: FieldSpec; state: FieldState; what: string }) {
   const isDefault = sameValue(spec, state.value, state.fallback);
   if (!state.dirty && isDefault) return null;
 
   return (
-    <span className="inline-flex items-center gap-1.5 text-xs/5 whitespace-nowrap">
+    <span className="flex flex-wrap items-center justify-end gap-1.5 text-xs/5">
       {state.dirty && <Badge tone="info">changed</Badge>}
       {!isDefault && (
         <button
@@ -360,17 +359,17 @@ function SettingRow({ spec, state, id }: { spec: FieldSpec; state: FieldState; i
         <span id={hintId} className="sr-only">
           {spec.hint} {spec.range ? `Valid: ${spec.range}.` : ''}
         </span>
-        <span className="ml-auto inline-flex items-center gap-1.5">
-          <Mark spec={spec} state={state} what={spec.label} />
+        <span className="ml-auto">
           <Control id={id} hintId={hintId} spec={spec} state={state} />
         </span>
       </div>
+      <Mark spec={spec} state={state} what={spec.label} />
       <Problem state={state} />
     </div>
   );
 }
 
-const CELL = 'flex flex-col gap-2 rounded-sm border border-border bg-background p-3';
+const CELL = 'flex min-w-0 flex-col gap-2 rounded-sm border border-border bg-background p-3';
 
 /** SettingCell is one setting of a strip: its label and info above, its control below. */
 function SettingCell({ spec, state, id }: { spec: FieldSpec; state: FieldState; id: string }) {
@@ -378,7 +377,7 @@ function SettingCell({ spec, state, id }: { spec: FieldSpec; state: FieldState; 
 
   return (
     <div className={CELL}>
-      <div className="flex min-h-6 items-center gap-2">
+      <div className="flex min-h-6 flex-wrap items-center gap-x-2 gap-y-1">
         <label htmlFor={id} className="text-sm/6 font-medium whitespace-nowrap">
           {spec.label}
         </label>
@@ -388,14 +387,12 @@ function SettingCell({ spec, state, id }: { spec: FieldSpec; state: FieldState; 
         <span id={hintId} className="sr-only">
           {spec.hint}
         </span>
-        <span className="ml-auto">
-          <Mark spec={spec} state={state} what={spec.label} />
-        </span>
       </div>
       <div className="flex min-h-6 items-center gap-2 text-xs/5 text-muted">
         <Control id={id} hintId={hintId} spec={spec} state={state} />
         {spec.kind === 'switch' && (state.value === 'true' ? 'on: nothing new is granted' : 'off: the scheduler runs')}
       </div>
+      <Mark spec={spec} state={state} what={spec.label} />
       <Problem state={state} />
     </div>
   );
@@ -422,7 +419,7 @@ function KindCell({
 
   return (
     <div className={CELL}>
-      <div className="flex min-h-6 items-center gap-2">
+      <div className="flex min-h-6 flex-wrap items-center gap-x-2 gap-y-1">
         <span className="text-sm/6 font-medium whitespace-nowrap">{kind.label}</span>
         <InfoTip label={policySpec.label}>
           <span className="block">
@@ -437,8 +434,7 @@ function KindCell({
             Default: {policy.fallback}. Setting: <span className="font-mono">{kind.policy}</span>
           </span>
         </InfoTip>
-        <span className="ml-auto inline-flex items-center gap-1.5">
-          <Mark spec={policySpec} state={policy} what={policySpec.label} />
+        <span className="ml-auto">
           <Segmented
             label={policySpec.label}
             value={policy.value as Policy}
@@ -448,16 +444,16 @@ function KindCell({
           />
         </span>
       </div>
-      <div className="flex min-h-6 items-center gap-2 text-xs/5 text-muted">
-        <span>Pause after the canary</span>
+      <Mark spec={policySpec} state={policy} what={policySpec.label} />
+      <div className="flex min-h-6 flex-wrap items-center gap-x-2 gap-y-1 text-xs/5 text-muted">
+        <span className="whitespace-nowrap">Pause after the canary</span>
         <InfoTip label={canarySpec.label}>
           <InfoText spec={canarySpec} fallback={canary.fallback} />
         </InfoTip>
         <span id={canaryHint} className="sr-only">
           {canarySpec.hint}
         </span>
-        <span className="ml-auto inline-flex items-center gap-1.5">
-          <Mark spec={canarySpec} state={canary} what={canarySpec.label} />
+        <span className="ml-auto">
           <Switch
             label={canarySpec.label}
             describedBy={canaryHint}
@@ -469,6 +465,7 @@ function KindCell({
           />
         </span>
       </div>
+      <Mark spec={canarySpec} state={canary} what={canarySpec.label} />
       <Problem state={policy} />
       <Problem state={canary} />
     </div>

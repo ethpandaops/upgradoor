@@ -50,10 +50,12 @@ type Record struct {
 	Container string   `json:"container,omitempty"`
 	// HostAction names the configured action of an action record.
 	HostAction string `json:"hostAction,omitempty"`
-	Before     string `json:"before,omitempty"`
-	After      string `json:"after,omitempty"`
-	Reason     string `json:"reason,omitempty"`
-	Lease      string `json:"lease,omitempty"`
+	// Holder is whose hold a hold record sets or lifts.
+	Holder string `json:"holder,omitempty"`
+	Before string `json:"before,omitempty"`
+	After  string `json:"after,omitempty"`
+	Reason string `json:"reason,omitempty"`
+	Lease  string `json:"lease,omitempty"`
 	// Result is accepted, refused, failed, or a step status.
 	Result string `json:"result"`
 	Error  string `json:"error,omitempty"`
@@ -111,6 +113,7 @@ func (a *audit) Record(rec *Record) {
 		Time: rec.Time, Action: plan.Line(rec.Action), Source: plan.Line(rec.Source),
 		User: plan.Line(rec.User), Teams: lines(rec.Teams), Feature: plan.Line(rec.Feature),
 		Directive: plan.Line(rec.Directive), Container: plan.Line(rec.Container),
+		HostAction: plan.Line(rec.HostAction), Holder: plan.Line(rec.Holder),
 		Before: plan.Line(rec.Before), After: plan.Line(rec.After), Reason: plan.Line(rec.Reason),
 		Lease: plan.Line(rec.Lease), Result: plan.Line(rec.Result), Error: plan.Line(rec.Error),
 	}

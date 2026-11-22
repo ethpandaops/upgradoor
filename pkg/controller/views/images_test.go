@@ -11,6 +11,8 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
+var fullAccess = &Access{Full: true}
+
 func imageHosts() []*fleet.Host {
 	host := func(name string, containers ...protocol.Container) *fleet.Host {
 		return &fleet.Host{Name: name, Status: &protocol.SyncRequest{Containers: containers}}
@@ -41,7 +43,7 @@ func imageNames(p Images) []string {
 }
 
 func TestNewImages(t *testing.T) {
-	page, err := NewImages(imageHosts(), "", "", 50)
+	page, err := NewImages(imageHosts(), "", "", 50, fullAccess)
 	require.NoError(t, err)
 
 	assert.Equal(t, []string{"consensys/teku:develop", "ethpandaops/geth:master", "prom/node-exporter:latest"},
@@ -59,6 +61,18 @@ func TestNewImages(t *testing.T) {
 }
 
 // The newest lookup a host reports is the image's.
+func TestNewImagesReduced(t *testing.T) {
+	hosts := imageHosts()
+	hosts[0].Status.Containers[0].Managed = true
+
+	page, err := NewImages(hosts, "", "", 50, &Access{})
+	require.NoError(t, err)
+
+	require.Equal(t, []string{"ethpandaops/geth:master"}, imageNames(page), "managed containers only")
+	assert.Equal(t, []ImageVersion{{Digest: "sha256:1", Revision: "r-sha256:1", Hosts: []string{"c"}}},
+		page.Matches[0].Versions)
+}
+
 func TestNewImagesRegistryLookup(t *testing.T) {
 	hosts := imageHosts()
 	at := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
@@ -68,7 +82,7 @@ func TestNewImagesRegistryLookup(t *testing.T) {
 		Digest: "sha256:2", CheckedAt: at.Add(time.Minute), Error: "registry: timeout",
 	}
 
-	page, err := NewImages(hosts, "geth", "", 50)
+	page, err := NewImages(hosts, "geth", "", 50, fullAccess)
 	require.NoError(t, err)
 	require.Len(t, page.Matches, 1)
 	assert.Equal(t, &ImageLookup{Digest: "sha256:2", CheckedAt: at.Add(time.Minute), Error: "registry: timeout"},
@@ -78,29 +92,29 @@ func TestNewImagesRegistryLookup(t *testing.T) {
 func TestNewImagesFiltersAndPages(t *testing.T) {
 	hosts := imageHosts()
 
-	page, err := NewImages(hosts, "E", "", 50)
+	page, err := NewImages(hosts, "E", "", 50, fullAccess)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"ethpandaops/geth:master", "consensys/teku:develop", "prom/node-exporter:latest"},
 		imageNames(page), "a reference that starts with the query first")
 
-	first, err := NewImages(hosts, "", "", 2)
+	first, err := NewImages(hosts, "", "", 2, fullAccess)
 	require.NoError(t, err)
 	assert.Len(t, first.Matches, 2)
 	require.NotEmpty(t, first.Next)
 
-	second, err := NewImages(hosts, "", first.Next, 2)
+	second, err := NewImages(hosts, "", first.Next, 2, fullAccess)
 	require.NoError(t, err)
 	assert.Equal(t, []string{"prom/node-exporter:latest"}, imageNames(second))
 	assert.Nil(t, second.Total, "counted for the first page only")
 	assert.Empty(t, second.Next)
 
-	none, err := NewImages(hosts, "nothing", "", 2)
+	none, err := NewImages(hosts, "nothing", "", 2, fullAccess)
 	require.NoError(t, err)
 	assert.Empty(t, none.Matches)
 	assert.NotNil(t, none.Matches)
 
 	for _, bad := range []string{"x", "9geth", "0"} {
-		_, err = NewImages(hosts, "", bad, 2)
+		_, err = NewImages(hosts, "", bad, 2, fullAccess)
 		require.ErrorIs(t, err, ErrBadImageCursor, bad)
 	}
 }

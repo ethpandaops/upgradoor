@@ -11,6 +11,7 @@ const (
 	pkgDocker    = "pkg/agent/host/docker"
 	pkgSystem    = "pkg/agent/host/system"
 	pkgProbe     = "pkg/agent/host/probe"
+	pkgResources = "pkg/agent/host/resources"
 	pkgRegistry  = "pkg/agent/registry"
 	pkgLink      = "pkg/agent/link"
 	pkgLease     = "pkg/agent/lease"
@@ -32,14 +33,15 @@ var mayImport = map[string][]string{
 	pkgPlan: {pkgProtocol, pkgImageref},
 	// Only host imports its sub-packages; they import no package of
 	// pkg/agent.
-	pkgHost:     {pkgDocker, pkgSystem, pkgProbe, pkgProtocol},
-	pkgDocker:   {pkgProtocol, pkgImageref},
-	pkgSystem:   {pkgProtocol},
-	pkgProbe:    {pkgProtocol},
-	pkgRegistry: {pkgProtocol, pkgImageref},
-	pkgLink:     {pkgProtocol, pkgIdentity},
-	pkgLease:    {pkgHost, pkgPlan, pkgProtocol},
-	pkgLocal:    {pkgPlan, pkgProtocol},
+	pkgHost:      {pkgDocker, pkgSystem, pkgProbe, pkgResources, pkgProtocol},
+	pkgDocker:    {pkgProtocol, pkgImageref},
+	pkgSystem:    {pkgProtocol},
+	pkgProbe:     {pkgProtocol},
+	pkgResources: {pkgProtocol},
+	pkgRegistry:  {pkgProtocol, pkgImageref},
+	pkgLink:      {pkgProtocol, pkgIdentity},
+	pkgLease:     {pkgHost, pkgPlan, pkgProtocol},
+	pkgLocal:     {pkgPlan, pkgProtocol},
 	pkgAgenttest: {
 		pkgHost, pkgRegistry, pkgProtocol, pkgIdentity, pkgImageref,
 	},

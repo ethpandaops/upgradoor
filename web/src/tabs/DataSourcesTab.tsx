@@ -1,11 +1,32 @@
 import { useMemo, useState } from 'react';
 
 import { errorText } from '../api/client';
-import { list, type BeaconEndpoint, type DataSources, type ValidatorRangesSource } from '../api/types';
+import {
+  list,
+  type BeaconEndpoint,
+  type ChainErrors,
+  type DataSources,
+  type ValidatorRangesSource,
+} from '../api/types';
 import { useApp } from '../appContext';
 import { Disclosure } from '../components/icons';
+import { useLive } from '../components/Live';
 import { RelTime } from '../components/RelTime';
-import { Badge, Button, Card, ErrorBanner, INPUT_CLASS, Loading, Table, Td, Th, cx } from '../components/primitives';
+import { ShortId } from '../components/Digest';
+import {
+  Badge,
+  Button,
+  Card,
+  Dash,
+  ErrorBanner,
+  INPUT_CLASS,
+  Loading,
+  Table,
+  Td,
+  Th,
+  cx,
+  type Tone,
+} from '../components/primitives';
 import { useQuery } from '../hooks/useQuery';
 import { plural } from '../lib/format';
 
@@ -13,78 +34,144 @@ import { plural } from '../lib/format';
 const MAX_RANGE_ROWS = 500;
 
 /**
- * DataSourcesCard shows where the controller reads the chain and the
- * validator ranges from, and what it saw there. It is loaded on demand; the
- * refresh of the validator ranges answers with the sources after it.
+ * DataSourcesTab shows where the controller reads the chain and the validator
+ * ranges from, and what it saw there. It is loaded on demand; the refresh of
+ * the validator ranges answers with the sources after it.
  */
-export function DataSourcesCard() {
+export function DataSourcesTab() {
   const { api } = useApp();
   const loaded = useQuery(s => api.dataSources(s), { key: 'data-sources' });
   const [fresh, setFresh] = useState<DataSources | undefined>(undefined);
   const data = fresh ?? loaded.data;
 
   return (
-    <Card
-      title="Data sources"
-      aside={
-        <Button
-          variant="ghost"
-          dense
-          onClick={() => {
-            setFresh(undefined);
-            loaded.refresh();
-          }}
-        >
-          Reload
-        </Button>
-      }
-    >
+    <div className="mx-auto flex w-full max-w-screen-2xl flex-col gap-4">
       {loaded.error !== undefined && (
         <ErrorBanner error={loaded.error} what="the data sources" onRetry={loaded.refresh} />
       )}
       {!data ? (
         loaded.loading && <Loading what="data sources" />
       ) : (
-        <div className="grid grid-cols-1 gap-6 lg:grid-cols-3">
-          <BeaconEndpoints endpoints={list(data.beacon)} />
+        <>
+          <BeaconEndpoints
+            endpoints={list(data.beacon)}
+            chain={data.chain}
+            onReload={() => {
+              setFresh(undefined);
+              loaded.refresh();
+            }}
+          />
           <ValidatorRanges source={data.validatorRanges} onRefreshed={setFresh} />
-        </div>
+        </>
       )}
-    </Card>
+    </div>
   );
 }
 
-const HEADING = 'text-xs/5 font-semibold tracking-wide text-muted uppercase';
+const STATE_TONE: Record<BeaconEndpoint['state'], Tone> = {
+  ok: 'success',
+  behind: 'warning',
+  syncing: 'info',
+  forked: 'danger',
+  down: 'danger',
+};
 
-function BeaconEndpoints({ endpoints }: { endpoints: readonly BeaconEndpoint[] }) {
+/** stateLabel is the endpoint's state; behind says by how much, against the highest head of the endpoints that are ok. */
+export function stateLabel(e: BeaconEndpoint, okHead: number | undefined): string {
+  if (e.state !== 'behind' || okHead === undefined || e.headSlot === undefined) return e.state;
+  return `behind by ${plural(Math.max(0, okHead - e.headSlot), 'slot')}`;
+}
+
+/** CHAIN_ERRORS label the error texts of the beacon service, which the other pages show as fixed texts. */
+const CHAIN_ERRORS: readonly [keyof ChainErrors, string][] = [
+  ['error', 'Beacon service'],
+  ['timingError', 'Chain timing'],
+  ['livenessError', 'Participation count'],
+];
+
+function BeaconEndpoints({
+  endpoints,
+  chain,
+  onReload,
+}: {
+  endpoints: readonly BeaconEndpoint[];
+  chain: ChainErrors | undefined;
+  onReload: () => void;
+}) {
+  const split = useLive('public-network').data?.network.split;
+  const errors = CHAIN_ERRORS.flatMap(([key, label]) => (chain?.[key] ? [{ label, text: chain[key] }] : []));
+  const okHeads = endpoints.filter(e => e.state === 'ok' && e.headSlot !== undefined).map(e => e.headSlot ?? 0);
+  const okHead = okHeads.length > 0 ? Math.max(...okHeads) : undefined;
+
   return (
-    <section aria-label="Beacon endpoints" className="flex min-w-0 flex-col gap-2">
-      <h3 className={HEADING}>Beacon endpoints</h3>
-      <ul className="flex flex-col">
-        {endpoints.map(e => (
-          <li
-            key={e.label}
-            className="flex flex-col gap-0.5 border-b border-border py-2 text-xs/5 first:pt-0 last:border-b-0"
-          >
-            <span className="flex flex-wrap items-center gap-2">
-              <span className="font-mono break-all">{e.label}</span>
-              {e.active && <Badge tone="success">in use</Badge>}
-            </span>
-            <span className="flex flex-wrap gap-x-4 text-muted">
-              <span>
-                Last answer <RelTime value={e.successAt} />
-              </span>
-              {e.headSlot !== undefined && <span className="tabular-nums">Head slot {e.headSlot}</span>}
-            </span>
-            {e.error && (
-              <span className="text-danger">
-                {e.error} (<RelTime value={e.errorAt} />)
-              </span>
-            )}
-          </li>
-        ))}
-      </ul>
-    </section>
+    <Card
+      title="Beacon endpoints"
+      count={endpoints.length}
+      aside={
+        <Button variant="ghost" dense onClick={onReload}>
+          Reload
+        </Button>
+      }
+    >
+      <p className="text-xs/5 text-muted">
+        The endpoints are queried in parallel; the controller follows the chain most of them agree on.
+      </p>
+      {split && (
+        <p role="alert" className="rounded-sm border border-danger bg-danger-subtle px-2 py-1 text-xs/5 text-danger">
+          Chain split: {split}. The network gate stays closed until one chain has a strict majority.
+        </p>
+      )}
+      {errors.map(e => (
+        <p key={e.label} className="text-xs/5 text-danger">
+          {e.label}: {e.text}
+        </p>
+      ))}
+      <Table label="Beacon endpoints">
+        <thead>
+          <tr>
+            <Th>Endpoint</Th>
+            <Th>State</Th>
+            <Th>Head slot</Th>
+            <Th>Finalized epoch</Th>
+            <Th>Last answer</Th>
+            <Th>Error</Th>
+          </tr>
+        </thead>
+        <tbody>
+          {endpoints.map(e => (
+            <tr key={e.label}>
+              <Td className="font-mono">{e.label}</Td>
+              <Td>
+                <Badge tone={STATE_TONE[e.state]}>{stateLabel(e, okHead)}</Badge>
+              </Td>
+              <Td className="tabular-nums">
+                {e.headSlot === undefined ? (
+                  <Dash />
+                ) : (
+                  <span className="inline-flex items-center gap-1.5">
+                    {e.headSlot}
+                    {e.headRoot && <ShortId value={e.headRoot} label="head root" />}
+                  </span>
+                )}
+              </Td>
+              <Td className="tabular-nums">{e.finalizedEpoch ?? <Dash />}</Td>
+              <Td>
+                <RelTime value={e.successAt} />
+              </Td>
+              <Td className="whitespace-normal">
+                {e.error ? (
+                  <span className="text-danger">
+                    {e.error} (<RelTime value={e.errorAt} />)
+                  </span>
+                ) : (
+                  <Dash />
+                )}
+              </Td>
+            </tr>
+          ))}
+        </tbody>
+      </Table>
+    </Card>
   );
 }
 
@@ -133,10 +220,10 @@ function ValidatorRanges({
   const shownRanges = matchingRanges.slice(0, MAX_RANGE_ROWS);
 
   return (
-    <section aria-label="Validator ranges" className="flex min-w-0 flex-col gap-2 lg:col-span-2">
-      <div className="flex flex-wrap items-center gap-2">
-        <h3 className={HEADING}>Validator ranges</h3>
-        <span className="ml-auto inline-flex items-center gap-2">
+    <Card
+      title="Validator ranges"
+      aside={
+        <>
           <span role="status" className="text-xs/5 text-muted">
             {note}
           </span>
@@ -148,9 +235,9 @@ function ValidatorRanges({
           >
             {busy ? 'Refreshing…' : 'Refresh'}
           </Button>
-        </span>
-      </div>
-
+        </>
+      }
+    >
       {!source.url ? (
         <p className="text-xs/5 text-muted">No validator ranges URL is configured: no host has validators.</p>
       ) : (
@@ -263,7 +350,7 @@ function ValidatorRanges({
           </Disclosure>
         </>
       )}
-    </section>
+    </Card>
   );
 }
 

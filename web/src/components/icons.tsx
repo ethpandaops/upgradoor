@@ -18,7 +18,7 @@ const PATHS = {
   pause: 'M9 5v14M15 5v14',
   resume: 'M7 5l12 7-12 7z',
   abort: 'M6 6h12v12H6z',
-  skip: 'M5 5l10 7-10 7zM19 5v14',
+  skip: 'M4 6l6 6-6 6M11 6l6 6-6 6M20 5v14',
   forget: 'M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3',
   image: 'M12 3l8 4.5v9L12 21l-8-4.5v-9zM4 7.5l8 4.5 8-4.5M12 12v9',
   flags: 'M4 6h9M17 6h3M4 12h3M11 12h9M4 18h11M19 18h1M15 4v4M9 10v4M17 16v4',
@@ -268,6 +268,8 @@ export function ActionMenu({
 
 function MenuEntry({ item, onChoose }: { item: MenuItem; onChoose: () => void }) {
   const permissions = usePermissions();
+  if (item.intent && !permissions.offers(item.intent)) return null;
+
   const verdict = item.intent ? permissions.canIntent(item.intent) : undefined;
   const reason = item.blocked || (verdict && !verdict.allowed ? verdict.reason : '');
 

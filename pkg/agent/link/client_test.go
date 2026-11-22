@@ -351,7 +351,7 @@ func TestAnswersNotOfTheControllerAreNotActedOn(t *testing.T) {
 				f.forge = tt.forge(t)
 				f.resp = &protocol.SyncResponse{
 					Lease:         &protocol.Lease{ID: "lease-1"},
-					Directives:    []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold}},
+					Directives:    []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff}},
 					WantInventory: true,
 				}
 			})
@@ -405,7 +405,7 @@ func TestUnsignedAnswersNeedTheOptOut(t *testing.T) {
 	e.ctrl.set(func(f *fakeController) {
 		f.signer = nil
 		f.resp = &protocol.SyncResponse{
-			Directives: []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold}},
+			Directives: []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff}},
 		}
 	})
 
@@ -434,7 +434,7 @@ func TestSignedAnswersAreRefusedWithoutControllerKeys(t *testing.T) {
 	})
 	e.ctrl.set(func(f *fakeController) {
 		f.resp = &protocol.SyncResponse{
-			Directives: []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold}},
+			Directives: []protocol.Directive{{ID: "d-hold", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff}},
 		}
 	})
 

@@ -89,7 +89,7 @@ func TestHeldHostDeclinesTheLease(t *testing.T) {
 			e.pull(agenttest.GethImage, agenttest.GethV2)
 
 			hold := func(o *plan.Overrides) {
-				o.Holds = map[string]plan.Hold{plan.HoldLocal: {Reason: "maintenance"}}
+				o.Holds = map[string]plan.Hold{protocol.HolderHost: {Reason: "maintenance"}}
 			}
 			if tt.at == 0 {
 				e.files.set(hold)

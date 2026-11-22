@@ -1,7 +1,7 @@
 import { useId, useMemo, useState, type ReactNode } from 'react';
 
 import type { ActionCall } from '../api/client';
-import type { ActionResult, Container } from '../api/types';
+import { list, type ActionResult, type Container } from '../api/types';
 import { useApp } from '../appContext';
 import {
   buildRebootRequest,
@@ -12,11 +12,12 @@ import {
   type Timing,
 } from '../lib/actionRequests';
 import { plural } from '../lib/format';
-import type { RolloutAction } from '../lib/hostActions';
+import type { CallContext } from '../lib/permissions';
 import { ActionShell, Choice, Field } from './ActionShell';
 import { ClientOverrideDialog, type ClientOverrideIntent } from './ClientOverrideDialog';
 import { HostActionDialog, type HostActionIntent } from './HostActionDialog';
 import { Disclosure, IconButton } from './icons';
+import { useLive } from './Live';
 import { DURATIONS, OverrideDialog, durationMs, type Duration } from './Overrides';
 import { usePermissions } from './Permissions';
 import { Segmented, cx } from './primitives';
@@ -62,7 +63,7 @@ type ActionIntentKind =
   | OverrideOf<'flag-override'>
   | ClientOverrideIntent
   | HostActionIntent
-  | {
+  | ({
       kind: 'call';
       title: string;
       /** verb is the label of the primary button ("Hold", "Abort"); "Confirm" when absent. */
@@ -74,13 +75,9 @@ type ActionIntentKind =
       /** ends offers an end for what the call sets: until lifted, or after one of the durations. */
       ends?: boolean;
       danger?: boolean;
-      /** leaseHost is the host of the lease an end-lease call is about; the permission to end it follows the host. */
-      leaseHost?: string;
-      /** rolloutClient is the client of the rollout a pause or resume is about ("" for none): its team may approve it. */
-      rolloutClient?: string;
-      /** rolloutAction is the action and members of an action rollout: who may run it everywhere may approve it. */
-      rolloutAction?: RolloutAction;
-    };
+      /** notes state what the decision rests on now (the gate's reasons, a readiness note). */
+      notes?: readonly string[];
+    } & CallContext);
 
 /** The intents this dialog confirms itself; an override and a host action have their own. */
 type PlainIntent = Exclude<
@@ -153,14 +150,16 @@ function PlainActionDialog({
   const permissions = usePermissions();
   const id = useId();
 
-  // Through a team feature alone the controller runs a roll or reboot
-  // staggered, whatever is asked: "now" is not offered then.
-  const mustStagger = intent.kind !== 'call' && permissions.canIntent(intent).staggered;
   const [timing, setTiming] = useState<Timing>(
-    intent.kind !== 'call' && (mustStagger || intent.all || intent.hosts.length > 1) ? 'staggered' : 'now'
+    intent.kind !== 'call' && (intent.all || intent.hosts.length > 1) ? 'staggered' : 'now'
   );
   const [force, setForce] = useState(false);
   const [ignoreBudget, setIgnoreBudget] = useState(false);
+  // Offered only while the network gate is closed; sent only then.
+  const gate = useLive('plan', intent.kind !== 'call').data?.gate;
+  const gateReasons = gate && !gate.ok ? list(gate.reasons) : undefined;
+  const [despiteGate, setDespiteGate] = useState(false);
+  const ignoreGate = gateReasons !== undefined && despiteGate;
   // A login that may roll only some of the containers starts with those.
   const [containers, setContainers] = useState<readonly string[]>(() => permissions.ownContainers(intent));
   const [reason, setReason] = useState('');
@@ -180,13 +179,22 @@ function PlainActionDialog({
             timing,
             force,
             ignoreBudget,
+            ignoreGate,
             reason,
           }),
         };
       case 'reboot':
         return {
           action: 'reboot',
-          body: buildRebootRequest({ hosts: intent.hosts, all: intent.all, timing, force, ignoreBudget, reason }),
+          body: buildRebootRequest({
+            hosts: intent.hosts,
+            all: intent.all,
+            timing,
+            force,
+            ignoreBudget,
+            ignoreGate,
+            reason,
+          }),
         };
       case 'call':
         return intent.make(
@@ -194,7 +202,7 @@ function PlainActionDialog({
           ends === 'never' ? undefined : new Date(Date.now() + durationMs(ends)).toISOString()
         );
     }
-  }, [intent, containers, timing, force, ignoreBudget, reason, ends]);
+  }, [intent, containers, timing, force, ignoreBudget, ignoreGate, reason, ends]);
 
   const description = useMemo<string[]>(() => {
     const opts = {
@@ -203,6 +211,7 @@ function PlainActionDialog({
       timing,
       force,
       ignoreBudget,
+      ignoreGate,
       reason,
     };
     switch (intent.kind) {
@@ -213,19 +222,21 @@ function PlainActionDialog({
       case 'call':
         return describeCall(call);
     }
-  }, [intent, call, containers, timing, force, ignoreBudget, reason]);
+  }, [intent, call, containers, timing, force, ignoreBudget, ignoreGate, reason]);
 
   const disruptive = intent.kind !== 'call';
   const danger = disruptive ? ignoreBudget : intent.danger === true;
 
   // The same rule the controller applies to the call as it stands now.
-  const verdict = permissions.can(
-    call,
-    intent.kind === 'call' ? intent.leaseHost : undefined,
-    intent.kind === 'call' ? intent.rolloutClient : undefined,
-    intent.kind === 'call' ? intent.rolloutAction : undefined
-  );
-  const adminHint = permissions.admin ? '' : ` Needs ${permissions.login.service}:admin.`;
+  // Nothing ticked rolls every managed container: say so plainly to a login that may not.
+  const pickOne =
+    intent.kind === 'roll' &&
+    intent.containerChoices.length > 1 &&
+    containers.length === 0 &&
+    !permissions.rollChoices(intent).whole;
+  const verdict = pickOne
+    ? { allowed: false, reason: 'tick at least one container your teams own', by: '' }
+    : permissions.can(call, intent.kind === 'call' ? intent : undefined);
 
   const submit = async () => {
     setBusy(true);
@@ -297,23 +308,22 @@ function PlainActionDialog({
                 type="radio"
                 name={`${id}-timing`}
                 checked={timing === 'now'}
-                disabled={mustStagger}
                 onChange={() => {
                   setTiming('now');
                 }}
                 label="Now"
-                hint={`As fast as budget and gate allow; no canary, no ready check.${mustStagger ? adminHint : ''}`}
+                hint="As fast as budget and gate allow; no canary, no ready check."
               />
             </fieldset>
             <Choice
               type="checkbox"
               checked={timing === 'staggered' && force}
-              disabled={timing !== 'staggered' || !permissions.admin}
+              disabled={timing !== 'staggered'}
               onChange={() => {
                 setForce(f => !f);
               }}
               label="Force"
-              hint={`Skip the order and the ready check (never the budget).${adminHint}`}
+              hint="Skip the order and the ready check (never the budget)."
             />
             <div
               className={cx(
@@ -324,44 +334,102 @@ function PlainActionDialog({
               <Choice
                 type="checkbox"
                 checked={ignoreBudget}
-                disabled={!permissions.admin}
                 onChange={() => {
                   setIgnoreBudget(v => !v);
                 }}
                 label={<span className="text-danger">Ignore budget</span>}
-                hint={`Dangerous: also skips the host limit and the network gate; audited.${adminHint}`}
+                hint="Dangerous: also skips the host limit and the network gate; audited."
               />
             </div>
           </>
         )
       }
     >
+      {intent.kind === 'call' && intent.notes && intent.notes.length > 0 && (
+        <ul aria-label="Current state" className="flex flex-col rounded-sm bg-surface-raised px-3 py-2 text-xs/5">
+          {intent.notes.map(note => (
+            <li key={note} className="whitespace-normal">
+              {note}
+            </li>
+          ))}
+        </ul>
+      )}
+      {disruptive && gateReasons !== undefined && (
+        <div
+          className={cx(
+            'rounded-sm border px-2 py-1.5',
+            ignoreGate ? 'border-warning bg-warning-subtle' : 'border-border'
+          )}
+        >
+          <Choice
+            type="checkbox"
+            checked={ignoreGate || ignoreBudget}
+            disabled={ignoreBudget}
+            onChange={() => {
+              setDespiteGate(v => !v);
+            }}
+            label="Roll despite network state"
+            hint={`The network gate is closed: ${gateReasons.join('; ') || 'no reason given'}. Pass it anyway; budget, host limit and canary still apply. Audited.`}
+          />
+        </div>
+      )}
       {intent.kind === 'call' && intent.ends === true && (
         <Field label="Ends">
           <Segmented<EndChoice> label="Ends" value={ends} options={END_CHOICES} onChange={setEnds} disabled={busy} />
         </Field>
       )}
       {intent.kind === 'roll' && intent.containerChoices.length > 1 && (
-        <fieldset className="flex flex-col gap-1">
-          <legend className="text-xs/5 font-medium">
-            Containers <span className="font-normal text-muted">(none ticked: every managed container)</span>
-          </legend>
-          <div className="flex flex-wrap gap-x-4 gap-y-1">
-            {intent.containerChoices.map(name => (
-              <Choice
-                key={name}
-                type="checkbox"
-                checked={containers.includes(name)}
-                onChange={() => {
-                  setContainers(prev => (prev.includes(name) ? prev.filter(c => c !== name) : [...prev, name]));
-                }}
-                label={<span className="font-mono">{name}</span>}
-              />
-            ))}
-          </div>
-        </fieldset>
+        <RollContainers
+          intent={intent}
+          containers={containers}
+          onToggle={name => {
+            setContainers(prev => (prev.includes(name) ? prev.filter(c => c !== name) : [...prev, name]));
+          }}
+        />
       )}
     </ActionShell>
+  );
+}
+
+/**
+ * RollContainers offers the managed containers of a roll. One the login may not roll is greyed out with its
+ * owners; nothing ticked rolls every managed container, which a login that may not is told to avoid.
+ */
+function RollContainers({
+  intent,
+  containers,
+  onToggle,
+}: {
+  intent: PlainIntent & { kind: 'roll' };
+  containers: readonly string[];
+  onToggle: (name: string) => void;
+}) {
+  const { whole, choices } = usePermissions().rollChoices(intent);
+
+  return (
+    <fieldset className="flex flex-col gap-1">
+      <legend className="text-xs/5 font-medium">
+        Containers{' '}
+        <span className="font-normal text-muted">
+          {whole ? '(none ticked: every managed container)' : '(tick the ones to roll)'}
+        </span>
+      </legend>
+      <div className="flex flex-wrap gap-x-4 gap-y-1">
+        {choices.map(c => (
+          <Choice
+            key={c.name}
+            type="checkbox"
+            checked={containers.includes(c.name)}
+            disabled={!c.allowed}
+            onChange={() => {
+              onToggle(c.name);
+            }}
+            label={<span className="font-mono">{c.name}</span>}
+            hint={c.allowed ? undefined : c.owners.length > 0 ? `team ${c.owners.join(', ')}` : 'staff'}
+          />
+        ))}
+      </div>
+    </fieldset>
   );
 }
 

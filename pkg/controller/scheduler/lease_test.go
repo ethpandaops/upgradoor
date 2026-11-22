@@ -81,13 +81,18 @@ func TestLeaseLifecycle(t *testing.T) {
 	assert.Equal(t, uint64(10), out.Plan.Budget.UnavailableWeight, "still unavailable while verifying")
 	assert.Equal(t, noteAwaitSync, l.Readiness)
 
-	// The epoch the operation ended in does not count.
-	b.advance(testEpoch)
+	// Slots are counted two slots behind the clock; the slot the operation
+	// ended in does not count.
+	b.advance(2 * testSlot)
 	b.step()
 	assert.Equal(t, fleet.LeaseVerifying, b.lease("a").State)
-	assert.Equal(t, "validators attesting: 0 of 1 epochs with at least 9 of 10", b.lease("a").Readiness)
+	assert.Equal(t, "waiting for the first attestation since "+clock(doneAt), b.lease("a").Readiness)
 
-	b.advance(testEpoch)
+	b.advance(testSlot)
+	b.step()
+	assert.Equal(t, "validators attesting: 1 of 2 slots since "+clock(doneAt), b.lease("a").Readiness)
+
+	b.advance(testSlot)
 
 	out = b.step()
 	assert.Nil(t, b.lease("a"))
@@ -637,11 +642,12 @@ func TestNeedStillReportedAfterTheOperationFails(t *testing.T) {
 }
 
 func TestDoneReportAloneDoesNotReleaseWithoutALaterSync(t *testing.T) {
-	// With readyEpochs 0 the readiness check of a validator host holds at once, but
-	// the needs of the sync that reported done may predate the operation.
+	// With readyStableFor 0 the readiness check of a host without validators
+	// holds at once, but the needs of the sync that reported done may predate
+	// the operation.
 	b := newWorldBuilder(t)
-	b.w.Settings.ReadyEpochs = 0
-	b.host("a", 10)
+	b.w.Settings.ReadyStableFor = 0
+	b.host("a", 0)
 	b.wants("a", rebootNeed())
 	b.step()
 
@@ -693,47 +699,54 @@ func TestRunningLeaseWhoseOperationIsGoneFails(t *testing.T) {
 	assert.Empty(t, b.leasedHosts(), "b is not granted in a halted rollout")
 }
 
-func TestReadinessEpochCounting(t *testing.T) {
-	// The agent reports done 10 s into epoch 100.
+// clock is how a readiness note gives a time.
+func clock(at time.Time) string {
+	return at.UTC().Format(time.TimeOnly)
+}
+
+func TestReadinessAttestedSlots(t *testing.T) {
+	// The agent reports done 10 s into slot 3200, at 10:40:10; the clock is
+	// in slot 3210 when the check runs.
+	const since = " since 10:40:10"
+
 	tests := []struct {
 		name   string
 		weight uint64
-		epochs uint64
-		// rows maps epochs to how many of the host's validators attested.
-		rows map[uint64]uint64
-		want bool
-		note string
+		want   uint64 // readyAttestations; 0 is the default
+		slots  []uint64
+		ready  bool
+		note   string
 	}{
 		{
-			name:   "the epoch the operation ended in does not count",
-			epochs: 1, rows: map[uint64]uint64{100: 10},
-			note: "validators attesting: 0 of 1 epochs with at least 9 of 10",
+			name:  "slots up to the one the operation ended in do not count",
+			slots: []uint64{3198, 3199, 3200},
+			note:  "waiting for the first attestation" + since,
 		},
+		{name: "one of two", slots: []uint64{3200, 3203}, note: "validators attesting: 1 of 2 slots" + since},
 		{
-			name:   "one complete epoch after done",
-			epochs: 1, rows: map[uint64]uint64{100: 0, 101: 10},
-			want: true,
-			note: "ready: no node probe configured, validators attesting",
+			name:  "two slots after done",
+			slots: []uint64{3201, 3205}, ready: true,
+			note: "ready: no node probe configured, validators attesting: 2 of 2 slots" + since,
 		},
-		{name: "minParticipation of the host's weight is enough", epochs: 1, rows: map[uint64]uint64{101: 9}, want: true},
-		{name: "one validator short", epochs: 1, rows: map[uint64]uint64{101: 8}},
-		{name: "two epochs wanted, one seen", epochs: 2, rows: map[uint64]uint64{101: 10}, note: "validators attesting: 1 of 2 epochs with at least 9 of 10"},
-		{name: "two consecutive epochs", epochs: 2, rows: map[uint64]uint64{101: 10, 102: 10}, want: true},
-		{name: "the run must be unbroken", epochs: 2, rows: map[uint64]uint64{101: 10, 102: 3}},
-		{name: "a new run after a bad epoch", epochs: 2, rows: map[uint64]uint64{101: 3, 102: 10, 103: 10}, want: true},
-		{name: "a missing epoch breaks the run", epochs: 2, rows: map[uint64]uint64{101: 10, 103: 10}},
-		{name: "three epochs", epochs: 3, rows: map[uint64]uint64{101: 10, 102: 9, 103: 10}, want: true},
-		{name: "a single validator must attest", weight: 1, epochs: 1, rows: map[uint64]uint64{101: 0}, note: "validators attesting: 0 of 1 epochs with at least 1 of 1"},
-		{name: "a single validator attests", weight: 1, epochs: 1, rows: map[uint64]uint64{101: 1}, want: true},
-		{name: "readyEpochs 0", epochs: 0, rows: map[uint64]uint64{100: 0}, want: true},
-		{name: "no rows after done at all", epochs: 1, rows: map[uint64]uint64{}},
+		{name: "more than wanted", slots: []uint64{3201, 3202, 3203}, ready: true},
+		{name: "readyAttestations 3", want: 3, slots: []uint64{3201, 3202}, note: "validators attesting: 2 of 3 slots" + since},
+		{name: "readyAttestations 1", want: 1, slots: []uint64{3207}, ready: true},
+		{
+			name: "a single validator needs one slot", weight: 1,
+			slots: []uint64{3204}, ready: true,
+			note: "ready: no node probe configured, validators attesting: 1 of 1 slots" + since,
+		},
+		{name: "a single validator that has not attested", weight: 1, note: "waiting for the first attestation" + since},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			b := newWorldBuilder(t)
 			b.autoLive = false
-			b.w.Settings.ReadyEpochs = tt.epochs
+
+			if tt.want > 0 {
+				b.w.Settings.ReadyAttestations = tt.want
+			}
 
 			weight := tt.weight
 			if weight == 0 {
@@ -741,7 +754,6 @@ func TestReadinessEpochCounting(t *testing.T) {
 			}
 
 			b.host("a", weight)
-			b.host("other", 10)
 
 			// The node part of the check holds throughout: no probe is
 			// configured and the run of syncs started with the done report.
@@ -752,33 +764,67 @@ func TestReadinessEpochCounting(t *testing.T) {
 				GrantedAt: doneAt, ExpiresAt: doneAt.Add(time.Hour),
 			}
 			b.w.Leases = []*fleet.Lease{lease}
+			b.w.Attested = map[string][]uint64{"a": tt.slots}
 
-			newest := uint64(100)
-
-			for epoch, live := range tt.rows {
-				b.live(epoch, "a", live)
-				newest = max(newest, epoch)
-			}
-
-			// Another host always has a row, also in epochs "a" misses.
-			for epoch := uint64(99); epoch <= newest; epoch++ {
-				b.live(epoch, "other", 10)
-			}
-
-			b.advance(time.Duration(newest-99) * testEpoch)
+			b.advance(10 * testSlot)
 
 			p := newPass(b.w)
 			ready, note := p.ready(p.leases[0], p.hosts["a"])
 
-			assert.Equal(t, tt.want, ready)
+			assert.Equal(t, tt.ready, ready)
 
 			if tt.note != "" {
 				assert.Equal(t, tt.note, note)
 			}
 
 			out := b.step()
-			assert.Equal(t, tt.want, b.lease("a") == nil, "the lease is released exactly when ready")
-			assert.Equal(t, tt.want, len(out.Leases) == 1 && out.Leases[0].State == fleet.LeaseReleased)
+			assert.Equal(t, tt.ready, b.lease("a") == nil, "the lease is released exactly when ready")
+			assert.Equal(t, tt.ready, len(out.Leases) == 1 && out.Leases[0].State == fleet.LeaseReleased)
+		})
+	}
+}
+
+// The slot after the one the operation ended in is placed by the chain's slot
+// phases.
+func TestFirstSlotAfter(t *testing.T) {
+	for _, tt := range []struct {
+		name   string
+		phases []fleet.SlotPhase
+		at     time.Time
+		want   uint64
+		placed bool
+	}{
+		{
+			name:   "12 s slots",
+			phases: fleet.SinglePhase(testGenesis, 12*time.Second),
+			at:     testGenesis.Add(100*testEpoch + 13*time.Second), want: 3202, placed: true,
+		},
+		{
+			name: "the slot duration halves at epoch 99",
+			phases: []fleet.SlotPhase{
+				{Epoch: 0, Start: testGenesis, SlotMs: 12000},
+				{Epoch: 99, Start: testGenesis.Add(99 * testEpoch), SlotMs: 6000},
+			},
+			at: testGenesis.Add(99*testEpoch + 13*time.Second), want: 99*32 + 3, placed: true,
+		},
+		{
+			name:   "4.5 s slots",
+			phases: fleet.SinglePhase(testGenesis, 4500*time.Millisecond),
+			at:     testGenesis.Add(9 * time.Second), want: 3, placed: true,
+		},
+		{
+			name:   "before genesis: the first slot",
+			phases: fleet.SinglePhase(testGenesis, 12*time.Second),
+			at:     testGenesis.Add(-time.Minute), want: 0, placed: true,
+		},
+		{name: "no timing", at: testGenesis.Add(time.Hour)},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p := newPass(&World{Health: fleet.NetworkHealth{SlotsPerEpoch: testSlotsPerEpoch, Phases: tt.phases}})
+
+			slot, placed := p.firstSlotAfter(tt.at)
+			assert.Equal(t, tt.placed, placed)
+			assert.Equal(t, tt.want, slot)
 		})
 	}
 }
@@ -818,9 +864,9 @@ func TestProbeReadiness(t *testing.T) {
 		b.step()
 		require.NotNil(t, b.lease("a").SyncedSince)
 		assert.Equal(t, since, *b.lease("a").SyncedSince)
-		assert.Equal(t, "node at head with peers, waiting for it to stay so for 6m24s", b.lease("a").Readiness)
+		assert.Equal(t, "node at head with peers, waiting for it to stay so for 1m0s", b.lease("a").Readiness)
 		require.NotNil(t, b.lease("a").ReadyAt)
-		assert.Equal(t, since.Add(6*time.Minute+24*time.Second), *b.lease("a").ReadyAt)
+		assert.Equal(t, since.Add(time.Minute), *b.lease("a").ReadyAt)
 
 		// A sync that is not synced starts the run over.
 		b.advance(testEpoch / 2)
@@ -832,9 +878,9 @@ func TestProbeReadiness(t *testing.T) {
 		b.advance(5 * time.Second)
 		b.get("a").Status.Node = synced
 		b.step()
-		b.advance(testEpoch - time.Second)
+		b.advance(time.Minute - time.Second)
 		b.step()
-		require.NotNil(t, b.lease("a"), "one second short of readyEpochs epoch durations")
+		require.NotNil(t, b.lease("a"), "one second short of readyStableFor")
 
 		require.NotNil(t, b.lease("a").ReadyAt)
 
@@ -852,7 +898,7 @@ func TestProbeReadiness(t *testing.T) {
 		b.step()
 		b.advance(5 * time.Second)
 		b.step()
-		b.advance(testEpoch - time.Second)
+		b.advance(time.Minute - time.Second)
 		b.step()
 		require.NotNil(t, b.lease("a"))
 
@@ -861,23 +907,32 @@ func TestProbeReadiness(t *testing.T) {
 		assert.Nil(t, b.lease("a"))
 	})
 
-	t.Run("validator host waits for liveness while it is unknown", func(t *testing.T) {
-		b := start(t, 10)
-		b.healthMod = func(n *fleet.NetworkHealth) { n.LivenessKnown = false }
-		b.refreshHealth()
+	t.Run("readyStableFor 0: the first healthy sync", func(t *testing.T) {
+		b := start(t, 0)
+		b.w.Settings.ReadyStableFor = 0
 		b.get("a").Status.Node = synced
 
 		b.step()
 		b.advance(5 * time.Second)
 		b.step()
-		assert.Equal(t, "waiting for attestation data from the beacon node", b.lease("a").Readiness)
+		assert.Nil(t, b.lease("a"))
+		assert.Nil(t, b.lastLease("a").ReadyAt)
+	})
 
+	t.Run("validator host waits for its attestations", func(t *testing.T) {
+		b := start(t, 10)
+		b.liveOverride["a"] = 0
+		b.get("a").Status.Node = synced
+		doneAt := b.w.Now
+
+		b.step()
+		b.advance(5 * time.Second)
+		b.step()
 		b.advance(testEpoch)
-
-		out := b.step()
+		b.step()
 		require.NotNil(t, b.lease("a"), "the probes alone do not release a host with validators")
-		assert.Equal(t, "waiting for attestation data from the beacon node", b.lease("a").Readiness)
-		assert.False(t, out.Plan.Gate.OK)
+		assert.Equal(t, "waiting for the first attestation since "+clock(doneAt), b.lease("a").Readiness)
+		assert.Nil(t, b.lease("a").ReadyAt, "no time to count down to")
 	})
 
 	t.Run("a rolled kind waits for its own probe", func(t *testing.T) {
@@ -949,7 +1004,7 @@ func TestReadinessTimeout(t *testing.T) {
 	out := b.step()
 	require.Nil(t, b.lease("a"))
 	assert.Equal(t, fleet.LeaseFailed, out.Leases[0].State)
-	assert.Equal(t, "not ready after 30m0s: validators attesting: 0 of 1 epochs with at least 2 of 10",
+	assert.Equal(t, "not ready after 30m0s: waiting for the first attestation since "+clock(*out.Leases[0].AgentDoneAt),
 		out.Leases[0].Error)
 
 	r := b.mustRollout(packagesKey("2.0"))
@@ -1280,7 +1335,7 @@ func TestStepDoneInAFailedLeaseIsNoSuccess(t *testing.T) {
 	// a is not proven back: it keeps the one place of the host limit until a
 	// liveness epoch that began after its failure has settled.
 	assert.Empty(t, b.leasedHosts())
-	assert.Equal(t, "host limit 1 of 1", queueReasons(out.Plan)["b"])
+	assert.Equal(t, "hosts at once: 1 of 1 busy", queueReasons(out.Plan)["b"])
 
 	b.advance(2 * testEpoch)
 	out = b.step()
@@ -1308,7 +1363,7 @@ func TestHealthyRunMustSpanTheWindow(t *testing.T) {
 	b.advance(testEpoch+time.Minute, "a")
 	b.step()
 	require.NotNil(t, b.lease("a"), "an old sync says nothing about now")
-	assert.Equal(t, "node at head with peers, waiting for it to stay so for 6m24s", b.lease("a").Readiness)
+	assert.Equal(t, "node at head with peers, waiting for it to stay so for 1m0s", b.lease("a").Readiness)
 
 	// It syncs again, still healthy: the run now spans the window.
 	b.advance(5 * time.Second)
@@ -1318,168 +1373,20 @@ func TestHealthyRunMustSpanTheWindow(t *testing.T) {
 	assert.Equal(t, "ready: node at head with peers", releasedReadiness(t, out))
 }
 
-// The attestation bar is the smallest count that is at least
-// minParticipationPercent of the host's validators.
-func TestAttestationBarRoundsUp(t *testing.T) {
-	for _, tt := range []struct {
-		percent float64
-		weight  uint64
-		want    uint64
-	}{
-		{90, 1, 1}, {90, 2, 2}, {90, 3, 3}, {90, 9, 9}, {90, 10, 9}, {90, 11, 10},
-		{90, 128, 116}, {90, 100, 90}, {66, 3, 2}, {50, 3, 2}, {50, 4, 2},
-		{100, 5, 5}, {0, 5, 1}, {33.3, 3, 1}, {80, 5, 4},
-	} {
-		assert.Equal(t, tt.want, attestationBar(tt.percent, tt.weight), "%v%% of %d", tt.percent, tt.weight)
-	}
-
-	// One of two validators attesting is 50%, not 90%.
-	b := verifying(t, 5, 2)
-	b.liveOverride["a"] = 1
+// Without a chain timing no slot can be placed: a host with validators is not
+// ready.
+func TestReadinessWithoutChainTiming(t *testing.T) {
+	b := verifying(t, 5, 10)
 	b.get("a").Status.Node = nodeWith(8, 8)
+	b.healthMod = func(n *fleet.NetworkHealth) { n.Phases = nil }
 	b.advance(5 * time.Second)
 	b.step()
 	b.advance(3 * testEpoch)
-	b.step()
 
+	out := b.step()
 	require.NotNil(t, b.lease("a"))
-	assert.Equal(t, "validators attesting: 0 of 1 epochs with at least 2 of 2", b.lease("a").Readiness)
-
-	delete(b.liveOverride, "a")
-	b.advance(testEpoch)
-	b.step()
-	assert.Nil(t, b.lease("a"))
-}
-
-// forked gives the builder's chain a fork at an epoch that changes the slot
-// duration, and keeps the beacon view's epochs in line with the clock.
-func forked(b *worldBuilder, at uint64, slot time.Duration) {
-	base := testSecondsPerSlot * time.Second
-	phases := []fleet.SlotPhase{
-		{Epoch: 0, Start: testGenesis, SlotMs: uint64(base / time.Millisecond)},
-		{Epoch: at, Start: testGenesis.Add(time.Duration(at) * testEpoch), SlotMs: uint64(slot / time.Millisecond)},
-	}
-
-	b.healthMod = func(n *fleet.NetworkHealth) {
-		n.Phases = phases
-		n.SecondsPerSlot = uint64(slot / time.Second)
-
-		current, _ := n.EpochAt(b.w.Now)
-		n.CurrentEpoch = current
-		n.FinalizedEpoch = current - 2
-		n.LivenessEpoch = current - 1
-	}
-	b.refreshHealth()
-}
-
-// Epochs are placed in time by the chain's slot phases, not by genesis plus
-// the current slot duration: across a fork that changes the slot duration a
-// lease is released on the epochs that began after the operation.
-func TestReadinessAcrossASlotDurationFork(t *testing.T) {
-	t.Run("the slot duration halves", func(t *testing.T) {
-		// The fork is at epoch 99; the clock is 394 s past it, in epoch 101
-		// of 192 s epochs.
-		b := newWorldBuilder(t)
-		forked(b, 99, 6*time.Second)
-		require.Equal(t, uint64(101), b.w.Health.CurrentEpoch)
-		require.Equal(t, 192*time.Second, b.w.Health.EpochDuration())
-
-		b.host("a", 10).Status.Node = nodeWith(8, 8)
-		b.host("idle", 90)
-		b.wants("a", packagesNeed("2.0"))
-		b.step()
-		b.finish("a")
-		b.step()
-		b.advance(5 * time.Second)
-		b.step()
-		assert.Equal(t, "validators attesting: 0 of 1 epochs with at least 9 of 10", b.lease("a").Readiness,
-			"the epoch of the operation proves nothing")
-
-		// Epoch 101 ends: it began before the operation was done.
-		b.advance(192 * time.Second)
-		b.step()
-		require.NotNil(t, b.lease("a"))
-		assert.Equal(t, "validators attesting: 0 of 1 epochs with at least 9 of 10", b.lease("a").Readiness)
-
-		// Epoch 102 began after it and is complete: ready.
-		b.advance(192 * time.Second)
-
-		out := b.step()
-		require.Nil(t, b.lease("a"))
-		assert.Equal(t, "ready: node at head with peers, validators attesting", releasedReadiness(t, out))
-	})
-
-	t.Run("the slot duration doubles", func(t *testing.T) {
-		// The fork is at epoch 99; the clock is 394 s past it, still in epoch
-		// 99 of 768 s epochs.
-		b := newWorldBuilder(t)
-		forked(b, 99, 24*time.Second)
-		require.Equal(t, uint64(99), b.w.Health.CurrentEpoch)
-
-		b.host("a", 10).Status.Node = nodeWith(8, 8)
-		b.host("idle", 90)
-		b.wants("a", packagesNeed("2.0"))
-		b.step()
-		b.finish("a")
-		b.step()
-		b.advance(5 * time.Second)
-		b.step()
-
-		// Epoch 99 ends, full of attestations, but it began before the
-		// operation was done.
-		b.advance(768 * time.Second)
-		b.step()
-		require.NotNil(t, b.lease("a"), "an epoch from before the operation proves nothing")
-		assert.Equal(t, "validators attesting: 0 of 1 epochs with at least 9 of 10", b.lease("a").Readiness)
-
-		b.advance(768 * time.Second)
-		b.step()
-		assert.Nil(t, b.lease("a"))
-	})
-
-	t.Run("a slot that is not a whole number of seconds", func(t *testing.T) {
-		// 4.5 s slots from genesis on: 144 s epochs.
-		b := newWorldBuilder(t)
-		b.healthMod = func(n *fleet.NetworkHealth) {
-			n.Phases = fleet.SinglePhase(testGenesis, 4500*time.Millisecond)
-			n.SecondsPerSlot = 4
-
-			current, _ := n.EpochAt(b.w.Now)
-			n.CurrentEpoch = current
-			n.FinalizedEpoch = current - 2
-			n.LivenessEpoch = current - 1
-		}
-		b.refreshHealth()
-		require.Equal(t, 144*time.Second, b.w.Health.EpochDuration())
-
-		b.host("a", 10).Status.Node = nodeWith(8, 8)
-		b.host("idle", 90)
-		b.wants("a", packagesNeed("2.0"))
-		b.step()
-		b.finish("a")
-		b.step()
-		b.advance(5 * time.Second)
-		b.step()
-		assert.Equal(t, "validators attesting: 0 of 1 epochs with at least 9 of 10", b.lease("a").Readiness)
-
-		b.advance(2 * 144 * time.Second)
-		b.step()
-		assert.Nil(t, b.lease("a"))
-	})
-
-	t.Run("an epoch that cannot be placed fails safe", func(t *testing.T) {
-		b := verifying(t, 5, 10)
-		b.get("a").Status.Node = nodeWith(8, 8)
-		b.healthMod = func(n *fleet.NetworkHealth) { n.Phases = nil }
-		b.advance(5 * time.Second)
-		b.step()
-		b.advance(3 * testEpoch)
-
-		out := b.step()
-		require.NotNil(t, b.lease("a"))
-		assert.Equal(t, "epoch timing unknown", b.lease("a").Readiness)
-		assert.False(t, out.Plan.Gate.OK)
-	})
+	assert.Equal(t, "chain timing unknown", b.lease("a").Readiness)
+	assert.False(t, out.Plan.Gate.OK)
 }
 
 // A run of healthy syncs with a gap of more than hostStaleAfter is two runs.
@@ -1502,7 +1409,7 @@ func TestSilenceEndsTheHealthyRun(t *testing.T) {
 	b.step()
 	require.NotNil(t, b.lease("a"))
 	assert.Equal(t, b.w.Now, *b.lease("a").SyncedSince)
-	assert.Equal(t, "node at head with peers, waiting for it to stay so for 6m24s", b.lease("a").Readiness)
+	assert.Equal(t, "node at head with peers, waiting for it to stay so for 1m0s", b.lease("a").Readiness)
 
 	b.advance(testEpoch)
 	b.step()
@@ -1589,96 +1496,9 @@ func TestReleasedMemberThatIsNotDoneCarriesNoLeaseID(t *testing.T) {
 	})
 }
 
-// beforeGenesis moves the builder's clock to d before genesis, with a beacon
-// view as a node gives it then: epoch 0, nothing finalized, no liveness.
-func beforeGenesis(b *worldBuilder, d time.Duration) {
-	b.autoLive = false
-	b.healthMod = func(n *fleet.NetworkHealth) {
-		current, _ := n.EpochAt(b.w.Now)
-		n.CurrentEpoch = current
-		n.FinalizedEpoch = current - min(current, 2)
-		n.FinalityLagEpochs = min(current, 2)
-		n.LivenessKnown = false
-		n.LivenessEpoch = 0
-	}
-	b.w.Now = testGenesis.Add(-d)
-	b.refreshHealth()
-}
-
-// A run of healthy syncs that began before genesis is placed from genesis on.
-func TestHealthyRunThatBeganBeforeGenesis(t *testing.T) {
-	b := newWorldBuilder(t)
-	beforeGenesis(b, 10*time.Minute)
-
-	b.host("a", 0).Status.Node = nodeWith(8, 8)
-	b.host("b", 0).Status.Node = nodeWith(8, 8)
-	b.wants("a", packagesNeed("2.0"))
-
-	out := b.step()
-	require.True(t, out.Plan.Gate.OK, "gate: %v", out.Plan.Gate.Reasons)
-	require.Equal(t, []string{"a"}, b.leasedHosts())
-
-	// The operation is done three minutes before genesis.
-	b.advance(7 * time.Minute)
-	b.finish("a")
-	b.step()
-	require.Equal(t, fleet.LeaseVerifying, b.lease("a").State)
-
-	// A healthy sync every minute. The window is the chain's first epoch: at
-	// six minutes past genesis the run is nine minutes old and still short of
-	// it.
-	for b.w.Now.Before(testGenesis.Add(6 * time.Minute)) {
-		b.advance(time.Minute)
-		b.step()
-
-		l := b.lease("a")
-		require.NotNil(t, l, "released at %s past genesis", b.w.Now.Sub(testGenesis))
-		require.Equal(t, fleet.LeaseVerifying, l.State)
-		assert.Equal(t, "node at head with peers, waiting for it to stay so for 6m24s", l.Readiness,
-			"at %s past genesis", b.w.Now.Sub(testGenesis))
-	}
-
-	since := *b.lease("a").SyncedSince
-	assert.Equal(t, testGenesis.Add(-2*time.Minute), since, "the run itself began before genesis")
-
-	// Seven minutes past genesis the first epoch is over.
-	b.advance(time.Minute)
-
-	out = b.step()
-	require.Nil(t, b.lease("a"))
-	assert.Contains(t, auditActions(out), "lease.released")
-	assert.Equal(t, "ready: node at head with peers", releasedReadiness(t, out))
-	assert.Equal(t, fleet.RolloutCompleted, b.closed(packagesKey("2.0")).State)
-
-	// A run that begins after genesis is measured as before.
-	t.Run("a run from after genesis", func(t *testing.T) {
-		b := newWorldBuilder(t)
-		beforeGenesis(b, time.Minute)
-
-		b.host("a", 0).Status.Node = nodeWith(8, 8)
-		b.host("b", 0).Status.Node = nodeWith(8, 8)
-		b.wants("a", packagesNeed("2.0"))
-		b.step()
-		b.advance(3 * time.Minute)
-		b.finish("a")
-		b.step()
-		b.advance(time.Minute)
-		b.step()
-		require.Equal(t, testGenesis.Add(3*time.Minute), *b.lease("a").SyncedSince)
-
-		b.advance(testEpoch - time.Second)
-		b.step()
-		require.NotNil(t, b.lease("a"))
-
-		b.advance(time.Second)
-		b.step()
-		assert.Nil(t, b.lease("a"))
-	})
-}
-
 // comparing builds a fleet in which "a" has just reported its operation
 // done: a and one reference host per node of refs ("ref1", ...), all without
-// validators. readyEpochs is 0, so a is ready at its first healthy sync and
+// validators. readyStableFor is 0, so a is ready at its first healthy sync and
 // the comparison with the fleet is all that can keep its lease; prepare runs
 // before the first reconcile and may change that.
 func comparing(t *testing.T, share float64, prepare func(b *worldBuilder), refs ...protocol.NodeHealth) *worldBuilder {
@@ -1686,7 +1506,7 @@ func comparing(t *testing.T, share float64, prepare func(b *worldBuilder), refs 
 
 	b := newWorldBuilder(t)
 	b.w.Settings.ReadyPeerShare = share
-	b.w.Settings.ReadyEpochs = 0
+	b.w.Settings.ReadyStableFor = 0
 	b.w.Settings.MinPeers = 1
 	b.w.Settings.MaxUnavailablePercent = 100
 	b.w.Settings.MaxLeasedPercent = 100
@@ -2003,7 +1823,7 @@ func TestReadinessNeedsPeers(t *testing.T) {
 	b.advance(5 * time.Second)
 	b.step()
 	require.NotNil(t, b.lease("a").SyncedSince)
-	assert.Equal(t, "node at head with peers, waiting for it to stay so for 6m24s", b.lease("a").Readiness)
+	assert.Equal(t, "node at head with peers, waiting for it to stay so for 1m0s", b.lease("a").Readiness)
 
 	// Losing a peer starts the time over.
 	b.get("a").Status.Node = nodeWith(3, 2)
@@ -2058,7 +1878,7 @@ func TestReadinessMinPeersOnSmallFleets(t *testing.T) {
 			b.host("unseen", 0).Status = nil
 
 			b.w.Settings.MinPeers = tt.minPeers
-			b.w.Settings.ReadyEpochs = 0
+			b.w.Settings.ReadyStableFor = 0
 			b.get("a").Status.Node = nodeWith(tt.peers, tt.peers)
 			b.advance(5 * time.Second)
 			b.step()
@@ -2076,8 +1896,8 @@ func TestReadinessMinPeersOnSmallFleets(t *testing.T) {
 }
 
 // TestReadinessOfAValidatorHostNeedsBoth: the node at head with peers in its
-// newest sync and the validators attesting for readyEpochs; attesting
-// validators make a run of healthy syncs unnecessary.
+// newest sync and the validators attesting in readyAttestations slots;
+// attesting validators make a run of healthy syncs unnecessary.
 func TestReadinessOfAValidatorHostNeedsBoth(t *testing.T) {
 	healthy := nodeWith(8, 8)
 	syncing := nodeWith(8, 8)
@@ -2101,11 +1921,13 @@ func TestReadinessOfAValidatorHostNeedsBoth(t *testing.T) {
 
 		out := b.step()
 		require.Nil(t, b.lease("a"))
-		assert.Equal(t, "ready: node at head with peers, validators attesting", releasedReadiness(t, out))
+		assert.Equal(t, "ready: node at head with peers, validators attesting: 2 of 2 slots since "+
+			clock(*out.Leases[0].AgentDoneAt), releasedReadiness(t, out))
 	})
 
 	t.Run("the node is at head with peers but the validators do not attest", func(t *testing.T) {
 		b := verifying(t, 5, 10)
+		doneAt := *b.lease("a").AgentDoneAt
 		b.liveOverride["a"] = 0
 		b.get("a").Status.Node = healthy
 		b.advance(5 * time.Second)
@@ -2114,15 +1936,21 @@ func TestReadinessOfAValidatorHostNeedsBoth(t *testing.T) {
 		b.step()
 
 		require.NotNil(t, b.lease("a"), "healthy probes alone do not release")
-		assert.Equal(t, "validators attesting: 0 of 1 epochs with at least 9 of 10", b.lease("a").Readiness)
+		assert.Equal(t, "waiting for the first attestation since "+clock(doneAt), b.lease("a").Readiness)
 
-		// They attest in the next epoch.
+		// They attest again.
 		delete(b.liveOverride, "a")
-		b.advance(testEpoch)
+		b.advance(testSlot)
+		b.step()
+		require.NotNil(t, b.lease("a"))
+		assert.Equal(t, "validators attesting: 1 of 2 slots since "+clock(doneAt), b.lease("a").Readiness)
+
+		b.advance(testSlot)
 
 		out := b.step()
 		require.Nil(t, b.lease("a"))
-		assert.Equal(t, "ready: node at head with peers, validators attesting", releasedReadiness(t, out))
+		assert.Equal(t, "ready: node at head with peers, validators attesting: 2 of 2 slots since "+clock(doneAt),
+			releasedReadiness(t, out))
 	})
 
 	t.Run("too few peers although the validators attest", func(t *testing.T) {
@@ -2157,43 +1985,38 @@ func releasedReadiness(t *testing.T, out *Outcome) string {
 	return ""
 }
 
-// A host with validators is not released on its probes alone while the beacon
-// service has not settled an epoch yet. It publishes the epoch timing before
-// the first epoch settles, so every controller restart passes through this
-// state, with the run of healthy syncs already stored on the lease.
-func TestValidatorHostIsNotReadyWhileLivenessIsUnknown(t *testing.T) {
+// The attested slots are the beacon service's memory: after a controller
+// restart a host with validators waits for new ones, with the run of healthy
+// syncs kept.
+func TestValidatorHostAfterAControllerRestart(t *testing.T) {
 	b := verifying(t, 5, 10)
+	doneAt := *b.lease("a").AgentDoneAt
 	b.get("a").Status.Node = nodeWith(8, 8)
+	b.liveOverride["a"] = 0
 	b.advance(5 * time.Second)
 	b.step()
 	b.advance(2 * testEpoch)
 
-	// The controller restarts: timing is known, liveness is not yet.
+	// The controller restarts: timing is known, nothing else yet.
 	b.healthMod = func(n *fleet.NetworkHealth) { n.LivenessKnown = false }
 	b.refreshHealth()
-	b.liveOverride["a"] = 0
+	b.w.Attested = nil
 
 	out := b.step()
 	require.NotNil(t, b.lease("a"), "not released without the attestation check")
 	assert.Equal(t, fleet.LeaseVerifying, b.lease("a").State)
-	assert.Equal(t, "waiting for attestation data from the beacon node", b.lease("a").Readiness)
+	assert.Equal(t, "waiting for the first attestation since "+clock(doneAt), b.lease("a").Readiness)
 	assert.NotNil(t, b.lease("a").SyncedSince, "the run of healthy syncs is kept")
 	assert.NotContains(t, auditActions(out), "lease.released")
 
-	// Liveness arrives and says the validators do not attest.
-	b.healthMod = nil
-	b.advance(5 * time.Second)
-	b.step()
-	require.NotNil(t, b.lease("a"))
-	assert.Equal(t, "validators attesting: 0 of 1 epochs with at least 9 of 10", b.lease("a").Readiness)
-
-	// They attest for a complete epoch: released.
+	// Its validators attest: released, whether or not an epoch has settled.
 	delete(b.liveOverride, "a")
-	b.advance(testEpoch)
+	b.advance(3 * testSlot)
 
 	out = b.step()
 	require.Nil(t, b.lease("a"))
-	assert.Equal(t, "ready: node at head with peers, validators attesting", releasedReadiness(t, out))
+	assert.Equal(t, "ready: node at head with peers, validators attesting: 2 of 2 slots since "+clock(doneAt),
+		releasedReadiness(t, out))
 
 	// A host without validators does not wait for the beacon node.
 	t.Run("host without validators", func(t *testing.T) {
@@ -2213,7 +2036,7 @@ func TestValidatorHostIsNotReadyWhileLivenessIsUnknown(t *testing.T) {
 
 // Readiness notes of a host that probes its node.
 const (
-	noteNodeWaiting = "node at head with peers, waiting for it to stay so for 6m24s"
+	noteNodeWaiting = "node at head with peers, waiting for it to stay so for 1m0s"
 	noteReadyNode   = "ready: node at head with peers"
 )
 
@@ -2240,7 +2063,7 @@ func TestFailedHostStaysChargedUntilProvenBack(t *testing.T) {
 
 	out := b.step()
 	assert.Empty(t, b.leasedHosts())
-	assert.Equal(t, "budget 10% of 10%", queueReasons(out.Plan)["b"])
+	assert.Equal(t, "validators down: 10% now, 20% with this host, limit 10%", queueReasons(out.Plan)["b"])
 	assert.Equal(t, uint64(10), out.Plan.Budget.UnavailableWeight)
 	assert.Equal(t, 1, out.Plan.Budget.LeasedHosts)
 	assert.Equal(t, SlotFailed, out.Plan.Hosts["a"].Slot)
@@ -2253,7 +2076,7 @@ func TestFailedHostStaysChargedUntilProvenBack(t *testing.T) {
 
 	out = b.step()
 	assert.Equal(t, []string{"a"}, b.leasedHosts())
-	assert.Equal(t, "budget 10% of 10%", queueReasons(out.Plan)["b"])
+	assert.Equal(t, "validators down: 10% now, 20% with this host, limit 10%", queueReasons(out.Plan)["b"])
 
 	b.report("a", protocol.PhaseFailed, true)
 	b.step()
@@ -2266,7 +2089,7 @@ func TestFailedHostStaysChargedUntilProvenBack(t *testing.T) {
 	out = b.step()
 	assert.Nil(t, b.get("a").Unproven)
 	assert.Zero(t, out.Plan.Budget.LeasedHosts)
-	assert.Equal(t, "budget 10% of 10%", queueReasons(out.Plan)["b"])
+	assert.Equal(t, "validators down: 10% now, 20% with this host, limit 10%", queueReasons(out.Plan)["b"])
 
 	// They attest again.
 	b.liveOverride["a"] = 10

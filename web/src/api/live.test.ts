@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it, vi } from 'vitest';
 
 import { MOCK_LOGINS, MockController } from '../mock/mockController';
 import { ApiClient, type FetchFn, type TokenSource } from './client';
-import { LiveStore } from './live';
+import { LiveStore, OutdatedError } from './live';
 import { list } from './types';
 import { WIRE_VERSION } from './wire';
 
@@ -75,7 +75,7 @@ describe('LiveStore', () => {
     });
     const before = store.view('hosts');
     const name = list(before?.hosts)[0]?.name ?? '';
-    expect(list(before?.hosts).find(h => h.name === name)?.holdWanted).toBe(false);
+    expect(list(before?.hosts).find(h => h.name === name)?.holders).toEqual([]);
 
     const res = await controller.fetch('/api/v1/actions/hold', {
       method: 'POST',
@@ -85,7 +85,7 @@ describe('LiveStore', () => {
     expect(res.status).toBe(200);
 
     await vi.waitFor(() => {
-      expect(list(store.view('hosts')?.hosts).find(h => h.name === name)?.holdWanted).toBe(true);
+      expect(list(store.view('hosts')?.hosts).find(h => h.name === name)?.holders).toEqual(['staff']);
     });
     expect(store.view('hosts')?.hosts).toHaveLength(24);
     expect(paths).toEqual(['/api/v1/events']);
@@ -108,7 +108,7 @@ describe('LiveStore', () => {
     expect(store.view('public-network')?.ok).toBe(false);
   });
 
-  it('backs off while the controller encodes with another wire version', async () => {
+  it('stops for good when the controller encodes with another wire version', async () => {
     let opened = 0;
     const api = {
       events: (opts: Parameters<ApiClient['events']>[0]) => {
@@ -117,17 +117,18 @@ describe('LiveStore', () => {
         return Promise.resolve();
       },
     } as unknown as ApiClient;
-    const store = started(new LiveStore(api, { backoffMinMs: 20, backoffMaxMs: 10_000 }));
+    const store = started(new LiveStore(api, { backoffMinMs: 2, backoffMaxMs: 10 }));
 
-    await new Promise(resolve => setTimeout(resolve, 200));
-
-    // 10..20 ms, then 20..40, 40..80, 80..160: without the backoff about one stream every 15 ms.
-    expect(opened).toBeGreaterThan(1);
-    expect(opened).toBeLessThanOrEqual(5);
-    expect(store.getStatus()).toMatchObject({
-      state: 'reconnecting',
-      error: { message: expect.stringContaining('reload the page') as string },
+    await vi.waitFor(() => {
+      expect(store.getStatus().state).toBe('outdated');
     });
+    expect(store.getStatus().error).toBeInstanceOf(OutdatedError);
+
+    // Neither a login nor time reopens it.
+    store.setPrivate(true);
+    await new Promise(resolve => setTimeout(resolve, 50));
+    expect(opened).toBe(1);
+    expect(store.getStatus().state).toBe('outdated');
   });
 
   it('keeps what it has and says why while the controller is away', async () => {
@@ -148,11 +149,14 @@ describe('LiveStore', () => {
       });
     });
     expect(store.view('public-hosts')?.hosts).toHaveLength(24);
+    expect(store.getStatus().lostAt).toBeTypeOf('number');
+    expect(store.getStatus().waitingSince).toBeTypeOf('number');
 
     fetchFn.mockRestore();
     await vi.waitFor(() => {
       expect(store.getStatus().state).toBe('live');
     });
+    expect(store.getStatus().lostAt).toBeUndefined();
   });
 
   it('asks the stream for the details of the hosts that are watched', async () => {

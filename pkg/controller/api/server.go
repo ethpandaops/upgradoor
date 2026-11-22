@@ -64,6 +64,8 @@ type Store interface {
 	GetRollout(ctx context.Context, id string) (*fleet.Rollout, error)
 	// GetLease returns one lease or store.ErrNotFound.
 	GetLease(ctx context.Context, id string) (*fleet.Lease, error)
+	// ListDirectives returns directives, oldest first.
+	ListDirectives(ctx context.Context, filter store.DirectiveFilter) ([]*fleet.Directive, error)
 
 	AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error
 	ListAudit(ctx context.Context, filter store.AuditFilter) ([]fleet.AuditEntry, error)
@@ -234,7 +236,8 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 
 	s.streams = stream.New(s.log, stream.Options{
 		Store: opts.Store, Scheduler: opts.Scheduler, Beacon: opts.Beacon, Views: s.views,
-		DefaultSettings: opts.DefaultSettings, Now: opts.Now,
+		Access: func(u *authz.User) views.Access { return s.users.Access(u) },
+		Now:    opts.Now,
 	})
 	s.agents = agentapi.New(s.log, agentapi.Options{
 		Verifier: opts.Verifier, PublicURLs: publicURLs,

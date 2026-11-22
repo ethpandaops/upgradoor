@@ -28,7 +28,7 @@ func TestReconcileIsIdempotentAndPure(t *testing.T) {
 		b.wants(h, packagesNeed("2.0"))
 	}
 
-	b.get("t2").HoldWanted = true
+	b.get("t2").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
 	b.fillLiveness()
 
 	first := Reconcile(b.w)

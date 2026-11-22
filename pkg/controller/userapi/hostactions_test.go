@@ -16,9 +16,9 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// actionFixture: the mixed and the teku host report the action, which the
-// feature upgradoor:actions and the team devops may start; the unowned host
-// does not have it.
+// actionFixture: the mixed and the teku host report security-upgrades,
+// which the feature details and the team devops may start, and
+// restart-exporter, which names no feature; the unowned host has neither.
 func actionFixture(h *harness) {
 	controllertest.OwnershipFixture(h.store)
 
@@ -26,10 +26,13 @@ func actionFixture(h *harness) {
 	defer h.store.Unlock()
 
 	for _, name := range []string{controllertest.HostMixed, controllertest.HostTeku} {
-		h.store.Hosts[name].Status.Actions = []protocol.ActionInfo{{
-			Name: "security-upgrades", Impact: protocol.ImpactIndependent,
-			Feature: "upgradoor:actions", Teams: []string{"devops"},
-		}}
+		h.store.Hosts[name].Status.Actions = []protocol.ActionInfo{
+			{Name: "restart-exporter", Impact: protocol.ImpactNode},
+			{
+				Name: "security-upgrades", Impact: protocol.ImpactIndependent,
+				Feature: "details", Teams: []string{"devops"},
+			},
+		}
 	}
 
 	h.store.Rollouts = append(h.store.Rollouts, &fleet.Rollout{
@@ -48,8 +51,8 @@ func postAction(h *harness, u *authz.User, name, body string) *httptest.Response
 	return rec
 }
 
-// TestHostActionPermissions: admin, the action's feature or one of its teams
-// permit a host; a selection by client or all takes the permitted hosts that
+// TestHostActionPermissions: admin, the action's feature (manage when it
+// names none) or one of its teams permit a host; a selection by client or all takes the permitted hosts that
 // have the action, a named host that is not permitted is rejected.
 func TestHostActionPermissions(t *testing.T) {
 	user := func(services string, teams ...string) *authz.User {
@@ -70,7 +73,7 @@ func TestHostActionPermissions(t *testing.T) {
 			status: http.StatusOK, hosts: []string{controllertest.HostMixed, controllertest.HostTeku}, basis: "admin",
 		},
 		{
-			name: "the action's feature", user: user("+upgradoor:actions"),
+			name: "the action's feature", user: user("+upgradoor:details"),
 			body:   `{"action":"security-upgrades","hosts":["` + controllertest.HostTeku + `"]}`,
 			status: http.StatusOK, hosts: []string{controllertest.HostTeku}, basis: "feature",
 		},
@@ -85,8 +88,26 @@ func TestHostActionPermissions(t *testing.T) {
 			status: http.StatusOK, hosts: []string{controllertest.HostTeku, controllertest.HostUnowned}, basis: "team",
 		},
 		{
-			name: "no permission", user: user("+upgradoor:roll", "geth"),
+			name: "no permission", user: user("+upgradoor:manage", "geth"),
 			body: `{"action":"security-upgrades","all":true}`, status: http.StatusForbidden,
+		},
+		{
+			name: "the twin of the action's feature", user: user("+upgradoor:team_details", "teku"),
+			body:   `{"action":"security-upgrades","hosts":["` + controllertest.HostTeku + `"]}`,
+			status: http.StatusForbidden,
+		},
+		{
+			name: "no feature named: manage", user: user("+upgradoor:manage"),
+			body:   `{"action":"restart-exporter","all":true}`,
+			status: http.StatusOK, hosts: []string{controllertest.HostMixed, controllertest.HostTeku}, basis: "feature",
+		},
+		{
+			name: "no feature named: not team_manage", user: user("+upgradoor:team_*", "teku", "geth"),
+			body: `{"action":"restart-exporter","all":true}`, status: http.StatusForbidden,
+		},
+		{
+			name: "no feature named: not details", user: user("+upgradoor:details"),
+			body: `{"action":"restart-exporter","all":true}`, status: http.StatusForbidden,
 		},
 		{
 			name: "two selections", user: user("+upgradoor:admin"),
@@ -129,7 +150,7 @@ func TestHostActionPermissions(t *testing.T) {
 }
 
 // A login that may run the action on every member host approves its
-// rollout; any other resume needs supervise as before.
+// rollout; any other resume needs manage as before.
 func TestResumeApprovesActionRollouts(t *testing.T) {
 	h := newHarness(t, nil)
 	actionFixture(h)

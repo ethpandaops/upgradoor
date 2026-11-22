@@ -99,7 +99,7 @@ describe('OverviewTab, logged in', () => {
     const lease = (await within(progress).findByText('lighthouse-geth-2')).closest('li');
     expect(lease).toHaveTextContent('Image roll');
     expect(within(lease as HTMLElement).getByRole('list', { name: 'Step 6 of 6: Ready check' })).toBeInTheDocument();
-    expect(lease).toHaveTextContent(/node at head with peers, ready in \d+m \d+s/);
+    expect(lease).toHaveTextContent(/node at head with peers, ready in (\d+m )?\d+s/);
 
     expect(screen.getByRole('region', { name: 'Outage budget' })).toHaveTextContent(
       /[\d.]+% of 10% validators offline/
@@ -112,7 +112,9 @@ describe('OverviewTab, logged in', () => {
       .getAllByRole('listitem')
       .map(li => li.textContent);
     expect(hosts).toHaveLength(3);
-    expect(hosts[0]).toMatch(/^1lighthouse-nethermind-1Image rollwaits: budget [\d.]+% of 10%$/);
+    expect(hosts[0]).toMatch(
+      /^1lighthouse-nethermind-1Image rollwaits: validators down: [\d.]+% now, [\d.]+% with this host, limit 10%$/
+    );
     // A failed pull is tried again without anybody acting.
     expect(hosts).toContainEqual(
       expect.stringMatching(/lighthouse-geth-4Image rollwaits: waiting to pull its image again after a failed pull$/)

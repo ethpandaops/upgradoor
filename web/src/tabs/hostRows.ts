@@ -11,6 +11,8 @@ import {
   type QueueEntry,
 } from '../api/types';
 import type { SortDirection, Tone } from '../components/primitives';
+import { heldBy, QUEUE_PLACE_TITLE, queuePlace } from '../lib/format';
+import { matchesUsageWord } from '../lib/usage';
 
 export interface HostRow {
   name: string;
@@ -65,7 +67,7 @@ export function mergeHostRows(
 }
 
 /** hostState is the one state a host is in, as the State column shows it. */
-export function hostState(row: HostRow): { tone: Tone; label: string; detail?: string } | undefined {
+export function hostState(row: HostRow): { tone: Tone; label: string; title?: string; detail?: string } | undefined {
   const s = row.summary;
   if (!s) return undefined;
 
@@ -76,8 +78,15 @@ export function hostState(row: HostRow): { tone: Tone; label: string; detail?: s
       return { tone: 'accent', label: 'verifying' };
     case 'failed':
       return { tone: 'danger', label: 'failed', detail: s.plan.reason };
-    case 'held':
-      return { tone: 'warning', label: 'held', detail: s.plan.reason === 'held' ? undefined : s.plan.reason };
+    case 'held': {
+      // One hold per holder, the host's own among them: the count says how many there are.
+      const holds = list(s.holders).length;
+      return {
+        tone: 'warning',
+        label: holds > 1 ? `held ×${holds}` : 'held',
+        detail: heldBy(s),
+      };
+    }
     case 'offline':
       return { tone: 'warning', label: 'offline', detail: s.offline?.reason };
     case 'stale':
@@ -85,7 +94,8 @@ export function hostState(row: HostRow): { tone: Tone; label: string; detail?: s
     case 'queued':
       return {
         tone: 'info',
-        label: row.queuePosition === undefined ? 'queued' : `queued #${row.queuePosition}`,
+        label: row.queuePosition === undefined ? 'queued' : queuePlace(row.queuePosition),
+        ...(row.queuePosition === undefined ? {} : { title: QUEUE_PLACE_TITLE }),
         detail: s.plan.reason,
       };
     case 'idle':
@@ -96,10 +106,19 @@ export function hostState(row: HostRow): { tone: Tone; label: string; detail?: s
 /**
  * matchesFilter reports whether every word of the filter occurs in the row's
  * name, images, roles or state: the state as the table shows it ("updating",
- * "silent", "up to date") and the waiting reason.
+ * "silent", "up to date") and the waiting reason. A word such as "memory>=90"
+ * keeps the hosts at that use or more.
  */
 export function matchesFilter(row: HostRow, filter: string): boolean {
-  const words = filter.toLowerCase().split(/\s+/).filter(Boolean);
+  const all = filter.toLowerCase().split(/\s+/).filter(Boolean);
+  if (all.length === 0) return true;
+
+  const words: string[] = [];
+  for (const w of all) {
+    const usage = matchesUsageWord(w, row.summary?.usage);
+    if (usage === false) return false;
+    if (usage === undefined) words.push(w);
+  }
   if (words.length === 0) return true;
 
   const haystack = [
@@ -132,7 +151,9 @@ export type SortKey =
   | 'security'
   | 'attesting'
   | 'lastSeen'
-  | 'slot';
+  | 'slot'
+  | 'cpu'
+  | 'memory';
 
 /** attestingShare is live / weight, or undefined without validators or data. */
 export function attestingShare(s: HostListing | undefined): number | undefined {
@@ -163,6 +184,9 @@ function sortValue(row: HostRow, key: SortKey): string | number | undefined {
       return s ? Date.parse(s.lastSeen) : undefined;
     case 'slot':
       return s?.plan.slot;
+    case 'cpu':
+    case 'memory':
+      return s?.usage?.[key];
   }
 }
 

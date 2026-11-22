@@ -19,10 +19,10 @@
 //	POST /api/v1/images/refresh        user     {} -> ImagesRefresh
 //	GET  /api/v1/rollouts?limit=       user     -> Rollouts
 //	GET  /api/v1/plan                  user     -> scheduler.Plan
-//	GET  /api/v1/settings              user     -> SettingsBody
+//	GET  /api/v1/settings              admin    -> SettingsBody
 //	PUT  /api/v1/settings              user     fleet.Settings -> SettingsBody
-//	GET  /api/v1/settings/sources      user     -> DataSources
-//	POST /api/v1/settings/sources/validator-ranges/refresh  user  {} -> ValidatorRangesRefresh
+//	GET  /api/v1/settings/sources      admin    -> DataSources
+//	POST /api/v1/settings/sources/validator-ranges/refresh  admin  {} -> ValidatorRangesRefresh
 //	GET  /api/v1/audit?target=&action=&before=&limit=   user -> Audit
 //	GET  /api/v1/slots?window=         user     -> SlotHistory
 //	POST /api/v1/actions/roll          user     scheduler.RollRequest         -> scheduler.ActionResult
@@ -39,15 +39,21 @@
 //	POST /api/v1/actions/abort         user     scheduler.ScopeRequest        -> scheduler.ActionResult
 //	POST /api/v1/actions/forget        user     scheduler.HoldRequest         -> scheduler.ActionResult
 //	POST /api/v1/actions/end-lease     user     scheduler.EndLeaseRequest     -> scheduler.ActionResult
+//	POST /api/v1/actions/ignore-gate   user     scheduler.ScopeRequest        -> scheduler.ActionResult
+//	POST /api/v1/actions/approve-lease user     scheduler.ApproveLeaseRequest -> scheduler.ActionResult
 //
 //	GET  /metrics                      Prometheus
 //	GET  /healthz
 //
 // "user" routes need a bearer token from the authenticatoor when
 // --auth-provider-url is set and are open otherwise. Every such token may
-// read; PUT and POST need a feature of this service in the token, or its
-// team twin for targets a team of the token owns (authz.go, actions.go), and
-// are answered 403 without it. The public routes are
+// read but the "admin" routes; PUT and POST need a feature of this service
+// in the token, or its team twin for targets a team of the token owns
+// (authz.go, actions.go), and are answered 403 without it. What a login
+// reads of the hosts depends on authz.FeatureDetails, of the audit log on
+// authz.FeatureAdmin too (Access). No user view carries the error texts of
+// the beacon service or the validator ranges inventory (PublicGate); the
+// data sources do. The public routes are
 // the only unauthenticated view of host data and must never carry package
 // versions, kernels, OS details, addresses or anything else not listed in
 // their types.
@@ -131,16 +137,13 @@ type HostSummary struct {
 	OS            protocol.OSSummary   `json:"os"`
 	Pending       protocol.Pending     `json:"pending"`
 	UptimeSeconds int64                `json:"uptimeSeconds"`
-	Hold          protocol.Hold        `json:"hold"`
-	HoldWanted    bool                 `json:"holdWanted"`
-	// HoldReason is the reason of the controller hold (HoldWanted), as the
-	// person gave it. It is for the authenticated views only.
-	HoldReason string `json:"holdReason,omitempty"`
-	// HoldBy says who set the controller hold: "team:<teams>" for a hold that
-	// these teams set through a team feature, which a team feature of one of
-	// them may lift again, "staff" for every other hold. Absent when the host
-	// is not held.
-	HoldBy string `json:"holdBy,omitempty"`
+	// Resources is the host's resource use by its last sync; absent before
+	// the first and for a login without the full view.
+	Resources *protocol.Resources `json:"resources,omitempty"`
+	// Hold is the hold state the agent reports: its holds with who set
+	// each, why and when. The reasons are for the authenticated views only.
+	// Plan.HoldRequests are the hold requests the agent has not answered.
+	Hold protocol.Hold `json:"hold"`
 	// Offline is the host's known-offline mark while it is in force: its
 	// validators are left out of the gate and the budget, and it gets no
 	// lease. Absent otherwise.
@@ -176,17 +179,29 @@ type HostListing struct {
 	OS            protocol.OSSummary `json:"os"`
 	Pending       protocol.Pending   `json:"pending"`
 	UptimeSeconds int64              `json:"uptimeSeconds"`
-	Hold          protocol.Hold      `json:"hold"`
-	HoldWanted    bool               `json:"holdWanted"`
-	HoldReason    string             `json:"holdReason,omitempty"`
-	HoldBy        string             `json:"holdBy,omitempty"`
-	Offline       *fleet.OfflineMark `json:"offline,omitempty"`
-	Verbs         []protocol.Verb    `json:"verbs"`
+	// Usage is HostSummary.Resources in brief.
+	Usage *HostUsage    `json:"usage,omitempty"`
+	Hold  protocol.Hold `json:"hold"`
+	// Holders are the holders of the holds (Hold.Holds), the host's own as
+	// protocol.HolderHost.
+	Holders []string           `json:"holders"`
+	Offline *fleet.OfflineMark `json:"offline,omitempty"`
+	Verbs   []protocol.Verb    `json:"verbs"`
 	// Needs are the kinds of the host's open needs, one entry per need.
 	Needs []NeedListing      `json:"needs"`
 	Plan  scheduler.HostPlan `json:"plan"`
 	// Actions are the host's actions (HostSummary.Actions).
 	Actions []protocol.ActionInfo `json:"actions"`
+}
+
+// HostUsage is a host's resource use in whole percents, which is what the
+// host list sorts and filters by: a number that moves less is a row that
+// changes less often on the stream.
+type HostUsage struct {
+	// CPU is the busy share; absent until the agent has two readings.
+	CPU *int `json:"cpu,omitempty"`
+	// Memory is the share not available; absent when unknown.
+	Memory *int `json:"memory,omitempty"`
 }
 
 // ContainerName is the name of a container in a listing. Names repeat from
@@ -235,6 +250,9 @@ type HostDetail struct {
 	Leases []*fleet.Lease `json:"leases"`
 	// History are the audit entries about this host, newest first.
 	History []fleet.AuditEntry `json:"history"`
+	// Reduced says that the login sees the host reduced (Access): what the
+	// host's details leave out is hidden, not absent.
+	Reduced bool `json:"reduced,omitempty"`
 }
 
 // Packages is the body of GET /api/v1/packages.
@@ -249,11 +267,20 @@ type Packages struct {
 	Next string `json:"next,omitempty"`
 }
 
+// RolloutView is a rollout as the views show it.
+type RolloutView struct {
+	fleet.Rollout
+
+	// Policy is the policy the rollout answers to
+	// (fleet.Settings.RolloutPolicy): manual waits for a person's approval.
+	Policy fleet.Policy `json:"policy"`
+}
+
 // Rollouts is the body of GET /api/v1/rollouts.
 type Rollouts struct {
 	// Open are all non-terminal rollouts; Recent the latest terminal ones.
-	Open   []*fleet.Rollout `json:"open"`
-	Recent []*fleet.Rollout `json:"recent"`
+	Open   []*RolloutView `json:"open"`
+	Recent []*RolloutView `json:"recent"`
 	// Leases are the open leases; RecentLeases the latest closed ones.
 	Leases       []*fleet.Lease `json:"leases"`
 	RecentLeases []*fleet.Lease `json:"recentLeases"`

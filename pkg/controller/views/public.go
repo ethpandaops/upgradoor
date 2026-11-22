@@ -15,40 +15,42 @@ import (
 // Nothing is copied wholesale from a host, so a new field on fleet.Host or
 // protocol.Container cannot reach an unauthenticated visitor by accident.
 
-// The fixed texts that stand in the public network view for the error texts
-// of the beacon service: those are err.Error() of beacon calls and can name
-// the endpoint and in-cluster addresses.
+// The fixed texts that stand in the user views for the error texts of the
+// beacon service and of the validator ranges inventory: those are
+// err.Error() of their requests and can name the endpoint, the inventory URL
+// and in-cluster addresses. The data sources carry them (admin).
 const (
-	beaconErrorPublic   = "beacon node unavailable"
-	livenessErrorPublic = "attestation data missing or stale"
-	timingErrorPublic   = "invalid chain timing"
+	beaconErrorPublic     = "beacon node unavailable"
+	livenessErrorPublic   = "attestation data missing or stale"
+	timingErrorPublic     = "invalid chain timing"
+	validatorRangesFailed = "the last fetch failed"
 )
 
-// PublicGate is the network gate as everybody may see it.
+// PublicGate is the network gate as everybody may see it: scrubbed, and
+// without the state of the validator ranges inventory.
 func (v *Views) PublicGate() scheduler.Gate {
 	// Gate() hands out a copy, reasons included.
 	gate := v.Gate()
 	scrubGate(&gate)
+	gate.Network.ValidatorRangesError = ""
 
 	return gate
 }
 
-// scrubGate removes the beacon service's error texts from a gate: from the
-// network view (Error says that there is one in a fixed text, LivenessError
-// and TimingError go) and from every reason that quotes one, which becomes
-// the fixed text of that error. A reason that starts with a fixed text and a
-// colon (the scheduler's "attestation data missing or stale: <error>") is
-// cut back to the fixed text.
+// scrubGate removes the error texts from a gate: from the network view
+// (Error and ValidatorRangesError say that there is one in a fixed text,
+// LivenessError and TimingError go) and from every reason that quotes one
+// (scrubber.reason).
 func scrubGate(gate *scheduler.Gate) {
+	scrub := newScrubber(&gate.Network)
 	n := &gate.Network
-	secrets := []struct{ text, public string }{
-		{n.LivenessError, livenessErrorPublic},
-		{n.TimingError, timingErrorPublic},
-		{n.Error, beaconErrorPublic},
-	}
 
 	if n.Error != "" {
 		n.Error = beaconErrorPublic
+	}
+
+	if n.ValidatorRangesError != "" {
+		n.ValidatorRangesError = validatorRangesFailed
 	}
 
 	n.LivenessError, n.TimingError = "", ""
@@ -56,23 +58,70 @@ func scrubGate(gate *scheduler.Gate) {
 	reasons := make([]string, 0, len(gate.Reasons))
 
 	for _, reason := range gate.Reasons {
-		for _, secret := range secrets {
-			if strings.HasPrefix(reason, secret.public+": ") ||
-				(secret.text != "" && reasonQuotes(reason, secret.text)) {
-				// Nothing of such a reason is kept: what surrounds the quote
-				// may be part of the same error chain.
-				reason = secret.public
-
-				break
-			}
-		}
-
+		reason = scrub.reason(reason)
 		if !slices.Contains(reasons, reason) {
 			reasons = append(reasons, reason)
 		}
 	}
 
 	gate.Reasons = reasons
+}
+
+// scrubber replaces the beacon service's error texts in reasons.
+type scrubber struct {
+	secrets []scrubbed
+}
+
+// scrubbed is one error text and the fixed text that stands for it.
+type scrubbed struct {
+	text, public string
+}
+
+func newScrubber(n *fleet.NetworkHealth) scrubber {
+	return scrubber{secrets: []scrubbed{
+		{n.LivenessError, livenessErrorPublic},
+		{n.TimingError, timingErrorPublic},
+		{n.Error, beaconErrorPublic},
+	}}
+}
+
+// none reports whether the network view has no error text: no waiting
+// reason then quotes one.
+func (s scrubber) none() bool {
+	for _, secret := range s.secrets {
+		if secret.text != "" {
+			return false
+		}
+	}
+
+	return true
+}
+
+// reason scrubs one gate reason: a reason that quotes an error text becomes
+// the fixed text of that error, and one that starts with a fixed text and a
+// colon (the scheduler's "attestation data missing or stale: <error>") is
+// cut back to the fixed text.
+func (s scrubber) reason(reason string) string {
+	for _, secret := range s.secrets {
+		if strings.HasPrefix(reason, secret.public+": ") ||
+			(secret.text != "" && reasonQuotes(reason, secret.text)) {
+			// Nothing of such a reason is kept: what surrounds the quote
+			// may be part of the same error chain.
+			return secret.public
+		}
+	}
+
+	return reason
+}
+
+// waitReason scrubs a waiting reason, which quotes a gate reason after
+// scheduler.ReasonGatePrefix.
+func (s scrubber) waitReason(reason string) string {
+	if rest, ok := strings.CutPrefix(reason, scheduler.ReasonGatePrefix); ok {
+		return scheduler.ReasonGatePrefix + s.reason(rest)
+	}
+
+	return s.reason(reason)
 }
 
 // reasonQuotes reports whether reason carries the error text or one of the

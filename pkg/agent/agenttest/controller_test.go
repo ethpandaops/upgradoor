@@ -85,8 +85,8 @@ func TestController(t *testing.T) {
 	req := &protocol.SyncRequest{ProtocolVersion: protocol.Version}
 
 	// Direct replaces the directives, and without any clears them.
-	c.Direct(protocol.Directive{ID: "d-1", Kind: protocol.DirectiveHold})
-	c.Direct(protocol.Directive{ID: "d-2", Kind: protocol.DirectiveHold})
+	c.Direct(protocol.Directive{ID: "d-1", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff})
+	c.Direct(protocol.Directive{ID: "d-2", Kind: protocol.DirectiveHold, Holder: protocol.HolderStaff})
 	assert.Equal(t, "d-2", syncOnce(t, c, req).Directives[0].ID)
 	assert.Len(t, syncOnce(t, c, req).Directives, 1, "restated, acknowledged or not")
 

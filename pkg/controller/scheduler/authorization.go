@@ -16,10 +16,10 @@ const (
 
 // Authorization says why the API let a person make a request. The scheduler
 // writes it into the audit entries of the action, and asks it one question:
-// whether a hold or unhold came through a team feature (setHold).
+// whether a hold or unhold came through a team feature (holdHolders).
 type Authorization struct {
-	// By names what allowed the request: a feature of the token ("roll"), its
-	// team twin ("team_roll"), several joined by a comma ("reboot,admin"), or
+	// By names what allowed the request: a feature of the token ("manage"),
+	// its team twin ("team_manage"), "action:<basis>" for a host action, or
 	// "open" when the API runs without an auth provider.
 	By string
 	// Teams are the teams of the token.
@@ -73,27 +73,14 @@ func stampAuthorization(ctx context.Context, entries []fleet.AuditEntry) {
 // teamFeaturePrefix starts the name of a team feature in Authorization.By.
 const teamFeaturePrefix = "team_"
 
-// throughTeamFeature reports whether the request of ctx was allowed through a
-// team feature and not through the plain one: the first name of
-// Authorization.By is what allowed the action itself.
-func throughTeamFeature(ctx context.Context) bool {
-	a, ok := AuthorizationFrom(ctx)
-
-	return ok && strings.HasPrefix(a.By, teamFeaturePrefix)
-}
-
 // teamFeatureOf returns the team feature a request was allowed through
-// ("team_hold"), and whether it was allowed through one.
+// ("team_manage"), and whether it was allowed through one and not through
+// the plain feature.
 func teamFeatureOf(ctx context.Context) (string, bool) {
-	if !throughTeamFeature(ctx) {
+	a, ok := AuthorizationFrom(ctx)
+	if !ok || !strings.HasPrefix(a.By, teamFeaturePrefix) {
 		return "", false
 	}
 
-	a, _ := AuthorizationFrom(ctx)
-	twin, _, _ := strings.Cut(a.By, ",")
-
-	return twin, true
+	return a.By, true
 }
-
-// holdByStaff is how an audit entry names a hold that is not a team's.
-const holdByStaff = "staff"

@@ -17,16 +17,10 @@ const (
 	keyReboot      = "reboot"
 	groupPackages  = "packages"
 	prefixPackages = "packages:"
-	prefixManual   = "manual:"
+	prefixManual   = fleet.KeyManualPrefix
 	prefixLocal    = "local:"
 	prefixAction   = "action:"
 )
-
-// directed reports whether a rollout serves the needs of directives: a manual
-// roll or reboot, or a host action a person started.
-func directed(r *fleet.Rollout) bool {
-	return strings.HasPrefix(r.Key, prefixManual)
-}
 
 // reportedNeeds is what the hosts' observed needs (those without a
 // directive) ask for.
@@ -81,8 +75,7 @@ func localTitle(host string, needs []protocol.Need) string {
 	return host + ": " + strings.Join(parts, ", ")
 }
 
-// syncDirectives takes over the agents' acknowledgements and keeps the hold
-// directives in line with Host.HoldWanted.
+// syncDirectives takes over the agents' acknowledgements.
 func (p *pass) syncDirectives() {
 	for _, d := range p.directives {
 		if d.State != fleet.DirectivePending {
@@ -97,7 +90,7 @@ func (p *pass) syncDirectives() {
 			continue
 		}
 
-		if isHoldKind(d.Kind) || hv.h.Status == nil {
+		if hv.h.Status == nil {
 			continue
 		}
 
@@ -116,11 +109,7 @@ func (p *pass) syncDirectives() {
 			break
 		}
 
-		p.settleOverride(d)
-	}
-
-	for _, name := range p.names {
-		p.syncHold(p.hosts[name])
+		p.settleAnswer(d)
 	}
 }
 
@@ -195,93 +184,43 @@ func (p *pass) manualWanted(hv *hostView, id string) bool {
 	return false
 }
 
-// settleOverride records the agent's answer to an override directive, which
-// belongs to no rollout that would show it, and withdraws one that the agent
-// has not answered in time.
-func (p *pass) settleOverride(d *fleet.Directive) {
-	if d.Kind != protocol.DirectiveOverride {
+// settleAnswer records the agent's answer to an override, hold or
+// release-hold directive, which belong to no rollout that would show it, and
+// withdraws an override directive that the agent has not answered in time.
+// A hold directive is sent until the agent answers it.
+func (p *pass) settleAnswer(d *fleet.Directive) {
+	switch d.Kind {
+	case protocol.DirectiveOverride:
+		if d.State == fleet.DirectivePending {
+			if p.now.Sub(later(d.CreatedAt, p.w.Since)) <= overrideAnswerTimeout {
+				return
+			}
+
+			d.State = fleet.DirectiveCancelled
+			d.Error = "the agent did not answer in time"
+		}
+	case protocol.DirectiveHold, protocol.DirectiveReleaseHold:
+		if d.State == fleet.DirectivePending {
+			return
+		}
+	default:
 		return
 	}
 
-	if d.State == fleet.DirectivePending {
-		if p.now.Sub(later(d.CreatedAt, p.w.Since)) <= overrideAnswerTimeout {
-			return
-		}
-
-		d.State = fleet.DirectiveCancelled
-		d.Error = "the agent did not answer in time"
+	detail := map[string]any{keyDirective: d.ID, "kind": d.Kind}
+	if d.Container != "" {
+		detail["container"] = d.Container
 	}
 
-	detail := map[string]any{"directive": d.ID, "kind": d.Kind, "container": d.Container}
+	if d.Holder != "" {
+		detail[keyHolder] = d.Holder
+	}
+
 	if d.Error != "" {
 		detail["error"] = d.Error
 	}
 
 	p.record("directive."+string(d.State), d.Host, detail)
-}
-
-// holdActor is who set the controller hold of a host, as the hold directive
-// tells the agent: the person, and whether through a team feature or as
-// staff. The agent keeps it in its state file.
-func holdActor(h *fleet.Host) *protocol.Actor {
-	if !h.HoldWanted {
-		return nil
-	}
-
-	feature := "staff"
-	if _, team := fleet.HoldTeams(h.HoldBy); team {
-		feature = "team"
-	}
-
-	return &protocol.Actor{User: cmpOr(h.HoldActor, actorScheduler), Feature: feature}
-}
-
-func isHoldKind(k protocol.DirectiveKind) bool {
-	return k == protocol.DirectiveHold || k == protocol.DirectiveReleaseHold
-}
-
-// syncHold issues hold / release-hold directives until the agent's reported
-// controller hold matches Host.HoldWanted. They are settled by the reported
-// state, not by acknowledgements.
-func (p *pass) syncHold(hv *hostView) {
-	if hv.h.Status == nil {
-		return
-	}
-
-	kind := protocol.DirectiveReleaseHold
-	if hv.h.HoldWanted {
-		kind = protocol.DirectiveHold
-	}
-
-	agreed := hv.h.Status.Hold.Controller == hv.h.HoldWanted
-	outstanding := false
-
-	for _, d := range p.byHost[hv.h.Name] {
-		if d.State != fleet.DirectivePending || !isHoldKind(d.Kind) {
-			continue
-		}
-
-		switch {
-		case agreed && d.Kind == kind:
-			d.State = fleet.DirectiveAccepted
-		case agreed || d.Kind != kind:
-			d.State = fleet.DirectiveCancelled
-		default:
-			outstanding = true
-		}
-	}
-
-	if agreed || outstanding {
-		return
-	}
-
-	p.addDirective(&fleet.Directive{
-		Directive: protocol.Directive{ID: p.w.NewID(), Kind: kind, Reason: hv.h.HoldReason, By: holdActor(hv.h)},
-		Host:      hv.h.Name,
-		State:     fleet.DirectivePending,
-		CreatedBy: actorScheduler,
-		CreatedAt: p.now,
-	})
 }
 
 // syncRollouts supersedes, opens, updates membership of and completes
@@ -300,10 +239,41 @@ func (p *pass) syncRollouts() {
 			continue
 		}
 
-		p.syncMembers(r)
+		if p.syncMembers(r) && len(r.Hosts) == 0 {
+			p.drop(r)
+
+			continue
+		}
+
 		p.complete(r)
 		p.pauseAfterCanary(r)
 	}
+
+	if len(p.dropped) > 0 {
+		p.rollouts = slices.DeleteFunc(p.rollouts, func(r *fleet.Rollout) bool {
+			return p.rolloutByID[r.ID] == nil
+		})
+	}
+}
+
+// drop deletes a rollout whose members all left it: each host's need went
+// away before a lease of the rollout served it. One audit entry stays.
+func (p *pass) drop(r *fleet.Rollout) {
+	for _, d := range p.directives {
+		if d.RolloutID == r.ID && d.State == fleet.DirectivePending {
+			d.State = fleet.DirectiveCancelled
+		}
+	}
+
+	delete(p.rolloutByID, r.ID)
+
+	if p.origRollouts[r.ID] != nil {
+		p.dropped = append(p.dropped, r.ID)
+	}
+
+	p.record("rollout.dropped", r.ID, map[string]any{
+		keyKey: r.Key, keyTitle: r.Title, keyReason: "every host resolved on its own",
+	})
 }
 
 // pauseAfterCanary pauses a rollout that had its first success in this pass
@@ -464,9 +434,9 @@ func (p *pass) supersede(rep *reportedNeeds) {
 // host asks for something else now, or for nothing: the overrides file
 // changed again, the container was put right by other means, or the work
 // failed and left nothing to ask for. Only a host that reports says so (one
-// that is held, silent or forgotten says nothing about its needs), and only
-// of a member that still waits or failed: one that holds a lease or is done
-// is settled by the lease.
+// that is silent or forgotten says nothing about its needs), and only of a
+// member that still waits or failed: one that holds a lease or is done is
+// settled by the lease.
 func (p *pass) supersedeLocal(r *fleet.Rollout, rep *reportedNeeds) {
 	if len(r.Hosts) != 1 {
 		return
@@ -475,7 +445,7 @@ func (p *pass) supersedeLocal(r *fleet.Rollout, rep *reportedNeeds) {
 	m := &r.Hosts[0]
 
 	hv := p.hosts[m.Host]
-	if hv == nil || hv.h.Status == nil || hv.held || hv.stale ||
+	if hv == nil || hv.h.Status == nil || hv.stale ||
 		m.State == fleet.HostLeased || m.State == fleet.HostDone {
 		return
 	}
@@ -526,7 +496,7 @@ func (p *pass) open(rep *reportedNeeds) {
 		p.rolloutByID[r.ID] = r
 		openKeys[r.Key] = true
 
-		p.record("rollout.created", r.ID, map[string]any{keyKey: r.Key, "title": r.Title})
+		p.record("rollout.created", r.ID, map[string]any{keyKey: r.Key, keyTitle: r.Title})
 	}
 
 	// A group with an open rollout that holds everything the hosts ask for
@@ -633,13 +603,29 @@ func (p *pass) assignNeeds() {
 	}
 }
 
-// syncMembers updates the members of one open rollout.
-func (p *pass) syncMembers(r *fleet.Rollout) {
+// syncMembers updates the members of one open rollout. It reports whether
+// a member left the rollout.
+func (p *pass) syncMembers(r *fleet.Rollout) bool {
 	needs := p.needs[r.ID]
+
+	var left map[string]bool
 
 	for i := range r.Hosts {
 		m := &r.Hosts[i]
-		p.syncMember(r, m, needs[m.Host])
+		if !p.syncMember(r, m, needs[m.Host]) {
+			continue
+		}
+
+		if left == nil {
+			left = make(map[string]bool, 1)
+		}
+
+		left[m.Host] = true
+	}
+
+	if left != nil {
+		r.Hosts = slices.DeleteFunc(r.Hosts, func(m fleet.RolloutHost) bool { return left[m.Host] })
+		delete(p.members, r)
 	}
 
 	joined := make([]fleet.RolloutHost, 0, 4)
@@ -669,6 +655,8 @@ func (p *pass) syncMembers(r *fleet.Rollout) {
 	r.Hosts = append(r.Hosts, joined...)
 
 	p.stages(r)
+
+	return left != nil
 }
 
 // stages settles the canary and gives every member its stage: the canary is
@@ -698,8 +686,8 @@ func (p *pass) stages(r *fleet.Rollout) {
 // that goes alone until the rollout has its first success. A canary that
 // holds a lease, is done by one that was released, or failed and halted the
 // rollout stays. Until then the choice is made anew in every pass, so a
-// canary that left without having been served (skipped, held, silent,
-// forgotten, its need gone by itself) is replaced by the next candidate.
+// canary that was not served (skipped, held, silent, forgotten, or gone
+// from the rollout with its need) is replaced by the next candidate.
 // There is no new canary in a forced rollout, in a rollout with a single
 // member, after the first success, and while a member whose host is broken is
 // still to be served. A host that is broken is never chosen.
@@ -859,8 +847,9 @@ func (p *pass) canaryBefore(a, b *fleet.RolloutHost) bool {
 	) < 0
 }
 
-// syncMember applies the membership rules to one existing member.
-func (p *pass) syncMember(r *fleet.Rollout, m *fleet.RolloutHost, needs []protocol.Need) {
+// syncMember applies the membership rules to one existing member. It
+// reports whether the member leaves the rollout.
+func (p *pass) syncMember(r *fleet.Rollout, m *fleet.RolloutHost, needs []protocol.Need) bool {
 	hv := p.hosts[m.Host]
 	if hv == nil {
 		// A member that a person skipped is left out for the forgotten host
@@ -872,94 +861,111 @@ func (p *pass) syncMember(r *fleet.Rollout, m *fleet.RolloutHost, needs []protoc
 			m.UpdatedAt = p.now
 		}
 
-		return
+		return false
 	}
 
 	switch m.State {
 	case fleet.HostExpected:
-		p.syncExpected(r, m, hv, needs)
+		return p.syncExpected(r, m, hv, needs)
 	case fleet.HostPending:
 		switch {
 		case len(needs) > 0:
 			m.NeedID = needs[0].ID
 		case hv.h.Status == nil:
 		case r.Kind == fleet.RolloutGroup && expectsImage(r, hv):
-			// The host no longer reports the need (it is held, or it looks
-			// at an older digest) but still runs another digest.
+			// The host no longer reports the need (it looks at an older
+			// digest) but still runs another digest.
 			m.NeedID = ""
 			p.setMember(m, fleet.HostExpected)
 		default:
-			// The need disappeared without a lease.
-			m.LeaseID = ""
-			p.setMember(m, fleet.HostDone)
+			return p.resolved(m)
 		}
 	case fleet.HostDone:
 		// A host that was done without a lease and reports the need again
-		// (a hold was lifted) rejoins.
+		// rejoins.
 		if m.LeaseID == "" && len(needs) > 0 {
 			m.NeedID = needs[0].ID
 			p.setMember(m, fleet.HostPending)
 		}
 	case fleet.HostSkipped:
-		p.syncSkipped(r, m, hv, needs)
+		return p.syncSkipped(r, m, hv, needs)
 	default:
 	}
+
+	return false
+}
+
+// resolved settles a member whose need went away without a lease: done when
+// a lease of the rollout was granted for it before, else it leaves the
+// rollout (reported true): the rollout did nothing for it.
+func (p *pass) resolved(m *fleet.RolloutHost) bool {
+	if !m.Served {
+		return true
+	}
+
+	m.LeaseID = ""
+	p.setMember(m, fleet.HostDone)
+
+	return false
 }
 
 // syncSkipped looks whether a member that a person skipped in a rollout of an
 // observed cause still has the need. The skip holds, and keeps the rollout
 // open (blocks), for as long as it has: a rollout that completed would be
-// opened again for the host at once. Once a host that is neither held nor
-// silent syncs without the need, the member is done like a waiting one whose
-// need went away; a held or silent host says nothing about its needs. In a
-// manual rollout a skip is final: nothing follows the rollout.
-func (p *pass) syncSkipped(r *fleet.Rollout, m *fleet.RolloutHost, hv *hostView, needs []protocol.Need) {
-	if !operatorSkipped(m) || directed(r) {
-		return
+// opened again for the host at once. Once a host that is not silent syncs
+// without the need, the member is settled like a waiting one whose need went
+// away (resolved); a silent host says nothing about its needs. In a manual
+// rollout a skip is final: nothing follows the rollout.
+func (p *pass) syncSkipped(r *fleet.Rollout, m *fleet.RolloutHost, hv *hostView, needs []protocol.Need) bool {
+	if !operatorSkipped(m) || r.Directed() {
+		return false
 	}
 
 	switch {
 	case len(needs) > 0:
 		m.NeedID = needs[0].ID
-	case hv.h.Status == nil || hv.held || hv.stale:
+	case hv.h.Status == nil || hv.stale:
 	case r.Kind == fleet.RolloutGroup && expectsImage(r, hv):
 		// It still runs another digest: the need is not reported, not gone.
 	default:
-		m.LeaseID = ""
-		p.setMember(m, fleet.HostDone)
+		return p.resolved(m)
 	}
+
+	return false
 }
 
 func (p *pass) syncExpected(
 	r *fleet.Rollout, m *fleet.RolloutHost, hv *hostView, needs []protocol.Need,
-) {
+) bool {
 	outstanding, rejected := p.manualDirectives(r, m.Host)
 
 	if len(needs) > 0 && !outstanding {
 		m.NeedID = needs[0].ID
 		p.setMember(m, fleet.HostPending)
 
-		return
+		return false
 	}
 
 	if hv.h.Status == nil {
-		return
+		return false
 	}
 
 	// Only image and manual rollouts have expected members.
 	switch {
 	case r.Kind == fleet.RolloutGroup && !expectsImage(r, hv) && runsImage(r, hv):
-		p.setMember(m, fleet.HostDone)
-	case directed(r) && !outstanding && len(needs) == 0 && rejected != "":
+		return p.resolved(m)
+	case r.Directed() && !outstanding && len(needs) == 0 && rejected != "":
 		p.setMember(m, fleet.HostSkipped)
 		m.Error = rejected
 	}
+
+	return false
 }
 
 // manualDirectives reports whether a directive of the rollout is still
 // unanswered by the host, and the reason of the first one it rejected.
 func (p *pass) manualDirectives(r *fleet.Rollout, host string) (outstanding bool, rejected string) {
-	if !directed(r) {
+	if !r.Directed() {
 		return false, ""
 	}
 
@@ -1026,7 +1032,7 @@ func (p *pass) blocks(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 	case fleet.HostDone:
 		return false
 	case fleet.HostSkipped:
-		return operatorSkipped(m) && !directed(r)
+		return operatorSkipped(m) && !r.Directed()
 	case fleet.HostAborted:
 		return false
 	case fleet.HostExpected:

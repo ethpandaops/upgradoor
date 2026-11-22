@@ -12,7 +12,7 @@ import (
 func newHoldCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "hold [reason]",
-		Short: "Hold the host: the agent reports no needs and refuses all work",
+		Short: "Hold the host: the agent refuses all work",
 		Args:  cobra.ArbitraryArgs,
 	}
 

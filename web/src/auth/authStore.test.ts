@@ -179,7 +179,9 @@ describe('AuthStore', () => {
 
   it('asks the auth client for features and takes the teams of the status event', async () => {
     const fake = fakeClient({ ...status(true), teams: ['geth', 'lighthouse'], services: '+upgradoor:team_*' });
-    const hasFeature = vi.fn((service: string, feature: string) => service === 'upgradoor' && feature === 'team_roll');
+    const hasFeature = vi.fn(
+      (service: string, feature: string) => service === 'upgradoor' && feature === 'team_manage'
+    );
     window.ethpandaops = { authenticatoor: { ...fake.client, hasFeature } };
 
     const store = new AuthStore(noScript);
@@ -188,9 +190,9 @@ describe('AuthStore', () => {
     await store.start('https://auth.example.org');
 
     expect(store.getState()).toMatchObject({ teams: ['geth', 'lighthouse'], services: '+upgradoor:team_*' });
-    expect(store.hasFeature('upgradoor', 'team_roll')).toBe(true);
+    expect(store.hasFeature('upgradoor', 'team_manage')).toBe(true);
     expect(store.hasFeature('upgradoor', 'roll')).toBe(false);
-    expect(store.hasFeature('spamoor', 'team_roll')).toBe(false);
+    expect(store.hasFeature('spamoor', 'team_manage')).toBe(false);
 
     // New grants are a new state, so the views decide again.
     seen.mockClear();
@@ -202,7 +204,7 @@ describe('AuthStore', () => {
     hasFeature.mockReturnValue(true);
     fake.push(status(false));
     expect(store.getState()).toMatchObject({ loggedIn: false, teams: [], services: '' });
-    expect(store.hasFeature('upgradoor', 'team_roll')).toBe(false);
+    expect(store.hasFeature('upgradoor', 'team_manage')).toBe(false);
   });
 
   it('has no feature with an auth client from before features', async () => {

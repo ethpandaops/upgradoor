@@ -25,6 +25,7 @@ type Store struct {
 	Slots       []fleet.SlotParticipation // oldest first
 	Rollouts    []*fleet.Rollout          // newest first
 	Leases      []*fleet.Lease            // newest first
+	Directives  []*fleet.Directive        // oldest first
 	Audit       []fleet.AuditEntry
 	Packages    []store.PackageMatch
 	// Ranges is the validator ranges inventory; SetValidatorRanges assigns
@@ -65,14 +66,6 @@ func (f *Store) RecordSync(_ context.Context, sync *store.HostSync) (*store.Sync
 		host = &fleet.Host{Name: name, FirstSeen: sync.At, Validators: f.assigned(name)}
 		f.Hosts[name] = host
 		res.Created = true
-
-		// Like the real store: a new host that reports a controller hold
-		// keeps it.
-		if sync.Request != nil && sync.Request.Hold.Controller {
-			res.HoldAdopted = true
-			host.HoldWanted = true
-			host.HoldReason = store.HoldReasonAdopted
-		}
 	} else if host.CertHash != sync.Cert.Hash {
 		res.PreviousCertHash = host.CertHash
 	}
@@ -483,6 +476,29 @@ func (f *Store) GetLease(_ context.Context, id string) (*fleet.Lease, error) {
 	}
 
 	return nil, store.ErrNotFound
+}
+
+func (f *Store) ListDirectives(_ context.Context, filter store.DirectiveFilter) ([]*fleet.Directive, error) {
+	f.Lock()
+	defer f.Unlock()
+
+	if f.Err != nil {
+		return nil, f.Err
+	}
+
+	out := make([]*fleet.Directive, 0, len(f.Directives))
+
+	for _, d := range f.Directives {
+		switch {
+		case filter.Host != "" && d.Host != filter.Host:
+		case filter.PendingOnly && d.State != fleet.DirectivePending:
+		case len(filter.Rollouts) > 0 && !slices.Contains(filter.Rollouts, d.RolloutID):
+		default:
+			out = append(out, d)
+		}
+	}
+
+	return out, nil
 }
 
 func (f *Store) AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error {

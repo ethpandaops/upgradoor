@@ -178,7 +178,6 @@ func TestWireRoundTrip(t *testing.T) {
 		plan.Queue[0],
 		plan.Budget,
 		wireGate{OK: true, Reasons: []string{}, Network: wireNetwork{NetworkHealth: plan.Gate.Network}},
-		views.SettingsBody{Settings: fleet.DefaultSettings(), Defaults: fleet.DefaultSettings()},
 		views.NewPublicHosts([]*fleet.Host{h.store.Hosts["lighthouse-geth-1"]}).Hosts[0],
 		views.HostSummary{Name: "empty", Roles: []string{}},
 	}
@@ -446,8 +445,13 @@ func TestWireFiles(t *testing.T) {
 	golden.User = raw(user.event(eventSnapshot))
 
 	h.change(func(f *controllertest.Store) {
-		f.Hosts["lighthouse-geth-2"].HoldWanted = true
-		f.Hosts["lighthouse-geth-2"].HoldReason = "golden"
+		host := f.Hosts["lighthouse-geth-2"]
+		status := *host.Status
+		status.Hold = protocol.Hold{Holds: []protocol.HostHold{
+			{Holder: fleet.HolderStaff, By: "alice", Reason: "golden", At: controllertest.Epoch},
+			{Holder: "geth", By: "gina", At: controllertest.Epoch},
+		}}
+		host.Status = &status
 	})
 
 	golden.Patch = raw(user.event(eventPatch))

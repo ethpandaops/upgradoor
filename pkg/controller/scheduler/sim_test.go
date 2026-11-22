@@ -60,11 +60,12 @@ const (
 )
 
 // simReasons are the forms a waiting reason may take.
-var simReasons = regexp.MustCompile(`^(held|known offline|agent silent|working on an operation without a lease|paused|rollout paused|` +
-	`paused after the canary; resume to continue|aborted(: .+)?; resume to continue|` +
+var simReasons = regexp.MustCompile(`^(held( by .+)?|hold requested, waiting for the host|known offline|agent silent|working on an operation without a lease|paused|rollout paused|` +
+	`paused after the canary; resume to continue|aborted(: .+)?; resume to continue|\S+ cancelled by .+|` +
 	`waiting for approval \(policy manual\)|rollout halted: .+|` +
 	`verb not allowed by the agent|waiting to pull its image again after a failed pull|network gate: .+|after .+|` +
-	`budget [0-9.]+% of [0-9.]+%|host limit \d+ of \d+|independent limit \d+ of \d+)$`)
+	`validators down: [0-9.]+% now, [0-9.]+% with this host, limit [0-9.]+%|` +
+	`hosts at once: \d+ of \d+ busy|independent hosts at once: \d+ of \d+ busy)$`)
 
 // sim is one simulation run.
 type sim struct {
@@ -213,7 +214,8 @@ func newSim(seed uint64) (*sim, error) {
 		MaxUnavailablePercent:   pick(0, 5, 10, 10, 20, 34, 50, 100),
 		MinParticipationPercent: pick(66, 80, 90),
 		MaxFinalityLagEpochs:    uint64(pick(2, 3, 5)),
-		ReadyEpochs:             uint64(pick(0, 1, 1, 2)),
+		ReadyAttestations:       uint64(pick(1, 2, 2, 4)),
+		ReadyStableFor:          fleet.Duration(time.Duration(pick(0, 30, 60, 60)) * time.Second),
 		MinPeers:                int(pick(1, 3, 3, 5)),
 		LeaseTTL:                fleet.Duration(time.Duration(pick(60, 120, 300)) * time.Second),
 		HostStaleAfter:          fleet.Duration(time.Duration(pick(30, 60, 120)) * time.Second),
@@ -270,6 +272,7 @@ func (s *sim) service(st *fakeStore, newID func() string) (*service, error) {
 		Store:    st,
 		Health:   s.world.health,
 		Liveness: st.listLiveness,
+		Attested: s.world.attestedSlots,
 		Defaults: s.defaults,
 		Now:      func() time.Time { return s.world.now },
 		NewID:    newID,
@@ -287,6 +290,8 @@ func (s *sim) boot(st *fakeStore) error {
 	svc, err := s.service(st, s.newID)
 	s.svc = svc
 	s.since = s.world.now
+	// The beacon service keeps the attested slots in memory.
+	clear(s.world.attested)
 
 	if !s.world.calm {
 		s.world.livenessUnknownUntil = later(s.world.livenessUnknownUntil,
@@ -392,10 +397,7 @@ func (s *sim) syncAgents() error {
 		req := w.request(a)
 		host := &fleet.Host{Name: a.name, Validators: a.val, LastSeen: w.now, Status: req}
 
-		if s.store.recordSync(host) {
-			s.stats["holds adopted from the agents"]++
-			s.note("%s: registered on hold, as its agent reports", a.name)
-		}
+		s.store.recordSync(host)
 
 		a.lastSync = w.now
 		a.lastSent = req
@@ -556,6 +558,15 @@ func (s *sim) facts() *simFacts {
 		retried:        s.retried,
 	}
 
+	_, _, directives := s.store.view()
+	requested := make(map[string]bool, len(directives))
+
+	for _, d := range directives {
+		if d.State == fleet.DirectivePending && d.Kind == protocol.DirectiveHold {
+			requested[d.Host] = true
+		}
+	}
+
 	for _, a := range w.agents {
 		registered := s.store.host(a.name)
 		if registered == nil {
@@ -565,14 +576,14 @@ func (s *sim) facts() *simFacts {
 		live := w.publishedLive(a)
 
 		f.hosts[a.name] = &simHostFact{
-			weight:     a.weight,
-			live:       live,
-			holdWanted: registered.HoldWanted,
-			offline:    registered.KnownOffline(w.now),
-			unproven:   registered.Unproven,
-			lastSync:   a.lastSync,
-			status:     a.lastSent,
-			reported:   a.reported,
+			weight:        a.weight,
+			live:          live,
+			holdRequested: requested[a.name],
+			offline:       registered.KnownOffline(w.now),
+			unproven:      registered.Unproven,
+			lastSync:      a.lastSync,
+			status:        a.lastSent,
+			reported:      a.reported,
 		}
 	}
 
@@ -1287,8 +1298,15 @@ func (s *sim) settingsAction() error {
 			break
 		}
 
-		set.ReadyEpochs = uint64(s.rng.IntN(3))
-		what = fmt.Sprintf("readyEpochs=%d", set.ReadyEpochs)
+		if s.rng.IntN(2) == 0 {
+			set.ReadyAttestations = uint64(1 + s.rng.IntN(4))
+			what = fmt.Sprintf("readyAttestations=%d", set.ReadyAttestations)
+
+			break
+		}
+
+		set.ReadyStableFor = fleet.Duration(time.Duration(s.rng.IntN(3)) * 30 * time.Second)
+		what = "readyStableFor=" + set.ReadyStableFor.Std().String()
 	case 5:
 		set.PolicyImage = policies[s.rng.IntN(len(policies))]
 		what = "policyImage=" + string(set.PolicyImage)
@@ -1350,7 +1368,7 @@ func (s *sim) converge() error {
 
 	// A retried host is done only through a readiness check (a recheck), so
 	// the check must be able to pass.
-	set.ReadinessTimeout = max(set.ReadinessTimeout, fleet.Duration(time.Duration(set.ReadyEpochs+3)*simEpoch))
+	set.ReadinessTimeout = max(set.ReadinessTimeout, fleet.Duration(set.ReadyStableFor.Std()+3*simEpoch))
 
 	if set.MaxUnavailablePercent == 0 {
 		set.MaxUnavailablePercent = 10
@@ -1415,7 +1433,7 @@ func (s *sim) operate() error {
 	rollouts, _, _ := s.store.view()
 
 	for _, a := range s.world.agents {
-		if h := s.store.host(a.name); h != nil && h.HoldWanted {
+		if h := s.store.host(a.name); h != nil && (len(a.ctrlHolds) > 0 || s.holdRequested(a.name)) {
 			if err := s.unhold([]string{a.name}); err != nil {
 				return err
 			}
@@ -1439,7 +1457,9 @@ func (s *sim) operate() error {
 			}
 		}
 
-		failed := slices.ContainsFunc(r.Hosts, func(m fleet.RolloutHost) bool { return m.State == fleet.HostFailed })
+		failed := slices.ContainsFunc(r.Hosts, func(m fleet.RolloutHost) bool {
+			return m.State == fleet.HostFailed || m.State == fleet.HostCancelled
+		})
 		if r.State == fleet.RolloutHalted || failed {
 			if err := s.retry(r, nil); err != nil {
 				return err
@@ -1673,12 +1693,12 @@ func TestSimulation(t *testing.T) {
 		for _, what := range []string{
 			"grants", "released leases", "failed leases", "expired leases", "completed rollouts",
 			"superseded rollouts", "halts", "forced grants", "budget-exempt grants", "bundled leases",
-			"restart comparisons", "write failures", "lost databases", "holds adopted from the agents",
+			"restart comparisons", "write failures", "lost databases",
 			"outages longer than leaseTtl", "open leases carried over an outage",
 			"skipped hosts", "grants through the closed gate", "steps that agents began",
 			"hosts seen working without a lease",
 			"slot-duration forks", "leases ended by a person: granted", "leases ended by a person: running",
-			"leases ended by a person: verifying", "waits: verb", "waits: budget", "waits: host",
+			"leases ended by a person: verifying", "waits: verb", "waits: validators", "waits: hosts",
 			"waits: network", "waits: after", "completed unlabelled rollouts",
 		} {
 			if total[what] == 0 {
@@ -1762,7 +1782,8 @@ type simAgent struct {
 	boot         int
 
 	localHold bool
-	ctrlHold  bool
+	// ctrlHolds are the holders of the holds directives set, sorted.
+	ctrlHolds []string
 	manual    []simManual
 	// handled remembers the answer to every directive ever applied; acks are
 	// the answers to the directives of the last response.
@@ -1853,7 +1874,21 @@ type simBegin struct {
 
 func (a *simAgent) allows(v protocol.Verb) bool { return slices.Contains(a.verbs, v) }
 
-func (a *simAgent) held() bool { return a.localHold || a.ctrlHold }
+func (a *simAgent) held() bool { return a.localHold || len(a.ctrlHolds) > 0 }
+
+// hold is the hold state the agent reports.
+func (a *simAgent) hold() protocol.Hold {
+	out := protocol.Hold{Local: a.localHold}
+	if a.localHold {
+		out.Holds = append(out.Holds, protocol.HostHold{Holder: protocol.HolderHost})
+	}
+
+	for _, holder := range a.ctrlHolds {
+		out.Holds = append(out.Holds, protocol.HostHold{Holder: holder})
+	}
+
+	return out
+}
 
 func (a *simAgent) container(name string) *simContainer {
 	for _, c := range a.containers {
@@ -1908,6 +1943,9 @@ type simWorld struct {
 	publishedEpoch uint64
 	havePublished  bool
 	dropped        map[string]bool
+	// attested holds the newest slots per host in which it attested while
+	// the beacon service could see it.
+	attested map[string][]uint64
 }
 
 // simImpacts are the classes a managed container is drawn from: mostly the
@@ -1952,6 +1990,7 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 		epochMin:   make(map[string]uint64, 32),
 		published:  make(map[uint64]map[string]uint64, 64),
 		dropped:    make(map[string]bool, 2),
+		attested:   make(map[string][]uint64, 32),
 		pkgVersion: 1,
 		phases:     []simPhase{{start: testGenesis, slot: simSecondsPerSlot * time.Second}},
 	}
@@ -2283,11 +2322,48 @@ func (w *simWorld) advance(d time.Duration, st *fakeStore) {
 	}
 }
 
-// sample records the hosts' attesting validators for the running epoch.
+// sample records the hosts' attesting validators for the running epoch, and
+// the slot of each host that attests while the beacon service can see it.
 func (w *simWorld) sample() {
+	slot, inChain := w.slotOf(w.now)
+	seen := inChain && !w.now.Before(w.beaconDownUntil) && !w.now.Before(w.livenessStallUntil)
+
 	for _, a := range w.agents {
-		w.epochMin[a.name] = min(w.epochMin[a.name], w.attesting(a))
+		attesting := w.attesting(a)
+		w.epochMin[a.name] = min(w.epochMin[a.name], attesting)
+
+		if seen && attesting > 0 {
+			w.attest(a.name, slot)
+		}
 	}
+}
+
+// attest records a slot in which the host attested, keeping the newest
+// fleet.MaxReadyAttestations of them. Slices are replaced, not changed.
+func (w *simWorld) attest(name string, slot uint64) {
+	slots := w.attested[name]
+	if len(slots) > 0 && slots[len(slots)-1] >= slot {
+		return
+	}
+
+	next := append(slices.Clone(slots), slot)
+	w.attested[name] = next[max(0, len(next)-fleet.MaxReadyAttestations):]
+}
+
+// attestedSlots stands in for the beacon service's AttestedSlots.
+func (w *simWorld) attestedSlots() map[string][]uint64 {
+	return maps.Clone(w.attested)
+}
+
+// slotOf is the slot a time is in; false before genesis.
+func (w *simWorld) slotOf(t time.Time) (uint64, bool) {
+	if t.Before(w.phases[0].start) {
+		return 0, false
+	}
+
+	epoch := w.epochOf(t)
+
+	return epoch*simSlotsPerEpoch + uint64(t.Sub(w.epochStart(epoch))/w.phaseOf(epoch).slot), true
 }
 
 // publish stores the liveness rows of a complete epoch, unless the beacon
@@ -2766,14 +2842,10 @@ func simPackages(from, to int) []protocol.PackageChange {
 	}}
 }
 
-// needs lists the agent's open needs. A held agent reports none, and a need
-// is reported only for a verb the local configuration allows; a sloppy agent
-// reports its observed needs regardless.
+// needs lists the agent's open needs, held or not. A need is reported only
+// for a verb the local configuration allows; a sloppy agent reports its
+// observed needs regardless.
 func (w *simWorld) needs(a *simAgent) []protocol.Need {
-	if a.held() && !a.sloppy {
-		return nil
-	}
-
 	needs := make([]protocol.Need, 0, 4)
 
 	if a.allows(protocol.VerbRoll) || a.sloppy {
@@ -2803,11 +2875,6 @@ func (w *simWorld) needs(a *simAgent) []protocol.Need {
 
 	if (a.allows(protocol.VerbReboot) || a.sloppy) && a.rebootRequired {
 		needs = append(needs, rebootNeed())
-	}
-
-	if a.held() {
-		// Held: the observed needs at most, no manual ones.
-		return needs
 	}
 
 	// A manual need that local policy no longer permits is dropped.
@@ -2847,7 +2914,7 @@ func (w *simWorld) request(a *simAgent) *protocol.SyncRequest {
 		SentAt:          w.now,
 		BootID:          fmt.Sprintf("%s-boot-%d", a.name, a.boot),
 		Verbs:           slices.Clone(a.verbs),
-		Hold:            protocol.Hold{Local: a.localHold, Controller: a.ctrlHold},
+		Hold:            a.hold(),
 		Containers:      make([]protocol.Container, 0, len(a.containers)),
 		Needs:           w.needs(a),
 		Operation:       cloneOperation(a.op),
@@ -2982,10 +3049,18 @@ func (w *simWorld) apply(a *simAgent, d protocol.Directive) protocol.DirectiveAc
 	}
 
 	switch d.Kind {
-	case protocol.DirectiveHold:
-		a.ctrlHold = true
-	case protocol.DirectiveReleaseHold:
-		a.ctrlHold = false
+	case protocol.DirectiveHold, protocol.DirectiveReleaseHold:
+		if !protocol.ValidHolder(d.Holder) {
+			return reject("not a holder")
+		}
+
+		a.ctrlHolds = slices.DeleteFunc(a.ctrlHolds, func(h string) bool { return h == d.Holder })
+		if d.Kind == protocol.DirectiveHold {
+			a.ctrlHolds = append(a.ctrlHolds, d.Holder)
+			slices.SortFunc(a.ctrlHolds, func(x, y string) int {
+				return protocol.HoldOrder(protocol.HostHold{Holder: x}, protocol.HostHold{Holder: y})
+			})
+		}
 	case protocol.DirectiveOverride:
 		return reject("the simulated agents have no overrides file")
 	case protocol.DirectiveAction:
@@ -3096,10 +3171,10 @@ type simHostFact struct {
 	// live is how many validators attested in the newest liveness epoch the
 	// beacon service settled (the full weight without a row).
 	live uint64
-	// holdWanted is the operator's hold switch; offline says that the
-	// operator's known-offline mark is in force.
-	holdWanted bool
-	offline    bool
+	// holdRequested: a hold directive waits for the agent's answer; offline
+	// says that the operator's known-offline mark is in force.
+	holdRequested bool
+	offline       bool
 	// unproven is the scheduler's mark that the host is not proven back after
 	// a lease (fleet.Host.Unproven).
 	unproven *time.Time
@@ -3112,7 +3187,7 @@ type simHostFact struct {
 }
 
 func (h *simHostFact) held() bool {
-	return h.holdWanted || h.offline || (h.status != nil && h.status.Hold.Active())
+	return h.holdRequested || h.offline || (h.status != nil && h.status.Hold.Active())
 }
 
 // simFacts is the state of the simulated world at one observation.
@@ -3678,4 +3753,13 @@ func (o *oracle) checkRollout(f *simFacts, r *fleet.Rollout, l *fleet.Lease, gat
 	default:
 		return nil
 	}
+}
+
+// holdRequested reports whether a hold directive waits for the host's answer.
+func (s *sim) holdRequested(host string) bool {
+	_, _, directives := s.store.view()
+
+	return slices.ContainsFunc(directives, func(d *fleet.Directive) bool {
+		return d.Host == host && d.State == fleet.DirectivePending && d.Kind == protocol.DirectiveHold
+	})
 }

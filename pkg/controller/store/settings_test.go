@@ -53,7 +53,7 @@ func TestSettings(t *testing.T) {
 
 			changed := defaults
 			changed.MaxUnavailablePercent = 12.5
-			changed.ReadyEpochs = 3
+			changed.ReadyAttestations = 3
 			changed.LeaseTTL = fleet.Duration(45 * time.Minute)
 			changed.PolicyReboot = fleet.PolicyAuto
 			changed.Paused = true
@@ -61,7 +61,7 @@ func TestSettings(t *testing.T) {
 			require.NoError(t, s.SaveSettings(ctx, defaults, changed))
 			assert.Equal(t, map[string]string{
 				"maxUnavailablePercent": "12.5",
-				"readyEpochs":           "3",
+				"readyAttestations":     "3",
 				"leaseTtl":              `"45m0s"`,
 				"policyReboot":          `"auto"`,
 				"paused":                "true",
@@ -75,16 +75,16 @@ func TestSettings(t *testing.T) {
 			// changed flag default shows through for fields not overridden.
 			other := defaults
 			other.MinParticipationPercent = 80
-			other.ReadyEpochs = 9
+			other.ReadyAttestations = 9
 
 			got, err = s.LoadSettings(ctx, other)
 			require.NoError(t, err)
 			assert.InDelta(t, 80.0, got.MinParticipationPercent, 0, "not overridden: the new default")
-			assert.Equal(t, uint64(3), got.ReadyEpochs, "overridden: the stored value")
+			assert.Equal(t, uint64(3), got.ReadyAttestations, "overridden: the stored value")
 
 			// Setting fields back to their defaults removes their rows.
 			partly := changed
-			partly.ReadyEpochs = defaults.ReadyEpochs
+			partly.ReadyAttestations = defaults.ReadyAttestations
 			partly.Paused = false
 			partly.HostStaleAfter = fleet.Duration(5 * time.Minute)
 
@@ -141,7 +141,7 @@ func TestLoadSettingsRefusesBadRows(t *testing.T) {
 		t.Run(row, func(t *testing.T) {
 			s := newFileStore(t)
 
-			_, err := rawDB(t, s).Exec(`INSERT INTO settings (key, value) VALUES ('readyEpochs', '4'), ` + row)
+			_, err := rawDB(t, s).Exec(`INSERT INTO settings (key, value) VALUES ('readyAttestations', '4'), ` + row)
 			require.NoError(t, err)
 
 			got, err := s.LoadSettings(ctx, defaults)
@@ -162,7 +162,7 @@ func TestSettingsFieldsCoverEveryField(t *testing.T) {
 	// Every field of fleet.Settings must have its own key: a field with
 	// `json:"-"` or omitempty would silently never be stored.
 	assert.ElementsMatch(t, []string{
-		"maxUnavailablePercent", "maxLeasedPercent", "maxIndependentPercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyEpochs", "minPeers",
+		"maxUnavailablePercent", "maxLeasedPercent", "maxIndependentPercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyAttestations", "readyStableFor", "minPeers",
 		"leaseTtl", "hostStaleAfter", "readinessTimeout",
 		"policyImage", "policyPackages", "policyReboot", "paused",
 		"pauseAfterCanaryImage", "pauseAfterCanaryPackages", "pauseAfterCanaryReboot", "readyPeerShare",

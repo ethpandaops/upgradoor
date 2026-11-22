@@ -44,7 +44,7 @@ func TestAuditLogRotates(t *testing.T) {
 	for i := range 40 {
 		a.Record(&Record{
 			Action: "override.set", Source: SourceController, User: "sam@example.org",
-			Teams: []string{"geth"}, Feature: "team_image_override", Container: "geth",
+			Teams: []string{"geth"}, Feature: "team_manage_image", Container: "geth",
 			Before: "nothing", After: "image ethpandaops/geth:fix", Result: Accepted,
 			Reason: string(rune('a' + i%26)),
 		})

@@ -155,7 +155,7 @@ func TestServer(t *testing.T) {
 
 	answer, err = c.Hold(t.Context(), &HoldRequest{Reason: "disk"})
 	require.NoError(t, err)
-	assert.Equal(t, "host held: the agent reports no needs and refuses all work until it is released",
+	assert.Equal(t, "host held: the agent refuses all work until it is released",
 		answer.Message)
 
 	answer, err = c.Hold(t.Context(), &HoldRequest{Release: true})

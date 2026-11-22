@@ -240,3 +240,115 @@ func TestMigrateContainerLabels(t *testing.T) {
 	require.NoError(t, err, "the removed setting is gone")
 	assert.Equal(t, fleet.PolicyManual, settings.PolicyImage)
 }
+
+// Step 3 drops the controller's hold columns, the holds in them with them:
+// the agents own their holds. The offline mark loses its "by". The removed
+// readyEpochs setting goes.
+func TestMigrateHolds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "upgradoor.db")
+
+	steps, err := loadMigrations()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(steps), 3)
+
+	s, ok := New(quietLog(), path).(*sqliteStore)
+	require.True(t, ok)
+
+	db := fileDB(t, path)
+	require.NoError(t, s.migrate(ctx, db, steps[:2]))
+
+	_, err = db.Exec(`
+		INSERT INTO hosts (name, cert_hash, first_seen, last_seen, hold_wanted, hold_reason, hold_by, hold_actor, offline)
+		VALUES
+			('free', 'h', 1, 1, 0, '', '', '', ''),
+			('teams', 'h', 1, 1, 1, 'debugging', 'team:reth,geth', 'bob',
+			 '{"reason":"broken on purpose","by":"team"}');
+		INSERT INTO settings (key, value) VALUES ('readyEpochs', '2'), ('paused', 'true');`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.migrate(ctx, db, steps))
+
+	rows, err := db.QueryContext(ctx, `SELECT name FROM pragma_table_info('hosts') WHERE name LIKE 'hold%'`)
+	require.NoError(t, err)
+
+	var left []string
+
+	for rows.Next() {
+		var name string
+		require.NoError(t, rows.Scan(&name))
+		left = append(left, name)
+	}
+
+	require.NoError(t, rows.Err())
+	require.NoError(t, rows.Close())
+	assert.Empty(t, left, "no hold column is left")
+
+	require.NoError(t, s.Start(ctx))
+	t.Cleanup(func() { _ = s.Stop() })
+
+	hosts, err := s.ListHosts(ctx)
+	require.NoError(t, err)
+	require.Len(t, hosts, 2)
+
+	byName := make(map[string]*fleet.Host, len(hosts))
+	for _, h := range hosts {
+		byName[h.Name] = h
+		assert.False(t, h.Held(), h.Name)
+	}
+
+	assert.Equal(t, &fleet.OfflineMark{Reason: "broken on purpose"}, byName["teams"].Offline)
+
+	settings, err := s.LoadSettings(ctx, fleet.DefaultSettings())
+	require.NoError(t, err, "the removed setting is gone")
+	assert.True(t, settings.Paused)
+}
+
+// Step 3 marks the members a lease was granted for as served.
+func TestMigrateServedMembers(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "upgradoor.db")
+
+	steps, err := loadMigrations()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(steps), 3)
+
+	s, ok := New(quietLog(), path).(*sqliteStore)
+	require.True(t, ok)
+
+	db := fileDB(t, path)
+	require.NoError(t, s.migrate(ctx, db, steps[:2]))
+
+	_, err = db.Exec(`
+		INSERT INTO rollouts (id, kind, key, state, created_at, updated_at, data)
+		VALUES ('r', 'packages', 'packages:x', 'active', 1, 2, '{"id":"r","kind":"packages","state":"active"}');
+		INSERT INTO rollout_hosts (rollout_id, host, state, stage, lease_id, updated_at) VALUES
+			('r', 'released', 'done', 3, 'l-1', 1),
+			('r', 'leased', 'leased', 3, 'l-2', 1),
+			('r', 'failed', 'failed', 3, '', 1),
+			('r', 'cancelled', 'cancelled', 3, '', 1),
+			('r', 'waiting', 'pending', 3, '', 1),
+			('r', 'gone', 'done', 3, '', 1);`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.migrate(ctx, db, steps))
+
+	require.NoError(t, s.Start(ctx))
+	t.Cleanup(func() { _ = s.Stop() })
+
+	r, err := s.GetRollout(ctx, "r")
+	require.NoError(t, err)
+
+	served := make(map[string]bool, len(r.Hosts))
+	for _, m := range r.Hosts {
+		served[m.Host] = m.Served
+	}
+
+	assert.Equal(t, map[string]bool{
+		"released": true, "leased": true, "failed": true, "cancelled": true, "waiting": false, "gone": false,
+	}, served)
+}

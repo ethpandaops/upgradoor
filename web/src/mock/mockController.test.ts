@@ -80,7 +80,7 @@ describe('MockController event streams', () => {
 
     const [snap] = await readEvents(res, 'snap');
     expect(Object.keys(snap?.data as object).sort()).toEqual(
-      ['a', 'c', 'd', 'h', 'i', 'im', 'le', 'm', 'n', 'pl', 'q', 'ro', 's', 'se', 'sl', 't', 'v'].sort()
+      ['a', 'c', 'd', 'h', 'i', 'im', 'le', 'm', 'n', 'pl', 'q', 'ro', 's', 'sl', 't', 'v'].sort()
     );
 
     // Nothing changed: publishing again says nothing.

@@ -8,17 +8,13 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// Needs returns the host's open needs sorted by ID, none while on hold:
+// Needs returns the host's open needs sorted by ID, a hold notwithstanding:
 // allowed manual needs (covering the observed need they replace), a target
 // or image need per managed container, the blocked packages, the reboot
-// need and the actions that are due. PullError is set while a lease's pull of the need's image has just
-// failed.
+// need and the actions that are due. PullError is set while a lease's pull
+// of the need's image has just failed.
 func Needs(policy *Policy, view *View, manual []protocol.Need) []protocol.Need {
 	needs := make([]protocol.Need, 0, len(manual)+len(view.Containers)+2)
-
-	if view.Hold.Active() {
-		return needs
-	}
 
 	manualContainers := make(map[string]struct{}, len(manual))
 	manualActions := make(map[string]struct{}, len(manual))

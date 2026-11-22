@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '../api/client';
+import { hasUnsavedWork } from '../hooks/useUnsavedWork';
 import { createHarness, renderWithApp } from '../test/harness';
 import { SettingsTab } from './SettingsTab';
 
@@ -35,14 +36,16 @@ describe('SettingsTab', () => {
     expect(rowOf(form, 'Max finality lag')).toHaveTextContent('epochs');
 
     const readiness = group('Readiness after an operation');
-    expect(within(readiness).getByLabelText('Ready epochs')).toHaveValue(1);
+    expect(within(readiness).getByLabelText('Ready attestations')).toHaveValue(2);
+    expect(rowOf(form, 'Ready attestations')).toHaveTextContent('slots');
+    expect(within(readiness).getByLabelText('Ready stable for')).toHaveValue('1m');
     expect(within(readiness).getByLabelText('Min peers')).toHaveValue(3);
     expect(within(group('Timeouts')).getByLabelText('Readiness timeout')).toHaveValue('30m');
     // Off by default; the fixture has it on at a quarter, which the line says.
     expect(within(readiness).getByLabelText('Ready peer share')).toHaveValue(0.25);
     expect(rowOf(form, 'Ready peer share')).toHaveTextContent('default 0');
     expect(rowOf(form, 'Ready peer share')).toHaveTextContent('× median');
-    expect(rowOf(form, 'Ready epochs')).not.toHaveTextContent('default');
+    expect(rowOf(form, 'Ready attestations')).not.toHaveTextContent('default');
 
     expect(within(group('Timeouts')).getByLabelText('Lease TTL')).toHaveValue('30m');
     expect(within(group('Timeouts')).getByLabelText('Host stale after')).toHaveValue('2m');
@@ -60,9 +63,6 @@ describe('SettingsTab', () => {
     expect(within(form).getByRole('status')).toHaveTextContent('No unsaved changes.');
     expect(screen.queryByRole('list', { name: 'Changes to save' })).not.toBeInTheDocument();
     expect(h.calls.filter(c => c.method === 'PUT')).toEqual([]);
-
-    // The data sources follow the settings.
-    expect(await screen.findByRole('region', { name: 'Beacon endpoints' })).toBeInTheDocument();
   });
 
   it('keeps the long description behind the info icon', async () => {
@@ -104,7 +104,7 @@ describe('SettingsTab', () => {
     await user.click(within(form).getByRole('switch', { name: 'Global pause' }));
 
     expect(within(rowOf(form, 'Max unavailable')).getByText('changed')).toBeInTheDocument();
-    expect(within(rowOf(form, 'Ready epochs')).queryByText('changed')).not.toBeInTheDocument();
+    expect(within(rowOf(form, 'Ready attestations')).queryByText('changed')).not.toBeInTheDocument();
     expect(within(form).getByRole('status')).toHaveTextContent('4 unsaved changes');
 
     const changes = within(screen.getByRole('list', { name: 'Changes to save' }))
@@ -170,7 +170,10 @@ describe('SettingsTab', () => {
     const cases: [string, string, string][] = [
       ['Max unavailable', '150', 'must be between 0 and 100'],
       ['Max finality lag', '1', 'must be at least 2'],
-      ['Ready epochs', '1.5', 'must be a whole number'],
+      ['Ready attestations', '1.5', 'must be a whole number'],
+      ['Ready attestations', '0', 'must be at least 1'],
+      ['Ready attestations', '33', 'must be at most 32'],
+      ['Ready stable for', '31m', 'must be at most 30m'],
       ['Min peers', '0', 'must be at least 1'],
       ['Ready peer share', '1.5', 'must be between 0 and 1'],
       ['Lease TTL', '30', 'must be a duration like 30m, 90s or 1h30m'],
@@ -196,9 +199,12 @@ describe('SettingsTab', () => {
 
     expect(screen.getByRole('button', { name: /^Save/ })).toBeDisabled();
     expect(within(form).getByRole('status')).toHaveTextContent('Fix the marked fields to save.');
+    // A reload of the page would lose the edits.
+    expect(hasUnsavedWork()).toBe(true);
 
     await user.click(screen.getByRole('button', { name: 'Discard changes' }));
     expect(within(form).getByLabelText('Max unavailable')).toHaveValue(10);
+    expect(hasUnsavedWork()).toBe(false);
     expect(within(form).queryByRole('alert')).not.toBeInTheDocument();
     expect(h.calls.filter(c => c.method === 'PUT')).toEqual([]);
   });
@@ -227,7 +233,7 @@ describe('SettingsTab', () => {
       'minPeers must be at most 5 on this fleet'
     );
     expect(input).toHaveAttribute('aria-invalid', 'true');
-    expect(within(rowOf(form, 'Ready epochs')).queryByRole('alert')).not.toBeInTheDocument();
+    expect(within(rowOf(form, 'Ready attestations')).queryByRole('alert')).not.toBeInTheDocument();
 
     // It was about the value that was sent: another value clears it.
     await user.clear(input);
@@ -238,9 +244,9 @@ describe('SettingsTab', () => {
   it('shows a failed save and keeps the edit', async () => {
     const { form, h, user } = await openSettings();
 
-    const input = within(form).getByLabelText('Ready epochs');
+    const input = within(form).getByLabelText('Ready attestations');
     await user.clear(input);
-    await user.type(input, '2');
+    await user.type(input, '3');
 
     // The token is no longer accepted when the save is sent: the controller answers 401.
     h.auth.getToken = () => Promise.resolve('stale-token');
@@ -249,7 +255,7 @@ describe('SettingsTab', () => {
 
     const alerts = await screen.findAllByRole('alert');
     expect(alerts.some(a => /Could not save the settings: .*HTTP 401/.test(a.textContent))).toBe(true);
-    expect(within(form).getByLabelText('Ready epochs')).toHaveValue(2);
+    expect(within(form).getByLabelText('Ready attestations')).toHaveValue(3);
     expect(screen.getByRole('button', { name: 'Save' })).toBeEnabled();
   });
 });

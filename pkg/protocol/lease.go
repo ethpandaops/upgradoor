@@ -108,9 +108,10 @@ type DirectiveKind string
 // Directive kinds. Directives never widen the verb set: roll and reboot only
 // create a need, which is then served under a lease like any other.
 const (
-	// DirectiveHold puts the host on controller hold.
+	// DirectiveHold sets the hold of Holder (ValidHolder) with By and Reason,
+	// replacing that holder's hold.
 	DirectiveHold DirectiveKind = "hold"
-	// DirectiveReleaseHold lifts a controller hold. It never lifts a local
+	// DirectiveReleaseHold lifts the hold of Holder. It never lifts the local
 	// hold.
 	DirectiveReleaseHold DirectiveKind = "release-hold"
 	// DirectiveRoll creates an image need for Container at the digest its
@@ -182,6 +183,8 @@ type Directive struct {
 	Withdraws string `json:"withdraws,omitempty"`
 	// Action names the configured action of an action directive.
 	Action string `json:"action,omitempty"`
+	// Holder is whose hold a hold or release-hold directive sets or lifts.
+	Holder string `json:"holder,omitempty"`
 }
 
 // DirectiveStatus is the agent's answer to a directive.

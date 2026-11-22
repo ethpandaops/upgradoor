@@ -83,12 +83,13 @@ type fakeNode struct {
 	// headRoot is the root of the head ("0x01" when empty). blocks are the
 	// blocks served by root; the head is served without one, as a block of
 	// headSlot that carries nothing and has no parent. committees are the
-	// attestation committees per slot, by committee index. syncing is what
-	// the node says about itself.
+	// attestation committees per slot, by committee index. syncing and
+	// elOffline are what the node says about itself.
 	headRoot   string
 	blocks     map[string]fakeBlock
 	committees map[uint64][][]uint64
 	syncing    bool
+	elOffline  bool
 	// committeesStatus, when set, answers a committees request of an epoch
 	// with that status.
 	committeesStatus map[uint64]int
@@ -258,7 +259,9 @@ func (n *fakeNode) handle(w http.ResponseWriter, r *http.Request) {
 			"finalized":          epoch,
 		}})
 	case "/eth/v1/node/syncing":
-		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{"is_syncing": n.syncing}})
+		writeJSON(w, http.StatusOK, map[string]any{"data": map[string]any{
+			"is_syncing": n.syncing, "el_offline": n.elOffline, "head_slot": strconv.FormatUint(n.headSlot, 10),
+		}})
 	case "/eth/v1/beacon/states/head/committees":
 		n.handleCommittees(w, r)
 	default:

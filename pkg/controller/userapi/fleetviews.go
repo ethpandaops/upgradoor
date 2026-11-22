@@ -88,8 +88,26 @@ func (s *Handler) writeBodyError(w http.ResponseWriter, err error) {
 	}
 }
 
+// Access is how much of the hosts u reads: everything with the feature
+// details or when the API runs open; otherwise the reduced view, with
+// the hosts a team of u owns a container on in full under the twin. The
+// audit log in full needs admin too.
+func (s *Handler) Access(u *authz.User) views.Access {
+	admin := u.Open || s.authz.HasFeature(u, authz.FeatureAdmin)
+
+	if u.Open || s.authz.HasFeature(u, authz.FeatureDetails) {
+		return views.Access{Full: true, Admin: admin}
+	}
+
+	return views.Access{
+		Admin:      admin,
+		Teams:      u.Teams,
+		OwnedHosts: s.authz.HasFeature(u, authz.TeamFeaturePrefix+authz.FeatureDetails),
+	}
+}
+
 // handleHosts serves GET /api/v1/hosts.
-func (s *Handler) handleHosts(w http.ResponseWriter, r *http.Request, _ *authz.User) {
+func (s *Handler) handleHosts(w http.ResponseWriter, r *http.Request, u *authz.User) {
 	ctx := r.Context()
 
 	hosts, err := s.opts.Store.ListHosts(ctx)
@@ -106,12 +124,14 @@ func (s *Handler) handleHosts(w http.ResponseWriter, r *http.Request, _ *authz.U
 		return
 	}
 
-	plan := s.opts.Scheduler.Plan()
+	plan := s.views.Plan()
 	now := s.now()
+	access := s.Access(u)
 	out := views.Hosts{Hosts: make([]views.HostListing, 0, len(hosts))}
 
 	for _, host := range hosts {
-		sum := views.Summarize(host, plan, now, settings.HostStaleAfter.Std())
+		sum := views.Summarize(host, &plan, now, settings.HostStaleAfter.Std())
+		sum = access.Summary(&sum)
 		out.Hosts = append(out.Hosts, views.Listing(&sum))
 	}
 
@@ -119,12 +139,13 @@ func (s *Handler) handleHosts(w http.ResponseWriter, r *http.Request, _ *authz.U
 }
 
 // handleHost serves GET /api/v1/hosts/{name}.
-func (s *Handler) handleHost(w http.ResponseWriter, r *http.Request, _ *authz.User) {
+func (s *Handler) handleHost(w http.ResponseWriter, r *http.Request, u *authz.User) {
 	detail, err := s.views.HostDetail(r.Context(), r.PathValue("name"))
+	access := s.Access(u)
 
 	switch {
 	case err == nil:
-		httpjson.Write(s.log, w, http.StatusOK, detail)
+		httpjson.Write(s.log, w, http.StatusOK, access.Detail(detail))
 	case errors.Is(err, store.ErrNotFound):
 		httpjson.Error(s.log, w, http.StatusNotFound, "unknown host")
 	default:
@@ -136,7 +157,7 @@ func (s *Handler) handleHost(w http.ResponseWriter, r *http.Request, _ *authz.Us
 // one page of the images the containers of the fleet run, one entry per
 // reference with its digests and the hosts on each. It pages like
 // handlePackages.
-func (s *Handler) handleImages(w http.ResponseWriter, r *http.Request, _ *authz.User) {
+func (s *Handler) handleImages(w http.ResponseWriter, r *http.Request, u *authz.User) {
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	after := r.URL.Query().Get("after")
 
@@ -161,7 +182,9 @@ func (s *Handler) handleImages(w http.ResponseWriter, r *http.Request, _ *authz.
 		return
 	}
 
-	out, err := views.NewImages(hosts, query, after, limit)
+	access := s.Access(u)
+
+	out, err := views.NewImages(hosts, query, after, limit, &access)
 	if err != nil {
 		httpjson.Error(s.log, w, http.StatusBadRequest, "after is not the next of a page")
 
@@ -173,10 +196,10 @@ func (s *Handler) handleImages(w http.ResponseWriter, r *http.Request, _ *authz.
 
 // handleRefreshImages serves POST /api/v1/images/refresh: every followed tag
 // is looked up at its registry now instead of at its next interval, which
-// needs the feature roll; a tag looked up within discovery.RefreshFloor is
+// needs the feature manage; a tag looked up within discovery.RefreshFloor is
 // left alone, and the answer says until when.
 func (s *Handler) handleRefreshImages(w http.ResponseWriter, r *http.Request, u *authz.User) {
-	if _, ok := s.authz.Allow(w, r, u, &authz.Requirement{Feature: authz.FeatureRoll}); !ok {
+	if _, ok := s.authz.Allow(w, r, u, &authz.Requirement{Feature: authz.FeatureManage}); !ok {
 		return
 	}
 
@@ -201,8 +224,13 @@ func (s *Handler) handleRefreshImages(w http.ResponseWriter, r *http.Request, u 
 // one page of the packages installed across the fleet, one entry per name
 // with its versions and the hosts on each. Without q it lists every package
 // in alphabetical order; with q the names that contain it, the best match
-// first. "after" is the "next" of the page before.
-func (s *Handler) handlePackages(w http.ResponseWriter, r *http.Request, _ *authz.User) {
+// first. "after" is the "next" of the page before. It needs the plain
+// feature details.
+func (s *Handler) handlePackages(w http.ResponseWriter, r *http.Request, u *authz.User) {
+	if _, ok := s.authz.Allow(w, r, u, &authz.Requirement{Feature: authz.FeatureDetails}); !ok {
+		return
+	}
+
 	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	after := r.URL.Query().Get("after")
 
@@ -244,7 +272,7 @@ func (s *Handler) handlePackages(w http.ResponseWriter, r *http.Request, _ *auth
 }
 
 // handleRollouts serves GET /api/v1/rollouts.
-func (s *Handler) handleRollouts(w http.ResponseWriter, r *http.Request, _ *authz.User) {
+func (s *Handler) handleRollouts(w http.ResponseWriter, r *http.Request, u *authz.User) {
 	limit, err := queryLimit(r, defaultRolloutLimit, maxRolloutLimit)
 	if err != nil {
 		httpjson.BadRequest(s.log, w, err)
@@ -259,7 +287,8 @@ func (s *Handler) handleRollouts(w http.ResponseWriter, r *http.Request, _ *auth
 		return
 	}
 
-	httpjson.Write(s.log, w, http.StatusOK, out)
+	access := s.Access(u)
+	httpjson.Write(s.log, w, http.StatusOK, access.Rollouts(out))
 }
 
 // handlePlan serves GET /api/v1/plan.
@@ -267,9 +296,16 @@ func (s *Handler) handlePlan(w http.ResponseWriter, _ *http.Request, _ *authz.Us
 	httpjson.Write(s.log, w, http.StatusOK, s.views.Plan())
 }
 
-// handleGetSettings serves GET /api/v1/settings.
-func (s *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request, _ *authz.User) {
-	settings, err := s.opts.Scheduler.Settings(r.Context())
+// handleGetSettings serves GET /api/v1/settings; it needs the feature admin.
+// The other views carry what they need of the settings: the policy of each
+// rollout and client, the threshold of the slot history.
+func (s *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request, u *authz.User) {
+	ctx, ok := s.authz.Allow(w, r, u, &authz.Requirement{Feature: authz.FeatureAdmin})
+	if !ok {
+		return
+	}
+
+	settings, err := s.opts.Scheduler.Settings(ctx)
 	if err != nil {
 		httpjson.InternalError(s.log, w, r, err)
 
@@ -283,7 +319,7 @@ func (s *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request, _ *a
 }
 
 // handleAudit serves GET /api/v1/audit, newest first, paged by "before".
-func (s *Handler) handleAudit(w http.ResponseWriter, r *http.Request, _ *authz.User) {
+func (s *Handler) handleAudit(w http.ResponseWriter, r *http.Request, u *authz.User) {
 	q := r.URL.Query()
 
 	limit, err := queryLimit(r, store.DefaultAuditLimit, store.MaxAuditLimit)
@@ -322,7 +358,8 @@ func (s *Handler) handleAudit(w http.ResponseWriter, r *http.Request, _ *authz.U
 		return
 	}
 
-	out := views.Audit{Entries: views.NonNil(entries)}
+	access := s.Access(u)
+	out := views.Audit{Entries: views.NonNil(access.Audit(entries))}
 
 	if len(out.Entries) > limit {
 		out.Entries = out.Entries[:limit]

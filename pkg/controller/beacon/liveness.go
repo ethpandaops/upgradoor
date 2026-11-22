@@ -2,6 +2,7 @@ package beacon
 
 import (
 	"cmp"
+	"maps"
 	"slices"
 	"sort"
 
@@ -37,9 +38,9 @@ type trackedHost struct {
 // published: the scheduler then finds the liveness missing or stale and keeps
 // the gate closed, and no host becomes ready by its attestations.
 
-// livenessEpochs is how many settled epochs are kept in memory: enough for
-// the longest readiness run (fleet.MaxReadyEpochs) and the gate.
-const livenessEpochs = fleet.MaxReadyEpochs + 8
+// livenessEpochs is how many settled epochs are kept in memory: more than
+// the scheduler asks for.
+const livenessEpochs = 16
 
 // epochLiveness is the liveness of one settled epoch, by host.
 type epochLiveness struct {
@@ -176,6 +177,117 @@ func (s *service) Liveness(epochs int) []fleet.Liveness {
 	}
 
 	return out
+}
+
+// The readiness check of a host with validators asks for the slots their
+// attestations were included for. Per host the newest attestedSlots of them
+// are kept in memory, from the same per-slot counts: a slot is added when a
+// count finds an attestation of the host's validators included and removed
+// when a recount (a reorg, changed ranges) no longer does. A slot that left
+// the tracker's window stays as it was last counted.
+
+// attestedSlots is how many attested slots are kept per host.
+const attestedSlots = fleet.MaxReadyAttestations
+
+// noteAttested updates the attested slots of the hosts in slot's counts:
+// before is what the slot was counted as last, now what it is counted as.
+func (t *slotTracker) noteAttested(slot uint64, before, now []fleet.HostSlotParticipation) {
+	attested := make(map[string]struct{}, len(now))
+
+	for i := range now {
+		if now[i].Included > 0 {
+			attested[now[i].Host] = struct{}{}
+			t.addAttested(now[i].Host, slot)
+		}
+	}
+
+	for i := range before {
+		if _, still := attested[before[i].Host]; !still && before[i].Included > 0 {
+			t.dropAttested(before[i].Host, slot)
+		}
+	}
+}
+
+// addAttested adds slot to the host's attested slots. The slice is replaced,
+// not changed: a published map shares it.
+func (t *slotTracker) addAttested(host string, slot uint64) {
+	slots := t.attested[host]
+
+	i, found := slices.BinarySearch(slots, slot)
+	if found || (i == 0 && len(slots) >= attestedSlots) {
+		return
+	}
+
+	next := make([]uint64, 0, min(len(slots)+1, attestedSlots))
+	next = append(next, slots[:i]...)
+	next = append(next, slot)
+	next = append(next, slots[i:]...)
+
+	if len(next) > attestedSlots {
+		next = next[len(next)-attestedSlots:]
+	}
+
+	t.attested[host] = next
+	t.attestedChanged = true
+}
+
+// dropAttested removes slot from the host's attested slots.
+func (t *slotTracker) dropAttested(host string, slot uint64) {
+	slots := t.attested[host]
+
+	i, found := slices.BinarySearch(slots, slot)
+	if !found {
+		return
+	}
+
+	next := slices.Delete(slices.Clone(slots), i, i+1)
+	if len(next) == 0 {
+		delete(t.attested, host)
+	} else {
+		t.attested[host] = next
+	}
+
+	t.attestedChanged = true
+}
+
+// forgetAttested drops the attested slots of hosts that are not tracked.
+func (t *slotTracker) forgetAttested(hosts []trackedHost) {
+	names := make(map[string]struct{}, len(hosts))
+	for i := range hosts {
+		names[hosts[i].name] = struct{}{}
+	}
+
+	for name := range t.attested {
+		if _, ok := names[name]; !ok {
+			delete(t.attested, name)
+			t.attestedChanged = true
+		}
+	}
+}
+
+// publishAttested makes the attested slots what AttestedSlots returns, when
+// they changed.
+func (s *service) publishAttested() {
+	if !s.slots.attestedChanged {
+		return
+	}
+
+	published := maps.Clone(s.slots.attested)
+	s.slots.attestedChanged = false
+
+	s.healthMu.Lock()
+	s.attested = published
+	s.healthMu.Unlock()
+}
+
+// AttestedSlots returns per host the newest slots, ascending, for which a
+// canonical block carries an attestation of its validators. The map and its
+// slices must not be changed.
+func (s *service) AttestedSlots() map[string][]uint64 {
+	s.healthMu.RLock()
+	defer s.healthMu.RUnlock()
+
+	return s.attested
 }
 
 // trackedHosts returns the validator ranges of the hosts ordered by start

@@ -56,7 +56,7 @@ func TestLoadConfigReadsEveryKey(t *testing.T) {
 		KeyFile:  "/etc/upgradoor/test.key",
 		CertFile: "/etc/upgradoor/test.crt",
 		Roles:    []string{"ethereum_node", "rpc"},
-		StateDir: "/var/lib/upgradoor-test",
+		StateDir: "/data/upgradoor-test",
 		Local: local.Config{
 			EntryUser:     "ops",
 			OverridesFile: "/home/ops/custom-overrides.yaml",
@@ -87,12 +87,12 @@ func TestLoadConfigAppliesTheDefaults(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.True(t, cfg.defaulted())
-	assert.Equal(t, DefaultKeyFile, cfg.KeyFile)
-	assert.Equal(t, DefaultCertFile, cfg.CertFile)
-	assert.Equal(t, DefaultStateDir, cfg.StateDir)
+	assert.Equal(t, "/etc/upgradoor/host.key", cfg.KeyFile)
+	assert.Equal(t, "/etc/upgradoor/host.crt", cfg.CertFile)
+	assert.Equal(t, "/data/upgradoor", cfg.StateDir)
 	assert.Equal(t, 30*time.Second, cfg.Controller.SyncInterval)
 	assert.Equal(t, local.DefaultSocket, cfg.Local.Socket.Path)
-	assert.Equal(t, filepath.Join(DefaultStateDir, "audit.log"), cfg.Local.AuditLog.File)
+	assert.Equal(t, "/data/upgradoor/audit.log", cfg.Local.AuditLog.File)
 	assert.Equal(t, "unix:///var/run/docker.sock", cfg.Host.Docker.Host)
 	assert.Equal(t, "/root/.docker/config.json", cfg.Host.Docker.AuthFile)
 	assert.Equal(t, plan.DefaultIgnore, cfg.Policy.DefaultPolicy)

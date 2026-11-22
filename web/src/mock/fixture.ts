@@ -16,11 +16,13 @@ import type {
   AuditEntry,
   Container,
   ContainerOverride,
+  ContainerStats,
   ContainerKind,
   HostDetail,
   Lease,
   Need,
   Package,
+  Resources,
   Rollout,
   RolloutHost,
   RolloutTarget,
@@ -29,6 +31,10 @@ import type {
 } from '../api/types';
 
 /** hex returns `len` deterministic hex characters for a seed. */
+
+/** MockRollout is a rollout as the mock stores it; its policy follows from the settings when it is served. */
+export type MockRollout = Omit<Rollout, 'policy'>;
+
 export function hex(seed: string, len = 64): string {
   let h = 1779033703 ^ seed.length;
   for (let i = 0; i < seed.length; i++) {
@@ -314,7 +320,7 @@ export interface MockData {
   hosts: Map<string, HostDetail>;
   /** seenAgo is the constant part of how long ago a host's agent synced, in seconds. */
   seenAgo: Map<string, number>;
-  rollouts: Rollout[];
+  rollouts: MockRollout[];
   leases: Lease[];
   audit: AuditEntry[];
   settings: Settings;
@@ -334,7 +340,8 @@ export function defaultSettings(): Settings {
     maxIndependentPercent: 10,
     minParticipationPercent: 90,
     maxFinalityLagEpochs: 3,
-    readyEpochs: 1,
+    readyAttestations: 2,
+    readyStableFor: '1m0s',
     minPeers: 3,
     leaseTtl: '30m0s',
     hostStaleAfter: '2m0s',
@@ -636,6 +643,11 @@ function buildHost(spec: HostSpec, index: number, at: (s: number) => string): Ho
   }
   upgradable.sort((a, b) => a.name.localeCompare(b.name));
 
+  const resources = hostResources(spec.name, index);
+  for (const c of containers) {
+    if (c.managed && c.state === 'running') c.stats = containerStats(spec.name, c, resources.cpu.busy ?? 0);
+  }
+
   const runningKernel = spec.reboot ? KERNEL_OLD : KERNEL_NEW;
   const uptime = spec.reboot ? 41 * 86400 + (hash(spec.name) % 80000) : 6 * 86400 + (hash(spec.name) % 300000);
   const headSlot = 181_000 + index;
@@ -688,8 +700,16 @@ function buildHost(spec: HostSpec, index: number, at: (s: number) => string): Ho
       blocked: upgradable.filter(u => u.blocked).length,
     },
     uptimeSeconds: uptime,
-    hold: { local: spec.localHold !== undefined, localReason: spec.localHold, controller: false },
-    holdWanted: false,
+    resources,
+    hold:
+      spec.localHold === undefined
+        ? { local: false }
+        : {
+            local: true,
+            localReason: spec.localHold,
+            holds: [{ holder: 'host', by: 'pk', reason: spec.localHold, at: at(3600) }],
+          },
+    holders: spec.localHold === undefined ? [] : ['host'],
     verbs: spec.name === 'tooling-1' ? ['roll', 'packages'] : ['roll', 'packages', 'reboot'],
     // The mock's host actions are added by seedHostActions (hostActions.ts).
     actions: [],
@@ -722,6 +742,47 @@ function buildHost(spec: HostSpec, index: number, at: (s: number) => string): Ho
     leases: [],
     history: [],
   };
+}
+
+const GIB = 2 ** 30;
+
+/**
+ * hostResources is a host's resource use: most hosts are comfortable, every
+ * eleventh is busy and every thirteenth is short of memory, so the fleet
+ * summary and the colours have something to show.
+ */
+function hostResources(host: string, index: number): Resources {
+  const cores = [8, 16, 32][hash(`cores/${host}`) % 3] ?? 16;
+  const total = [32, 64, 128][hash(`mem/${host}`) % 3] ?? 64;
+  const busy = index % 11 === 5 ? 93.4 : index % 7 === 2 ? 82.1 : 8 + (hash(`busy/${host}`) % 450) / 10;
+  const memShare = index % 13 === 7 ? 0.94 : index % 9 === 4 ? 0.85 : 0.35 + (hash(`used/${host}`) % 40) / 100;
+  const swapTotal = hash(`swap/${host}`) % 2 === 0 ? 4 * GIB : 0;
+  const load = (busy / 100) * cores;
+
+  return {
+    cpu: { cores, load1: load, load5: load * 0.9, load15: load * 0.8, busy },
+    memory: {
+      total: total * GIB,
+      available: Math.round(total * GIB * (1 - memShare)),
+      swapTotal,
+      swapUsed: swapTotal > 0 ? Math.round(swapTotal * (memShare > 0.9 ? 0.6 : 0.02)) : 0,
+    },
+  };
+}
+
+/** containerStats is a running managed container's share of its host: the EL takes the most. */
+function containerStats(host: string, c: Container, busy: number): ContainerStats {
+  const seed = hash(`stats/${host}/${c.name}`);
+  switch (c.kind) {
+    case 'el':
+      return { cpu: Math.round(busy * 5.5) / 10, memory: (8 + (seed % 16)) * GIB };
+    case 'cl':
+      return { cpu: Math.round(busy * 3) / 10, memory: (4 + (seed % 8)) * GIB };
+    case 'vc':
+      return { cpu: 0.4, memory: (0.5 + (seed % 10) / 10) * GIB, memoryLimit: 4 * GIB };
+    default:
+      return { cpu: 0.2, memory: (seed % 400) * 2 ** 20 };
+  }
 }
 
 /** A group rollout's key and title, as the scheduler writes them (groupKey, groupTitle). */
@@ -763,6 +824,9 @@ export type MockFleet = 'small' | 'quiet' | 'large' | 'huge';
 
 export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'small'): MockData {
   const at = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
+  // The readiness note of a validator host that attested again after an operation done then.
+  const attested = (doneSecondsAgo: number) =>
+    `ready: node at head with peers, validators attesting: 2 of 2 slots since ${at(doneSecondsAgo).slice(11, 19)}`;
 
   const hosts = new Map<string, HostDetail>();
   const seenAgo = new Map<string, number>();
@@ -850,7 +914,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     needId: need(host, prefix),
   });
 
-  const rollouts: Rollout[] = [
+  const rollouts: MockRollout[] = [
     {
       id: lighthouseRollout,
       ...groupRollout('cl', 'lighthouse', [imageTarget(LIGHTHOUSE_IMAGE, lhDigest)]),
@@ -859,6 +923,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       approved: false,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       canary: 'lighthouse-geth-1',
       createdBy: 'scheduler',
       createdAt: at(47 * 60),
@@ -882,6 +947,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       approved: false,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       canary: 'nimbus-nethermind-1',
       createdBy: 'scheduler',
       createdAt: at(3 * 3600 + 12 * 60),
@@ -909,6 +975,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       approved: false,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       canary: 'grandine-erigon-1',
       createdBy: 'scheduler',
       createdAt: at(95 * 60),
@@ -928,6 +995,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       approved: false,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       canary: 'lodestar-reth-1',
       createdBy: 'scheduler',
       createdAt: at(26 * 3600),
@@ -953,6 +1021,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       approved: false,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       canary: 'grandine-erigon-1',
       createdBy: 'scheduler',
       createdAt: at(3 * 86400 + 5 * 3600),
@@ -974,6 +1043,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       approved: false,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       canary: 'lighthouse-geth-1',
       createdBy: 'scheduler',
       createdAt: at(4 * 86400),
@@ -1000,6 +1070,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       approved: true,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       createdBy: 'alice@example.org',
       createdAt: at(5 * 86400),
       updatedAt: at(5 * 86400 - 240),
@@ -1029,8 +1100,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       grantedBy: 'scheduler',
       grantedAt: at(9 * 60),
       expiresAt: at(9 * 60 - 30 * 60),
-      // Done two minutes ago, at head with peers since: the node part of the
-      // readiness check waits for that to span one epoch (384 s).
+      // Done two minutes ago, at head with peers for 30 s: the node part of
+      // the readiness check waits for that to last a minute.
       agentDoneAt: at(2 * 60),
       operation: {
         leaseId: leaseVerifying,
@@ -1043,8 +1114,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
         ],
         disrupted: true,
       },
-      readiness: 'node at head with peers, waiting for it to stay so for 6m24s',
-      readyAt: at(2 * 60 - 5 - 384),
+      readiness: 'node at head with peers, waiting for it to stay so for 1m0s',
+      readyAt: at(-30),
     },
     {
       id: leaseGrandine,
@@ -1074,7 +1145,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
         ],
         disrupted: true,
       },
-      readiness: 'ready: node at head with peers, validators attesting',
+      readiness: attested(92 * 60),
       // What it was released on: a quarter of the fleet's median (readyPeerShare 0.25).
       peerChecks: [
         { layer: 'EL', peers: 27, median: 31, needs: 8 },
@@ -1096,7 +1167,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       grantedBy: 'scheduler',
       grantedAt: at(46 * 60),
       expiresAt: at(16 * 60),
-      // Released 7 minutes after done: not before one epoch (384 s) at head.
+      // Released 7 minutes after done.
       agentDoneAt: at(45 * 60),
       endedAt: at(38 * 60),
       operation: {
@@ -1110,7 +1181,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
         ],
         disrupted: true,
       },
-      readiness: 'ready: node at head with peers, validators attesting',
+      readiness: attested(45 * 60),
     },
     {
       id: leaseRpc,
@@ -1185,7 +1256,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     after: { certHash: hex('cert/prysm-geth-2') },
   });
   log(6 * 86400, 'bob@example.org', 'settings.update', 'settings', {
-    before: { ...defaults, maxUnavailablePercent: 5, readyEpochs: 2 },
+    before: { ...defaults, maxUnavailablePercent: 5, readyAttestations: 4 },
     after: { ...defaults },
   });
   log(5 * 86400, 'alice@example.org', 'action.reboot', abortedRollout, {
@@ -1193,6 +1264,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     staggered: true,
     force: false,
     ignoreBudget: false,
+    ignoreGate: false,
     reason: 'kernel test',
   });
   log(5 * 86400 - 240, 'alice@example.org', 'action.abort', abortedRollout, { reason: 'wrong selection' });
@@ -1235,7 +1307,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
   });
   log(78 * 60, 'scheduler', 'lease.released', 'grandine-erigon-1', {
     lease: leaseGrandine,
-    readiness: 'ready: node at head with peers, validators attesting',
+    readiness: attested(92 * 60),
   });
   log(78 * 60 - 1, 'scheduler', 'rollout.paused', grandineRollout, {
     reason: 'paused after the canary; resume to continue',
@@ -1253,7 +1325,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
   });
   log(38 * 60, 'scheduler', 'lease.released', 'lighthouse-geth-1', {
     lease: leaseCanary,
-    readiness: 'ready: node at head with peers, validators attesting',
+    readiness: attested(45 * 60),
   });
   // The lighthouse rollout paused after its canary too, and was resumed.
   log(38 * 60 - 1, 'scheduler', 'rollout.paused', lighthouseRollout, {

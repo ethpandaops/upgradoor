@@ -1,5 +1,5 @@
-// The data sources of the mock controller: two beacon endpoints, one of them
-// failing, and a validator ranges inventory built from the fleet's hosts plus
+// The data sources of the mock controller: three beacon endpoints (ok, behind
+// and down), and a validator ranges inventory built from the fleet's hosts plus
 // hosts upgradoor does not know.
 
 import type {
@@ -34,15 +34,32 @@ export class MockSources {
     const iso = (ms: number) => new Date(ms).toISOString();
 
     return {
+      chain: {},
       beacon: [
-        { label: 'https://bn-1.devnet.example', active: true, successAt: iso(now - 4_000), headSlot: 181_042 },
+        {
+          label: 'https://bn-1.devnet.example',
+          state: 'ok',
+          headSlot: 181_042,
+          headRoot: '0x8d3f1c0a6b2e4f7d9a1c3e5b7d9f1a3c5e7b9d1f3a5c7e9b1d3f5a7c9e1b3d5f',
+          finalizedEpoch: 5_655,
+          successAt: iso(now - 4_000),
+        },
         {
           label: 'https://bn-2.devnet.example',
-          active: false,
-          successAt: iso(now - 2 * 3600_000),
+          state: 'behind',
+          headSlot: 181_039,
+          headRoot: '0x1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d7e8f9a0b1c2d3e4f5a6b7c8d9e0f1a2b',
+          finalizedEpoch: 5_655,
+          successAt: iso(now - 6_000),
+        },
+        {
+          label: 'https://bn-3.devnet.example',
+          state: 'down',
           headSlot: 180_441,
+          finalizedEpoch: 5_636,
+          successAt: iso(now - 2 * 3600_000),
           error: 'GET /eth/v1/beacon/headers/head: HTTP 503: beacon node is syncing',
-          errorAt: iso(now - 2 * 3600_000 + 12_000),
+          errorAt: iso(now - 12_000),
         },
       ],
       validatorRanges: this.ranges(iso),

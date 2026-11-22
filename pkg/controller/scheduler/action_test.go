@@ -75,7 +75,8 @@ func TestEndLeaseOfARunningLease(t *testing.T) {
 	assert.Equal(t, fleet.LeaseRunning, l.State)
 	assert.Equal(t, &fleet.LeaseCancel{At: h.now, By: "alice", State: fleet.LeaseRunning, Reason: "taken away"}, l.Cancelled)
 	assert.True(t, h.assignment("a").Lease.Cancel)
-	assert.False(t, h.store.host("a").HoldWanted, "ending a lease holds nobody")
+	assert.False(t, h.store.host("a").Held(), "ending a lease holds nobody")
+	assert.Empty(t, h.svc.Plan().Hosts["a"].HoldRequests)
 
 	entry := h.store.lastAuditOf("action.end-lease")
 	assert.Equal(t, "alice", entry.Actor)
@@ -95,31 +96,55 @@ func TestEndLeaseOfARunningLease(t *testing.T) {
 	assert.Contains(t, again.Message, "was already ended by alice")
 	assert.Equal(t, "alice", h.lease(lease).Cancelled.By)
 
-	// The agent stopped: its report ends the lease, as failed.
+	// The agent stopped: its report ends the lease, as cancelled. No
+	// failure: the rollout pauses, the host is not broken nor shown failed.
 	h.operation("a", lease, protocol.PhaseDone, true, protocol.StepCancelled)
 	h.tick()
 
 	l = h.lease(lease)
-	assert.Equal(t, fleet.LeaseFailed, l.State)
-	assert.Equal(t, reasonEndedByOperator, l.Error)
+	assert.Equal(t, fleet.LeaseCancelled, l.State)
+	assert.Empty(t, l.Error)
 	assert.Nil(t, h.assignment("a").Lease)
+	assert.Empty(t, h.store.host("a").Broken)
+	assert.NotNil(t, h.store.lastAuditOf("lease.cancelled"))
 
-	r := h.rollout(l.Rollouts[packagesNeed("2.0").ID])
-	assert.Equal(t, fleet.RolloutHalted, r.State)
-	assert.Equal(t, "a: ended by operator", r.Reason)
-	assert.Equal(t, fleet.HostFailed, r.Host("a").State)
+	id := l.Rollouts[packagesNeed("2.0").ID]
+	r := h.rollout(id)
+	assert.Equal(t, fleet.RolloutActive, r.State)
+	assert.True(t, r.Paused)
+	assert.Equal(t, "a cancelled by alice", r.PauseReason)
+	assert.Equal(t, fleet.HostCancelled, r.Host("a").State)
+	assert.NotEqual(t, SlotFailed, h.svc.Plan().Hosts["a"].Slot)
 
-	// Nothing is offered to the host, held or not, until a person retries.
+	// Nothing is offered while the rollout is paused.
 	h.advance(time.Minute)
 	h.tick()
 	assert.Nil(t, h.assignment("a").Lease)
 	assert.Nil(t, h.assignment("b").Lease)
 
+	// A resume goes on with the others; the cancelled host waits for a retry.
+	_, err = h.svc.Resume(h.ctx, "bob", ScopeRequest{Rollout: id})
+	require.NoError(t, err)
+
+	for range 3 {
+		h.advance(time.Minute)
+		h.tick()
+	}
+
+	assert.Nil(t, h.assignment("a").Lease)
+	assert.NotNil(t, h.assignment("b").Lease)
+	assert.Equal(t, fleet.HostCancelled, h.rollout(id).Host("a").State, "a resume is no retry")
+	assert.Equal(t, fleet.RolloutActive, h.rollout(id).State, "a cancelled member keeps the rollout open")
+
+	_, err = h.svc.Retry(h.ctx, "bob", RolloutHostsRequest{Rollout: id, Hosts: []string{"a"}})
+	require.NoError(t, err)
+	assert.Equal(t, fleet.HostPending, h.rollout(id).Host("a").State)
+
 	_, err = h.svc.EndLease(h.ctx, "alice", EndLeaseRequest{Lease: lease})
 	require.ErrorIs(t, err, ErrInvalidAction, "a lease that has ended cannot be ended")
 }
 
-// A lease that is being verified when it is ended fails in the next
+// A lease that is being verified when it is ended is cancelled in the next
 // reconcile: its operation is over.
 func TestEndLeaseOfAVerifyingLease(t *testing.T) {
 	h, lease := leasedFleet(t)
@@ -132,8 +157,77 @@ func TestEndLeaseOfAVerifyingLease(t *testing.T) {
 	assert.Equal(t, fleet.LeaseVerifying, h.lease(lease).State)
 
 	h.tick()
-	assert.Equal(t, fleet.LeaseFailed, h.lease(lease).State)
-	assert.Equal(t, reasonEndedByOperator, h.lease(lease).Error)
+	assert.Equal(t, fleet.LeaseCancelled, h.lease(lease).State)
+	assert.Equal(t, fleet.HostCancelled, h.rollout(h.openRollouts()[0].ID).Host("a").State)
+}
+
+// A person lets a rollout pass the gate: the flag is stored and audited, and
+// setting it again changes nothing.
+func TestIgnoreGateAction(t *testing.T) {
+	h, _ := leasedFleet(t)
+	id := h.openRollouts()[0].ID
+
+	res, err := h.svc.IgnoreGate(h.ctx, "alice", ScopeRequest{Rollout: id, Reason: "beacon nodes down"})
+	require.NoError(t, err)
+	assert.Equal(t, id, res.Rollout)
+	assert.True(t, h.rollout(id).IgnoreGate)
+
+	entry := h.store.lastAuditOf("action.ignore-gate")
+	assert.Equal(t, "alice", entry.Actor)
+	assert.Equal(t, id, entry.Target)
+	assert.Equal(t, map[string]any{
+		keyBefore: map[string]any{keyIgnoreGate: false},
+		keyAfter:  map[string]any{keyIgnoreGate: true},
+		keyReason: "beacon nodes down",
+	}, entry.Detail)
+
+	_, err = h.svc.IgnoreGate(h.ctx, "bob", ScopeRequest{Rollout: id})
+	require.NoError(t, err)
+	assert.Equal(t, 1, h.audited("action.ignore-gate"))
+
+	_, err = h.svc.IgnoreGate(h.ctx, "alice", ScopeRequest{Rollout: "nope"})
+	require.ErrorIs(t, err, ErrUnknownRollout)
+}
+
+// A person approves a verifying lease: it is released in the next reconcile
+// without waiting for readiness, and its host counts as the canary's success.
+// Only a verifying lease of a member can be approved.
+func TestApproveLease(t *testing.T) {
+	h, lease := leasedFleet(t)
+	id := h.openRollouts()[0].ID
+
+	_, err := h.svc.ApproveLease(h.ctx, "alice", ApproveLeaseRequest{Rollout: id, Host: "a"})
+	require.ErrorIs(t, err, ErrInvalidAction, "a granted lease is not verifying")
+	_, err = h.svc.ApproveLease(h.ctx, "alice", ApproveLeaseRequest{Rollout: id, Host: "b"})
+	require.ErrorIs(t, err, ErrInvalidAction, "b holds no lease")
+	_, err = h.svc.ApproveLease(h.ctx, "alice", ApproveLeaseRequest{Rollout: id, Host: "c"})
+	require.ErrorIs(t, err, ErrUnknownHost)
+
+	h.operation("a", lease, protocol.PhaseDone, true, protocol.StepDone)
+	h.tick()
+	require.Equal(t, fleet.LeaseVerifying, h.lease(lease).State)
+
+	res, err := h.svc.ApproveLease(h.ctx, "alice", ApproveLeaseRequest{Rollout: id, Host: "a", Reason: "no liveness"})
+	require.NoError(t, err)
+	assert.Equal(t, []string{"a"}, res.Hosts)
+
+	l := h.lease(lease)
+	assert.Equal(t, fleet.LeaseVerifying, l.State, "released by the reconcile")
+	assert.Equal(t, &fleet.LeaseApproval{At: h.now, By: "alice", Reason: "no liveness"}, l.Approved)
+
+	entry := h.store.lastAuditOf("action.approve-lease")
+	assert.Equal(t, "a", entry.Target)
+	assert.Equal(t, map[string]any{
+		keyLease: lease, keyRollouts: []string{id}, "readiness": l.Readiness, keyReason: "no liveness",
+	}, entry.Detail)
+
+	h.tick()
+	assert.Equal(t, fleet.LeaseReleased, h.lease(lease).State)
+	assert.Equal(t, "alice", h.store.lastAuditOf("lease.released").Detail["approvedBy"])
+	assert.Equal(t, fleet.HostDone, h.rollout(id).Host("a").State)
+
+	h.tick()
+	assert.NotNil(t, h.assignment("b").Lease, "the canary succeeded")
 }
 
 // A retried host whose ended lease did its step and whose need is gone is
@@ -150,11 +244,14 @@ func TestRetryAfterAnEndedLeaseRechecksReadiness(t *testing.T) {
 	_, err := h.svc.EndLease(h.ctx, "alice", EndLeaseRequest{Lease: lease})
 	require.NoError(t, err)
 	h.tick()
-	require.Equal(t, fleet.RolloutHalted, h.rollout(id).State)
+	require.Equal(t, fleet.HostCancelled, h.rollout(id).Host("a").State)
+	require.True(t, h.rollout(id).Paused)
 	h.sync("a", func(st *protocol.SyncRequest) { st.Operation = nil })
 
 	_, err = h.svc.Retry(h.ctx, "alice", RolloutHostsRequest{Rollout: id, Hosts: []string{"a"}})
 	require.NoError(t, err)
+
+	assert.False(t, h.rollout(id).Paused, "the pause of the cancel ends with the retry")
 
 	m := h.rollout(id).Host("a")
 	require.Equal(t, fleet.HostLeased, m.State, "not done without the readiness check")
@@ -180,33 +277,40 @@ func TestRetryAfterAnEndedLeaseRechecksReadiness(t *testing.T) {
 }
 
 // A lease that the agent has not started is no longer offered once it is
-// ended. However it goes on from there, it ends as failed and never as
-// expired: an expired lease would hand the host the same work at once.
+// ended. It ends as cancelled, never as expired (an expired lease would hand
+// the host the same work at once), or as failed when a step failed.
 func TestEndLeaseOfAGrantedLease(t *testing.T) {
 	tests := []struct {
 		name string
 		// then is what happens after the lease was ended.
 		then func(h *harness, lease string)
-		want string
+		want fleet.LeaseState
 	}{
 		{
 			name: "the agent declines it",
 			then: func(h *harness, lease string) {
 				h.operation("a", lease, protocol.PhaseDone, false, protocol.StepRefused)
 			},
-			want: reasonEndedByOperator,
+			want: fleet.LeaseCancelled,
 		},
 		{
 			name: "the agent never had it: its next sync carries no operation",
 			then: func(h *harness, _ string) { h.advance(2 * time.Second) },
-			want: reasonEndedByOperator,
+			want: fleet.LeaseCancelled,
+		},
+		{
+			name: "the agent stopped it",
+			then: func(h *harness, lease string) {
+				h.operation("a", lease, protocol.PhaseFailed, true, protocol.StepCancelled)
+			},
+			want: fleet.LeaseCancelled,
 		},
 		{
 			name: "the agent had started it and fails",
 			then: func(h *harness, lease string) {
 				h.operation("a", lease, protocol.PhaseFailed, true, protocol.StepFailed)
 			},
-			want: reasonAgentFailed,
+			want: fleet.LeaseFailed,
 		},
 	}
 
@@ -228,9 +332,19 @@ func TestEndLeaseOfAGrantedLease(t *testing.T) {
 			h.tick()
 
 			l := h.lease(lease)
-			assert.Equal(t, fleet.LeaseFailed, l.State)
-			assert.Equal(t, tt.want, l.Error)
-			assert.Equal(t, fleet.RolloutHalted, h.rollout(l.Rollouts[packagesNeed("2.0").ID]).State)
+			assert.Equal(t, tt.want, l.State)
+
+			r := h.rollout(l.Rollouts[packagesNeed("2.0").ID])
+			if tt.want == fleet.LeaseFailed {
+				assert.Equal(t, fleet.RolloutHalted, r.State)
+				assert.Equal(t, fleet.HostFailed, r.Host("a").State)
+
+				return
+			}
+
+			assert.Equal(t, fleet.RolloutActive, r.State)
+			assert.True(t, r.Paused)
+			assert.Equal(t, fleet.HostCancelled, r.Host("a").State)
 		})
 	}
 }
@@ -259,14 +373,16 @@ func TestHoldIsIndependentOfAnEndedLease(t *testing.T) {
 
 	_, err := h.svc.Hold(h.ctx, "alice", HoldRequest{Hosts: []string{"a"}, Reason: "look at it"})
 	require.NoError(t, err)
+	h.obeyHolds("a")
 
 	_, err = h.svc.EndLease(h.ctx, "alice", EndLeaseRequest{Lease: lease})
 	require.NoError(t, err)
-	assert.Equal(t, "look at it", h.store.host("a").HoldReason, "the hold is as the person set it")
+	assert.Equal(t, "look at it", h.store.host("a").HoldOf(fleet.HolderStaff).Reason, "the hold is as the person set it")
 
 	_, err = h.svc.Unhold(h.ctx, "alice", HoldRequest{Hosts: []string{"a"}})
 	require.NoError(t, err)
-	assert.False(t, h.store.host("a").HoldWanted)
+	h.obeyHolds("a")
+	assert.False(t, h.store.host("a").Held())
 	assert.NotNil(t, h.lease(lease).Cancelled)
 }
 
@@ -436,8 +552,8 @@ func TestRetryOfHostsIsAboutThoseHosts(t *testing.T) {
 			res, err := retry("c", "ghost")
 			require.ErrorIs(t, err, ErrInvalidAction)
 			require.ErrorContains(t, err, "no host could be retried: "+
-				"c has neither failed nor been skipped in the rollout; "+
-				"ghost has neither failed nor been skipped in the rollout")
+				"c has neither failed, been cancelled nor been skipped in the rollout; "+
+				"ghost has neither failed, been cancelled nor been skipped in the rollout")
 			assert.Empty(t, res.Hosts)
 			assert.Equal(t, before, r.rollout(id))
 			assert.Len(t, r.store.auditActions(), audits)
@@ -447,7 +563,7 @@ func TestRetryOfHostsIsAboutThoseHosts(t *testing.T) {
 			res, err = retry("a", "c")
 			require.NoError(t, err)
 			assert.Equal(t, []string{"a"}, res.Hosts)
-			assert.Equal(t, map[string]string{"c": "has neither failed nor been skipped in the rollout"},
+			assert.Equal(t, map[string]string{"c": "has neither failed, been cancelled nor been skipped in the rollout"},
 				res.Rejected)
 			assert.Equal(t, "1 host(s) retried; the rollout stays halted: b still failed", res.Message)
 
@@ -515,134 +631,101 @@ func TestRetryOfTheRolloutKeepsItsMeaning(t *testing.T) {
 	}
 }
 
-func asTeam(ctx context.Context) context.Context {
-	return WithAuthorization(ctx, Authorization{By: "team_hold", Teams: []string{"lighthouse"}})
-}
-
 func asStaff(ctx context.Context) context.Context {
-	return WithAuthorization(ctx, Authorization{By: "hold", Teams: []string{"panda"}})
+	return WithAuthorization(ctx, Authorization{By: "manage", Teams: []string{"panda"}})
 }
 
-// TestHoldRemembersWhoSetIt: a hold set through the team feature is a
-// team's; a hold of staff stays staff's when a team sets it again; every
-// other writer of a hold makes it staff's.
-func TestHoldRemembersWhoSetIt(t *testing.T) {
+// TestHoldsPerHolder: the plain feature sets and lifts staff's hold and
+// lifts any hold it names; team_manage sets and lifts the holds of the
+// request's teams that own a managed container of the host, and no other.
+func TestHoldsPerHolder(t *testing.T) {
 	h := newHarness(t)
-	h.addHost("a", 0, packagesNeed("2.0"))
-	h.tick()
-
-	hold := func(ctx context.Context, reason string) {
-		_, err := h.svc.Hold(ctx, "alice", HoldRequest{Hosts: []string{"a"}, Reason: reason})
-		require.NoError(t, err)
-	}
-	unhold := func(ctx context.Context) {
-		_, err := h.svc.Unhold(ctx, "alice", HoldRequest{Hosts: []string{"a"}})
-		require.NoError(t, err)
-	}
-	by := func() string { return h.store.host("a").HoldBy }
-	teamHold := fleet.TeamHold([]string{"lighthouse"})
-
-	hold(asTeam(h.ctx), "ours")
-	assert.True(t, h.store.host("a").HoldWanted)
-	assert.Equal(t, teamHold, by())
-
-	entry := h.store.lastAuditOf("action.hold")
-	assert.Equal(t, map[string]any{keyHoldWanted: true, keyHoldReason: "ours", keyHoldBy: teamHold},
-		entry.Detail[keyAfter])
-	assert.Equal(t, "team_hold", entry.Detail[keyAuthorizedBy])
-
-	// The team again: still the team's.
-	hold(asTeam(h.ctx), "ours, still")
-	assert.Equal(t, teamHold, by())
-
-	// Staff over it: staff's, and the entry says that it was a team's.
-	hold(asStaff(h.ctx), "staff")
-	assert.Empty(t, by())
-
-	entry = h.store.lastAuditOf("action.hold")
-	assert.Equal(t, map[string]any{keyHoldWanted: true, keyHoldReason: "ours, still", keyHoldBy: teamHold},
-		entry.Detail[keyBefore])
-	assert.Equal(t, map[string]any{keyHoldWanted: true, keyHoldReason: "staff", keyHoldBy: holdByStaff},
-		entry.Detail[keyAfter])
-
-	// A team cannot make it its own by setting it again, nor lift it: the
-	// scheduler asks again under its lock what the API asked before.
-	audits := len(h.store.auditActions())
-
-	_, err := h.svc.Hold(asTeam(h.ctx), "alice", HoldRequest{Hosts: []string{"a"}, Reason: "ours now?"})
-	require.ErrorIs(t, err, ErrForbidden)
-	require.ErrorContains(t, err, "team_hold does not change the hold on host a (set by staff)")
-
-	_, err = h.svc.Unhold(asTeam(h.ctx), "alice", HoldRequest{Hosts: []string{"a"}})
-	require.ErrorIs(t, err, ErrForbidden)
-	require.ErrorContains(t, err, "team_hold does not lift the hold on host a (set by staff)")
-
-	// Also with admin next to the twin: what allowed the hold is the twin.
-	_, err = h.svc.Unhold(WithAuthorization(h.ctx, Authorization{By: "team_hold,admin"}), "alice",
-		HoldRequest{Hosts: []string{"a"}})
-	require.ErrorIs(t, err, ErrForbidden)
-
-	assert.True(t, h.store.host("a").HoldWanted)
-	assert.Equal(t, "staff", h.store.host("a").HoldReason)
-	assert.Empty(t, by())
-	assert.Len(t, h.store.auditActions(), audits, "a refusal changes and records nothing")
-
-	unhold(asStaff(h.ctx))
-	assert.False(t, h.store.host("a").HoldWanted)
-	assert.Empty(t, by())
-
-	// Without an authorization (a caller that is not the API): staff's.
-	hold(h.ctx, "plain")
-	assert.Empty(t, by())
-	unhold(h.ctx)
-
-	// A request allowed by the plain feature of a login that also is in
-	// teams: staff's. The feature decides, not the teams.
-	hold(WithAuthorization(h.ctx, Authorization{By: "hold", Teams: []string{"lighthouse"}}), "x")
-	assert.Empty(t, by())
-	unhold(h.ctx)
-
-	// The end of a lease leaves a team's hold what it is, and whose it is
-	// survives a restart, like the reason does.
-	hold(asTeam(h.ctx), "ours")
-	require.Equal(t, teamHold, by())
-
-	lease := openLeaseOf(t, h, "a")
-	_, err = h.svc.EndLease(h.ctx, "bob", EndLeaseRequest{Lease: lease})
-	require.NoError(t, err)
-
-	h.restart()
-	h.tick()
-	assert.Equal(t, "ours", h.store.host("a").HoldReason)
-	assert.Equal(t, teamHold, by())
-}
-
-// A team lifts only a hold that one of its teams set; the hold records the
-// teams of the request that own a container of the host.
-func TestTeamLiftsOnlyItsOwnHold(t *testing.T) {
-	h := newHarness(t)
-	host := h.addHost("a", 0)
+	host := h.addHost("a", 0, packagesNeed("2.0"))
 	host.Status.Containers = []protocol.Container{
 		{Name: "geth", Managed: true, Kind: protocol.KindEL, Team: "geth"},
 		{Name: "beacon", Managed: true, Kind: protocol.KindCL, Team: "lighthouse"},
 	}
 	h.store.putHost(host)
+	h.tick()
 
 	as := func(teams ...string) context.Context {
-		return WithAuthorization(h.ctx, Authorization{By: "team_hold", Teams: teams})
+		return WithAuthorization(h.ctx, Authorization{By: "team_manage", Teams: teams})
 	}
+	hold := func(ctx context.Context, reason string) {
+		t.Helper()
 
-	_, err := h.svc.Hold(as("geth", "other"), "gina", HoldRequest{Hosts: []string{"a"}, Reason: "debug"})
-	require.NoError(t, err)
-	assert.Equal(t, "team:geth", h.store.host("a").HoldBy)
+		_, err := h.svc.Hold(ctx, "alice", HoldRequest{Hosts: []string{"a"}, Reason: reason})
+		require.NoError(t, err)
+		h.obeyHolds("a")
+	}
+	unhold := func(ctx context.Context, holders ...string) error {
+		_, err := h.svc.Unhold(ctx, "bob", HoldRequest{Hosts: []string{"a"}, Holders: holders})
+		h.obeyHolds("a")
 
-	_, err = h.svc.Unhold(as("lighthouse"), "lena", HoldRequest{Hosts: []string{"a"}})
+		return err
+	}
+	holders := func() []string { return h.store.host("a").Status.Hold.Holders() }
+
+	// One hold per team of the request that owns a container of the host.
+	hold(as("geth", "lighthouse", "other"), "ours")
+	assert.Equal(t, []string{"geth", "lighthouse"}, holders())
+
+	entry := h.store.lastAuditOf("action.hold")
+	assert.Equal(t, "lighthouse", entry.Detail[keyHolder])
+	assert.Equal(t, map[string]any{"held": false}, entry.Detail[keyBefore])
+	assert.Equal(t, map[string]any{"held": true, "by": "alice", keyReason: "ours"}, entry.Detail[keyAfter])
+	assert.Equal(t, "team_manage", entry.Detail[keyAuthorizedBy])
+	assert.NotEmpty(t, entry.Detail["directive"])
+
+	hold(asStaff(h.ctx), "staff")
+	assert.Equal(t, []string{fleet.HolderStaff, "geth", "lighthouse"}, holders())
+	assert.Equal(t, "held by staff, geth, lighthouse", h.store.host("a").HeldReason())
+
+	// A team lifts its own holds, all of them or the ones it names; never
+	// staff's or another team's. A refusal changes and records nothing.
+	audits := len(h.store.auditActions())
+
+	err := unhold(as("geth"), fleet.HolderStaff)
 	require.ErrorIs(t, err, ErrForbidden)
-	require.ErrorContains(t, err, "team_hold does not lift the hold on host a (set by team geth)")
+	require.ErrorContains(t, err, "team_manage does not lift the hold of staff on host a")
+	require.ErrorContains(t, unhold(as("geth"), "lighthouse"), "does not lift the hold of lighthouse on host a")
+	require.ErrorContains(t, unhold(as("other")), "team_manage does not cover host a")
 
-	_, err = h.svc.Unhold(as("geth"), "gus", HoldRequest{Hosts: []string{"a"}})
-	require.NoError(t, err)
-	assert.False(t, h.store.host("a").HoldWanted)
+	_, err = h.svc.Hold(as("other"), "alice", HoldRequest{Hosts: []string{"a"}})
+	require.ErrorIs(t, err, ErrForbidden)
+	assert.Len(t, h.store.auditActions(), audits)
+
+	require.NoError(t, unhold(as("geth", "lighthouse"), "geth"))
+	assert.Equal(t, []string{fleet.HolderStaff, "lighthouse"}, holders())
+
+	entry = h.store.lastAuditOf("action.unhold")
+	assert.Equal(t, "geth", entry.Detail[keyHolder])
+	assert.Equal(t, map[string]any{"held": true, "by": "alice", keyReason: "ours"}, entry.Detail[keyBefore])
+	assert.Equal(t, map[string]any{"held": false, "by": "bob", keyReason: ""}, entry.Detail[keyAfter])
+
+	// The plain feature lifts staff's hold by default, a team's by name.
+	require.NoError(t, unhold(asStaff(h.ctx)))
+	assert.Equal(t, []string{"lighthouse"}, holders())
+
+	require.NoError(t, unhold(asStaff(h.ctx), "lighthouse"))
+	assert.Empty(t, holders())
+
+	// A request allowed by the plain feature of a login that also is in
+	// teams sets staff's hold: the feature decides, not the teams.
+	hold(WithAuthorization(h.ctx, Authorization{By: "manage", Teams: []string{"lighthouse"}}), "x")
+	assert.Equal(t, []string{fleet.HolderStaff}, holders())
+
+	// A hold names no holders.
+	_, err = h.svc.Hold(h.ctx, "alice", HoldRequest{Hosts: []string{"a"}, Holders: []string{"geth"}})
+	require.ErrorIs(t, err, ErrInvalidAction)
+
+	// The holds are the agent's: a restart of the controller keeps them.
+	hold(as("geth"), "ours")
+
+	h.restart()
+	h.tick()
+	assert.Equal(t, []string{fleet.HolderStaff, "geth"}, holders())
+	assert.Equal(t, "ours", h.store.host("a").HoldOf("geth").Reason)
 }
 
 // TestUnholdOfAHostThatIsNotHeld changes nothing and writes no audit entry.
@@ -659,19 +742,14 @@ func TestUnholdOfAHostThatIsNotHeld(t *testing.T) {
 	res, err := h.svc.Unhold(h.ctx, "alice", HoldRequest{Hosts: []string{"a"}})
 	require.NoError(t, err)
 	assert.Empty(t, res.Hosts)
-	assert.Equal(t, "hold lifted on 0 host(s); 1 host(s) were not held", res.Message)
+	assert.Equal(t, "release requested on 0 host(s), waiting for the hosts; 1 host(s) had no such hold", res.Message)
 	assert.Equal(t, audits, h.store.auditActions())
 
-	// Through the team feature as well: there is no hold to refuse.
-	res, err = h.svc.Unhold(asTeam(h.ctx), "alice", HoldRequest{Hosts: []string{"a"}})
-	require.NoError(t, err)
-	assert.Empty(t, res.Hosts)
-	assert.Equal(t, audits, h.store.auditActions())
-
+	// The hold of "b" is only requested: lifting it takes the request back.
 	res, err = h.svc.Unhold(h.ctx, "alice", HoldRequest{Hosts: []string{"a", "b"}})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"b"}, res.Hosts)
-	assert.Equal(t, "hold lifted on 1 host(s); 1 host(s) were not held", res.Message)
+	assert.Equal(t, "release requested on 1 host(s), waiting for the hosts; 1 host(s) had no such hold", res.Message)
 	assert.Equal(t, append(audits, "action.unhold"), h.store.auditActions())
 }
 
@@ -774,43 +852,43 @@ func TestActionsRecordTheirAuthorization(t *testing.T) {
 		assert.Equal(t, "alice", entry.Actor)
 	}
 
-	_, err := h.svc.Pause(as("supervise"), "alice", ScopeRequest{Rollout: id})
+	_, err := h.svc.Pause(as("manage"), "alice", ScopeRequest{Rollout: id})
 	require.NoError(t, err)
-	recorded("action.pause", "supervise")
+	recorded("action.pause", "manage")
 
-	_, err = h.svc.Resume(as("supervise"), "alice", ScopeRequest{Rollout: id})
+	_, err = h.svc.Resume(as("manage"), "alice", ScopeRequest{Rollout: id})
 	require.NoError(t, err)
-	recorded("action.resume", "supervise")
+	recorded("action.resume", "manage")
 
 	h.failLease("a")
 
-	_, err = h.svc.Retry(as("team_recover"), "alice", RolloutHostsRequest{Rollout: id, Hosts: []string{"a"}})
+	_, err = h.svc.Retry(as("team_manage"), "alice", RolloutHostsRequest{Rollout: id, Hosts: []string{"a"}})
 	require.NoError(t, err)
-	recorded("action.retry", "team_recover")
+	recorded("action.retry", "team_manage")
 
-	_, err = h.svc.Skip(as("team_recover"), "alice", RolloutHostsRequest{Rollout: id, Hosts: []string{"c"}})
+	_, err = h.svc.Skip(as("team_manage"), "alice", RolloutHostsRequest{Rollout: id, Hosts: []string{"c"}})
 	require.NoError(t, err)
-	recorded("action.skip", "team_recover")
+	recorded("action.skip", "team_manage")
 
 	h.sync("a", func(st *protocol.SyncRequest) { st.Operation = nil })
 	h.tick()
 
 	lease := openLeaseOf(t, h, "")
-	_, err = h.svc.EndLease(as("recover"), "alice", EndLeaseRequest{Lease: lease})
+	_, err = h.svc.EndLease(as("manage"), "alice", EndLeaseRequest{Lease: lease})
 	require.NoError(t, err)
-	recorded("action.end-lease", "recover")
+	recorded("action.end-lease", "manage")
 
-	_, err = h.svc.Abort(as("supervise"), "alice", ScopeRequest{Rollout: id})
+	_, err = h.svc.Abort(as("manage"), "alice", ScopeRequest{Rollout: id})
 	require.NoError(t, err)
-	recorded("action.abort", "supervise")
+	recorded("action.abort", "manage")
 
-	_, err = h.svc.Roll(as("team_roll"), "alice", RollRequest{Hosts: []string{"b"}, Staggered: true})
+	_, err = h.svc.Roll(as("team_manage"), "alice", RollRequest{Hosts: []string{"b"}, Staggered: true})
 	require.NoError(t, err)
-	recorded("action.roll", "team_roll")
+	recorded("action.roll", "team_manage")
 
-	_, err = h.svc.Reboot(as("reboot,admin"), "alice", RebootRequest{Hosts: []string{"b"}, Force: true})
+	_, err = h.svc.Reboot(as("manage"), "alice", RebootRequest{Hosts: []string{"b"}, Force: true})
 	require.NoError(t, err)
-	recorded("action.reboot", "reboot,admin")
+	recorded("action.reboot", "manage")
 
 	_, err = h.svc.Pause(as("admin"), "alice", ScopeRequest{})
 	require.NoError(t, err)
@@ -876,7 +954,7 @@ func TestRollAction(t *testing.T) {
 	h.addHost("held", 0)
 	h.sync("held", func(st *protocol.SyncRequest) {
 		st.Containers = []protocol.Container{geth}
-		st.Hold.Local = true
+		st.Hold = protocol.Hold{Local: true, Holds: []protocol.HostHold{{Holder: protocol.HolderHost}}}
 	})
 	h.addHost("noverb", 0)
 	h.sync("noverb", func(st *protocol.SyncRequest) {
@@ -897,7 +975,7 @@ func TestRollAction(t *testing.T) {
 
 	assert.Equal(t, []string{"ok"}, res.Hosts)
 	assert.Equal(t, map[string]string{
-		"held":       "held",
+		"held":       "held by the host",
 		"noverb":     "verb roll not allowed by the agent",
 		"onlycustom": "no managed container to roll",
 		"silent":     "agent silent",
@@ -987,7 +1065,7 @@ func TestRollAction(t *testing.T) {
 
 		res, err := h.svc.Roll(h.ctx, "alice", RollRequest{Hosts: []string{"held"}})
 		require.ErrorIs(t, err, ErrInvalidAction)
-		assert.Equal(t, map[string]string{"held": "held"}, res.Rejected)
+		assert.Equal(t, map[string]string{"held": "held by the host"}, res.Rejected)
 
 		res, err = h.svc.Roll(h.ctx, "alice", RollRequest{Hosts: []string{"ok"}, Containers: []string{"nope"}})
 		require.ErrorIs(t, err, ErrInvalidAction)
@@ -1079,7 +1157,7 @@ func TestHoldAndUnholdActions(t *testing.T) {
 
 	_, err := h.svc.Hold(h.ctx, "alice", HoldRequest{Hosts: []string{"a", "nope"}})
 	require.ErrorIs(t, err, ErrUnknownHost)
-	assert.False(t, h.store.host("a").HoldWanted, "nothing applied")
+	assert.Empty(t, h.assignment("a").Directives, "nothing applied")
 
 	_, err = h.svc.Hold(h.ctx, "alice", HoldRequest{})
 	require.ErrorIs(t, err, ErrInvalidAction)
@@ -1087,31 +1165,51 @@ func TestHoldAndUnholdActions(t *testing.T) {
 	res, err := h.svc.Hold(h.ctx, "alice", HoldRequest{Hosts: []string{"a", "b"}, Reason: "debugging"})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a", "b"}, res.Hosts)
-	assert.Equal(t, "2 host(s) on hold", res.Message)
-	assert.True(t, h.store.host("a").HoldWanted)
-	assert.Equal(t, "debugging", h.store.host("a").HoldReason)
+	assert.Equal(t, "hold requested on 2 host(s), waiting for the hosts", res.Message)
 	assert.Equal(t, []string{"action.hold", "action.hold"}, h.store.auditActions())
+	assert.False(t, h.store.host("a").Held(), "the agent owns its holds")
 
 	entry := h.store.lastAudit()
 	assert.Equal(t, "alice", entry.Actor)
 	assert.Equal(t, "b", entry.Target)
-	assert.Equal(t, map[string]any{"holdWanted": false, "holdReason": ""}, entry.Detail["before"])
-	assert.Equal(t, map[string]any{"holdWanted": true, "holdReason": "debugging"}, entry.Detail["after"])
+	assert.Equal(t, fleet.HolderStaff, entry.Detail[keyHolder])
+	assert.Equal(t, map[string]any{"held": false}, entry.Detail["before"])
+	assert.Equal(t, map[string]any{"held": true, "by": "alice", "reason": "debugging"}, entry.Detail["after"])
 
-	// A held host is never granted, already before the agent agrees.
+	// A host asked for a hold is never granted, already before its agent
+	// answers; the plan shows the request until it does.
 	h.tick()
-	assert.Nil(t, h.assignment("a").Lease)
-	assert.Equal(t, "held", h.assignment("a").Queue.Reason)
+	a := h.assignment("a")
+	assert.Nil(t, a.Lease)
+	assert.Equal(t, "hold requested, waiting for the host", a.Queue.Reason)
+	require.Len(t, a.Directives, 1)
+	assert.Equal(t, protocol.Directive{
+		ID: a.Directives[0].ID, Kind: protocol.DirectiveHold, Holder: fleet.HolderStaff, Reason: "debugging",
+		By: &protocol.Actor{User: "alice"},
+	}, a.Directives[0])
+	assert.Equal(t, []PendingHold{{Holder: fleet.HolderStaff, By: "alice", Reason: "debugging", At: h.now}},
+		h.svc.Plan().Hosts["b"].HoldRequests)
 	assert.Equal(t, SlotHeld, h.svc.Plan().Hosts["b"].Slot)
+
+	h.obeyHolds("a")
+	h.obeyHolds("b")
+	assert.Equal(t, "held by staff", h.assignment("a").Queue.Reason)
+	assert.Empty(t, h.svc.Plan().Hosts["b"].HoldRequests, "answered")
+	assert.Equal(t, fleet.HolderStaff, h.store.lastAuditOf("directive.accepted").Detail["holder"])
 
 	res, err = h.svc.Unhold(h.ctx, "bob", HoldRequest{Hosts: []string{"a"}})
 	require.NoError(t, err)
-	assert.Equal(t, "hold lifted on 1 host(s)", res.Message)
-	assert.False(t, h.store.host("a").HoldWanted)
-	assert.Empty(t, h.store.host("a").HoldReason)
+	assert.Equal(t, "release requested on 1 host(s), waiting for the hosts", res.Message)
 	assert.Equal(t, "action.unhold", h.store.lastAudit().Action)
 
+	// Until the agent answers it is held as it says.
 	h.tick()
+	assert.Nil(t, h.assignment("a").Lease)
+	assert.Equal(t, []PendingHold{{Holder: fleet.HolderStaff, Release: true, By: "bob", At: h.now}},
+		h.svc.Plan().Hosts["a"].HoldRequests)
+
+	h.obeyHolds("a")
+	assert.False(t, h.store.host("a").Held())
 	assert.NotNil(t, h.assignment("a").Lease)
 }
 
@@ -1295,7 +1393,7 @@ func TestRetryAction(t *testing.T) {
 	})
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a"}, res.Hosts)
-	assert.Equal(t, map[string]string{"b": "has neither failed nor been skipped in the rollout"}, res.Rejected)
+	assert.Equal(t, map[string]string{"b": "has neither failed, been cancelled nor been skipped in the rollout"}, res.Rejected)
 
 	r := h.rollout(id)
 	assert.Equal(t, fleet.RolloutActive, r.State)
@@ -1465,9 +1563,10 @@ func TestHoldOfSeveralHostsReportsThePartialResult(t *testing.T) {
 	require.NotNil(t, res, "the caller learns what was changed")
 	assert.Equal(t, []string{"a"}, res.Hosts)
 	assert.Contains(t, res.Message, "stopped at b")
-	assert.True(t, h.store.host("a").HoldWanted)
-	assert.False(t, h.store.host("b").HoldWanted)
-	assert.False(t, h.store.host("c").HoldWanted)
+	h.tick()
+	assert.Len(t, h.assignment("a").Directives, 1)
+	assert.Empty(t, h.assignment("b").Directives)
+	assert.Empty(t, h.assignment("c").Directives)
 	assert.Equal(t, []string{"action.hold"}, h.store.auditActions())
 }
 
@@ -1605,7 +1704,7 @@ func TestOverrideActions(t *testing.T) {
 		}
 	})
 
-	ctx := WithAuthorization(h.ctx, Authorization{By: "team_image_override", Teams: []string{"geth"}})
+	ctx := WithAuthorization(h.ctx, Authorization{By: "team_manage_image", Teams: []string{"geth"}})
 
 	res, err := h.svc.ImageOverride(ctx, "sam@example.org", ImageOverrideRequest{
 		Host: "a", Container: "geth", Image: "ethpandaops/geth:fix", Reason: "sync",
@@ -1620,7 +1719,7 @@ func TestOverrideActions(t *testing.T) {
 	d := directives[0]
 	assert.Equal(t, protocol.DirectiveOverride, d.Kind)
 	assert.Equal(t, "geth", d.Container)
-	assert.Equal(t, &protocol.Actor{User: "sam@example.org", Teams: []string{"geth"}, Feature: "team_image_override"}, d.By)
+	assert.Equal(t, &protocol.Actor{User: "sam@example.org", Teams: []string{"geth"}, Feature: "team_manage_image"}, d.By)
 	assert.Equal(t, protocol.OverrideImage, d.Override.Part)
 	assert.Equal(t, h.now.Add(DefaultOverrideDuration).UTC().Truncate(time.Second), *d.Override.Until,
 		"an override always has an end")
@@ -1628,7 +1727,7 @@ func TestOverrideActions(t *testing.T) {
 	entry := h.store.lastAudit()
 	assert.Equal(t, "action.image-override", entry.Action)
 	assert.Equal(t, "a", entry.Target)
-	assert.Equal(t, "team_image_override", entry.Detail["authorizedBy"])
+	assert.Equal(t, "team_manage_image", entry.Detail["authorizedBy"])
 
 	h.tick()
 	assert.Empty(t, h.openRollouts())
@@ -1711,15 +1810,14 @@ func TestMarkOffline(t *testing.T) {
 
 	until := h.now.Add(time.Hour)
 
-	_, err := h.svc.MarkOffline(asTeam(h.ctx), "alice",
+	_, err := h.svc.MarkOffline(asStaff(h.ctx), "alice",
 		OfflineRequest{Hosts: []string{"a"}, Reason: "debugging", Until: &until})
 	require.NoError(t, err)
 
 	mark := h.store.host("a").Offline
 	require.NotNil(t, mark)
 	assert.Equal(t, "debugging", mark.Reason)
-	assert.Equal(t, fleet.HoldByTeam, mark.By)
-	assert.False(t, h.store.host("a").HoldWanted, "the mark is no hold")
+	assert.False(t, h.store.host("a").Held(), "the mark is no hold")
 
 	entry := h.store.lastAuditOf("action.mark-offline")
 	assert.Equal(t, map[string]any{"offline": false}, entry.Detail[keyBefore])
@@ -1727,15 +1825,47 @@ func TestMarkOffline(t *testing.T) {
 	require.True(t, ok)
 	assert.Equal(t, true, after["offline"])
 
-	// Staff takes it over; the team then may not lift it.
-	_, err = h.svc.MarkOffline(asStaff(h.ctx), "bob", OfflineRequest{Hosts: []string{"a"}, Reason: "ours"})
-	require.NoError(t, err)
-
-	_, err = h.svc.UnmarkOffline(asTeam(h.ctx), "alice", OfflineRequest{Hosts: []string{"a"}})
-	require.ErrorIs(t, err, ErrForbidden)
-
 	_, err = h.svc.UnmarkOffline(asStaff(h.ctx), "bob", OfflineRequest{Hosts: []string{"a"}})
 	require.NoError(t, err)
 	assert.Nil(t, h.store.host("a").Offline)
 	assert.NotNil(t, h.store.lastAuditOf("action.unmark-offline"))
+}
+
+// A manual roll is a team's when every container it rolls is of that team,
+// and of their kind when they share one; a roll across teams is nobody's.
+func TestManualRollRecordsItsTeam(t *testing.T) {
+	h := newHarness(t)
+
+	el := container("geth", imgGeth, digestA, digestA, h.now)
+	el.Kind, el.Team = protocol.KindEL, "geth"
+	vc := container("geth-vc", imgGeth, digestA, digestA, h.now)
+	vc.Kind, vc.Team = protocol.KindVC, "geth"
+	cl := container("lighthouse", imgLighthouse, digestA, digestA, h.now)
+	cl.Kind, cl.Team = protocol.KindCL, "lighthouse"
+
+	h.addHost("a", 0)
+	h.sync("a", func(st *protocol.SyncRequest) { st.Containers = []protocol.Container{el, vc, cl} })
+	h.addHost("b", 0)
+	h.sync("b", func(st *protocol.SyncRequest) { st.Containers = []protocol.Container{el} })
+
+	roll := func(req RollRequest) *fleet.Rollout {
+		t.Helper()
+
+		res, err := h.svc.Roll(h.ctx, "alice", req)
+		require.NoError(t, err)
+
+		return h.rollout(res.Rollout)
+	}
+
+	r := roll(RollRequest{Hosts: []string{"a", "b"}, Containers: []string{"geth"}, Staggered: true})
+	assert.Equal(t, "geth", r.Team)
+	assert.Equal(t, protocol.KindEL, r.ContainerKind)
+
+	r = roll(RollRequest{Hosts: []string{"a"}, Containers: []string{"geth", "geth-vc"}, Staggered: true})
+	assert.Equal(t, "geth", r.Team)
+	assert.Empty(t, r.ContainerKind, "two kinds")
+
+	r = roll(RollRequest{Hosts: []string{"a"}, Staggered: true})
+	assert.Empty(t, r.Team, "containers of two teams")
+	assert.Empty(t, r.ContainerKind)
 }

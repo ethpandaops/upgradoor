@@ -1,11 +1,11 @@
 // Who may start a host action, decided the way the controller decides it
 // (authz.ActionBasis, userapi/hostactions.go): open mode, admin, the action's
-// own feature, or a team the action names. The rule is per host: each host
-// reports its actions with their feature and teams.
+// feature (manage when it names none), or a team the action names. The rule
+// is per host: each host reports its actions with their feature and teams.
 
 import { list, type ActionInfo, type HostActionRequest, type Impact, type Policy, type Rollout } from '../api/types';
 import type { HostActionIntent } from '../components/HostActionDialog';
-import { FEATURE, type Login, type Verdict } from './permissions';
+import { FEATURE, hasFeature, type Login, type Verdict } from './permissions';
 
 /** SECURITY_UPDATES is the condition of an action that installs pending security updates. */
 export const SECURITY_UPDATES = 'securityUpdates';
@@ -17,24 +17,16 @@ export interface ActionHost {
   verbs?: readonly string[] | null;
 }
 
-/** splitFeature splits "<service>:<feature>"; undefined when either part is missing. */
-export function splitFeature(full: string | undefined): { service: string; feature: string } | undefined {
-  const at = full?.indexOf(':') ?? -1;
-  if (!full || at <= 0 || at === full.length - 1) return undefined;
-  return { service: full.slice(0, at), feature: full.slice(at + 1) };
-}
-
-/** actionBasis says what lets the login start the action: open, admin, feature or team; empty when nothing does. */
+/**
+ * actionBasis says what lets the login start the action: open, admin, feature or team; empty when nothing does.
+ * The action's feature is a plain one of the controller, manage when it names none; an unknown one allows nobody.
+ */
 export function actionBasis(login: Login, info: ActionInfo): string {
   if (login.open) return 'open';
   if (login.hasFeature(FEATURE.admin)) return FEATURE.admin;
 
-  const f = splitFeature(info.feature);
-  if (f) {
-    const has =
-      login.hasServiceFeature?.(f.service, f.feature) ?? (f.service === login.service && login.hasFeature(f.feature));
-    if (has) return 'feature';
-  }
+  const feature = info.feature || FEATURE.manage;
+  if ((Object.values(FEATURE) as string[]).includes(feature) && hasFeature(login, feature)) return 'feature';
 
   if (list(info.teams).some(t => login.teams.includes(t))) return 'team';
   return '';
@@ -92,8 +84,8 @@ export function selectionActions(login: Login, hosts: readonly ActionHost[]): Se
  * hosts it selects. The controller rejects the others host by host.
  */
 export function hostActionVerdict(login: Login, body: HostActionRequest, hosts: readonly ActionHost[]): Verdict {
-  if (login.open) return { allowed: true, reason: '', by: 'open', staggered: false };
-  if (login.hasFeature(FEATURE.admin)) return { allowed: true, reason: '', by: FEATURE.admin, staggered: false };
+  if (login.open) return { allowed: true, reason: '', by: 'open' };
+  if (login.hasFeature(FEATURE.admin)) return { allowed: true, reason: '', by: FEATURE.admin };
 
   const named = list(body.hosts);
   const selected = named.length > 0 ? hosts.filter(h => named.includes(h.name)) : body.all ? hosts : [];
@@ -102,12 +94,11 @@ export function hostActionVerdict(login: Login, body: HostActionRequest, hosts: 
     .map(a => (a ? actionBasis(login, a) : ''))
     .find(b => b !== '');
 
-  if (basis) return { allowed: true, reason: '', by: basis, staggered: false };
+  if (basis) return { allowed: true, reason: '', by: basis };
   return {
     allowed: false,
     reason: `Needs ${login.service}:${FEATURE.admin}, or the feature or a team of the action ${body.action} on a selected host`,
     by: '',
-    staggered: false,
   };
 }
 
@@ -125,7 +116,7 @@ export function rolloutActionOf(r: Pick<Rollout, 'kind' | 'action' | 'hosts'>): 
 
 /**
  * approvalBasis says what lets the login resume (approve) an action rollout
- * without supervise (userapi allowActionApproval): it may start the action on
+ * without manage (userapi allowActionApproval): it may start the action on
  * every member host. Empty when a member does not report the action or does
  * not permit it.
  */

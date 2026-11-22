@@ -13,7 +13,7 @@ import (
 
 // rolloutHostsQuery reads the members of one rollout.
 const rolloutHostsQuery = `
-	SELECT host, state, stage, need_id, lease_id, error, skipped_by, updated_at
+	SELECT host, state, stage, need_id, lease_id, error, skipped_by, served, updated_at
 	FROM rollout_hosts WHERE rollout_id = ? ORDER BY host`
 
 // The queries below are read on every reconcile tick (the open rollouts, the
@@ -232,7 +232,7 @@ func loadRolloutHosts(ctx context.Context, tx *sql.Tx, rollouts []*fleet.Rollout
 			)
 
 			err := rows.Scan(&host.Host, &state, &stage, &host.NeedID, &host.LeaseID,
-				&host.Error, &host.SkippedBy, &updatedAt)
+				&host.Error, &host.SkippedBy, &host.Served, &updatedAt)
 			if err != nil {
 				return errors.Join(err, rows.Close())
 			}
@@ -340,6 +340,7 @@ func (s *sqliteStore) ListDirectives(
 				}
 
 				d.By, d.Override, d.Withdraws, d.Action = extra.By, extra.Override, extra.Withdraws, extra.Action
+				d.Holder = extra.Holder
 			}
 
 			d.Kind = protocol.DirectiveKind(kind)
@@ -381,6 +382,13 @@ func (s *sqliteStore) Commit(ctx context.Context, changes *Changes) error {
 			}
 		}
 
+		for _, id := range changes.Dropped {
+			// The members go with it (ON DELETE CASCADE).
+			if _, err := tx.ExecContext(ctx, `DELETE FROM rollouts WHERE id = ?`, id); err != nil {
+				return fmt.Errorf("drop rollout %s: %w", id, err)
+			}
+		}
+
 		for i, lease := range changes.Leases {
 			if err := upsertLease(ctx, tx, lease); err != nil {
 				return fmt.Errorf("lease %d: %w", i, err)
@@ -390,12 +398,6 @@ func (s *sqliteStore) Commit(ctx context.Context, changes *Changes) error {
 		for i, directive := range changes.Directives {
 			if err := upsertDirective(ctx, tx, directive); err != nil {
 				return fmt.Errorf("directive %d: %w", i, err)
-			}
-		}
-
-		for _, hold := range changes.Holds {
-			if err := setHostHold(ctx, tx, hold.Host, hold.Wanted, hold.Reason, hold.By, hold.Actor); err != nil {
-				return fmt.Errorf("hold of %s: %w", hold.Host, err)
 			}
 		}
 
@@ -482,13 +484,14 @@ func upsertRollout(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) erro
 type rolloutHostRow struct {
 	state, needID, leaseID, err, skippedBy string
 	stage                                  int
+	served                                 bool
 	updatedAt                              int64
 }
 
 func newRolloutHostRow(h *fleet.RolloutHost) rolloutHostRow {
 	return rolloutHostRow{
 		state: string(h.State), needID: h.NeedID, leaseID: h.LeaseID, err: h.Error,
-		skippedBy: h.SkippedBy, stage: int(h.Stage), updatedAt: millis(h.UpdatedAt),
+		skippedBy: h.SkippedBy, stage: int(h.Stage), served: h.Served, updatedAt: millis(h.UpdatedAt),
 	}
 }
 
@@ -499,7 +502,7 @@ func writeRolloutHosts(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) 
 	stored := make(map[string]rolloutHostRow, len(rollout.Hosts))
 
 	err := queryRows(ctx, tx, `
-		SELECT host, state, stage, need_id, lease_id, error, skipped_by, updated_at
+		SELECT host, state, stage, need_id, lease_id, error, skipped_by, served, updated_at
 		FROM rollout_hosts WHERE rollout_id = ?`, []any{rollout.ID},
 		func(row rowScanner) error {
 			var (
@@ -508,7 +511,7 @@ func writeRolloutHosts(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) 
 			)
 
 			if err := row.Scan(&host, &r.state, &r.stage, &r.needID, &r.leaseID, &r.err,
-				&r.skippedBy, &r.updatedAt); err != nil {
+				&r.skippedBy, &r.served, &r.updatedAt); err != nil {
 				return err
 			}
 
@@ -555,13 +558,14 @@ func writeRolloutHosts(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) 
 
 	return insertBatched(ctx, tx, `
 		INSERT INTO rollout_hosts
-			(rollout_id, host, state, stage, need_id, lease_id, error, skipped_by, updated_at) VALUES `,
-		9, len(changed),
+			(rollout_id, host, state, stage, need_id, lease_id, error, skipped_by, served, updated_at)
+		VALUES `,
+		10, len(changed),
 		func(args []any, i int) []any {
 			h := &rollout.Hosts[changed[i]]
 
 			return append(args, rollout.ID, h.Host, string(h.State), int(h.Stage), h.NeedID,
-				h.LeaseID, h.Error, h.SkippedBy, millis(h.UpdatedAt))
+				h.LeaseID, h.Error, h.SkippedBy, h.Served, millis(h.UpdatedAt))
 		})
 }
 
@@ -588,6 +592,12 @@ func upsertLease(ctx context.Context, tx *sql.Tx, lease *fleet.Lease) error {
 		cancelled := *lease.Cancelled
 		cancelled.At = storedTime(cancelled.At)
 		stored.Cancelled = &cancelled
+	}
+
+	if lease.Approved != nil {
+		approved := *lease.Approved
+		approved.At = storedTime(approved.At)
+		stored.Approved = &approved
 	}
 
 	if lease.Operation != nil {
@@ -627,6 +637,7 @@ type directiveDetail struct {
 	Override  *protocol.OverrideInstruction `json:"override,omitempty"`
 	Withdraws string                        `json:"withdraws,omitempty"`
 	Action    string                        `json:"action,omitempty"`
+	Holder    string                        `json:"holder,omitempty"`
 }
 
 func upsertDirective(ctx context.Context, tx *sql.Tx, d *fleet.Directive) error {
@@ -640,8 +651,10 @@ func upsertDirective(ctx context.Context, tx *sql.Tx, d *fleet.Directive) error 
 
 	detail := ""
 
-	if d.By != nil || d.Override != nil || d.Withdraws != "" || d.Action != "" {
-		extra := directiveDetail{By: d.By, Override: d.Override, Withdraws: d.Withdraws, Action: d.Action}
+	if d.By != nil || d.Override != nil || d.Withdraws != "" || d.Action != "" || d.Holder != "" {
+		extra := directiveDetail{
+			By: d.By, Override: d.Override, Withdraws: d.Withdraws, Action: d.Action, Holder: d.Holder,
+		}
 
 		// Times are stored as every other one: UTC, to the millisecond.
 		if d.Override != nil && d.Override.Until != nil {

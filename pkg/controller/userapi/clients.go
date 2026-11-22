@@ -19,7 +19,7 @@ const (
 )
 
 // handleClients serves GET /api/v1/clients.
-func (s *Handler) handleClients(w http.ResponseWriter, r *http.Request, _ *authz.User) {
+func (s *Handler) handleClients(w http.ResponseWriter, r *http.Request, u *authz.User) {
 	idx, err := s.views.Clients(r.Context())
 	if err != nil {
 		httpjson.InternalError(s.log, w, r, err)
@@ -27,7 +27,8 @@ func (s *Handler) handleClients(w http.ResponseWriter, r *http.Request, _ *authz
 		return
 	}
 
-	httpjson.Write(s.log, w, http.StatusOK, views.Clients{Clients: idx.Views})
+	access := s.Access(u)
+	httpjson.Write(s.log, w, http.StatusOK, views.Clients{Clients: access.Clients(idx.Views)})
 }
 
 // handleClientHosts serves
@@ -36,7 +37,7 @@ func (s *Handler) handleClients(w http.ResponseWriter, r *http.Request, _ *authz
 // of views.ClientHostState separated by commas, q a part of the host name, override
 // "image" or "flags" (hosts with that part of an override). names=true
 // answers the names of every matched host instead of a page.
-func (s *Handler) handleClientHosts(w http.ResponseWriter, r *http.Request, _ *authz.User) {
+func (s *Handler) handleClientHosts(w http.ResponseWriter, r *http.Request, u *authz.User) {
 	query := r.URL.Query()
 	needle := strings.ToLower(strings.TrimSpace(query.Get("q")))
 
@@ -103,6 +104,7 @@ func (s *Handler) handleClientHosts(w http.ResponseWriter, r *http.Request, _ *a
 	}
 
 	rows := idx.Hosts[name]
+	access := s.Access(u)
 	out := views.ClientHosts{
 		Client: name, Version: idx.Views[at].Version, Total: len(rows),
 		Offset: offset, Limit: limit, Hosts: make([]views.ClientHost, 0, limit),
@@ -123,7 +125,7 @@ func (s *Handler) handleClientHosts(w http.ResponseWriter, r *http.Request, _ *a
 				out.Names = append(out.Names, row.Host)
 			}
 		case out.Matched >= offset && len(out.Hosts) < limit:
-			out.Hosts = append(out.Hosts, *row)
+			out.Hosts = append(out.Hosts, access.ClientHost(row))
 		}
 
 		out.Matched++

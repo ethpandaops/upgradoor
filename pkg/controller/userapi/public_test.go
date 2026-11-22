@@ -237,9 +237,11 @@ func TestPublicNetwork(t *testing.T) {
 	assert.Equal(t, uint64(190), gate.Network.Live)
 	assert.Equal(t, "beacon node unavailable", gate.Network.Error, "the real error text stays inside")
 
-	// The authenticated plan carries the real error.
-	plan := controllertest.DecodeJSON[scheduler.Plan](t, h.get("/api/v1/plan"))
-	assert.Equal(t, controllertest.SecretBeaconError, plan.Gate.Network.Error)
+	assert.Empty(t, gate.Network.ValidatorRangesError, "the inventory is not public")
+
+	// The data sources carry the real errors.
+	sources := controllertest.DecodeJSON[views.DataSources](t, h.get("/api/v1/settings/sources"))
+	assert.Equal(t, views.ChainErrors{Error: controllertest.SecretBeaconError}, sources.Chain)
 
 	// Before the first plan: a closed gate around the beacon view.
 	h.sched.Set(func(f *controllertest.Scheduler) { f.CurrentPlan = nil })
@@ -352,10 +354,12 @@ func TestPublicNetworkScrubsReasons(t *testing.T) {
 			assert.Empty(t, gate.Network.LivenessError)
 			assert.Empty(t, gate.Network.TimingError)
 
-			// The plan the scheduler handed out is not modified, and users
-			// still see the real text.
-			plan := controllertest.DecodeJSON[scheduler.Plan](t, h.get("/api/v1/plan"))
-			assert.Equal(t, tt.reasons, plan.Gate.Reasons)
+			// A login reads the plan scrubbed alike; the plan the scheduler
+			// handed out is not modified.
+			rec = h.get("/api/v1/plan")
+			assert.NotContains(t, rec.Body.String(), "10.77.0.3")
+			assert.Equal(t, tt.want, controllertest.DecodeJSON[scheduler.Plan](t, rec).Gate.Reasons)
+			assert.Equal(t, tt.reasons, h.sched.Plan().Gate.Reasons)
 		})
 	}
 }
@@ -398,7 +402,7 @@ func TestWebFeaturesAreTheServers(t *testing.T) {
 
 	src := string(raw)
 
-	// export const FEATURE = { roll: 'roll', ... } as const;
+	// export const FEATURE = { manage: 'manage', ... } as const;
 	entry := regexp.MustCompile(`(?m)^\s*(\w+):\s*'([^']+)',\s*$`)
 	web := make([]string, 0, 8)
 
@@ -408,15 +412,14 @@ func TestWebFeaturesAreTheServers(t *testing.T) {
 	}
 
 	server := []string{
-		authz.FeatureRoll, authz.FeatureReboot, authz.FeatureHold, authz.FeatureRecover, authz.FeatureSupervise, authz.FeatureAdmin,
-		authz.FeatureClientPolicy, authz.FeatureImageOverride, authz.FeatureFlagOverride,
+		authz.FeatureDetails, authz.FeatureManage, authz.FeatureManageImage, authz.FeatureManageFlags, authz.FeatureAdmin,
 	}
 
 	slices.Sort(web)
 	slices.Sort(server)
 	assert.Equal(t, server, web, "features of %s and of authz.go", webPermissions)
 
-	// export const TWINNED: readonly Feature[] = [FEATURE.roll, ...];
+	// export const TWINNED: readonly Feature[] = [FEATURE.manage, ...];
 	twinned := make([]string, 0, 4)
 	for _, m := range regexp.MustCompile(`FEATURE\.(\w+)`).FindAllStringSubmatch(
 		tsBlock(t, src, "export const TWINNED: readonly Feature[] = [", "];"), -1) {
@@ -424,11 +427,8 @@ func TestWebFeaturesAreTheServers(t *testing.T) {
 	}
 
 	slices.Sort(twinned)
-	assert.Equal(t, []string{
-		authz.FeatureClientPolicy, authz.FeatureFlagOverride, authz.FeatureHold, authz.FeatureImageOverride,
-		authz.FeatureReboot, authz.FeatureRecover, authz.FeatureRoll, authz.FeatureSupervise,
-	}, twinned,
-		"the features with a team twin")
+	assert.Equal(t, []string{authz.FeatureManage, authz.FeatureManageFlags, authz.FeatureManageImage}, twinned,
+		"the action features with a team twin")
 
 	assert.Contains(t, src, "export const TEAM_PREFIX = '"+authz.TeamFeaturePrefix+"';")
 

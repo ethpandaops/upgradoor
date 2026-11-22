@@ -21,6 +21,11 @@ type Service interface {
 	// at most epochs of them, newest epoch first. It never blocks on the
 	// network.
 	Liveness(epochs int) []fleet.Liveness
+	// AttestedSlots returns per host the newest slots, ascending, for which
+	// a canonical block carries an attestation of its validators, at most
+	// fleet.MaxReadyAttestations of them. The map and its slices must not be
+	// changed. It never blocks on the network.
+	AttestedSlots() map[string][]uint64
 	// Endpoints returns what was seen of every configured endpoint, in the
 	// configured order. It never blocks on the network.
 	Endpoints() []EndpointStatus

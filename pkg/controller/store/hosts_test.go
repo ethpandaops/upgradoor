@@ -164,84 +164,6 @@ func TestRecordSyncConfirms(t *testing.T) {
 	}
 }
 
-// A host that reports a controller hold when the controller sees it for the
-// first time keeps the hold: the row is created with the hold wanted.
-func TestRecordSyncAdoptsControllerHold(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-
-	held := func(controller, local bool) *protocol.SyncRequest {
-		req := testRequest()
-		req.Hold = protocol.Hold{Controller: controller, Local: local}
-
-		return req
-	}
-
-	for _, backend := range backends {
-		t.Run(backend.name, func(t *testing.T) {
-			t.Parallel()
-
-			s := backend.open(t)
-
-			res, err := s.RecordSync(ctx, &HostSync{
-				Cert: testCert("held"), Request: held(true, false), At: at(0),
-			})
-			require.NoError(t, err)
-			assert.True(t, res.Created)
-			assert.True(t, res.HoldAdopted)
-			assert.True(t, res.Host.HoldWanted)
-			assert.Equal(t, HoldReasonAdopted, res.Host.HoldReason)
-			assert.Equal(t, "held on the agent before this controller knew the host", res.Host.HoldReason)
-
-			got, err := s.GetHost(ctx, "held")
-			require.NoError(t, err)
-			assert.True(t, got.HoldWanted)
-			assert.Equal(t, HoldReasonAdopted, got.HoldReason)
-
-			// Only the first sight adopts: a person lifts the hold, the agent
-			// still reports it until it has the release, and the switch stays
-			// off.
-			require.NoError(t, setHold(ctx, s, "held", false, ""))
-
-			res, err = s.RecordSync(ctx, &HostSync{
-				Cert: testCert("held"), Request: held(true, false), At: at(10),
-			})
-			require.NoError(t, err)
-			assert.False(t, res.Created)
-			assert.False(t, res.HoldAdopted)
-			assert.False(t, res.Host.HoldWanted)
-			assert.Empty(t, res.Host.HoldReason)
-
-			// A local hold is not the controller's hold.
-			res, err = s.RecordSync(ctx, &HostSync{
-				Cert: testCert("local"), Request: held(false, true), At: at(0),
-			})
-			require.NoError(t, err)
-			assert.True(t, res.Created)
-			assert.False(t, res.HoldAdopted)
-			assert.False(t, res.Host.HoldWanted)
-			assert.Empty(t, res.Host.HoldReason)
-
-			// No request, no report of a hold.
-			res, err = s.RecordSync(ctx, &HostSync{Cert: testCert("bare"), At: at(0)})
-			require.NoError(t, err)
-			assert.False(t, res.HoldAdopted)
-			assert.False(t, res.Host.HoldWanted)
-
-			// A forgotten host that comes back held is adopted again.
-			require.NoError(t, s.DeleteHost(ctx, "held"))
-
-			res, err = s.RecordSync(ctx, &HostSync{
-				Cert: testCert("held"), Request: held(true, true), At: at(20),
-			})
-			require.NoError(t, err)
-			assert.True(t, res.HoldAdopted)
-			assert.True(t, res.Host.HoldWanted)
-		})
-	}
-}
-
 func TestRecordSyncEdgeCases(t *testing.T) {
 	ctx := context.Background()
 	s := newFileStore(t)
@@ -392,45 +314,6 @@ func TestGetAndListHosts(t *testing.T) {
 	}
 }
 
-func TestCommitHoldsSwitch(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	s := newFileStore(t)
-
-	require.ErrorIs(t, setHold(ctx, s, "nope", true, "x"), ErrNotFound)
-
-	addHost(t, s, "node-1", nil)
-	addHost(t, s, "node-2", nil)
-
-	require.NoError(t, setHold(ctx, s, "node-1", true, "disk swap"))
-
-	host, err := s.GetHost(ctx, "node-1")
-	require.NoError(t, err)
-	assert.True(t, host.HoldWanted)
-	assert.Equal(t, "disk swap", host.HoldReason)
-	assert.True(t, host.Held())
-
-	other, err := s.GetHost(ctx, "node-2")
-	require.NoError(t, err)
-	assert.False(t, other.HoldWanted)
-
-	// A sync does not touch the switch.
-	_, err = s.RecordSync(ctx, &HostSync{Cert: testCert("node-1"), Request: testRequest(), At: at(10)})
-	require.NoError(t, err)
-
-	host, err = s.GetHost(ctx, "node-1")
-	require.NoError(t, err)
-	assert.True(t, host.HoldWanted)
-
-	require.NoError(t, setHold(ctx, s, "node-1", false, ""))
-
-	host, err = s.GetHost(ctx, "node-1")
-	require.NoError(t, err)
-	assert.False(t, host.HoldWanted)
-	assert.Empty(t, host.HoldReason)
-}
-
 func TestDeleteHost(t *testing.T) {
 	t.Parallel()
 
@@ -515,11 +398,6 @@ func TestDeleteHost(t *testing.T) {
 	}
 }
 
-// setHold sets the controller-side hold switch of one host, as staff does.
-func setHold(ctx context.Context, s Store, name string, wanted bool, reason string) error {
-	return s.Commit(ctx, &Changes{Holds: []HostHold{{Host: name, Wanted: wanted, Reason: reason}}})
-}
-
 // The broken marks are the host's: a commit replaces them, a sync leaves them
 // and they go with the host. A host that does not exist has none.
 func TestCommitBrokenMarks(t *testing.T) {
@@ -599,11 +477,10 @@ func TestCommitUnproven(t *testing.T) {
 	assert.Nil(t, unproven())
 }
 
-// TestHoldBy: a hold remembers that it was set through a team feature only
-// when the writer says so. Every writer that does not (a hold without By, a
-// Changes.Holds entry without By: the scheduler, the end of a lease) makes it
-// a hold of staff, also over a team's hold. A lifted hold remembers nothing.
-func TestHoldBy(t *testing.T) {
+// TestHoldsAreTheAgents: the holds are what the host's last sync reports and
+// nothing else. A host that comes back with a fresh state and no holds has
+// none.
+func TestHoldsAreTheAgents(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -613,51 +490,32 @@ func TestHoldBy(t *testing.T) {
 			t.Parallel()
 
 			s := backend.open(t)
-			addHost(t, s, "node-1", nil)
 
-			by := func() (wanted bool, reason, by string) {
-				h, err := s.GetHost(ctx, "node-1")
-				require.NoError(t, err)
+			held := testRequest()
+			held.Hold = protocol.Hold{Holds: []protocol.HostHold{
+				{Holder: fleet.HolderStaff, By: "alice", Reason: "disk swap", At: at(1)}, {Holder: "geth"},
+			}}
 
-				// The list reads the same column.
-				hosts, err := s.ListHosts(ctx)
-				require.NoError(t, err)
-				require.Len(t, hosts, 1)
-				assert.Equal(t, h.HoldBy, hosts[0].HoldBy)
+			_, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-1"), Request: held, At: at(2)})
+			require.NoError(t, err)
 
-				return h.HoldWanted, h.HoldReason, h.HoldBy
-			}
+			h, err := s.GetHost(ctx, "node-1")
+			require.NoError(t, err)
+			assert.True(t, h.Held())
+			assert.Equal(t, "disk swap", h.HoldOf(fleet.HolderStaff).Reason)
+			assert.Equal(t, []string{fleet.HolderStaff, "geth"}, h.Status.Hold.Holders())
 
-			commit := func(hold HostHold) {
-				require.NoError(t, s.Commit(ctx, &Changes{Holds: []HostHold{hold}}))
-			}
+			fresh := testRequest()
+			fresh.Hold = protocol.Hold{}
 
-			_, _, who := by()
-			assert.Empty(t, who, "a new host")
+			_, err = s.RecordSync(ctx, &HostSync{Cert: testCert("node-1"), Request: fresh, At: at(3)})
+			require.NoError(t, err)
 
-			commit(HostHold{Host: "node-1", Wanted: true, Reason: "ours", By: fleet.HoldByTeam})
-			wanted, reason, who := by()
-			assert.True(t, wanted)
-			assert.Equal(t, "ours", reason)
-			assert.Equal(t, fleet.HoldByTeam, who)
-
-			// The end of a lease extends the reason through Changes.Holds
-			// without By: the hold is staff's from then on.
-			commit(HostHold{Host: "node-1", Wanted: true, Reason: "ours; lease ended by operator"})
-			_, reason, who = by()
-			assert.Equal(t, "ours; lease ended by operator", reason)
-			assert.Empty(t, who)
-
-			commit(HostHold{Host: "node-1", Wanted: true, Reason: "ours", By: fleet.HoldByTeam})
-			require.NoError(t, setHold(ctx, s, "node-1", true, "staff"))
-			_, _, who = by()
-			assert.Empty(t, who, "a hold without a writer is not a team's")
-
-			// Lifted: nothing is remembered, whatever the writer says.
-			commit(HostHold{Host: "node-1", Wanted: false, By: fleet.HoldByTeam})
-			wanted, _, who = by()
-			assert.False(t, wanted)
-			assert.Empty(t, who)
+			hosts, err := s.ListHosts(ctx)
+			require.NoError(t, err)
+			require.Len(t, hosts, 1)
+			assert.False(t, hosts[0].Held())
+			assert.Empty(t, hosts[0].Holds())
 		})
 	}
 }

@@ -436,8 +436,11 @@ export function Timeline({
                     width={b.width}
                     height={BLOCK}
                     rx={3}
-                    className={cx(fill, hover?.block === b && 'stroke-foreground')}
-                    strokeWidth={hover?.block === b ? 1.5 : 0}
+                    className={cx(
+                      fill,
+                      hover?.block === b ? 'stroke-foreground' : b.deployed && !b.failed && 'stroke-accent'
+                    )}
+                    strokeWidth={hover?.block === b ? 1.5 : b.deployed && !b.failed ? 2 : 0}
                   />
                   {text && (
                     <text
@@ -550,6 +553,9 @@ function BlockTip({ block, now, canOpen }: { block: OutageBlock; now: number; ca
           {workLabel(block)} · {block.hosts === 1 ? names[0] : plural(block.hosts, 'host')}
         </span>
       </span>
+      {block.deployed && (
+        <span className="text-accent">Deployed on the host (upgradoor deploy, e.g. from Ansible).</span>
+      )}
       <span className="text-muted">
         {block.group === 'off'
           ? 'Not attesting, and upgradoor was not working on it.'
@@ -686,6 +692,7 @@ export function TimelineLegend({ lanes, threshold }: { lanes: boolean; threshold
       {lanes && (
         <>
           {swatch('bg-series-image', 'Image roll')}
+          {swatch('bg-series-image ring-2 ring-accent ring-inset', 'Image roll deployed on the host')}
           {swatch('bg-series-packages', 'Packages')}
           {swatch('bg-series-action', 'Host action')}
           {swatch('bg-series-reboot', 'Reboot')}

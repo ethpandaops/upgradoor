@@ -2,6 +2,7 @@ package plan
 
 import (
 	"slices"
+	"strings"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/imageref"
@@ -238,18 +239,29 @@ func rollable(c *protocol.Container, name string) (reason string, refused bool) 
 // host locally: when in doubt the agent does nothing.
 func HoldState(files *Overrides, now time.Time) protocol.Hold {
 	if !files.Known {
-		return protocol.Hold{Local: true, LocalReason: Line(files.Err)}
+		reason := Line(files.Err)
+
+		return protocol.Hold{
+			Local: true, LocalReason: reason,
+			Holds: []protocol.HostHold{{Holder: protocol.HolderHost, Reason: reason}},
+		}
 	}
 
 	var out protocol.Hold
 
-	if h, ok := files.Holds[HoldLocal]; ok && !h.Expired(now) {
-		out.Local, out.LocalReason = true, h.Reason
+	for holder, h := range files.Holds {
+		if h.Expired(now) {
+			continue
+		}
+
+		if holder == protocol.HolderHost {
+			out.Local, out.LocalReason = true, h.Reason
+		}
+
+		out.Holds = append(out.Holds, protocol.HostHold{Holder: holder, By: h.By, Reason: h.Reason, At: h.At})
 	}
 
-	if h, ok := files.Holds[HoldController]; ok && !h.Expired(now) {
-		out.Controller = true
-	}
+	slices.SortFunc(out.Holds, protocol.HoldOrder)
 
 	return out
 }
@@ -262,7 +274,7 @@ func HoldReason(h protocol.Hold) string {
 	case h.Local:
 		return "host is on local hold"
 	default:
-		return "host is on controller hold"
+		return "host is on hold by " + strings.Join(h.Holders(), ", ")
 	}
 }
 

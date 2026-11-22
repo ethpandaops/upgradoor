@@ -408,7 +408,7 @@ func TestValidateDeclinesAndWaits(t *testing.T) {
 	gethImage := imageNeedFor("geth", "ethpandaops/geth:master", "sha256:b")
 
 	files := known()
-	files.Holds = map[string]Hold{HoldLocal: {Reason: "debugging"}}
+	files.Holds = map[string]Hold{protocol.HolderHost: {Reason: "debugging"}}
 	got, err := Validate(p, leaseOf(gethImage), leaseView(p, validateFacts(), files), nil)
 	require.NoError(t, err)
 	assert.Equal(t, "host is on local hold: debugging", got.Decline)

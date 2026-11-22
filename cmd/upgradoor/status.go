@@ -44,13 +44,13 @@ func printStatus(w io.Writer, st *local.Status) {
 		fmt.Fprintf(w, "! %s\n", st.SyncError)
 	}
 
-	switch {
-	case st.Hold.Local:
-		fmt.Fprintf(w, "hold: local (%s)\n", orDash(st.Hold.LocalReason))
-	case st.Hold.Controller:
-		fmt.Fprintln(w, "hold: by the controller")
-	default:
+	if !st.Hold.Active() {
 		fmt.Fprintln(w, "hold: none")
+	}
+
+	for _, h := range st.Hold.Holds {
+		fmt.Fprintf(w, "hold: %s by %s, %s (%s)\n", h.Holder, orDash(h.By),
+			h.At.Local().Format(time.DateTime), orDash(h.Reason))
 	}
 
 	if len(st.Needs) == 0 {

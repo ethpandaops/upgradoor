@@ -71,12 +71,16 @@ type Settings struct {
 	MinParticipationPercent float64 `json:"minParticipationPercent"`
 	// MaxFinalityLagEpochs is the network gate's finality lag ceiling.
 	MaxFinalityLagEpochs uint64 `json:"maxFinalityLagEpochs"`
-	// ReadyEpochs is how long a host must look healthy after its operation
-	// before its slot is released: the node at head with peers for this many
-	// epoch durations, and its validators attesting in this many consecutive
-	// complete epochs. 0 releases at the first healthy sync after the
-	// operation. At most MaxReadyEpochs.
-	ReadyEpochs uint64 `json:"readyEpochs"`
+	// ReadyAttestations is for how many distinct slots after its operation a
+	// host with validators must have attestations of them included on the
+	// canonical chain before its slot is released; a host with fewer
+	// validators needs one slot per validator. 1 to MaxReadyAttestations.
+	ReadyAttestations uint64 `json:"readyAttestations"`
+	// ReadyStableFor is how long the node of a host without validators must
+	// stay at head with peers after its operation before its slot is
+	// released. 0 releases at the first healthy sync. At most
+	// MaxReadyStableFor.
+	ReadyStableFor Duration `json:"readyStableFor"`
 	// MinPeers is how many peers each of the execution and the consensus
 	// client must have for the node to count as back, at most. See
 	// EffectiveMinPeers.
@@ -133,7 +137,8 @@ func DefaultSettings() Settings {
 		MaxIndependentPercent:   10,
 		MinParticipationPercent: 90,
 		MaxFinalityLagEpochs:    3,
-		ReadyEpochs:             1,
+		ReadyAttestations:       2,
+		ReadyStableFor:          Duration(time.Minute),
 		MinPeers:                3,
 		LeaseTTL:                Duration(30 * time.Minute),
 		HostStaleAfter:          Duration(2 * time.Minute),
@@ -237,6 +242,29 @@ func (s *Settings) ImagePolicy(client string) Policy {
 	return s.PolicyImage
 }
 
+// RolloutPolicy is the policy that governs a rollout: that of its kind, and
+// for an image rollout that of its team where one is set (PolicyImage for a
+// rollout without a team). A rollout a person or a host asked for answers to
+// no policy: auto.
+func (s *Settings) RolloutPolicy(r *Rollout) Policy {
+	switch r.Kind {
+	case RolloutGroup:
+		return s.ImagePolicy(r.Team)
+	case RolloutPackages:
+		return s.PolicyPackages
+	case RolloutReboot:
+		return s.PolicyReboot
+	case RolloutAction:
+		if r.Directed() {
+			return PolicyAuto
+		}
+
+		return s.ActionPolicy(r.Action)
+	default:
+		return PolicyAuto
+	}
+}
+
 // Equal reports whether two settings are the same; no client or action
 // policies and an empty set of them are.
 func (s *Settings) Equal(o *Settings) bool {
@@ -273,9 +301,13 @@ func (s *Settings) EffectiveMinPeers(nodes int) int {
 	return max(1, min(s.MinPeers, nodes/2))
 }
 
-// MaxReadyEpochs bounds Settings.ReadyEpochs: the beacon service keeps the
-// per-epoch liveness of this many epochs and a few more.
-const MaxReadyEpochs = 32
+// MaxReadyAttestations bounds Settings.ReadyAttestations: the beacon service
+// keeps this many attested slots per host. MaxReadyStableFor bounds
+// Settings.ReadyStableFor.
+const (
+	MaxReadyAttestations = 32
+	MaxReadyStableFor    = 30 * time.Minute
+)
 
 // Validate checks value ranges.
 func (s *Settings) Validate() error {
@@ -303,8 +335,12 @@ func (s *Settings) Validate() error {
 		return errors.New("minPeers must be at least 1")
 	}
 
-	if s.ReadyEpochs > MaxReadyEpochs {
-		return fmt.Errorf("readyEpochs must be at most %d", MaxReadyEpochs)
+	if s.ReadyAttestations < 1 || s.ReadyAttestations > MaxReadyAttestations {
+		return fmt.Errorf("readyAttestations must be between 1 and %d", MaxReadyAttestations)
+	}
+
+	if s.ReadyStableFor < 0 || s.ReadyStableFor.Std() > MaxReadyStableFor {
+		return errors.New("readyStableFor must be between 0 and 30m")
 	}
 
 	// Written so that NaN fails too.

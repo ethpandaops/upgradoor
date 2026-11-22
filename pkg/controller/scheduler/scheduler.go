@@ -100,9 +100,15 @@ type Service interface {
 	// closed while hosts report the cause: it is paused instead, until a
 	// person resumes it or the cause changes. Open leases finish.
 	Abort(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
+	// IgnoreGate lets one rollout's leases pass a closed network gate.
+	IgnoreGate(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
+	// ApproveLease releases a member's verifying lease as ready without
+	// waiting for the readiness check.
+	ApproveLease(ctx context.Context, actor string, req ApproveLeaseRequest) (*ActionResult, error)
 	// EndLease asks for the end of one open lease: the lease is marked
 	// cancelled. It stays open, with its place in the budget, until the agent
-	// reports that it has stopped or goes silent, and then ends as failed.
+	// reports that it has stopped, and then ends as cancelled (failed when it
+	// goes silent or a step failed).
 	EndLease(ctx context.Context, actor string, req EndLeaseRequest) (*ActionResult, error)
 	// Forget deletes hosts that are gone. Refused while a host holds a lease.
 	Forget(ctx context.Context, actor string, req HoldRequest) (*ActionResult, error)
@@ -137,8 +143,11 @@ type RollRequest struct {
 	// Force skips ordering and readiness for a staggered rollout as well.
 	Force bool `json:"force"`
 	// IgnoreBudget also skips the budget and the network gate. Audited.
-	IgnoreBudget bool   `json:"ignoreBudget"`
-	Reason       string `json:"reason"`
+	IgnoreBudget bool `json:"ignoreBudget"`
+	// IgnoreGate passes a closed network gate; budget, host limit and order
+	// still apply. Audited.
+	IgnoreGate bool   `json:"ignoreGate"`
+	Reason     string `json:"reason"`
 }
 
 // RebootRequest is the body of POST /api/v1/actions/reboot.
@@ -148,6 +157,7 @@ type RebootRequest struct {
 	Staggered    bool     `json:"staggered"`
 	Force        bool     `json:"force"`
 	IgnoreBudget bool     `json:"ignoreBudget"`
+	IgnoreGate   bool     `json:"ignoreGate"`
 	Reason       string   `json:"reason"`
 }
 
@@ -155,6 +165,9 @@ type RebootRequest struct {
 type HoldRequest struct {
 	Hosts  []string `json:"hosts"`
 	Reason string   `json:"reason"`
+	// Holders names the holds an unhold lifts (fleet.HolderStaff or teams);
+	// empty lifts the holds the login sets. A hold takes none.
+	Holders []string `json:"holders,omitempty"`
 }
 
 // OfflineRequest is the body of the mark-offline and unmark-offline actions.
@@ -259,8 +272,8 @@ type ClientPolicyRequest struct {
 	Reason string       `json:"reason"`
 }
 
-// ScopeRequest is the body of pause, resume and abort. An empty Rollout
-// means the global scope (pause and resume only).
+// ScopeRequest is the body of pause, resume, abort and ignore-gate. An empty
+// Rollout means the global scope (pause and resume only).
 type ScopeRequest struct {
 	Rollout string `json:"rollout"`
 	Reason  string `json:"reason"`
@@ -278,6 +291,14 @@ type EndLeaseRequest struct {
 	// Lease is the ID of an open lease.
 	Lease  string `json:"lease"`
 	Reason string `json:"reason"`
+}
+
+// ApproveLeaseRequest is the body of POST /api/v1/actions/approve-lease: the
+// verifying lease of one member of a rollout.
+type ApproveLeaseRequest struct {
+	Rollout string `json:"rollout"`
+	Host    string `json:"host"`
+	Reason  string `json:"reason"`
 }
 
 // ActionResult is the answer to every action.
@@ -306,9 +327,10 @@ type Plan struct {
 	Hosts map[string]HostPlan `json:"hosts"`
 }
 
-// Gate is the network gate. No new lease is granted while it fails, with one
-// exception (a host none of whose validators attests, while nothing else is
-// leased); open leases finish.
+// Gate is the network gate. No new lease is granted while it fails, except
+// to a host none of whose validators attests while nothing else is leased,
+// and for a rollout a person let pass it (Rollout.PassesGate); open leases
+// finish.
 type Gate struct {
 	OK bool `json:"ok"`
 	// Reasons lists every failing condition, e.g.
@@ -351,7 +373,8 @@ type Budget struct {
 type QueueEntry struct {
 	Host     string `json:"host"`
 	Position int    `json:"position"`
-	// Reason is the one-line waiting reason, e.g. "budget 8% of 10%",
+	// Reason is the one-line waiting reason, e.g. "validators down: 8% now,
+	// 12% with this host, limit 10%", "hosts at once: 1 of 1 busy",
 	// "network gate: participation 88% < 90%", "paused",
 	// "waiting for approval (policy manual)", "after canary lighthouse-geth-1".
 	Reason string `json:"reason"`
@@ -424,4 +447,17 @@ type HostPlan struct {
 	LeaseID string `json:"leaseId,omitempty"`
 	// Reason is the waiting reason when queued.
 	Reason string `json:"reason,omitempty"`
+	// HoldRequests are the hold and release-hold directives the host has not
+	// answered yet, oldest first.
+	HoldRequests []PendingHold `json:"holdRequests,omitempty"`
+}
+
+// PendingHold is a hold or release-hold directive that waits for the host.
+type PendingHold struct {
+	Holder string `json:"holder"`
+	// Release is true for a release-hold directive.
+	Release bool      `json:"release,omitempty"`
+	By      string    `json:"by,omitempty"`
+	Reason  string    `json:"reason,omitempty"`
+	At      time.Time `json:"at"`
 }

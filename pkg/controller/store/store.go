@@ -132,16 +132,7 @@ type SyncResult struct {
 	PreviousSeen time.Time
 	// PreviousCertHash is set when the certificate hash changed.
 	PreviousCertHash string
-	// HoldAdopted is true when the host was created on hold because its
-	// agent reported a controller hold (see HoldReasonAdopted).
-	HoldAdopted bool
 }
-
-// HoldReasonAdopted is the hold reason of a host that reported a controller
-// hold in the sync that created its row: a controller that does not know the
-// host (a lost database, a forgotten host) keeps the hold instead of lifting
-// it.
-const HoldReasonAdopted = "held on the agent before this controller knew the host"
 
 // PackageMatch is one package name with the versions installed across the
 // fleet.
@@ -227,16 +218,15 @@ type AuditFilter struct {
 
 // Changes is one atomic set of scheduler writes. Rollouts, leases and
 // directives are upserted by ID; a rollout's Hosts replace its member rows.
-// Holds set the controller-side hold switch of hosts; a host that does not
-// exist fails the whole set with ErrNotFound; so do Offline marks. Broken
-// replaces the broken
-// marks of hosts, Unproven their fleet.Host.Unproven; a host that does not
-// exist is passed over.
+// Dropped are the IDs of rollouts deleted with their members.
+// An Offline mark of a host that does not exist fails the whole set with
+// ErrNotFound. Broken replaces the broken marks of hosts, Unproven their
+// fleet.Host.Unproven; a host that does not exist is passed over.
 type Changes struct {
 	Rollouts   []*fleet.Rollout
+	Dropped    []string
 	Leases     []*fleet.Lease
 	Directives []*fleet.Directive
-	Holds      []HostHold
 	Offline    []HostOffline
 	Broken     []HostBroken
 	Unproven   []HostUnproven
@@ -263,22 +253,9 @@ type HostOffline struct {
 	Mark *fleet.OfflineMark
 }
 
-// HostHold is one change of a host's controller-side hold switch.
-type HostHold struct {
-	Host   string
-	Wanted bool
-	Reason string
-	// By is fleet.Host.HoldBy: fleet.TeamHold for a hold set through a team
-	// feature, empty for every other writer. It is not kept for a hold that
-	// is lifted.
-	By string
-	// Actor is fleet.Host.HoldActor.
-	Actor string
-}
-
 // Empty reports whether there is nothing to commit.
 func (c *Changes) Empty() bool {
-	return len(c.Rollouts) == 0 && len(c.Leases) == 0 &&
-		len(c.Directives) == 0 && len(c.Holds) == 0 && len(c.Offline) == 0 &&
+	return len(c.Rollouts) == 0 && len(c.Dropped) == 0 && len(c.Leases) == 0 &&
+		len(c.Directives) == 0 && len(c.Offline) == 0 &&
 		len(c.Broken) == 0 && len(c.Unproven) == 0 && len(c.Audit) == 0
 }

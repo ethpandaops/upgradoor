@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"math"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -36,17 +37,27 @@ func TestEffectiveMinPeers(t *testing.T) {
 func TestSettingsDefaultsAndValidation(t *testing.T) {
 	s := DefaultSettings()
 	require.NoError(t, s.Validate())
-	assert.Equal(t, uint64(1), s.ReadyEpochs)
+	assert.Equal(t, uint64(2), s.ReadyAttestations)
+	assert.Equal(t, time.Minute, s.ReadyStableFor.Std())
 	assert.Equal(t, 3, s.MinPeers)
 
-	s.ReadyEpochs = 0
-	require.NoError(t, s.Validate(), "0: no waiting beyond one healthy sync")
+	for _, v := range []uint64{0, MaxReadyAttestations + 1} {
+		s.ReadyAttestations = v
+		require.EqualError(t, s.Validate(), "readyAttestations must be between 1 and 32", "%d", v)
+	}
 
-	s.ReadyEpochs = MaxReadyEpochs + 1
-	require.EqualError(t, s.Validate(), "readyEpochs must be at most 32",
-		"the beacon service keeps no longer a history")
+	s.ReadyAttestations = MaxReadyAttestations
+	require.NoError(t, s.Validate())
 
-	s.ReadyEpochs = MaxReadyEpochs
+	s.ReadyStableFor = 0
+	require.NoError(t, s.Validate(), "0: the first healthy sync suffices")
+
+	for _, v := range []time.Duration{-time.Second, MaxReadyStableFor + time.Second} {
+		s.ReadyStableFor = Duration(v)
+		require.EqualError(t, s.Validate(), "readyStableFor must be between 0 and 30m", "%s", v)
+	}
+
+	s.ReadyStableFor = Duration(MaxReadyStableFor)
 	require.NoError(t, s.Validate())
 
 	s.MinPeers = 0

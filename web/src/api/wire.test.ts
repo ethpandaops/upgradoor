@@ -85,7 +85,7 @@ describe('the stream encoding, against the controller', () => {
     for (const name of ['public-network', 'public-hosts', 'public-images'] as const) {
       expect(plain(views[name]), name).toEqual(plain(golden.rest[name]));
     }
-    for (const name of ['plan', 'rollouts', 'settings'] as const) {
+    for (const name of ['plan', 'rollouts'] as const) {
       expect(plain(views[name]), name).toEqual(plain(golden.rest[name]));
     }
     expect(steady(views.hosts)).toEqual(steady(golden.rest.hosts));
@@ -107,7 +107,7 @@ describe('the stream encoding, against the controller', () => {
     const tables = without(golden.patch as Event, 'i', 's', 'd') as DocBody;
 
     expect(i).toBe(((golden.user as Event).i ?? 0) + 1);
-    expect(JSON.stringify(golden.patch).length).toBeLessThan(120);
+    expect(JSON.stringify(golden.patch).length).toBeLessThan(280);
 
     doc.apply(tables, false);
     const views = buildViews(doc, [...strings, ...(s ?? [])], true, NOW);

@@ -109,3 +109,20 @@ export function validateFlags(add: readonly string[], remove: readonly string[])
 
   return null;
 }
+
+/**
+ * commandDiff sets a command line against the arguments most hosts run:
+ * each argument, marked when the base lacks it, then the arguments of the
+ * base this command line lacks.
+ */
+export function commandDiff(
+  command: readonly string[],
+  base: readonly string[]
+): { args: { arg: string; extra: boolean }[]; missing: string[] } {
+  const inBase = new Set(base);
+  const inCommand = new Set(command);
+  return {
+    args: command.map(arg => ({ arg, extra: !inBase.has(arg) })),
+    missing: base.filter(arg => !inCommand.has(arg)),
+  };
+}

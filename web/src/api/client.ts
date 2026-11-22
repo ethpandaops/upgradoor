@@ -3,6 +3,7 @@ import type {
   Audit,
   ClientHostState,
   ClientHosts,
+  ApproveLeaseRequest,
   ClientPolicyRequest,
   Clients,
   Config,
@@ -159,6 +160,8 @@ interface ActionBodies {
   'flag-override': FlagOverrideRequest;
   'client-override': ClientOverrideRequest;
   'host-action': HostActionRequest;
+  'ignore-gate': ScopeRequest;
+  'approve-lease': ApproveLeaseRequest;
 }
 
 type ActionName = keyof ActionBodies;

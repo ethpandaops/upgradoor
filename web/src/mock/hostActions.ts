@@ -12,12 +12,12 @@ import {
   type HostDetail,
   type Lease,
   type Need,
-  type Rollout,
   type RolloutHost,
 } from '../api/types';
+import { isHeld } from '../lib/format';
 import { SECURITY_UPDATES, actionBasis, actionOf } from '../lib/hostActions';
 import type { Login } from '../lib/permissions';
-import type { MockData } from './fixture';
+import type { MockData, MockRollout } from './fixture';
 
 /** The mock's actions: security updates on every node, one for the lighthouse team, one for admins. */
 export const SECURITY_ACTION = 'security-upgrades';
@@ -25,7 +25,7 @@ export const TEAM_ACTION = 'prune-beacon-db';
 export const ADMIN_ACTION = 'docker-prune';
 
 /** The feature that allows SECURITY_ACTION, next to admin. */
-const SECURITY_FEATURE = 'upgradoor:actions';
+const SECURITY_FEATURE = 'manage';
 
 /** MockHostActionError is a refused request: its status is the answer's. */
 export class MockHostActionError extends Error {
@@ -62,7 +62,12 @@ export function seedHostActions(data: MockData): void {
       });
     }
     if (!nodes) {
-      actions.push({ name: ADMIN_ACTION, description: 'Remove unused Docker images', impact: 'independent' });
+      actions.push({
+        name: ADMIN_ACTION,
+        description: 'Remove unused Docker images',
+        impact: 'independent',
+        feature: 'admin',
+      });
     }
 
     host.actions = actions;
@@ -128,7 +133,7 @@ function selected(
     } else if (!permitted) {
       refused += 1;
       if (named.length > 0) rejected[name] = `this login may not start the action ${req.action} on this host`;
-    } else if (host.hold.local || host.hold.controller || host.holdWanted) rejected[name] = 'the host is on hold';
+    } else if (isHeld(host)) rejected[name] = 'the host is on hold';
     else hosts.push(host);
   }
 
@@ -234,7 +239,7 @@ export function startHostAction(ctx: HostActionContext, login: Login, body: unkn
   });
 
   const paused = req.pauseAfterCanary === true && hosts.length > 1;
-  const rollout: Rollout = {
+  const rollout: MockRollout = {
     id,
     kind: 'action',
     key: `manual:${id}`,
@@ -248,6 +253,7 @@ export function startHostAction(ctx: HostActionContext, login: Login, body: unkn
     approved: true,
     force: false,
     ignoreBudget: false,
+    ignoreGate: req.ignoreGate === true,
     canary: hosts[0]?.name,
     createdBy: ctx.actor,
     createdAt: at(100),

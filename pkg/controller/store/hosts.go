@@ -16,15 +16,15 @@ import (
 )
 
 const hostColumns = `name, cert_hash, roles,
-	first_seen, last_seen, remote_addr, status, inventory_hash, hold_wanted, hold_reason, hold_by,
-	offline, broken, sync_interval, status_hash, hold_actor, unproven`
+	first_seen, last_seen, remote_addr, status, inventory_hash,
+	offline, broken, sync_interval, status_hash, unproven`
 
 // RecordSync upserts the host named by the certificate subject. first_seen
 // is kept for a known host. With a nil Request only the identity, last_seen
 // and remote address are updated; the stored status stays.
 //
 // A host seen for the first time that reports a controller hold is created
-// with hold_wanted set. The hold was put there by a controller whose database
+// with a hold of staff. The hold was put there by a controller whose database
 // is gone (or that was told to forget the host); without this the scheduler
 // would find the hold unwanted and lift it.
 func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult, error) {
@@ -64,7 +64,6 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 		switch {
 		case errors.Is(txErr, sql.ErrNoRows):
 			result.Created = true
-			result.HoldAdopted = in.Request != nil && in.Request.Hold.Controller
 		case txErr != nil:
 			return txErr
 		case prev.certHash != cert.Hash:
@@ -79,17 +78,11 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 
 		result.Changed = true
 
-		holdReason := ""
-		if result.HoldAdopted {
-			holdReason = HoldReasonAdopted
-		}
-
-		// hold_wanted and hold_reason are only written for a new row.
 		_, txErr = tx.ExecContext(ctx, `
 			INSERT INTO hosts (name, cert_hash,
-				roles, first_seen, last_seen, remote_addr, status, hold_wanted, hold_reason,
+				roles, first_seen, last_seen, remote_addr, status,
 				status_hash, sync_interval)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(name) DO UPDATE SET
 				cert_hash = excluded.cert_hash,
 				roles = CASE WHEN excluded.status IS NULL
@@ -102,7 +95,7 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 				sync_interval = excluded.sync_interval`,
 			cert.Subject, cert.Hash,
 			rolesJSON, millis(at), millis(at), in.RemoteAddr, status,
-			result.HoldAdopted, holdReason, statusHash, in.SyncInterval.Milliseconds())
+			statusHash, in.SyncInterval.Milliseconds())
 		if txErr != nil {
 			return txErr
 		}
@@ -303,8 +296,8 @@ func (s *sqliteStore) scanHost(row rowScanner) (*fleet.Host, error) {
 
 	err := row.Scan(&host.Name, &host.CertHash, &roles,
 		&firstSeen, &lastSeen, &host.RemoteAddr, &status, &host.InventoryHash,
-		&host.HoldWanted, &host.HoldReason, &host.HoldBy, &offline, &broken, &syncInterval,
-		&host.StatusHash, &host.HoldActor, &unproven)
+		&offline, &broken, &syncInterval,
+		&host.StatusHash, &unproven)
 	if err != nil {
 		return nil, err
 	}
@@ -420,25 +413,6 @@ func setHostOffline(ctx context.Context, tx *sql.Tx, name string, mark *fleet.Of
 	}
 
 	res, err := tx.ExecContext(ctx, `UPDATE hosts SET offline = ? WHERE name = ?`, encoded, name)
-	if err != nil {
-		return err
-	}
-
-	return requireRow(res)
-}
-
-// setHostHold writes the hold switch of a host. by is fleet.Host.HoldBy; a
-// host that is not held has none.
-func setHostHold(
-	ctx context.Context, tx *sql.Tx, name string, wanted bool, reason, by, actor string,
-) error {
-	if !wanted {
-		by, actor = "", ""
-	}
-
-	res, err := tx.ExecContext(ctx,
-		`UPDATE hosts SET hold_wanted = ?, hold_reason = ?, hold_by = ?, hold_actor = ? WHERE name = ?`,
-		wanted, reason, by, actor, name)
 	if err != nil {
 		return err
 	}

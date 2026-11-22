@@ -19,6 +19,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/controllertest"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
+	"github.com/ethpandaops/upgradoor/pkg/controller/views"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -269,8 +270,8 @@ func TestUserEventStream(t *testing.T) {
 	controllertest.LeakFixture(t, h.store, h.sched, h.beacon)
 	h.start()
 
-	// Basic access is all a read needs, on a stream as on a route.
-	authorization := provider.Grant(t, "+upgradoor")
+	// The full view of the hosts needs details (TestReducedEventStream).
+	authorization := provider.Grant(t, "+upgradoor:details")
 
 	require.Equal(t, http.StatusUnauthorized, h.stream(PathEvents, "").status)
 
@@ -287,13 +288,29 @@ func TestUserEventStream(t *testing.T) {
 	snapshot := st.event(eventSnapshot)
 	assert.Equal(t, []string{
 		tableAudit, tableClients, wireKeyDetails, tableHosts, wireKeyVersion, tableImages, tableLeases, tableMembers,
-		tableNetwork, tablePlan, tableQueue, tableRollouts, wireKeyStrings, tableSettings, tableSlots,
+		tableNetwork, tablePlan, tableQueue, tableRollouts, wireKeyStrings, tableSlots,
 		wireKeyTime, wireKeySchema,
 	}, keysOf(snapshot), "the teams of the containers are clients")
 
 	// A login sees which hosts missed attestations in a slot; a host that
 	// attested everything is not named.
 	assert.Regexp(t, `^\{"r":\[\[7190,1,4,3,\[\[\d+,2,1\]\]\]\]\}$`, string(snapshot[tableSlots]))
+
+	// What only the admin pages show is on no stream, an admin's included:
+	// the beacon errors in fixed texts, no settings.
+	for _, login := range []string{authorization, provider.Grant(t, "+upgradoor:admin")} {
+		admin := h.stream(PathEvents+"?host=lighthouse-geth-1&host=lighthouse-geth-2", login)
+		require.Equal(t, http.StatusOK, admin.status)
+
+		event := admin.event(eventSnapshot)
+		for key, data := range event {
+			for _, secret := range controllertest.AdminSecrets {
+				assert.NotContains(t, string(data), secret, key)
+			}
+		}
+
+		assert.Contains(t, string(event[tableNetwork]), "the last fetch failed")
+	}
 
 	var details map[string]json.RawMessage
 
@@ -311,8 +328,14 @@ func TestUserEventStream(t *testing.T) {
 	})
 	st.quiet(300 * time.Millisecond)
 
-	// A hold is lifted: two cells of the host's row, and of its details.
-	h.change(func(f *controllertest.Store) { f.Hosts["lighthouse-geth-1"].HoldWanted = false })
+	// Staff's hold is lifted: two cells of the host's row, and of its
+	// details.
+	h.change(func(f *controllertest.Store) {
+		host := f.Hosts["lighthouse-geth-1"]
+		status := *host.Status
+		status.Hold.Holds = status.Hold.Holds[:1]
+		host.Status = &status
+	})
 
 	patch := st.event(eventPatch)
 	assert.Equal(t, []string{wireKeyDetails, tableHosts, wireKeyVersion}, keysOf(patch))
@@ -323,7 +346,7 @@ func TestUserEventStream(t *testing.T) {
 	require.Len(t, table.Updates, 1)
 	assert.Empty(t, table.Rows)
 	assert.JSONEq(t, `"lighthouse-geth-1"`, string(table.Updates[0][0]))
-	assert.Len(t, table.Updates[0], 1+2*2, "holdWanted and holdBy: %s", patch[tableHosts])
+	assert.Len(t, table.Updates[0], 1+2*2, "hold and holders: %s", patch[tableHosts])
 
 	// A host that is forgotten leaves the table, and its details say so.
 	h.change(func(f *controllertest.Store) { delete(f.Hosts, "lighthouse-geth-1") })
@@ -333,6 +356,85 @@ func TestUserEventStream(t *testing.T) {
 	assert.Equal(t, []json.RawMessage{json.RawMessage(`"lighthouse-geth-1"`)}, table.Removed)
 	assert.JSONEq(t, `{"lighthouse-geth-1":0}`, string(patch[wireKeyDetails]))
 	assert.JSONEq(t, "3", string(patch[wireKeyVersion]))
+}
+
+// A login without details gets the reduced tables, whatever its teams,
+// and the details of a host in full only where team_details covers it.
+func TestReducedEventStream(t *testing.T) {
+	c := controllertest.NewClock(controllertest.Epoch)
+	provider := controllertest.NewAuthProvider(t, c, true)
+
+	h := newHarness(t, func(o *harnessOptions) {
+		o.AuthProviderURL = provider.Server.URL
+		o.Now = c.Now
+	})
+	h.clock = c
+
+	fastStreams(h)
+	controllertest.LeakFixture(t, h.store, h.sched, h.beacon)
+	h.start()
+
+	noLeak := func(event map[string]json.RawMessage) {
+		t.Helper()
+
+		for key, data := range event {
+			for _, secret := range slices.Concat(controllertest.HostDetailSecrets, controllertest.AdminSecrets) {
+				assert.NotContains(t, string(data), secret, key)
+			}
+		}
+	}
+
+	path := PathEvents + "?host=lighthouse-geth-1&host=bootnode-1"
+
+	// The details of a login without teams are reduced; those of a team
+	// member show the team's containers in full.
+	for i, login := range []struct {
+		authorization  string
+		reducedDetails bool
+	}{
+		{provider.Grant(t, "+upgradoor"), true},
+		{provider.Grant(t, "+upgradoor", controllertest.SecretOwnerEL), false},
+		{provider.Grant(t, "+upgradoor:team_details", controllertest.SecretOwnerCL), false},
+	} {
+		st := h.stream(path, login.authorization)
+		require.Equal(t, http.StatusOK, st.status)
+
+		snapshot := st.event(eventSnapshot)
+		details := snapshot[wireKeyDetails]
+		delete(snapshot, wireKeyDetails)
+		noLeak(snapshot)
+
+		if login.reducedDetails {
+			noLeak(map[string]json.RawMessage{wireKeyDetails: details})
+		}
+
+		if i == 1 {
+			assert.Contains(t, string(details), controllertest.SecretFlag, "the command line of the team's container")
+			assert.NotContains(t, string(details), controllertest.SecretCertHash)
+		}
+
+		// A change reaches the reduced tables as a patch: one more need.
+		h.change(func(f *controllertest.Store) {
+			status := *f.Hosts["lighthouse-geth-2"].Status
+			status.Needs = append(slices.Clone(status.Needs),
+				protocol.Need{ID: fmt.Sprint("reboot-", i), Kind: protocol.NeedReboot})
+			f.Hosts["lighthouse-geth-2"].Status = &status
+		})
+
+		patch := st.event(eventPatch)
+		assert.Contains(t, keysOf(patch), tableHosts)
+		noLeak(patch)
+	}
+
+	// The twin covers the host its team owns a container on.
+	st := h.stream(path, provider.Grant(t, "+upgradoor:team_details", controllertest.SecretOwnerCL))
+	require.Equal(t, http.StatusOK, st.status)
+
+	var details map[string]json.RawMessage
+
+	require.NoError(t, json.Unmarshal(st.event(eventSnapshot)[wireKeyDetails], &details))
+	assert.Contains(t, string(details["lighthouse-geth-1"]), controllertest.SecretCertHash)
+	assert.NotContains(t, string(details["bootnode-1"]), controllertest.SecretCertHash)
 }
 
 // A stream is opened by a token and ends with it.
@@ -388,8 +490,9 @@ func TestEventStreamSendsWhatChangedOnce(t *testing.T) {
 	// A burst of writes: every one is announced, the last one is what counts.
 	for i := 1; i <= 20; i++ {
 		h.change(func(f *controllertest.Store) {
-			f.Hosts["lighthouse-geth-1"].HoldWanted = true
-			f.Hosts["lighthouse-geth-1"].HoldReason = fmt.Sprintf("reason %d", i)
+			f.Hosts["lighthouse-geth-1"].Status = &protocol.SyncRequest{
+				Hold: protocol.Hold{Holds: []protocol.HostHold{{Holder: fmt.Sprintf("team-%d", i)}}},
+			}
 		})
 	}
 
@@ -416,7 +519,7 @@ collect:
 
 	require.NotEmpty(t, patches)
 	assert.LessOrEqual(t, len(patches), 3, "twenty writes in a burst are not twenty events")
-	assert.Contains(t, patches[len(patches)-1], "reason 20")
+	assert.Contains(t, patches[len(patches)-1], "team-20")
 }
 
 // A sync that only moved the probe values rebuilds the tables while a stream
@@ -469,16 +572,16 @@ func TestEventStreamBounds(t *testing.T) {
 	})
 
 	for range maxPublicStreams {
-		sub, err := hub.subscribe(ctx, false, nil)
+		sub, err := hub.subscribe(ctx, nil, nil)
 		require.NoError(t, err)
 
 		subs = append(subs, sub)
 	}
 
-	_, err := hub.subscribe(ctx, false, nil)
+	_, err := hub.subscribe(ctx, nil, nil)
 	require.ErrorIs(t, err, errStreamsFull)
 
-	sub, err := hub.subscribe(ctx, true, nil)
+	sub, err := hub.subscribe(ctx, &views.Access{}, nil)
 	require.NoError(t, err, "an operator's stream still opens")
 
 	subs = append(subs, sub)

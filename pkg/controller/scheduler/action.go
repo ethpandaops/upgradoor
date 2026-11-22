@@ -18,6 +18,7 @@ import (
 const (
 	keyLease    = "lease"
 	keyReason   = "reason"
+	keyHost     = "host"
 	keyHosts    = "hosts"
 	keyBefore   = "before"
 	keyAfter    = "after"
@@ -25,14 +26,15 @@ const (
 	keyPaused   = "paused"
 	keyState    = "state"
 	keyKey      = "key"
+	keyTitle    = "title"
 	keyRollouts = "rollouts"
-	// keyHoldWanted and keyHoldReason are the hold switch of a host in the
-	// before and after of an audit entry.
-	keyHoldWanted = "holdWanted"
-	keyHoldReason = "holdReason"
-	// keyHoldBy says, in the after of a hold, that it was set through a team
-	// feature.
-	keyHoldBy = "holdBy"
+	// keyIgnoreGate is Rollout.IgnoreGate.
+	keyIgnoreGate = "ignoreGate"
+	// keyHolder names whose hold an entry of hold or unhold is about.
+	keyHolder    = "holder"
+	keyDirective = "directive"
+	keyBy        = "by"
+	keyHeld      = "held"
 )
 
 // manualRequest is a roll or reboot request in one shape.
@@ -44,6 +46,7 @@ type manualRequest struct {
 	staggered    bool
 	force        bool
 	ignoreBudget bool
+	ignoreGate   bool
 	reason       string
 }
 
@@ -51,7 +54,8 @@ type manualRequest struct {
 func (s *service) Roll(ctx context.Context, actor string, req RollRequest) (*ActionResult, error) { //nolint:gocritic // hugeParam: the signature is the Service contract.
 	return s.manual(ctx, actor, &manualRequest{
 		verb: protocol.VerbRoll, hosts: req.Hosts, all: req.All, containers: req.Containers,
-		staggered: req.Staggered, force: req.Force, ignoreBudget: req.IgnoreBudget, reason: req.Reason,
+		staggered: req.Staggered, force: req.Force, ignoreBudget: req.IgnoreBudget, ignoreGate: req.IgnoreGate,
+		reason: req.Reason,
 	})
 }
 
@@ -59,7 +63,8 @@ func (s *service) Roll(ctx context.Context, actor string, req RollRequest) (*Act
 func (s *service) Reboot(ctx context.Context, actor string, req RebootRequest) (*ActionResult, error) {
 	return s.manual(ctx, actor, &manualRequest{
 		verb: protocol.VerbReboot, hosts: req.Hosts, all: req.All,
-		staggered: req.Staggered, force: req.Force, ignoreBudget: req.IgnoreBudget, reason: req.Reason,
+		staggered: req.Staggered, force: req.Force, ignoreBudget: req.IgnoreBudget, ignoreGate: req.IgnoreGate,
+		reason: req.Reason,
 	})
 }
 
@@ -88,6 +93,7 @@ func (s *service) manual(ctx context.Context, actor string, req *manualRequest) 
 		Approved:     true,
 		Force:        !req.staggered || req.force,
 		IgnoreBudget: req.ignoreBudget,
+		IgnoreGate:   req.ignoreGate,
 		CreatedBy:    actorName(actor),
 		CreatedAt:    now,
 		UpdatedAt:    now,
@@ -130,6 +136,10 @@ func (s *service) manual(ctx context.Context, actor string, req *manualRequest) 
 		}
 	}
 
+	if req.verb == protocol.VerbRoll {
+		r.ContainerKind, r.Team = manualUnit(hosts, changes.Directives)
+	}
+
 	if len(res.Hosts) == 0 {
 		res.Message = "no host can take the " + string(req.verb)
 
@@ -149,7 +159,7 @@ func (s *service) manual(ctx context.Context, actor string, req *manualRequest) 
 	changes.Audit = []fleet.AuditEntry{s.entry(actor, "action."+string(req.verb), r.ID, map[string]any{
 		keyHosts: res.Hosts, "rejected": res.Rejected, "containers": req.containers,
 		"staggered": req.staggered, keyForce: r.Force, "ignoreBudget": r.IgnoreBudget,
-		keyReason: req.reason,
+		keyIgnoreGate: r.IgnoreGate, keyReason: req.reason,
 	})}
 
 	if err := s.commit(ctx, changes); err != nil {
@@ -160,6 +170,36 @@ func (s *service) manual(ctx context.Context, actor string, req *manualRequest) 
 	res.Message = r.Title
 
 	return res, nil
+}
+
+// manualUnit is the team of a manual roll when every container it rolls is
+// of that one team, and their kind when they share one; empty otherwise.
+func manualUnit(hosts []*fleet.Host, directives []*fleet.Directive) (kind protocol.ContainerKind, team string) {
+	byName := make(map[string]*fleet.Host, len(hosts))
+	for _, h := range hosts {
+		byName[h.Name] = h
+	}
+
+	for i, d := range directives {
+		h := byName[d.Host]
+		idx := slices.IndexFunc(h.Status.Containers, func(c protocol.Container) bool { return c.Name == d.Container })
+		c := &h.Status.Containers[idx]
+
+		switch {
+		case i == 0:
+			kind, team = c.Kind, c.Team
+		case c.Team != team:
+			return "", ""
+		case c.Kind != kind:
+			kind = ""
+		}
+	}
+
+	if team == "" {
+		return "", ""
+	}
+
+	return kind, team
 }
 
 // manualTargets returns what a manual action applies to on one host: the
@@ -174,7 +214,7 @@ func manualTargets(
 	case h.KnownOffline(now):
 		return nil, reasonOffline
 	case h.Held():
-		return nil, reasonHeld
+		return nil, h.HeldReason()
 	case hostStale(h, now, since, settings.HostStaleAfter.Std()):
 		return nil, reasonAgentSilent
 	case !slices.Contains(h.Status.Verbs, req.verb):
@@ -248,12 +288,16 @@ func (s *service) commit(ctx context.Context, changes *store.Changes) error {
 	return nil
 }
 
-// Hold puts hosts on controller hold.
+// Hold asks the agents to set holds: staff's, or through team_manage one per
+// team of the request that owns a managed container of the host. The agent
+// owns its holds; a hold directive is pending until it answers.
 func (s *service) Hold(ctx context.Context, actor string, req HoldRequest) (*ActionResult, error) {
 	return s.setHold(ctx, actor, &req, true)
 }
 
-// Unhold lifts the controller hold.
+// Unhold asks the agents to lift holds: staff's unless req.Holders names
+// others, or through team_manage those of the request's teams (all that own a
+// managed container of the host unless req.Holders names some of them).
 func (s *service) Unhold(ctx context.Context, actor string, req HoldRequest) (*ActionResult, error) {
 	return s.setHold(ctx, actor, &req, false)
 }
@@ -261,6 +305,11 @@ func (s *service) Unhold(ctx context.Context, actor string, req HoldRequest) (*A
 func (s *service) setHold(
 	ctx context.Context, actor string, req *HoldRequest, wanted bool,
 ) (*ActionResult, error) {
+	if wanted && len(req.Holders) > 0 {
+		return nil, fmt.Errorf("%w: a hold is set for staff or the teams of the login, not for named holders",
+			ErrInvalidAction)
+	}
+
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -269,50 +318,42 @@ func (s *service) setHold(
 		return nil, err
 	}
 
-	// A request that was allowed through the team feature does not touch a
-	// hold that none of its teams set. The API refuses that before it gets
-	// here; this is the same question asked again under the lock, against
-	// the holds as they are now. Nothing is changed when one host is refused.
-	if twin, ok := teamFeatureOf(ctx); ok {
-		a, _ := AuthorizationFrom(ctx)
+	pending, err := s.opts.Store.ListDirectives(ctx, store.DirectiveFilter{PendingOnly: true})
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: list directives: %w", err)
+	}
 
-		for _, h := range hosts {
-			if !h.HoldWanted {
-				continue
-			}
+	// The holders are decided for every host before anything changes: one
+	// refused host refuses the request. The API asked the same before; this
+	// asks again under the lock, against the hosts as they are now.
+	holders := make([][]string, len(hosts))
 
-			if by := HoldSetBy(h.HoldBy, a.Teams); by != "" {
-				verb := "lift"
-				if wanted {
-					verb = "change"
-				}
-
-				return nil, fmt.Errorf("%w: %s does not %s the hold on host %s (set by %s)",
-					ErrForbidden, twin, verb, h.Name, by)
-			}
+	for i, h := range hosts {
+		holders[i], err = holdHolders(ctx, h, req.Holders, wanted)
+		if err != nil {
+			return nil, err
 		}
 	}
 
-	action, reason := "action.unhold", ""
+	action := "action.unhold"
 	if wanted {
-		action, reason = "action.hold", req.Reason
+		action = "action.hold"
 	}
 
 	res := &ActionResult{}
-	notHeld := 0
+	unchanged := 0
 
 	// Each host is one transaction: when one fails, the earlier ones stay
 	// changed and audited, and the result names them.
-	for _, h := range hosts {
-		// Lifting a hold that is not there changes nothing and is no entry
-		// in the audit log.
-		if !wanted && !h.HoldWanted {
-			notHeld++
+	for i, h := range hosts {
+		changes := s.holdChanges(ctx, actor, action, h, holders[i], wanted, req.Reason, pending)
+		if changes.Empty() {
+			unchanged++
 
 			continue
 		}
 
-		if err := s.setHostHold(ctx, actor, action, h, wanted, reason, req.Reason); err != nil {
+		if err := s.write(ctx, changes); err != nil {
 			res.Message = fmt.Sprintf("stopped at %s; changed before it: %d host(s)", h.Name, len(res.Hosts))
 
 			if len(res.Hosts) > 0 {
@@ -325,87 +366,125 @@ func (s *service) setHold(
 		res.Hosts = append(res.Hosts, h.Name)
 	}
 
-	res.Message = fmt.Sprintf("hold lifted on %d host(s)", len(res.Hosts))
+	res.Message = fmt.Sprintf("release requested on %d host(s), waiting for the hosts", len(res.Hosts))
 	if wanted {
-		res.Message = fmt.Sprintf("%d host(s) on hold", len(res.Hosts))
+		res.Message = fmt.Sprintf("hold requested on %d host(s), waiting for the hosts", len(res.Hosts))
 	}
 
-	if notHeld > 0 {
-		res.Message += fmt.Sprintf("; %d host(s) were not held", notHeld)
+	if !wanted && unchanged > 0 {
+		res.Message += fmt.Sprintf("; %d host(s) had no such hold", unchanged)
 	}
 
-	if len(res.Hosts) == 0 {
-		return res, nil
+	if len(res.Hosts) > 0 {
+		s.Nudge()
 	}
-
-	s.Nudge()
 
 	return res, nil
 }
 
-// setHostHold changes the hold switch of one host and audits it, in one
-// transaction.
-//
-// A hold set by a request that was allowed through the team feature is
-// recorded as the hold of the request's teams that own a container of the
-// host (fleet.TeamHold), which is what lets a team feature of one of them
-// lift it again. A hold that is there already and is not a team's stays
-// staff's: a team cannot make a hold its own by setting it again.
-func (s *service) setHostHold(
-	ctx context.Context, actor, action string, h *fleet.Host, wanted bool, reason, given string,
-) error {
-	_, teamHold := fleet.HoldTeams(h.HoldBy)
+// holdHolders are the holders whose holds a hold or unhold changes on one
+// host. Through team_manage they are the request's teams that own a managed
+// container of the host, or those of them that named is limited to;
+// otherwise staff, or for an unhold the holders named.
+func holdHolders(ctx context.Context, h *fleet.Host, named []string, wanted bool) ([]string, error) {
+	twin, viaTeam := teamFeatureOf(ctx)
+	if !viaTeam {
+		if len(named) > 0 {
+			return named, nil
+		}
 
-	by := ""
-	if a, ok := AuthorizationFrom(ctx); ok && wanted && throughTeamFeature(ctx) && (!h.HoldWanted || teamHold) {
-		by = fleet.TeamHold(owningTeams(h, a.Teams))
+		return []string{fleet.HolderStaff}, nil
 	}
 
-	return s.write(ctx, &store.Changes{
-		Holds: []store.HostHold{{Host: h.Name, Wanted: wanted, Reason: reason, By: by, Actor: actor}},
-		Audit: []fleet.AuditEntry{s.entry(actor, action, h.Name, map[string]any{
-			keyBefore: holdDetail(h.HoldWanted, h.HoldReason, h.HoldBy, false),
-			keyAfter:  holdDetail(wanted, reason, by, h.HoldBy != "" && wanted),
-			keyReason: given,
-		})},
-	})
-}
+	a, _ := AuthorizationFrom(ctx)
+	own := holdTeams(h, a.Teams)
 
-// HoldSetBy says who set a hold that none of the teams set: "staff", or
-// "team <teams>"; empty when one of the teams set it.
-func HoldSetBy(holdBy string, teams []string) string {
-	holders, team := fleet.HoldTeams(holdBy)
-
-	switch {
-	case !team:
-		return holdByStaff
-	case slices.ContainsFunc(holders, func(t string) bool { return slices.Contains(teams, t) }):
-		return ""
-	default:
-		return "team " + strings.Join(holders, ", ")
+	if len(own) == 0 {
+		return nil, fmt.Errorf("%w: %s does not cover host %s (owners: none of your teams)", ErrForbidden, twin, h.Name)
 	}
+
+	if wanted || len(named) == 0 {
+		return own, nil
+	}
+
+	for _, holder := range named {
+		if !slices.Contains(own, holder) {
+			return nil, fmt.Errorf("%w: %s does not lift the hold of %s on host %s", ErrForbidden, twin, holder, h.Name)
+		}
+	}
+
+	return named, nil
 }
 
-// owningTeams are the teams of the managed containers of the host among
-// teams, or all of them when none is.
-func owningTeams(h *fleet.Host, teams []string) []string {
+// holdChanges adds a hold or release-hold directive per holder of one host,
+// with an audit entry each, and cancels the unanswered hold directives of
+// those holders it replaces. Lifting a hold that is neither reported nor
+// requested changes nothing.
+func (s *service) holdChanges(
+	ctx context.Context, actor, action string, h *fleet.Host, holders []string, wanted bool, reason string,
+	pending []*fleet.Directive,
+) *store.Changes {
+	changes := &store.Changes{}
+	now := s.opts.Now()
+
+	by := &protocol.Actor{User: actorName(actor)}
+	if a, ok := AuthorizationFrom(ctx); ok {
+		by.Teams, by.Feature = slices.Clone(a.Teams), a.By
+	}
+
+	kind := protocol.DirectiveReleaseHold
+	if wanted {
+		kind = protocol.DirectiveHold
+	}
+
+	for _, holder := range holders {
+		before := h.HoldOf(holder)
+		requested := false
+
+		for _, d := range pending {
+			if d.Host != h.Name || d.Holder != holder ||
+				(d.Kind != protocol.DirectiveHold && d.Kind != protocol.DirectiveReleaseHold) {
+				continue
+			}
+
+			requested = requested || d.Kind == protocol.DirectiveHold
+			d.State, d.Error, d.UpdatedAt = fleet.DirectiveCancelled, "replaced by a later request", now
+			changes.Directives = append(changes.Directives, d)
+		}
+
+		if !wanted && before == nil && !requested {
+			continue
+		}
+
+		d := &fleet.Directive{
+			Directive: protocol.Directive{ID: s.opts.NewID(), Kind: kind, Holder: holder, Reason: reason, By: by},
+			Host:      h.Name, State: fleet.DirectivePending,
+			CreatedBy: by.User, CreatedAt: now, UpdatedAt: now,
+		}
+
+		changes.Directives = append(changes.Directives, d)
+		changes.Audit = append(changes.Audit, s.entry(actor, action, h.Name, map[string]any{
+			keyHolder: holder, keyDirective: d.ID, keyBefore: holdDetail(before),
+			keyAfter: map[string]any{keyHeld: wanted, keyBy: by.User, keyReason: reason}, keyReason: reason,
+		}))
+	}
+
+	return changes
+}
+
+// holdTeams are the teams among teams that own a managed container of the
+// host, sorted. A team named like staff's holder holds nothing.
+func holdTeams(h *fleet.Host, teams []string) []string {
 	out := make([]string, 0, len(teams))
 
 	if h.Status != nil {
 		for i := range h.Status.Containers {
 			c := &h.Status.Containers[i]
-			if !c.Managed {
-				continue
-			}
-
-			if slices.Contains(teams, c.Team) && !slices.Contains(out, c.Team) {
+			if c.Managed && c.Team != fleet.HolderStaff && slices.Contains(teams, c.Team) &&
+				!slices.Contains(out, c.Team) {
 				out = append(out, c.Team)
 			}
 		}
-	}
-
-	if len(out) == 0 {
-		out = append(out, teams...)
 	}
 
 	slices.Sort(out)
@@ -413,21 +492,13 @@ func owningTeams(h *fleet.Host, teams []string) []string {
 	return out
 }
 
-// holdDetail is the hold switch of a host in the before or after of an audit
-// entry. Whose hold it is stands in it for a team's hold; for a hold of
-// staff only where it says that a team's hold became staff's (tookOver).
-func holdDetail(wanted bool, reason, by string, tookOver bool) map[string]any {
-	detail := map[string]any{keyHoldWanted: wanted, keyHoldReason: reason}
-
-	switch {
-	case !wanted:
-	case by != "":
-		detail[keyHoldBy] = by
-	case tookOver:
-		detail[keyHoldBy] = holdByStaff
+// holdDetail is one hold in the before or after of an audit entry.
+func holdDetail(hold *protocol.HostHold) map[string]any {
+	if hold == nil {
+		return map[string]any{keyHeld: false}
 	}
 
-	return detail
+	return map[string]any{keyHeld: true, keyBy: hold.By, keyReason: hold.Reason}
 }
 
 // MarkOffline marks hosts as known offline: their validators are left out of
@@ -436,12 +507,7 @@ func holdDetail(wanted bool, reason, by string, tookOver bool) map[string]any {
 func (s *service) MarkOffline(
 	ctx context.Context, actor string, req OfflineRequest,
 ) (*ActionResult, error) {
-	mark := &fleet.OfflineMark{Reason: req.Reason, Until: req.Until}
-	if throughTeamFeature(ctx) {
-		mark.By = fleet.HoldByTeam
-	}
-
-	return s.setOffline(ctx, actor, req.Hosts, mark, req.Reason)
+	return s.setOffline(ctx, actor, req.Hosts, &fleet.OfflineMark{Reason: req.Reason, Until: req.Until}, req.Reason)
 }
 
 // UnmarkOffline lifts the offline mark.
@@ -452,8 +518,7 @@ func (s *service) UnmarkOffline(
 }
 
 // setOffline sets (mark) or lifts (nil) the offline mark of hosts, one
-// transaction with its audit entry per host. A request allowed through the
-// team feature changes only marks that were set through one.
+// transaction with its audit entry per host.
 func (s *service) setOffline(
 	ctx context.Context, actor string, names []string, mark *fleet.OfflineMark, given string,
 ) (*ActionResult, error) {
@@ -463,15 +528,6 @@ func (s *service) setOffline(
 	hosts, err := s.selectHosts(ctx, names, false)
 	if err != nil {
 		return nil, err
-	}
-
-	if twin, ok := teamFeatureOf(ctx); ok {
-		for _, h := range hosts {
-			if h.Offline != nil && h.Offline.By != fleet.HoldByTeam {
-				return nil, fmt.Errorf("%w: %s does not change the offline mark of host %s (set by staff)",
-					ErrForbidden, twin, h.Name)
-			}
-		}
 	}
 
 	action := "action.unmark-offline"
@@ -530,10 +586,6 @@ func offlineDetail(mark *fleet.OfflineMark) map[string]any {
 		detail["until"] = mark.Until.UTC().Format(time.RFC3339)
 	}
 
-	if mark.By != "" {
-		detail["by"] = mark.By
-	}
-
 	return detail
 }
 
@@ -587,7 +639,7 @@ func (s *service) Resume(ctx context.Context, actor string, req ScopeRequest) (*
 
 	before := map[string]any{keyPaused: r.Paused, "approved": r.Approved}
 	res := &ActionResult{Rollout: r.ID, Message: "rollout resumed"}
-	approve := !r.Approved && rolloutPolicy(&settings, r) == fleet.PolicyManual
+	approve := !r.Approved && settings.RolloutPolicy(r) == fleet.PolicyManual
 
 	if !r.Paused && !approve {
 		res.Message = "rollout is not paused and needs no approval"
@@ -607,6 +659,86 @@ func (s *service) Resume(ctx context.Context, actor string, req ScopeRequest) (*
 		keyBefore: before,
 		keyAfter:  map[string]any{keyPaused: r.Paused, "approved": r.Approved},
 		keyReason: req.Reason,
+	})
+}
+
+// IgnoreGate lets the leases of an open rollout pass a closed network gate.
+func (s *service) IgnoreGate(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.openRollout(ctx, req.Rollout)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &ActionResult{Rollout: r.ID, Message: "rollout passes the network gate"}
+	if r.PassesGate() {
+		return res, nil
+	}
+
+	r.IgnoreGate = true
+
+	return res, s.commitRollout(ctx, actor, "action.ignore-gate", r, map[string]any{
+		keyBefore: map[string]any{keyIgnoreGate: false},
+		keyAfter:  map[string]any{keyIgnoreGate: true},
+		keyReason: req.Reason,
+	})
+}
+
+// ApproveLease marks the verifying lease of one member of a rollout as
+// approved; the next reconcile releases it as ready (pass.verify).
+func (s *service) ApproveLease(
+	ctx context.Context, actor string, req ApproveLeaseRequest,
+) (*ActionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.rollout(ctx, req.Rollout)
+	if err != nil {
+		return nil, err
+	}
+
+	m := r.Host(req.Host)
+
+	switch {
+	case m == nil:
+		return nil, fmt.Errorf("%w: %s is no host of rollout %s", ErrUnknownHost, req.Host, r.ID)
+	case m.State != fleet.HostLeased || m.LeaseID == "":
+		return nil, fmt.Errorf("%w: %s holds no lease in rollout %s", ErrInvalidAction, m.Host, r.ID)
+	}
+
+	l, err := s.opts.Store.GetLease(ctx, m.LeaseID)
+
+	switch {
+	case errors.Is(err, store.ErrNotFound):
+		return nil, fmt.Errorf("%w: %s", ErrUnknownLease, m.LeaseID)
+	case err != nil:
+		return nil, fmt.Errorf("scheduler: get lease %s: %w", m.LeaseID, err)
+	case l.State != fleet.LeaseVerifying:
+		return nil, fmt.Errorf("%w: lease %s is %s, not verifying", ErrInvalidAction, l.ID, l.State)
+	case l.Cancelled != nil:
+		return nil, fmt.Errorf("%w: lease %s was ended by %s", ErrInvalidAction, l.ID, l.Cancelled.By)
+	}
+
+	res := &ActionResult{
+		Message: fmt.Sprintf("lease %s of %s approved", l.ID, l.Host),
+		Rollout: r.ID,
+		Hosts:   []string{l.Host},
+	}
+
+	if l.Approved != nil {
+		return res, nil
+	}
+
+	l.Approved = &fleet.LeaseApproval{At: s.opts.Now(), By: actorName(actor), Reason: req.Reason}
+
+	return res, s.commit(ctx, &store.Changes{
+		Leases: []*fleet.Lease{l},
+		Audit: []fleet.AuditEntry{s.entry(actor, "action.approve-lease", l.Host, map[string]any{
+			keyLease: l.ID, keyRollouts: slices.Compact(slices.Sorted(maps.Values(l.Rollouts))),
+			"readiness": l.Readiness, keyReason: req.Reason,
+		})},
 	})
 }
 
@@ -914,29 +1046,6 @@ func (s *service) SetClientPolicy(
 	return res, nil
 }
 
-// rolloutPolicy is the policy that governs a rollout: that of its kind, and
-// for an image rollout that of its team where one is set (policyImage for a
-// rollout without a team). Manual rollouts are requested by a person and
-// answer to no policy.
-func rolloutPolicy(settings *fleet.Settings, r *fleet.Rollout) fleet.Policy {
-	switch r.Kind {
-	case fleet.RolloutGroup:
-		return settings.ImagePolicy(r.Team)
-	case fleet.RolloutPackages:
-		return settings.PolicyPackages
-	case fleet.RolloutReboot:
-		return settings.PolicyReboot
-	case fleet.RolloutAction:
-		if directed(r) {
-			return fleet.PolicyAuto
-		}
-
-		return settings.ActionPolicy(r.Action)
-	default:
-		return fleet.PolicyAuto
-	}
-}
-
 func (s *service) setGlobalPause(
 	ctx context.Context, actor, action string, paused bool, reason string,
 ) (*ActionResult, error) {
@@ -1062,14 +1171,14 @@ func (s *service) Skip(
 	})
 }
 
-// Retry returns failed hosts of an open rollout to pending.
+// Retry returns failed and cancelled hosts of an open rollout to pending.
 //
-// Without hosts it is about the rollout: every failed member returns to
-// pending and a halted rollout is active again, also when no member is
-// failed.
+// Without hosts it is about the rollout: every failed or cancelled member
+// returns to pending and a halted rollout is active again, also when no
+// member is failed.
 //
-// With hosts it is about those hosts: the named members that are failed, or
-// that a person skipped, return to pending. The rollout leaves its halt only
+// With hosts it is about those hosts: the named members that are failed or
+// cancelled, or that a person skipped, return to pending. The rollout leaves its halt only
 // when one of the hosts returned to pending had failed and no member is
 // failed after that. A failed host that was not named keeps it halted, and
 // taking back a skip lifts no halt: a halt whose failed hosts were all
@@ -1101,16 +1210,16 @@ func (s *service) Retry(
 		m := &r.Hosts[i]
 		listed := slices.Contains(req.Hosts, m.Host)
 
-		// Failed hosts are retried unless others are listed; a skip is only
-		// taken back for a host that is named.
-		if (m.State != fleet.HostFailed || (len(req.Hosts) > 0 && !listed)) &&
-			(!operatorSkipped(m) || !listed) {
+		// Failed and cancelled hosts are retried unless others are listed; a
+		// skip is only taken back for a host that is named.
+		retryable := m.State == fleet.HostFailed || m.State == fleet.HostCancelled
+		if (!retryable || (len(req.Hosts) > 0 && !listed)) && (!operatorSkipped(m) || !listed) {
 			continue
 		}
 
 		retriedFailed = retriedFailed || m.State == fleet.HostFailed
 
-		if m.State == fleet.HostFailed && m.LeaseID != "" {
+		if retryable && m.LeaseID != "" {
 			failedLeases[m.Host] = m.LeaseID
 		}
 
@@ -1124,7 +1233,7 @@ func (s *service) Retry(
 
 	for _, name := range req.Hosts {
 		if !slices.Contains(res.Hosts, name) {
-			res.Rejected[name] = "has neither failed nor been skipped in the rollout"
+			res.Rejected[name] = "has neither failed, been cancelled nor been skipped in the rollout"
 		}
 	}
 
@@ -1172,6 +1281,13 @@ func (s *service) Retry(
 		res.Message = fmt.Sprintf("rollout reopened, %d host(s) retried", len(res.Hosts))
 	}
 
+	// A pause that a cancelled member caused ends with the last of them.
+	if r.Paused && strings.Contains(r.PauseReason, " "+cancelPauseMark+" ") &&
+		!slices.ContainsFunc(r.Hosts, func(m fleet.RolloutHost) bool { return m.State == fleet.HostCancelled }) {
+		r.Paused = false
+		r.PauseReason = ""
+	}
+
 	r.UpdatedAt = now
 	changes := &store.Changes{
 		Rollouts: []*fleet.Rollout{r},
@@ -1202,7 +1318,7 @@ func (s *service) Retry(
 	return res, nil
 }
 
-// recheck returns the recheck lease of a retried member whose failed lease
+// recheck returns the recheck lease of a retried member whose failed or cancelled lease
 // did the rollout's steps and whose host no longer reports their needs, and
 // moves the member to it; nil when the member waits for a lease as usual.
 func (s *service) recheck(
@@ -1215,7 +1331,7 @@ func (s *service) recheck(
 		return nil, nil //nolint:nilnil // no lease to recheck.
 	case err != nil:
 		return nil, fmt.Errorf("scheduler: get lease %s: %w", leaseID, err)
-	case failed.State != fleet.LeaseFailed || !stepsDone(failed, r.ID):
+	case (failed.State != fleet.LeaseFailed && failed.State != fleet.LeaseCancelled) || !stepsDone(failed, r.ID):
 		return nil, nil //nolint:nilnil // nothing was done to recheck.
 	}
 
@@ -1263,6 +1379,7 @@ func (s *service) recheck(
 
 	m := r.Host(host)
 	m.State = fleet.HostLeased
+	m.Served = true
 	m.LeaseID = l.ID
 	m.NeedID = l.Needs[0].ID
 
@@ -1318,7 +1435,7 @@ func (s *service) Abort(ctx context.Context, actor string, req ScopeRequest) (*A
 		return nil, err
 	}
 
-	if r.Kind == fleet.RolloutReboot || r.Kind == fleet.RolloutLocal || (r.Kind == fleet.RolloutAction && !directed(r)) {
+	if r.Kind == fleet.RolloutReboot || r.Kind == fleet.RolloutLocal || (r.Kind == fleet.RolloutAction && !r.Directed()) {
 		before := map[string]any{keyPaused: r.Paused}
 		r.Paused = true
 		r.PauseReason = abortedReason(req.Reason)
@@ -1373,7 +1490,7 @@ func (s *service) Abort(ctx context.Context, actor string, req ScopeRequest) (*A
 	}
 
 	msg := "rollout aborted"
-	if !directed(r) {
+	if !r.Directed() {
 		msg += ": its target is not rolled again until it changes or someone rolls it by hand"
 	}
 
@@ -1399,14 +1516,14 @@ func abortedReason(reason string) string {
 // lease stays open: it keeps its place in the budget, in the host limit and
 // in the gate, because the host is as far down as it was a moment ago. From
 // the next sync on the agent is told (protocol.Lease.Cancel) and begins no
-// further step. The lease then ends as failed, with the reason "ended by
-// operator" unless the agent reports a failure of its own: when the agent
-// reports the end of its operation, at once when the lease is being
-// verified, and for a lease that was only granted with the agent's next sync:
-// the agent declines it, or never had it. An agent that stays silent fails the lease as it fails any
-// other. A failed lease halts its rollouts, so the host is offered nothing
-// until a person retries; a person who wants the host left alone beyond that
-// holds it.
+// further step. The lease then ends as cancelled unless the agent reports a
+// failed step: when the agent reports the end of its operation, at once when
+// the lease is being verified, and for a lease that was only granted with the
+// agent's next sync: the agent declines it, or never had it. An agent that
+// stays silent fails the lease as it fails any other. A cancelled lease
+// pauses its rollouts and leaves its members cancelled: the host is offered
+// nothing for them until a person retries it; a resume goes on with the
+// others. A person who wants the host left alone beyond that holds it.
 //
 // Ending a lease that is already cancelled changes nothing and succeeds.
 func (s *service) EndLease(

@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'vitest';
 
 import { describeCall } from './actionRequests';
-import { endLeaseIntent } from './intents';
+import { endLeaseIntent, holdIntent } from './intents';
 
 describe('endLeaseIntent', () => {
-  it('describes the end of a lease as a request that ends it as failed', () => {
-    const intent = endLeaseIntent('ls-1', 'host-a');
+  it('describes the end of a lease as a request that ends it as cancelled', () => {
+    const intent = endLeaseIntent({ id: 'ls-1', host: 'host-a', needs: [] });
     if (intent.kind !== 'call') throw new Error('not a call intent');
     expect(intent.title).toBe('End the lease of host-a');
 
@@ -16,6 +16,22 @@ describe('endLeaseIntent', () => {
     expect(text).toContain('completes the step in progress');
     expect(text).toContain('No hold is set');
     expect(text).toContain('stays open');
-    expect(text).toContain('then it ends as failed');
+    expect(text).toContain('then it ends as cancelled');
+  });
+});
+
+describe('holdIntent', () => {
+  it('names the holds an unhold lifts', () => {
+    const intent = holdIntent('unhold', ['host-a'], [], ['geth']);
+    if (intent.kind !== 'call') throw new Error('not a call intent');
+    expect(intent.title).toBe('Unhold host-a (hold of geth)');
+    expect(intent.make('done')).toStrictEqual({
+      action: 'unhold',
+      body: { hosts: ['host-a'], reason: 'done', holders: ['geth'] },
+    });
+
+    const plain = holdIntent('hold', ['host-a']);
+    if (plain.kind !== 'call') throw new Error('not a call intent');
+    expect(plain.make('')).toStrictEqual({ action: 'hold', body: { hosts: ['host-a'], reason: '' } });
   });
 });

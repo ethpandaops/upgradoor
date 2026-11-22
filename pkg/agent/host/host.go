@@ -9,6 +9,7 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/host/docker"
 	"github.com/ethpandaops/upgradoor/pkg/agent/host/probe"
+	"github.com/ethpandaops/upgradoor/pkg/agent/host/resources"
 	"github.com/ethpandaops/upgradoor/pkg/agent/host/system"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -55,6 +56,9 @@ type Host interface {
 
 	// Probe checks the local EL and CL.
 	Probe(ctx context.Context) protocol.NodeHealth
+	// Resources reads the resource use of the host and of the running
+	// managed containers of containers.
+	Resources(ctx context.Context, containers []protocol.Container) Resources
 
 	// Close releases the Docker client.
 	Close() error
@@ -65,6 +69,9 @@ type Change = docker.Change
 
 // System is the cheap, frequently read part of the OS state.
 type System = system.Status
+
+// Resources is one reading of the resource use.
+type Resources = resources.Sample
 
 // Login returns the credentials for a registry host, for pulls.
 type Login = docker.Login
@@ -85,6 +92,7 @@ func New(log logrus.FieldLogger, cfg *Config, blocked []string, login Login) (Ho
 		Runtime: runtime,
 		system:  system.New(log, blocked, cfg.Commands),
 		Prober:  probe.New(log, cfg.Probes),
+		sampler: resources.New(log),
 	}, nil
 }
 
@@ -94,7 +102,8 @@ type machine struct {
 	probe.Prober
 
 	// system is a named field: its Status is Host's System.
-	system system.System
+	system  system.System
+	sampler resources.Sampler
 }
 
 var _ Host = (*machine)(nil)
@@ -102,6 +111,11 @@ var _ Host = (*machine)(nil)
 // System implements Host.
 func (m *machine) System(ctx context.Context) (System, error) {
 	return m.system.Status(ctx)
+}
+
+// Resources implements Host.
+func (m *machine) Resources(ctx context.Context, containers []protocol.Container) Resources {
+	return m.sampler.Sample(ctx, containers)
 }
 
 // Inventory implements Host.

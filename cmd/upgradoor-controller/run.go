@@ -72,7 +72,7 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 			"(closed test networks only)")
 	f.StringVar(&cfg.AuthService, "auth-service", api.DefaultAuthService,
 		"name of this service in the token's services claim; "+
-			"its features (roll, team_roll, ...) are what allows actions")
+			"its features (manage, team_manage, ...) are what allows actions")
 	f.StringArrayVar(&cfg.BeaconEndpoints, "beacon-endpoint", nil,
 		"beacon API base URL (repeatable; tried in order)")
 	f.StringVar(&cfg.ValidatorRangesURL, "validator-ranges-url", "",

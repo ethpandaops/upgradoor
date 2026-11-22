@@ -9,7 +9,7 @@ import { fakeAuthenticatoor } from './mock/install';
 import { MockController, type MockProfile } from './mock/mockController';
 import { PUBLIC_PATHS, recordingFetch, type RecordedCall } from './test/harness';
 
-const TABS = ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Settings', 'Audit'];
+const TABS = ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Settings', 'Data sources', 'Audit'];
 
 function boot(opts: { auth: boolean; loggedIn?: boolean; unreachable?: boolean; profile?: MockProfile }) {
   const controller = new MockController({ auth: opts.auth });
@@ -113,11 +113,12 @@ describe('App in public mode (auth configured, logged out)', () => {
 
 describe('the menu of a login', () => {
   // Who the mock's fake auth client is logged in as: staff holds every
-  // feature, a team member the team features, a reader none.
+  // feature, a team member the team features, a reader none. Packages
+  // needs details.
   const cases: [MockProfile, string[]][] = [
-    ['staff', ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Settings', 'Audit']],
-    ['team', ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Audit']],
-    ['reader', ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Audit']],
+    ['staff', ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Settings', 'Data sources', 'Audit']],
+    ['team', ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Audit']],
+    ['reader', ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Audit']],
   ];
 
   it.each(cases)('offers a %s login the tabs it can use', async (profile, tabs) => {
@@ -140,8 +141,8 @@ describe('the menu of a login', () => {
   });
 
   it('decides by what the login may do', () => {
-    expect(visibleTabs({ priv: false, admin: false })).toEqual(['overview', 'hosts']);
-    expect(visibleTabs({ priv: true, admin: false })).toEqual([
+    expect(visibleTabs({ priv: false, admin: false, hostDetails: true })).toEqual(['overview', 'hosts']);
+    expect(visibleTabs({ priv: true, admin: false, hostDetails: true })).toEqual([
       'overview',
       'hosts',
       'clients',
@@ -149,7 +150,8 @@ describe('the menu of a login', () => {
       'packages',
       'audit',
     ]);
-    expect(visibleTabs({ priv: true, admin: true })).toHaveLength(7);
+    expect(visibleTabs({ priv: true, admin: false, hostDetails: false })).not.toContain('packages');
+    expect(visibleTabs({ priv: true, admin: true, hostDetails: true })).toHaveLength(8);
   });
 });
 

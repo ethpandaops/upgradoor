@@ -29,7 +29,7 @@ import { useSlotHistory } from '../hooks/useSlotHistory';
 import { attentionItems, type AttentionItem } from '../lib/activity';
 import { formatPercent, percentOf, plural } from '../lib/format';
 import { rolloutActionOf } from '../lib/hostActions';
-import { holdIntent, hostsIntent, scopeIntent } from '../lib/intents';
+import { approveIntent, holdIntent, hostsIntent, scopeIntent } from '../lib/intents';
 import { splitQueue, workKind, type StageOf } from '../lib/timeline';
 
 const RANGES = [
@@ -555,7 +555,7 @@ function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (inte
           icon="check"
           label="Approve…"
           onAction={onAction}
-          intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.team, rolloutActionOf(r))}
+          intent={approveIntent(`Approve rollout: ${r.title}`, r.id, r.team, rolloutActionOf(r))}
         />
       );
       break;

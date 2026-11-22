@@ -4,35 +4,38 @@ import type { ActionInfo, RolloutHost } from '../api/types';
 import { actionBasis, approvalBasis, hostActionVerdict, rolloutActionOf, selectionActions } from './hostActions';
 import type { Login } from './permissions';
 
-const login = (features: string[], teams: string[] = [], other: string[] = []): Login => ({
+const login = (features: string[], teams: string[] = []): Login => ({
   open: false,
   service: 'upgradoor',
   hasFeature: f => features.includes(f),
-  hasServiceFeature: (s, f) => (s === 'upgradoor' ? features.includes(f) : other.includes(`${s}:${f}`)),
   teams,
 });
 
 const info = (p: Partial<ActionInfo>): ActionInfo => ({ name: 'security-upgrades', impact: 'node', ...p });
 
 describe('actionBasis', () => {
-  it('allows open mode, admin, the action feature of its own service and a team the action names', () => {
+  it('allows open mode, admin, the action feature (manage when it names none) and a team the action names', () => {
     expect(actionBasis({ ...login([]), open: true }, info({}))).toBe('open');
-    expect(actionBasis(login(['admin']), info({}))).toBe('admin');
-    expect(actionBasis(login(['actions']), info({ feature: 'upgradoor:actions' }))).toBe('feature');
-    expect(actionBasis(login([], [], ['ops:patch']), info({ feature: 'ops:patch' }))).toBe('feature');
+    expect(actionBasis(login(['admin']), info({ feature: 'bogus' }))).toBe('admin');
+    expect(actionBasis(login(['details']), info({ feature: 'details' }))).toBe('feature');
+    expect(actionBasis(login(['manage']), info({}))).toBe('feature');
+    expect(actionBasis(login(['manage_flags']), info({ feature: 'manage_flags' }))).toBe('feature');
     expect(actionBasis(login([], ['lighthouse']), info({ teams: ['lighthouse'] }))).toBe('team');
 
-    // A feature of the same name in another service, another team, or nothing at all is not enough.
-    expect(actionBasis(login(['patch']), info({ feature: 'ops:patch' }))).toBe('');
+    // A twin, another feature, an unknown one, another team or nothing at all is not enough.
+    expect(actionBasis(login(['team_manage'], ['lighthouse']), info({}))).toBe('');
+    expect(actionBasis(login(['manage']), info({ feature: 'details' }))).toBe('');
+    expect(actionBasis(login(['manage']), info({ feature: 'admin' }))).toBe('');
+    expect(actionBasis(login(['bogus']), info({ feature: 'bogus' }))).toBe('');
     expect(actionBasis(login([], ['prysm']), info({ teams: ['lighthouse'] }))).toBe('');
-    expect(actionBasis(login(['roll']), info({}))).toBe('');
+    expect(actionBasis(login([]), info({}))).toBe('');
   });
 });
 
 describe('selectionActions and hostActionVerdict', () => {
   const hosts = [
     { name: 'a', actions: [info({ teams: ['lighthouse'] }), info({ name: 'prune', teams: ['lighthouse'] })] },
-    { name: 'b', actions: [info({ feature: 'upgradoor:actions' })] },
+    { name: 'b', actions: [info({ feature: 'details' })] },
     { name: 'c', actions: null },
   ];
 

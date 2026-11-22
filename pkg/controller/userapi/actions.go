@@ -28,22 +28,22 @@ const (
 // and audits it.
 //
 // The second argument of each registration is the action's requirement: the
-// feature that allows it, what it acts on (for the feature's team twin) and
-// whether the request needs admin as well. This is the only place where an
+// feature that allows it and what it acts on (for the feature's team twin).
+// This is the only place where an
 // action says what it needs; an action cannot be registered without it.
 func (s *Handler) actions() map[string]UserHandler {
 	sched := s.opts.Scheduler
 
 	return map[string]UserHandler{
 		"roll":   action(s, needRoll, validateRoll, sched.Roll),
-		"reboot": action(s, needReboot, validateReboot, sched.Reboot),
+		"reboot": action(s, needManage[scheduler.RebootRequest], validateReboot, sched.Reboot),
 		// A configured host action; permitted per host: see handleHostAction.
 		"host-action": s.handleHostAction,
 		"hold":        action(s, needHold, validateHostsRequest, sched.Hold),
-		"unhold":      action(s, needUnhold, validateHostsRequest, sched.Unhold),
+		"unhold":      action(s, needUnhold, validateUnhold, sched.Unhold),
 		// A host known to be offline is left out of the gate and the budget.
-		"mark-offline":   action(s, needOffline, s.validateMarkOffline, sched.MarkOffline),
-		"unmark-offline": action(s, needOffline, validateUnmarkOffline, sched.UnmarkOffline),
+		"mark-offline":   action(s, needManage[scheduler.OfflineRequest], s.validateMarkOffline, sched.MarkOffline),
+		"unmark-offline": action(s, needManage[scheduler.OfflineRequest], validateUnmarkOffline, sched.UnmarkOffline),
 		// Instructions for a host's overrides file; its agent decides.
 		"image-override": action(s, needImageOverride, validateImageOverride, sched.ImageOverride),
 		"flag-override":  action(s, needFlagOverride, validateFlagOverride, sched.FlagOverride),
@@ -52,7 +52,7 @@ func (s *Handler) actions() map[string]UserHandler {
 		// The image policy of one client.
 		"client-policy": action(s, needClientPolicy, validateClientPolicy, sched.SetClientPolicy),
 		"forget":        action(s, needAdmin[scheduler.HoldRequest], validateHostsRequest, sched.Forget),
-		// Ask for the end of one open lease: it is marked, and ends as failed.
+		// Ask for the end of one open lease: it is marked, and ends as cancelled.
 		"end-lease": action(s, needEndLease, validateEndLease, sched.EndLease),
 		"pause":     action(s, needScope, validateScope(false), sched.Pause),
 		// needScope, or the action's own permission: see handleResume.
@@ -60,64 +60,35 @@ func (s *Handler) actions() map[string]UserHandler {
 		"abort":  action(s, needAbort, validateScope(true), sched.Abort),
 		"skip":   action(s, needRecoverHosts, validateRolloutHosts(true), sched.Skip),
 		"retry":  action(s, needRetry, validateRolloutHosts(false), sched.Retry),
+		// Whoever may approve the rollout: see allowApproval.
+		"ignore-gate":   s.handleIgnoreGate,
+		"approve-lease": s.handleApproveLease,
 	}
 }
 
-// needRoll: roll, or team_roll for the containers the roll touches. The
-// flags force and ignoreBudget and the selector all need admin as well.
-//
-// Through the team twin alone a roll is always staggered: a roll "now" skips
-// the order and the wait for readiness, which is what force does to a
-// staggered one. A login with admin keeps the choice.
+// needRoll: manage, or team_manage for the containers the roll touches.
 func needRoll(req *scheduler.RollRequest) authz.Requirement {
 	return authz.Requirement{
-		Feature:   authz.FeatureRoll,
-		Team:      authz.ContainerTargets(req.Hosts, req.All, req.Containers),
-		Admin:     authz.AdminReason(req.Force, req.IgnoreBudget, req.All),
-		TeamAdmin: nowReason(req.Staggered),
-		TeamOnly:  func() { req.Staggered = true },
+		Feature: authz.FeatureManage, Team: authz.ContainerTargets(req.Hosts, req.All, req.Containers),
 	}
 }
 
-// needReboot: reboot, or team_reboot for the named hosts. The flags force
-// and ignoreBudget and the selector all need admin as well. Through the team
-// twin alone a reboot is always staggered, like a roll.
-func needReboot(req *scheduler.RebootRequest) authz.Requirement {
-	return authz.Requirement{
-		Feature:   authz.FeatureReboot,
-		Team:      authz.HostTargets(req.Hosts, req.All),
-		Admin:     authz.AdminReason(req.Force, req.IgnoreBudget, req.All),
-		TeamAdmin: nowReason(req.Staggered),
-		TeamOnly:  func() { req.Staggered = true },
-	}
+// needManage: manage; the twin does not allow it (reboot, mark-offline,
+// unmark-offline).
+func needManage[T any](*T) authz.Requirement {
+	return authz.Requirement{Feature: authz.FeatureManage}
 }
 
-// nowReason names a roll or reboot that is not staggered, for
-// requirement.teamAdmin.
-func nowReason(staggered bool) string {
-	if staggered {
-		return ""
-	}
-
-	return "now"
-}
-
-// needHold: hold, or team_hold for the named hosts. The twin does not take
-// over a hold that was not set through it.
+// needHold: manage (staff's hold), or team_manage for the named hosts (the
+// holds of the token's teams there).
 func needHold(req *scheduler.HoldRequest) authz.Requirement {
-	return authz.Requirement{Feature: authz.FeatureHold, Team: authz.HoldTargets(req.Hosts, authz.HoldSet)}
+	return authz.Requirement{Feature: authz.FeatureManage, Team: authz.HoldTargets(req.Hosts, nil)}
 }
 
-// needUnhold: hold, or team_hold for the named hosts. The twin lifts only a
-// hold that was set through it.
+// needUnhold: manage, or team_manage for the named hosts and only for holds
+// of the token's teams.
 func needUnhold(req *scheduler.HoldRequest) authz.Requirement {
-	return authz.Requirement{Feature: authz.FeatureHold, Team: authz.HoldTargets(req.Hosts, authz.HoldLift)}
-}
-
-// needOffline: hold, or team_hold for hosts the team owns a container of.
-// The scheduler lets the twin change only a mark that was set through it.
-func needOffline(req *scheduler.OfflineRequest) authz.Requirement {
-	return authz.Requirement{Feature: authz.FeatureHold, Team: authz.HoldTargets(req.Hosts, authz.HoldUntouched)}
+	return authz.Requirement{Feature: authz.FeatureManage, Team: authz.HoldTargets(req.Hosts, req.Holders)}
 }
 
 // validateMarkOffline: hosts as for a hold, a reason, and an end, if any, in
@@ -143,28 +114,28 @@ func validateUnmarkOffline(req *scheduler.OfflineRequest) error {
 	return validateHostsRequest(&scheduler.HoldRequest{Hosts: req.Hosts, Reason: req.Reason})
 }
 
-// needImageOverride: image_override, or team_image_override for that one
+// needImageOverride: manage_image, or team_manage_image for that one
 // container of the host.
 func needImageOverride(req *scheduler.ImageOverrideRequest) authz.Requirement {
 	return authz.Requirement{
-		Feature: authz.FeatureImageOverride,
+		Feature: authz.FeatureManageImage,
 		Team:    authz.ContainerTargets([]string{req.Host}, false, []string{req.Container}),
 	}
 }
 
-// needFlagOverride: flag_override, or team_flag_override for that one
+// needFlagOverride: manage_flags, or team_manage_flags for that one
 // container of the host.
 func needFlagOverride(req *scheduler.FlagOverrideRequest) authz.Requirement {
 	return authz.Requirement{
-		Feature: authz.FeatureFlagOverride,
+		Feature: authz.FeatureManageFlags,
 		Team:    authz.ContainerTargets([]string{req.Host}, false, []string{req.Container}),
 	}
 }
 
-// needClientPolicy: client_policy, or team_client_policy for a client whose
-// reported containers are all owned by a team of the token.
+// needClientPolicy: manage, or team_manage for a client whose reported
+// containers are all owned by a team of the token.
 func needClientPolicy(req *scheduler.ClientPolicyRequest) authz.Requirement {
-	return authz.Requirement{Feature: authz.FeatureClientPolicy, Team: &authz.Targets{Client: req.Client}}
+	return authz.Requirement{Feature: authz.FeatureManage, Team: &authz.Targets{Client: req.Client}}
 }
 
 // needAdmin: admin and nothing else (forget).
@@ -172,41 +143,46 @@ func needAdmin[T any](*T) authz.Requirement {
 	return authz.Requirement{Feature: authz.FeatureAdmin}
 }
 
-// needEndLease: recover, or team_recover for the host of the lease.
+// needEndLease: manage, or team_manage for a lease that only rolls
+// containers of the token's teams.
 func needEndLease(req *scheduler.EndLeaseRequest) authz.Requirement {
-	return authz.Requirement{Feature: authz.FeatureRecover, Team: authz.LeaseTarget(req.Lease)}
+	return authz.Requirement{Feature: authz.FeatureManage, Team: authz.RecoverLeaseTarget(req.Lease)}
 }
 
-// needScope: supervise, or team_supervise for the client of the rollout,
-// for pause and resume (which approves) of one rollout; without a rollout
-// the request is the global switch and needs admin.
+// needScope: manage, or team_manage for a rollout of the team, for pause
+// and resume (which approves) of one rollout; without a rollout the
+// request is the global switch and needs admin.
 func needScope(req *scheduler.ScopeRequest) authz.Requirement {
 	if req.Rollout == "" {
 		return authz.Requirement{Feature: authz.FeatureAdmin}
 	}
 
-	return authz.Requirement{Feature: authz.FeatureSupervise, Team: authz.RolloutTarget(req.Rollout)}
+	return authz.Requirement{Feature: authz.FeatureManage, Team: authz.RolloutTarget(req.Rollout)}
 }
 
-// needAbort: supervise. An abort is final: it has no twin.
-func needAbort(*scheduler.ScopeRequest) authz.Requirement {
-	return authz.Requirement{Feature: authz.FeatureSupervise}
+// needAbort: manage, or team_manage for a rollout of the team.
+func needAbort(req *scheduler.ScopeRequest) authz.Requirement {
+	return authz.Requirement{Feature: authz.FeatureManage, Team: authz.RolloutTarget(req.Rollout)}
 }
 
-// needRecoverHosts: recover, or team_recover for the named hosts (skip).
-func needRecoverHosts(req *scheduler.RolloutHostsRequest) authz.Requirement {
-	return authz.Requirement{Feature: authz.FeatureRecover, Team: authz.HostTargets(req.Hosts, false)}
-}
-
-// needRetry: without hosts it reopens the whole rollout and needs supervise.
-// With hosts it is the recovery of those hosts, like skip. An aborted
-// rollout is retried by nobody (the scheduler answers 409).
+// needRetry: without hosts it reopens the whole rollout and needs manage, or
+// team_manage for a rollout of the team. With hosts it is the recovery of
+// those hosts, like skip. An aborted rollout is retried by nobody (the
+// scheduler answers 409).
 func needRetry(req *scheduler.RolloutHostsRequest) authz.Requirement {
 	if len(req.Hosts) == 0 {
-		return authz.Requirement{Feature: authz.FeatureSupervise}
+		return authz.Requirement{Feature: authz.FeatureManage, Team: authz.RolloutTarget(req.Rollout)}
 	}
 
 	return needRecoverHosts(req)
+}
+
+// needRecoverHosts: manage, or team_manage for members of the rollout that
+// only roll containers of the token's teams (skip, retry with hosts).
+func needRecoverHosts(req *scheduler.RolloutHostsRequest) authz.Requirement {
+	return authz.Requirement{
+		Feature: authz.FeatureManage, Team: authz.RecoverMembersTarget(req.Rollout, req.Hosts),
+	}
 }
 
 // action builds the handler of one action: decode, authorize, validate, call,
@@ -409,11 +385,38 @@ func validateReboot(req *scheduler.RebootRequest) error {
 }
 
 func validateHostsRequest(req *scheduler.HoldRequest) error {
+	if len(req.Holders) > 0 {
+		return httpjson.BadRequestf("holders are named only to unhold")
+	}
+
 	if err := validateHosts(req.Hosts, true); err != nil {
 		return err
 	}
 
 	return validateReason(req.Reason)
+}
+
+// maxHolders bounds the holders an unhold names: staff and the teams.
+const maxHolders = 64
+
+// validateUnhold: hosts as for a hold, and the holders, if named, as
+// protocol.ValidHolder allows them: staff or a team, never the host.
+func validateUnhold(req *scheduler.HoldRequest) error {
+	if len(req.Holders) > maxHolders {
+		return httpjson.BadRequestf("more than %d holders", maxHolders)
+	}
+
+	for i, holder := range req.Holders {
+		if !protocol.ValidHolder(holder) {
+			return httpjson.BadRequestf("invalid holder %q", authz.Echo(holder))
+		}
+
+		if slices.Contains(req.Holders[:i], holder) {
+			return httpjson.BadRequestf("holder %q is listed twice", authz.Echo(holder))
+		}
+	}
+
+	return validateHostsRequest(&scheduler.HoldRequest{Hosts: req.Hosts, Reason: req.Reason})
 }
 
 // validateEndLease checks the end-lease action: one lease, by its ID.

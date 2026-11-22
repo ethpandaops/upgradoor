@@ -282,6 +282,15 @@ func (a *agent) report(ctx context.Context, view *plan.View) *protocol.SyncReque
 		Actions:         plan.Actions(&a.cfg.Policy, view),
 	}
 
+	res := a.host.Resources(ctx, view.Containers)
+	req.Resources = res.Host
+
+	for i := range req.Containers {
+		if stats, ok := res.Containers[req.Containers[i].Name]; ok {
+			req.Containers[i].Stats = &stats
+		}
+	}
+
 	if sys := view.System; sys != nil {
 		req.BootID = sys.BootID
 		req.UptimeSeconds = int64(sys.Uptime / time.Second)

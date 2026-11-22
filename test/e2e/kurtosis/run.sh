@@ -237,7 +237,7 @@ mkdir -p "$work/data"
     "${beacon_args[@]}" \
     --validator-ranges-url "http://127.0.0.1:$ranges_port/validator-ranges.json" \
     --default-setting maxUnavailablePercent=25 \
-    --default-setting readyEpochs=1 \
+    --default-setting readyAttestations=2 \
     --default-setting leaseTtl=5m \
     --default-setting readinessTimeout=6m \
     --default-setting hostStaleAfter=1m \
@@ -279,7 +279,7 @@ controller:
   maxSyncInterval: 5s
 keyFile: /etc/upgradoor/host.key
 certFile: /etc/upgradoor/host.crt
-stateDir: /var/lib/upgradoor
+stateDir: /data/upgradoor
 roles: [ethereum_node]
 # Only image rolls: this "host" shares the real machine's kernel.
 verbs: [roll]
@@ -295,7 +295,7 @@ EOF
     docker run -d --name "$prefix-node-$i" --hostname "node-$i" --network host \
         -v /var/run/docker.sock:/var/run/docker.sock \
         -v "$dir:/etc/upgradoor:ro" \
-        -v "$prefix-node-$i-state:/var/lib/upgradoor" \
+        -v "$prefix-node-$i-state:/data/upgradoor" \
         "$prefix-host" agent --config /etc/upgradoor/agent.yaml >/dev/null
 done
 unset UPGRADOOR_SEED
@@ -380,10 +380,10 @@ expect_status 403 "$reader_token" /api/v1/settings "$(api /api/v1/settings | jq 
 
 # A lighthouse member rolls lighthouse, not geth, and not the host as a whole.
 expect_status 403 "$team_token" /api/v1/actions/roll "{\"hosts\":[\"node-1\"],\"containers\":[\"$el1\"]}"
-jq -e --arg c "$el1" '.error == "forbidden: upgradoor:team_roll does not cover container \($c) on host node-1 (owners: geth)"' \
+jq -e --arg c "$el1" '.error == "forbidden: upgradoor:team_manage does not cover container \($c) on host node-1 (owners: geth)"' \
     "$work/answer.json" >/dev/null || die "the refusal does not name the container: $(cat "$work/answer.json")"
 expect_status 403 "$team_token" /api/v1/actions/roll '{"hosts":["node-1"]}'
-expect_status 403 "$team_token" /api/v1/actions/roll "{\"hosts\":[\"node-1\"],\"containers\":[\"$cl1\"],\"force\":true}"
+expect_status 403 "$team_token" /api/v1/actions/roll "{\"hosts\":[\"node-1\"],\"containers\":[\"$el1\"],\"force\":true}"
 expect_status 403 "$team_token" /api/v1/actions/roll '{"all":true}'
 expect_status 403 "$team_token" /api/v1/actions/pause '{}'
 expect_status 403 "$team_token" /api/v1/actions/forget '{"hosts":["node-1"]}'
@@ -393,18 +393,19 @@ expect_status 403 "$team_token" /api/v1/settings "$(api /api/v1/settings | jq .s
     die "a refused request created a rollout"
 [ "$(api "/api/v1/audit?action=action.&limit=1" | jq '.entries[0].id // 0')" = "$audit_before" ] ||
     die "a refused request was audited"
-jq_true /api/v1/hosts/node-1 '.holdWanted == false' || die "a refused request changed a host"
+jq_true /api/v1/hosts/node-1 '(.hold.holds // []) == [] and (.plan.holdRequests // []) == []' ||
+    die "a refused request changed a host"
 pass "refusals: 403, nothing changed, nothing audited"
 
 # One owned container is enough for a host-level action.
 expect_status 200 "$team_token" /api/v1/actions/hold '{"hosts":["node-3"],"reason":"e2e: team hold"}'
-wait_until "node-3 reports the controller hold" 60 jq_true /api/v1/hosts/node-3 '.hold.controller == true'
+wait_until "node-3 reports the team hold" 60 jq_true /api/v1/hosts/node-3 '.holders == ["lighthouse"]'
 jq_true "/api/v1/audit?action=action.hold&limit=1" '.entries[0] |
         .actor == "lh@example.com" and .target == "node-3" and
-        .detail.authorizedBy == "team_hold" and .detail.teams == ["lighthouse"]' ||
+        .detail.authorizedBy == "team_manage" and .detail.teams == ["lighthouse"]' ||
     die "the team hold is not audited with the team and the feature"
 expect_status 200 "$team_token" /api/v1/actions/unhold '{"hosts":["node-3"],"reason":"e2e: team unhold"}'
-wait_until "node-3 hold lifted" 60 jq_true /api/v1/hosts/node-3 '.hold.controller == false'
+wait_until "node-3 hold lifted" 60 jq_true /api/v1/hosts/node-3 '(.hold.holds // []) == []'
 pass "a team member holds and releases a host of its team; the audit log says through which feature"
 
 wait_until "liveness known and gate open" 300 \
@@ -442,7 +443,7 @@ jq -e --arg c "$(jq -r .canary "$work/rollout-b.json")" '
 pass "B rolled host by host: canary first, never more than one lease, each released before the next"
 
 jq -e '[.[] | select(.action == "lease.released") | .detail.readiness
-        | . == "ready: node at head with peers, validators attesting"] | length == 4 and all' \
+        | startswith("ready: node at head with peers, validators attesting: ")] | length == 4 and all' \
     "$work/audit-leases.json" >/dev/null ||
     die "a lease was released without the node and attestation readiness check: $(jq -c '[.[] | select(.action == "lease.released") | .detail]' "$work/audit-leases.json")"
 pass "every slot was released with the node at head with peers and the validators attesting"
@@ -500,15 +501,16 @@ wait_until "manual roll of node-2 completed" 600 \
     jq_true /api/v1/rollouts --arg id "$rn" 'any(.recent[]; .id == $id and .state == "completed")'
 
 post /api/v1/actions/hold '{"hosts":["node-4"],"reason":"e2e: hold"}' >/dev/null
-wait_until "node-4 reports the controller hold" 60 \
-    jq_true /api/v1/hosts/node-4 '.hold.controller == true'
+wait_until "node-4 reports staff's hold" 60 \
+    jq_true /api/v1/hosts/node-4 '.holders == ["staff"]'
 
 # A hold of staff is not a team's to lift, also on a host of the team.
-jq_true /api/v1/hosts/node-4 '.holdBy == "staff"' || die "the staff hold is not shown as staff's"
-expect_status 403 "$team_token" /api/v1/actions/unhold '{"hosts":["node-4"]}'
-jq -e '.error == "forbidden: upgradoor:team_hold does not lift the hold on host node-4 (set by staff)"' \
+jq_true /api/v1/hosts/node-4 '.holders == ["staff"]' || die "the staff hold is not shown as staff's"
+expect_status 403 "$team_token" /api/v1/actions/unhold '{"hosts":["node-4"],"holders":["staff"]}'
+jq -e '.error == "forbidden: upgradoor:team_manage does not lift the hold of staff on host node-4"' \
     "$work/answer.json" >/dev/null || die "the refusal does not say whose hold it is: $(cat "$work/answer.json")"
-jq_true /api/v1/hosts/node-4 '.holdWanted == true' || die "a team member lifted a staff hold"
+jq_true /api/v1/hosts/node-4 '.holders == ["staff"] and (.plan.holdRequests // []) == []' ||
+    die "a team member lifted a staff hold"
 
 post /api/v1/actions/roll '{"all":true,"staggered":true,"reason":"e2e: staggered roll"}' \
     >"$work/action-roll-staggered.json"
@@ -523,13 +525,13 @@ post /api/v1/actions/resume '{"reason":"e2e: resume"}' >/dev/null
 wait_until "staggered manual roll completed" 1500 \
     jq_true /api/v1/rollouts --arg id "$rs" 'any(.recent[]; .id == $id and .state == "completed")'
 post /api/v1/actions/unhold '{"hosts":["node-4"],"reason":"e2e: unhold"}' >/dev/null
-wait_until "node-4 hold lifted" 60 jq_true /api/v1/hosts/node-4 '.hold.controller == false'
+wait_until "node-4 hold lifted" 60 jq_true /api/v1/hosts/node-4 '(.hold.holds // []) == []'
 [ "$(cat "$work/max-open-leases" 2>/dev/null || echo 0)" -le 1 ] || die "more than one lease was open at once"
 pass "roll now, hold, pause/resume and a staggered roll all worked, still one lease at a time"
 
-api /api/v1/settings | jq '.settings | .readyEpochs = 2 | .minPeers = 2 | .policyReboot = "auto"' >"$work/settings.json"
+api /api/v1/settings | jq '.settings | .readyAttestations = 3 | .minPeers = 2 | .policyReboot = "auto"' >"$work/settings.json"
 post /api/v1/settings "$(cat "$work/settings.json")" PUT >/dev/null
-jq_true /api/v1/settings '.settings.readyEpochs == 2 and .defaults.readyEpochs == 1 and .settings.minPeers == 2 and .defaults.minPeers == 3' || die "settings change not stored"
+jq_true /api/v1/settings '.settings.readyAttestations == 3 and .defaults.readyAttestations == 2 and .settings.minPeers == 2 and .defaults.minPeers == 3' || die "settings change not stored"
 
 api "/api/v1/audit?limit=500" >"$work/audit.json"
 for action in settings.update action.roll action.hold action.unhold action.pause action.resume; do
@@ -537,7 +539,7 @@ for action in settings.update action.roll action.hold action.unhold action.pause
         "$work/audit.json" >/dev/null || die "audit log has no $action by e2e@example.com"
 done
 jq -e 'any(.entries[]; .action == "settings.update"
-        and .detail.before.readyEpochs == 1 and .detail.after.readyEpochs == 2
+        and .detail.before.readyAttestations == 2 and .detail.after.readyAttestations == 3
         and .detail.before.minPeers == 3 and .detail.after.minPeers == 2)' \
     "$work/audit.json" >/dev/null || die "settings change is not audited with before and after"
 for action in host.registered rollout.created rollout.halted rollout.completed lease.granted lease.released lease.failed; do

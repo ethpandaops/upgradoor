@@ -41,8 +41,8 @@ func TestAppendAudit(t *testing.T) {
 			require.NoError(t, s.AppendAudit(ctx), "no entries is a no-op")
 
 			detail := map[string]any{
-				"before": map[string]any{"paused": false, "readyEpochs": float64(1)},
-				"after":  map[string]any{"paused": true, "readyEpochs": float64(2)},
+				"before": map[string]any{"paused": false, "readyAttestations": float64(1)},
+				"after":  map[string]any{"paused": true, "readyAttestations": float64(2)},
 				"note":   "quotes \" and ' and ü",
 				"list":   []any{"a", float64(1), nil},
 			}

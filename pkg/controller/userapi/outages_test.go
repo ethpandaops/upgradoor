@@ -233,3 +233,42 @@ func TestSlotHistoryOutages(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	assert.NotContains(t, rec.Body.String(), "lighthouse-geth")
 }
+
+func TestLeaseWork(t *testing.T) {
+	t.Parallel()
+
+	needs := func(kinds ...protocol.NeedKind) *fleet.Lease {
+		l := &fleet.Lease{Needs: make([]protocol.Need, 0, len(kinds))}
+		for _, k := range kinds {
+			l.Needs = append(l.Needs, protocol.Need{Kind: k})
+		}
+
+		return l
+	}
+
+	tests := []struct {
+		name string
+		l    *fleet.Lease
+		want string
+	}{
+		{"spec needs are an image roll", needs(protocol.NeedSpec, protocol.NeedSpec), "image"},
+		{"override and image are one image roll", needs(protocol.NeedOverride, protocol.NeedImage), "image"},
+		{"reboot", needs(protocol.NeedReboot), "reboot"},
+		{"spec with a reboot is mixed", needs(protocol.NeedSpec, protocol.NeedReboot), workMixed},
+		{"no needs is an image roll", needs(), "image"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tt.want, leaseWork(tt.l))
+		})
+	}
+}
+
+func TestLeaseDeployed(t *testing.T) {
+	t.Parallel()
+
+	assert.True(t, leaseDeployed(&fleet.Lease{Needs: []protocol.Need{{Kind: protocol.NeedImage}, {Kind: protocol.NeedSpec}}}))
+	assert.False(t, leaseDeployed(&fleet.Lease{Needs: []protocol.Need{{Kind: protocol.NeedImage}, {Kind: protocol.NeedOverride}}}))
+}

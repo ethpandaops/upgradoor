@@ -62,6 +62,7 @@ func (h *harness) restart() {
 		Store:    h.store,
 		Health:   func() fleet.NetworkHealth { return h.health },
 		Liveness: h.store.listLiveness,
+		Attested: h.store.attestedSlots,
 		Defaults: defaults,
 		Now:      func() time.Time { return h.now },
 		NewID: func() string {
@@ -120,7 +121,39 @@ func (h *harness) sync(name string, change func(st *protocol.SyncRequest)) {
 	h.store.putHost(host)
 }
 
-// advance moves the clock, syncs every host and publishes full liveness.
+// obeyHolds is the agent of host name: it applies its unanswered hold and
+// release-hold directives to the holds it reports, answers them, and the
+// scheduler takes the answer.
+func (h *harness) obeyHolds(name string) {
+	h.t.Helper()
+
+	pending, err := h.store.ListDirectives(h.ctx, store.DirectiveFilter{Host: name, PendingOnly: true})
+	require.NoError(h.t, err)
+
+	h.sync(name, func(st *protocol.SyncRequest) {
+		holds := slices.Clone(st.Hold.Holds)
+
+		for _, d := range pending {
+			if d.Kind != protocol.DirectiveHold && d.Kind != protocol.DirectiveReleaseHold {
+				continue
+			}
+
+			holds = slices.DeleteFunc(holds, func(x protocol.HostHold) bool { return x.Holder == d.Holder })
+			if d.Kind == protocol.DirectiveHold {
+				holds = append(holds, protocol.HostHold{Holder: d.Holder, By: d.By.User, Reason: d.Reason, At: h.now})
+			}
+
+			st.DirectiveAcks = append(st.DirectiveAcks, protocol.DirectiveAck{ID: d.ID, Status: protocol.DirectiveAccepted})
+		}
+
+		slices.SortFunc(holds, protocol.HoldOrder)
+		st.Hold.Holds = holds
+	})
+	h.tick()
+}
+
+// advance moves the clock, syncs every host and publishes full liveness and
+// an attestation of every validator host for the newest settled slot.
 func (h *harness) advance(d time.Duration) {
 	h.t.Helper()
 
@@ -130,6 +163,8 @@ func (h *harness) advance(d time.Duration) {
 	hosts, err := h.store.ListHosts(h.ctx)
 	require.NoError(h.t, err)
 
+	clock, _ := h.health.SlotAt(h.now)
+
 	for _, host := range hosts {
 		h.sync(host.Name, nil)
 
@@ -137,6 +172,7 @@ func (h *harness) advance(d time.Duration) {
 			h.store.putLiveness(fleet.Liveness{
 				Host: host.Name, Epoch: h.health.LivenessEpoch, Live: host.Weight(), Total: host.Weight(),
 			})
+			h.store.attest(host.Name, clock-2)
 		}
 	}
 }
@@ -252,22 +288,21 @@ func TestServiceAssignment(t *testing.T) {
 	require.NotNil(t, h.assignment("a").Lease)
 	assert.Equal(t, SlotVerifying, h.svc.Plan().Hosts["a"].Slot)
 
-	// Hold directives are restated until the agent agrees.
+	// Hold directives are restated until the agent answers.
 	_, err := h.svc.Hold(h.ctx, "alice", HoldRequest{Hosts: []string{"idle"}, Reason: "debugging"})
 	require.NoError(t, err)
-	assert.Empty(t, h.assignment("idle").Directives, "visible only after the reconcile committed it")
 	h.tick()
 
 	dirs := h.assignment("idle").Directives
 	require.Len(t, dirs, 1)
 	assert.Equal(t, protocol.DirectiveHold, dirs[0].Kind)
+	assert.Equal(t, fleet.HolderStaff, dirs[0].Holder)
 	assert.Equal(t, "debugging", dirs[0].Reason)
 
 	h.tick()
 	assert.Equal(t, dirs, h.assignment("idle").Directives)
 
-	h.sync("idle", func(st *protocol.SyncRequest) { st.Hold.Controller = true })
-	h.tick()
+	h.obeyHolds("idle")
 	assert.Empty(t, h.assignment("idle").Directives)
 }
 
@@ -550,7 +585,8 @@ func TestUnauditedChangesAreTakenBack(t *testing.T) {
 
 	_, err = h.svc.Hold(h.ctx, "alice", HoldRequest{Hosts: []string{"a"}, Reason: "debugging"})
 	require.ErrorIs(t, err, errWrite)
-	assert.False(t, h.store.host("a").HoldWanted, "a hold without an audit entry must not stay")
+	h.tick()
+	assert.Empty(t, h.assignment("a").Directives, "a hold without an audit entry must not stay")
 	assert.Empty(t, h.store.auditActions())
 }
 
@@ -621,7 +657,7 @@ func TestTickReadsOnlyWhatIsOpen(t *testing.T) {
 	assert.Equal(t, steady, h.store.readKinds(), "a tick reads no closed rollout and no other answered directive")
 	assert.Equal(t, fleet.HostPending, h.rollout(res.Rollout).Host("b").State,
 		"the answered directive of the open manual rollout is still known")
-	assert.Equal(t, "host limit 1 of 1", h.assignment("b").Queue.Reason)
+	assert.Equal(t, "hosts at once: 1 of 1 busy", h.assignment("b").Queue.Reason)
 
 	// A restarted scheduler reads the same and decides the same.
 	h.restart()
@@ -854,8 +890,7 @@ func TestAgentThatReportsAnEndedLeaseIsToldOfIt(t *testing.T) {
 	assert.True(t, offered.Cancel)
 
 	r.pass()
-	assert.Equal(t, fleet.LeaseFailed, r.storedLease(lease).State)
-	assert.Equal(t, "ended by operator", r.storedLease(lease).Error)
+	assert.Equal(t, fleet.LeaseCancelled, r.storedLease(lease).State)
 }
 
 // set changes the stored settings, as the settings page does, without an
@@ -1005,7 +1040,7 @@ func TestPatchSettingsOverlapping(t *testing.T) {
 	wg.Add(3)
 
 	go patch(func(i int, s *fleet.Settings) { s.MinPeers = 4 + i })
-	go patch(func(i int, s *fleet.Settings) { s.ReadyEpochs = uint64(i % 30) })
+	go patch(func(i int, s *fleet.Settings) { s.ReadyAttestations = uint64(i%30) + 1 })
 	go patch(func(i int, s *fleet.Settings) { s.PauseAfterCanaryImage = i%2 == 1 })
 
 	wg.Wait()
@@ -1013,7 +1048,7 @@ func TestPatchSettingsOverlapping(t *testing.T) {
 	got, err := h.svc.Settings(h.ctx)
 	require.NoError(t, err)
 	assert.Equal(t, 4+rounds-1, got.MinPeers)
-	assert.Equal(t, uint64((rounds-1)%30), got.ReadyEpochs)
+	assert.Equal(t, uint64((rounds-1)%30)+1, got.ReadyAttestations)
 	assert.True(t, got.PauseAfterCanaryImage)
 }
 

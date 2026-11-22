@@ -43,19 +43,6 @@ type Host struct {
 	// InventoryHash is the hash of the inventory stored for this host.
 	InventoryHash string `json:"inventoryHash,omitempty"`
 
-	// HoldWanted is the controller-side hold switch; the scheduler turns it
-	// into hold / release-hold directives until the agent agrees.
-	HoldWanted bool   `json:"holdWanted"`
-	HoldReason string `json:"holdReason,omitempty"`
-	// HoldBy says through what the hold was set: TeamHold of the teams when
-	// a person set it with a team feature, empty for every other hold. A team
-	// feature lifts only a hold that one of its teams set.
-	HoldBy string `json:"holdBy,omitempty"`
-	// HoldActor is the person who set the controller hold, as the audit log
-	// names them; the agent writes them into the hold entry of its overrides
-	// file.
-	HoldActor string `json:"holdActor,omitempty"`
-
 	// Offline is a person's mark that the host is known offline, for example
 	// a client kept broken on purpose for debugging; nil while unmarked. While
 	// it is in force (KnownOffline) the host's validators are left out of the
@@ -84,25 +71,64 @@ type Host struct {
 	SyncInterval time.Duration `json:"syncInterval,omitempty"`
 }
 
-// HoldByTeam is OfflineMark.By for a mark set through a team feature, and
-// starts Host.HoldBy of a hold set through one (TeamHold).
-const HoldByTeam = "team"
+// HolderStaff is the holder of the hold set through the plain hold feature.
+// Every other holder a person sets is a team.
+const HolderStaff = protocol.HolderStaff
 
-// TeamHold is Host.HoldBy for a hold that the teams set through a team
-// feature: "team:geth,reth".
-func TeamHold(teams []string) string {
-	return HoldByTeam + ":" + strings.Join(teams, ",")
-}
-
-// HoldTeams returns the teams of a Host.HoldBy that TeamHold wrote, and
-// whether it is one.
-func HoldTeams(by string) ([]string, bool) {
-	rest, ok := strings.CutPrefix(by, HoldByTeam+":")
-	if !ok || rest == "" {
-		return nil, false
+// Holds are the holds the host's agent reports, in protocol.HoldOrder.
+func (h *Host) Holds() []protocol.HostHold {
+	if h.Status == nil {
+		return nil
 	}
 
-	return strings.Split(rest, ","), true
+	return h.Status.Hold.Holds
+}
+
+// HoldOf returns the reported hold of holder, or nil.
+func (h *Host) HoldOf(holder string) *protocol.HostHold {
+	if h.Status == nil {
+		return nil
+	}
+
+	return h.Status.Hold.Of(holder)
+}
+
+// DescribeHolds says every hold with its reason: "staff: kernel debugging;
+// geth".
+func DescribeHolds(holds []protocol.HostHold) string {
+	parts := make([]string, 0, len(holds))
+
+	for i := range holds {
+		part := holds[i].Holder
+		if holds[i].Reason != "" {
+			part += ": " + holds[i].Reason
+		}
+
+		parts = append(parts, part)
+	}
+
+	return strings.Join(parts, "; ")
+}
+
+// HeldReason says what holds the host, for a waiting reason: "held by the
+// host, staff, geth", "the host" for the agent's local hold.
+func (h *Host) HeldReason() string {
+	holds := h.Holds()
+	by := make([]string, 0, len(holds))
+
+	for i := range holds {
+		if holds[i].Holder == protocol.HolderHost {
+			by = append(by, "the host")
+		} else {
+			by = append(by, holds[i].Holder)
+		}
+	}
+
+	if len(by) == 0 {
+		return "held"
+	}
+
+	return "held by " + strings.Join(by, ", ")
 }
 
 // OfflineMark marks a host as known offline.
@@ -112,9 +138,6 @@ type OfflineMark struct {
 	// Until is when the mark ends by itself; nil keeps it until a person
 	// lifts it.
 	Until *time.Time `json:"until,omitempty"`
-	// By is HoldByTeam for a mark set through a team feature: a team feature
-	// lifts only such a mark.
-	By string `json:"by,omitempty"`
 }
 
 // KnownOffline reports whether the host's offline mark is in force at now.
@@ -151,10 +174,9 @@ func (h *Host) Stale(now time.Time, staleAfter time.Duration) bool {
 	return now.Sub(h.LastSeen) > h.StaleAfter(staleAfter)
 }
 
-// Held reports whether the agent reports any hold or a controller hold is
-// wanted.
+// Held reports whether the agent reports any hold.
 func (h *Host) Held() bool {
-	return h.HoldWanted || (h.Status != nil && h.Status.Hold.Active())
+	return h.Status != nil && h.Status.Hold.Active()
 }
 
 // Liveness is the attestation liveness of one host's validators in one epoch.
@@ -196,6 +218,10 @@ type NetworkHealth struct {
 	// FinalityLagEpochs is CurrentEpoch - FinalizedEpoch. A healthy network
 	// sits at 2.
 	FinalityLagEpochs uint64 `json:"finalityLagEpochs"`
+	// Split says how the beacon endpoints in sync divide over chains when no
+	// chain is followed by a strict majority of them ("2 chains, 3/5 and 2/5
+	// endpoints"); empty otherwise. While it is set the network gate is closed.
+	Split string `json:"split,omitempty"`
 
 	// LivenessEpoch is the newest settled epoch the beacon service summed
 	// from the per-slot participation; LivenessKnown is false until there is

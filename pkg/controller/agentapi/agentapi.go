@@ -18,6 +18,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
@@ -417,6 +418,7 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 	req.Containers = cleanContainers(req.Containers)
 	req.Roles = cleanRoles(req.Roles)
 	req.Actions = cleanActions(req.Actions)
+	req.Hold.Holds = cleanHolds(req.Hold.Holds)
 
 	now := s.now().UTC()
 	remote := s.remoteAddr(r)
@@ -514,6 +516,28 @@ func cleanRoles(in []string) []string {
 	return out[:min(len(out), protocol.MaxRoles)]
 }
 
+// cleanHolds keeps the holds of valid holders a host reports, one per
+// holder, in protocol.HoldOrder and at most protocol.MaxHolds: a team's hold
+// is what lets the team lift it.
+func cleanHolds(in []protocol.HostHold) []protocol.HostHold {
+	out := make([]protocol.HostHold, 0, min(len(in), protocol.MaxHolds))
+
+	for _, h := range in {
+		if (h.Holder == protocol.HolderHost || protocol.ValidHolder(h.Holder)) &&
+			!slices.ContainsFunc(out, func(o protocol.HostHold) bool { return o.Holder == h.Holder }) {
+			out = append(out, h)
+		}
+	}
+
+	slices.SortFunc(out, protocol.HoldOrder)
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out[:min(len(out), protocol.MaxHolds)]
+}
+
 // cleanContainers makes what a host reports about its containers unambiguous
 // before it is stored, because what is stored is what authorizes. A container
 // name stands for one container: Docker has no two of a name, so of several
@@ -550,8 +574,9 @@ func cleanContainers(in []protocol.Container) []protocol.Container {
 
 // cleanActions keeps the actions a host reports with a valid name, the
 // first of each name, sorted and at most protocol.MaxActions. What is stored
-// authorizes: a feature or a team that is not a name is dropped, an unknown
-// impact counts as node and an unknown condition as none.
+// authorizes: an unknown feature counts as admin, a team that is not a name
+// is dropped, an unknown impact counts as node and an unknown condition as
+// none.
 func cleanActions(in []protocol.ActionInfo) []protocol.ActionInfo {
 	out := make([]protocol.ActionInfo, 0, min(len(in), protocol.MaxActions))
 	seen := make(map[string]struct{}, len(in))
@@ -569,8 +594,8 @@ func cleanActions(in []protocol.ActionInfo) []protocol.ActionInfo {
 			a.Impact = protocol.ImpactNode
 		}
 
-		if !protocol.ValidFeature(a.Feature) {
-			a.Feature = ""
+		if a.Feature != "" && !protocol.ValidActionFeature(a.Feature) {
+			a.Feature = authz.FeatureAdmin
 		}
 
 		if !a.When.Valid() {
@@ -608,12 +633,6 @@ func (s *Handler) identityAudit(
 			"roles":          result.Host.Roles,
 			"validators":     result.Host.Weight(),
 			detailRemoteAddr: remote,
-		}
-
-		// The agent reported a controller hold this controller did not know
-		// of; the host row was created with the hold wanted.
-		if result.HoldAdopted {
-			detail["holdAdopted"] = true
 		}
 
 		entries = append(entries, fleet.AuditEntry{

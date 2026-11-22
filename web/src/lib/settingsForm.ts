@@ -109,7 +109,7 @@ export const FIELDS: readonly FieldSpec[] = [
     max: 100,
     step: 0.5,
     range: '0 to 100 %',
-    hint: 'No new lease while the participation of the tracked validators is below this. Also the share of a host’s validators that must attest again before its slot is released.',
+    hint: 'No new lease while the participation of the tracked validators is below this.',
   },
   {
     key: 'maxFinalityLagEpochs',
@@ -121,14 +121,23 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: 'No new lease while finality lags more than this many epochs.',
   },
   {
-    key: 'readyEpochs',
-    label: 'Ready epochs',
+    key: 'readyAttestations',
+    label: 'Ready attestations',
     kind: 'count',
-    unit: 'epochs',
-    min: 0,
+    unit: 'slots',
+    min: 1,
     max: 32,
-    range: '0 to 32',
-    hint: 'How long a host must be healthy after its operation before its slot is released: the node at head with peers for this many epochs, and its validators attesting in this many complete epochs. 0 releases at the first healthy sync.',
+    range: '1 to 32',
+    hint: 'For how many distinct slots after its operation a host’s validators must have attestations included on the canonical chain before its slot is released, next to the node at head with peers. A host with fewer validators needs one slot per validator.',
+  },
+  {
+    key: 'readyStableFor',
+    label: 'Ready stable for',
+    kind: 'duration',
+    min: 0,
+    max: 30 * 60_000,
+    range: 'a duration like 1m or 90s, 0 to 30m',
+    hint: 'How long the node of a host without validators must stay at head with peers after its operation before its slot is released. 0 releases at its first healthy sync.',
   },
   {
     key: 'minPeers',
@@ -277,7 +286,7 @@ export const GROUPS: readonly GroupSpec[] = [
     id: 'readiness',
     title: 'Readiness after an operation',
     about: 'When a host counts as back, so the next one may go.',
-    keys: ['readyEpochs', 'minPeers', 'readyPeerShare'],
+    keys: ['readyAttestations', 'readyStableFor', 'minPeers', 'readyPeerShare'],
   },
   {
     id: 'timeouts',
@@ -388,13 +397,15 @@ export function validateField(spec: FieldSpec, raw: string): string | null {
       if (text === '') return 'must be a whole number';
       if (!/^\d+$/.test(text)) return 'must be a whole number';
       const min = spec.min ?? 0;
-      return Number(text) < min ? `must be at least ${min}` : null;
+      if (Number(text) < min) return `must be at least ${min}`;
+      return spec.max !== undefined && Number(text) > spec.max ? `must be at most ${spec.max}` : null;
     }
     case 'duration': {
       const ms = parseGoDuration(text);
       if (ms === null) return 'must be a duration like 30m, 90s or 1h30m';
       const min = spec.min ?? 0;
-      return ms < min ? `must be at least ${formatGoDuration(min)}` : null;
+      if (ms < min) return `must be at least ${formatGoDuration(min)}`;
+      return spec.max !== undefined && ms > spec.max ? `must be at most ${formatGoDuration(spec.max)}` : null;
     }
     case 'policy':
       return (POLICIES as readonly string[]).includes(text) ? null : 'must be auto, manual or paused';
@@ -427,7 +438,8 @@ export function fromForm(form: SettingsForm): FormSettings {
     maxIndependentPercent: Number(form.maxIndependentPercent),
     minParticipationPercent: Number(form.minParticipationPercent),
     maxFinalityLagEpochs: Number(form.maxFinalityLagEpochs),
-    readyEpochs: Number(form.readyEpochs),
+    readyAttestations: Number(form.readyAttestations),
+    readyStableFor: duration('readyStableFor'),
     minPeers: Number(form.minPeers),
     leaseTtl: duration('leaseTtl'),
     hostStaleAfter: duration('hostStaleAfter'),

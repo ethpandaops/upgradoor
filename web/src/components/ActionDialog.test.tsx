@@ -51,6 +51,7 @@ describe('ActionDialog: roll', () => {
       staggered: true,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       reason: '',
     });
     expect(onDone.mock.calls[0]?.[0].hosts).toEqual(['lighthouse-geth-3', 'lighthouse-geth-4']);
@@ -81,6 +82,7 @@ describe('ActionDialog: roll', () => {
       staggered: true,
       force: true,
       ignoreBudget: true,
+      ignoreGate: false,
       reason: 'hotfix for the sync bug',
     });
   });
@@ -114,6 +116,7 @@ describe('ActionDialog: roll', () => {
       staggered: false,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       reason: '',
     });
   });
@@ -136,8 +139,35 @@ describe('ActionDialog: roll', () => {
       staggered: true,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       reason: '',
     });
+  });
+});
+
+describe('ActionDialog: despite the network state', () => {
+  const intent: ActionIntent = { kind: 'reboot', hosts: ['teku-besu-1'], all: false };
+
+  it('offers to pass the gate only while it is closed, with its reasons, and sends ignoreGate', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: true });
+    h.controller.setGateFailing(true);
+    const onDone = vi.fn<(r: ActionResult) => void>();
+    const user = userEvent.setup();
+    renderWithApp(<ActionDialog intent={intent} onClose={vi.fn()} onDone={onDone} />, h);
+
+    const despite = await screen.findByRole('checkbox', { name: /^Roll despite network state/ });
+    expect(despite.closest('label')).toHaveTextContent(/The network gate is closed: .+/);
+    await user.click(despite);
+    await user.click(screen.getByRole('button', PRIMARY));
+    await waitFor(() => {
+      expect(onDone).toHaveBeenCalledTimes(1);
+    });
+    expect(posted(h).body).toMatchObject({ ignoreGate: true });
+  });
+
+  it('does not offer it while the gate is open', async () => {
+    await open(intent);
+    expect(screen.queryByRole('checkbox', { name: /^Roll despite network state/ })).not.toBeInTheDocument();
   });
 });
 
@@ -164,6 +194,7 @@ describe('ActionDialog: reboot', () => {
       staggered: true,
       force: false,
       ignoreBudget: false,
+      ignoreGate: false,
       reason: 'kernel 6.12.57',
     });
   });

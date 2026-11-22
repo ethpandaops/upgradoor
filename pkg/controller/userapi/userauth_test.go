@@ -381,52 +381,51 @@ func TestTokenClaimsAuthorize(t *testing.T) {
 		{
 			name: "team twin, owning team", action: "hold", body: holdMixed,
 			authorization: provider.Grant(t, "-all,+upgradoor,+upgradoor:team_*", "lighthouse"),
-			by:            "team_hold", teams: []string{"lighthouse"},
+			by:            "team_manage", teams: []string{"lighthouse"},
 		},
 		{
 			name: "team twin, several teams", action: "hold", body: holdMixed,
-			authorization: provider.Grant(t, "+upgradoor:team_hold", "teku", "geth"),
-			by:            "team_hold", teams: []string{"geth", "teku"},
+			authorization: provider.Grant(t, "+upgradoor:team_manage", "teku", "geth"),
+			by:            "team_manage", teams: []string{"geth", "teku"},
 		},
 		{
 			name: "team twin, another team", action: "hold", body: holdMixed,
-			authorization: provider.Grant(t, "+upgradoor:team_hold", "teku"),
-			refusal: "forbidden: upgradoor:team_hold does not cover host lighthouse-geth-1 " +
+			authorization: provider.Grant(t, "+upgradoor:team_manage", "teku"),
+			refusal: "forbidden: upgradoor:team_manage does not cover host lighthouse-geth-1 " +
 				"(owners: geth, lighthouse)",
 		},
 		{
 			name: "team twin, a token without teams", action: "hold", body: holdMixed,
-			authorization: provider.Grant(t, "+upgradoor:team_hold"),
-			refusal: "forbidden: upgradoor:team_hold does not cover host lighthouse-geth-1 " +
+			authorization: provider.Grant(t, "+upgradoor:team_manage"),
+			refusal: "forbidden: upgradoor:team_manage does not cover host lighthouse-geth-1 " +
 				"(owners: geth, lighthouse)",
 		},
 		{
 			name: "roll of mixed ownership", action: "roll",
 			body:          `{"hosts":["` + controllertest.HostMixed + `"],"containers":["lighthouse","geth"]}`,
-			authorization: provider.Grant(t, "+upgradoor:team_roll", "lighthouse"),
-			refusal: "forbidden: upgradoor:team_roll does not cover container geth " +
+			authorization: provider.Grant(t, "+upgradoor:team_manage", "lighthouse"),
+			refusal: "forbidden: upgradoor:team_manage does not cover container geth " +
 				"on host lighthouse-geth-1 (owners: geth)",
 		},
 		{
 			name: "another feature", action: "reboot", body: `{"hosts":["` + controllertest.HostMixed + `"]}`,
-			authorization: provider.Grant(t, "+upgradoor:hold:roll", "lighthouse"),
-			refusal:       "forbidden: this login lacks the feature upgradoor:reboot",
+			authorization: provider.Grant(t, "+upgradoor:manage_image:details", "lighthouse"),
+			refusal:       "forbidden: this login lacks the feature upgradoor:manage",
 		},
 		{
 			name: "plain feature", action: "reboot", body: `{"hosts":["` + controllertest.HostMixed + `"]}`,
-			authorization: provider.Grant(t, "+upgradoor:reboot", "teku"),
-			by:            "reboot", teams: []string{"teku"},
+			authorization: provider.Grant(t, "+upgradoor:manage", "teku"),
+			by:            "manage", teams: []string{"teku"},
 		},
 		{
 			name: "force without admin", action: "reboot",
 			body:          `{"hosts":["` + controllertest.HostMixed + `"],"force":true}`,
-			authorization: provider.Grant(t, "+upgradoor:reboot"),
-			refusal:       "forbidden: this login lacks the feature upgradoor:admin (needed for force)",
+			authorization: provider.Grant(t, "+upgradoor:manage"), by: "manage",
 		},
 		{
 			name: "staff", action: "reboot", body: `{"all":true,"force":true}`,
 			authorization: provider.Grant(t, "+all:all", "panda"),
-			by:            "reboot,admin", teams: []string{"panda"},
+			by:            "manage", teams: []string{"panda"},
 		},
 	}
 
@@ -483,11 +482,11 @@ func TestConfiguredServiceName(t *testing.T) {
 
 	rec := h.serve(hold.request(other))
 	require.Equal(t, http.StatusForbidden, rec.Code)
-	assert.Equal(t, httpjson.ErrorBody{Error: "forbidden: this login lacks the feature upgradoor-dev:hold"},
+	assert.Equal(t, httpjson.ErrorBody{Error: "forbidden: this login lacks the feature upgradoor-dev:manage"},
 		controllertest.DecodeJSON[httpjson.ErrorBody](t, rec))
 
 	require.Equal(t, http.StatusOK,
-		h.serve(hold.request(provider.Grant(t, "-all,+upgradoor-dev:hold"))).Code)
+		h.serve(hold.request(provider.Grant(t, "-all,+upgradoor-dev:manage"))).Code)
 	require.Equal(t, http.StatusUnauthorized,
 		h.serve(read.request(provider.Grant(t, "-all,+upgradoor:all"))).Code)
 }

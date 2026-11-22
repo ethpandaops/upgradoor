@@ -299,7 +299,7 @@ func (s *server) handleHold(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	msg := "host held: the agent reports no needs and refuses all work until it is released"
+	msg := "host held: the agent refuses all work until it is released"
 	if req.Release {
 		msg = "local hold released"
 	}

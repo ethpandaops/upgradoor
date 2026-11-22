@@ -4,6 +4,7 @@
 package authz
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -24,60 +25,65 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// The features of this service, as they are written in a grant of the
-// authenticatoor ("upgradoor:roll", "upgradoor:team_*", "upgradoor:all").
-// Every one is checked default-deny: a token has it only when its "services"
-// claim grants it by name, by prefix or by "all". Reading needs none of
-// them: every token the verifier accepts has basic access, which covers all
-// authenticated GET routes.
+// The features of this service, as a grant of the authenticatoor spells them
+// ("upgradoor:manage", "upgradoor:team_*", "upgradoor:all"). Each is checked
+// default-deny: a token has it only when its "services" claim grants it by
+// name, by prefix or by "all". Every token the verifier accepts reads the
+// reduced view without any of them.
 //
-// A feature with a team twin ("team_" + name) can be held in two ways. The
-// plain feature allows the action on every target. The twin allows it only
-// on targets that one of the token's teams owns.
+// A feature with a team twin ("team_" + name) allows a request on every
+// target; the twin only on targets that one of the token's teams owns, and
+// only ever acts on the teams' own containers.
 //
-// A prefix grant covers every feature whose name starts with it, so no
-// feature name starts with another one (TestFeatureNames): a grant of
-// "upgradoor:roll*" is the feature roll and nothing else.
+// What a team T owns, one rule per kind of target:
+//   - a container: its team label is T;
+//   - a client: every container of it has team T;
+//   - a rollout: its Team is T (a group rollout of T, a manual roll of T's
+//     containers only);
+//   - a rollout member or a lease: everything it does rolls containers of T;
+//     a reboot, packages, a host action, another team's or teamless work
+//     along with it makes it staff's;
+//   - a host: T owns a managed container on it; only for T's own hold and
+//     team_details.
+//
+// Implications (Implied): admin includes details, manage, manage_image and
+// manage_flags; a plain feature includes its twin. Nothing else.
+//
+// A prefix grant covers every feature whose name starts with it: "manage*"
+// is manage, manage_image and manage_flags (TestFeatureNames).
 const (
-	// FeatureRoll covers the action roll and, without a twin, POST
-	// /api/v1/images/refresh. Twin: team_roll, for containers a team of the
+	// FeatureDetails is what a login reads of the hosts beyond the reduced
+	// view (views.Access): OS, kernel, packages, unmanaged containers,
+	// container internals, addresses, host actions. Twin: team_details, the
+	// hosts on which a team of the token owns a managed container. GET
+	// /api/v1/packages needs the plain feature.
+	FeatureDetails = "details"
+	// FeatureManage covers roll, reboot, hold, unhold, mark-offline,
+	// unmark-offline, skip, retry, end-lease, client-policy, pause, resume,
+	// ignore-gate, approve-lease and abort of one rollout, POST
+	// /api/v1/images/refresh, the flags force and ignoreBudget, the selector
+	// all and a roll that is not staggered. It is the feature of a host action
+	// that names none. A host has one hold per holder: the plain feature sets
+	// and lifts staff's hold and lifts any hold it names.
+	//
+	// Twin: team_manage, under the rule of each target: a roll of the teams'
+	// containers, a hold or unhold of the holds of the token's teams that own
+	// a managed container of the host, skip, retry and end-lease of members
+	// and leases that only roll the teams' containers, the decisions on a
+	// rollout of a team, the policy of a team's client. Never reboot,
+	// mark-offline, unmark-offline or the image refresh.
+	FeatureManage = "manage"
+	// FeatureManageImage covers image-override and the image part of
+	// client-override. Twin: team_manage_image, for a container a team of the
 	// token owns.
-	FeatureRoll = "roll"
-	// FeatureReboot covers the action reboot. Twin: team_reboot, for hosts
-	// on which a team of the token owns a container.
-	FeatureReboot = "reboot"
-	// FeatureHold covers the actions hold, unhold, mark-offline and
-	// unmark-offline. Twin: team_hold, for hosts on which a team of the
-	// token owns a container, and only for holds that a team of the token
-	// set through the twin.
-	FeatureHold = "hold"
-	// FeatureRecover covers what gets a stuck host moving again: the actions
-	// skip, retry with hosts and end-lease. Twin: team_recover, for hosts on
-	// which a team of the token owns a container.
-	FeatureRecover = "recover"
-	// FeatureSupervise covers the actions on one rollout as a whole: pause,
-	// resume (which approves) and abort with a rollout, and retry without
-	// hosts. An aborted rollout is final: nothing retries it. Twin:
-	// team_supervise, for pause and resume of a rollout of a client whose
-	// reported containers are all owned by a team of the token (the rule of
-	// team_client_policy).
-	FeatureSupervise = "supervise"
-	// FeatureImageOverride covers the action image-override: setting or
-	// taking away the image override of one container on one host. Twin:
-	// team_image_override, for a container a team of the token owns.
-	FeatureImageOverride = "image_override"
-	// FeatureFlagOverride covers the action flag-override: the same for the
-	// flags of a container. Twin: team_flag_override.
-	FeatureFlagOverride = "flag_override"
-	// FeatureClientPolicy covers the action client-policy: the image policy
-	// (auto or manual) of one client. Twin: team_client_policy, for a client
-	// whose reported containers are all owned by a team of the token.
-	FeatureClientPolicy = "client_policy"
-	// FeatureAdmin covers the action forget, pause and resume without a
-	// rollout (the global switch) and PUT /api/v1/settings, and it is needed
-	// on top of an action's own feature for the request flags force and
-	// ignoreBudget and for the selector all. It does not imply any other
-	// feature. No twin.
+	FeatureManageImage = "manage_image"
+	// FeatureManageFlags covers flag-override and the flags part of
+	// client-override. Twin: team_manage_flags.
+	FeatureManageFlags = "manage_flags"
+	// FeatureAdmin covers forget, pause and resume without a rollout (the
+	// global switch), GET and PUT /api/v1/settings, the data sources and
+	// their refresh, and the audit log in full (views.Access). It includes
+	// every other feature. No twin.
 	FeatureAdmin = "admin"
 
 	// teamFeaturePrefix turns a feature into its team twin.
@@ -86,10 +92,6 @@ const (
 	// authorizedByOpen is what the audit log records as the authorization of
 	// an action when the API runs open.
 	AuthorizedByOpen = "open"
-
-	// holdByStaff is HostSummary.HoldBy for a hold that was not set through
-	// a team feature.
-	HoldByStaff = "staff"
 
 	// maxTokenTeams bounds the teams of a token. A token with more is not
 	// accepted: its teams would be decided with and written into every audit
@@ -111,17 +113,6 @@ const (
 // stand in a directive of the "services" claim.
 var AuthServicePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}$`)
 
-// holdChange says what a request does to the controller hold of its hosts.
-type holdChange int
-
-const (
-	HoldUntouched holdChange = iota
-	// holdSet: the request puts its hosts on hold.
-	HoldSet
-	// holdLift: the request lifts the hold of its hosts.
-	HoldLift
-)
-
 // requirement is what one request needs to be allowed. Each action declares
 // it once, where the action is registered (actions).
 type Requirement struct {
@@ -129,18 +120,8 @@ type Requirement struct {
 	Feature string
 	// team is what the request acts on, for the team twin of feature: a token
 	// with "team_"+feature is allowed when a team of the token owns every
-	// one of these targets. nil means the feature has no twin.
+	// one of these targets. nil: the twin does not allow the request.
 	Team *Targets
-	// admin, when not empty, says why the request needs FeatureAdmin on top
-	// ("force", "ignoreBudget", "all").
-	Admin string
-	// teamAdmin, when not empty, names what the request asks for that the
-	// team twin alone does not give ("now" for a roll or reboot that is not
-	// staggered). A login with FeatureAdmin next to the twin gets it, and the
-	// audit log records admin for it; for a login without, teamOnly is called
-	// and takes it out of the request.
-	TeamAdmin string
-	TeamOnly  func()
 }
 
 // targets names what a request acts on.
@@ -149,8 +130,11 @@ type Targets struct {
 	// controller knows instead.
 	hosts []string
 	all   bool
-	// lease names an open lease; the target is the lease's host.
+	// lease names a lease, for the rule of a recovery (recover.go).
 	lease string
+	// recover selects the rule of a recovery: lease, or the hosts as
+	// members of rollout.
+	recover bool
 	// perContainer selects the rule. False is the any-owner rule of
 	// host-level actions: a host is covered when a team of the token owns at
 	// least one of its managed containers. True is the rule of a roll: every
@@ -164,13 +148,12 @@ type Targets struct {
 	// of a roll (every one of them owned by a team of the token). A client
 	// no host reports is owned by nobody.
 	Client string
-	// rollout names a rollout instead: the target is the client the rollout
-	// is for, by the rule of Client. A rollout for no client is owned by
-	// nobody.
+	// rollout names a rollout instead: it is owned by its team. A rollout
+	// for no team is owned by nobody.
 	rollout string
-	// hold says that the request sets or lifts the hold of its hosts. The
-	// twin does neither to a hold that was not set through the twin.
-	hold holdChange
+	// holders are the holds an unhold names: each must be the hold of a team
+	// of the token that owns a managed container of the host.
+	holders []string
 }
 
 // hostTargets are the targets of a host-level action.
@@ -178,9 +161,10 @@ func HostTargets(hosts []string, all bool) *Targets {
 	return &Targets{hosts: hosts, all: all}
 }
 
-// holdTargets are the targets of hold and unhold.
-func HoldTargets(hosts []string, change holdChange) *Targets {
-	return &Targets{hosts: hosts, hold: change}
+// HoldTargets are the targets of hold and unhold: the hosts, and the holds
+// an unhold names.
+func HoldTargets(hosts, holders []string) *Targets {
+	return &Targets{hosts: hosts, holders: holders}
 }
 
 // containerTargets are the targets of a roll.
@@ -191,26 +175,6 @@ func ContainerTargets(hosts []string, all bool, containers []string) *Targets {
 // RolloutTarget is the target of an action on one rollout.
 func RolloutTarget(rollout string) *Targets {
 	return &Targets{rollout: rollout}
-}
-
-// leaseTarget is the target of an action on one lease.
-func LeaseTarget(lease string) *Targets {
-	return &Targets{lease: lease}
-}
-
-// adminReason names the first of the request flags that needs FeatureAdmin;
-// empty when none is set.
-func AdminReason(force, ignoreBudget, all bool) string {
-	switch {
-	case force:
-		return "force"
-	case ignoreBudget:
-		return "ignoreBudget"
-	case all:
-		return "all"
-	default:
-		return ""
-	}
 }
 
 // forbiddenError refuses a request that is authenticated and not allowed.
@@ -313,6 +277,7 @@ type Store interface {
 	GetRollout(ctx context.Context, id string) (*fleet.Rollout, error)
 	GetLease(ctx context.Context, id string) (*fleet.Lease, error)
 	ListHosts(ctx context.Context) ([]*fleet.Host, error)
+	ListDirectives(ctx context.Context, filter store.DirectiveFilter) ([]*fleet.Directive, error)
 	AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error
 }
 
@@ -329,12 +294,30 @@ func New(log logrus.FieldLogger, authService string, st Store, now func() time.T
 	}
 }
 
+// HasFeature implements Authorizer: the feature is granted, or implied by
+// one that is (Implied).
 func (s *authorizer) HasFeature(u *User, feature string) bool {
-	return auth.FeatureAllowed(u.Services, s.authService, feature, auth.FeatureDefaultDeny)
+	return Implied(feature, func(f string) bool {
+		return auth.FeatureAllowed(u.Services, s.authService, f, auth.FeatureDefaultDeny)
+	})
 }
 
-// ActionBasis implements Authorizer. The action's feature names its own
-// service ("upgradoor:actions").
+// Implied reports whether granted gives feature: by name, through admin
+// (which includes every other feature) or through its plain form (a plain
+// feature includes its team twin).
+func Implied(feature string, granted func(string) bool) bool {
+	if granted(feature) || granted(FeatureAdmin) {
+		return true
+	}
+
+	plain, twin := strings.CutPrefix(feature, TeamFeaturePrefix)
+
+	return twin && granted(plain)
+}
+
+// ActionBasis implements Authorizer. The action's feature is one of this
+// service, protocol.DefaultActionFeature when it names none; an unknown one
+// allows nobody.
 func (s *authorizer) ActionBasis(u *User, a *protocol.ActionInfo) string {
 	switch {
 	case u.Open:
@@ -343,8 +326,8 @@ func (s *authorizer) ActionBasis(u *User, a *protocol.ActionInfo) string {
 		return FeatureAdmin
 	}
 
-	if service, feature, ok := protocol.SplitFeature(a.Feature); ok &&
-		auth.FeatureAllowed(u.Services, service, feature, auth.FeatureDefaultDeny) {
+	if feature := cmp.Or(a.Feature, protocol.DefaultActionFeature); protocol.ValidActionFeature(feature) &&
+		s.HasFeature(u, feature) {
 		return ActionByFeature
 	}
 
@@ -356,14 +339,12 @@ func (s *authorizer) ActionBasis(u *User, a *protocol.ActionInfo) string {
 }
 
 // authorize decides whether u may make a request with the given requirement.
-// It returns the features that allowed it, as the audit log records them:
-// the plain feature ("roll") or its team twin ("team_roll"), followed by
-// ",admin" when the request needed that as well, or "open" when the API runs
-// without an auth provider.
+// It returns the feature that allowed it, as the audit log records it: the
+// plain feature ("manage") or its team twin ("team_manage"), or "open" when
+// the API runs without an auth provider.
 //
 // The rule: the request is allowed when the token has the plain feature, or
-// it has the team twin and a team of the token owns every target. When the
-// request needs FeatureAdmin as well, the token must have that too. A refusal
+// it has the team twin and a team of the token owns every target. A refusal
 // is a *forbiddenError. authorize reads the store and changes nothing.
 func (s *authorizer) authorize(ctx context.Context, u *User, need *Requirement) (string, error) {
 	if u.Open {
@@ -371,51 +352,26 @@ func (s *authorizer) authorize(ctx context.Context, u *User, need *Requirement) 
 	}
 
 	feature, team := need.Feature, need.Team
-	by := feature
-	viaTeam := false
-
-	if !s.HasFeature(u, feature) {
-		twin := TeamFeaturePrefix + feature
-
-		if team == nil || !s.HasFeature(u, twin) {
-			return "", forbiddenf("this login lacks the feature %s:%s", s.authService, feature)
-		}
-
-		uncovered, err := s.uncovered(ctx, u.Teams, team)
-		if err != nil {
-			return "", err
-		}
-
-		if uncovered != "" {
-			return "", forbiddenf("%s:%s %s", s.authService, twin, uncovered)
-		}
-
-		by, viaTeam = twin, true
+	if s.HasFeature(u, feature) {
+		return feature, nil
 	}
 
-	admin := s.HasFeature(u, FeatureAdmin)
+	twin := TeamFeaturePrefix + feature
 
-	if need.Admin != "" {
-		if !admin {
-			return "", forbiddenf("this login lacks the feature %s:%s (needed for %s)",
-				s.authService, FeatureAdmin, need.Admin)
-		}
-
-		by += "," + FeatureAdmin
+	if team == nil || !s.HasFeature(u, twin) {
+		return "", forbiddenf("this login lacks the feature %s:%s", s.authService, feature)
 	}
 
-	// What the twin alone does not give: admin permits it, and is named for
-	// it; without admin it is taken out of the request.
-	if viaTeam && need.TeamAdmin != "" {
-		switch {
-		case !admin:
-			need.TeamOnly()
-		case need.Admin == "":
-			by += "," + FeatureAdmin
-		}
+	uncovered, err := s.uncovered(ctx, u.Teams, team)
+	if err != nil {
+		return "", err
 	}
 
-	return by, nil
+	if uncovered != "" {
+		return "", forbiddenf("%s:%s %s", s.authService, twin, uncovered)
+	}
+
+	return twin, nil
 }
 
 // uncovered says what keeps the teams from covering the targets, naming the
@@ -427,6 +383,10 @@ func (s *authorizer) authorize(ctx context.Context, u *User, need *Requirement) 
 // containers. A host the controller does not know, a host that never synced
 // and a container the host does not manage have no owners.
 func (s *authorizer) uncovered(ctx context.Context, teams []string, t *Targets) (string, error) {
+	if t.recover {
+		return s.uncoveredRecover(ctx, teams, t)
+	}
+
 	names := slices.Clone(t.hosts)
 	client := t.Client
 
@@ -440,22 +400,11 @@ func (s *authorizer) uncovered(ctx context.Context, teams []string, t *Targets) 
 			return "", fmt.Errorf("authorize: get rollout %s: %w", Echo(t.rollout), err)
 		case r.Team == "":
 			return fmt.Sprintf("does not cover rollout %s: it is for no team", Echo(t.rollout)), nil
+		case !ownedBy(teams, []string{r.Team}):
+			return fmt.Sprintf("does not cover rollout %s (owners: %s)", Echo(t.rollout), Echo(r.Team)), nil
 		}
 
-		client = r.Team
-	}
-
-	if t.lease != "" {
-		lease, err := s.store.GetLease(ctx, t.lease)
-
-		switch {
-		case errors.Is(err, store.ErrNotFound):
-			return fmt.Sprintf("does not cover lease %s (owners: none)", Echo(t.lease)), nil
-		case err != nil:
-			return "", fmt.Errorf("authorize: get lease %s: %w", Echo(t.lease), err)
-		}
-
-		names = []string{lease.Host}
+		return "", nil
 	}
 
 	hosts, err := s.store.ListHosts(ctx)
@@ -498,7 +447,7 @@ func OwnershipOf(hosts []*fleet.Host) map[string]*hostOwnership {
 	known := make(map[string]*hostOwnership, len(hosts))
 
 	for _, host := range hosts {
-		own := &hostOwnership{held: host.HoldWanted, holdBy: host.HoldBy}
+		own := &hostOwnership{}
 
 		if host.Status != nil {
 			own.containers = make([]containerOwners, 0, len(host.Status.Containers))
@@ -531,9 +480,6 @@ func teamOf(c *protocol.Container) []string {
 type hostOwnership struct {
 	// containers are the managed containers with their owners.
 	containers []containerOwners
-	// held: the controller hold is wanted; holdBy is fleet.Host.HoldBy.
-	held   bool
-	holdBy string
 }
 
 // containerOwners is one managed container of a host with its owners (its
@@ -571,15 +517,11 @@ func UncoveredOn(teams []string, host string, own *hostOwnership, t *Targets) st
 			return onHost
 		}
 
-		// A hold that no team of the token set through the twin is not the
-		// twin's to lift, nor to set again as its own.
-		if by := scheduler.HoldSetBy(own.holdBy, teams); t.hold != HoldUntouched && own.held && by != "" {
-			verb := "lift"
-			if t.hold == HoldSet {
-				verb = "change"
+		// An unhold names only holds of the token's teams on the host.
+		for _, holder := range t.holders {
+			if holder == fleet.HolderStaff || !slices.Contains(teams, holder) || !slices.Contains(all, holder) {
+				return fmt.Sprintf("does not lift the hold of %s on host %s", Echo(holder), Echo(host))
 			}
-
-			return fmt.Sprintf("does not %s the hold on host %s (set by %s)", verb, Echo(host), Echo(by))
 		}
 
 		return ""

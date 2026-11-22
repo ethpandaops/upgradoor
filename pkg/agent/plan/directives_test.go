@@ -18,7 +18,7 @@ func TestRollRefusal(t *testing.T) {
 		want      string
 	}{
 		{name: "a managed, rolled container", container: "geth"},
-		{name: "verb first", verbs: []protocol.Verb{}, hold: protocol.Hold{Controller: true}, container: "",
+		{name: "verb first", verbs: []protocol.Verb{}, hold: staffHold, container: "",
 			want: "verb roll is not allowed on this host"},
 		{name: "then the hold", hold: protocol.Hold{Local: true, LocalReason: "x"}, want: "host is on local hold: x"},
 		{name: "no container", want: "roll directive names no container"},
@@ -79,8 +79,8 @@ func TestRollNeed(t *testing.T) {
 		mutate func(v *View)
 		want   string
 	}{
-		{name: "refused first", ref: "ethpandaops/geth:stable", mutate: func(v *View) { v.Hold.Controller = true },
-			want: "host is on controller hold"},
+		{name: "refused first", ref: "ethpandaops/geth:stable", mutate: func(v *View) { v.Hold = staffHold },
+			want: "host is on hold by staff"},
 		{name: "the container moved", ref: "ethpandaops/geth:stable", check: same,
 			want: "container geth moved to another image"},
 		{name: "no digest", ref: ref, check: &protocol.RegistryCheck{},
@@ -112,9 +112,9 @@ func TestManualReboot(t *testing.T) {
 	}, need)
 
 	v := observed(p)
-	v.Hold.Controller = true
+	v.Hold = staffHold
 	_, reject = ManualReboot(p, v, "d1")
-	assert.Equal(t, "host is on controller hold", reject)
+	assert.Equal(t, "host is on hold by staff", reject)
 
 	p.Verbs = []protocol.Verb{protocol.VerbRoll}
 	_, reject = ManualReboot(p, v, "d1")

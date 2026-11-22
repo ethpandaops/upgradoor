@@ -33,7 +33,7 @@ func TestClientOverrideEachHost(t *testing.T) {
 	h := newHarness(t, nil)
 	controllertest.OwnershipFixture(h.store)
 
-	team := &authz.User{Actor: controllertest.UserEmail, Teams: []string{"lighthouse"}, Services: "+upgradoor:team_image_override"}
+	team := &authz.User{Actor: controllertest.UserEmail, Teams: []string{"lighthouse"}, Services: "+upgradoor:team_manage_image"}
 
 	// teku-geth-1 runs no consensus container of lighthouse: the scheduler
 	// names that. ghost-1 is unknown: so does the scheduler.
@@ -45,21 +45,21 @@ func TestClientOverrideEachHost(t *testing.T) {
 
 	calls := h.sched.Recorded()
 	require.Len(t, calls, 1)
-	assert.Equal(t, scheduler.Authorization{By: "team_image_override", Teams: team.Teams}, calls[0].Auth)
+	assert.Equal(t, scheduler.Authorization{By: "team_manage_image", Teams: team.Teams}, calls[0].Auth)
 	assert.Equal(t, []string{controllertest.HostMixed, controllertest.HostTeku, controllertest.HostGhost}, overrideReq(t, calls[0]).Hosts)
 
 	// The teku team: lighthouse-geth-1's lighthouse is not its own.
-	tekuTeam := &authz.User{Actor: controllertest.UserEmail, Teams: []string{"teku"}, Services: "+upgradoor:team_image_override"}
+	tekuTeam := &authz.User{Actor: controllertest.UserEmail, Teams: []string{"teku"}, Services: "+upgradoor:team_manage_image"}
 	body = fmt.Sprintf(`{"client":"lighthouse","kind":"cl","hosts":[%q],"part":"image","image":"sigp/lighthouse:fix"}`,
 		controllertest.HostMixed)
 
 	rec = postClientOverride(h, tekuTeam, body)
 	require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
 	assert.Contains(t, controllertest.DecodeJSON[httpjson.ErrorBody](t, rec).Error,
-		"forbidden: upgradoor:team_image_override does not cover container lighthouse on host "+controllertest.HostMixed)
+		"forbidden: upgradoor:team_manage_image does not cover container lighthouse on host "+controllertest.HostMixed)
 
 	// Both: the covered host is sent, the other one is listed.
-	both := &authz.User{Actor: controllertest.UserEmail, Teams: []string{"teku"}, Services: "+upgradoor:team_image_override"}
+	both := &authz.User{Actor: controllertest.UserEmail, Teams: []string{"teku"}, Services: "+upgradoor:team_manage_image"}
 	body = fmt.Sprintf(`{"client":"teku","kind":"cl","hosts":[%q,%q],"part":"image","image":"consensys/teku:fix"}`,
 		controllertest.HostTeku, controllertest.HostMixed)
 
@@ -72,7 +72,7 @@ func TestClientOverrideEachHost(t *testing.T) {
 		"a host that runs no such container is the scheduler's to refuse")
 
 	// The plain feature decides once for every host.
-	plain := &authz.User{Actor: controllertest.UserEmail, Services: "+upgradoor:flag_override"}
+	plain := &authz.User{Actor: controllertest.UserEmail, Services: "+upgradoor:manage_flags"}
 	body = fmt.Sprintf(`{"client":"lighthouse","kind":"vc","hosts":[%q,%q],"part":"flags","addFlags":["--debug"]}`,
 		controllertest.HostMixed, controllertest.HostTeku)
 
@@ -88,7 +88,7 @@ func TestClientOverrideRefusesUncoveredHosts(t *testing.T) {
 	controllertest.OwnershipFixture(h.store)
 
 	// geth on both hosts; the team geth owns both, the team lighthouse none.
-	u := &authz.User{Actor: controllertest.UserEmail, Teams: []string{"lighthouse", "geth"}, Services: "+upgradoor:team_flag_override"}
+	u := &authz.User{Actor: controllertest.UserEmail, Teams: []string{"lighthouse", "geth"}, Services: "+upgradoor:team_manage_flags"}
 	body := fmt.Sprintf(`{"client":"lighthouse","kind":"cl","hosts":[%q,%q],"part":"flags","addFlags":["--x"]}`,
 		controllertest.HostMixed, controllertest.HostUnowned)
 
@@ -112,7 +112,7 @@ func TestClientOverrideValidates(t *testing.T) {
 	h := newHarness(t, nil)
 	controllertest.OwnershipFixture(h.store)
 
-	admin := &authz.User{Actor: controllertest.UserEmail, Services: "+upgradoor:image_override,+upgradoor:flag_override"}
+	admin := &authz.User{Actor: controllertest.UserEmail, Services: "+upgradoor:manage_image,+upgradoor:manage_flags"}
 
 	for name, body := range map[string]string{
 		"no client":       `{"kind":"cl","hosts":["a"],"part":"image","image":"x:y"}`,

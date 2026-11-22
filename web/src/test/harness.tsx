@@ -112,5 +112,5 @@ export function renderWithApp(ui: ReactNode, h: Harness): RenderResult {
 
 /** PRIMARY is the query of the primary button of an action dialog: it names what the action does. */
 export const PRIMARY = {
-  name: /^(Confirm|Roll|Reboot|Hold|Unhold|Forget|Pause|Resume|Abort|Skip|Retry|End the lease|Set the policy|Override image|Override flags|Clear)$/,
+  name: /^(Confirm|Roll|Reboot|Hold|Unhold|Forget|Pause|Resume|Abort|Skip|Retry|End the lease|Set the policy|Override image|Override flags|Clear|Approve|Approve now|Roll despite network state)$/,
 };

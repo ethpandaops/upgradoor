@@ -26,7 +26,7 @@ type Overrides struct {
 	Deployed map[string]Deployed
 	// Entries are the unexpired overrides, by container name.
 	Entries map[string]Entry
-	// Holds are the holds by source (HoldLocal, HoldController).
+	// Holds are the holds by holder (protocol.HolderHost for the local one).
 	Holds map[string]Hold
 }
 
@@ -69,22 +69,15 @@ type Entry struct {
 	Until *time.Time
 }
 
-// Hold is one hold of the state file.
+// Hold is one hold of the state file, keyed by its holder.
 type Hold struct {
-	// By, Reason, Teams and Feature say who set it and why.
-	By      string   `json:"by"`
-	Reason  string   `json:"reason"`
-	Teams   []string `json:"teams,omitempty"`
-	Feature string   `json:"feature,omitempty"`
+	// By and Reason say who set it and why; At when.
+	By     string    `json:"by"`
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
 	// Until is when the hold ends by itself; nil for one without an end.
 	Until *time.Time `json:"until,omitempty"`
 }
-
-// Hold sources: the keys of the holds in the state file.
-const (
-	HoldLocal      = "local"
-	HoldController = "controller"
-)
 
 // Bounds of an override that is not written by hand.
 const (

@@ -818,7 +818,7 @@ func TestCancelDuringAnOperation(t *testing.T) {
 
 				if hold {
 					e.files.set(func(o *plan.Overrides) {
-						o.Holds = map[string]plan.Hold{plan.HoldLocal: {By: "alice", Reason: "maintenance"}}
+						o.Holds = map[string]plan.Hold{protocol.HolderHost: {By: "alice", Reason: "maintenance"}}
 					})
 				} else {
 					e.cancel(l)
@@ -870,7 +870,7 @@ func TestLocalHoldDuringThePull(t *testing.T) {
 
 	agenttest.AwaitParked(t, entered, "pull")
 	e.files.set(func(o *plan.Overrides) {
-		o.Holds = map[string]plan.Hold{plan.HoldLocal: {By: "alice"}}
+		o.Holds = map[string]plan.Hold{protocol.HolderHost: {By: "alice"}}
 	})
 	release()
 

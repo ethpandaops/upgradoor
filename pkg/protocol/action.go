@@ -2,7 +2,7 @@ package protocol
 
 import (
 	"regexp"
-	"strings"
+	"slices"
 )
 
 // Host actions are commands that agent.yaml defines and names. The
@@ -52,23 +52,16 @@ func ValidActionName(name string) bool {
 	return len(name) <= maxActionName && actionNamePattern.MatchString(name)
 }
 
-// featurePattern is a feature as a token's services claim grants it:
-// "<service>:<feature>".
-var featurePattern = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,62}:[a-z0-9][a-z0-9_-]{0,62}$`)
+// DefaultActionFeature is the controller feature that allows a person to
+// start an action that names none.
+const DefaultActionFeature = "manage"
 
-// ValidFeature reports whether feature is "<service>:<feature>".
-func ValidFeature(feature string) bool { return featurePattern.MatchString(feature) }
+// actionFeatures are the controller features an action may name: the plain
+// ones of authz, never a team twin.
+var actionFeatures = []string{"details", "manage", "manage_image", "manage_flags", "admin"}
 
-// SplitFeature splits a valid feature into its service and its name.
-func SplitFeature(feature string) (service, name string, ok bool) {
-	if !ValidFeature(feature) {
-		return "", "", false
-	}
-
-	service, name, ok = strings.Cut(feature, ":")
-
-	return service, name, ok
-}
+// ValidActionFeature reports whether an action may name feature.
+func ValidActionFeature(feature string) bool { return slices.Contains(actionFeatures, feature) }
 
 // ActionInfo is one configured action as the agent reports it. The command
 // is not reported.
@@ -76,8 +69,8 @@ type ActionInfo struct {
 	Name        string `json:"name"`
 	Description string `json:"description,omitempty"`
 	Impact      Impact `json:"impact"`
-	// Feature is the login feature ("<service>:<feature>") that allows a
-	// person to start the action, next to admin.
+	// Feature is the controller feature that allows a person to start the
+	// action, next to admin; DefaultActionFeature when empty.
 	Feature string `json:"feature,omitempty"`
 	// Teams are the teams whose members may start the action.
 	Teams []string `json:"teams,omitempty"`

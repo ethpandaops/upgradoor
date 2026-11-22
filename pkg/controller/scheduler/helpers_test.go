@@ -37,8 +37,10 @@ var errWrite = errors.New("fakestore: write failed")
 type fakeStore struct {
 	mu sync.Mutex
 
-	hosts      map[string]*fleet.Host
-	liveness   map[uint64]map[string]fleet.Liveness
+	hosts    map[string]*fleet.Host
+	liveness map[uint64]map[string]fleet.Liveness
+	// attested stands in for the beacon service's attested slots.
+	attested   map[string][]uint64
 	rollouts   map[string]*fleet.Rollout
 	rolloutSeq []string
 	leases     map[string]*fleet.Lease
@@ -65,6 +67,7 @@ func newFakeStore() *fakeStore {
 	return &fakeStore{
 		hosts:      map[string]*fleet.Host{},
 		liveness:   map[uint64]map[string]fleet.Liveness{},
+		attested:   map[string][]uint64{},
 		rollouts:   map[string]*fleet.Rollout{},
 		leases:     map[string]*fleet.Lease{},
 		directives: map[string]*fleet.Directive{},
@@ -178,10 +181,8 @@ func (s *fakeStore) putHost(h *fleet.Host) {
 }
 
 // recordSync stores a sync as store.RecordSync does: the host is created or
-// its certificate data, status and last-seen time replaced; the hold switch
-// stays. A new host that reports a controller hold is created with the hold
-// wanted; adopted says so.
-func (s *fakeStore) recordSync(h *fleet.Host) (adopted bool) {
+// its certificate data, status and last-seen time replaced.
+func (s *fakeStore) recordSync(h *fleet.Host) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -189,25 +190,13 @@ func (s *fakeStore) recordSync(h *fleet.Host) (adopted bool) {
 
 	if old := s.hosts[h.Name]; old != nil {
 		c.FirstSeen = old.FirstSeen
-		c.HoldWanted = old.HoldWanted
-		c.HoldReason = old.HoldReason
-		c.HoldBy = old.HoldBy
-		c.HoldActor = old.HoldActor
 		c.Broken = old.Broken
 		c.Unproven = old.Unproven
 	} else {
 		c.FirstSeen = h.LastSeen
-
-		if h.Status != nil && h.Status.Hold.Controller {
-			adopted = true
-			c.HoldWanted = true
-			c.HoldReason = store.HoldReasonAdopted
-		}
 	}
 
 	s.hosts[h.Name] = &c
-
-	return adopted
 }
 
 // setFailing injects write failures: every write while all is set, else the
@@ -308,6 +297,28 @@ func (s *fakeStore) DeleteHost(_ context.Context, name string) error {
 	}
 
 	return nil
+}
+
+// attest records an included attestation of the host's validators for slot.
+func (s *fakeStore) attest(host string, slot uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	slots := s.attested[host]
+	if len(slots) > 0 && slots[len(slots)-1] >= slot {
+		return
+	}
+
+	next := append(slices.Clone(slots), slot)
+	s.attested[host] = next[max(0, len(next)-fleet.MaxReadyAttestations):]
+}
+
+// attestedSlots stands in for the beacon service's AttestedSlots.
+func (s *fakeStore) attestedSlots() map[string][]uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return maps.Clone(s.attested)
 }
 
 // listLiveness stands in for the beacon service's Liveness.
@@ -477,22 +488,6 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 	}
 
 	// All or nothing, like the transaction of the SQLite store.
-	for _, hold := range ch.Holds {
-		if s.hosts[hold.Host] == nil {
-			return store.ErrNotFound
-		}
-	}
-
-	for _, hold := range ch.Holds {
-		s.hosts[hold.Host].HoldWanted = hold.Wanted
-		s.hosts[hold.Host].HoldReason = hold.Reason
-		s.hosts[hold.Host].HoldBy, s.hosts[hold.Host].HoldActor = "", ""
-
-		if hold.Wanted {
-			s.hosts[hold.Host].HoldBy, s.hosts[hold.Host].HoldActor = hold.By, hold.Actor
-		}
-	}
-
 	for _, off := range ch.Offline {
 		if s.hosts[off.Host] == nil {
 			return store.ErrNotFound
@@ -519,6 +514,11 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 		}
 
 		s.rollouts[r.ID] = storedRollout(r)
+	}
+
+	for _, id := range ch.Dropped {
+		delete(s.rollouts, id)
+		s.rolloutSeq = slices.DeleteFunc(s.rolloutSeq, func(seq string) bool { return seq == id })
 	}
 
 	for _, l := range ch.Leases {
@@ -785,7 +785,8 @@ var testGenesis = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 const (
 	testSecondsPerSlot = 12
 	testSlotsPerEpoch  = 32
-	testEpoch          = testSecondsPerSlot * testSlotsPerEpoch * time.Second
+	testSlot           = testSecondsPerSlot * time.Second
+	testEpoch          = testSlotsPerEpoch * testSlot
 
 	imgLighthouse = "sigp/lighthouse:unstable"
 	imgGeth       = "ethereum/client-go:latest"
@@ -805,7 +806,8 @@ type worldBuilder struct {
 	ids           int
 	nextValidator uint64
 	// autoLive adds a fully live row in the newest complete epoch for every
-	// validator host that has none.
+	// validator host that has none, and has every validator host whose
+	// liveOverride is not 0 attest in every slot up to the newest settled one.
 	autoLive bool
 	// liveOverride is what autoLive writes for a host instead of its weight;
 	// dutyOverride is the number of its validators with a duty that live
@@ -814,6 +816,10 @@ type worldBuilder struct {
 	dutyOverride map[string]uint64
 	// healthMod changes the beacon view after every refresh.
 	healthMod func(n *fleet.NetworkHealth)
+	// attestedUpTo is the newest slot fillAttested filled; attestedSome is
+	// false before it first did.
+	attestedUpTo uint64
+	attestedSome bool
 	// ended are the leases that ended, in the order in which they did;
 	// closedRollouts the rollouts that closed, newest first.
 	ended          []*fleet.Lease
@@ -964,8 +970,13 @@ func (b *worldBuilder) step() *Outcome {
 	return out
 }
 
-// fillLiveness adds the rows of the newest complete epoch that are missing.
+// fillLiveness adds the rows of the newest complete epoch that are missing,
+// and the attested slots.
 func (b *worldBuilder) fillLiveness() {
+	if b.autoLive {
+		b.fillAttested()
+	}
+
 	if b.autoLive && b.w.Health.LivenessKnown {
 		epoch := b.w.Health.LivenessEpoch
 
@@ -986,6 +997,57 @@ func (b *worldBuilder) fillLiveness() {
 	}
 }
 
+// fillAttested has every validator host that attests attest in every slot up
+// to two slots before the clock's, as the beacon service settles them.
+func (b *worldBuilder) fillAttested() {
+	clock, ok := b.w.Health.SlotAt(b.w.Now)
+	if !ok || clock < 2 {
+		return
+	}
+
+	settled := clock - 2
+
+	from := settled - min(settled, fleet.MaxReadyAttestations-1)
+	if b.attestedSome {
+		from = max(from, b.attestedUpTo+1)
+	}
+
+	b.attestedUpTo, b.attestedSome = settled, true
+
+	for _, h := range b.w.Hosts {
+		if live, set := b.liveOverride[h.Name]; h.Weight() == 0 || set && live == 0 {
+			continue
+		}
+
+		for slot := from; slot <= settled; slot++ {
+			b.attest(h.Name, slot)
+		}
+	}
+}
+
+// attest records an included attestation of the host's validators for slot,
+// keeping the newest fleet.MaxReadyAttestations slots as the beacon service
+// does.
+func (b *worldBuilder) attest(name string, slot uint64) {
+	if b.w.Attested == nil {
+		b.w.Attested = map[string][]uint64{}
+	}
+
+	slots := slices.Clone(b.w.Attested[name])
+
+	i, found := slices.BinarySearch(slots, slot)
+	if found {
+		return
+	}
+
+	slots = slices.Insert(slots, i, slot)
+	if len(slots) > fleet.MaxReadyAttestations {
+		slots = slots[len(slots)-fleet.MaxReadyAttestations:]
+	}
+
+	b.w.Attested[name] = slots
+}
+
 // applyOutcome writes an outcome back into a world.
 func applyOutcome(w *World, out *Outcome) {
 	for _, r := range out.Rollouts {
@@ -994,6 +1056,10 @@ func applyOutcome(w *World, out *Outcome) {
 		if !r.State.Terminal() {
 			w.Rollouts = append(w.Rollouts, r)
 		}
+	}
+
+	for _, id := range out.Dropped {
+		w.Rollouts = slices.DeleteFunc(w.Rollouts, func(x *fleet.Rollout) bool { return x.ID == id })
 	}
 
 	for _, l := range out.Leases {
@@ -1296,7 +1362,9 @@ func failedOnDigestA(t *testing.T, failing string, hosts map[string]uint64) *wor
 	for _, name := range sortedKeys(hosts) {
 		b.host(name, hosts[name])
 		b.wantsImage(name, imgLighthouse, digestA)
-		b.get(name).HoldWanted = name != failing
+		if name != failing {
+			b.get(name).Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
+		}
 	}
 
 	b.step()
@@ -1304,7 +1372,7 @@ func failedOnDigestA(t *testing.T, failing string, hosts map[string]uint64) *wor
 	b.report(failing, protocol.PhaseFailed, true)
 
 	for name := range hosts {
-		b.get(name).HoldWanted = false
+		b.get(name).Status.Hold.Holds = nil
 	}
 
 	b.step()

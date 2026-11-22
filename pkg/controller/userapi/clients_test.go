@@ -64,7 +64,7 @@ func clientFixture(h *harness) {
 		host.Status.Containers[2].Registry.Digest = "sha256:l2"
 	})
 	host("n-held", func(host *fleet.Host) {
-		host.HoldWanted, host.HoldReason = true, "debugging"
+		host.Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff, Reason: "debugging"}}
 		// A flag override: its command line is not the configured one.
 		host.Status.Containers[1].Command = []string{"--network=hoodi", "--http", "--debug"}
 		host.Status.Containers[1].Override = &protocol.ContainerOverride{AddFlags: []string{"--debug"}}
@@ -116,6 +116,7 @@ func TestClients(t *testing.T) {
 			Kind: protocol.KindCL, Image: "sigp/lighthouse:latest", Digest: "sha256:l1",
 			Revision: "rev-sha256:l1", Hosts: 6,
 			Command: []string{"--network=hoodi", "--http"}, CommandHosts: 5,
+			CommonArgs: []string{"--network=hoodi", "--http"},
 		},
 		{
 			Kind: protocol.KindVC, Image: "sigp/lighthouse:latest", Digest: "sha256:l1",
@@ -208,7 +209,7 @@ func TestClientHosts(t *testing.T) {
 	assert.Equal(t, "geth", broken.Containers[0].Name)
 
 	assert.Equal(t, views.ClientHeld, all.Hosts[3].State)
-	assert.Equal(t, "debugging", all.Hosts[3].Reason)
+	assert.Equal(t, "staff: debugging", all.Hosts[3].Reason)
 	assert.Equal(t, views.ClientCurrent, all.Hosts[4].State, "pending for lighthouse is not pending for geth")
 
 	second := page(t, "?limit=2&offset=2")

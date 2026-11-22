@@ -214,7 +214,7 @@ func TestBrokenHostWithoutValidatorsGoesFirst(t *testing.T) {
 		assert.Equal(t, []string{"h1"}, b.leasedHosts())
 
 		out = b.step()
-		assert.Equal(t, map[string]string{"h2": "budget 50% of 10%"}, queueReasons(out.Plan))
+		assert.Equal(t, map[string]string{"h2": "validators down: 50% now, 100% with this host, limit 10%"}, queueReasons(out.Plan))
 	})
 
 	// Case 2: only "h1" has seen the new digest, "h3" is still expected to.
@@ -273,14 +273,14 @@ func TestBrokenHostStaysFirstThroughStateChanges(t *testing.T) {
 
 	// The host goes on hold: a held agent reports no need.
 	needs := b.get("h3").Status.Needs
-	b.get("h3").HoldWanted = true
+	b.get("h3").Status.Hold.Holds = []protocol.HostHold{{Holder: fleet.HolderStaff}}
 	b.get("h3").Status.Needs = nil
 	b.step()
 	require.Equal(t, fleet.HostExpected, b.mustRollout(key).Host("h3").State)
 	assert.Equal(t, fleet.StageRepair, b.mustRollout(key).Host("h3").Stage)
 
 	// The hold is lifted: it is still the host that goes first.
-	b.get("h3").HoldWanted = false
+	b.get("h3").Status.Hold.Holds = nil
 	b.get("h3").Status.Needs = needs
 	b.w.Settings.Paused = false
 

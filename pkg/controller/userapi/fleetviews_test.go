@@ -54,9 +54,8 @@ func TestHosts(t *testing.T) {
 	assert.Equal(t, protocol.Pending{Upgradable: 9, Security: 4, Blocked: 1}, one.Pending)
 	assert.Equal(t, int64(86400), one.UptimeSeconds)
 	assert.True(t, one.Hold.Local)
-	assert.True(t, one.HoldWanted)
-	assert.Equal(t, controllertest.SecretHoldReason, one.HoldReason, "the reason of the controller hold, for those who are signed in")
-	assert.Empty(t, boot.HoldReason)
+	assert.Equal(t, []string{protocol.HolderHost, fleet.HolderStaff}, one.Holders)
+	assert.Empty(t, boot.Holders)
 	assert.Equal(t, []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages}, one.Verbs)
 	assert.Len(t, one.Needs, 2)
 	assert.Equal(t, scheduler.SlotHeld, one.Plan.Slot)
@@ -421,9 +420,15 @@ func TestPlan(t *testing.T) {
 	plan = controllertest.DecodeJSON[scheduler.Plan](t, rec)
 	assert.True(t, plan.ComputedAt.Equal(controllertest.Epoch))
 	assert.Equal(t, uint64(10), plan.Budget.UnavailableWeight)
-	require.Len(t, plan.Queue, 1)
+	require.Len(t, plan.Queue, 2)
 	assert.Equal(t, "lighthouse-geth-1", plan.Queue[0].Host)
 	assert.Equal(t, scheduler.SlotHeld, plan.Hosts["lighthouse-geth-1"].Slot)
+
+	// A waiting reason that quotes the beacon error keeps the fixed text.
+	assert.Equal(t, "network gate: beacon node unavailable", plan.Queue[1].Reason)
+	assert.Equal(t, "network gate: beacon node unavailable", plan.Hosts["lighthouse-geth-2"].Reason)
+	assert.Equal(t, "beacon node unavailable", plan.Gate.Network.Error)
+	assert.Equal(t, "the last fetch failed", plan.Gate.Network.ValidatorRangesError)
 
 	// A plan with nil lists still encodes them as empty.
 	h.sched.Set(func(f *controllertest.Scheduler) { f.CurrentPlan = &scheduler.Plan{ComputedAt: controllertest.Epoch} })
@@ -436,7 +441,7 @@ func TestPlan(t *testing.T) {
 
 func TestSettings(t *testing.T) {
 	defaults := fleet.DefaultSettings()
-	defaults.ReadyEpochs = 2
+	defaults.ReadyAttestations = 3
 
 	h := newHarness(t, func(o *Options) { o.DefaultSettings = defaults })
 
@@ -451,6 +456,8 @@ func TestSettings(t *testing.T) {
 	changed.PolicyReboot = fleet.PolicyAuto
 	changed.PauseAfterCanaryImage = true
 	changed.ReadyPeerShare = 0.25
+	changed.ReadyAttestations = 1
+	changed.ReadyStableFor = 0
 	changed.Paused = true
 
 	body, err := json.Marshal(changed)
@@ -459,6 +466,7 @@ func TestSettings(t *testing.T) {
 	require.Contains(t, string(body), `"pauseAfterCanaryImage":true`)
 	require.Contains(t, string(body), `"pauseAfterCanaryPackages":false`)
 	require.Contains(t, string(body), `"readyPeerShare":0.25`)
+	require.Contains(t, string(body), `"readyStableFor":"0s"`)
 
 	rec = h.sendJSON(http.MethodPut, "/api/v1/settings", string(body))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
@@ -505,7 +513,7 @@ func TestSettingsPutKeepsWhatItDoesNotName(t *testing.T) {
 	}
 
 	t.Run("the body of a page that knows neither the peer share nor the pause switches", func(t *testing.T) {
-		old := `{"maxUnavailablePercent":20,"minParticipationPercent":90,"maxFinalityLagEpochs":3,"readyEpochs":1,` +
+		old := `{"maxUnavailablePercent":20,"minParticipationPercent":90,"maxFinalityLagEpochs":3,"readyAttestations":2,` +
 			`"minPeers":3,"leaseTtl":"30m","hostStaleAfter":"2m","readinessTimeout":"30m","policyImage":"auto",` +
 			`"policyPackages":"auto","policyReboot":"manual","paused":false}`
 
@@ -794,4 +802,176 @@ func TestAuditPaging(t *testing.T) {
 		rec := h.get("/api/v1/audit" + bad)
 		assert.Equal(t, http.StatusBadRequest, rec.Code, bad)
 	}
+}
+
+// A login without details reads no system data of a host on any read
+// route; the containers of its own teams it reads in full, and with
+// team_details the hosts those teams own a container on.
+func TestHostDetailsFeature(t *testing.T) {
+	h, provider := authHarness(t, true)
+	controllertest.LeakFixture(t, h.store, h.sched, h.beacon)
+	h.store.Audit = append(h.store.Audit, fleet.AuditEntry{
+		ID: 2, Time: controllertest.Epoch, Actor: "agent:lighthouse-geth-1", Action: "host.registered",
+		Target: "lighthouse-geth-1",
+		Detail: map[string]any{"certHash": controllertest.SecretCertHash, "remoteAddr": controllertest.SecretAddr},
+	})
+
+	paths := []string{
+		"/api/v1/hosts", "/api/v1/hosts/lighthouse-geth-1", "/api/v1/hosts/lighthouse-geth-2",
+		"/api/v1/hosts/bootnode-1", "/api/v1/rollouts", "/api/v1/audit", "/api/v1/images",
+		"/api/v1/clients", "/api/v1/clients/" + controllertest.SecretOwnerEL + "/hosts",
+		"/api/v1/clients/" + controllertest.SecretOwnerCL + "/hosts", "/api/v1/plan",
+		"/api/v1/slots?window=600",
+	}
+
+	read := func(path, authorization string) string {
+		t.Helper()
+
+		rec := h.serve(userRoute{method: http.MethodGet, path: path}.request(authorization))
+		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+		return rec.Body.String()
+	}
+
+	packages := func(authorization string) int {
+		return h.serve(userRoute{method: http.MethodGet, path: "/api/v1/packages"}.request(authorization)).Code
+	}
+
+	t.Run("reduced", func(t *testing.T) {
+		basic := provider.Grant(t, "+upgradoor")
+
+		for _, path := range paths {
+			raw := read(path, basic)
+			assert.NotContains(t, raw, `"resources":`, "%s leaks the resource use", path)
+			assert.NotContains(t, raw, `"usage":`, "%s leaks the resource use", path)
+
+			for _, secret := range controllertest.HostDetailSecrets {
+				assert.NotContains(t, raw, secret, "%s leaks host details", path)
+			}
+		}
+
+		detail := controllertest.DecodeJSON[views.HostDetail](t,
+			h.serve(userRoute{method: http.MethodGet, path: "/api/v1/hosts/lighthouse-geth-1"}.request(basic)))
+		assert.True(t, detail.Reduced)
+		assert.Nil(t, detail.Resources)
+		assert.Len(t, detail.Containers, 3, "the managed containers")
+		assert.Nil(t, detail.Containers[0].Stats)
+		assert.Equal(t, controllertest.SecretVCImage, detail.Containers[2].Image)
+		assert.Equal(t, []protocol.NeedKind{protocol.NeedPackages, protocol.NeedReboot},
+			[]protocol.NeedKind{detail.Needs[0].Kind, detail.Needs[1].Kind})
+		require.NotEmpty(t, detail.Leases)
+		assert.Equal(t, controllertest.SecretLeaseError, detail.Leases[0].Error)
+
+		assert.Equal(t, http.StatusForbidden, packages(basic))
+		assert.Equal(t, http.StatusForbidden, packages(provider.Grant(t, "+upgradoor:team_details")))
+	})
+
+	t.Run("own containers", func(t *testing.T) {
+		member := provider.Grant(t, "+upgradoor", controllertest.SecretOwnerEL)
+
+		raw := read("/api/v1/hosts/lighthouse-geth-1", member)
+		assert.Contains(t, raw, controllertest.SecretFlag, "the command line of the team's container")
+		assert.Contains(t, raw, `"stats":`, "the resource use of the team's container")
+		assert.NotContains(t, raw, controllertest.SecretCertHash)
+		assert.Contains(t, read("/api/v1/clients/"+controllertest.SecretOwnerEL+"/hosts", member),
+			controllertest.SecretFlag)
+	})
+
+	t.Run("owned hosts", func(t *testing.T) {
+		twin := provider.Grant(t, "+upgradoor:team_details", controllertest.SecretOwnerEL)
+
+		raw := read("/api/v1/hosts/lighthouse-geth-1", twin)
+		for _, secret := range []string{
+			controllertest.SecretCertHash, controllertest.SecretOtherImage, controllertest.SecretPkgName,
+			controllertest.SecretActionOutput,
+		} {
+			assert.Contains(t, raw, secret)
+		}
+
+		assert.Contains(t, raw, `"resources":`, "the host's resource use")
+
+		assert.NotContains(t, read("/api/v1/hosts/bootnode-1", twin), controllertest.SecretCertHash,
+			"a host without a container of the team")
+	})
+
+	t.Run("full", func(t *testing.T) {
+		full := provider.Grant(t, "+upgradoor:details")
+
+		raw := read("/api/v1/hosts/lighthouse-geth-1", full)
+		for _, secret := range controllertest.HostDetailSecrets {
+			if secret != controllertest.SecretBootID && secret != controllertest.SecretAddr6 {
+				assert.Contains(t, raw, secret)
+			}
+		}
+
+		assert.Contains(t, read("/api/v1/audit", full), controllertest.SecretCertHash)
+		assert.Equal(t, http.StatusOK, packages(full))
+	})
+}
+
+// What only the admin pages show (the settings, the data sources, the error
+// texts of the beacon service and the inventory, the settings a change left
+// alone) is on no read route of a login without admin, details or not.
+func TestAdminFeature(t *testing.T) {
+	h, provider := authHarness(t, true)
+	controllertest.LeakFixture(t, h.store, h.sched, h.beacon)
+
+	paths := []string{
+		"/api/v1/hosts", "/api/v1/hosts/lighthouse-geth-1", "/api/v1/hosts/lighthouse-geth-2",
+		"/api/v1/rollouts", "/api/v1/audit", "/api/v1/images", "/api/v1/clients",
+		"/api/v1/clients/" + controllertest.SecretOwnerEL + "/hosts", "/api/v1/plan", "/api/v1/slots?window=600",
+	}
+
+	get := func(path, authorization string) *httptest.ResponseRecorder {
+		return h.serve(userRoute{method: http.MethodGet, path: path}.request(authorization))
+	}
+
+	for _, services := range []string{"+upgradoor", "+upgradoor:details", "+upgradoor:details,manage*"} {
+		login := provider.Grant(t, services, controllertest.SecretOwnerEL)
+
+		for _, path := range paths {
+			rec := get(path, login)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+			for _, secret := range controllertest.AdminSecrets {
+				assert.NotContains(t, rec.Body.String(), secret, "%s: %s", services, path)
+			}
+		}
+
+		for _, path := range []string{"/api/v1/settings", "/api/v1/settings/sources"} {
+			assert.Equal(t, http.StatusForbidden, get(path, login).Code, "%s: %s", services, path)
+		}
+
+		details := map[string]map[string]any{}
+		for _, e := range controllertest.DecodeJSON[views.Audit](t, get("/api/v1/audit", login)).Entries {
+			details[e.Action] = e.Detail
+		}
+
+		assert.Equal(t, map[string]any{
+			"before": map[string]any{"maxUnavailablePercent": 10.0},
+			"after":  map[string]any{"maxUnavailablePercent": 20.0},
+		}, details["settings.update"], "%s: what the change changed", services)
+		assert.Equal(t, map[string]any{"changed": false}, details["sources.validator-ranges.refresh"])
+	}
+
+	admin := provider.Grant(t, "+upgradoor:admin")
+
+	rec := get("/api/v1/settings", admin)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	sources := controllertest.DecodeJSON[views.DataSources](t, get("/api/v1/settings/sources", admin))
+	assert.Equal(t, controllertest.SecretBeaconError, sources.Chain.Error)
+
+	raw := get("/api/v1/audit", admin).Body.String()
+	assert.Contains(t, raw, controllertest.SecretSettingsKey)
+	assert.Contains(t, raw, "zz-inventory", "the error of the fetch")
+
+	// The policies that the views need come with the rows.
+	rollouts := controllertest.DecodeJSON[views.Rollouts](t, get("/api/v1/rollouts", provider.Grant(t, "+upgradoor")))
+	require.Len(t, rollouts.Open, 1)
+	assert.Equal(t, fleet.DefaultSettings().PolicyReboot, rollouts.Open[0].Policy)
+
+	clients := controllertest.DecodeJSON[views.Clients](t, get("/api/v1/clients", provider.Grant(t, "+upgradoor")))
+	require.NotEmpty(t, clients.Clients)
+	assert.Equal(t, fleet.DefaultSettings().PolicyImage, clients.Clients[0].DefaultPolicy)
 }

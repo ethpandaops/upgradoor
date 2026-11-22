@@ -73,6 +73,7 @@ const HOST_STATE_TONE: Record<HostState, Tone> = {
   leased: 'accent',
   done: 'success',
   failed: 'danger',
+  cancelled: 'neutral',
   skipped: 'neutral',
   aborted: 'neutral',
 };
@@ -126,6 +127,7 @@ const LEASE_TONE: Record<LeaseState, Tone> = {
   released: 'success',
   failed: 'danger',
   expired: 'neutral',
+  cancelled: 'neutral',
 };
 
 export function LeaseStateBadge({ state }: { state: LeaseState }) {

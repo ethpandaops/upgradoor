@@ -248,7 +248,7 @@ describe('the override buttons', () => {
     expect(reader).toBeDisabled();
     expect(reader).toHaveAttribute(
       'title',
-      'Needs upgradoor:flag_override or upgradoor:team_flag_override for a team that owns this container'
+      'Needs upgradoor:manage_flags or upgradoor:team_manage_flags for a team that owns this container'
     );
   });
 
@@ -267,7 +267,7 @@ describe('the override buttons', () => {
     expect(within(dialog).queryByRole('note')).not.toBeInTheDocument();
     await user.selectOptions(pick, 'geth');
     expect(within(dialog).getByRole('note')).toHaveTextContent(
-      'Not permitted: upgradoor:team_image_override does not cover container geth on host rpc-1 (owners: geth)'
+      'Not permitted: upgradoor:team_manage_image does not cover container geth on host rpc-1 (owners: geth)'
     );
   });
 

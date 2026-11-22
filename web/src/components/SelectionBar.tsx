@@ -87,6 +87,8 @@ export function BulkAction({
   tone?: 'default' | 'danger';
 }) {
   const permissions = usePermissions();
+  if (check && !permissions.offers(check)) return null;
+
   const verdict = check ? permissions.canIntent(check) : undefined;
   const reason = blocked || (verdict && !verdict.allowed ? verdict.reason : '');
 

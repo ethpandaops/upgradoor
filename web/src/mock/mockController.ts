@@ -9,6 +9,8 @@ import {
   type Audit,
   type AuditEntry,
   type Budget,
+  type HostHold,
+  type ApproveLeaseRequest,
   type ClientPolicyRequest,
   type Clients,
   type Container,
@@ -54,7 +56,8 @@ import {
 } from '../api/types';
 import { WIRE_VERSION, without } from '../api/wire';
 import { applyFlags, validateFlags } from '../lib/flags';
-import { formatPercent } from '../lib/format';
+import { formatPercent, heldBy, isHeld } from '../lib/format';
+import { hostUsage } from '../lib/usage';
 import { validateImageRef } from '../lib/imageRef';
 import { parseGoDuration } from '../lib/goDuration';
 import { rolloutActionOf } from '../lib/hostActions';
@@ -70,6 +73,7 @@ import {
   hex,
   type MockData,
   type MockFleet,
+  type MockRollout,
 } from './fixture';
 import { ClientQueryError, clientHostsPage, clientIndex, imagePolicy, type ClientIndex } from './clients';
 import { MockHostActionError, seedHostActions, startHostAction } from './hostActions';
@@ -112,11 +116,20 @@ export const MOCK_LOGINS: Record<MockProfile, MockLogin> = {
   staff: { token: MOCK_TOKEN, features: 'all', teams: ['panda'] },
   team: {
     token: 'mock-token-team',
-    features: TWINNED.map(f => TEAM_PREFIX + f),
+    features: [...TWINNED, FEATURE.details].map(f => TEAM_PREFIX + f),
     teams: ['lighthouse'],
   },
   reader: { token: 'mock-token-reader', features: [], teams: [] },
 };
+
+/** withoutCommands takes the command lines out of the clients the teams do not own, as the controller's reduced views do. */
+function withoutCommands(clients: Clients, teams: readonly string[]): Clients {
+  return {
+    clients: list(clients.clients).map(c =>
+      teams.includes(c.name) ? c : { ...c, images: list(c.images).map(i => ({ ...i, command: undefined })) }
+    ),
+  };
+}
 
 /** mockHasFeature is the feature check of a mock login. */
 export function mockHasFeature(login: MockLogin, feature: string): boolean {
@@ -131,6 +144,8 @@ const ACTIONS: readonly string[] = [
   'unhold',
   'forget',
   'end-lease',
+  'ignore-gate',
+  'approve-lease',
   'pause',
   'resume',
   'abort',
@@ -183,7 +198,7 @@ const RESUME = '; resume to continue';
 
 /** waitKind classifies a waiting reason the way the scheduler does. */
 function waitKind(reason: string): WaitKind {
-  if (reason === 'held') return 'held';
+  if (reason === 'held' || reason.startsWith('held by ')) return 'held';
   if (reason === 'agent silent') return 'silent';
   if (reason === 'paused') return 'paused';
   if (reason === 'rollout paused' || reason.endsWith(RESUME)) return 'rollout-paused';
@@ -193,7 +208,7 @@ function waitKind(reason: string): WaitKind {
   if (reason.startsWith('verb not allowed')) return 'verb';
   if (reason === REASON_PULL) return 'pull';
   if (reason.startsWith('after ')) return 'order';
-  if (reason.startsWith('budget ')) return 'budget';
+  if (reason.startsWith('validators down: ')) return 'budget';
   return 'host-limit';
 }
 
@@ -212,7 +227,7 @@ const RECONCILE_MS = 5_000;
 const isOpen = (l: Lease) => !['released', 'failed', 'expired'].includes(l.state);
 
 /** succeeded: the rollout has served a member successfully (one is done through a lease). */
-function succeeded(r: Rollout): boolean {
+function succeeded(r: MockRollout): boolean {
   return list(r.hosts).some(m => m.state === 'done' && Boolean(m.leaseId));
 }
 
@@ -248,6 +263,8 @@ interface MockOptions {
 /** One open event stream of the mock: who reads it and what it was sent last. */
 interface MockStream {
   user: boolean;
+  /** full: the login reads the hosts in full (details); the others get no command lines of the clients. */
+  full: boolean;
   hosts: string[];
   controller: ReadableStreamDefaultController<Uint8Array>;
   /** What the stream was sent last: its tables, its string table, their version, and the details of its hosts. */
@@ -357,7 +374,7 @@ export class MockController {
   private openStream(input: string, init?: RequestInit): Response {
     const url = new URL(input, 'http://mock.invalid');
     const user = url.pathname === USER_EVENTS_PATH;
-    if (user) this.login(init);
+    const full = user && this.login(init).hasFeature(FEATURE.details);
 
     let stream: MockStream | undefined;
     const close = () => {
@@ -373,6 +390,7 @@ export class MockController {
       start: controller => {
         stream = {
           user,
+          full,
           hosts: user ? url.searchParams.getAll('host') : [],
           controller,
           doc: new Map(),
@@ -403,14 +421,12 @@ export class MockController {
     const tables = stream.user
       ? privateTables({
           now: this.now(),
-          publicGate: this.gate(),
           plan: this.plan(),
           hosts: this.hosts(),
-          clients: this.clients(),
+          clients: stream.full ? this.clients() : withoutCommands(this.clients(), []),
           images,
           slots,
           rollouts: this.rollouts(STREAM_ROLLOUT_LIMIT),
-          settings: this.settingsBody(),
           latestAuditId: this.data.audit.reduce((max, e) => Math.max(max, e.id), 0),
         })
       : publicTables({ now: this.now(), gate: this.gate(), hosts: this.publicHosts(), images, slots });
@@ -476,13 +492,22 @@ export class MockController {
     const login = this.login(init);
 
     if (method === 'GET') {
-      if (route === 'clients') return this.clients();
+      if (route === 'clients')
+        return login.hasFeature(FEATURE.details) ? this.clients() : withoutCommands(this.clients(), login.teams);
       const clientHosts = /^clients\/([^/]+)\/hosts$/.exec(route);
-      if (clientHosts) return clientHostsPage(this.clientIndex(), decodeURIComponent(clientHosts[1] ?? ''), q);
+      if (clientHosts) {
+        const page = clientHostsPage(this.clientIndex(), decodeURIComponent(clientHosts[1] ?? ''), q);
+        // The resource use of a host only for a login that reads it (Access.ClientHost).
+        if (login.hasFeature(FEATURE.details) || login.teams.includes(page.client)) return page;
+        return { ...page, hosts: list(page.hosts).map(h => without(h, 'usage')) };
+      }
       if (route === 'packages')
         return this.packages(q.get('q') ?? '', Number(q.get('limit')) || 50, q.get('after') ?? '');
       if (route === 'images') return this.images(q.get('q') ?? '', Number(q.get('limit')) || 50, q.get('after') ?? '');
-      if (route === 'settings') return this.settingsBody();
+      if (route === 'settings') {
+        this.authorizeAdmin(login);
+        return this.settingsBody();
+      }
       if (route === 'settings/sources') {
         this.authorizeAdmin(login);
         return this.sources.view();
@@ -513,8 +538,8 @@ export class MockController {
     }
 
     if (method === 'POST' && route === 'images/refresh') {
-      if (!login.open && !login.hasFeature(FEATURE.roll)) {
-        throw new HttpError(403, `forbidden: this login lacks the feature ${login.service}:${FEATURE.roll}`);
+      if (!login.open && !login.hasFeature(FEATURE.manage)) {
+        throw new HttpError(403, `forbidden: this login lacks the feature ${login.service}:${FEATURE.manage}`);
       }
 
       return this.refreshImages();
@@ -581,7 +606,11 @@ export class MockController {
       hosts: [...this.data.hosts.values()],
       // The client table is only read for the policy of a client and its rollouts.
       clients: ['client-policy', 'pause', 'resume'].includes(call.action) ? this.clientIndex().views : [],
-      leaseHost: id => this.data.leases.find(l => l.id === id)?.host,
+      leaseWork: id => {
+        const l = this.data.leases.find(x => x.id === id);
+        return l ? { host: l.host, needs: list(l.needs) } : undefined;
+      },
+      rolloutKind: id => this.data.rollouts.find(x => x.id === id)?.kind,
       rolloutClient: id => {
         const r = this.data.rollouts.find(x => x.id === id);
         return r ? (r.team ?? '') : undefined;
@@ -592,9 +621,6 @@ export class MockController {
       },
     });
     if (!verdict.allowed) throw new HttpError(403, `forbidden: ${verdict.reason}`);
-
-    // Through a team feature alone a roll or reboot is run staggered.
-    if (verdict.staggered && (call.action === 'roll' || call.action === 'reboot')) call.body.staggered = true;
 
     this.authorization = { authorizedBy: verdict.by, teams: [...login.teams] };
   }
@@ -861,7 +887,7 @@ export class MockController {
 
   // ---------------------------------------------------------- scheduler
 
-  private openRollouts(): Rollout[] {
+  private openRollouts(): MockRollout[] {
     return this.data.rollouts
       .filter(r => r.state === 'active' || r.state === 'halted')
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
@@ -879,7 +905,7 @@ export class MockController {
     return base > 60 ? base + elapsed : (base + elapsed) % 30;
   }
 
-  private policy(r: Rollout): Settings['policyImage'] {
+  private policy(r: MockRollout): Settings['policyImage'] {
     const s = this.data.settings;
     switch (r.kind) {
       case 'group':
@@ -935,7 +961,7 @@ export class MockController {
   }
 
   /** hasVerb: the agent allows the verb of a need it reports for the rollout. */
-  private hasVerb(r: Rollout, host: HostDetail): boolean {
+  private hasVerb(r: MockRollout, host: HostDetail): boolean {
     const kinds = this.rolloutNeeds(r, host).map(n => n.kind);
     return kinds.some(kind =>
       list(host.verbs).includes(kind === 'image' || kind === 'override' || kind === 'spec' ? 'roll' : kind)
@@ -947,7 +973,7 @@ export class MockController {
    * rollout those of its kind and team, for another the need its member
    * names, for a manual or local one every need of the host.
    */
-  private rolloutNeeds(r: Rollout, host: HostDetail): readonly Need[] {
+  private rolloutNeeds(r: MockRollout, host: HostDetail): readonly Need[] {
     const needs = list(host.needs);
     switch (r.kind) {
       case 'group':
@@ -971,7 +997,7 @@ export class MockController {
   }
 
   /** pullFailed: the last lease could not pull the image of one of the host's needs in the rollout. */
-  private pullFailed(r: Rollout, host: HostDetail): boolean {
+  private pullFailed(r: MockRollout, host: HostDetail): boolean {
     return this.rolloutNeeds(r, host).some(n => n.pullError);
   }
 
@@ -980,7 +1006,7 @@ export class MockController {
    * success yet. The mock does not choose canaries or stages: the fixture's
    * stay as they are.
    */
-  private orderWait(r: Rollout, host: string): { reason: string; after: string } | undefined {
+  private orderWait(r: MockRollout, host: string): { reason: string; after: string } | undefined {
     if (r.force || !r.canary || r.canary === host || succeeded(r)) return undefined;
     return { reason: `after canary ${r.canary}`, after: r.canary };
   }
@@ -989,8 +1015,8 @@ export class MockController {
    * waitingReason is a short form of the scheduler's waiting reasons, enough
    * for every kind the page shows. A host that waits for nothing has none.
    */
-  private waitingReason(host: HostDetail, memberOf: Rollout[], gate: Gate, budget: Budget): string | undefined {
-    if (host.holdWanted || host.hold.local || host.hold.controller) return 'held';
+  private waitingReason(host: HostDetail, memberOf: MockRollout[], gate: Gate, budget: Budget): string | undefined {
+    if (isHeld(host)) return heldBy(host) ?? 'held';
     if (this.isStale(host.name)) return 'agent silent';
     if (this.data.settings.paused) return 'paused';
 
@@ -1012,19 +1038,22 @@ export class MockController {
     if (able.length === 0) return REASON_PULL;
 
     const ignoresBudget = able.some(r => r.ignoreBudget);
-    const throughGate = !gate.ok && !ignoresBudget;
+    const throughGate = !gate.ok && !able.some(r => r.ignoreBudget || r.ignoreGate);
     if (throughGate) return `network gate: ${list(gate.reasons)[0] ?? 'failing'}`;
 
     const waits = able.map(r => this.orderWait(r, host.name));
     if (waits[0] !== undefined && waits.every(w => w !== undefined)) return waits[0].reason;
 
     if (!ignoresBudget) {
-      if (!fits(this.live(host.name), budget)) {
-        const pct = (w: number) => formatPercent(budget.totalWeight > 0 ? (w / budget.totalWeight) * 100 : 0);
-        return `budget ${pct(budget.unavailableWeight)} of ${pct(budget.allowedWeight)}`;
+      const cost = this.live(host.name);
+      if (!fits(cost, budget)) {
+        const pct = (w: number) => (budget.totalWeight > 0 ? (w / budget.totalWeight) * 100 : 0);
+        const now = formatPercent(pct(budget.unavailableWeight));
+        const withHost = formatPercent(pct(budget.unavailableWeight + cost));
+        return `validators down: ${now} now, ${withHost} with this host, limit ${formatPercent(pct(budget.allowedWeight))}`;
       }
       if (budget.leasedHosts >= budget.maxLeasedHosts) {
-        return `host limit ${budget.leasedHosts} of ${budget.maxLeasedHosts}`;
+        return `hosts at once: ${budget.leasedHosts} of ${budget.maxLeasedHosts} busy`;
       }
     }
 
@@ -1032,7 +1061,7 @@ export class MockController {
   }
 
   /** orderAfter names the host that a host waiting for its place in the order waits for. */
-  private orderAfter(host: string, memberOf: Rollout[]): string | undefined {
+  private orderAfter(host: string, memberOf: MockRollout[]): string | undefined {
     for (const r of memberOf) {
       const wait = r.state === 'active' ? this.orderWait(r, host) : undefined;
       if (wait) return wait.after;
@@ -1042,7 +1071,7 @@ export class MockController {
   }
 
   /** aboutRollout is the rollout a waiting reason is about, as the scheduler names it in the plan. */
-  private aboutRollout(host: string, memberOf: Rollout[], wait: WaitKind): string | undefined {
+  private aboutRollout(host: string, memberOf: MockRollout[], wait: WaitKind): string | undefined {
     const active = memberOf.filter(r => r.state === 'active');
 
     switch (wait) {
@@ -1088,7 +1117,7 @@ export class MockController {
       const lease = this.openLease(host.name);
       const memberOf = open.filter(r => list(r.hosts).some(m => m.host === host.name && m.state === 'pending'));
       const failed = open.some(r => list(r.hosts).some(m => m.host === host.name && m.state === 'failed'));
-      const held = host.holdWanted || host.hold.local || host.hold.controller;
+      const held = isHeld(host);
 
       const plan: HostPlan = {
         slot: 'idle',
@@ -1213,10 +1242,9 @@ export class MockController {
       os: host.os,
       pending: host.pending,
       uptimeSeconds: host.uptimeSeconds + Math.floor((this.now() - this.data.createdAt) / 1000),
+      resources: host.resources,
       hold: host.hold,
-      holdWanted: host.holdWanted,
-      holdReason: host.holdWanted ? host.holdReason : undefined,
-      holdBy: host.holdWanted ? (host.holdBy ?? 'staff') : undefined,
+      holders: list(host.hold.holds).map(h => h.holder),
       offline: host.offline,
       broken: host.broken && Object.keys(host.broken).length > 0 ? host.broken : undefined,
       verbs: host.verbs,
@@ -1395,12 +1423,16 @@ export class MockController {
     const newest = <T extends { createdAt?: string; grantedAt?: string }>(a: T, b: T) =>
       (b.createdAt ?? b.grantedAt ?? '').localeCompare(a.createdAt ?? a.grantedAt ?? '');
 
+    // A rollout is served with the policy it answers to (views.RolloutView).
+    const view = (r: MockRollout): Rollout => ({ ...r, policy: this.policy(r) });
+
     return {
-      open: this.openRollouts(),
+      open: this.openRollouts().map(view),
       recent: this.data.rollouts
         .filter(r => r.state !== 'active' && r.state !== 'halted')
         .sort((a, b) => (b.endedAt ?? '').localeCompare(a.endedAt ?? ''))
-        .slice(0, limit),
+        .slice(0, limit)
+        .map(view),
       leases: this.data.leases.filter(l => !terminal(l)).sort(newest),
       recentLeases: this.data.leases
         .filter(terminal)
@@ -1505,7 +1537,7 @@ export class MockController {
     return `${prefix}-${hex(`${prefix}/${this.data.seq}`, 16)}`;
   }
 
-  private rollout(id: string): Rollout {
+  private rollout(id: string): MockRollout {
     const r = this.data.rollouts.find(x => x.id === id);
     if (!r) throw new HttpError(404, `unknown rollout ${id}`);
     return r;
@@ -1537,6 +1569,10 @@ export class MockController {
         return this.forget(body as HoldRequest);
       case 'end-lease':
         return this.endLease(body as EndLeaseRequest);
+      case 'ignore-gate':
+        return this.ignoreGate(body as ScopeRequest);
+      case 'approve-lease':
+        return this.approveLease(body as ApproveLeaseRequest);
       case 'pause':
       case 'resume':
         return this.pause(name, body as ScopeRequest);
@@ -1833,6 +1869,7 @@ export class MockController {
       // One host: there is no order, and no canary.
       force: true,
       ignoreBudget: false,
+      ignoreGate: false,
       createdBy: 'scheduler',
       createdAt: now,
       updatedAt: now,
@@ -1980,6 +2017,7 @@ export class MockController {
     const selected = this.selectHosts(req);
     const rejected: Record<string, string> = {};
     const members: RolloutHost[] = [];
+    const rolled: Need[] = [];
     const id = this.newId('ro');
     const now = this.iso(this.now());
 
@@ -1988,7 +2026,7 @@ export class MockController {
         rejected[host.name] = `the agent does not allow ${verb}`;
         continue;
       }
-      if (host.hold.local || host.hold.controller || host.holdWanted) {
+      if (isHeld(host)) {
         rejected[host.name] = 'the host is on hold';
         continue;
       }
@@ -2031,12 +2069,18 @@ export class MockController {
       }
 
       host.needs = [...list(host.needs), ...needs];
+      rolled.push(...needs.filter(n => n.image));
       members.push({ host: host.name, state: 'pending', stage: STAGE_REST, needId: needs[0]?.id, updatedAt: now });
     }
 
     if (members.length === 0) {
       return { message: `Nothing to ${verb}: every selected host was rejected.`, rejected };
     }
+
+    // A roll of one team's containers is that team's (and of their kind when they share one).
+    const teams = [...new Set(rolled.map(n => n.image?.team ?? ''))];
+    const kinds = [...new Set(rolled.map(n => n.image?.kind ?? ''))];
+    const team = teams.length === 1 && teams[0] ? teams[0] : undefined;
 
     const what = verb === 'roll' ? 'roll' : 'reboot';
     const title = `Manual ${what} of ${req.all ? 'the fleet' : members.length === 1 ? (members[0]?.host ?? '') : `${members.length} hosts`}`;
@@ -2046,11 +2090,13 @@ export class MockController {
       kind: 'manual',
       key: `manual:${id}`,
       title,
+      ...(team ? { team, ...(kinds.length === 1 && kinds[0] ? { containerKind: kinds[0] } : {}) } : {}),
       state: 'active',
       paused: false,
       approved: true,
       force: req.force || !req.staggered,
       ignoreBudget: req.ignoreBudget,
+      ignoreGate: req.ignoreGate === true,
       createdBy: this.actor(),
       createdAt: now,
       updatedAt: now,
@@ -2063,6 +2109,7 @@ export class MockController {
       staggered: req.staggered,
       force: req.force,
       ignoreBudget: req.ignoreBudget,
+      ignoreGate: req.ignoreGate === true,
       reason: req.reason,
     });
 
@@ -2080,31 +2127,32 @@ export class MockController {
     const applied: string[] = [];
 
     for (const host of hosts) {
-      if (action === 'unhold' && host.hold.local && !host.hold.controller && !host.holdWanted) {
-        rejected[host.name] = 'only the local hold file is set; it can only be removed on the host';
-        continue;
-      }
-      // Lifting a hold that is not there changes nothing and is not audited.
-      if (action === 'unhold' && !host.holdWanted && !host.hold.controller) {
-        rejected[host.name] = 'the host is not held';
-        continue;
-      }
-      // A hold set through the team feature is the hold of the login's teams
-      // that own a container of the host; a hold that staff set stays
-      // staff's when a team sets it again.
+      // Through team_manage the holds of the login's teams that own a container of the host; otherwise staff's, or
+      // for an unhold the holders named.
       const viaTeam = this.authorization?.authorizedBy.startsWith(TEAM_PREFIX) === true;
-      const asTeam = viaTeam && (!host.holdWanted || host.holdBy?.startsWith('team:') === true);
       const login = this.authorization?.teams ?? [];
-      const owning = login.filter(t => list(host.containers).some(c => c.managed && c.team === t));
-      const teams = (owning.length > 0 ? owning : login).slice().sort();
-      host.holdBy = action === 'hold' ? (asTeam ? `team:${teams.join(',')}` : 'staff') : undefined;
-      host.holdWanted = action === 'hold';
-      host.holdReason = action === 'hold' && req.reason ? req.reason : undefined;
-      // The mock agent agrees at once.
-      host.hold = { ...host.hold, controller: action === 'hold' };
-      if (action === 'hold') host.needs = [];
+      const owning = login.filter(t => list(host.containers).some(c => c.managed && c.team === t)).sort();
+      const named = list(req.holders);
+      const holders = viaTeam ? (named.length > 0 ? named : owning) : named.length > 0 ? named : ['staff'];
+
+      const before = list(host.hold.holds);
+      const kept = before.filter(h => !holders.includes(h.holder));
+      // Lifting a hold that is not there changes nothing and is not audited.
+      if (action === 'unhold' && kept.length === before.length) {
+        rejected[host.name] = 'the host has no such hold';
+        continue;
+      }
+      const at = new Date(this.now()).toISOString();
+      const by = this.actor();
+      // The mock agent answers the directive at once.
+      const holds =
+        action === 'hold'
+          ? [...kept, ...holders.map(holder => ({ holder, by, at, ...(req.reason ? { reason: req.reason } : {}) }))]
+          : kept;
+      host.hold = { ...host.hold, holds: holds.slice().sort(holdOrder) };
+      host.holders = host.hold.holds?.map(h => h.holder) ?? [];
       applied.push(host.name);
-      this.log(`action.${action}`, host.name, { reason: req.reason });
+      this.log(`action.${action}`, host.name, { reason: req.reason, holders });
     }
 
     return {
@@ -2120,10 +2168,7 @@ export class MockController {
 
     for (const host of hosts) {
       if (!mark && !host.offline) continue;
-      const viaTeam = this.authorization?.authorizedBy.startsWith(TEAM_PREFIX) === true;
-      host.offline = mark
-        ? { reason: req.reason, ...(req.until ? { until: req.until } : {}), ...(viaTeam ? { by: 'team' } : {}) }
-        : undefined;
+      host.offline = mark ? { reason: req.reason, ...(req.until ? { until: req.until } : {}) } : undefined;
       applied.push(host.name);
       this.log(mark ? 'action.mark-offline' : 'action.unmark-offline', host.name, { reason: req.reason });
     }
@@ -2168,7 +2213,7 @@ export class MockController {
     };
   }
 
-  /** endLease ends one open lease at once, as failed: the mock plays no agent that reports first. */
+  /** endLease ends one open lease at once, as cancelled: the mock plays no agent that reports first. */
   private endLease(req: EndLeaseRequest): ActionResult {
     if (!req.lease) throw new HttpError(400, 'scheduler: invalid action: no lease named');
 
@@ -2177,13 +2222,53 @@ export class MockController {
     if (!isOpen(l)) throw new HttpError(409, `scheduler: invalid action: lease ${l.id} is ${l.state}`);
 
     this.log('action.end-lease', l.host, { lease: l.id, state: l.state, reason: req.reason });
-    this.failLease(l, ENDED_BY_OPERATOR);
+    this.cancelLease(l, this.actor());
     return { message: `lease ${l.id} of ${l.host} is ending`, hosts: [l.host] };
   }
 
+  /** ignoreGate lets one open rollout pass a closed network gate. */
+  private ignoreGate(req: ScopeRequest): ActionResult {
+    if (req.rollout === '') throw new HttpError(400, 'rollout must not be empty');
+    const r = this.openRollout(req.rollout);
+    if (!r.ignoreGate && !r.ignoreBudget) {
+      r.ignoreGate = true;
+      r.updatedAt = this.iso(this.now());
+      this.log('action.ignore-gate', r.id, {
+        before: { ignoreGate: false },
+        after: { ignoreGate: true },
+        reason: req.reason,
+      });
+    }
+    return { message: 'rollout passes the network gate', rollout: r.id };
+  }
+
+  /** approveLease releases the verifying lease of one member at once, as the next reconcile would. */
+  private approveLease(req: ApproveLeaseRequest): ActionResult {
+    const r = this.rollout(req.rollout);
+    const m = list(r.hosts).find(x => x.host === req.host);
+    if (!m) throw new HttpError(404, `scheduler: unknown host: ${req.host} is no host of rollout ${r.id}`);
+    const l = this.data.leases.find(x => x.id === m.leaseId);
+    if (m.state !== 'leased' || !l) {
+      throw new HttpError(409, `scheduler: invalid action: ${req.host} holds no lease in rollout ${r.id}`);
+    }
+    if (l.state !== 'verifying') {
+      throw new HttpError(409, `scheduler: invalid action: lease ${l.id} is ${l.state}, not verifying`);
+    }
+
+    const at = this.iso(this.now());
+    const by = this.actor();
+    this.log('action.approve-lease', l.host, { lease: l.id, readiness: l.readiness, reason: req.reason });
+    Object.assign(l, { state: 'released', endedAt: at, approved: { at, by, reason: req.reason } });
+    for (const { member } of this.leaseMembers(l)) {
+      Object.assign(member, { state: 'done', updatedAt: at });
+    }
+    this.log('lease.released', l.host, { lease: l.id, readiness: l.readiness, approvedBy: by }, 'scheduler');
+    return { message: `lease ${l.id} of ${l.host} approved`, rollout: r.id, hosts: [l.host] };
+  }
+
   /** leaseMembers is the host's member, leased by the lease, in every open rollout the lease served. */
-  private leaseMembers(l: Lease): { rollout: Rollout; member: RolloutHost }[] {
-    const out: { rollout: Rollout; member: RolloutHost }[] = [];
+  private leaseMembers(l: Lease): { rollout: MockRollout; member: RolloutHost }[] {
+    const out: { rollout: MockRollout; member: RolloutHost }[] = [];
     for (const rollout of this.openRollouts()) {
       const member = list(rollout.hosts).find(x => x.host === l.host && x.state === 'leased' && x.leaseId === l.id);
       if (member) out.push({ rollout, member });
@@ -2191,31 +2276,31 @@ export class MockController {
     return out;
   }
 
-  /** failLease ends a lease as failed and halts every open rollout it served. */
-  private failLease(l: Lease, reason: string): void {
+  /** cancelLease ends a lease a person ended: its members wait as cancelled, its active rollouts pause. */
+  private cancelLease(l: Lease, by: string): void {
     const now = this.iso(this.now());
     const members = this.leaseMembers(l);
-    l.error = reason;
-    l.state = 'failed';
+    l.state = 'cancelled';
     l.endedAt = now;
+    l.cancelled = { at: now, by, state: l.state };
 
-    const halted: string[] = [];
+    const paused: string[] = [];
 
     for (const { rollout: r, member: m } of members) {
       m.updatedAt = now;
-      m.state = 'failed';
-      m.error = reason;
-      halted.push(r.id);
+      m.state = 'cancelled';
+      m.error = ENDED_BY_OPERATOR;
 
-      if (r.state === 'active') {
-        r.state = 'halted';
-        r.reason = `${l.host}: ${reason}`;
+      if (r.state === 'active' && !r.paused) {
+        r.paused = true;
+        r.pauseReason = `${l.host} cancelled by ${by}`;
         r.updatedAt = now;
-        this.log('rollout.halted', r.id, { host: l.host, lease: l.id, reason }, 'scheduler');
+        paused.push(r.id);
+        this.log('rollout.paused', r.id, { host: l.host, lease: l.id, reason: r.pauseReason }, 'scheduler');
       }
     }
 
-    this.log('lease.failed', l.host, { lease: l.id, reason, rollouts: halted }, 'scheduler');
+    this.log('lease.cancelled', l.host, { lease: l.id, by, rollouts: paused }, 'scheduler');
   }
 
   private pause(action: 'pause' | 'resume', req: ScopeRequest): ActionResult {
@@ -2244,7 +2329,7 @@ export class MockController {
   }
 
   /** openRollout is a rollout that an action may still change: a closed one is refused. */
-  private openRollout(id: string): Rollout {
+  private openRollout(id: string): MockRollout {
     const r = this.rollout(id);
     if (r.state !== 'active' && r.state !== 'halted') {
       throw new HttpError(409, `scheduler: invalid action: rollout ${r.id} is ${r.state}`);
@@ -2351,7 +2436,7 @@ export class MockController {
 
     for (const m of list(r.hosts)) {
       const named = wanted.includes(m.host);
-      const failed = m.state === 'failed' && (wanted.length === 0 || named);
+      const failed = (m.state === 'failed' || m.state === 'cancelled') && (wanted.length === 0 || named);
       const skipped = m.state === 'skipped' && Boolean(m.skippedBy) && named;
       if (!failed && !skipped) continue;
 
@@ -2365,7 +2450,8 @@ export class MockController {
     }
 
     for (const name of wanted) {
-      if (!applied.includes(name)) rejected[name] = 'has neither failed nor been skipped in the rollout';
+      if (!applied.includes(name))
+        rejected[name] = 'has neither failed, been cancelled nor been skipped in the rollout';
     }
 
     const before = { state: r.state, reason: r.reason ?? '' };
@@ -2441,13 +2527,18 @@ function hostListing(s: HostSummary): HostListing {
     os: s.os,
     pending: s.pending,
     uptimeSeconds: s.uptimeSeconds,
+    ...(s.resources ? { usage: hostUsage(s.resources) } : {}),
     hold: s.hold,
-    holdWanted: s.holdWanted,
-    ...(s.holdReason ? { holdReason: s.holdReason } : {}),
-    ...(s.holdBy ? { holdBy: s.holdBy } : {}),
+    holders: [...list(s.holders)],
     verbs: s.verbs,
     actions: s.actions,
     needs: list(s.needs).map(n => ({ kind: n.kind })),
     plan: s.plan,
   };
+}
+
+/** holdOrder sorts holds as the agent reports them: the host's own, staff's, then the teams by name. */
+function holdOrder(a: HostHold, b: HostHold): number {
+  const rank = (holder: string) => (holder === 'host' ? 0 : holder === 'staff' ? 1 : 2);
+  return rank(a.holder) - rank(b.holder) || a.holder.localeCompare(b.holder);
 }

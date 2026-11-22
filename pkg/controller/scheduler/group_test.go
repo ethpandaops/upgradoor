@@ -89,12 +89,12 @@ func TestRolloutPerTeamAndKind(t *testing.T) {
 	assert.Contains(t, snooper.Title, "snooper-el: ")
 	assert.Equal(t, UnitName("snooper-el", ""), rolloutGroupName(snooper))
 
-	assert.Equal(t, fleet.PolicyManual, rolloutPolicy(&b.w.Settings, geth))
-	assert.Equal(t, fleet.PolicyAuto, rolloutPolicy(&b.w.Settings, besu))
-	assert.Equal(t, fleet.PolicyAuto, rolloutPolicy(&b.w.Settings, snooper))
+	assert.Equal(t, fleet.PolicyManual, b.w.Settings.RolloutPolicy(geth))
+	assert.Equal(t, fleet.PolicyAuto, b.w.Settings.RolloutPolicy(besu))
+	assert.Equal(t, fleet.PolicyAuto, b.w.Settings.RolloutPolicy(snooper))
 
 	b.w.Settings.PolicyImage = fleet.PolicyManual
-	assert.Equal(t, fleet.PolicyManual, rolloutPolicy(&b.w.Settings, snooper), "policyImage")
+	assert.Equal(t, fleet.PolicyManual, b.w.Settings.RolloutPolicy(snooper), "policyImage")
 }
 
 // Unlabelled containers are one rollout per image, under policyImage, and
@@ -134,7 +134,7 @@ func TestUnlabelledIsOneRolloutPerImage(t *testing.T) {
 	assert.Equal(t, protocol.ImpactIndependent, b.w.Leases[0].Impact)
 
 	b.w.Settings.PolicyImage = fleet.PolicyManual
-	assert.Equal(t, fleet.PolicyManual, rolloutPolicy(&b.w.Settings, open[0]), "policyImage")
+	assert.Equal(t, fleet.PolicyManual, b.w.Settings.RolloutPolicy(open[0]), "policyImage")
 }
 
 // A second tag of the unit moving while its rollout is open supersedes it

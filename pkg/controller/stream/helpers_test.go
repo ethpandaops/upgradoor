@@ -12,6 +12,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 	"github.com/ethpandaops/upgradoor/pkg/controller/controllertest"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/userapi"
@@ -64,7 +65,8 @@ func newHarness(t *testing.T, mod func(*harnessOptions)) *harness {
 	h.views = views.New(views.Options{Store: h.store, Scheduler: h.sched, Beacon: h.beacon, Now: ho.Now})
 	h.srv = New(log, Options{
 		Store: h.store, Scheduler: h.sched, Beacon: h.beacon, Views: h.views,
-		DefaultSettings: fleet.DefaultSettings(), Now: ho.Now,
+		Access: func(u *authz.User) views.Access { return h.users.Access(u) },
+		Now:    ho.Now,
 	})
 	h.users = userapi.New(log, userapi.Options{
 		Network: controllertest.Network, AuthProviderURL: strings.TrimRight(ho.AuthProviderURL, "/"),

@@ -182,6 +182,9 @@ func TestClassifyOverrides(t *testing.T) {
 	assert.True(t, view.Hold.Local)
 }
 
+// staffHold is the hold state of a host that staff holds.
+var staffHold = protocol.Hold{Holds: []protocol.HostHold{{Holder: protocol.HolderStaff}}}
+
 func TestHoldState(t *testing.T) {
 	past, future := testNow.Add(-time.Minute), testNow.Add(time.Hour)
 
@@ -193,19 +196,37 @@ func TestHoldState(t *testing.T) {
 		{"no hold", known(), protocol.Hold{}},
 		{
 			"unreadable file holds the host", &Overrides{Err: "managed.yaml cannot be read: bad\nfile"},
-			protocol.Hold{Local: true, LocalReason: "managed.yaml cannot be read: bad"},
+			protocol.Hold{
+				Local: true, LocalReason: "managed.yaml cannot be read: bad",
+				Holds: []protocol.HostHold{{Holder: protocol.HolderHost, Reason: "managed.yaml cannot be read: bad"}},
+			},
 		},
 		{
-			"local", &Overrides{Known: true, Holds: map[string]Hold{HoldLocal: {Reason: "debugging"}}},
-			protocol.Hold{Local: true, LocalReason: "debugging"},
+			"local", &Overrides{Known: true, Holds: map[string]Hold{protocol.HolderHost: {Reason: "debugging"}}},
+			protocol.Hold{
+				Local: true, LocalReason: "debugging",
+				Holds: []protocol.HostHold{{Holder: protocol.HolderHost, Reason: "debugging"}},
+			},
 		},
 		{
-			"controller", &Overrides{Known: true, Holds: map[string]Hold{HoldController: {Until: &future}}},
-			protocol.Hold{Controller: true},
+			"staff's", &Overrides{Known: true, Holds: map[string]Hold{protocol.HolderStaff: {Until: &future}}},
+			staffHold,
+		},
+		{
+			"every holder, in order", &Overrides{Known: true, Holds: map[string]Hold{
+				"lighthouse": {By: "lh", At: testNow}, protocol.HolderStaff: {By: "sam", Reason: "fork"},
+				"geth": {}, protocol.HolderHost: {By: "pk", Reason: "oom"},
+			}},
+			protocol.Hold{Local: true, LocalReason: "oom", Holds: []protocol.HostHold{
+				{Holder: protocol.HolderHost, By: "pk", Reason: "oom"},
+				{Holder: protocol.HolderStaff, By: "sam", Reason: "fork"},
+				{Holder: "geth"},
+				{Holder: "lighthouse", By: "lh", At: testNow},
+			}},
 		},
 		{
 			"expired holds", &Overrides{Known: true, Holds: map[string]Hold{
-				HoldLocal: {Until: &past}, HoldController: {Until: &testNow},
+				protocol.HolderHost: {Until: &past}, protocol.HolderStaff: {Until: &testNow},
 			}},
 			protocol.Hold{},
 		},
@@ -217,9 +238,15 @@ func TestHoldState(t *testing.T) {
 }
 
 func TestHoldReason(t *testing.T) {
-	assert.Equal(t, "host is on local hold: x", HoldReason(protocol.Hold{Local: true, LocalReason: "x", Controller: true}))
+	assert.Equal(t, "host is on local hold: x", HoldReason(protocol.Hold{
+		Local: true, LocalReason: "x",
+		Holds: []protocol.HostHold{{Holder: protocol.HolderHost}, {Holder: protocol.HolderStaff}},
+	}))
 	assert.Equal(t, "host is on local hold", HoldReason(protocol.Hold{Local: true}))
-	assert.Equal(t, "host is on controller hold", HoldReason(protocol.Hold{Controller: true}))
+	assert.Equal(t, "host is on hold by staff", HoldReason(staffHold))
+	assert.Equal(t, "host is on hold by staff, geth", HoldReason(protocol.Hold{
+		Holds: []protocol.HostHold{{Holder: protocol.HolderStaff}, {Holder: "geth"}},
+	}))
 }
 
 // The overrides file has a key for each overridable container, showing

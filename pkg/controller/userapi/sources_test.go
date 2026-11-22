@@ -55,8 +55,11 @@ func sourcesHarness(t *testing.T) (*harness, *controllertest.AuthProvider) {
 	head := uint64(82)
 	h.srv.opts.Validators = svc
 	h.srv.opts.Endpoints = fakeEndpoints{
-		{Label: "http://beacon-1:5052", Active: true, SuccessAt: controllertest.Epoch, HeadSlot: &head},
-		{Label: "http://beacon-2:5052", Error: "GET /eth/v1/node/health: HTTP 503", ErrorAt: controllertest.Epoch},
+		{
+			Label: "http://beacon-1:5052", State: beacon.EndpointOK, SuccessAt: controllertest.Epoch,
+			HeadSlot: &head, HeadRoot: "0x01",
+		},
+		{Label: "http://beacon-2:5052", State: beacon.EndpointDown, Error: "GET /eth/v1/node/health: HTTP 503", ErrorAt: controllertest.Epoch},
 	}
 
 	return h, provider
@@ -69,7 +72,7 @@ func TestSourcesNeedAdmin(t *testing.T) {
 		{method: http.MethodGet, path: pathSources},
 		{method: http.MethodPost, path: pathRefresh, body: `{}`},
 	} {
-		rec := h.serve(route.request(provider.Grant(t, "+upgradoor:roll:hold")))
+		rec := h.serve(route.request(provider.Grant(t, "+upgradoor:manage")))
 		require.Equal(t, http.StatusForbidden, rec.Code, route.path)
 		assert.Contains(t, rec.Body.String(), "upgradoor:admin")
 	}
@@ -90,7 +93,9 @@ func TestSources(t *testing.T) {
 	got := controllertest.DecodeJSON[views.DataSources](t, rec)
 
 	require.Len(t, got.Beacon, 2)
-	assert.True(t, got.Beacon[0].Active)
+	assert.Equal(t, beacon.EndpointOK, got.Beacon[0].State)
+	assert.Equal(t, "0x01", got.Beacon[0].HeadRoot)
+	assert.Equal(t, beacon.EndpointDown, got.Beacon[1].State)
 	assert.Equal(t, uint64(82), *got.Beacon[0].HeadSlot)
 	assert.Equal(t, "GET /eth/v1/node/health: HTTP 503", got.Beacon[1].Error)
 

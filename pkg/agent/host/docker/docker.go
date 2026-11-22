@@ -317,6 +317,10 @@ func (r *dockerRuntime) describe(
 			out.ExitCode = ctr.State.ExitCode
 		}
 
+		if ctr.State.Running {
+			out.PID = ctr.State.Pid
+		}
+
 		if ctr.State.Health != nil {
 			out.Health = string(ctr.State.Health.Status)
 		}
