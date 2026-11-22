@@ -62,6 +62,8 @@ type Host struct {
 	upgradable []protocol.Upgradable
 
 	failures map[string]error
+	// action is what RunAction returns; nil runs it with exit code 0.
+	action   *protocol.ActionResult
 	resolves int
 	// remote, when set, is asked for a tag's digest by every pull.
 	remote func(ctx context.Context, ref string) (string, error)
@@ -429,6 +431,10 @@ func (h *Host) System(ctx context.Context) (host.System, error) {
 
 		if u.Security {
 			sys.Pending.Security++
+
+			if !u.Blocked {
+				sys.SecurityOpen++
+			}
 		}
 
 		if u.Blocked {
@@ -540,6 +546,40 @@ func (h *Host) UpgradePackages(ctx context.Context, names []string) error {
 	return nil
 }
 
+// RunAction implements host.Host (op "action", call "action <argv>"). A run
+// that exits 0 installs the security updates outside the blocked set, as
+// unattended-upgrades would.
+func (h *Host) RunAction(ctx context.Context, argv []string, _ time.Duration) protocol.ActionResult {
+	if err := h.begin(ctx, "action", "action "+strings.Join(argv, " ")); err != nil {
+		return protocol.ActionResult{ExitCode: -1, Output: err.Error()}
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	res := protocol.ActionResult{}
+	if h.action != nil {
+		res = *h.action
+	}
+
+	if res.ExitCode == 0 {
+		h.upgradable = slices.DeleteFunc(h.upgradable, func(u protocol.Upgradable) bool {
+			return u.Security && !u.Blocked
+		})
+	}
+
+	return res
+}
+
+// Rescan implements host.Host (op "rescan", call "rescan").
+func (h *Host) Rescan(ctx context.Context) (host.System, error) {
+	if err := h.begin(ctx, "rescan", "rescan"); err != nil {
+		return host.System{}, fmt.Errorf("agenttest: rescan: %w", err)
+	}
+
+	return h.System(ctx)
+}
+
 // Reboot implements host.Host by rebooting in place (unless SetInertReboot):
 // new boot id, newest kernel, flag cleared. Running containers restart with
 // their restart count kept, as Docker keeps it across a daemon restart;
@@ -640,6 +680,14 @@ func (h *Host) setUpgradableLocked(list []protocol.Upgradable) {
 	for i := range h.upgradable {
 		h.upgradable[i].Blocked = slices.Contains(h.blocked, h.upgradable[i].Name)
 	}
+}
+
+// SetActionResult sets what RunAction returns from now on; nil is success.
+func (h *Host) SetActionResult(res *protocol.ActionResult) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.action = res
 }
 
 // SetRebootRequired sets the reboot-required flag.

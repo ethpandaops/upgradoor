@@ -66,6 +66,9 @@ type Service interface {
 	Roll(ctx context.Context, actor string, req RollRequest) (*ActionResult, error)
 	// Reboot requests a manual reboot.
 	Reboot(ctx context.Context, actor string, req RebootRequest) (*ActionResult, error)
+	// HostAction starts a configured host action on the permitted hosts of
+	// req as one staggered rollout.
+	HostAction(ctx context.Context, actor string, req HostActionRequest) (*ActionResult, error)
 	// Hold puts hosts on controller hold; Unhold lifts it.
 	Hold(ctx context.Context, actor string, req HoldRequest) (*ActionResult, error)
 	Unhold(ctx context.Context, actor string, req HoldRequest) (*ActionResult, error)

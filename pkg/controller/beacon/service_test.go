@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -374,6 +375,40 @@ func TestEndpointFailoverIsSticky(t *testing.T) {
 
 	assert.Equal(t, secondBefore+1, second.totalRequests(), "sticky on the first again")
 	assert.Equal(t, 2, first.count(pathHead))
+}
+
+func TestEndpointStatus(t *testing.T) {
+	h := newHarness(t, 2, newFakeStore(host("a", 0, 4)), func(o *Options) {
+		o.Endpoints[0] = strings.Replace(o.Endpoints[0], "http://", "http://user:secret@", 1)
+	})
+	first, second := h.nodes[0], h.nodes[1]
+	label := func(n *fakeNode) string { return n.srv.URL }
+
+	assert.Nil(t, New(h.log, h.opts).Endpoints(), "nothing before Start")
+
+	first.set(func(n *fakeNode) { n.down = true })
+	h.svc.poll(t.Context())
+
+	got := h.svc.Endpoints()
+	require.Len(t, got, 2)
+
+	assert.Equal(t, label(first), got[0].Label, "no credentials")
+	assert.False(t, got[0].Active)
+	assert.True(t, got[0].SuccessAt.IsZero())
+	assert.Nil(t, got[0].HeadSlot)
+	assert.Contains(t, got[0].Error, "HTTP 503: beacon node is syncing")
+	assert.Equal(t, h.clock.Now(), got[0].ErrorAt)
+
+	assert.Equal(t, label(second), got[1].Label)
+	assert.True(t, got[1].Active)
+	assert.Equal(t, h.clock.Now(), got[1].SuccessAt)
+	require.NotNil(t, got[1].HeadSlot)
+	assert.Equal(t, uint64(82), *got[1].HeadSlot)
+	assert.Empty(t, got[1].Error)
+
+	for _, e := range got {
+		assert.NotContains(t, e.Label+e.Error, "secret")
+	}
 }
 
 func TestAllEndpointsDown(t *testing.T) {

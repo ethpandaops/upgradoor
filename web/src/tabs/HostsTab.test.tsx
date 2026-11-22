@@ -329,3 +329,51 @@ describe('HostsTab, a large fleet', () => {
     expect(screen.queryByRole('group', { name: 'Pages' })?.textContent ?? '1–').toMatch(/^1–/);
   });
 });
+
+describe('HostsTab, host actions on the selection', () => {
+  it('starts an action on the selected hosts and shows the hosts it was not sent to', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<HostsTab />, h);
+    const table = await screen.findByRole('table', { name: 'Hosts' });
+    await within(table).findByRole('columnheader', { name: /Kernel/ });
+
+    await user.click(within(table).getByRole('checkbox', { name: 'Select prysm-erigon-1' }));
+    await user.click(within(table).getByRole('checkbox', { name: 'Select tooling-1' }));
+    const bulk = screen.getByRole('group', { name: 'Actions on the selected hosts' });
+    await user.click(within(bulk).getByRole('button', { name: 'Action…' }));
+
+    // Each host offers another action: the choice says on how many of them.
+    const dialog = screen.getByRole('dialog', { name: 'Run an action' });
+    const choice = within(dialog).getByRole('combobox');
+    expect(
+      within(choice)
+        .getAllByRole('option')
+        .map(o => o.textContent)
+    ).toEqual(['docker-prune (1 of 2)', 'security-upgrades (1 of 2)']);
+    await user.selectOptions(choice, 'security-upgrades');
+    expect(within(dialog).getByRole('note')).toHaveTextContent('1 selected host does not offer security-upgrades');
+
+    await user.click(within(dialog).getByText('Advanced options'));
+    await user.click(within(dialog).getByRole('checkbox', { name: /Pause after the canary/ }));
+    await user.click(within(dialog).getByRole('button', { name: 'Start' }));
+
+    await vi.waitFor(() => {
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument();
+    });
+    const post = h.calls.find(c => c.method === 'POST');
+    expect(post?.path).toBe('/api/v1/actions/host-action');
+    expect(post?.body).toStrictEqual({
+      action: 'security-upgrades',
+      hosts: ['prysm-erigon-1', 'tooling-1'],
+      pauseAfterCanary: true,
+      reason: '',
+    });
+
+    const notice = screen.getByRole('status');
+    expect(notice).toHaveTextContent('action security-upgrades on 1 host(s)');
+    expect(within(notice).getByRole('list', { name: 'Hosts not sent' })).toHaveTextContent(
+      'tooling-1: the host does not report the action security-upgrades'
+    );
+  });
+});

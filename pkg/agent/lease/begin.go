@@ -89,6 +89,7 @@ func (o *operation) begin(ctx context.Context, rec *Record) error {
 		"reboot":   len(lp.Reboot) > 0,
 		"packages": lp.Packages,
 		"images":   len(lp.Recreates),
+		"actions":  len(lp.Actions),
 	}).Info("operation started")
 
 	return o.execute(ctx)
@@ -107,6 +108,8 @@ func (o *operation) start(lp *plan.LeasePlan) bool {
 		first = protocol.PhasePulling
 	case len(lp.Reboot) > 0:
 		first = protocol.PhaseDraining
+	case len(lp.PackageIDs) == 0:
+		first = protocol.PhaseAction
 	}
 
 	bootID := ""

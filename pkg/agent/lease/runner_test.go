@@ -123,6 +123,8 @@ type env struct {
 	runners  []Runner
 	releases []func()
 	phases   map[string][]protocol.Phase
+	// ran is what ActionRan heard, by action name.
+	ran map[string]string
 }
 
 func newEnv(t *testing.T, sc *agenttest.Scenario) *env {
@@ -171,8 +173,19 @@ func (e *env) now() time.Time { return time.Now().Add(time.Duration(e.offset.Loa
 func (e *env) deps() *Deps {
 	return &Deps{
 		Host: e.machine, Policy: e.policy, Overrides: e.files, Registry: e.host, Audit: e.audit,
-		Notify: e.notified, Now: e.now,
+		Notify: e.notified, Now: e.now, ActionRan: e.actionRan,
 	}
+}
+
+func (e *env) actionRan(name, inventoryHash string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+
+	if e.ran == nil {
+		e.ran = make(map[string]string, 1)
+	}
+
+	e.ran[name] = inventoryHash
 }
 
 // notified notes the phase of the current operation.

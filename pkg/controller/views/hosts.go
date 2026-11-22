@@ -92,6 +92,7 @@ func Summarize(
 		Containers: []protocol.Container{},
 		Verbs:      []protocol.Verb{},
 		Needs:      []protocol.Need{},
+		Actions:    []protocol.ActionInfo{},
 		Plan:       scheduler.HostPlan{Slot: scheduler.SlotIdle, Weight: host.Weight()},
 	}
 
@@ -105,6 +106,7 @@ func Summarize(
 		sum.Hold = status.Hold
 		sum.Verbs = NonNil(status.Verbs)
 		sum.Needs = NonNil(status.Needs)
+		sum.Actions = NonNil(status.Actions)
 	}
 
 	if plan != nil {
@@ -125,7 +127,7 @@ func Listing(sum *HostSummary) HostListing {
 		Containers: make([]ContainerListing, 0, len(sum.Containers)),
 		OS:         sum.OS, Pending: sum.Pending, UptimeSeconds: sum.UptimeSeconds, Hold: sum.Hold,
 		HoldWanted: sum.HoldWanted, HoldReason: sum.HoldReason, HoldBy: sum.HoldBy, Offline: sum.Offline, Verbs: sum.Verbs,
-		Needs: make([]NeedListing, 0, len(sum.Needs)), Plan: sum.Plan,
+		Needs: make([]NeedListing, 0, len(sum.Needs)), Plan: sum.Plan, Actions: sum.Actions,
 	}
 
 	for i := range sum.Containers {

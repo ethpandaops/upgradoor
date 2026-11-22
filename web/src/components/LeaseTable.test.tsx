@@ -2,7 +2,7 @@ import { render, screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
-import type { Lease, LeaseState, StepStatus } from '../api/types';
+import type { ActionRun, Lease, LeaseState, StepStatus } from '../api/types';
 import { createHarness, renderWithApp } from '../test/harness';
 import { LeaseTable } from './LeaseTable';
 
@@ -114,5 +114,53 @@ describe('LeaseTable, the comparison with the fleet', () => {
     expect(within(checks).getByText(/EL 28 peers/)).not.toHaveClass('text-danger');
 
     expect(within(row('host-plain')).queryByLabelText('Peers compared with the fleet')).toBeNull();
+  });
+});
+
+describe('LeaseTable, a host action', () => {
+  it('shows the exit code of each run and folds its output away', async () => {
+    const user = userEvent.setup();
+    const need = {
+      id: 'manual/dir-1',
+      kind: 'action' as const,
+      action: { name: 'security-upgrades', impact: 'node' as const },
+    };
+    const run = (host: string, action: ActionRun) =>
+      lease(host, 'failed', {
+        needs: [need],
+        operation: {
+          leaseId: `ls-${host}`,
+          phase: 'failed',
+          startedAt: '2026-01-01T00:00:00Z',
+          updatedAt: '2026-01-01T00:01:00Z',
+          steps: [{ needId: need.id, status: 'failed', action }],
+          disrupted: true,
+        },
+      });
+    renderWithApp(
+      <LeaseTable
+        label="Recent leases"
+        closed
+        leases={[
+          run('host-failed', { exitCode: 100, output: 'Reading package lists...\nE: Could not get lock\n' }),
+          run('host-slow', { exitCode: -1, timedOut: true }),
+          run('host-restarted', { exitCode: 0, unknown: true }),
+        ]}
+      />,
+      await createHarness({ mode: 'open' })
+    );
+
+    expect(within(row('host-failed')).getByText('security-upgrades')).toBeInTheDocument();
+    expect(within(row('host-failed')).getByText('exit 100')).toBeInTheDocument();
+    const output = within(row('host-failed')).getByLabelText('Output of security-upgrades on host-failed');
+    expect(output).toHaveTextContent('E: Could not get lock');
+    expect(output.closest('details')).not.toHaveAttribute('open');
+    await user.click(within(row('host-failed')).getByText('output (last 2 lines)'));
+    expect(output.closest('details')).toHaveAttribute('open');
+
+    expect(within(row('host-slow')).getByText('timed out')).toBeInTheDocument();
+    expect(within(row('host-slow')).queryByText(/^output/)).toBeNull();
+    expect(within(row('host-restarted')).getByText('outcome unknown')).toBeInTheDocument();
+    expect(within(row('host-restarted')).queryByText(/^exit/)).toBeNull();
   });
 });

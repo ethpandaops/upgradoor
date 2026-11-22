@@ -7,11 +7,21 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// needImpact is the impact class of one need on a host: the class the host
-// reports for the container the need is about. A need about no container
+// needImpact is the impact class of one need on a host: the class of the
+// action it runs, or the class the host reports for the container the need
+// is about. A need about no container
 // (packages, a reboot) takes the whole node down, and so does one about a
 // container the host does not report.
 func needImpact(h *fleet.Host, n *protocol.Need) protocol.Impact {
+	// An action is as heavy as its agent.yaml says.
+	if n.Action != nil {
+		if n.Action.Impact.Valid() {
+			return n.Action.Impact
+		}
+
+		return protocol.ImpactNode
+	}
+
 	name := n.Container()
 	if name == "" || h == nil || h.Status == nil {
 		return protocol.ImpactNode

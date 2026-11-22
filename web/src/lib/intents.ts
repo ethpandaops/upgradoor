@@ -11,6 +11,7 @@ import {
   buildScopeRequest,
 } from './actionRequests';
 import { plural } from './format';
+import type { RolloutAction } from './hostActions';
 
 /** holdIntent builds the confirm dialog of hold / unhold / forget. */
 export function holdIntent(
@@ -48,13 +49,15 @@ export function offlineIntent(mark: boolean, hosts: readonly string[]): ActionIn
 /**
  * scopeIntent pauses, resumes or aborts one rollout, or everything with an
  * empty rollout ID. client is the client the rollout is for ("" for none):
- * its team may pause and resume (approve) it.
+ * its team may pause and resume (approve) it. hostAction is the action and
+ * members of an action rollout: who may run it on all of them may resume it.
  */
 export function scopeIntent(
   action: 'pause' | 'resume' | 'abort',
   title: string,
   rollout: string,
-  client?: string
+  client?: string,
+  hostAction?: RolloutAction
 ): ActionIntent {
   return {
     kind: 'call',
@@ -62,6 +65,7 @@ export function scopeIntent(
     verb: action === 'pause' ? 'Pause' : action === 'resume' ? 'Resume' : 'Abort',
     danger: action === 'abort',
     rolloutClient: rollout === '' ? undefined : (client ?? ''),
+    rolloutAction: rollout === '' ? undefined : hostAction,
     make: reason => ({ action, body: buildScopeRequest(rollout, reason) }),
   };
 }

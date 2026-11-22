@@ -4,7 +4,7 @@
 import { list, type NeedKind, type QueueEntry, type WaitKind } from '../api/types';
 
 /** WorkKind is what a lease does to a host; the timeline colours by it. */
-type WorkKind = 'image' | 'packages' | 'reboot';
+type WorkKind = 'image' | 'packages' | 'action' | 'reboot';
 
 const AUTO_WAITS: ReadonlySet<WaitKind> = new Set(['budget', 'host-limit', 'order', 'pull']);
 
@@ -20,7 +20,7 @@ function holdsBack(wait: WaitKind): boolean {
   return !NOBODY_WAITS.has(wait);
 }
 
-const KIND_RANK: Record<WorkKind, number> = { image: 0, packages: 1, reboot: 2 };
+const KIND_RANK: Record<WorkKind, number> = { image: 0, packages: 1, action: 2, reboot: 3 };
 
 /**
  * workKind is the most disruptive of the given need kinds; a roll when there

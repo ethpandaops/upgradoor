@@ -36,6 +36,10 @@ type System interface {
 	UpgradePackages(ctx context.Context, names []string) error
 	// Reboot issues the reboot and returns once it is accepted.
 	Reboot(ctx context.Context) error
+	// RunAction runs a configured action (RunAction).
+	RunAction(ctx context.Context, argv []string, timeout time.Duration) protocol.ActionResult
+	// Rescan collects the inventory now and returns the status from it.
+	Rescan(ctx context.Context) (Status, error)
 }
 
 // Status is the cheap, frequently read part of the OS state.
@@ -44,6 +48,8 @@ type Status struct {
 	Uptime  time.Duration
 	OS      protocol.OSSummary
 	Pending protocol.Pending
+	// SecurityOpen counts the security updates outside the blocked set.
+	SecurityOpen int
 	// Blocked are the pending upgrades of configured blocked packages.
 	Blocked []protocol.PackageChange
 	// InventoryHash is the hash of the inventory Inventory would return now.
@@ -101,7 +107,9 @@ type osSystem struct {
 type snapshot struct {
 	inventory *protocol.Inventory
 	pending   protocol.Pending
-	blocked   []protocol.PackageChange
+	// securityOpen counts the security updates outside the blocked set.
+	securityOpen int
+	blocked      []protocol.PackageChange
 	// kernelPackages are the releases of the installed linux-image packages.
 	kernelPackages []string
 }
@@ -204,6 +212,7 @@ func (s *osSystem) status(ctx context.Context) (Status, error) {
 			RebootPackages: rebootPackages,
 		},
 		Pending:       snap.pending,
+		SecurityOpen:  snap.securityOpen,
 		Blocked:       slices.Clone(snap.blocked),
 		InventoryHash: snap.inventory.Hash,
 	}, nil
@@ -247,6 +256,20 @@ func (s *osSystem) Reboot(ctx context.Context) error {
 	}
 
 	return fmt.Errorf("reboot: %w", err)
+}
+
+// RunAction implements System.
+func (s *osSystem) RunAction(ctx context.Context, argv []string, timeout time.Duration) protocol.ActionResult {
+	return RunAction(ctx, argv, timeout)
+}
+
+// Rescan implements System.
+func (s *osSystem) Rescan(ctx context.Context) (Status, error) {
+	if _, err := s.refresh(ctx); err != nil {
+		return Status{}, fmt.Errorf("rescan: %w", err)
+	}
+
+	return s.Status(ctx)
 }
 
 // current returns the cached snapshot, collecting one when there is none or
@@ -396,6 +419,10 @@ func (s *osSystem) collect(ctx context.Context) (*snapshot, error) {
 
 		if up.Security {
 			snap.pending.Security++
+
+			if !up.Blocked {
+				snap.securityOpen++
+			}
 		}
 
 		if !up.Blocked {

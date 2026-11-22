@@ -323,5 +323,22 @@ export function describeCall(call: ActionCall): string[] {
             'once none of its hosts is failed.',
         'Only an open rollout can be retried.',
       ];
+    case 'host-action': {
+      const { action, hosts, all, client, pauseAfterCanary } = call.body;
+      const on = all
+        ? 'every host that has it'
+        : client
+          ? `the hosts of ${client}`
+          : selectionText({ hosts: hosts ?? [], all: false });
+      const one = !all && !client && (hosts ?? []).length === 1;
+      return [
+        (one
+          ? `Run the host action ${action} on ${on} under a lease.`
+          : `Run the host action ${action} on ${on}, one lease per host, staggered: one canary first, then the others.`) +
+          (pauseAfterCanary ? ' The rollout pauses after the canary until a person resumes it.' : ''),
+        'Each lease goes through the budget and the network gate like any other update. ' +
+          'A host the login may not start the action on is rejected; a failed run halts the rollout.',
+      ];
+    }
   }
 }

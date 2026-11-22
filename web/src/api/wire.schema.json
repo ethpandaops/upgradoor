@@ -1,5 +1,5 @@
 {
- "version": "6f7f3b77fde2",
+ "version": "9d8462f64f55",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -28,6 +28,77 @@
   "d.v"
  ],
  "schemas": {
+  "ActionInfo": [
+   {
+    "n": "name",
+    "t": "s"
+   },
+   {
+    "n": "description",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "impact",
+    "t": "r"
+   },
+   {
+    "n": "feature",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "teams",
+    "t": "l",
+    "omit": true
+   },
+   {
+    "n": "when",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "due",
+    "t": "b",
+    "omit": true
+   }
+  ],
+  "ActionNeed": [
+   {
+    "n": "name",
+    "t": "s"
+   },
+   {
+    "n": "impact",
+    "t": "r"
+   },
+   {
+    "n": "when",
+    "t": "r",
+    "omit": true
+   }
+  ],
+  "ActionResult": [
+   {
+    "n": "exitCode",
+    "t": "n"
+   },
+   {
+    "n": "output",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "timedOut",
+    "t": "b",
+    "omit": true
+   },
+   {
+    "n": "unknown",
+    "t": "b",
+    "omit": true
+   }
+  ],
   "AuditEntry": [
    {
     "n": "id",
@@ -688,6 +759,11 @@
     "omit": true
    },
    {
+    "n": "readyAt",
+    "t": "t",
+    "omit": true
+   },
+   {
     "n": "peerChecks",
     "t": "a",
     "of": "PeerCheck",
@@ -781,6 +857,12 @@
     "n": "reboot",
     "t": "o",
     "of": "RebootNeed",
+    "omit": true
+   },
+   {
+    "n": "action",
+    "t": "o",
+    "of": "ActionNeed",
     "omit": true
    }
   ],
@@ -1167,6 +1249,16 @@
     "omit": true
    },
    {
+    "n": "action",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "pauseAfterCanary",
+    "t": "b",
+    "omit": true
+   },
+   {
     "n": "state",
     "t": "r"
    },
@@ -1350,6 +1442,10 @@
     "t": "j"
    },
    {
+    "n": "actionPolicies",
+    "t": "j"
+   },
+   {
     "n": "pauseAfterCanaryImage",
     "t": "b"
    },
@@ -1485,6 +1581,12 @@
     "n": "error",
     "t": "r",
     "omit": true
+   },
+   {
+    "n": "action",
+    "t": "o",
+    "of": "ActionResult",
+    "omit": true
    }
   ],
   "Upgradable": [
@@ -1604,6 +1706,11 @@
     "n": "needs",
     "t": "a",
     "of": "Need"
+   },
+   {
+    "n": "actions",
+    "t": "a",
+    "of": "ActionInfo"
    },
    {
     "n": "plan",
@@ -1734,6 +1841,11 @@
     "n": "plan",
     "t": "o",
     "of": "HostPlan"
+   },
+   {
+    "n": "actions",
+    "t": "a",
+    "of": "ActionInfo"
    },
    {
     "n": "bootTime",

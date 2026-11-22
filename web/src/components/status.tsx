@@ -241,6 +241,8 @@ export function needSummary(need: Need): string {
         .join(', ')}`;
     case 'reboot':
       return `reboot (${list(need.reboot?.reasons).join(', ') || 'unknown reason'})`;
+    case 'action':
+      return `action ${need.action?.name ?? '?'}${need.action?.when ? ` (due: ${need.action.when})` : ''}`;
   }
 }
 
@@ -283,6 +285,12 @@ export function NeedLine({ need }: { need: Need }) {
           </span>
         ))}
       {need.kind === 'reboot' && <span>{list(need.reboot?.reasons).join(', ')}</span>}
+      {need.kind === 'action' && need.action && (
+        <>
+          <span className="font-mono">{need.action.name}</span>
+          {need.action.when && <span className="text-muted">due: {need.action.when}</span>}
+        </>
+      )}
       {need.pullError && (
         <Badge tone="warning" title={`image pull failed: ${need.pullError}`}>
           pull failed
@@ -293,8 +301,18 @@ export function NeedLine({ need }: { need: Need }) {
   );
 }
 
-export const WORK_LABEL = { image: 'Image roll', packages: 'Package upgrade', reboot: 'Reboot' } as const;
-const WORK_DOT = { image: 'bg-series-image', packages: 'bg-series-packages', reboot: 'bg-series-reboot' } as const;
+export const WORK_LABEL = {
+  image: 'Image roll',
+  packages: 'Package upgrade',
+  action: 'Host action',
+  reboot: 'Reboot',
+} as const;
+const WORK_DOT = {
+  image: 'bg-series-image',
+  packages: 'bg-series-packages',
+  action: 'bg-series-action',
+  reboot: 'bg-series-reboot',
+} as const;
 
 /** WorkTag names what is done to a host, keyed with the timeline's colour. */
 export function WorkTag({ kind }: { kind: keyof typeof WORK_LABEL }) {

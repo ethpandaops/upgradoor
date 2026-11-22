@@ -152,6 +152,12 @@ func (f *Scheduler) Reboot(ctx context.Context, actor string, req scheduler.Rebo
 	return f.record(ctx, "reboot", actor, req)
 }
 
+func (f *Scheduler) HostAction(ctx context.Context, actor string, req scheduler.HostActionRequest) (
+	*scheduler.ActionResult, error,
+) {
+	return f.record(ctx, "host-action", actor, req)
+}
+
 func (f *Scheduler) Hold(ctx context.Context, actor string, req scheduler.HoldRequest) (
 	*scheduler.ActionResult, error,
 ) {

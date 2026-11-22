@@ -1,6 +1,6 @@
 import { screen, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import { useActions } from '../components/ActionDialog';
 import { createHarness, renderWithApp } from '../test/harness';
@@ -87,5 +87,53 @@ describe('HostDetailPanel, the containers of a client', () => {
 
     await screen.findByRole('heading', { name: /^Containers/ });
     expect(screen.queryByRole('heading', { name: 'Clients, overrides and command lines' })).not.toBeInTheDocument();
+  });
+});
+
+describe('HostDetailPanel, host actions', () => {
+  it('lists only the actions the login may start, and starts one on the host', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'auth', loggedIn: true, profile: 'team' });
+    renderWithApp(<Panel name="lighthouse-geth-1" />, h);
+
+    // The team login is in lighthouse, which the prune action names; it lacks the feature of the security updates.
+    await user.click(await screen.findByRole('button', { name: 'Host actions of lighthouse-geth-1' }));
+    const menu = screen.getByRole('menu');
+    expect(
+      within(menu)
+        .getAllByRole('menuitem')
+        .map(i => i.textContent)
+    ).toEqual([expect.stringMatching(/^prune-beacon-db/) as string]);
+    expect(screen.queryByRole('button', { name: /^Run security-upgrades/ })).not.toBeInTheDocument();
+
+    await user.click(within(menu).getByRole('menuitem'));
+    const dialog = await screen.findByRole('dialog', { name: 'Run prune-beacon-db on lighthouse-geth-1' });
+    expect(within(dialog).queryByText('Advanced options')).not.toBeInTheDocument();
+    await user.type(within(dialog).getByRole('textbox'), 'db too large');
+    await user.click(within(dialog).getByRole('button', { name: 'Start' }));
+
+    await vi.waitFor(() => {
+      expect(h.calls.find(c => c.method === 'POST')).toBeDefined();
+    });
+    const post = h.calls.find(c => c.method === 'POST');
+    expect(post?.path).toBe('/api/v1/actions/host-action');
+    expect(post?.body).toStrictEqual({
+      action: 'prune-beacon-db',
+      hosts: ['lighthouse-geth-1'],
+      reason: 'db too large',
+    });
+  });
+
+  it('offers the security updates next to the package counts, highlighted when they are due', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<Panel name="prysm-erigon-1" />, h);
+
+    const shortcut = await screen.findByRole('button', { name: 'Run security-upgrades on prysm-erigon-1' });
+    expect(shortcut).toHaveTextContent('Update now');
+    expect(shortcut).toHaveAttribute('title', expect.stringContaining('security updates are due'));
+
+    await user.click(shortcut);
+    expect(await screen.findByRole('dialog', { name: 'Run security-upgrades on prysm-erigon-1' })).toBeInTheDocument();
   });
 });

@@ -30,6 +30,7 @@ const PATHS = {
   chevron: 'M6 9l6 6 6-6',
   check: 'M5 12l5 5 9-10',
   policy: 'M12 3l7 3v6c0 4.5-3 7.5-7 9-4-1.5-7-4.5-7-9V6z',
+  action: 'M13 2L4 14h7l-1 8 9-12h-7z',
 } as const;
 
 export type IconName = keyof typeof PATHS;
@@ -142,6 +143,8 @@ export function ActionIcon({
 interface MenuItem {
   icon: IconName;
   label: string;
+  /** hint is a line under the label of an entry that is not blocked. */
+  hint?: string;
   intent?: ActionIntent;
   onSelect?: () => void;
   blocked?: string;
@@ -155,10 +158,13 @@ interface MenuItem {
  */
 export function ActionMenu({
   label,
+  text,
   items,
   onAction,
 }: {
   label: string;
+  /** text makes the trigger a labelled button instead of the "more" icon. */
+  text?: string;
   items: readonly MenuItem[];
   onAction: (intent: ActionIntent) => void;
 }) {
@@ -217,13 +223,22 @@ export function ActionMenu({
           aria-controls={open ? id : undefined}
           onClick={toggle}
           className={cx(
-            'inline-flex size-7 items-center justify-center rounded-sm border text-muted',
+            'inline-flex items-center justify-center rounded-sm border',
+            text ? 'h-7 gap-1.5 px-2 text-xs/5 font-medium text-foreground' : 'size-7 text-muted',
             open
               ? 'border-border-strong bg-surface-hover text-foreground'
               : 'border-transparent hover:border-border-strong hover:bg-surface-hover hover:text-foreground'
           )}
         >
-          <Icon name="more" />
+          {text ? (
+            <>
+              <Icon name="action" />
+              {text}
+              <Icon name="chevron" className="size-3.5" />
+            </>
+          ) : (
+            <Icon name="more" />
+          )}
         </button>
       </span>
       {open && (
@@ -271,7 +286,11 @@ function MenuEntry({ item, onChoose }: { item: MenuItem; onChoose: () => void })
       <Icon name={item.icon} className={cx('mt-0.5', reason !== '' && 'opacity-40')} />
       <span className="flex min-w-0 flex-col">
         <span className={cx('font-medium', reason !== '' && 'opacity-50')}>{item.label}</span>
-        {reason !== '' && <span className="whitespace-normal text-muted">{reason}</span>}
+        {reason !== '' ? (
+          <span className="whitespace-normal text-muted">{reason}</span>
+        ) : (
+          item.hint && <span className="whitespace-normal text-muted">{item.hint}</span>
+        )}
       </span>
     </button>
   );

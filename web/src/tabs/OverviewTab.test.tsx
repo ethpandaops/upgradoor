@@ -99,7 +99,7 @@ describe('OverviewTab, logged in', () => {
     const lease = (await within(progress).findByText('lighthouse-geth-2')).closest('li');
     expect(lease).toHaveTextContent('Image roll');
     expect(within(lease as HTMLElement).getByRole('list', { name: 'Step 6 of 6: Ready check' })).toBeInTheDocument();
-    expect(lease).toHaveTextContent('validators attesting: 0 of 1 epochs with at least 115 of 128');
+    expect(lease).toHaveTextContent(/node at head with peers, ready in \d+m \d+s/);
 
     expect(screen.getByRole('region', { name: 'Outage budget' })).toHaveTextContent(
       /[\d.]+% of 10% validators offline/

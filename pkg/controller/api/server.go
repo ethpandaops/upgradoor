@@ -124,6 +124,10 @@ type Options struct {
 	Store     Store
 	Scheduler scheduler.Service
 	Beacon    Beacon
+	// Endpoints and Validators are the data sources the settings page shows;
+	// nil shows none.
+	Endpoints  userapi.BeaconEndpoints
+	Validators userapi.ValidatorRanges
 	// Lookups says what the tags of the hosts point at.
 	Lookups discovery.Tracker
 	// DefaultSettings are the settings from flags, shown next to the
@@ -245,6 +249,7 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		Network: opts.Network, Version: opts.Version,
 		AuthProviderURL: opts.AuthProviderURL, AuthService: opts.AuthService,
 		Store: opts.Store, Scheduler: opts.Scheduler, Beacon: opts.Beacon, Views: s.views,
+		Endpoints: opts.Endpoints, Validators: opts.Validators,
 		DefaultSettings: opts.DefaultSettings, Notify: s.Notify, Now: opts.Now,
 	})
 

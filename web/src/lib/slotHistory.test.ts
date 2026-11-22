@@ -209,6 +209,13 @@ describe('liveOutages', () => {
     );
   });
 
+  it('names the work of a host-action lease', () => {
+    const acting: Lease = { ...lease('l3', 'c', 'running', 108), needs: [{ id: 'act', kind: 'action' }] };
+    const { outages } = liveOutages({ ...input, history: base([]), rows: [], leases: [acting] });
+
+    expect(outages.map(o => o.work)).toEqual(['action']);
+  });
+
   it('opens a span for a host that keeps missing, extends the one it has, and leaves a host that is being worked on alone', () => {
     const off: Outage = {
       hosts: 1,

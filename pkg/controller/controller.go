@@ -202,6 +202,8 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Store:                  c.store,
 		Scheduler:              c.scheduler,
 		Beacon:                 c.beacon,
+		Endpoints:              c.beacon,
+		Validators:             c.validators,
 		Lookups:                c.lookups,
 		DefaultSettings:        defaults,
 		WebFS:                  cfg.WebFS,

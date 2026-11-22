@@ -9,9 +9,11 @@ import { list } from '../api/types';
 import { useApp, useAuthState } from '../appContext';
 import { canViewPrivate } from '../auth/authStore';
 import { buildRebootRequest, buildRollRequest } from '../lib/actionRequests';
+import type { RolloutAction } from '../lib/hostActions';
 import {
   FEATURE,
   can,
+  needsActionHosts,
   needsOwnership,
   type Login,
   type OwnedClient,
@@ -20,6 +22,7 @@ import {
   type Verdict,
 } from '../lib/permissions';
 import type { ActionIntent } from './ActionDialog';
+import { intentVerdict } from './HostActionDialog';
 import { useLive } from './Live';
 import { Button } from './primitives';
 
@@ -32,9 +35,10 @@ export interface Permissions {
   /**
    * can decides one call. leaseHost names the host of the lease an end-lease
    * call is about, rolloutClient the client of the rollout a pause or resume
-   * is about ("" for none).
+   * is about ("" for none), rolloutAction the action and members of an
+   * action rollout a resume is about.
    */
-  can: (call: PermissionCall, leaseHost?: string, rolloutClient?: string) => Verdict;
+  can: (call: PermissionCall, leaseHost?: string, rolloutClient?: string, rolloutAction?: RolloutAction) => Verdict;
   /** canIntent decides whether the dialog of an intent can end in a call the login may make. */
   canIntent: (intent: ActionIntent) => Verdict;
   /**
@@ -62,18 +66,27 @@ function build(
   login: Login,
   hosts: readonly OwnedHost[],
   clients: readonly OwnedClient[],
-  ready: boolean
+  ready: boolean,
+  hostsReady: boolean
 ): Permissions {
-  const decide = (call: PermissionCall, leaseHost?: string, rolloutClient?: string): Verdict => {
+  const decide = (
+    call: PermissionCall,
+    leaseHost?: string,
+    rolloutClient?: string,
+    rolloutAction?: RolloutAction
+  ): Verdict => {
     const verdict = can(login, call, {
       hosts,
       clients,
       leaseHost: () => leaseHost,
       rolloutClient: () => rolloutClient,
+      rolloutAction: () => rolloutAction,
     });
 
     // Until the hosts are loaded nobody owns anything: say so instead.
-    if (!verdict.allowed && !ready) return { ...verdict, reason: 'Checking what your teams own…' };
+    if (!verdict.allowed && (!ready || (rolloutAction !== undefined && !hostsReady))) {
+      return { ...verdict, reason: 'Checking what your teams own…' };
+    }
 
     return verdict;
   };
@@ -103,7 +116,7 @@ function build(
           body: buildRebootRequest({ hosts: intent.hosts, all: intent.all, ...QUIET }),
         });
       case 'call':
-        return decide(intent.make(''), intent.leaseHost, intent.rolloutClient);
+        return decide(intent.make(''), intent.leaseHost, intent.rolloutClient, intent.rolloutAction);
       case 'client-override': {
         // One part the login may override is enough to open the dialog; the controller judges every host.
         const parts = intent.part === 'clear' ? (['image', 'flags'] as const) : ([intent.part] as const);
@@ -133,6 +146,9 @@ function build(
           verdicts[0] ?? { allowed: false, reason: 'This host has no such container', by: '', staggered: false }
         );
       }
+      case 'host-action':
+        // The choices were judged host by host when the intent was built.
+        return intentVerdict(intent);
     }
   };
 
@@ -149,7 +165,8 @@ function build(
 /**
  * PermissionsProvider answers what the login may do. A login that holds a
  * team feature without the plain one needs to know who owns what: that is read
- * from the host table of the event stream.
+ * from the host table of the event stream. A login without supervise reads the
+ * host table too: the approval of an action rollout follows the action on its hosts.
  */
 export function PermissionsProvider({ children }: { children: ReactNode }) {
   const { auth, config } = useApp();
@@ -161,6 +178,7 @@ export function PermissionsProvider({ children }: { children: ReactNode }) {
       open: state.ready && !state.enabled,
       service,
       hasFeature: feature => auth.hasFeature(service, feature),
+      hasServiceFeature: (other, feature) => auth.hasFeature(other, feature),
       teams: state.teams,
     }),
     // A new state is a new login: the features are read from the auth client.
@@ -168,12 +186,20 @@ export function PermissionsProvider({ children }: { children: ReactNode }) {
   );
 
   const owned = canViewPrivate(state) && needsOwnership(login);
-  const hosts = useLive('hosts', owned);
+  const actionHosts = canViewPrivate(state) && needsActionHosts(login);
+  const hosts = useLive('hosts', owned || actionHosts);
   const clients = useLive('clients', owned);
 
   const value = useMemo(
-    () => build(login, list(hosts.data?.hosts), list(clients.data?.clients), !owned || hosts.data !== undefined),
-    [login, hosts.data, clients.data, owned]
+    () =>
+      build(
+        login,
+        list(hosts.data?.hosts),
+        list(clients.data?.clients),
+        !owned || hosts.data !== undefined,
+        !actionHosts || hosts.data !== undefined
+      ),
+    [login, hosts.data, clients.data, owned, actionHosts]
   );
 
   return <PermissionsContext value={value}>{children}</PermissionsContext>;

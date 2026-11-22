@@ -343,6 +343,7 @@ export function defaultSettings(): Settings {
     policyPackages: 'auto',
     policyReboot: 'manual',
     policyClients: {},
+    actionPolicies: {},
     pauseAfterCanaryImage: false,
     pauseAfterCanaryPackages: false,
     pauseAfterCanaryReboot: false,
@@ -690,6 +691,8 @@ function buildHost(spec: HostSpec, index: number, at: (s: number) => string): Ho
     hold: { local: spec.localHold !== undefined, localReason: spec.localHold, controller: false },
     holdWanted: false,
     verbs: spec.name === 'tooling-1' ? ['roll', 'packages'] : ['roll', 'packages', 'reboot'],
+    // The mock's host actions are added by seedHostActions (hostActions.ts).
+    actions: [],
     needs,
     // The scheduler view is computed per request by the mock controller.
     plan: { slot: 'idle', weight: 0, live: 0, liveKnown: false },
@@ -1026,21 +1029,22 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       grantedBy: 'scheduler',
       grantedAt: at(9 * 60),
       expiresAt: at(9 * 60 - 30 * 60),
-      // Done for longer than one epoch (384 s): the node part of the readiness
-      // check has passed, the validators are still missing.
-      agentDoneAt: at(7 * 60 + 30),
+      // Done two minutes ago, at head with peers since: the node part of the
+      // readiness check waits for that to span one epoch (384 s).
+      agentDoneAt: at(2 * 60),
       operation: {
         leaseId: leaseVerifying,
         phase: 'done',
         startedAt: at(9 * 60 - 8),
-        updatedAt: at(7 * 60 + 30),
+        updatedAt: at(2 * 60),
         steps: [
           { needId: lhNeed('lighthouse').id, status: 'done' },
           { needId: lhNeed('lighthouse-validator').id, status: 'done' },
         ],
         disrupted: true,
       },
-      readiness: 'validators attesting: 0 of 1 epochs with at least 115 of 128',
+      readiness: 'node at head with peers, waiting for it to stay so for 6m24s',
+      readyAt: at(2 * 60 - 5 - 384),
     },
     {
       id: leaseGrandine,

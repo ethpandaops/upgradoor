@@ -73,12 +73,18 @@ if [ ${#pr_array[@]} -gt 0 ]; then
     done
 fi
 
+# Without merged pull requests (direct commits), the commit messages describe the changes.
+if [ ${#pr_array[@]} -eq 0 ]; then
+    merge_commits="(no pull requests, direct commits)"
+    git log --no-merges --format='Commit %h: %s%n%b' ${previous_tag:+$previous_tag..HEAD} | head -c 16000 > ./pr-details.txt
+fi
+
 # Create a minified changelog combining merge commits and PR details
 minified_changelog=$(cat <<EOF
 Merged Pull Requests:
 ${merge_commits}
 
-Pull Request Details:
+Pull Request / Commit Details:
 $(cat ./pr-details.txt)
 EOF
 )

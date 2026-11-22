@@ -12,10 +12,12 @@ import {
   type Settings,
 } from '../api/types';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
+import { ActionRunView, leaseRun } from '../components/ActionRun';
 import { Digest, ShortId } from '../components/Digest';
 import { LeaseTable, PeerChecks } from '../components/LeaseTable';
 import { useLive } from '../components/Live';
 import { ActionIcon } from '../components/icons';
+import { Readiness } from '../components/Readiness';
 import { IntentAction } from '../components/SelectionBar';
 import { RelTime } from '../components/RelTime';
 import {
@@ -33,6 +35,7 @@ import {
 } from '../components/primitives';
 import { HostStateBadge, RolloutKindBadge, RolloutStateBadge, stageLabel } from '../components/status';
 import { pauseLabel, percentOf, plural, shortRevision } from '../lib/format';
+import { rolloutActionOf } from '../lib/hostActions';
 import { endLeaseIntent, hostsIntent, scopeIntent } from '../lib/intents';
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
@@ -61,6 +64,11 @@ export function policyFor(settings: Settings | undefined, rollout: Rollout): Pol
     case 'local':
       // Asked for by a person, or on the host itself: no policy, no approval.
       return undefined;
+    case 'action':
+      // A person's start (key manual:<id>) has no policy; a due action answers to its own, manual without one.
+      return rollout.key.startsWith('manual:')
+        ? undefined
+        : (settings.actionPolicies[rollout.action ?? ''] ?? 'manual');
   }
 }
 
@@ -286,7 +294,12 @@ function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, le
               , agent phase <span className="font-mono">{lease.operation.phase}</span>
             </>
           )}
-          {lease.readiness && <span className="text-muted"> — {lease.readiness}</span>}
+          {lease.readiness && (
+            <span className="text-muted">
+              {' '}
+              — <Readiness lease={lease} />
+            </span>
+          )}
           <PeerChecks checks={lease.peerChecks} />
         </span>
       );
@@ -350,7 +363,7 @@ export function RolloutCard({
               icon="check"
               label="Approve…"
               onAction={onAction}
-              intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.team)}
+              intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.team, rolloutActionOf(r))}
             />
           )}
           {r.paused ? (
@@ -358,7 +371,7 @@ export function RolloutCard({
               icon="resume"
               label="Resume…"
               onAction={onAction}
-              intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.team)}
+              intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.team, rolloutActionOf(r))}
             />
           ) : (
             <IntentAction
@@ -393,6 +406,12 @@ export function RolloutCard({
         {r.kind === 'group' && (
           <span>
             kind <span className="font-medium text-foreground">{r.containerKind || 'unlabelled'}</span>
+          </span>
+        )}
+        {r.kind === 'action' && (
+          <span>
+            action <span className="font-mono font-medium text-foreground">{r.action}</span>
+            {r.pauseAfterCanary && ', pauses after the canary'}
           </span>
         )}
         {r.team && (
@@ -442,49 +461,56 @@ export function RolloutCard({
           </tr>
         </thead>
         <tbody>
-          {hosts.map(h => (
-            <tr key={h.host} className="hover:bg-surface-hover">
-              <Td className="font-medium">
-                {h.host}
-                {r.canary === h.host && (
-                  <>
-                    {' '}
-                    <Badge tone="info">canary</Badge>
-                  </>
-                )}
-              </Td>
-              {/* A host's own request is one host: there is no order to name. */}
-              <Td>{r.kind === 'local' ? <Dash /> : stageLabel(h.stage)}</Td>
-              {/* State and actions keep their width from one state to the next. */}
-              <Td className="min-w-24">
-                <HostStateBadge state={h.state} />
-              </Td>
-              <Td className="whitespace-normal">{hostProgress(h, queue, leases)}</Td>
-              <Td>
-                <RelTime fixed value={h.updatedAt} />
-              </Td>
-              <Td className="min-w-28">
-                <span className="inline-flex gap-1">
-                  {(h.state === 'pending' || h.state === 'expected' || h.state === 'failed') && (
-                    <ActionIcon
-                      icon="skip"
-                      label={`Skip ${h.host} in ${r.title}`}
-                      onAction={onAction}
-                      intent={hostsIntent('skip', `Skip ${h.host}`, r.id, [h.host])}
-                    />
+          {hosts.map(h => {
+            const run = r.kind === 'action' ? leaseRun(h.leaseId ? leases.get(h.leaseId) : undefined) : undefined;
+            return (
+              <tr key={h.host} className="hover:bg-surface-hover">
+                <Td className="font-medium">
+                  {h.host}
+                  {r.canary === h.host && (
+                    <>
+                      {' '}
+                      <Badge tone="info">canary</Badge>
+                    </>
                   )}
-                  {h.state === 'failed' && (
-                    <ActionIcon
-                      icon="retry"
-                      label={`Retry ${h.host} in ${r.title}`}
-                      onAction={onAction}
-                      intent={hostsIntent('retry', `Retry ${h.host}`, r.id, [h.host])}
-                    />
-                  )}
-                </span>
-              </Td>
-            </tr>
-          ))}
+                </Td>
+                {/* A host's own request is one host: there is no order to name. */}
+                <Td>{r.kind === 'local' ? <Dash /> : stageLabel(h.stage)}</Td>
+                {/* State and actions keep their width from one state to the next. */}
+                <Td className="min-w-24">
+                  <HostStateBadge state={h.state} />
+                </Td>
+                <Td className="whitespace-normal">
+                  {/* A done member of an action rollout is its run; any other says what it waits for, then its run. */}
+                  {!(run && h.state === 'done') && hostProgress(h, queue, leases)}
+                  {run && <ActionRunView run={run} label={`${r.action ?? 'the action'} on ${h.host}`} />}
+                </Td>
+                <Td>
+                  <RelTime fixed value={h.updatedAt} />
+                </Td>
+                <Td className="min-w-28">
+                  <span className="inline-flex gap-1">
+                    {(h.state === 'pending' || h.state === 'expected' || h.state === 'failed') && (
+                      <ActionIcon
+                        icon="skip"
+                        label={`Skip ${h.host} in ${r.title}`}
+                        onAction={onAction}
+                        intent={hostsIntent('skip', `Skip ${h.host}`, r.id, [h.host])}
+                      />
+                    )}
+                    {h.state === 'failed' && (
+                      <ActionIcon
+                        icon="retry"
+                        label={`Retry ${h.host} in ${r.title}`}
+                        onAction={onAction}
+                        intent={hostsIntent('retry', `Retry ${h.host}`, r.id, [h.host])}
+                      />
+                    )}
+                  </span>
+                </Td>
+              </tr>
+            );
+          })}
         </tbody>
       </Table>
     </article>
@@ -560,7 +586,15 @@ export function RecentRollouts({
           return (
             <tr key={r.id} className="hover:bg-surface-hover">
               <Td className="font-medium">{r.title}</Td>
-              <Td>{r.kind === 'local' ? 'host request' : r.kind === 'group' ? unitLabel(r) : r.kind}</Td>
+              <Td>
+                {r.kind === 'local'
+                  ? 'host request'
+                  : r.kind === 'group'
+                    ? unitLabel(r)
+                    : r.kind === 'action'
+                      ? `action ${r.action ?? ''}`
+                      : r.kind}
+              </Td>
               <Td>
                 <RolloutStateBadge state={r.state} />
               </Td>

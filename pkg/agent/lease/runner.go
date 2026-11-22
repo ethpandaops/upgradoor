@@ -19,6 +19,8 @@ import (
 const (
 	containersTimeout = 30 * time.Second
 	systemTimeout     = 30 * time.Second
+	// rescanTimeout bounds the package rescan after an action.
+	rescanTimeout = 5 * time.Minute
 
 	// persistAttempts is how often a write that must precede a disruptive
 	// call is tried.
@@ -54,7 +56,7 @@ type Audit interface {
 	LeaseResult(lease string, need *protocol.Need, step *protocol.Step)
 }
 
-// Deps are what the runner is handed; every field is required.
+// Deps are what the runner is handed; every field but ActionRan is required.
 type Deps struct {
 	Host      host.Host
 	Policy    *plan.Policy
@@ -64,6 +66,8 @@ type Deps struct {
 	// Notify tells the loop to sync now.
 	Notify func()
 	Now    func() time.Time
+	// ActionRan hears the inventory hash after each run of an action.
+	ActionRan func(name, inventoryHash string)
 }
 
 // Runner carries out the lease in the state file in its own goroutine.
@@ -417,6 +421,7 @@ func (o *operation) execute(ctx context.Context) error {
 
 	o.applyPackages(work)
 	o.applyImages(work)
+	o.runActions(work)
 
 	if reboot && !o.stopped() && o.reboot(work) {
 		if err := o.awaitReboot(ctx, o.lp.Reboot); err != nil {
@@ -444,6 +449,9 @@ func (o *operation) resume(ctx context.Context, rec *Record) error {
 	case protocol.PhasePulling:
 		// Nothing was stopped yet: the lease is not begun.
 		o.deferSteps(reasonPullInterrupted)
+	case protocol.PhaseAction:
+		// The command may outlive the agent (KillMode=process).
+		o.failUnknownActions(rec)
 	case protocol.PhaseDraining, protocol.PhaseApplying:
 		// Only a kill or crash leaves these phases; the running step's
 		// outcome is unknown, so it failed.

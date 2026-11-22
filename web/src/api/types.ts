@@ -28,7 +28,24 @@ export function dict<T>(v: Record<string, T> | null | undefined): Record<string,
 // ---------------------------------------------------------------- protocol
 
 /** protocol.Verb */
-type Verb = 'roll' | 'packages' | 'reboot';
+type Verb = 'roll' | 'packages' | 'reboot' | 'action';
+
+/** protocol.ActionCondition: when an action is due by itself. */
+export type ActionCondition = 'securityUpdates';
+
+/** protocol.ActionInfo: one configured host action as the agent reports it. */
+export interface ActionInfo {
+  name: string;
+  description?: string;
+  impact: Impact;
+  /** feature is the login feature ("<service>:<feature>") that allows starting the action, next to admin. */
+  feature?: string;
+  /** teams are the teams whose members may start the action. */
+  teams?: string[];
+  when?: ActionCondition;
+  /** due: when holds now. */
+  due?: boolean;
+}
 
 /** protocol.Hold */
 export interface Hold {
@@ -176,7 +193,7 @@ export interface Pending {
 }
 
 /** protocol.NeedKind */
-export type NeedKind = 'image' | 'override' | 'spec' | 'packages' | 'reboot';
+export type NeedKind = 'image' | 'override' | 'spec' | 'packages' | 'reboot' | 'action';
 
 /** protocol.ImageNeed */
 interface ImageNeed {
@@ -242,6 +259,14 @@ interface RebootNeed {
   reasons: List<string>;
 }
 
+/** protocol.ActionNeed: run one configured action. */
+interface ActionNeed {
+  name: string;
+  impact: Impact;
+  /** when is the condition that made the need; absent for a person's start. */
+  when?: ActionCondition;
+}
+
 /** protocol.Need */
 export interface Need {
   id: string;
@@ -256,10 +281,20 @@ export interface Need {
   spec?: SpecNeed;
   packages?: PackagesNeed;
   reboot?: RebootNeed;
+  action?: ActionNeed;
 }
 
 /** protocol.Phase. `pulling`: the images are pulled first; nothing is stopped yet. */
-export type Phase = 'pulling' | 'draining' | 'applying' | 'rebooting' | 'starting' | 'verifying' | 'done' | 'failed';
+export type Phase =
+  | 'pulling'
+  | 'draining'
+  | 'applying'
+  | 'rebooting'
+  | 'starting'
+  | 'action'
+  | 'verifying'
+  | 'done'
+  | 'failed';
 
 /**
  * protocol.StepStatus. `cancelled`: the lease was cancelled before the step
@@ -277,11 +312,22 @@ export type StepStatus =
   | 'deferred'
   | 'cancelled';
 
+/** protocol.ActionResult: how one action run ended. */
+export interface ActionRun {
+  exitCode: number;
+  /** output is the tail of the output, at most 16 KiB. */
+  output?: string;
+  timedOut?: boolean;
+  /** unknown: the agent restarted while the action ran; the outcome is not known. */
+  unknown?: boolean;
+}
+
 /** protocol.Step */
 export interface Step {
   needId: string;
   status: StepStatus;
   error?: string;
+  action?: ActionRun;
 }
 
 /** protocol.Operation */
@@ -385,7 +431,7 @@ export interface NetworkHealth {
  * on the host itself (an override, a roll from its command line): it has one
  * member, answers to no policy and has no canary.
  */
-export type RolloutKind = 'group' | 'packages' | 'reboot' | 'manual' | 'local';
+export type RolloutKind = 'group' | 'packages' | 'reboot' | 'manual' | 'local' | 'action';
 
 /** fleet.RolloutState */
 export type RolloutState = 'active' | 'halted' | 'completed' | 'superseded' | 'aborted';
@@ -448,6 +494,10 @@ export interface Rollout {
   team?: string;
   targets?: List<RolloutTarget>;
   packages?: PackageChange[];
+  /** action is the host action of an action rollout. */
+  action?: string;
+  /** pauseAfterCanary pauses the rollout at its first success, next to the settings of its kind. */
+  pauseAfterCanary?: boolean;
   state: RolloutState;
   reason?: string;
   paused: boolean;
@@ -519,6 +569,8 @@ export interface Lease {
   endedAt?: string;
   operation?: Operation;
   readiness?: string;
+  /** When the node check passes if the host stays at head with peers; set only while the readiness note waits for that. */
+  readyAt?: string;
   /** The comparison with the fleet that the last readiness check made, per client it applied to. */
   peerChecks?: PeerCheck[];
   error?: string;
@@ -568,6 +620,8 @@ export interface Settings {
    * others to policyImage. It is changed with the client-policy action.
    */
   policyClients: Record<string, Policy>;
+  /** The policy per host action; always an object. An action that is not listed is manual. */
+  actionPolicies: Record<string, Policy>;
   /** Pause a rollout of the kind when its first host is ready, until a person resumes it. */
   pauseAfterCanaryImage: boolean;
   pauseAfterCanaryPackages: boolean;
@@ -696,6 +750,20 @@ export interface ScopeRequest {
 export interface RolloutHostsRequest {
   rollout: string;
   hosts: string[];
+  reason: string;
+}
+
+/**
+ * scheduler.HostActionRequest: the body of host-action. Exactly one of hosts,
+ * client and all selects the hosts; named hosts the login may not start the
+ * action on come back in ActionResult.rejected.
+ */
+export interface HostActionRequest {
+  action: string;
+  hosts?: string[];
+  client?: string;
+  all?: boolean;
+  pauseAfterCanary?: boolean;
   reason: string;
 }
 
@@ -911,7 +979,7 @@ export interface Outage {
   /** The lease that explains the span, when it stands for one host. */
   lease?: string;
   /** What the lease does; absent for a span no lease explains. */
-  work?: 'image' | 'packages' | 'reboot' | 'mixed' | (string & {});
+  work?: 'image' | 'packages' | 'action' | 'reboot' | 'mixed' | (string & {});
   rollout?: string;
   /** The lease failed or expired. */
   failed?: boolean;
@@ -977,6 +1045,8 @@ export interface HostListing {
   /** offline is the known-offline mark while it is in force. */
   offline?: OfflineMark;
   verbs: List<Verb>;
+  /** The host actions the agent reports; always an array. */
+  actions: List<ActionInfo>;
   /** The kinds of the host's open needs, one entry per need. */
   needs: List<Pick<Need, 'kind'>>;
   plan: HostPlan;
@@ -1143,6 +1213,68 @@ export interface ImagesRefresh {
   recent?: number;
   next?: string;
   message: string;
+}
+
+/** beacon.EndpointStatus: what the controller saw of one beacon endpoint; label carries no credentials. */
+export interface BeaconEndpoint {
+  label: string;
+  /** active: the endpoint that is tried first. */
+  active: boolean;
+  successAt?: string;
+  /** headSlot is the head the endpoint last reported; absent before. */
+  headSlot?: number;
+  error?: string;
+  errorAt?: string;
+}
+
+/** views.ValidatorRangeRow: the half-open range [start, end) of one host. */
+export interface ValidatorRangeRow {
+  start: number;
+  end: number;
+  host: string;
+  count: number;
+  /** unknown: upgradoor knows no host of that name. */
+  unknown?: boolean;
+}
+
+/** views.ValidatorHostTotal: what the inventory gives one host. */
+export interface ValidatorHostTotal {
+  host: string;
+  ranges: number;
+  validators: number;
+  unknown?: boolean;
+}
+
+/** views.ValidatorRangesSource: the validator ranges inventory; url is empty when none is configured. */
+export interface ValidatorRangesSource {
+  url?: string;
+  attemptAt?: string;
+  successAt?: string;
+  changedAt?: string;
+  etag?: string;
+  lastModified?: string;
+  error?: string;
+  validators: number;
+  unknownHosts: number;
+  ranges: List<ValidatorRangeRow>;
+  hosts: List<ValidatorHostTotal>;
+}
+
+/** views.DataSources: GET /api/v1/settings/sources (admin). */
+export interface DataSources {
+  beacon: List<BeaconEndpoint>;
+  validatorRanges: ValidatorRangesSource;
+}
+
+/** views.ValidatorRangesRefresh: what a refresh of the validator ranges did, and the sources after it. */
+export interface ValidatorRangesRefresh {
+  fetched: boolean;
+  changed?: boolean;
+  error?: string;
+  /** next: when a fetch may be asked for again, when one ran too recently. */
+  next?: string;
+  message: string;
+  sources: DataSources;
 }
 
 /** api.Images: one page of the images the fleet's containers run; it pages like Packages. */

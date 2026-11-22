@@ -164,13 +164,27 @@ func (s *service) Health() fleet.NetworkHealth {
 	return s.health
 }
 
+// Endpoints returns what was seen of every configured endpoint; nil before
+// Start. It never blocks on the network.
+func (s *service) Endpoints() []EndpointStatus {
+	s.lifecycle.Lock()
+	client := s.client
+	s.lifecycle.Unlock()
+
+	if client == nil {
+		return nil
+	}
+
+	return client.Status()
+}
+
 // init checks the options and builds the API client.
 func (s *service) init() error {
 	if s.opts.Store == nil {
 		return errors.New("beacon service needs a store")
 	}
 
-	client, err := newNodeClient(s.log, s.opts.HTTPClient, s.opts.Endpoints)
+	client, err := newNodeClient(s.log, s.opts.HTTPClient, s.now, s.opts.Endpoints)
 	if err != nil {
 		return err
 	}
@@ -416,6 +430,8 @@ func (s *service) refreshChain(ctx context.Context, now time.Time) error {
 
 	headSlot := uint64(*head.Data.Header.Message.Slot)
 	finalized := uint64(*finality.Data.Finalized.Epoch)
+
+	s.client.noteHead(headSlot)
 
 	s.head = headRef{root: head.Data.Root, slot: headSlot}
 

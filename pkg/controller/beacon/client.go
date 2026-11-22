@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -69,17 +70,40 @@ type endpoint struct {
 	label string
 }
 
+// EndpointStatus is what the service saw of one beacon endpoint.
+type EndpointStatus struct {
+	// Label is the endpoint's scheme and host, without credentials or path.
+	Label string `json:"label"`
+	// Active marks the endpoint that is tried first.
+	Active bool `json:"active"`
+	// SuccessAt is the last answer of the endpoint.
+	SuccessAt time.Time `json:"successAt,omitzero"`
+	// HeadSlot is the head slot the endpoint last reported; absent before.
+	HeadSlot *uint64 `json:"headSlot,omitempty"`
+	// Error is why the last failed request failed, at ErrorAt.
+	Error   string    `json:"error,omitempty"`
+	ErrorAt time.Time `json:"errorAt,omitzero"`
+}
+
 // nodeClient talks to the beacon API. Endpoints are tried in order starting
-// with the one that worked last. It is used by one goroutine at a time.
+// with the one that worked last. Requests are made by one goroutine at a
+// time; Status may be called from any.
 type nodeClient struct {
 	log       logrus.FieldLogger
 	http      *http.Client
+	now       func() time.Time
 	endpoints []endpoint
-	active    int
+
+	// mu guards active and status; status is per endpoint.
+	mu     sync.Mutex
+	active int
+	status []EndpointStatus
 }
 
 // newNodeClient validates the endpoint URLs.
-func newNodeClient(log logrus.FieldLogger, client *http.Client, urls []string) (*nodeClient, error) {
+func newNodeClient(
+	log logrus.FieldLogger, client *http.Client, now func() time.Time, urls []string,
+) (*nodeClient, error) {
 	if len(urls) == 0 {
 		return nil, errors.New("no beacon endpoints configured")
 	}
@@ -107,7 +131,62 @@ func newNodeClient(log logrus.FieldLogger, client *http.Client, urls []string) (
 		client = &http.Client{Timeout: 2 * requestTimeout}
 	}
 
-	return &nodeClient{log: log, http: client, endpoints: endpoints}, nil
+	status := make([]EndpointStatus, len(endpoints))
+	for i := range endpoints {
+		status[i].Label = endpoints[i].label
+	}
+
+	return &nodeClient{log: log, http: client, now: now, endpoints: endpoints, status: status}, nil
+}
+
+// Status returns what was seen of every endpoint, in the configured order.
+func (c *nodeClient) Status() []EndpointStatus {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	out := make([]EndpointStatus, len(c.status))
+	for i := range c.status {
+		out[i] = c.status[i]
+		out[i].Active = i == c.active
+
+		if slot := c.status[i].HeadSlot; slot != nil {
+			out[i].HeadSlot = new(*slot)
+		}
+	}
+
+	return out
+}
+
+// noteHead records the head slot the active endpoint reported.
+func (c *nodeClient) noteHead(slot uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.status[c.active].HeadSlot = new(slot)
+}
+
+// noteResult records the outcome of a request to endpoint idx.
+func (c *nodeClient) noteResult(idx int, err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	st := &c.status[idx]
+	if err == nil {
+		st.SuccessAt = c.now()
+
+		return
+	}
+
+	st.Error = err.Error()
+	st.ErrorAt = c.now()
+}
+
+// activeIndex returns the endpoint that is tried first.
+func (c *nodeClient) activeIndex() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.active
 }
 
 // get performs a GET and decodes the JSON answer into out. It tries the
@@ -121,16 +200,22 @@ func (c *nodeClient) get(ctx context.Context, path string, out any) error {
 		notServed = 0
 	)
 
+	active := c.activeIndex()
+
 	for i := range c.endpoints {
-		idx := (c.active + i) % len(c.endpoints)
+		idx := (active + i) % len(c.endpoints)
 		target := c.endpoints[idx]
 
 		err := c.request(ctx, target, path, out)
 		if err == nil {
-			if idx != c.active {
+			c.noteResult(idx, nil)
+
+			if idx != active {
 				c.log.WithField("endpoint", target.label).Info("Switched beacon endpoint")
 
+				c.mu.Lock()
 				c.active = idx
+				c.mu.Unlock()
 			}
 
 			return nil
@@ -143,6 +228,9 @@ func (c *nodeClient) get(ctx context.Context, path string, out any) error {
 		var status *statusError
 		if errors.As(err, &status) {
 			if status.rejected() {
+				// The endpoint answered; the request was wrong, not the endpoint.
+				c.noteResult(idx, nil)
+
 				return fmt.Errorf("%s %s: %s: %w", method, path, target.label, err)
 			}
 
@@ -151,6 +239,7 @@ func (c *nodeClient) get(ctx context.Context, path string, out any) error {
 			}
 		}
 
+		c.noteResult(idx, fmt.Errorf("%s %s: %w", method, path, err))
 		errs = append(errs, fmt.Errorf("%s: %w", target.label, err))
 	}
 

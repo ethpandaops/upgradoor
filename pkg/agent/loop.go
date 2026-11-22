@@ -70,6 +70,7 @@ func (a *agent) cycle(ctx context.Context) bool {
 
 	files := a.inputs()
 	view := plan.Classify(&a.cfg.Policy, &facts, &files, a.tracker.Checks(), a.now())
+	view.ActionsRan = a.ranActions()
 
 	// Stale containers change nothing of what is followed.
 	if facts.Fresh {
@@ -269,7 +270,7 @@ func (a *agent) report(ctx context.Context, view *plan.View) *protocol.SyncReque
 		ProtocolVersion: protocol.Version,
 		AgentVersion:    a.version,
 		SentAt:          a.now().UTC(),
-		Verbs:           append([]protocol.Verb{}, a.cfg.Policy.Verbs...),
+		Verbs:           a.cfg.Policy.ReportedVerbs(),
 		Roles:           a.cfg.Roles,
 		Hold:            view.Hold,
 		Containers:      slices.Clone(view.Containers),
@@ -278,6 +279,7 @@ func (a *agent) report(ctx context.Context, view *plan.View) *protocol.SyncReque
 		DirectiveAcks:   a.state.Acks(a.directives.repeated),
 		Tags:            a.tags,
 		Operation:       cur.Reported(),
+		Actions:         plan.Actions(&a.cfg.Policy, view),
 	}
 
 	if sys := view.System; sys != nil {
@@ -377,7 +379,7 @@ func (a *agent) publish(
 
 	status := local.Status{
 		Host: a.hostName, Network: a.network, Version: a.version, At: a.now().UTC(),
-		Verbs: slices.Clone(a.cfg.Policy.Verbs), Hold: view.Hold,
+		Verbs: a.cfg.Policy.ReportedVerbs(), Hold: view.Hold,
 		Containers: local.ContainersOf(view),
 		Needs:      plan.CloneNeeds(req.Needs), Lease: progress.Lease, Operation: progress.Operation,
 		OverridesFile: a.files.Path(), OverridesError: view.OverridesError,

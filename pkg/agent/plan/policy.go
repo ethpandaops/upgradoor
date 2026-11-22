@@ -23,6 +23,8 @@ type Policy struct {
 	Packages Packages `yaml:"packages"`
 	// Fallback is what the host does while the controller cannot be reached.
 	Fallback Fallback `yaml:"fallback"`
+	// Actions are the commands the controller may have run, by name.
+	Actions map[string]Action `yaml:"actions"`
 }
 
 // DefaultPolicy is the policy of unlabelled containers.
@@ -50,8 +52,26 @@ type Packages struct {
 	Blocked []string `yaml:"blocked"`
 }
 
-// Allows reports whether the policy allows a verb.
-func (p *Policy) Allows(v protocol.Verb) bool { return slices.Contains(p.Verbs, v) }
+// Allows reports whether the policy allows a verb. The action verb is
+// allowed when any action is configured.
+func (p *Policy) Allows(v protocol.Verb) bool {
+	if v == protocol.VerbAction {
+		return len(p.Actions) > 0
+	}
+
+	return slices.Contains(p.Verbs, v)
+}
+
+// ReportedVerbs are the verbs the sync reports: the configured ones, and
+// the action verb when an action is configured.
+func (p *Policy) ReportedVerbs() []protocol.Verb {
+	out := slices.Clone(p.Verbs)
+	if p.Allows(protocol.VerbAction) {
+		out = append(out, protocol.VerbAction)
+	}
+
+	return out
+}
 
 // ApplyDefaults fills unset fields: the default policy and the fallback's
 // times.
@@ -63,8 +83,8 @@ func (p *Policy) ApplyDefaults() {
 	p.Fallback.applyDefaults()
 }
 
-// Validate checks verbs, the default policy, the kind policies and the
-// fallback. packages.blocked is checked by host.
+// Validate checks verbs, the default policy, the kind policies, the actions
+// and the fallback. packages.blocked is checked by host.
 func (p *Policy) Validate() error {
 	for _, v := range p.Verbs {
 		if v != protocol.VerbRoll && v != protocol.VerbPackages && v != protocol.VerbReboot {
@@ -81,6 +101,10 @@ func (p *Policy) Validate() error {
 		if !protocol.ValidKind(kind) || kind == protocol.KindNone {
 			return fmt.Errorf("kindPolicies: %q is not a kind ([a-z0-9][a-z0-9._-]{0,62}, not none)", kind)
 		}
+	}
+
+	if err := validateActions(p.Actions); err != nil {
+		return err
 	}
 
 	return p.Fallback.validate(p.fallbackRolls())

@@ -276,7 +276,22 @@ type Authorizer interface {
 	Allow(w http.ResponseWriter, r *http.Request, u *User, need *Requirement) (context.Context, bool)
 	// Refuse answers 403 with msg, logs it and audits it.
 	Refuse(w http.ResponseWriter, r *http.Request, u *User, msg string)
+	// ActionBasis says on what u may start or approve a host action as the
+	// host reports it: ActionByOpen, FeatureAdmin, ActionByFeature or
+	// ActionByTeam; empty when u may not.
+	ActionBasis(u *User, a *protocol.ActionInfo) string
 }
+
+// What allows a person to start a host action (ActionBasis), next to
+// FeatureAdmin.
+const (
+	// ActionByOpen: the API runs without an auth provider.
+	ActionByOpen = AuthorizedByOpen
+	// ActionByFeature: the login has the action's feature.
+	ActionByFeature = "feature"
+	// ActionByTeam: the login is in one of the action's teams.
+	ActionByTeam = "team"
+)
 
 var _ Authorizer = (*authorizer)(nil)
 
@@ -316,6 +331,28 @@ func New(log logrus.FieldLogger, authService string, st Store, now func() time.T
 
 func (s *authorizer) HasFeature(u *User, feature string) bool {
 	return auth.FeatureAllowed(u.Services, s.authService, feature, auth.FeatureDefaultDeny)
+}
+
+// ActionBasis implements Authorizer. The action's feature names its own
+// service ("upgradoor:actions").
+func (s *authorizer) ActionBasis(u *User, a *protocol.ActionInfo) string {
+	switch {
+	case u.Open:
+		return ActionByOpen
+	case s.HasFeature(u, FeatureAdmin):
+		return FeatureAdmin
+	}
+
+	if service, feature, ok := protocol.SplitFeature(a.Feature); ok &&
+		auth.FeatureAllowed(u.Services, service, feature, auth.FeatureDefaultDeny) {
+		return ActionByFeature
+	}
+
+	if ownedBy(u.Teams, a.Teams) {
+		return ActionByTeam
+	}
+
+	return ""
 }
 
 // authorize decides whether u may make a request with the given requirement.

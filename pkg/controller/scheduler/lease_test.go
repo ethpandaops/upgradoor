@@ -810,6 +810,7 @@ func TestProbeReadiness(t *testing.T) {
 		b.step()
 		assert.Equal(t, "node is syncing", b.lease("a").Readiness)
 		assert.Nil(t, b.lease("a").SyncedSince)
+		assert.Nil(t, b.lease("a").ReadyAt)
 
 		b.advance(5 * time.Second)
 		b.get("a").Status.Node = synced
@@ -818,12 +819,15 @@ func TestProbeReadiness(t *testing.T) {
 		require.NotNil(t, b.lease("a").SyncedSince)
 		assert.Equal(t, since, *b.lease("a").SyncedSince)
 		assert.Equal(t, "node at head with peers, waiting for it to stay so for 6m24s", b.lease("a").Readiness)
+		require.NotNil(t, b.lease("a").ReadyAt)
+		assert.Equal(t, since.Add(6*time.Minute+24*time.Second), *b.lease("a").ReadyAt)
 
 		// A sync that is not synced starts the run over.
 		b.advance(testEpoch / 2)
 		b.get("a").Status.Node = syncing
 		b.step()
 		assert.Nil(t, b.lease("a").SyncedSince)
+		assert.Nil(t, b.lease("a").ReadyAt)
 
 		b.advance(5 * time.Second)
 		b.get("a").Status.Node = synced
@@ -832,9 +836,12 @@ func TestProbeReadiness(t *testing.T) {
 		b.step()
 		require.NotNil(t, b.lease("a"), "one second short of readyEpochs epoch durations")
 
+		require.NotNil(t, b.lease("a").ReadyAt)
+
 		b.advance(time.Second)
 		b.step()
 		assert.Nil(t, b.lease("a"))
+		assert.Nil(t, b.lastLease("a").ReadyAt, "released")
 		assert.Equal(t, fleet.RolloutCompleted, b.closed(packagesKey("2.0")).State)
 	})
 

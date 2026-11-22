@@ -40,6 +40,7 @@ const (
 	PhasePulling   Phase = "pulling"   // pulling the images; nothing is stopped yet
 	PhaseDraining  Phase = "draining"  // stopping containers ahead of a reboot
 	PhaseApplying  Phase = "applying"  // upgrading packages, recreating containers
+	PhaseAction    Phase = "action"    // running a configured action
 	PhaseRebooting Phase = "rebooting" // reboot issued; persisted before it
 	PhaseStarting  Phase = "starting"  // containers starting (after a reboot too)
 	PhaseVerifying Phase = "verifying" // containers must stay up, probes answer
@@ -81,6 +82,8 @@ type Step struct {
 	NeedID string     `json:"needId"`
 	Status StepStatus `json:"status"`
 	Error  string     `json:"error,omitempty"`
+	// Action is how the run of an action need ended.
+	Action *ActionResult `json:"action,omitempty"`
 }
 
 // Operation is the agent's work on one lease. It is persisted in the agent's
@@ -177,6 +180,8 @@ type Directive struct {
 	// Withdraws is the ID of the directive whose need a withdraw directive
 	// takes back.
 	Withdraws string `json:"withdraws,omitempty"`
+	// Action names the configured action of an action directive.
+	Action string `json:"action,omitempty"`
 }
 
 // DirectiveStatus is the agent's answer to a directive.

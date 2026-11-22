@@ -26,6 +26,8 @@ type System struct {
 	Uptime  time.Duration
 	OS      protocol.OSSummary
 	Pending protocol.Pending
+	// SecurityOpen counts the security updates outside the blocked set.
+	SecurityOpen int
 	// Blocked are the configured blocked packages with a newer candidate.
 	Blocked []protocol.PackageChange
 	// InventoryHash is the hash of the inventory host would return now.
@@ -54,6 +56,9 @@ type View struct {
 	// Checks are the registry checks the view was built with, by normalised
 	// reference.
 	Checks map[string]protocol.RegistryCheck
+	// ActionsRan is the inventory hash after the last run of each action,
+	// by name; the agent sets it after Classify.
+	ActionsRan map[string]string
 }
 
 // Container returns the container of that name in the view, or nil.

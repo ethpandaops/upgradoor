@@ -98,6 +98,10 @@ type Settings struct {
 	// listed answer to its entry; those of every other team, and of
 	// containers without a team, to PolicyImage.
 	PolicyClients ClientPolicies `json:"policyClients"`
+	// ActionPolicies is the policy per host action name: auto opens a
+	// rollout from the hosts' reports that the action is due, manual (the
+	// default for an action that is not listed) waits for approval.
+	ActionPolicies ActionPolicies `json:"actionPolicies"`
 
 	// PauseAfterCanaryImage, PauseAfterCanaryPackages and
 	// PauseAfterCanaryReboot pause a rollout that serves needs of that kind
@@ -180,6 +184,49 @@ func (c *ClientPolicies) UnmarshalJSON(b []byte) error {
 // MaxPolicyClients bounds PolicyClients.
 const MaxPolicyClients = 64
 
+// ActionPolicies is a policy per host action. In JSON it is always an
+// object: none is {}, never null.
+type ActionPolicies map[string]Policy
+
+// MarshalJSON implements json.Marshaler.
+func (a ActionPolicies) MarshalJSON() ([]byte, error) {
+	if a == nil {
+		return []byte("{}"), nil
+	}
+
+	return json.Marshal(map[string]Policy(a))
+}
+
+// UnmarshalJSON implements json.Unmarshaler: the object replaces what was
+// there, and an empty one is no policies at all (nil).
+func (a *ActionPolicies) UnmarshalJSON(b []byte) error {
+	var m map[string]Policy
+	if err := json.Unmarshal(b, &m); err != nil {
+		return fmt.Errorf("actionPolicies must be an object of action to policy: %w", err)
+	}
+
+	if len(m) == 0 {
+		m = nil
+	}
+
+	*a = m
+
+	return nil
+}
+
+// MaxActionPolicies bounds ActionPolicies.
+const MaxActionPolicies = 64
+
+// ActionPolicy is the policy of the rollouts a host action's condition
+// opens: its own when one is set, manual otherwise.
+func (s *Settings) ActionPolicy(name string) Policy {
+	if p, ok := s.ActionPolicies[name]; ok {
+		return p
+	}
+
+	return PolicyManual
+}
+
 // ImagePolicy is the policy the image rollouts of a client answer to: the
 // client's own when one is set, PolicyImage otherwise.
 func (s *Settings) ImagePolicy(client string) Policy {
@@ -190,13 +237,15 @@ func (s *Settings) ImagePolicy(client string) Policy {
 	return s.PolicyImage
 }
 
-// Equal reports whether two settings are the same; no client policies and an
-// empty set of them are.
+// Equal reports whether two settings are the same; no client or action
+// policies and an empty set of them are.
 func (s *Settings) Equal(o *Settings) bool {
 	a, b := *s, *o
 	a.PolicyClients, b.PolicyClients = nil, nil
+	a.ActionPolicies, b.ActionPolicies = nil, nil
 
-	return reflect.DeepEqual(a, b) && maps.Equal(s.PolicyClients, o.PolicyClients)
+	return reflect.DeepEqual(a, b) && maps.Equal(s.PolicyClients, o.PolicyClients) &&
+		maps.Equal(s.ActionPolicies, o.ActionPolicies)
 }
 
 // PauseAfterCanaryFor reports whether a rollout that serves needs of the kind
@@ -279,6 +328,12 @@ func (s *Settings) Validate() error {
 		return errors.New("lookupInterval must be between 30s and 24h")
 	}
 
+	return s.validatePolicies()
+}
+
+// validatePolicies checks the policies: the kinds', the clients' and the
+// actions'.
+func (s *Settings) validatePolicies() error {
 	for _, p := range []Policy{s.PolicyImage, s.PolicyPackages, s.PolicyReboot} {
 		if p != PolicyAuto && p != PolicyManual {
 			return fmt.Errorf("invalid policy %q", p)
@@ -296,6 +351,20 @@ func (s *Settings) Validate() error {
 
 		if p != PolicyAuto && p != PolicyManual {
 			return fmt.Errorf("policyClients: invalid policy %q for %s", p, client)
+		}
+	}
+
+	if len(s.ActionPolicies) > MaxActionPolicies {
+		return fmt.Errorf("actionPolicies lists more than %d actions", MaxActionPolicies)
+	}
+
+	for name, p := range s.ActionPolicies {
+		if !protocol.ValidActionName(name) {
+			return fmt.Errorf("actionPolicies: %q is not an action name", name)
+		}
+
+		if p != PolicyAuto && p != PolicyManual {
+			return fmt.Errorf("actionPolicies: invalid policy %q for %s", p, name)
 		}
 	}
 

@@ -47,6 +47,11 @@ type Host interface {
 	UpgradePackages(ctx context.Context, names []string) error
 	// Reboot reboots the host.
 	Reboot(ctx context.Context) error
+	// RunAction runs a configured action's argument vector with a timeout.
+	RunAction(ctx context.Context, argv []string, timeout time.Duration) protocol.ActionResult
+	// Rescan collects the package inventory now and returns the system state
+	// from it.
+	Rescan(ctx context.Context) (System, error)
 
 	// Probe checks the local EL and CL.
 	Probe(ctx context.Context) protocol.NodeHealth
@@ -112,4 +117,14 @@ func (m *machine) UpgradePackages(ctx context.Context, names []string) error {
 // Reboot implements Host.
 func (m *machine) Reboot(ctx context.Context) error {
 	return m.system.Reboot(ctx)
+}
+
+// RunAction implements Host.
+func (m *machine) RunAction(ctx context.Context, argv []string, timeout time.Duration) protocol.ActionResult {
+	return m.system.RunAction(ctx, argv, timeout)
+}
+
+// Rescan implements Host.
+func (m *machine) Rescan(ctx context.Context) (System, error) {
+	return m.system.Rescan(ctx)
 }

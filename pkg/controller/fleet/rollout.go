@@ -28,6 +28,9 @@ const (
 	// something else than a container runs, or a roll was requested on the
 	// host. It has one member, the host.
 	RolloutLocal RolloutKind = "local"
+	// RolloutAction: one host action (Rollout.Action), on the hosts whose
+	// agents report it due, or on a selection a person started it on.
+	RolloutAction RolloutKind = "action"
 )
 
 // RolloutTarget is one part of the target of a group rollout: a tag that
@@ -89,8 +92,9 @@ type Rollout struct {
 	//   unit:/<image>@<digest of the targets> (unlabelled containers)
 	//   packages:<protocol.PackagesKey>
 	//   reboot
-	//   manual:<rollout id>
+	//   manual:<rollout id> (also an action a person started)
 	//   local:<host>:<digest of the IDs of the host's local needs>
+	//   action:<action name>
 	Key string `json:"key"`
 	// Title is a one-line description for people.
 	Title string `json:"title"`
@@ -103,6 +107,11 @@ type Rollout struct {
 	Targets       []RolloutTarget        `json:"targets,omitempty"`
 	// Packages is set for packages rollouts.
 	Packages []protocol.PackageChange `json:"packages,omitempty"`
+	// Action is the host action of an action rollout.
+	Action string `json:"action,omitempty"`
+	// PauseAfterCanary pauses the rollout at its first success, next to the
+	// settings of the kind it serves.
+	PauseAfterCanary bool `json:"pauseAfterCanary,omitempty"`
 
 	State RolloutState `json:"state"`
 	// Reason explains State halted / aborted / superseded.
@@ -318,6 +327,10 @@ type Lease struct {
 	Operation *protocol.Operation `json:"operation,omitempty"`
 	// Readiness is a one-line progress note while verifying.
 	Readiness string `json:"readiness,omitempty"`
+	// ReadyAt is when the node check passes if the host stays at head with
+	// peers; set only while the note says it waits for that run to span the
+	// required epochs.
+	ReadyAt *time.Time `json:"readyAt,omitempty"`
 	// PeerChecks is the comparison with the fleet that the last readiness
 	// check made, per client it applied to. It is for people: no decision
 	// reads it.

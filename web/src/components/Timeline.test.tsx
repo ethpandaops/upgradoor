@@ -2,7 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Outage, SlotHistory } from '../api/types';
-import { Timeline } from './Timeline';
+import { Timeline, TimelineLegend } from './Timeline';
 
 const FIRST = Date.parse('2026-01-01T00:00:00Z');
 const SLOT = 4000;
@@ -148,6 +148,21 @@ describe('Timeline', () => {
     expect(screen.getByRole('tooltip')).toHaveTextContent(/before .* – now/);
     fireEvent.click(block);
     expect(onOpenHost).toHaveBeenCalledWith('c');
+  });
+
+  it('draws a host action in a colour of its own and keys it in the legend', () => {
+    const action: Outage[] = [{ ...(outages[0] as Outage), work: 'action' }];
+    const { container } = render(
+      <>
+        <Timeline history={history} outages={action} now={NOW} rangeMs={10 * SLOT} />
+        <TimelineLegend lanes threshold={undefined} />
+      </>
+    );
+
+    expect(screen.getByRole('img', { name: 'b: host action' })).toBeInTheDocument();
+    expect(container.querySelector('.fill-series-action')).not.toBeNull();
+    expect(container.querySelector('.fill-series-packages')).toBeNull();
+    expect(screen.getByRole('list', { name: 'Legend' })).toHaveTextContent('Host action');
   });
 
   it('has no bands without a login, and says so when there is nothing to draw', () => {

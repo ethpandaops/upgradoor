@@ -72,7 +72,7 @@ var wireRefFields = []string{
 	"state", "holdReason", "pauseReason", "readiness", "error", "agentVersion", "runningKernel",
 	"newestKernel", "prettyName", "versionId", "arch", "grantedBy", "createdBy", "actor",
 	"action", "origin", "layer", "by", "after", "rollout", "target", "localReason",
-	"timingError", "health", "from", "to", "candidate", "current", "host",
+	"timingError", "health", "from", "to", "candidate", "current", "host", "description", "feature",
 }
 
 var (

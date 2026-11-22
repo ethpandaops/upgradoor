@@ -416,6 +416,7 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 
 	req.Containers = cleanContainers(req.Containers)
 	req.Roles = cleanRoles(req.Roles)
+	req.Actions = cleanActions(req.Actions)
 
 	now := s.now().UTC()
 	remote := s.remoteAddr(r)
@@ -545,6 +546,48 @@ func cleanContainers(in []protocol.Container) []protocol.Container {
 	}
 
 	return out
+}
+
+// cleanActions keeps the actions a host reports with a valid name, the
+// first of each name, sorted and at most protocol.MaxActions. What is stored
+// authorizes: a feature or a team that is not a name is dropped, an unknown
+// impact counts as node and an unknown condition as none.
+func cleanActions(in []protocol.ActionInfo) []protocol.ActionInfo {
+	out := make([]protocol.ActionInfo, 0, min(len(in), protocol.MaxActions))
+	seen := make(map[string]struct{}, len(in))
+
+	for i := range in {
+		a := in[i]
+
+		if _, dup := seen[a.Name]; dup || !protocol.ValidActionName(a.Name) {
+			continue
+		}
+
+		seen[a.Name] = struct{}{}
+
+		if !a.Impact.Valid() {
+			a.Impact = protocol.ImpactNode
+		}
+
+		if !protocol.ValidFeature(a.Feature) {
+			a.Feature = ""
+		}
+
+		if !a.When.Valid() {
+			a.When, a.Due = "", false
+		}
+
+		if len(a.Description) > protocol.MaxActionDescription {
+			a.Description = strings.ToValidUTF8(a.Description[:protocol.MaxActionDescription], "")
+		}
+
+		a.Teams = protocol.CleanOwners(a.Teams)
+		out = append(out, a)
+	}
+
+	slices.SortFunc(out, func(a, b protocol.ActionInfo) int { return strings.Compare(a.Name, b.Name) })
+
+	return out[:min(len(out), protocol.MaxActions)]
 }
 
 // identityAudit builds the audit entries for a new host and for a changed

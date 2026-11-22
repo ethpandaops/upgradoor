@@ -926,6 +926,12 @@ func rolloutPolicy(settings *fleet.Settings, r *fleet.Rollout) fleet.Policy {
 		return settings.PolicyPackages
 	case fleet.RolloutReboot:
 		return settings.PolicyReboot
+	case fleet.RolloutAction:
+		if directed(r) {
+			return fleet.PolicyAuto
+		}
+
+		return settings.ActionPolicy(r.Action)
 	default:
 		return fleet.PolicyAuto
 	}
@@ -1312,7 +1318,7 @@ func (s *service) Abort(ctx context.Context, actor string, req ScopeRequest) (*A
 		return nil, err
 	}
 
-	if r.Kind == fleet.RolloutReboot || r.Kind == fleet.RolloutLocal {
+	if r.Kind == fleet.RolloutReboot || r.Kind == fleet.RolloutLocal || (r.Kind == fleet.RolloutAction && !directed(r)) {
 		before := map[string]any{keyPaused: r.Paused}
 		r.Paused = true
 		r.PauseReason = abortedReason(req.Reason)
@@ -1367,7 +1373,7 @@ func (s *service) Abort(ctx context.Context, actor string, req ScopeRequest) (*A
 	}
 
 	msg := "rollout aborted"
-	if r.Kind != fleet.RolloutManual {
+	if !directed(r) {
 		msg += ": its target is not rolled again until it changes or someone rolls it by hand"
 	}
 

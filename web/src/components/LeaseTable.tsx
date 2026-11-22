@@ -1,8 +1,10 @@
 import { list, type Lease, type Need, type PeerCheck } from '../api/types';
 import { formatDuration, secondsBetween } from '../lib/format';
 import { endLeaseIntent } from '../lib/intents';
+import { RunExit, RunOutput } from './ActionRun';
 import { ShortId } from './Digest';
 import { ActionIcon } from './icons';
+import { Readiness } from './Readiness';
 import { RelTime } from './RelTime';
 import { Badge, Dash, Table, Td, Th } from './primitives';
 import { LeaseStateBadge, StepBadge, needSummary } from './status';
@@ -13,6 +15,7 @@ function stepLabel(needs: readonly Need[], needId: string): string {
   if (need.kind === 'image') return need.image?.container ?? 'image';
   if (need.kind === 'override') return need.override?.container ?? 'override';
   if (need.kind === 'spec') return need.spec?.container ?? 'spec';
+  if (need.kind === 'action') return need.action?.name ?? 'action';
   return need.kind;
 }
 
@@ -113,6 +116,7 @@ export function LeaseTable({
                               status={s.status}
                               title={[need ? needSummary(need) : s.needId, s.error].filter(Boolean).join('\n')}
                             />
+                            {s.action && <RunExit run={s.action} />}
                           </span>
                         );
                       })
@@ -122,6 +126,12 @@ export function LeaseTable({
                         </span>
                       ))}
                 </span>
+                {steps.map(
+                  s =>
+                    s.action && (
+                      <RunOutput key={s.needId} run={s.action} label={`${stepLabel(needs, s.needId)} on ${l.host}`} />
+                    )
+                )}
               </Td>
               {/* The one column that takes the room that is left: the others stay as wide as their content. */}
               <Td className="w-full min-w-72 whitespace-normal">
@@ -130,7 +140,7 @@ export function LeaseTable({
                 ) : l.operation?.error ? (
                   <span className="text-danger">{l.operation.error}</span>
                 ) : l.readiness ? (
-                  l.readiness
+                  <Readiness lease={l} />
                 ) : (
                   <Dash />
                 )}

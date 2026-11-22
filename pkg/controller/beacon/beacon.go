@@ -21,4 +21,7 @@ type Service interface {
 	// at most epochs of them, newest epoch first. It never blocks on the
 	// network.
 	Liveness(epochs int) []fleet.Liveness
+	// Endpoints returns what was seen of every configured endpoint, in the
+	// configured order. It never blocks on the network.
+	Endpoints() []EndpointStatus
 }

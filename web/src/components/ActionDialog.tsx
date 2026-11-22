@@ -12,8 +12,10 @@ import {
   type Timing,
 } from '../lib/actionRequests';
 import { plural } from '../lib/format';
+import type { RolloutAction } from '../lib/hostActions';
 import { ActionShell, Choice, Field } from './ActionShell';
 import { ClientOverrideDialog, type ClientOverrideIntent } from './ClientOverrideDialog';
+import { HostActionDialog, type HostActionIntent } from './HostActionDialog';
 import { Disclosure, IconButton } from './icons';
 import { DURATIONS, OverrideDialog, durationMs, type Duration } from './Overrides';
 import { usePermissions } from './Permissions';
@@ -59,6 +61,7 @@ type ActionIntentKind =
   | OverrideOf<'image-override'>
   | OverrideOf<'flag-override'>
   | ClientOverrideIntent
+  | HostActionIntent
   | {
       kind: 'call';
       title: string;
@@ -75,10 +78,15 @@ type ActionIntentKind =
       leaseHost?: string;
       /** rolloutClient is the client of the rollout a pause or resume is about ("" for none): its team may approve it. */
       rolloutClient?: string;
+      /** rolloutAction is the action and members of an action rollout: who may run it everywhere may approve it. */
+      rolloutAction?: RolloutAction;
     };
 
-/** The intents this dialog confirms itself; an override has its own. */
-type PlainIntent = Exclude<ActionIntent, { kind: 'image-override' | 'flag-override' | 'client-override' }>;
+/** The intents this dialog confirms itself; an override and a host action have their own. */
+type PlainIntent = Exclude<
+  ActionIntent,
+  { kind: 'image-override' | 'flag-override' | 'client-override' | 'host-action' }
+>;
 
 function intentTitle(intent: PlainIntent): string {
   switch (intent.kind) {
@@ -125,6 +133,8 @@ export function ActionDialog({
       return <OverrideDialog intent={intent} onClose={onClose} onDone={onDone} />;
     case 'client-override':
       return <ClientOverrideDialog intent={intent} onClose={onClose} onDone={onDone} />;
+    case 'host-action':
+      return <HostActionDialog intent={intent} onClose={onClose} onDone={onDone} />;
     default:
       return <PlainActionDialog intent={intent} onClose={onClose} onDone={onDone} />;
   }
@@ -212,7 +222,8 @@ function PlainActionDialog({
   const verdict = permissions.can(
     call,
     intent.kind === 'call' ? intent.leaseHost : undefined,
-    intent.kind === 'call' ? intent.rolloutClient : undefined
+    intent.kind === 'call' ? intent.rolloutClient : undefined,
+    intent.kind === 'call' ? intent.rolloutAction : undefined
   );
   const adminHint = permissions.admin ? '' : ` Needs ${permissions.login.service}:admin.`;
 

@@ -10,8 +10,8 @@ import (
 
 // Needs returns the host's open needs sorted by ID, none while on hold:
 // allowed manual needs (covering the observed need they replace), a target
-// or image need per managed container, the blocked packages and the reboot
-// need. PullError is set while a lease's pull of the need's image has just
+// or image need per managed container, the blocked packages, the reboot
+// need and the actions that are due. PullError is set while a lease's pull of the need's image has just
 // failed.
 func Needs(policy *Policy, view *View, manual []protocol.Need) []protocol.Need {
 	needs := make([]protocol.Need, 0, len(manual)+len(view.Containers)+2)
@@ -21,6 +21,7 @@ func Needs(policy *Policy, view *View, manual []protocol.Need) []protocol.Need {
 	}
 
 	manualContainers := make(map[string]struct{}, len(manual))
+	manualActions := make(map[string]struct{}, len(manual))
 	manualReboot := false
 
 	for i := range manual {
@@ -34,6 +35,12 @@ func Needs(policy *Policy, view *View, manual []protocol.Need) []protocol.Need {
 			manualContainers[n.Image.Container] = struct{}{}
 		case n.Kind == protocol.NeedReboot && n.Reboot != nil:
 			manualReboot = true
+		case n.Kind == protocol.NeedAction && n.Action != nil:
+			if _, ok := policy.Actions[n.Action.Name]; !ok {
+				continue
+			}
+
+			manualActions[n.Action.Name] = struct{}{}
 		default:
 			continue
 		}
@@ -86,6 +93,8 @@ func Needs(policy *Policy, view *View, manual []protocol.Need) []protocol.Need {
 			Reboot: &protocol.RebootNeed{Reasons: reasons},
 		})
 	}
+
+	needs = append(needs, actionNeeds(policy, view, manualActions)...)
 
 	for i := range needs {
 		needs[i].PullError = pullError(&needs[i], view.Checks)
@@ -256,6 +265,11 @@ func cloneNeed(n *protocol.Need) protocol.Need {
 		out.Reboot = &protocol.RebootNeed{Reasons: slices.Clone(n.Reboot.Reasons)}
 	}
 
+	if n.Action != nil {
+		a := *n.Action
+		out.Action = &a
+	}
+
 	return out
 }
 
@@ -285,6 +299,14 @@ func Reconcile(policy *Policy, view *View, manual []protocol.Need) Reconciled {
 		case !policy.Allows(n.Kind.Verb()):
 			out.Dropped[n.ID] = "verb " + string(n.Kind.Verb()) + " is no longer allowed"
 		case n.Kind == protocol.NeedReboot && n.Reboot != nil:
+			out.Kept = append(out.Kept, n)
+		case n.Kind == protocol.NeedAction && n.Action != nil:
+			if _, ok := policy.Actions[n.Action.Name]; !ok {
+				out.Dropped[n.ID] = "action " + n.Action.Name + " is no longer configured"
+
+				continue
+			}
+
 			out.Kept = append(out.Kept, n)
 		case n.Kind == protocol.NeedImage && n.Image != nil:
 			// A stale container list must not lose a request.

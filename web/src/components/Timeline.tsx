@@ -18,6 +18,7 @@ import { WORK_LABEL } from './status';
 const WORK_FILL: Record<string, string> = {
   image: 'fill-series-image',
   packages: 'fill-series-packages',
+  action: 'fill-series-action',
   reboot: 'fill-series-reboot',
   mixed: 'fill-series-image',
 };
@@ -95,7 +96,9 @@ interface Hover {
 function workLabel(block: OutageBlock): string {
   if (block.group === 'off') return 'Offline';
   const work = block.work;
-  return work === 'image' || work === 'packages' || work === 'reboot' ? WORK_LABEL[work] : 'Update';
+  return work === 'image' || work === 'packages' || work === 'action' || work === 'reboot'
+    ? WORK_LABEL[work]
+    : 'Update';
 }
 
 /** blockNames are the names a block can show, and how many hosts it stands for beyond them. */
@@ -684,6 +687,7 @@ export function TimelineLegend({ lanes, threshold }: { lanes: boolean; threshold
         <>
           {swatch('bg-series-image', 'Image roll')}
           {swatch('bg-series-packages', 'Packages')}
+          {swatch('bg-series-action', 'Host action')}
           {swatch('bg-series-reboot', 'Reboot')}
           {swatch('bg-danger-solid', 'Failed update')}
           {swatch('bg-foreground/55', 'Offline')}

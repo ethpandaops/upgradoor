@@ -31,13 +31,15 @@ type LeasePlan struct {
 	Packages   []string
 	// Recreates are the containers to recreate, one each, in start order.
 	Recreates []Recreate
+	// Actions are the actions to run, in the order granted.
+	Actions []ActionRun
 	// WasRunning are the containers the starting phase brings back, sorted.
 	WasRunning []string
 }
 
 // Empty reports whether the plan does nothing.
 func (p *LeasePlan) Empty() bool {
-	return len(p.Reboot) == 0 && len(p.PackageIDs) == 0 && len(p.Recreates) == 0
+	return len(p.Reboot) == 0 && len(p.PackageIDs) == 0 && len(p.Recreates) == 0 && len(p.Actions) == 0
 }
 
 // Recreate is one container to recreate under a lease; what it is recreated
@@ -100,7 +102,8 @@ func Validate(
 	}
 
 	if view.System == nil && slices.ContainsFunc(granted, func(n protocol.Need) bool {
-		return n.Kind == protocol.NeedReboot || n.Kind == protocol.NeedPackages
+		return n.Kind == protocol.NeedReboot || n.Kind == protocol.NeedPackages ||
+			(n.Kind == protocol.NeedAction && n.DirectiveID == "")
 	}) {
 		return LeasePlan{}, errors.New("the system state is not known")
 	}
@@ -161,6 +164,8 @@ func (v *validation) other(n *protocol.Need, roll bool) {
 		v.reboot(n)
 	case n.Kind == protocol.NeedPackages:
 		v.packagesNeed(n)
+	case n.Kind == protocol.NeedAction:
+		v.action(n)
 	default:
 		v.image(n)
 	}

@@ -38,8 +38,8 @@ type Record struct {
 	Time time.Time `json:"time"`
 	// Action: override.set, override.clear, override.expire, override.edit,
 	// override.apply, override.restore, spec.apply, roll.request,
-	// roll.result, reboot.request, reboot.result, hold.set, hold.release,
-	// overrides.init, deploy.
+	// roll.result, reboot.request, reboot.result, action.request,
+	// action.result, hold.set, hold.release, overrides.init, deploy.
 	Action string `json:"action"`
 	// Source is SourceController, SourceLocal or SourceAgent.
 	Source    string   `json:"source"`
@@ -48,10 +48,12 @@ type Record struct {
 	Feature   string   `json:"feature,omitempty"`
 	Directive string   `json:"directive,omitempty"`
 	Container string   `json:"container,omitempty"`
-	Before    string   `json:"before,omitempty"`
-	After     string   `json:"after,omitempty"`
-	Reason    string   `json:"reason,omitempty"`
-	Lease     string   `json:"lease,omitempty"`
+	// HostAction names the configured action of an action record.
+	HostAction string `json:"hostAction,omitempty"`
+	Before     string `json:"before,omitempty"`
+	After      string `json:"after,omitempty"`
+	Reason     string `json:"reason,omitempty"`
+	Lease      string `json:"lease,omitempty"`
 	// Result is accepted, refused, failed, or a step status.
 	Result string `json:"result"`
 	Error  string `json:"error,omitempty"`
@@ -64,8 +66,9 @@ type Audit interface {
 	// Record appends one record; a zero Time is now. Free text is cut to
 	// one line (plan.Line).
 	Record(rec *Record)
-	// LeaseResult records how a requested need ended under a lease; needs
-	// the controller rolls out by itself are not recorded.
+	// LeaseResult records how a requested need, and every action run, ended
+	// under a lease; other needs the controller rolls out by itself are not
+	// recorded.
 	LeaseResult(lease string, need *protocol.Need, step *protocol.Step)
 }
 
@@ -218,6 +221,13 @@ func (a *audit) LeaseResult(lease string, need *protocol.Need, step *protocol.St
 		rec.Before, rec.After = im.Image+"@"+im.FromDigest, im.Image+"@"+im.ToDigest
 	case n.Kind == protocol.NeedReboot && n.DirectiveID != "":
 		rec.Action, rec.Directive = "reboot.result", n.DirectiveID
+	case n.Kind == protocol.NeedAction && n.Action != nil:
+		// Every run of an action is recorded, requested or not.
+		rec.Action, rec.Directive, rec.HostAction = "action.result", n.DirectiveID, n.Action.Name
+
+		if step != nil && step.Action != nil {
+			rec.After = fmt.Sprintf("exit code %d", step.Action.ExitCode)
+		}
 	default:
 		// What the controller rolls out by itself is nobody's request.
 		return

@@ -5,7 +5,16 @@
 import { describe, expect, it } from 'vitest';
 
 import type { ActionCall } from '../api/client';
-import { FEATURE, TEAM_PREFIX, TWINNED, can, needsOwnership, type Login, type OwnedHost } from './permissions';
+import {
+  FEATURE,
+  TEAM_PREFIX,
+  TWINNED,
+  can,
+  needsActionHosts,
+  needsOwnership,
+  type Login,
+  type OwnedHost,
+} from './permissions';
 import type { PermissionCall } from './permissions';
 
 const MIXED = 'lighthouse-geth-1';
@@ -506,6 +515,16 @@ describe('needsOwnership', () => {
   });
 });
 
+describe('needsActionHosts', () => {
+  it('is true for a login without supervise', () => {
+    expect(needsActionHosts(OPEN)).toBe(false);
+    expect(needsActionHosts(login('all'))).toBe(false);
+    expect(needsActionHosts(login(['supervise']))).toBe(false);
+    expect(needsActionHosts(login([]))).toBe(true);
+    expect(needsActionHosts(login(['admin', 'team_supervise']))).toBe(true);
+  });
+});
+
 describe('can, what the review of the first version found', () => {
   const teamRecover = (...teams: string[]) => login(['team_recover'], teams);
   const retry = (rollout: string, hosts: string[]) =>
@@ -534,6 +553,43 @@ describe('can, what the review of the first version found', () => {
     expect(can(team, scope('resume', 'r-ghost'), OWNERSHIP).reason).toBe(
       'upgradoor:team_supervise does not cover rollout r-ghost (owners: none)'
     );
+  });
+
+  it('lets a login that may run the action on every member host approve an action rollout', () => {
+    const action = (teams: string[]) => [{ name: 'security-upgrades', impact: 'node' as const, teams }];
+    const hosts: OwnedHost[] = [
+      { name: MIXED, actions: action(['lighthouse']) },
+      { name: TEKU, actions: action(['lighthouse', 'teku']) },
+      { name: UNOWNED, actions: action(['ops']) },
+    ];
+    const ownership = (members: string[]) => ({
+      hosts,
+      rolloutAction: (id: string) => (id === 'r-action' ? { action: 'security-upgrades', hosts: members } : undefined),
+    });
+    const team = login([], ['lighthouse']);
+
+    expect(can(team, scope('resume', 'r-action'), ownership([MIXED, TEKU]))).toEqual({
+      allowed: true,
+      reason: '',
+      by: 'team',
+      staggered: false,
+    });
+
+    // One member the team may not run the action on, or one that does not report it, keeps supervise.
+    for (const members of [[MIXED, UNOWNED], [MIXED, FRESH], []]) {
+      expect(can(team, scope('resume', 'r-action'), ownership(members)).reason).toBe(
+        'Needs upgradoor:supervise or upgradoor:team_supervise for a team that owns every container of this ' +
+          "rollout's client; or the feature or a team of the action security-upgrades on every host of the rollout"
+      );
+    }
+
+    // Pause and abort, and any other rollout, stay supervise's.
+    expect(can(team, scope('pause', 'r-action'), ownership([MIXED])).allowed).toBe(false);
+    expect(can(team, scope('abort', 'r-action'), ownership([MIXED])).allowed).toBe(false);
+    expect(can(team, scope('resume', 'r-lighthouse'), { ...OWNERSHIP, ...ownership([MIXED]) }).reason).toBe(
+      "Needs upgradoor:supervise or upgradoor:team_supervise for a team that owns every container of this rollout's client"
+    );
+    expect(can(login(['supervise']), scope('resume', 'r-action'), ownership([UNOWNED])).by).toBe('supervise');
   });
 
   it('leaves a hold of staff alone on the team path', () => {

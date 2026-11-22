@@ -13,6 +13,8 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 // The closed set of programs; the runner refuses everything else.
@@ -257,4 +259,49 @@ func (t *teeWriter) Write(p []byte) (int, error) {
 	}
 
 	return t.second.Write(p)
+}
+
+// RunAction runs a configured action's argument vector, argv[0] an absolute
+// path, without a shell and with the fixed environment, until it exits or
+// timeout passes (SIGTERM, then a kill after commandWaitDelay). The result
+// carries the exit code and the tail of the combined output.
+func RunAction(ctx context.Context, argv []string, timeout time.Duration) protocol.ActionResult {
+	res := protocol.ActionResult{ExitCode: -1}
+
+	if len(argv) == 0 || !filepath.IsAbs(argv[0]) {
+		res.Output = errCommandNotAllowed.Error()
+
+		return res
+	}
+
+	ctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+
+	out := &tailBuffer{limit: protocol.MaxActionOutput}
+
+	cmd := exec.CommandContext(ctx, argv[0], argv[1:]...) //nolint:gosec // agent.yaml's argv, never the controller's.
+	cmd.Env = commandEnv
+	cmd.Stdout = out
+	cmd.Stderr = out
+	cmd.WaitDelay = commandWaitDelay
+	cmd.Cancel = func() error {
+		return cmd.Process.Signal(syscall.SIGTERM)
+	}
+
+	err := cmd.Run()
+	res.Output = out.String()
+	res.TimedOut = errors.Is(ctx.Err(), context.DeadlineExceeded)
+
+	var exitErr *exec.ExitError
+
+	switch {
+	case err == nil:
+		res.ExitCode = 0
+	case errors.As(err, &exitErr):
+		res.ExitCode = exitErr.ExitCode()
+	default:
+		res.Output = strings.TrimPrefix(res.Output+"\n"+err.Error(), "\n")
+	}
+
+	return res
 }

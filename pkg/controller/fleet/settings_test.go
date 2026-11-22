@@ -121,3 +121,29 @@ func TestSettingsClientPolicies(t *testing.T) {
 	s.PolicyClients = ClientPolicies{"geth": "sometimes"}
 	require.ErrorContains(t, s.Validate(), "invalid policy")
 }
+
+func TestSettingsActionPolicies(t *testing.T) {
+	s := DefaultSettings()
+	assert.Equal(t, PolicyManual, s.ActionPolicy("security-upgrades"), "manual unless listed")
+
+	raw, err := json.Marshal(s)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"actionPolicies":{}`)
+
+	require.NoError(t, json.Unmarshal([]byte(`{"actionPolicies":{"security-upgrades":"auto"}}`), &s))
+	assert.Equal(t, PolicyAuto, s.ActionPolicy("security-upgrades"))
+	require.NoError(t, s.Validate())
+
+	other := DefaultSettings()
+	assert.False(t, s.Equal(&other))
+
+	require.NoError(t, json.Unmarshal([]byte(`{"actionPolicies":{}}`), &s))
+	assert.Nil(t, s.ActionPolicies, "an empty object is none")
+	assert.True(t, s.Equal(&other))
+
+	s.ActionPolicies = ActionPolicies{"Bad Name": PolicyAuto}
+	require.ErrorContains(t, s.Validate(), "is not an action name")
+
+	s.ActionPolicies = ActionPolicies{"a": "sometimes"}
+	require.ErrorContains(t, s.Validate(), `invalid policy "sometimes" for a`)
+}

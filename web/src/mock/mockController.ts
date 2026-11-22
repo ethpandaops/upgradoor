@@ -57,6 +57,7 @@ import { applyFlags, validateFlags } from '../lib/flags';
 import { formatPercent } from '../lib/format';
 import { validateImageRef } from '../lib/imageRef';
 import { parseGoDuration } from '../lib/goDuration';
+import { rolloutActionOf } from '../lib/hostActions';
 import { FEATURE, TEAM_PREFIX, TWINNED, can, type Login, type PermissionCall } from '../lib/permissions';
 import { FIELDS, toForm, validateField } from '../lib/settingsForm';
 import {
@@ -71,7 +72,9 @@ import {
   type MockFleet,
 } from './fixture';
 import { ClientQueryError, clientHostsPage, clientIndex, imagePolicy, type ClientIndex } from './clients';
+import { MockHostActionError, seedHostActions, startHostAction } from './hostActions';
 import { OFF_SLOTS, capOutages, outageSpans, type Deviation } from './outages';
+import { MockSources } from './sources';
 import {
   StringTable,
   detailTables,
@@ -276,13 +279,16 @@ export class MockController {
   private readonly streams = new Set<MockStream>();
   /** The overrides that were set or cleared through the mock, by "host/container"; the fixture's own stay as they are. */
   private readonly overrides = new Map<string, { host: string; container: string; base?: OverrideBase }>();
+  private readonly sources: MockSources;
 
   constructor(opts: MockOptions = {}) {
     this.now = opts.now ?? (() => Date.now());
     this.data = buildMockData(this.now(), opts.fleet ?? 'small');
+    seedHostActions(this.data);
     this.auth = opts.auth ?? false;
     this.latencyMs = opts.latencyMs ?? 0;
     this.actor = () => (this.auth ? 'mock-user@example.org' : 'anonymous');
+    this.sources = new MockSources(this.now, () => [...this.data.hosts.values()]);
   }
 
   /** gateFailing reports whether the network gate is forced to fail. */
@@ -310,7 +316,10 @@ export class MockController {
       const body = this.route(input, init);
       return new Response(JSON.stringify(body), { status: 200, headers: { 'Content-Type': 'application/json' } });
     } catch (err) {
-      const status = err instanceof HttpError || err instanceof ClientQueryError ? err.status : 500;
+      const status =
+        err instanceof HttpError || err instanceof ClientQueryError || err instanceof MockHostActionError
+          ? err.status
+          : 500;
       const message = err instanceof Error ? err.message : String(err);
       return new Response(JSON.stringify({ error: message }), {
         status,
@@ -474,6 +483,10 @@ export class MockController {
         return this.packages(q.get('q') ?? '', Number(q.get('limit')) || 50, q.get('after') ?? '');
       if (route === 'images') return this.images(q.get('q') ?? '', Number(q.get('limit')) || 50, q.get('after') ?? '');
       if (route === 'settings') return this.settingsBody();
+      if (route === 'settings/sources') {
+        this.authorizeAdmin(login);
+        return this.sources.view();
+      }
       if (route === 'slots') return this.slots(q.get('window'), true);
       if (route === 'audit') {
         return this.auditPage(
@@ -492,12 +505,37 @@ export class MockController {
       return this.putSettings(body);
     }
 
+    if (method === 'POST' && route === 'settings/sources/validator-ranges/refresh') {
+      this.authorizeAdmin(login);
+      const done = this.sources.refresh();
+      if (done.fetched) this.log('sources.validator-ranges.refresh', 'validator-ranges', { changed: false });
+      return done;
+    }
+
     if (method === 'POST' && route === 'images/refresh') {
       if (!login.open && !login.hasFeature(FEATURE.roll)) {
         throw new HttpError(403, `forbidden: this login lacks the feature ${login.service}:${FEATURE.roll}`);
       }
 
       return this.refreshImages();
+    }
+
+    if (method === 'POST' && route === 'actions/host-action') {
+      // Permitted host by host: see hostActions.ts.
+      this.authorization = { authorizedBy: 'action', teams: [...login.teams] };
+      return startHostAction(
+        {
+          data: this.data,
+          now: this.now(),
+          actor: this.actor(),
+          newId: prefix => this.newId(prefix),
+          log: (action, target, detail) => {
+            this.log(action, target, detail);
+          },
+        },
+        login,
+        body
+      );
     }
 
     if (method === 'POST' && route.startsWith('actions/')) {
@@ -530,6 +568,14 @@ export class MockController {
    * authorize refuses a request the login may not make, with the rule the
    * controller uses, and remembers what allowed it for the audit entries.
    */
+  /** authorizeAdmin refuses a login without the feature admin, and notes what allowed the request. */
+  private authorizeAdmin(login: Login): void {
+    if (!login.open && !login.hasFeature(FEATURE.admin)) {
+      throw new HttpError(403, `forbidden: this login lacks the feature ${login.service}:${FEATURE.admin}`);
+    }
+    this.authorization = { authorizedBy: login.open ? 'open' : FEATURE.admin, teams: [...login.teams] };
+  }
+
   private authorize(login: Login, call: PermissionCall): void {
     const verdict = can(login, call, {
       hosts: [...this.data.hosts.values()],
@@ -539,6 +585,10 @@ export class MockController {
       rolloutClient: id => {
         const r = this.data.rollouts.find(x => x.id === id);
         return r ? (r.team ?? '') : undefined;
+      },
+      rolloutAction: id => {
+        const r = this.data.rollouts.find(x => x.id === id);
+        return r ? rolloutActionOf(r) : undefined;
       },
     });
     if (!verdict.allowed) throw new HttpError(403, `forbidden: ${verdict.reason}`);
@@ -844,6 +894,9 @@ export class MockController {
       case 'local':
         // Asked for by a person, or on the host itself: no policy.
         return 'auto';
+      case 'action':
+        // A person's start has no policy; a due action answers to its own, manual when it has none.
+        return r.key.startsWith('manual:') ? 'auto' : (s.actionPolicies[r.action ?? ''] ?? 'manual');
     }
   }
 
@@ -1167,6 +1220,7 @@ export class MockController {
       offline: host.offline,
       broken: host.broken && Object.keys(host.broken).length > 0 ? host.broken : undefined,
       verbs: host.verbs,
+      actions: host.actions,
       needs: host.needs,
       plan: plan.hosts?.[host.name] ?? host.plan,
     };
@@ -1381,6 +1435,16 @@ export class MockController {
           !Array.isArray(value) &&
           Object.entries(value).every(([client, p]) => CLIENT_NAME.test(client) && (p === 'auto' || p === 'manual'));
         if (!ok) throw new HttpError(400, 'policyClients must be an object of client to policy');
+        continue;
+      }
+      // The policies per host action, replaced as a whole.
+      if (key === 'actionPolicies') {
+        const ok =
+          typeof value === 'object' &&
+          value !== null &&
+          !Array.isArray(value) &&
+          Object.values(value).every(p => p === 'auto' || p === 'manual');
+        if (!ok) throw new HttpError(400, 'actionPolicies must be an object of action to policy');
         continue;
       }
 
@@ -2382,6 +2446,7 @@ function hostListing(s: HostSummary): HostListing {
     ...(s.holdReason ? { holdReason: s.holdReason } : {}),
     ...(s.holdBy ? { holdBy: s.holdBy } : {}),
     verbs: s.verbs,
+    actions: s.actions,
     needs: list(s.needs).map(n => ({ kind: n.kind })),
     plan: s.plan,
   };

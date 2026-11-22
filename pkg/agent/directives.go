@@ -98,6 +98,11 @@ func (a *agent) applyDirective(d *protocol.Directive, view *plan.View) bool {
 		if reject = why; why == "" {
 			need = &n
 		}
+	case protocol.DirectiveAction:
+		n, why := plan.ManualAction(&a.cfg.Policy, view, d.Action, d.ID)
+		if reject = why; why == "" {
+			need = &n
+		}
 	case protocol.DirectiveRoll:
 		if reject = a.startRoll(d.ID, d.Container, view, false); reject == "" {
 			log.WithField("container", d.Container).Info("manual roll requested")
@@ -291,12 +296,13 @@ func actorOf(d *protocol.Directive) actor {
 	}
 }
 
-// auditDirective records a roll, reboot, hold or release directive and
+// auditDirective records a roll, reboot, action, hold or release directive and
 // whether the host took it.
 func (a *agent) auditDirective(d *protocol.Directive, reject string) {
 	actions := map[protocol.DirectiveKind]string{
 		protocol.DirectiveRoll: "roll.request", protocol.DirectiveReboot: "reboot.request",
 		protocol.DirectiveHold: "hold.set", protocol.DirectiveReleaseHold: "hold.release",
+		protocol.DirectiveAction: "action.request",
 	}
 
 	action, ok := actions[d.Kind]
@@ -307,8 +313,8 @@ func (a *agent) auditDirective(d *protocol.Directive, reject string) {
 	who := actorOf(d)
 	rec := &local.Record{
 		Action: action, Source: local.SourceController, User: who.User, Teams: who.Teams,
-		Feature: who.Feature, Directive: d.ID, Container: d.Container, Reason: d.Reason,
-		Result: local.Accepted,
+		Feature: who.Feature, Directive: d.ID, Container: d.Container, HostAction: plan.Line(d.Action),
+		Reason: d.Reason, Result: local.Accepted,
 	}
 
 	if reject != "" {

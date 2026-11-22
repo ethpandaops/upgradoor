@@ -339,7 +339,7 @@ func (s *sqliteStore) ListDirectives(
 					return fmt.Errorf("directive %s: detail: %w", d.ID, err)
 				}
 
-				d.By, d.Override, d.Withdraws = extra.By, extra.Override, extra.Withdraws
+				d.By, d.Override, d.Withdraws, d.Action = extra.By, extra.Override, extra.Withdraws, extra.Action
 			}
 
 			d.Kind = protocol.DirectiveKind(kind)
@@ -581,6 +581,7 @@ func upsertLease(ctx context.Context, tx *sql.Tx, lease *fleet.Lease) error {
 	stored.AgentDoneAt = storedTimePtr(stored.AgentDoneAt)
 	stored.SyncedSince = storedTimePtr(stored.SyncedSince)
 	stored.SyncedUntil = storedTimePtr(stored.SyncedUntil)
+	stored.ReadyAt = storedTimePtr(stored.ReadyAt)
 	stored.EndedAt = storedTimePtr(stored.EndedAt)
 
 	if lease.Cancelled != nil {
@@ -625,6 +626,7 @@ type directiveDetail struct {
 	By        *protocol.Actor               `json:"by,omitempty"`
 	Override  *protocol.OverrideInstruction `json:"override,omitempty"`
 	Withdraws string                        `json:"withdraws,omitempty"`
+	Action    string                        `json:"action,omitempty"`
 }
 
 func upsertDirective(ctx context.Context, tx *sql.Tx, d *fleet.Directive) error {
@@ -638,8 +640,8 @@ func upsertDirective(ctx context.Context, tx *sql.Tx, d *fleet.Directive) error 
 
 	detail := ""
 
-	if d.By != nil || d.Override != nil || d.Withdraws != "" {
-		extra := directiveDetail{By: d.By, Override: d.Override, Withdraws: d.Withdraws}
+	if d.By != nil || d.Override != nil || d.Withdraws != "" || d.Action != "" {
+		extra := directiveDetail{By: d.By, Override: d.Override, Withdraws: d.Withdraws, Action: d.Action}
 
 		// Times are stored as every other one: UTC, to the millisecond.
 		if d.Override != nil && d.Override.Until != nil {

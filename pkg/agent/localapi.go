@@ -40,6 +40,7 @@ func (l localAPI) Status() local.Status {
 
 	files := a.inputs()
 	view := plan.Classify(&a.cfg.Policy, facts, &files, a.tracker.Checks(), a.now())
+	view.ActionsRan = a.ranActions()
 	manual, _ := a.state.ManualAndCurrent()
 
 	out.Hold, out.OverridesError = view.Hold, view.OverridesError

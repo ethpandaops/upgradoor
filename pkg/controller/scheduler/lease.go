@@ -160,6 +160,7 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 	}
 
 	l.PeerChecks = nil
+	l.ReadyAt = nil
 	ready, note := p.ready(l, hv)
 
 	// The needs of the sync that reported done may predate the operation:
@@ -448,6 +449,9 @@ func (p *pass) nodeReady(l *fleet.Lease, hv *hostView, span bool) (ready bool, n
 	}
 
 	if seen.Sub(began) < window {
+		readyAt := began.Add(window)
+		l.ReadyAt = &readyAt
+
 		return false, fmt.Sprintf(wait, note, window)
 	}
 
@@ -591,6 +595,7 @@ func (p *pass) endLease(l *fleet.Lease, state fleet.LeaseState) {
 	ended := p.now
 	l.State = state
 	l.EndedAt = &ended
+	l.ReadyAt = nil
 
 	if hv := p.hosts[l.Host]; hv != nil && hv.lease == l {
 		hv.lease = nil

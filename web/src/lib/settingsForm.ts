@@ -17,7 +17,8 @@ export type SettingKey = Exclude<keyof Settings, (typeof ELSEWHERE)[number]>;
 /** FormSettings are the settings the form edits. */
 type FormSettings = Pick<Settings, SettingKey>;
 
-type FieldKind = 'percent' | 'share' | 'count' | 'duration' | 'policy' | 'switch';
+/** actions: the policy per host action, as the JSON text of an object of action to policy. */
+type FieldKind = 'percent' | 'share' | 'count' | 'duration' | 'policy' | 'switch' | 'actions';
 
 export interface FieldSpec {
   key: SettingKey;
@@ -179,6 +180,12 @@ export const FIELDS: readonly FieldSpec[] = [
   { key: 'pauseAfterCanaryImage', label: 'Pause after canary: images', kind: 'switch', hint: CANARY_HINT },
   { key: 'pauseAfterCanaryPackages', label: 'Pause after canary: packages', kind: 'switch', hint: CANARY_HINT },
   { key: 'pauseAfterCanaryReboot', label: 'Pause after canary: reboots', kind: 'switch', hint: CANARY_HINT },
+  {
+    key: 'actionPolicies',
+    label: 'Policy: host actions',
+    kind: 'actions',
+    hint: `What the scheduler does when hosts report a host action due. ${POLICIES.map(p => `${p}: ${POLICY_MEANING[p]}`).join('; ')}. An action without a policy is manual; an action a person starts needs no approval.`,
+  },
 ];
 
 /** fieldSpec returns the spec of a setting. */
@@ -233,6 +240,8 @@ export interface GroupSpec {
   wide?: boolean;
   /** kinds: the group also shows the rollout kinds, each with its policy and its canary switch. */
   kinds?: readonly RolloutKindSpec[];
+  /** actionPolicies: the group also shows the policy of each host action, after the kinds. */
+  actionPolicies?: boolean;
 }
 
 /**
@@ -249,6 +258,7 @@ export const GROUPS: readonly GroupSpec[] = [
     wide: true,
     keys: ['paused', 'maxIndependentPercent'],
     kinds: ROLLOUT_KINDS,
+    actionPolicies: true,
   },
   {
     id: 'images',
@@ -279,18 +289,52 @@ export const GROUPS: readonly GroupSpec[] = [
 
 /** groupKeys lists the settings a group places. */
 export function groupKeys(group: GroupSpec): SettingKey[] {
-  return [...group.keys, ...(group.kinds ?? []).flatMap(k => [k.policy, k.canary])];
+  return [
+    ...group.keys,
+    ...(group.kinds ?? []).flatMap(k => [k.policy, k.canary]),
+    ...(group.actionPolicies ? (['actionPolicies'] as const) : []),
+  ];
 }
 
 /** valueText renders a stored or typed value for a person: with its unit, a switch as on or off. */
 export function valueText(spec: FieldSpec, value: string): string {
   if (spec.kind === 'switch') return value === 'true' ? 'on' : 'off';
+  if (spec.kind === 'actions') {
+    const auto = autoActions(parseActionPolicies(value) ?? {});
+    return auto.length === 0 ? 'every action manual' : `${auto.join(', ')} auto`;
+  }
   return spec.unit ? `${value} ${spec.unit}` : value;
 }
 
 /** shortValue is valueText without the unit, for where the unit stands next to it anyway. */
 export function shortValue(spec: FieldSpec, value: string): string {
-  return spec.kind === 'switch' ? valueText(spec, value) : value;
+  return spec.kind === 'switch' || spec.kind === 'actions' ? valueText(spec, value) : value;
+}
+
+/** actionPoliciesText is the form text of the action policies: the JSON object, sorted by action. */
+export function actionPoliciesText(policies: Record<string, Policy>): string {
+  return JSON.stringify(Object.fromEntries(Object.entries(policies).sort(([a], [b]) => a.localeCompare(b))));
+}
+
+/** autoActions are the actions whose policy is auto, sorted: an action that is not listed is manual. */
+function autoActions(policies: Record<string, Policy>): string[] {
+  return Object.keys(policies)
+    .filter(name => policies[name] === 'auto')
+    .sort();
+}
+
+/** parseActionPolicies reads the form text of the action policies; undefined when it is not an object of action to policy. */
+export function parseActionPolicies(text: string): Record<string, Policy> | undefined {
+  let v: unknown;
+  try {
+    v = JSON.parse(text);
+  } catch {
+    return undefined;
+  }
+  if (typeof v !== 'object' || v === null || Array.isArray(v)) return undefined;
+  const entries = Object.entries(v as Record<string, unknown>);
+  if (!entries.every(([, p]) => (POLICIES as readonly unknown[]).includes(p))) return undefined;
+  return Object.fromEntries(entries) as Record<string, Policy>;
 }
 
 /**
@@ -311,6 +355,7 @@ export type SettingsForm = Record<SettingKey, string>;
 export function displayValue(settings: FormSettings, key: SettingKey): string {
   const v = settings[key];
   if (typeof v === 'boolean') return v ? 'true' : 'false';
+  if (typeof v === 'object') return actionPoliciesText(v);
   if (typeof v === 'number') return String(v);
   const spec = FIELDS.find(f => f.key === key);
   return spec?.kind === 'duration' ? normalizeGoDuration(v) : v;
@@ -355,6 +400,8 @@ export function validateField(spec: FieldSpec, raw: string): string | null {
       return (POLICIES as readonly string[]).includes(text) ? null : 'must be auto, manual or paused';
     case 'switch':
       return text === 'true' || text === 'false' ? null : 'must be on or off';
+    case 'actions':
+      return parseActionPolicies(text) ? null : 'must be an object of action to auto or manual';
   }
 }
 
@@ -394,6 +441,7 @@ export function fromForm(form: SettingsForm): FormSettings {
     readyPeerShare: Number(form.readyPeerShare),
     lookupInterval: duration('lookupInterval'),
     paused: form.paused === 'true',
+    actionPolicies: parseActionPolicies(form.actionPolicies) ?? {},
   };
 }
 
@@ -402,6 +450,12 @@ export function sameValue(spec: FieldSpec, a: string, b: string): boolean {
   const x = a.trim();
   const y = b.trim();
   if (x === y) return true;
+
+  if (spec.kind === 'actions') {
+    const px = parseActionPolicies(x);
+    const py = parseActionPolicies(y);
+    return px !== undefined && py !== undefined && autoActions(px).join() === autoActions(py).join();
+  }
 
   if (spec.kind === 'duration') {
     const mx = parseGoDuration(x);

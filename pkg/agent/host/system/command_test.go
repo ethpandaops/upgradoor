@@ -7,9 +7,12 @@ import (
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 // Only the closed set of programs runs.
@@ -165,4 +168,54 @@ func TestOutputBuffers(t *testing.T) {
 	_, err = capped.Write([]byte("more"))
 	require.NoError(t, err)
 	assert.Equal(t, "abcde", capped.buf.String())
+}
+
+// An action runs without a shell around it, by its argv, until it exits or
+// its timeout passes; the result keeps the tail of the combined output.
+func TestRunAction(t *testing.T) {
+	sh, err := exec.LookPath("sh")
+	if err != nil {
+		t.Skip("no sh")
+	}
+
+	long := strings.Repeat("x", protocol.MaxActionOutput) + "tail"
+
+	tests := []struct {
+		name    string
+		argv    []string
+		timeout time.Duration
+		want    protocol.ActionResult
+	}{
+		{
+			name: "success", argv: []string{sh, "-c", "echo out; echo err >&2"}, timeout: time.Minute,
+			want: protocol.ActionResult{ExitCode: 0, Output: "out\nerr\n"},
+		},
+		{
+			name: "exit code", argv: []string{sh, "-c", "echo locked >&2; exit 3"}, timeout: time.Minute,
+			want: protocol.ActionResult{ExitCode: 3, Output: "locked\n"},
+		},
+		{
+			name: "timeout", argv: []string{sh, "-c", "echo started; exec sleep 30"}, timeout: 200 * time.Millisecond,
+			want: protocol.ActionResult{ExitCode: -1, Output: "started\n", TimedOut: true},
+		},
+		{
+			name: "output tail", argv: []string{sh, "-c", "printf %s " + long}, timeout: time.Minute,
+			want: protocol.ActionResult{ExitCode: 0, Output: long[len(long)-protocol.MaxActionOutput:]},
+		},
+		{
+			name: "no shell", argv: []string{sh, "-c", "echo $0", "a;b"}, timeout: time.Minute,
+			want: protocol.ActionResult{ExitCode: 0, Output: "a;b\n"},
+		},
+		{
+			name: "relative program", argv: []string{"sh", "-c", "true"}, timeout: time.Minute,
+			want: protocol.ActionResult{ExitCode: -1, Output: errCommandNotAllowed.Error()},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RunAction(t.Context(), tt.argv, tt.timeout)
+			assert.Equal(t, tt.want, got)
+		})
+	}
 }

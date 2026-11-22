@@ -6,6 +6,8 @@
 // enforcement; a wrong answer here costs a 403, never an action.
 
 import type { ActionCall } from '../api/client';
+import type { ActionInfo } from '../api/types';
+import { approvalBasis, hostActionVerdict, type RolloutAction } from './hostActions';
 
 /** The features of the controller's service, as a grant of the authenticatoor spells them. */
 export const FEATURE = {
@@ -61,6 +63,8 @@ export interface Login {
    * is too old to know.
    */
   hasFeature: (feature: string) => boolean;
+  /** hasServiceFeature checks a feature of any service (a host action's feature); without it only service's own. */
+  hasServiceFeature?: (service: string, feature: string) => boolean;
   /** teams are the token's teams. */
   teams: readonly string[];
 }
@@ -80,6 +84,8 @@ export interface OwnedHost {
   /** holdWanted and holdBy ("team:<teams>" or "staff"): a team lifts only a hold one of its teams set. */
   holdWanted?: boolean;
   holdBy?: string;
+  /** actions are the host actions the host reports, for the rule of host-action. */
+  actions?: readonly ActionInfo[] | null;
 }
 
 /** OwnedClient is the part of a client the rule reads; a ClientView is one. */
@@ -102,6 +108,8 @@ export interface Ownership {
    * no client, undefined for one the page does not know.
    */
   rolloutClient?: (rollout: string) => string | undefined;
+  /** rolloutAction is the action and members of an action rollout; undefined for any other. */
+  rolloutAction?: (rollout: string) => RolloutAction | undefined;
 }
 
 /** PermissionCall is an action call, or saving the settings. */
@@ -160,7 +168,7 @@ function adminReason(force: boolean, ignoreBudget: boolean, all: boolean): strin
 }
 
 /** requirement is what each request needs: the one table of this page, the mirror of actions.go. */
-function requirement(call: PermissionCall): Requirement {
+function requirement(call: Exclude<PermissionCall, { action: 'host-action' }>): Requirement {
   switch (call.action) {
     case 'roll': {
       const b = call.body;
@@ -399,6 +407,43 @@ const denied = (reason: string): Verdict => ({ allowed: false, reason, by: '', s
 export function can(login: Login, call: PermissionCall, ownership: Ownership): Verdict {
   if (login.open) return { allowed: true, reason: '', by: 'open', staggered: false };
 
+  // A host action has a rule of its own, per host: see hostActions.ts.
+  if (call.action === 'host-action') return hostActionVerdict(login, call.body, ownership.hosts);
+
+  if (call.action === 'resume' && call.body.rollout !== '') return resumeVerdict(login, call, ownership);
+
+  return featureVerdict(login, call, ownership);
+}
+
+/**
+ * resumeVerdict decides the resume (approval) of one rollout: supervise or its
+ * twin, or, for an action rollout, the action on every member host.
+ */
+function resumeVerdict(
+  login: Login,
+  call: Extract<PermissionCall, { action: 'resume' }>,
+  ownership: Ownership
+): Verdict {
+  const ra = login.hasFeature(FEATURE.supervise) ? undefined : ownership.rolloutAction?.(call.body.rollout);
+  if (!ra) return featureVerdict(login, call, ownership);
+
+  const by = approvalBasis(login, ra, ownership.hosts);
+  if (by !== '') return { allowed: true, reason: '', by, staggered: false };
+
+  const verdict = featureVerdict(login, call, ownership);
+  if (verdict.allowed) return verdict;
+
+  return denied(
+    `${verdict.reason}; or the feature or a team of the action ${echo(ra.action)} on every host of the rollout`
+  );
+}
+
+/** featureVerdict applies the call's feature, its team twin and the admin it needs on top. */
+function featureVerdict(
+  login: Login,
+  call: Exclude<PermissionCall, { action: 'host-action' }>,
+  ownership: Ownership
+): Verdict {
   const need = requirement(call);
   const feature = `${login.service}:${need.feature}`;
   let by: string = need.feature;
@@ -436,4 +481,9 @@ export function can(login: Login, call: PermissionCall, ownership: Ownership): V
 /** needsOwnership reports whether some verdict of this login depends on who owns what. */
 export function needsOwnership(login: Login): boolean {
   return !login.open && TWINNED.some(f => !login.hasFeature(f) && login.hasFeature(TEAM_PREFIX + f));
+}
+
+/** needsActionHosts: without supervise the approval of an action rollout follows the action on its hosts. */
+export function needsActionHosts(login: Login): boolean {
+  return !login.open && !login.hasFeature(FEATURE.supervise);
 }

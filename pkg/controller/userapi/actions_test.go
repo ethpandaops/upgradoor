@@ -1299,7 +1299,11 @@ func TestAuthorizeEveryAction(t *testing.T) {
 	}
 
 	delete(sampled, actionSettings)
-	assert.ElementsMatch(t, slices.Collect(maps.Keys(h.srv.actions())),
+
+	// A host action is permitted per host: TestHostActionPermissions.
+	registered := h.srv.actions()
+	delete(registered, "host-action")
+	assert.ElementsMatch(t, slices.Collect(maps.Keys(registered)),
 		slices.Collect(maps.Keys(sampled)))
 
 	owners := []string{"lighthouse"}

@@ -18,6 +18,7 @@ import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { Digest } from '../components/Digest';
 import { useLive } from '../components/Live';
 import { LeaseProgress } from '../components/LeaseProgress';
+import { useReadinessNote } from '../components/Readiness';
 import { IntentAction } from '../components/SelectionBar';
 import { RelTime, useSharedNow } from '../components/RelTime';
 import { Timeline, TimelineLegend } from '../components/Timeline';
@@ -27,6 +28,7 @@ import { setKept } from '../hooks/useKept';
 import { useSlotHistory } from '../hooks/useSlotHistory';
 import { attentionItems, type AttentionItem } from '../lib/activity';
 import { formatPercent, percentOf, plural } from '../lib/format';
+import { rolloutActionOf } from '../lib/hostActions';
 import { holdIntent, hostsIntent, scopeIntent } from '../lib/intents';
 import { splitQueue, workKind, type StageOf } from '../lib/timeline';
 
@@ -473,10 +475,11 @@ function rolloutTitles(ids: readonly string[], rollouts: readonly Rollout[]): st
 
 function LeaseItem({ lease, rollouts }: { lease: Lease; rollouts: readonly Rollout[] }) {
   const title = rolloutTitles(Object.values(dict(lease.rollouts)), rollouts);
+  const readiness = useReadinessNote(lease);
   const note =
     lease.error ??
     lease.operation?.error ??
-    lease.readiness ??
+    readiness ??
     (lease.operation ? undefined : 'Waiting for the agent to pick up the lease.');
 
   return (
@@ -552,7 +555,7 @@ function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (inte
           icon="check"
           label="Approve…"
           onAction={onAction}
-          intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.team)}
+          intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.team, rolloutActionOf(r))}
         />
       );
       break;
@@ -562,7 +565,7 @@ function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (inte
           icon="resume"
           label="Resume…"
           onAction={onAction}
-          intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.team)}
+          intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.team, rolloutActionOf(r))}
         />
       );
       break;

@@ -53,7 +53,11 @@ type Options struct {
 	// Lookups looks the hosts' tags up at the registries; nil without them.
 	Lookups Lookups
 	Beacon  views.Beacon
-	Views   *views.Views
+	// Endpoints and Validators are the data sources of the settings page;
+	// nil shows none.
+	Endpoints  BeaconEndpoints
+	Validators ValidatorRanges
+	Views      *views.Views
 	// DefaultSettings are the settings from flags, shown next to the
 	// effective ones.
 	DefaultSettings fleet.Settings
@@ -130,6 +134,11 @@ func (s *Handler) Routes() []Route {
 		{Method: http.MethodGet, Pattern: "/api/v1/plan", User: s.handlePlan},
 		{Method: http.MethodGet, Pattern: "/api/v1/settings", User: s.handleGetSettings},
 		{Method: http.MethodPut, Pattern: "/api/v1/settings", User: s.handlePutSettings},
+		{Method: http.MethodGet, Pattern: "/api/v1/settings/sources", User: s.handleSources},
+		{
+			Method: http.MethodPost, Pattern: "/api/v1/settings/sources/validator-ranges/refresh",
+			User: s.handleRefreshValidatorRanges,
+		},
 		{Method: http.MethodGet, Pattern: "/api/v1/audit", User: s.handleAudit},
 		{Method: http.MethodGet, Pattern: "/api/v1/slots", User: s.handleSlots},
 	}

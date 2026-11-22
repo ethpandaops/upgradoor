@@ -57,9 +57,12 @@ describe('SettingsTab', () => {
     expect(within(group('Scheduler')).getByRole('switch', { name: 'Global pause' })).not.toBeChecked();
 
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
-    expect(screen.getByRole('status')).toHaveTextContent('No unsaved changes.');
+    expect(within(form).getByRole('status')).toHaveTextContent('No unsaved changes.');
     expect(screen.queryByRole('list', { name: 'Changes to save' })).not.toBeInTheDocument();
     expect(h.calls.filter(c => c.method === 'PUT')).toEqual([]);
+
+    // The data sources follow the settings.
+    expect(await screen.findByRole('region', { name: 'Beacon endpoints' })).toBeInTheDocument();
   });
 
   it('keeps the long description behind the info icon', async () => {
@@ -102,7 +105,7 @@ describe('SettingsTab', () => {
 
     expect(within(rowOf(form, 'Max unavailable')).getByText('changed')).toBeInTheDocument();
     expect(within(rowOf(form, 'Ready epochs')).queryByText('changed')).not.toBeInTheDocument();
-    expect(screen.getByRole('status')).toHaveTextContent('4 unsaved changes');
+    expect(within(form).getByRole('status')).toHaveTextContent('4 unsaved changes');
 
     const changes = within(screen.getByRole('list', { name: 'Changes to save' }))
       .getAllByRole('listitem')
@@ -131,7 +134,9 @@ describe('SettingsTab', () => {
 
     // The form now shows the stored answer and is clean again.
     await waitFor(() => {
-      expect(screen.getByRole('status')).toHaveTextContent('No unsaved changes.');
+      expect(within(screen.getByRole('form', { name: 'Settings' })).getByRole('status')).toHaveTextContent(
+        'No unsaved changes.'
+      );
     });
     const saved = screen.getByRole('form', { name: 'Settings' });
     expect(within(saved).getByLabelText('Max unavailable')).toHaveValue(12.5);
@@ -156,7 +161,7 @@ describe('SettingsTab', () => {
     expect(rowOf(saved, 'Max unavailable')).toHaveTextContent('default 10');
     await user.click(within(saved).getByRole('button', { name: 'Reset Max unavailable to its default' }));
     expect(within(saved).getByLabelText('Max unavailable')).toHaveValue(10);
-    expect(screen.getByRole('status')).toHaveTextContent('1 unsaved change.');
+    expect(within(saved).getByRole('status')).toHaveTextContent('1 unsaved change.');
   });
 
   it('validates fields and blocks saving', async () => {
@@ -190,7 +195,7 @@ describe('SettingsTab', () => {
     expect(within(rowOf(form, 'Min participation')).getByRole('alert')).toHaveTextContent('must be a number');
 
     expect(screen.getByRole('button', { name: /^Save/ })).toBeDisabled();
-    expect(screen.getByRole('status')).toHaveTextContent('Fix the marked fields to save.');
+    expect(within(form).getByRole('status')).toHaveTextContent('Fix the marked fields to save.');
 
     await user.click(screen.getByRole('button', { name: 'Discard changes' }));
     expect(within(form).getByLabelText('Max unavailable')).toHaveValue(10);
@@ -205,7 +210,7 @@ describe('SettingsTab', () => {
     await user.clear(ttl);
     await user.type(ttl, '1800s');
 
-    expect(screen.getByRole('status')).toHaveTextContent('No unsaved changes.');
+    expect(within(form).getByRole('status')).toHaveTextContent('No unsaved changes.');
   });
 
   it('shows what the controller says about a field at that field', async () => {

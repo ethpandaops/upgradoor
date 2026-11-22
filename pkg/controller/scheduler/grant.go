@@ -594,7 +594,7 @@ func (g *granter) lease(hv *hostView, parts []part, excepted bool) {
 		ignoreBudget = ignoreBudget || r.IgnoreBudget
 		ids = append(ids, r.ID)
 
-		if r.Kind != fleet.RolloutManual || r.CreatedBy != l.GrantedBy {
+		if !directed(r) || r.CreatedBy != l.GrantedBy {
 			l.GrantedBy = actorScheduler
 		}
 	}

@@ -4,6 +4,7 @@ import { list, type CLHealth, type Container, type ELHealth, type HostDetail } f
 import type { ActionIntent } from '../components/ActionDialog';
 import { AuditTable } from '../components/AuditTable';
 import { Digest, ShortId } from '../components/Digest';
+import { HostActionsMenu, SecurityUpdates } from '../components/HostActions';
 import { LeaseTable } from '../components/LeaseTable';
 import { useLiveHost } from '../components/Live';
 import { OverrideButtons, OverrideSummary } from '../components/Overrides';
@@ -75,6 +76,7 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
           onAction={onAction}
           intent={holdIntent('forget', [name])}
         />
+        <HostActionsMenu host={h} onAction={onAction} />
         {owners.length > 0 && (
           <span className="text-xs/5 text-muted" title="The teams that own a container of this host">
             owners: {owners.join(', ')}
@@ -179,7 +181,7 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
             <Fact label="updates">
               {h.pending.upgradable} upgradable,{' '}
               <span className={h.pending.security > 0 ? 'text-danger' : undefined}>{h.pending.security} security</span>,{' '}
-              {h.pending.blocked} blocked
+              {h.pending.blocked} blocked <SecurityUpdates host={h} onAction={onAction} />
             </Fact>
             <Fact label="inventory">
               {h.inventory ? (

@@ -425,7 +425,7 @@ func (s *service) loadDirectives(ctx context.Context, w *World) error {
 	manual := make([]string, 0, len(w.Rollouts))
 
 	for _, r := range w.Rollouts {
-		if r.Kind == fleet.RolloutManual {
+		if directed(r) {
 			manual = append(manual, r.ID)
 		}
 	}
@@ -582,6 +582,7 @@ func (s *service) PatchSettings(
 
 	next := current
 	next.PolicyClients = maps.Clone(current.PolicyClients)
+	next.ActionPolicies = maps.Clone(current.ActionPolicies)
 
 	if err := apply(&next); err != nil {
 		return current, false, err
@@ -594,6 +595,10 @@ func (s *service) PatchSettings(
 	// Nothing named, or what is named is what is there: no write, no entry.
 	if len(next.PolicyClients) == 0 {
 		next.PolicyClients = nil
+	}
+
+	if len(next.ActionPolicies) == 0 {
+		next.ActionPolicies = nil
 	}
 
 	if next.Equal(&current) {

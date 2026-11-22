@@ -18,6 +18,8 @@ import {
   cx,
 } from '../components/primitives';
 import { useQuery } from '../hooks/useQuery';
+import { ActionPolicies } from './ActionPolicies';
+import { DataSourcesCard } from './DataSourcesCard';
 import {
   GROUPS,
   POLICIES,
@@ -52,25 +54,26 @@ export function SettingsTab() {
   // The answer of the last save is newer than what was loaded.
   const body = saved ?? loaded.data;
 
-  if (!body) {
-    return loaded.loading ? (
-      <Loading what="settings" />
-    ) : (
-      <ErrorBanner error={loaded.error} what="the settings" onRetry={loaded.refresh} />
-    );
-  }
-
   return (
-    <SettingsEditor
-      // A new stored state (after a save or a reload) resets the form.
-      key={JSON.stringify(body.settings)}
-      body={body}
-      onSaved={setSaved}
-      onReload={() => {
-        setSaved(null);
-        loaded.refresh();
-      }}
-    />
+    <div className="mx-auto flex w-full max-w-screen-2xl flex-col gap-4">
+      {body ? (
+        <SettingsEditor
+          // A new stored state (after a save or a reload) resets the form.
+          key={JSON.stringify(body.settings)}
+          body={body}
+          onSaved={setSaved}
+          onReload={() => {
+            setSaved(null);
+            loaded.refresh();
+          }}
+        />
+      ) : loaded.loading ? (
+        <Loading what="settings" />
+      ) : (
+        <ErrorBanner error={loaded.error} what="the settings" onRetry={loaded.refresh} />
+      )}
+      <DataSourcesCard />
+    </div>
   );
 }
 
@@ -139,13 +142,7 @@ function SettingsEditor({
   };
 
   return (
-    <form
-      id={formId}
-      aria-label="Settings"
-      onSubmit={e => void submit(e)}
-      className="mx-auto flex w-full max-w-screen-2xl flex-col gap-4"
-      noValidate
-    >
+    <form id={formId} aria-label="Settings" onSubmit={e => void submit(e)} className="flex flex-col gap-4" noValidate>
       {/*
         The scheduler's switches as a strip over the whole width, and below it
         three groups side by side, stretched to one height; on a narrow window
@@ -246,6 +243,7 @@ function GroupCard({
               formId={formId}
             />
           ))}
+          {group.actionPolicies && <ActionPolicies state={field('actionPolicies')} />}
         </div>
         {group.kinds && <ClientPolicies />}
       </Card>
@@ -482,6 +480,9 @@ function Control({ id, hintId, spec, state }: { id: string; hintId: string; spec
   const invalid = state.error !== undefined;
 
   switch (spec.kind) {
+    case 'actions':
+      // The policies per host action have an editor of their own: ActionPolicies.
+      return null;
     case 'switch':
       return (
         <Switch

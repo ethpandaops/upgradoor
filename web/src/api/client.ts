@@ -6,11 +6,13 @@ import type {
   ClientPolicyRequest,
   Clients,
   Config,
+  DataSources,
   ErrorBody,
   EndLeaseRequest,
   ClientOverrideRequest,
   FlagOverrideRequest,
   HoldRequest,
+  HostActionRequest,
   OfflineRequest,
   ImageOverrideRequest,
   Images,
@@ -23,6 +25,7 @@ import type {
   ScopeRequest,
   Settings,
   SettingsBody,
+  ValidatorRangesRefresh,
 } from './types';
 
 /** ApiError is a non-2xx answer (or a transport failure with status 0). */
@@ -155,6 +158,7 @@ interface ActionBodies {
   'image-override': ImageOverrideRequest;
   'flag-override': FlagOverrideRequest;
   'client-override': ClientOverrideRequest;
+  'host-action': HostActionRequest;
 }
 
 type ActionName = keyof ActionBodies;
@@ -277,6 +281,16 @@ export class ApiClient {
   /** putSettings changes the settings the body names; the others stay as they are. */
   putSettings(settings: Partial<Settings>): Promise<SettingsBody> {
     return this.request('/api/v1/settings', { user: true, method: 'PUT', body: settings });
+  }
+
+  /** dataSources asks for the beacon endpoints and the validator ranges inventory (admin). */
+  dataSources(signal?: AbortSignal): Promise<DataSources> {
+    return this.request('/api/v1/settings/sources', { user: true, signal });
+  }
+
+  /** refreshValidatorRanges asks the controller to fetch the validator ranges inventory now (admin). */
+  refreshValidatorRanges(): Promise<ValidatorRangesRefresh> {
+    return this.request('/api/v1/settings/sources/validator-ranges/refresh', { user: true, method: 'POST', body: {} });
   }
 
   audit(q: AuditQuery = {}, signal?: AbortSignal): Promise<Audit> {

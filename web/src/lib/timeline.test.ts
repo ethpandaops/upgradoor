@@ -23,6 +23,9 @@ describe('workKind', () => {
     expect(workKind([])).toBe('image');
     expect(workKind(['image', 'packages'])).toBe('packages');
     expect(workKind(['packages', 'reboot', 'image'])).toBe('reboot');
+    expect(workKind(['action'])).toBe('action');
+    expect(workKind(['packages', 'action', 'override'])).toBe('action');
+    expect(workKind(['action', 'reboot'])).toBe('reboot');
   });
 });
 

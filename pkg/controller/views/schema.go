@@ -21,10 +21,13 @@
 //	GET  /api/v1/plan                  user     -> scheduler.Plan
 //	GET  /api/v1/settings              user     -> SettingsBody
 //	PUT  /api/v1/settings              user     fleet.Settings -> SettingsBody
+//	GET  /api/v1/settings/sources      user     -> DataSources
+//	POST /api/v1/settings/sources/validator-ranges/refresh  user  {} -> ValidatorRangesRefresh
 //	GET  /api/v1/audit?target=&action=&before=&limit=   user -> Audit
 //	GET  /api/v1/slots?window=         user     -> SlotHistory
 //	POST /api/v1/actions/roll          user     scheduler.RollRequest         -> scheduler.ActionResult
 //	POST /api/v1/actions/reboot        user     scheduler.RebootRequest       -> scheduler.ActionResult
+//	POST /api/v1/actions/host-action   user     scheduler.HostActionRequest   -> scheduler.ActionResult
 //	POST /api/v1/actions/hold          user     scheduler.HoldRequest         -> scheduler.ActionResult
 //	POST /api/v1/actions/unhold        user     scheduler.HoldRequest         -> scheduler.ActionResult
 //	POST /api/v1/actions/mark-offline  user     scheduler.OfflineRequest      -> scheduler.ActionResult
@@ -149,6 +152,9 @@ type HostSummary struct {
 	Broken map[string]string `json:"broken,omitempty"`
 	Verbs  []protocol.Verb   `json:"verbs"`
 	Needs  []protocol.Need   `json:"needs"`
+	// Actions are the host actions its agent.yaml defines, as it reports
+	// them.
+	Actions []protocol.ActionInfo `json:"actions"`
 
 	// Plan is the scheduler's view: slot state, attesting validators and
 	// waiting reason.
@@ -179,6 +185,8 @@ type HostListing struct {
 	// Needs are the kinds of the host's open needs, one entry per need.
 	Needs []NeedListing      `json:"needs"`
 	Plan  scheduler.HostPlan `json:"plan"`
+	// Actions are the host's actions (HostSummary.Actions).
+	Actions []protocol.ActionInfo `json:"actions"`
 }
 
 // ContainerName is the name of a container in a listing. Names repeat from

@@ -1228,3 +1228,19 @@ func TestSyncAnswersTheDigestsOfTheHostsTags(t *testing.T) {
 	assert.Equal(t, req.Tags, h.lookups.Listed[agent.Name])
 	assert.Equal(t, 7*time.Minute, h.lookups.Interval)
 }
+
+// What a host reports of its actions authorizes: it is kept only in the form
+// of names.
+func TestCleanActions(t *testing.T) {
+	got := cleanActions([]protocol.ActionInfo{
+		{Name: "zeta", Impact: "host", Feature: "actions", Teams: []string{"Dev Ops", "devops"}, When: "always", Due: true},
+		{Name: "alpha", Impact: protocol.ImpactIndependent, Feature: "upgradoor:actions", When: protocol.ConditionSecurityUpdates, Due: true},
+		{Name: "alpha", Impact: protocol.ImpactNode},
+		{Name: "Bad Name", Impact: protocol.ImpactNode},
+	})
+
+	assert.Equal(t, []protocol.ActionInfo{
+		{Name: "alpha", Impact: protocol.ImpactIndependent, Feature: "upgradoor:actions", When: protocol.ConditionSecurityUpdates, Due: true},
+		{Name: "zeta", Impact: protocol.ImpactNode, Teams: []string{"devops"}},
+	}, got)
+}

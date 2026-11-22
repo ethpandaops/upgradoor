@@ -19,7 +19,14 @@ const (
 	prefixPackages = "packages:"
 	prefixManual   = "manual:"
 	prefixLocal    = "local:"
+	prefixAction   = "action:"
 )
+
+// directed reports whether a rollout serves the needs of directives: a manual
+// roll or reboot, or a host action a person started.
+func directed(r *fleet.Rollout) bool {
+	return strings.HasPrefix(r.Key, prefixManual)
+}
 
 // reportedNeeds is what the hosts' observed needs (those without a
 // directive) ask for.
@@ -31,6 +38,8 @@ type reportedNeeds struct {
 	// local are the needs each host asks for itself (overrides, rolls
 	// requested on the host), by host.
 	local map[string][]protocol.Need
+	// actions are the host actions some host reports due.
+	actions map[string]bool
 }
 
 // isLocal reports whether a need is one a host asks for itself.
@@ -305,7 +314,8 @@ func (p *pass) syncRollouts() {
 // stays as it is.
 func (p *pass) pauseAfterCanary(r *fleet.Rollout) {
 	l := p.first[r.ID]
-	if l == nil || r.Force || r.Paused || r.State.Terminal() || !p.set.PauseAfterCanaryFor(p.servedKind(r)) {
+	if l == nil || r.Force || r.Paused || r.State.Terminal() ||
+		(!r.PauseAfterCanary && !p.set.PauseAfterCanaryFor(p.servedKind(r))) {
 		return
 	}
 
@@ -327,6 +337,8 @@ func (p *pass) servedKind(r *fleet.Rollout) protocol.NeedKind {
 		return protocol.NeedPackages
 	case fleet.RolloutReboot:
 		return protocol.NeedReboot
+	case fleet.RolloutAction:
+		return protocol.NeedAction
 	default:
 	}
 
@@ -362,6 +374,7 @@ func (p *pass) reported() *reportedNeeds {
 		groups:   make(map[string]*groupTarget, 4),
 		packages: make(map[string][]protocol.PackageChange, 2),
 		local:    make(map[string][]protocol.Need, 2),
+		actions:  make(map[string]bool, 1),
 	}
 
 	for _, name := range p.names {
@@ -378,6 +391,8 @@ func (p *pass) reported() *reportedNeeds {
 				rep.packages[protocol.PackagesKey(n.Packages.Packages)] = n.Packages.Packages
 			case n.Kind == protocol.NeedReboot:
 				rep.reboot = true
+			case n.Kind == protocol.NeedAction && n.Action != nil:
+				rep.actions[n.Action.Name] = true
 			}
 		}
 	}
@@ -541,6 +556,12 @@ func (p *pass) open(rep *reportedNeeds) {
 
 	if rep.reboot {
 		add(&fleet.Rollout{Kind: fleet.RolloutReboot, Key: keyReboot, Title: "reboot"})
+	}
+
+	for _, name := range sortedKeys(rep.actions) {
+		add(&fleet.Rollout{
+			Kind: fleet.RolloutAction, Key: prefixAction + name, Title: "action " + name, Action: name,
+		})
 	}
 
 	for _, host := range sortedKeys(rep.local) {
@@ -893,7 +914,7 @@ func (p *pass) syncMember(r *fleet.Rollout, m *fleet.RolloutHost, needs []protoc
 // need went away; a held or silent host says nothing about its needs. In a
 // manual rollout a skip is final: nothing follows the rollout.
 func (p *pass) syncSkipped(r *fleet.Rollout, m *fleet.RolloutHost, hv *hostView, needs []protocol.Need) {
-	if !operatorSkipped(m) || r.Kind == fleet.RolloutManual {
+	if !operatorSkipped(m) || directed(r) {
 		return
 	}
 
@@ -929,7 +950,7 @@ func (p *pass) syncExpected(
 	switch {
 	case r.Kind == fleet.RolloutGroup && !expectsImage(r, hv) && runsImage(r, hv):
 		p.setMember(m, fleet.HostDone)
-	case r.Kind == fleet.RolloutManual && !outstanding && len(needs) == 0 && rejected != "":
+	case directed(r) && !outstanding && len(needs) == 0 && rejected != "":
 		p.setMember(m, fleet.HostSkipped)
 		m.Error = rejected
 	}
@@ -938,7 +959,7 @@ func (p *pass) syncExpected(
 // manualDirectives reports whether a directive of the rollout is still
 // unanswered by the host, and the reason of the first one it rejected.
 func (p *pass) manualDirectives(r *fleet.Rollout, host string) (outstanding bool, rejected string) {
-	if r.Kind != fleet.RolloutManual {
+	if !directed(r) {
 		return false, ""
 	}
 
@@ -1005,7 +1026,7 @@ func (p *pass) blocks(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 	case fleet.HostDone:
 		return false
 	case fleet.HostSkipped:
-		return operatorSkipped(m) && r.Kind != fleet.RolloutManual
+		return operatorSkipped(m) && !directed(r)
 	case fleet.HostAborted:
 		return false
 	case fleet.HostExpected:

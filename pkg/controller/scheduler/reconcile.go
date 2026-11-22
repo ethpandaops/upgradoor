@@ -40,6 +40,8 @@ func needKey(n *protocol.Need) string {
 		return prefixPackages + protocol.PackagesKey(n.Packages.Packages)
 	case n.Kind == protocol.NeedReboot:
 		return keyReboot
+	case n.Kind == protocol.NeedAction && n.Action != nil:
+		return prefixAction + n.Action.Name
 	default:
 		return ""
 	}
@@ -519,6 +521,7 @@ func cloneLease(l *fleet.Lease) *fleet.Lease {
 	c.AgentDoneAt = cloneTime(l.AgentDoneAt)
 	c.SyncedSince = cloneTime(l.SyncedSince)
 	c.SyncedUntil = cloneTime(l.SyncedUntil)
+	c.ReadyAt = cloneTime(l.ReadyAt)
 	c.EndedAt = cloneTime(l.EndedAt)
 	c.Operation = cloneOperation(l.Operation)
 	c.PeerChecks = slices.Clone(l.PeerChecks)

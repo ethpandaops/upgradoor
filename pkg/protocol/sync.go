@@ -82,6 +82,9 @@ type SyncRequest struct {
 	Operation *Operation `json:"operation,omitempty"`
 	// DirectiveAcks answer directives received in earlier responses.
 	DirectiveAcks []DirectiveAck `json:"directiveAcks,omitempty"`
+	// Actions are the host's configured actions, sorted by name, at most
+	// MaxActions.
+	Actions []ActionInfo `json:"actions,omitempty"`
 }
 
 // Hold is the agent's hold state.

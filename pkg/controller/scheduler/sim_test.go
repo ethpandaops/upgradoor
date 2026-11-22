@@ -2504,8 +2504,8 @@ func (w *simWorld) stepFor(a *simAgent, n *protocol.Need) protocol.StepStatus {
 		if n.DirectiveID == "" && !a.rebootRequired {
 			return protocol.StepSuperseded
 		}
-	case protocol.NeedSpec:
-		// The simulated agents have no agent.yaml that changes.
+	case protocol.NeedSpec, protocol.NeedAction:
+		// The simulated agents have no agent.yaml that changes, and no actions.
 		return protocol.StepRefused
 	}
 
@@ -2714,9 +2714,9 @@ func (w *simWorld) finishOperation(a *simAgent) {
 			a.pkgInstalled = w.pkgVersion
 			a.pkgSeen = w.pkgVersion
 			a.rebootRequired = a.rebootRequired || w.rng.IntN(4) == 0
-		case protocol.NeedOverride, protocol.NeedSpec:
-			// The simulated agents have no overrides file and no agent.yaml
-			// that changes.
+		case protocol.NeedOverride, protocol.NeedSpec, protocol.NeedAction:
+			// The simulated agents have no overrides file, no agent.yaml
+			// that changes and no actions.
 		case protocol.NeedReboot:
 			rebooted = true
 			a.boot++
@@ -2988,6 +2988,8 @@ func (w *simWorld) apply(a *simAgent, d protocol.Directive) protocol.DirectiveAc
 		a.ctrlHold = false
 	case protocol.DirectiveOverride:
 		return reject("the simulated agents have no overrides file")
+	case protocol.DirectiveAction:
+		return reject("the simulated agents have no actions")
 	case protocol.DirectiveRoll:
 		c := a.container(d.Container)
 

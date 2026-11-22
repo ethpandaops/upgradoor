@@ -1,4 +1,5 @@
 import { render, screen, within } from '@testing-library/react';
+import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 
 import type { Rollout } from '../api/types';
@@ -52,6 +53,36 @@ describe('RolloutsTab', () => {
   });
 });
 
+describe('RolloutsTab, a host action', () => {
+  it("names the action and shows each host's exit code and output", async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    await h.api.action({
+      action: 'host-action',
+      body: { action: 'security-upgrades', hosts: ['lighthouse-geth-1', 'prysm-geth-1', 'teku-besu-1'], reason: '' },
+    });
+    renderWithApp(<RolloutsTab />, h);
+
+    const card = await screen.findByRole('article', { name: 'action security-upgrades on 3 host(s)' });
+    expect(card).toHaveTextContent('action security-upgrades');
+    expect(card).toHaveTextContent('halted: prysm-geth-1 failed');
+
+    const hosts = within(card).getByRole('table', { name: /^Hosts of / });
+    const member = (host: string) => within(hosts).getByText(host).closest('tr') as HTMLElement;
+    expect(within(member('lighthouse-geth-1')).getByText('exit 0')).toBeInTheDocument();
+    expect(within(member('teku-besu-1')).getByText('timed out')).toBeInTheDocument();
+
+    const failed = member('prysm-geth-1');
+    expect(failed).toHaveTextContent('action security-upgrades exited with code 100');
+    expect(within(failed).getByText('exit 100')).toBeInTheDocument();
+    const output = within(failed).getByLabelText('Output of security-upgrades on prysm-geth-1');
+    expect(output.closest('details')).not.toHaveAttribute('open');
+    await user.click(within(failed).getByText(/^output \(last \d+ lines\)$/));
+    expect(output.closest('details')).toHaveAttribute('open');
+    expect(output).toHaveTextContent('Could not get lock /var/lib/dpkg/lock-frontend');
+  });
+});
+
 describe('RolloutTargets', () => {
   it('names a tag at its digest, and a soft deploy with its container and a changed command line', () => {
     render(
@@ -84,5 +115,15 @@ describe('policyFor', () => {
     expect(policyFor(settings, rollout({ team: 'prysm' }))).toBe('auto');
     expect(policyFor({ ...settings, policyImage: 'manual' }, rollout({ containerKind: 'snooper-el' }))).toBe('manual');
     expect(policyFor(settings, rollout({ kind: 'local' }))).toBeUndefined();
+  });
+
+  it("gives a due host action its own policy, manual without one, and a person's start none", () => {
+    const settings = { ...defaultSettings(), actionPolicies: { 'security-upgrades': 'auto' as const } };
+    const due = (action: string) => rollout({ kind: 'action', key: `action:${action}`, action });
+    expect(policyFor(settings, due('security-upgrades'))).toBe('auto');
+    expect(policyFor(settings, due('docker-prune'))).toBe('manual');
+    expect(
+      policyFor(settings, rollout({ kind: 'action', key: 'manual:ro-1', action: 'docker-prune' }))
+    ).toBeUndefined();
   });
 });

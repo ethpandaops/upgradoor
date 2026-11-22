@@ -74,6 +74,12 @@ type agent struct {
 	managed    map[string]plan.Deployed
 	managedErr string
 
+	// ranMu guards actionsRan: the inventory hash after the last run of each
+	// action, by name. Kept in memory: after a restart a due action may run
+	// once more.
+	ranMu      sync.Mutex
+	actionsRan map[string]string
+
 	// mu guards what the socket reads of the last cycle.
 	mu     sync.Mutex
 	view   *plan.View
@@ -227,7 +233,7 @@ func (a *agent) open() error {
 	a.state = state
 	a.runner = lease.New(a.log, &a.cfg.Verify, state, &lease.Deps{
 		Host: a.host, Policy: &a.cfg.Policy, Overrides: inputs{a}, Registry: a.tracker,
-		Audit: a.audit, Notify: a.wake, Now: a.now,
+		Audit: a.audit, Notify: a.wake, Now: a.now, ActionRan: a.noteActionRan,
 	})
 
 	return nil
@@ -310,6 +316,26 @@ func (a *agent) reloadManaged() {
 	}
 
 	a.managed, a.managedErr = m, ""
+}
+
+// noteActionRan records the inventory hash after a run of an action.
+func (a *agent) noteActionRan(name, inventoryHash string) {
+	a.ranMu.Lock()
+	defer a.ranMu.Unlock()
+
+	if a.actionsRan == nil {
+		a.actionsRan = make(map[string]string, len(a.cfg.Policy.Actions))
+	}
+
+	a.actionsRan[name] = inventoryHash
+}
+
+// ranActions returns a copy of the inventory hashes after the last runs.
+func (a *agent) ranActions() map[string]string {
+	a.ranMu.Lock()
+	defer a.ranMu.Unlock()
+
+	return maps.Clone(a.actionsRan)
 }
 
 // wake asks the loop for a sync now.

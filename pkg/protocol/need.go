@@ -34,6 +34,8 @@ func (k NeedKind) Verb() Verb {
 		return VerbPackages
 	case NeedReboot:
 		return VerbReboot
+	case NeedAction:
+		return VerbAction
 	default:
 		return ""
 	}
@@ -65,6 +67,7 @@ type Need struct {
 	Spec     *SpecNeed     `json:"spec,omitempty"`
 	Packages *PackagesNeed `json:"packages,omitempty"`
 	Reboot   *RebootNeed   `json:"reboot,omitempty"`
+	Action   *ActionNeed   `json:"action,omitempty"`
 }
 
 // ImageNeed asks to move one managed container to the digest its tag now

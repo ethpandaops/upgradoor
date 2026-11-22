@@ -54,6 +54,7 @@
   /* Chart series: what a lease does to a host. Validated as a set per theme. */
   --color-series-image: var(--series-image-value);
   --color-series-packages: var(--series-packages-value);
+  --color-series-action: var(--series-action-value);
   --color-series-reboot: var(--series-reboot-value);
 }
 
@@ -90,6 +91,7 @@
 
   --series-image-value: #2a78d6;
   --series-packages-value: #eb6834;
+  --series-action-value: #8b5bd6;
   --series-reboot-value: #1baf7a;
 }
 
@@ -126,6 +128,7 @@
 
   --series-image-value: #3987e5;
   --series-packages-value: #d95926;
+  --series-action-value: #9a6ce6;
   --series-reboot-value: #199e70;
 }
 

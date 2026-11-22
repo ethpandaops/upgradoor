@@ -151,6 +151,7 @@
      }
     }
    ],
+   "actions": [],
    "plan": {
     "slot": "held",
     "weight": 100,
@@ -300,7 +301,8 @@
       "weight": 0,
       "live": 0,
       "liveKnown": false
-     }
+     },
+     "actions": []
     },
     {
      "name": "lighthouse-geth-1",
@@ -392,7 +394,8 @@
       "liveKnown": true,
       "leaseId": "lease-zz",
       "reason": "zz debugging a consensus bug, ask sam"
-     }
+     },
+     "actions": []
     },
     {
      "name": "lighthouse-geth-2",
@@ -473,7 +476,8 @@
       "weight": 100,
       "live": 0,
       "liveKnown": false
-     }
+     },
+     "actions": []
     }
    ]
   },
@@ -719,6 +723,7 @@
     "policyPackages": "auto",
     "policyReboot": "manual",
     "policyClients": {},
+    "actionPolicies": {},
     "pauseAfterCanaryImage": false,
     "pauseAfterCanaryPackages": false,
     "pauseAfterCanaryReboot": false,
@@ -741,6 +746,7 @@
     "policyPackages": "auto",
     "policyReboot": "manual",
     "policyClients": {},
+    "actionPolicies": {},
     "pauseAfterCanaryImage": false,
     "pauseAfterCanaryPackages": false,
     "pauseAfterCanaryReboot": false,
@@ -861,7 +867,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "6f7f3b77fde2"
+  "v": "9d8462f64f55"
  },
  "user": {
   "a": {
@@ -1006,6 +1012,7 @@
        0,
        0,
        "zz EL peers 4, the fleet's median is 31 (needs 16)",
+       0,
        [
         [
          "zzEL",
@@ -1242,6 +1249,7 @@
          ]
         ]
        ],
+       [],
        [
         "held",
         100,
@@ -1286,6 +1294,7 @@
      [
       3
      ],
+     [],
      0,
      1
     ],
@@ -1384,6 +1393,7 @@
       "lease-zz",
       30
      ],
+     [],
      1794571200
     ],
     [
@@ -1470,6 +1480,7 @@
       3,
       100
      ],
+     [],
      1794571200,
      1
     ]
@@ -1547,6 +1558,7 @@
      0,
      0,
      46,
+     0,
      [
       [
        47,
@@ -1642,6 +1654,8 @@
      33,
      "reboot",
      "reboot",
+     0,
+     0,
      0,
      0,
      0,
@@ -1742,6 +1756,9 @@
       [
        {}
       ],
+      [
+       {}
+      ],
       0,
       0,
       0,
@@ -1770,6 +1787,9 @@
       50,
       50,
       54,
+      [
+       {}
+      ],
       [
        {}
       ],
@@ -1802,7 +1822,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "6f7f3b77fde2"
+  "v": "9d8462f64f55"
  },
  "patch": {
   "h": {
@@ -1884,7 +1904,8 @@
      "weight": 0,
      "live": 0,
      "liveKnown": false
-    }
+    },
+    "actions": []
    },
    {
     "name": "lighthouse-geth-1",
@@ -1976,7 +1997,8 @@
      "liveKnown": true,
      "leaseId": "lease-zz",
      "reason": "zz debugging a consensus bug, ask sam"
-    }
+    },
+    "actions": []
    },
    {
     "name": "lighthouse-geth-2",
@@ -2059,7 +2081,8 @@
      "weight": 100,
      "live": 0,
      "liveKnown": false
-    }
+    },
+    "actions": []
    }
   ]
  }

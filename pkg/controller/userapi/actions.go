@@ -37,8 +37,10 @@ func (s *Handler) actions() map[string]UserHandler {
 	return map[string]UserHandler{
 		"roll":   action(s, needRoll, validateRoll, sched.Roll),
 		"reboot": action(s, needReboot, validateReboot, sched.Reboot),
-		"hold":   action(s, needHold, validateHostsRequest, sched.Hold),
-		"unhold": action(s, needUnhold, validateHostsRequest, sched.Unhold),
+		// A configured host action; permitted per host: see handleHostAction.
+		"host-action": s.handleHostAction,
+		"hold":        action(s, needHold, validateHostsRequest, sched.Hold),
+		"unhold":      action(s, needUnhold, validateHostsRequest, sched.Unhold),
 		// A host known to be offline is left out of the gate and the budget.
 		"mark-offline":   action(s, needOffline, s.validateMarkOffline, sched.MarkOffline),
 		"unmark-offline": action(s, needOffline, validateUnmarkOffline, sched.UnmarkOffline),
@@ -53,10 +55,11 @@ func (s *Handler) actions() map[string]UserHandler {
 		// Ask for the end of one open lease: it is marked, and ends as failed.
 		"end-lease": action(s, needEndLease, validateEndLease, sched.EndLease),
 		"pause":     action(s, needScope, validateScope(false), sched.Pause),
-		"resume":    action(s, needScope, validateScope(false), sched.Resume),
-		"abort":     action(s, needAbort, validateScope(true), sched.Abort),
-		"skip":      action(s, needRecoverHosts, validateRolloutHosts(true), sched.Skip),
-		"retry":     action(s, needRetry, validateRolloutHosts(false), sched.Retry),
+		// needScope, or the action's own permission: see handleResume.
+		"resume": s.handleResume,
+		"abort":  action(s, needAbort, validateScope(true), sched.Abort),
+		"skip":   action(s, needRecoverHosts, validateRolloutHosts(true), sched.Skip),
+		"retry":  action(s, needRetry, validateRolloutHosts(false), sched.Retry),
 	}
 }
 

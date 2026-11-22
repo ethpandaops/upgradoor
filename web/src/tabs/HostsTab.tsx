@@ -3,6 +3,8 @@ import { Fragment, useMemo, useState } from 'react';
 import { list, type HostListing } from '../api/types';
 import { useApp, useAuthState, usePrivateAccess } from '../appContext';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
+import { SecurityUpdates } from '../components/HostActions';
+import { usePermissions } from '../components/Permissions';
 import { useLive } from '../components/Live';
 import { BulkAction, SelectionBar } from '../components/SelectionBar';
 import { RelTime, useSharedNow } from '../components/RelTime';
@@ -25,6 +27,7 @@ import {
 } from '../components/primitives';
 import { ImageCell, OfflineBadge } from '../components/status';
 import { absoluteTime, formatDuration, formatPercent, isZeroTime, plural } from '../lib/format';
+import { hostActionIntent } from '../lib/hostActions';
 import { holdIntent } from '../lib/intents';
 import { HostDetailPanel } from './HostDetailPanel';
 import {
@@ -64,6 +67,7 @@ export function HostsTab() {
   const [page, setPage] = useState(0);
 
   const actions = useActions();
+  const { login } = usePermissions();
 
   const allRows = useMemo(
     () => mergeHostRows(list(publicHosts.data?.hosts), list(hosts.data?.hosts), list(plan.data?.queue)),
@@ -130,6 +134,7 @@ export function HostsTab() {
     containerChoices: rollableContainers(selectedSummaries),
     hiddenHosts: hiddenSelection,
   };
+  const actionSelection = hostActionIntent(login, selectedSummaries, undefined, hiddenSelection);
 
   const loading = publicHosts.loading || (priv && hosts.loading);
 
@@ -261,6 +266,15 @@ export function HostsTab() {
               }}
             />
           ))}
+          <BulkAction
+            icon="action"
+            label="Action…"
+            blocked={selection.length === 0 ? 'Select hosts first' : ''}
+            check={actionSelection}
+            run={() => {
+              actions.request(actionSelection);
+            }}
+          />
         </SelectionBar>
       )}
 
@@ -340,6 +354,7 @@ export function HostsTab() {
                     onExpand={() => {
                       setExpanded(prev => toggle(prev, row.name));
                     }}
+                    onAction={actions.request}
                   />
                   {priv && isOpen && (
                     <tr>
@@ -367,6 +382,7 @@ function HostTableRow({
   expanded,
   onSelect,
   onExpand,
+  onAction,
 }: {
   row: HostRow;
   priv: boolean;
@@ -374,6 +390,7 @@ function HostTableRow({
   expanded: boolean;
   onSelect: () => void;
   onExpand: () => void;
+  onAction: (intent: ActionIntent) => void;
 }) {
   const s = row.summary;
 
@@ -451,7 +468,7 @@ function HostTableRow({
           )}
         </Td>
       )}
-      {priv && (s ? <PrivateCells row={row} summary={s} /> : <MissingCells />)}
+      {priv && (s ? <PrivateCells row={row} summary={s} onAction={onAction} /> : <MissingCells />)}
     </tr>
   );
 }
@@ -482,7 +499,15 @@ function MissingCells() {
   );
 }
 
-function PrivateCells({ row, summary: s }: { row: HostRow; summary: HostListing }) {
+function PrivateCells({
+  row,
+  summary: s,
+  onAction,
+}: {
+  row: HostRow;
+  summary: HostListing;
+  onAction: (intent: ActionIntent) => void;
+}) {
   const share = attestingShare(s);
   const state = hostState(row);
   const needs = list(s.needs);
@@ -571,6 +596,7 @@ function PrivateCells({ row, summary: s }: { row: HostRow; summary: HostListing 
               reboot
             </Badge>
           )}
+          <SecurityUpdates host={s} onAction={onAction} />
         </span>
       </Td>
       <Td className="hidden 2xl:table-cell">

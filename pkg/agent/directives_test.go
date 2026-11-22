@@ -605,3 +605,51 @@ func TestDirectivesWhoseWriteFails(t *testing.T) {
 
 	assert.Contains(t, auditActions(e.auditRecords()), "override.set failed")
 }
+
+// The host reports its actions and the due one as a need; served, the need
+// does not come back while the inventory stays as the run left it. An action
+// directive names the action, which agent.yaml defines.
+func TestActionReportAndDirective(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.cfg.Policy.Actions = map[string]plan.Action{"security-upgrades": {
+		Command: []string{"/usr/local/lib/upgradoor/actions/security-upgrades"}, Impact: protocol.ImpactIndependent,
+		Timeout: time.Minute, When: protocol.ConditionSecurityUpdates,
+	}}
+	// The run fails: what it left behind is not retried by itself.
+	e.host.SetActionResult(&protocol.ActionResult{ExitCode: 1})
+	e.host.SetUpgradable([]protocol.Upgradable{
+		{Name: "openssl", Arch: "amd64", Current: "3.5.1", Candidate: "3.5.2", Security: true},
+	})
+	e.start()
+
+	needID := protocol.ActionNeedID("security-upgrades")
+	req := e.ctrl.Await("the due action", func(req *protocol.SyncRequest) bool { return hasNeed(req, needID) })
+	assert.Contains(t, req.Verbs, protocol.VerbAction)
+	require.Len(t, req.Actions, 1)
+	assert.True(t, req.Actions[0].Due)
+
+	e.ctrl.Grant(e.lease("lease-action", findNeed(t, &req, needID)))
+	op := e.ctrl.AwaitFinished("lease-action")
+	require.Equal(t, protocol.PhaseFailed, op.Phase)
+
+	req = e.ctrl.AwaitSyncs(3)
+	assert.False(t, hasNeed(&req, needID))
+	assert.False(t, req.Actions[0].Due)
+
+	// A person starts it again; an unknown action is refused.
+	e.ctrl.Direct(
+		protocol.Directive{ID: "d-action", Kind: protocol.DirectiveAction, Action: "security-upgrades"},
+		protocol.Directive{ID: "d-unknown", Kind: protocol.DirectiveAction, Action: "rm-rf"},
+	)
+
+	req = e.ctrl.Await("answers", func(req *protocol.SyncRequest) bool {
+		return agenttest.AckOf(req, "d-action") != nil && agenttest.AckOf(req, "d-unknown") != nil
+	})
+	assert.Equal(t, protocol.DirectiveAccepted, agenttest.AckOf(&req, "d-action").Status)
+	assert.Equal(t, `unknown action "rm-rf"`, agenttest.AckOf(&req, "d-unknown").Error)
+
+	need := findNeed(t, &req, protocol.ManualNeedID("d-action"))
+	assert.Equal(t, "security-upgrades", need.Action.Name)
+}

@@ -9,7 +9,8 @@ function leaseStep(lease: Lease): { steps: StepName[]; current: number; failed: 
   const reboots = list(lease.needs).some(n => n.kind === 'reboot');
   // Only an operation that recreates containers pulls.
   const pulls =
-    lease.operation?.phase === 'pulling' || list(lease.needs).some(n => n.kind !== 'packages' && n.kind !== 'reboot');
+    lease.operation?.phase === 'pulling' ||
+    list(lease.needs).some(n => n.kind !== 'packages' && n.kind !== 'reboot' && n.kind !== 'action');
   const steps = STEPS.filter(s => (s !== 'Reboot' || reboots) && (s !== 'Pull' || pulls));
   const at = (name: StepName) => steps.indexOf(name);
   const failed = lease.state === 'failed' || lease.operation?.phase === 'failed';
@@ -22,6 +23,7 @@ function leaseStep(lease: Lease): { steps: StepName[]; current: number; failed: 
     case 'draining':
       return { steps, current: at('Drain'), failed };
     case 'applying':
+    case 'action':
       return { steps, current: at('Apply'), failed };
     case 'rebooting':
       return { steps, current: Math.max(at('Reboot'), at('Apply')), failed };

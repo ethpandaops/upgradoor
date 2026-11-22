@@ -172,7 +172,7 @@ export function mergeSlotRows(history: SlotHistory, rows: readonly SlotRow[]): S
 
 // ---------------------------------------------------------------- outages
 
-const WORKS = ['image', 'packages', 'reboot'];
+const WORKS = ['image', 'packages', 'action', 'reboot'];
 
 /** leaseOutage is the span of a lease, as the controller makes it (outageSpans in outages.go). */
 function leaseOutage(lease: Lease, validators: number, nowMs: number): Outage {

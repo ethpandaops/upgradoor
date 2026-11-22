@@ -4,6 +4,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"testing"
 	"testing/fstest"
@@ -371,6 +372,8 @@ func TestEveryUserRouteIsGuarded(t *testing.T) {
 	}
 	staff := provider.Grant(t, controllertest.StaffServices)
 
+	// adminReads are the reading routes that need the feature admin.
+	adminReads := []string{"GET /api/v1/settings/sources"}
 	mutating := 0
 
 	for _, route := range routes {
@@ -387,7 +390,7 @@ func TestEveryUserRouteIsGuarded(t *testing.T) {
 			for name, authorization := range basic {
 				got := h.serve(routeRequest(route, authorization))
 
-				if read {
+				if read && !slices.Contains(adminReads, route) {
 					// Some need a query; none refuses the login.
 					assert.NotContains(t, []int{http.StatusUnauthorized, http.StatusForbidden},
 						got.Code, "%s: %s", name, got.Body.String())
@@ -408,8 +411,8 @@ func TestEveryUserRouteIsGuarded(t *testing.T) {
 		})
 	}
 
-	// The actions, the settings and the registry refresh.
-	assert.Equal(t, len(actionNames(h))+2, mutating)
+	// The actions, the settings, the registry and the validator ranges refresh.
+	assert.Equal(t, len(actionNames(h))+3, mutating)
 
 	for _, name := range actionNames(h) {
 		assert.Contains(t, routes, "POST /api/v1/actions/"+name)
