@@ -3,7 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { MockProfile } from '../mock/mockController';
-import { createHarness, renderWithApp, type Harness, PRIMARY } from '../test/harness';
+import { createHarness, fakeClock, renderWithApp, type Harness, PRIMARY } from '../test/harness';
 import { CLIENT_PAGE_SIZE, ClientsTab, defaultClient } from './ClientsTab';
 
 async function open(profile: MockProfile = 'staff', hash = ''): Promise<Harness & { onOpenTab: () => void }> {
@@ -127,7 +127,7 @@ describe('ClientsTab', () => {
   });
 
   it('asks for a page at a time, filtered on the controller, and again when the list changed', async () => {
-    const user = userEvent.setup();
+    const user = fakeClock();
     const h = await createHarness({ mode: 'open', fleet: 'large' });
     const calls = () => hostCalls(h);
     window.location.hash = '#clients/lighthouse';

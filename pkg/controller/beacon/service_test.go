@@ -515,6 +515,7 @@ func TestEndpointURLForms(t *testing.T) {
 func TestStartStopLifecycle(t *testing.T) {
 	store := newFakeStore(host("a", 0, 4))
 	h := newHarness(t, 1, store, func(o *Options) { o.PollInterval = 2 * time.Millisecond })
+	sent := h.countSent()
 
 	svc := New(h.log, h.opts)
 
@@ -565,15 +566,11 @@ func TestStartStopLifecycle(t *testing.T) {
 	require.NoError(t, svc.Stop())
 	require.NoError(t, svc.Stop(), "Stop twice is harmless")
 
-	// Nothing polls after Stop. A request the cancelled poll had already sent
-	// may still reach the node's handler after Stop returned: let it land
-	// before counting.
-	time.Sleep(20 * time.Millisecond)
-
-	before := h.node.totalRequests()
+	// Nothing polls after Stop.
+	before := sent.count()
 
 	time.Sleep(30 * time.Millisecond)
-	assert.Equal(t, before, h.node.totalRequests())
+	assert.Equal(t, before, sent.count())
 
 	health := svc.Health()
 	assert.Equal(t, testGenesis, health.GenesisTime)
@@ -582,6 +579,7 @@ func TestStartStopLifecycle(t *testing.T) {
 
 func TestContextCancelStopsPolling(t *testing.T) {
 	h := newHarness(t, 1, newFakeStore(), func(o *Options) { o.PollInterval = time.Millisecond })
+	sent := h.countSent()
 
 	ctx, cancel := context.WithCancel(t.Context())
 	svc := New(h.log, h.opts)
@@ -602,10 +600,10 @@ func TestContextCancelStopsPolling(t *testing.T) {
 		t.Fatal("Stop did not return after the context was cancelled")
 	}
 
-	before := h.node.totalRequests()
+	before := sent.count()
 
 	time.Sleep(30 * time.Millisecond)
-	assert.Equal(t, before, h.node.totalRequests())
+	assert.Equal(t, before, sent.count())
 }
 
 func TestSlowNodeDoesNotBlockHealthOrStop(t *testing.T) {

@@ -2,7 +2,9 @@
 // with every request recorded.
 
 import { render, type RenderResult } from '@testing-library/react';
+import userEvent, { type UserEvent } from '@testing-library/user-event';
 import type { ReactNode } from 'react';
+import { vi } from 'vitest';
 
 import { ApiClient, type FetchFn } from '../api/client';
 import { AppContext } from '../appContext';
@@ -45,6 +47,18 @@ export function recordingFetch(inner: FetchFn, calls: RecordedCall[]): FetchFn {
     });
     return inner(input, init);
   };
+}
+
+/**
+ * fakeClock puts the test on fake timers that move only when the test, user
+ * events or waitFor move them, so debounces fire at the same point however
+ * slow the machine is. waitFor steps the clock as it does Jest's fake timers.
+ * setup.ts restores the real timers after the test.
+ */
+export function fakeClock(): UserEvent {
+  vi.useFakeTimers();
+  vi.stubGlobal('jest', { advanceTimersByTime: (ms: number) => vi.advanceTimersByTime(ms) });
+  return userEvent.setup({ advanceTimers: ms => vi.advanceTimersByTime(ms) });
 }
 
 /**

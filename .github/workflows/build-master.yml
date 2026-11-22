@@ -20,6 +20,8 @@ jobs:
   check_source:
     name: "Run code checks"
     uses: ./.github/workflows/_shared-check.yaml
+    with:
+      build: false
 
   build_binaries:
     name: "Build Upgradoor"

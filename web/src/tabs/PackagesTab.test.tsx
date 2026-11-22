@@ -2,7 +2,7 @@ import { screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 
-import { createHarness, renderWithApp } from '../test/harness';
+import { createHarness, fakeClock, renderWithApp } from '../test/harness';
 import { PAGE_SIZE, PackagesTab } from './PackagesTab';
 
 /** names are the package names of the page on screen, in order. */
@@ -56,7 +56,7 @@ describe('PackagesTab', () => {
   });
 
   it('filters as the user types and starts the filtered list at its first page', async () => {
-    const user = userEvent.setup();
+    const user = fakeClock();
     const h = await createHarness({ mode: 'open' });
     renderWithApp(<PackagesTab />, h);
     await screen.findByRole('table', { name: 'Packages' });

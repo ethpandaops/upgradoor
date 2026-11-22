@@ -149,6 +149,38 @@ func (n *fakeNode) totalRequests() int {
 	return n.total
 }
 
+// sentCounter is a transport that counts the requests the service sends.
+// The count moves in the poll goroutine, so it is settled once Stop returned;
+// the node's count is not, a request sent before the cancel may still reach
+// its handler after that.
+type sentCounter struct {
+	mu   sync.Mutex
+	sent int
+}
+
+func (c *sentCounter) RoundTrip(req *http.Request) (*http.Response, error) {
+	c.mu.Lock()
+	c.sent++
+	c.mu.Unlock()
+
+	return http.DefaultTransport.RoundTrip(req)
+}
+
+func (c *sentCounter) count() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	return c.sent
+}
+
+// countSent makes the harness's service send through a sentCounter.
+func (h *harness) countSent() *sentCounter {
+	counter := &sentCounter{}
+	h.opts.HTTPClient = &http.Client{Transport: counter, Timeout: 2 * requestTimeout}
+
+	return counter
+}
+
 func writeJSON(w http.ResponseWriter, status int, body any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
