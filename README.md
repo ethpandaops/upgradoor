@@ -1,410 +1,186 @@
 # upgradoor
 
-Staged, health-gated image rolls, package upgrades and reboots for the Debian
-hosts of an ethpandaops devnet. One controller per devnet, one small agent per
-host.
+Staggered container rolls, package upgrades and reboots for the hosts of an
+ethpandaops devnet, gated on network health. One controller per devnet, one
+agent per host. upgradoor never creates containers: Ansible deploys them,
+upgradoor only recreates them on a newer digest of their tag (or an override).
 
-- The **agent** runs on every host. It watches the Docker containers, the
-  package state and the reboot flag, and reports them. It restarts nothing
-  by itself.
-- The **controller** runs in the devnet's service cluster. It looks up where
-  the image tags of the hosts point, groups what the
-  hosts need into rollouts and hands out slots ("leases") a few hosts at a
-  time, only while the network is healthy, and stops when a host fails.
+## How it works
 
-It replaces watchtower for the node containers and adds what watchtower never
-had: coordination across hosts, reboots, upgrades of the Docker packages, and
-one place to see which host runs what.
+- The **agent** (`upgradoor agent`, systemd) reports the host's containers,
+  blocked packages and reboot flag to the controller over outbound HTTPS. It
+  opens no port and changes nothing without a lease.
+- The **controller** (`upgradoor-controller run`) looks up the image tags at
+  their registries, groups the needs into rollouts and grants leases a few
+  hosts at a time:
+  - budget: validator weight (`maxUnavailablePercent`) and a host limit
+    (`maxLeasedPercent`);
+  - network gate: participation and finality lag from the beacon node;
+  - canary first, then the rest; a slot is released once the host is ready
+    (at head, peers, validators attesting).
+- Policies `auto` or `manual` per verb (`policyImage`, `policyPackages`,
+  `policyReboot`) and per client (`policyClients`). Settings are edited in the
+  UI; `--default-setting key=value` sets their defaults.
+- Web UI and API with logins from the devnet's authenticatoor. Actions need a
+  feature of the service `upgradoor` (`roll`, `reboot`, `hold`, `recover`,
+  `admin`, ...); client teams get `team_*` features for their own containers.
 
-## What it is not
+## Containers
 
-- No remote shell, no arbitrary command execution, no configuration
-  management. Ansible stays the tool for that.
-- No per-package vetting, no file-integrity monitoring, no intrusion
-  detection.
-- One controller per devnet. No multi-devnet controller, no high availability:
-  exactly one replica with one SQLite file.
-- It does not install security updates. `unattended-upgrades` does (the
-  `unattended_upgrades` Ansible role configures it); upgradoor only upgrades a
-  short list of *blocked* packages (Docker) and reboots.
-- It never moves a container to another tag or another image. It recreates a
-  container on the newer digest of the tag the container already uses.
+The containers carry two labels, set by Ansible:
 
-## Architecture
+- `io.ethpandaops.upgradoor.kind`: any kind (`el`, `cl`, `vc`, ...) makes the
+  container managed with node impact; `none` excludes it.
+- `io.ethpandaops.upgradoor.team`: the owning team, the client name (`geth`).
+  Rollouts are per team and kind. Containers without a team form one rollout
+  per kind across the fleet, which only staff may act on.
+
+Unlabelled containers follow `defaultPolicy` in `agent.yaml`: `ignore`
+(default) or `roll` (rolled as independent, without gate or budget).
+
+## Host files
+
+`/etc/upgradoor/agent.yaml`:
+
+```yaml
+controller:
+  url: https://upgradoor.<network_subdomain>
+  publicKey: <output of keygen controller-pubkey>
+roles: [ethereum_node]
+verbs: [roll, packages, reboot]
+defaultPolicy: ignore
+overridesFile: /home/devops/upgradoor-overrides.yaml  # omit to disable overrides
+packages:
+  blocked: [docker-ce, containerd.io]
+probes:
+  el: http://127.0.0.1:8545
+  cl: http://127.0.0.1:5052
+commands:
+  upgradePackages: [/usr/bin/sudo, -n, /usr/local/lib/upgradoor/upgrade-packages]
+  reboot: [/usr/bin/sudo, -n, /usr/bin/systemctl, reboot]
+```
+
+Other keys (unknown keys are an error): `keyFile`, `certFile`, `stateDir`,
+`entryUser`, `managedFile`, `socket`, `auditLog`, `docker`, `verify`, and
+`kindPolicies` + `fallback` (rolls while the controller is unreachable).
+
+- `/etc/upgradoor/managed.yaml`: what Ansible deployed each container as
+  (image, command), written by `upgradoor deploy`.
+- Overrides file (only with `overridesFile`): a per-container image and/or
+  command for a while. A command override replaces the whole command.
+- Holds (local and controller) are kept in the agent's state in `stateDir`.
+
+On-host commands (via the agent's socket, root and the entry user's group):
 
 ```
- host (Debian + Docker)                     service cluster (k8s, per devnet)
- ┌───────────────────────────┐              ┌──────────────────────────────┐
- │ upgradoor agent (systemd) │  HTTPS poll  │ upgradoor-controller run     │
- │  - docker socket          │ ───────────> │  - scheduler / leases        │
- │  - image pulls            │  cert+proof  │  - SQLite on a PVC           │
- │  - apt / kernel / reboot  │ <─────────── │  - beacon liveness + gate    │
- │  - local EL/CL probes     │ signed lease │  - registry lookups          │
- └───────────────────────────┘  + directives │  - API + embedded web UI     │
-                                             └──────────────────────────────┘
-                                                 ▲                ▲
-                                   in-cluster beacon node   authenticatoor JWKS
+upgradoor list                  managed containers, images, commands, overrides
+upgradoor status                hold, open needs, lease, requested rolls
+upgradoor roll <container>...   request a roll and follow it
+upgradoor override set|clear    set or clear an override (--image, --add-flag, --remove-flag, --until)
+upgradoor init-overrides        lay out the overrides file
+upgradoor hold [reason]         hold the host; upgradoor release lifts it
+upgradoor deploy <container>    record what Ansible deployed (root only)
+upgradoor key                   create the host key, print its public key
+upgradoor verify-cert           print what a host certificate certifies
 ```
 
-- One Go module, two binaries: `upgradoor` on every host (`upgradoor agent`
-  and the on-host commands `upgradoor list`, `status`, `roll`, `override`,
-  `hold`, …) and `upgradoor-controller` in the cluster
-  (`upgradoor-controller run`, `upgradoor-controller keygen`). The host binary
-  links nothing of the controller.
-- The agent opens no port. Every exchange is an outbound HTTPS request from the
-  agent to `https://upgradoor.<network_subdomain>`: a sync every 30 s, every
-  5 s while it holds a lease.
-- The protocol is level-triggered. Every sync restates the host's full state
-  and open needs, every answer restates the host's lease and directives. A lost
-  message or a restart on either side loses nothing.
+## Validators
 
-## Security model
+The controller reads the devnet's validator name inventory from
+`--validator-ranges-url` (e.g.
+`https://config.<network_subdomain>/api/v1/nodes/validator-ranges`). Only
+validators with an attestation duty count toward the budget and readiness.
+Without the URL no host has validators and the budget is only the host limit.
 
-- **Both sides prove who they are, and not through DNS or TLS.** Every agent
-  request carries a host certificate and a proof signed with the host key.
-  Every controller answer an agent acts on carries a signature of the devnet's
-  controller key over the answer, the host it is for and the request it
-  answers. An agent takes no lease and no directive from an answer without
-  that signature: not from whoever took over the DNS name, obtained a TLS
-  certificate for it or sits in a proxy in front of the controller, and not
-  from a replayed answer or one meant for another host.
-- **One secret in the cluster: the controller seed.** It is one entry per
-  devnet group in the cluster's secrets file, mounted into the controller as
-  a file. The controller derives its signing key from it at start, for its
-  own network; nothing is generated at run time and nothing
-  has to be fetched from a running controller. Everything else the controller
-  holds is public: the signer public key for agents, the authenticatoor's
-  public keys for users. Whoever holds the controller seed of a group can
-  sign answers for the devnets of that group, which lets them order the
-  closed verb set below, and nothing else.
-- **Two seeds, two purposes.** The *devnet seed*, `secret_upgradoor_seed` in
-  the devnet's sops file, yields the signer key that certifies the hosts. It
-  never reaches a host or the cluster. A host creates its own key
-  (`upgradoor key`), which never leaves it; the certificate binds the host's
-  name and network to its public key. The *controller seed*,
-  `secret_upgradoor_controller_seed`, yields the controller key of each
-  devnet of a group. It is in the cluster and in the devnet repository's
-  sops file, never on a host: a host holds only its own key and the
-  controller's public key, so no host can sign for the controller.
-- **Post-quantum identity.** Signer, controller and host keys are ML-DSA-44
-  (FIPS 204, Go `crypto/mldsa`), and nothing else: no hybrid with a classical
-  signature. Host certificates, request proofs and answer signatures are
-  ML-DSA-44 signatures, because signatures of the elliptic-curve class are
-  not safe against a quantum attacker. The derivation from the seeds (HKDF-SHA256) is symmetric
-  and not affected. Two things are outside upgradoor's control and are not
-  post-quantum: the user-login tokens, which the authenticatoor issues and
-  signs (RS256), and TLS, which is the ingress's.
-- **Closed verb set.** An agent can do three things, each only under a lease
-  and only if its local configuration allows the verb: `roll` a managed
-  container, upgrade the configured blocked `packages`, `reboot`. The
-  controller cannot widen that set.
-- **Digest verification.** A roll happens only if the locally pulled image for
-  the container's own tag has exactly the digest named in the lease.
-- **Local hold.** `upgradoor hold "<reason>"` on a host (or a `hold: local:`
-  entry in the overrides file) and the agent requests nothing and refuses all
-  work. Nothing the controller sends can lift it; `upgradoor release` does.
-- **The host decides what is managed.** The agent manages the containers
-  Ansible labelled with a roll group; what a group allows (verbs, overrides,
-  owners) is in the host's `agent.yaml`. A container pinned to a digest is
-  never rolled. The overrides file is read only as a regular file with one
-  name, not through a symbolic link, in a directory that no user other than
-  root could replace.
-- **Public vs authenticated data.** Without a login the API serves host names,
-  the EL and CL image of each host (tag, digest, revision), an update-pending
-  marker and chain health. Kernels, OS details, package versions, addresses,
-  rollouts, settings, the audit log and all actions need a token from the
-  devnet's authenticatoor. `/metrics` is unauthenticated and carries fleet-wide
-  counts only; the helm chart keeps it off the Ingress.
-- **A token reads; a feature acts.** Every valid token may read. Each action
-  needs a feature of the service `upgradoor` in the token (`roll`, `reboot`,
-  `hold`, `recover`, `supervise`, `admin`), which the
-  authenticatoor's grants hand out and which nobody has by default. A client
-  team gets the team twins instead (`upgradoor:team_*`): its members may roll
-  the containers their team owns, and reboot, hold and recover the hosts on
-  which it owns one, always staggered and through the budget and the gate.
-  A team lifts only the holds it set itself, and retries its hosts, not
-  rollouts. `force`, "ignore budget", acting on the whole fleet, forgetting
-  hosts, the global pause and the settings need `admin`. Who owns a container is what the host's own
-  agent configuration says. The audit log records the teams of the login and
-  the feature that allowed each action.
+## Security
+
+- Each host creates its own ML-DSA key (`upgradoor key`). Its certificate is
+  issued with the devnet seed: `upgradoor-controller keygen host-cert
+  --network <n> --hostname <h> --public-key <key>`.
+- The controller signs its answers with a key derived from the controller
+  seed (`--controller-seed-file`); agents pin its public key
+  (`controller.publicKey`) and act on nothing else.
+- The agent runs as user `upgradoor` with two sudo rules (package upgrade,
+  reboot) and does only the verbs its `agent.yaml` allows.
+- Hosts install only signed releases (below).
 
 ## Releases and signing
 
 Hosts install only releases whose `upgradoor-manifest.txt` is signed by a key
-in `deploy/allowed_signers`. The manifest lists the sha256 of every binary and
-the controller image digest. The installer checks the signature against its
-own pinned copy of that file, then installs a binary only if its hash matches
-(see Installing on a host). CI builds, but never signs.
+in `deploy/allowed_signers`. CI builds but never signs.
 
-1. Run the `Build release` workflow with version `X.Y.Z`. CI builds
-   reproducible binaries, pushes the controller image by digest, writes the
-   manifest and opens a draft release.
-2. A signer runs `scripts/sign-release.sh vX.Y.Z` with a FIDO security key
-   plugged in. The script downloads the draft, rebuilds the binaries from the
-   tag, checks they are identical, and checks the image. It then prints the
-   manifest, signs it with one touch of the key and uploads the signature.
-3. Publish the draft. CI verifies the signature and only then tags the
-   signed image `vX.Y.Z` and `latest`.
+1. Run the `Build release` workflow with version `X.Y.Z`: reproducible
+   binaries, the controller image by digest, the manifest, a draft release.
+2. A signer runs `scripts/sign-release.sh vX.Y.Z` with a FIDO key plugged in.
+   It rebuilds from the tag, checks binaries and image against the manifest,
+   signs with one touch and uploads the signature.
+3. Publish the draft. CI verifies the signature, then tags the image
+   `vX.Y.Z` and `latest`.
 
-To become a signer, run `scripts/enroll-signer.sh "<your name>" --add`. It
-creates a key on your security key (`~/.ssh/upgradoor-release`), checks that
-it signs, and adds your line to `deploy/allowed_signers`. The same line must
-also go into `roles/upgradoor_agent/files/allowed_signers` of
-ansible-collection-general, through review in both repositories.
+New signers run `scripts/enroll-signer.sh "<name>" --add` and get the line
+into `deploy/allowed_signers` here and in
+`roles/upgradoor_agent/files/allowed_signers` of ansible-collection-general.
 
-## Installing on a host
+## Development
 
-The `upgradoor_agent` role of ansible-collection-general installs the agent.
-Per host it copies `install.sh`, which runs on the host: it downloads the
-manifest, its signature and the binary for the host's architecture, verifies
-them (`ssh-keygen -Y verify` against the pinned `allowed_signers`, the sha256
-of the binary, no downgrade), installs the binary, creates the host key with
-`upgradoor key` if there is none and reports the key's public half. The key
-is mode 0640, owned by root and the group `upgradoor` of `/etc/upgradoor`,
-through which the agent (user `upgradoor`) reads it.
-
-Only when the host has no certificate for that key and name does the role
-issue one on the Ansible controller, from the devnet seed in the release
-image:
+Needs Go 1.27+ and, for the web UI, Node 24.
 
 ```sh
-docker run --rm -i --network none -e UPGRADOOR_SEED ghcr.io/ethpandaops/upgradoor@<digest> \
-  keygen host-cert --network <network> --hostname <host> --public-key <public key>
+make build       # bin/upgradoor and bin/upgradoor-controller (UI embedded)
+make test        # Go tests (-race) and web tests
+make lint        # golangci-lint, eslint, prettier
+make wire        # regenerate the web UI's wire schema from the Go types
+make test-docker # container recreate against a real Docker daemon
+make test-system # package upgrades and reboots in a systemd container
+make test-reboot # agents under systemd across real reboots
+make e2e         # Kurtosis devnet with real clients
 ```
 
-`upgradoor verify-cert --network <network> --signer-public-key <key> < host.crt`
-on the host prints the hostname, network and public key a certificate
-certifies. The public keys the role and the controller need are derived once
-and kept as inventory variables; a seed file of `-` reads the seed from
-standard input:
+Local quick start with a fake beacon, a fake registry and one fake host
+(touches nothing on the machine):
 
 ```sh
-sops -d --extract '["secret_upgradoor_seed"]' all.sops.yaml |
-  docker run --rm -i ghcr.io/ethpandaops/upgradoor keygen signer-pubkey --network <network> --seed-file -
-sops -d --extract '["secret_upgradoor_controller_seed"]' all.sops.yaml |
-  docker run --rm -i ghcr.io/ethpandaops/upgradoor keygen controller-pubkey --network <network> \
-    --controller-seed-file -
-```
-
-## Build, test, lint
-
-Needs Go 1.27 or newer (`crypto/mldsa`). The web UI needs Node 24.
-
-```sh
-make build        # bin/upgradoor (hosts) and bin/upgradoor-controller with the web UI embedded
-                  # (rebuilds web/dist when a web source changed)
-make test         # go test -race ./... and the web UI tests
-make lint         # golangci-lint and eslint + prettier
-make wire         # regenerates web/src/api/wire.schema.json and wire.golden.json from the Go types
-```
-
-`go build ./...` and `go test ./...` work without Node: without the
-`webui` build tag the controller serves a placeholder page instead of the UI.
-
-More suites need Docker: `make test-docker` (container recreate against real
-containers), `make test-system` (package upgrades and reboots in a systemd
-container), `make test-reboot` (agents under systemd whose leases survive real
-reboots) and `make e2e` (a Kurtosis devnet with real beacons and tokens; CI
-runs it nightly and on pull requests labelled `e2e`).
-
-## Quick start for local development
-
-This runs a controller and three agents against **fake hosts**, plus a fake
-beacon node and a fake registry. `test/fakeagent` runs the agent on an
-in-memory host described by a scenario file. It does not talk to Docker, apt
-or systemd and touches nothing on the machine. `test/fakeregistry` answers
-the controller's tag lookups from the same scenario files, so the images are
-named under its address.
-
-Run everything from the repository root. All files go to `.tmp/dev`, which is
-ignored by git.
-
-```sh
-make build
-mkdir -p .tmp/dev/data
-
-# A throwaway seed. keygen reads it from the environment or a file (- is
-# standard input), never from an argument.
+make build && mkdir -p .tmp/dev/data && cd .tmp/dev
 export UPGRADOOR_SEED=$(openssl rand -hex 32)
-bin/upgradoor-controller keygen signer-pubkey --network dev > .tmp/dev/signer.pub
-
-# The controller seed is a second secret, not the seed above. The controller
-# derives the key it signs its answers with from it at start. The agents get
-# the public half and act on nothing that is not signed with it.
-(umask 077 && openssl rand -hex 32 > .tmp/dev/controller.seed)
-controller_pub=$(bin/upgradoor-controller keygen controller-pubkey --network dev \
-    --controller-seed-file .tmp/dev/controller.seed)
-
-# The fake registry's address, and digests for the images.
-reg=127.0.0.1:5050
-digest() { printf 'sha256:%064d' "$1"; }
-
-for h in node-1 node-2 bootnode-1; do
-  mkdir -p .tmp/dev/$h
-  role=ethereum_node; [ $h = bootnode-1 ] && role=bootnode
-
-  # The host creates its key; the certificate is issued for its public half.
-  pub=$(bin/upgradoor key --path .tmp/dev/$h/host.key)
-  bin/upgradoor-controller keygen host-cert --network dev --hostname $h --public-key "$pub" \
-      > .tmp/dev/$h/host.crt
-
-  cat > .tmp/dev/$h/agent.yaml <<EOF
-controller:
-  url: http://127.0.0.1:8080
-  allowInsecure: true
-  publicKey: "$controller_pub"
-  syncInterval: 5s
-keyFile: .tmp/dev/$h/host.key
-certFile: .tmp/dev/$h/host.crt
-roles: [$role]
-stateDir: .tmp/dev/$h/state
-overridesFile: .tmp/dev/$h/overrides.yaml
-socket: {path: .tmp/dev/$h/agent.sock}
+openssl rand -hex 32 > controller.seed
+../../bin/upgradoor-controller keygen signer-pubkey --network dev > signer.pub
+cpub=$(../../bin/upgradoor-controller keygen controller-pubkey --network dev --controller-seed-file controller.seed)
+pub=$(../../bin/upgradoor key --path host.key)
+../../bin/upgradoor-controller keygen host-cert --network dev --hostname node-1 --public-key "$pub" > host.crt
+cat > agent.yaml <<EOF
+controller: {url: http://127.0.0.1:8080, allowInsecure: true, publicKey: "$cpub"}
+keyFile: host.key
+certFile: host.crt
+stateDir: state
+managedFile: managed.yaml
+socket: {path: agent.sock}
 verbs: [roll, packages, reboot]
-groups:
-  execution: {client: geth, owners: [geth], overrides: [image, flags], stopTimeout: 5s}
-  consensus: {client: lighthouse, owners: [lighthouse], overrides: [image], stopTimeout: 5s}
-  proxy: {stopTimeout: 5s}
-packages:
-  blocked: [docker-ce]
-verify:
-  window: 5s
-  timeout: 1m
 EOF
-
-  cat > .tmp/dev/$h/host.yaml <<EOF
-os: {id: debian, versionId: "13", prettyName: Debian GNU/Linux 13, arch: amd64}
-runningKernel: 6.12.41-amd64
-newestKernel: 6.12.41-amd64
+cat > host.yaml <<EOF
+os: {id: debian, versionId: "13", arch: amd64}
 containers:
-  - {name: geth, image: "$reg/ethpandaops/geth:master", digest: "$(digest 1)", command: ["--http", "--maxpeers=50"],
-     group: execution, kind: el}
-  - {name: beacon, image: "$reg/sigp/lighthouse:latest", digest: "$(digest 2)", command: ["bn", "--http"],
-     group: consensus, kind: cl}
-  - {name: validator, image: "$reg/sigp/lighthouse:latest", digest: "$(digest 2)", command: ["vc"],
-     group: consensus, kind: vc}
-  - {name: nginx, image: "$reg/nginx:stable", digest: "$(digest 3)", group: proxy, kind: other}
-registry:
-  "$reg/ethpandaops/geth:fix": {digest: "$(digest 9)"}
-packages:
-  blocked: [docker-ce]
-  installed:
-    - {name: docker-ce, version: "28.0", arch: amd64}
+  - {name: geth, image: "127.0.0.1:5050/ethpandaops/geth:master", digest: "sha256:$(printf '%064d' 1)", kind: el, team: geth}
 EOF
-done
-unset UPGRADOOR_SEED
 ```
 
-Start the processes, each in its own terminal:
+Then, each in its own terminal from `.tmp/dev`:
 
 ```sh
-# A minimal beacon API: a healthy chain on which validators 0..63 attest.
-go run ./test/e2e/fakebeacon --listen 127.0.0.1:5052
+go run ../../test/e2e/fakebeacon --listen 127.0.0.1:5052
+go run ../../test/fakeregistry --scenario host.yaml
+../../bin/upgradoor-controller run --listen 127.0.0.1:8080 --data-dir data --network dev \
+  --signer-public-key "$(cat signer.pub)" --controller-seed-file controller.seed \
+  --allow-insecure-agent-http --allow-open-api --beacon-endpoint http://127.0.0.1:5052 \
+  --registry-plain-http 127.0.0.1:5050 --registry-allow-private --default-setting lookupInterval=30s
+go run ../../test/fakeagent --config agent.yaml --scenario host.yaml --registry 127.0.0.1:5050
 ```
+
+Open <http://127.0.0.1:8080> and move the tag to see a rollout:
 
 ```sh
-# The tags of the fake hosts: the three scenarios hold the same.
-go run ./test/fakeregistry --listen 127.0.0.1:5050 --scenario .tmp/dev/node-1/host.yaml
+curl -X POST http://127.0.0.1:5050/tags \
+  -d "{\"ref\":\"ethpandaops/geth:master\",\"digest\":\"sha256:$(printf '%064d' 2)\"}"
 ```
-
-```sh
-# The registry is on a loopback address and speaks plain http; a real
-# controller needs neither of the two registry flags.
-bin/upgradoor-controller run \
-    --listen 127.0.0.1:8080 --data-dir .tmp/dev/data \
-    --network dev --signer-public-key "$(cat .tmp/dev/signer.pub)" \
-    --controller-seed-file .tmp/dev/controller.seed \
-    --allow-insecure-agent-http --allow-open-api \
-    --registry-plain-http 127.0.0.1:5050 --registry-allow-private \
-    --default-setting lookupInterval=30s \
-    --beacon-endpoint http://127.0.0.1:5052
-```
-
-```sh
-go run ./test/fakeagent --config .tmp/dev/node-1/agent.yaml --scenario .tmp/dev/node-1/host.yaml \
-    --registry 127.0.0.1:5050 --control 127.0.0.1:7771
-```
-
-```sh
-go run ./test/fakeagent --config .tmp/dev/node-2/agent.yaml --scenario .tmp/dev/node-2/host.yaml \
-    --registry 127.0.0.1:5050 --control 127.0.0.1:7772
-```
-
-```sh
-go run ./test/fakeagent --config .tmp/dev/bootnode-1/agent.yaml --scenario .tmp/dev/bootnode-1/host.yaml \
-    --registry 127.0.0.1:5050 --control 127.0.0.1:7773
-```
-
-`allowInsecure` and `--allow-insecure-agent-http` only permit plain http on
-the loopback interface. The answers are signed and verified as in production:
-an agent started against a controller with another controller key (another
-controller seed) logs
-`refused the controller's answer` and does nothing. (The opt-outs
-`--allow-unsigned-agent-answers` and `controller.allowUnsignedAnswers` exist
-for development without keys; the quick start does not need them.)
-
-Open <http://127.0.0.1:8080>. With `--allow-open-api` (no `--auth-provider-url`) the API is open, so
-every tab is visible and every action allowed without a login. To try the
-permissions, run the auth stub and start the controller with
-`--auth-provider-url http://127.0.0.1:18099`; `--services` and `--teams` of
-the stub choose who the login button logs in.
-
-Make something happen through the fake registry and a fake host's control
-endpoint:
-
-```sh
-# The lighthouse tag moves to a new digest.
-curl -s -X POST -d "{\"ref\":\"sigp/lighthouse:latest\",\"digest\":\"$(printf 'sha256:%064d' 4)\"}" \
-    http://127.0.0.1:5050/tags
-
-# A reboot becomes necessary on node-1.
-curl -s -X POST -d '{"required":true}' http://127.0.0.1:7771/reboot-required > /dev/null
-```
-
-What to expect within the lookup interval (30 seconds here, 5 minutes by
-default):
-
-- The controller looks the tag up (it logs `tag points at a new digest`) and
-  tells the three hosts in their sync answers.
-- A group rollout of `consensus` opens: one lease per host pulls the new
-  image and then recreates the beacon node and the validator client together. One host goes first as the canary (none of the
-  fake hosts has validators, so it is the first host that reports the new
-  digest, or the first of those by name); when
-  it is ready the other two follow one after the other (the host limit is 1
-  for three hosts).
-- A reboot rollout opens for `node-1` and waits: `waiting for approval (policy
-  manual)`. Approve it on the rollout card to see a (simulated) reboot.
-
-Overrides and the on-host commands work on the fake hosts too. The **Clients**
-tab lists the hosts per client; "Image…" on a geth row sets an image override
-(`127.0.0.1:5050/ethpandaops/geth:fix` is in the fake registry; the group `execution` allows
-image overrides), which the agent writes into the host's `overrides.yaml` and
-applies under a lease. On the "node", the same through the agent's socket:
-
-```sh
-export UPGRADOOR_SOCKET=.tmp/dev/node-1/agent.sock
-bin/upgradoor init-overrides   # the generated block of .tmp/dev/node-1/overrides.yaml
-bin/upgradoor list             # containers, images, flags, overrides
-bin/upgradoor override set geth --add-flag --pprof --remove-flag --maxpeers --until 10m --reason "profiling"
-bin/upgradoor roll beacon      # waits and prints: resolving, queued, recreated, verified, done
-bin/upgradoor override clear geth
-```
-
-Editing `.tmp/dev/node-1/overrides.yaml` by hand does the same; the agent
-notices within a sync. What the host recorded of all this is in
-`.tmp/dev/node-1/state/audit.log`. (A Unix socket path is limited to about
-100 characters; from a deeply nested checkout give `socket.path` a shorter
-one.)
-
-The fake hosts have no validators on purpose. Serve a validator ranges
-inventory such as `{"ranges": {"0-31": "node-1"}}` (inclusive index ranges by
-hostname) and pass its URL with `--validator-ranges-url` to give one some: the
-fake beacon node's blocks carry a full attestation of every committee, so the
-controller counts those validators as attesting, slot by slot and per epoch,
-and the gate opens on that participation. On a devnet the controller reads the
-inventory the config service publishes,
-`https://config.<network_subdomain>/api/v1/nodes/validator-ranges`. For
-validators that really attest, use the Kurtosis run (`make e2e`).
 
 ## License
 
