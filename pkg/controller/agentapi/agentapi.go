@@ -11,6 +11,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -44,11 +45,6 @@ const (
 	// auditWriteTimeout bounds the write of identity audit entries, which
 	// does not end with the request.
 	auditWriteTimeout = 5 * time.Second
-
-	// validatorAuditInterval is the least time between two audit entries
-	// about the validator range of one host. A range is something a host
-	// says about itself, as often as it likes; every change is logged.
-	validatorAuditInterval = time.Minute
 
 	// agentActorPrefix prefixes the host name in audit entries written on
 	// behalf of an agent.
@@ -419,7 +415,7 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 	}
 
 	req.Containers = cleanContainers(req.Containers)
-	req.Validators = cleanValidators(req.Validators)
+	req.Roles = cleanRoles(req.Roles)
 
 	now := s.now().UTC()
 	remote := s.remoteAddr(r)
@@ -437,8 +433,7 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 		return nil, fmt.Errorf("record sync of %s: %w", cert.Subject, err)
 	}
 
-	s.auditIdentity(ctx, append(s.identityAudit(cert, result, remote),
-		s.validatorAudit(cert, req.Validators, result, remote)...))
+	s.auditIdentity(ctx, s.identityAudit(cert, result, remote))
 
 	assignment, err := s.opts.Scheduler.Assignment(ctx, cert.Subject)
 	if err != nil {
@@ -501,176 +496,29 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 	return resp, nil
 }
 
-// cleanValidators checks the validator range a host reports before it is
-// stored and counted. A range that is out of bounds, or a state this build
-// does not know, is kept as a report of an invalid range with the reason:
-// the host then counts as one that does not know its range, never as one
-// with the range it claimed.
-func cleanValidators(in *protocol.Validators) *protocol.Validators {
-	if in == nil {
-		return nil
-	}
+// cleanRoles keeps the valid role names a host reports, sorted, without
+// duplicates and at most protocol.MaxRoles.
+func cleanRoles(in []string) []string {
+	out := make([]string, 0, min(len(in), protocol.MaxRoles))
 
-	out := *in
-
-	if err := out.Validate(); err != nil {
-		out.State = protocol.ValidatorsInvalid
-		out.Error = "refused by the controller: " + err.Error()
-	}
-
-	if !out.Known() {
-		out.Start, out.End = 0, 0
-	}
-
-	if len(out.Error) > 256 {
-		out.Error = out.Error[:256]
-	}
-
-	if len(out.Source) > 32 {
-		out.Source = out.Source[:32]
-	}
-
-	return &out
-}
-
-// validatorAudit builds the audit entries about the validator range of a
-// sync: one when the range counted for the host changed, and one when the
-// host starts to report validators that are counted for other hosts (once
-// per episode: until the overlap is gone or is with other hosts). A range is
-// what a host says about itself, so neither is refused; both are logged and
-// audited, at most one entry of each kind per host and validatorAuditInterval.
-func (s *Handler) validatorAudit(
-	cert *identity.Certificate, reported *protocol.Validators, result *store.SyncResult,
-	remote string,
-) []fleet.AuditEntry {
-	if result == nil || result.Host == nil {
-		return nil
-	}
-
-	entries := make([]fleet.AuditEntry, 0, 2)
-	before, after := result.ValidatorsBefore, result.Host.Validators
-	changed := !result.Created && (before.Count() != after.Count() ||
-		(before != nil && after != nil && *before != *after))
-
-	rangeDetail := func(r *identity.ValidatorRange) any {
-		if r == nil {
-			return nil
-		}
-
-		return map[string]any{"start": r.Start, "end": r.End}
-	}
-
-	detail := func() map[string]any {
-		d := map[string]any{
-			"counted":        rangeDetail(after),
-			detailRemoteAddr: remote,
-		}
-
-		if reported != nil {
-			d["reported"] = reported
-		}
-
-		return d
-	}
-
-	if changed {
-		s.log.WithFields(logrus.Fields{
-			keyHost: cert.Subject, "before": rangeDetail(before), keyAfter: rangeDetail(after),
-		}).Info("Validator range of a host changed")
-
-		if s.validatorAuditDue("changed:" + cert.Subject) {
-			d := detail()
-			d["before"] = rangeDetail(before)
-
-			entries = append(entries, fleet.AuditEntry{
-				Time:   s.now().UTC(),
-				Actor:  agentActorPrefix + cert.Subject,
-				Action: "host.validators-changed",
-				Target: cert.Subject,
-				Detail: d,
-			})
+	for _, role := range in {
+		if identity.ValidateName(role) == nil {
+			out = append(out, role)
 		}
 	}
 
-	if s.overlapEpisodeBegins(cert.Subject, result.ValidatorOverlaps) {
-		s.log.WithFields(logrus.Fields{
-			keyHost: cert.Subject, "with": result.ValidatorOverlaps,
-			"counted": rangeDetail(after),
-		}).Warn("Host reports validators that are counted for other hosts; " +
-			"no validator is counted twice")
+	slices.Sort(out)
+	out = slices.Compact(out)
 
-		if s.validatorAuditDue("overlap:" + cert.Subject) {
-			d := detail()
-			d["with"] = result.ValidatorOverlaps
-
-			entries = append(entries, fleet.AuditEntry{
-				Time:   s.now().UTC(),
-				Actor:  agentActorPrefix + cert.Subject,
-				Action: "host.validators-overlap",
-				Target: cert.Subject,
-				Detail: d,
-			})
-		}
-	}
-
-	return entries
-}
-
-// overlapEpisodeBegins records the hosts a host's reported range overlaps
-// with and reports whether that is a new episode: there is an overlap and it
-// is not the one recorded.
-func (s *Handler) overlapEpisodeBegins(host string, with []string) bool {
-	s.auditMu.Lock()
-	defer s.auditMu.Unlock()
-
-	key := strings.Join(with, ",")
-	if key == "" {
-		delete(s.overlapAudited, host)
-
-		return false
-	}
-
-	if s.overlapAudited[host] == key {
-		return false
-	}
-
-	if s.overlapAudited == nil {
-		s.overlapAudited = make(map[string]string, 4)
-	}
-
-	s.overlapAudited[host] = key
-
-	return true
-}
-
-// validatorAuditDue reports whether an audit entry of the kind and host in
-// key is to be written now: at most one per validatorAuditInterval.
-func (s *Handler) validatorAuditDue(key string) bool {
-	s.auditMu.Lock()
-	defer s.auditMu.Unlock()
-
-	now := s.now()
-
-	if last, ok := s.validatorsAudited[key]; ok && now.Sub(last) < validatorAuditInterval {
-		return false
-	}
-
-	if s.validatorsAudited == nil {
-		s.validatorsAudited = make(map[string]time.Time, 4)
-	}
-
-	s.validatorsAudited[key] = now
-
-	return true
+	return out[:min(len(out), protocol.MaxRoles)]
 }
 
 // cleanContainers makes what a host reports about its containers unambiguous
 // before it is stored, because what is stored is what authorizes. A container
 // name stands for one container: Docker has no two of a name, so of several
-// entries with one name the first is kept and the others are dropped. Owners
-// are kept only in the form a team name has, and only for the containers the
-// host manages; a client only in the form a client name has, for a managed
-// execution, consensus or validator client.
+// entries with one name the first is kept and the others are dropped. A kind
+// and a team are kept only in the form of a name, and only for the
+// containers the host manages; a team only next to a kind.
 func cleanContainers(in []protocol.Container) []protocol.Container {
 	out := make([]protocol.Container, 0, len(in))
 	seen := make(map[string]struct{}, len(in))
@@ -683,15 +531,14 @@ func cleanContainers(in []protocol.Container) []protocol.Container {
 		}
 
 		seen[c.Name] = struct{}{}
-		c.Owners = protocol.CleanOwners(c.Owners)
-
-		if !c.Managed {
-			c.Owners = nil
+		// A team is a name that authorizes, the page lists and a setting is
+		// keyed by.
+		if !c.Managed || c.Kind == protocol.KindNone || (c.Kind != "" && !protocol.ValidKind(c.Kind)) {
+			c.Kind = ""
 		}
 
-		// A client is a name the page lists and a setting is keyed by.
-		if !c.Managed || c.Kind == protocol.KindOther || !protocol.ValidClient(c.Client) {
-			c.Client = ""
+		if c.Kind == "" || !protocol.ValidOwner(c.Team) {
+			c.Team = ""
 		}
 
 		out = append(out, c)
@@ -715,7 +562,7 @@ func (s *Handler) identityAudit(
 	if result.Created {
 		detail := map[string]any{
 			detailCertHash:   cert.Hash,
-			"roles":          cert.Roles,
+			"roles":          result.Host.Roles,
 			"validators":     result.Host.Weight(),
 			detailRemoteAddr: remote,
 		}

@@ -21,6 +21,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 // The features of this service, as they are written in a grant of the
@@ -400,11 +401,11 @@ func (s *authorizer) uncovered(ctx context.Context, teams []string, t *Targets) 
 			return fmt.Sprintf("does not cover rollout %s (owners: none)", Echo(t.rollout)), nil
 		case err != nil:
 			return "", fmt.Errorf("authorize: get rollout %s: %w", Echo(t.rollout), err)
-		case r.Client == "":
-			return fmt.Sprintf("does not cover rollout %s: it is for no client", Echo(t.rollout)), nil
+		case r.Team == "":
+			return fmt.Sprintf("does not cover rollout %s: it is for no team", Echo(t.rollout)), nil
 		}
 
-		client = r.Client
+		client = r.Team
 	}
 
 	if t.lease != "" {
@@ -468,7 +469,7 @@ func OwnershipOf(hosts []*fleet.Host) map[string]*hostOwnership {
 			for i := range host.Status.Containers {
 				if c := &host.Status.Containers[i]; c.Managed {
 					own.containers = append(own.containers, containerOwners{
-						name: c.Name, owners: c.Owners, notRolled: c.NotRolled != "",
+						name: c.Name, owners: teamOf(c), notRolled: c.NotRolled != "",
 					})
 				}
 			}
@@ -480,6 +481,15 @@ func OwnershipOf(hosts []*fleet.Host) map[string]*hostOwnership {
 	return known
 }
 
+// teamOf is the owners of a container: its team, if it has one.
+func teamOf(c *protocol.Container) []string {
+	if c.Team == "" {
+		return nil
+	}
+
+	return []string{c.Team}
+}
+
 // hostOwnership is what the team rule reads of one host.
 type hostOwnership struct {
 	// containers are the managed containers with their owners.
@@ -489,13 +499,13 @@ type hostOwnership struct {
 	holdBy string
 }
 
-// containerOwners is one managed container of a host with its owners.
+// containerOwners is one managed container of a host with its owners (its
+// team; none for a container without one, which is staff's).
 type containerOwners struct {
 	name   string
 	owners []string
-	// notRolled: the host rolls the container to nothing (pinned, linked, or
-	// of the default group on a host that does not roll it), so a roll of
-	// the whole host does not touch it.
+	// notRolled: the host rolls the container to nothing (pinned or linked),
+	// so a roll of the whole host does not touch it.
 	notRolled bool
 }
 
@@ -582,15 +592,15 @@ func UncoveredClient(teams []string, client string, hosts []*fleet.Host) string 
 
 		for i := range host.Status.Containers {
 			c := &host.Status.Containers[i]
-			if !c.Managed || c.Client != client {
+			if !c.Managed || c.Team != client {
 				continue
 			}
 
 			found = true
 
-			if !ownedBy(teams, c.Owners) {
+			if !ownedBy(teams, teamOf(c)) {
 				return fmt.Sprintf("does not cover client %s: container %s on host %s (owners: %s)",
-					Echo(client), Echo(c.Name), Echo(host.Name), ownerList(c.Owners))
+					Echo(client), Echo(c.Name), Echo(host.Name), ownerList(teamOf(c)))
 			}
 		}
 	}

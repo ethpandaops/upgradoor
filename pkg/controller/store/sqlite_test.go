@@ -87,13 +87,12 @@ func countRows(t *testing.T, s Store, table string) int {
 	return n
 }
 
-func testCert(name string, roles ...string) *identity.Certificate {
+func testCert(name string) *identity.Certificate {
 	return &identity.Certificate{
 		Claims: identity.Claims{
 			Issuer:  identity.Issuer,
 			Network: "testnet-0",
 			Subject: name,
-			Roles:   roles,
 		},
 		Raw:  "raw-" + name,
 		Hash: "hash-" + name,
@@ -136,14 +135,9 @@ func testRequest(needs ...protocol.Need) *protocol.SyncRequest {
 	}
 }
 
-// reporting is testRequest of a host that reports the validator range
-// [start, end) from its marker file.
-func reporting(start, end uint64, needs ...protocol.Need) *protocol.SyncRequest {
-	req := testRequest(needs...)
-	req.Validators = &protocol.Validators{
-		Start: start, End: end,
-		Source: protocol.ValidatorsFromMarker, State: protocol.ValidatorsKnown,
-	}
+// withRoles sets the roles a request reports.
+func withRoles(req *protocol.SyncRequest, roles ...string) *protocol.SyncRequest {
+	req.Roles = roles
 
 	return req
 }
@@ -159,20 +153,19 @@ func imageNeed(id string) protocol.Need {
 	}
 }
 
-// addHost registers a host through RecordSync; validators is the range it
-// reports, nil for none.
+// addHost registers a host through RecordSync; validators is a range the
+// stored validator ranges inventory gets for it, nil for none.
 func addHost(t *testing.T, s Store, name string, validators *identity.ValidatorRange) *fleet.Host {
 	t.Helper()
 
-	req := testRequest()
 	if validators != nil {
-		req = reporting(validators.Start, validators.End)
+		assign(t, s, fleet.HostRange{Host: name, ValidatorRange: *validators})
 	}
 
 	res, err := s.RecordSync(context.Background(), &HostSync{
 		Cert:       testCert(name),
 		RemoteAddr: "10.0.0.1:1234",
-		Request:    req,
+		Request:    testRequest(),
 		At:         at(0),
 	})
 	require.NoError(t, err)
@@ -376,7 +369,7 @@ func TestRestartPersistence(t *testing.T) {
 	assert.True(t, host.HoldWanted)
 	assert.Equal(t, "investigating", host.HoldReason)
 	assert.Equal(t, inv.Hash, host.InventoryHash)
-	assert.Equal(t, reporting(0, 100), host.Status)
+	assert.Equal(t, testRequest(), host.Status)
 	assert.Equal(t, uint64(100), host.Weight())
 
 	gotInv, err := second.GetInventory(ctx, "node-1")

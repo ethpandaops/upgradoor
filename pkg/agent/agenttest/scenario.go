@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -22,7 +23,7 @@ import (
 //	rebootRequired: true
 //	containers:
 //	  - {name: geth, image: "ethpandaops/geth:master", digest: "sha256:aaa",
-//	     group: execution, kind: el}
+//	     kind: el, team: geth}
 //	registry:
 //	  "ethpandaops/geth:master": {digest: "sha256:ccc", revision: 1a2b3c}
 //	packages:
@@ -66,11 +67,13 @@ type Container struct {
 	// State is the Docker state (default running).
 	State   string   `yaml:"state"`
 	Command []string `yaml:"command"`
-	// Group and Kind are the labels Ansible sets.
-	Group string `yaml:"group"`
-	Kind  string `yaml:"kind"`
+	// Kind and Team are the labels Ansible sets.
+	Kind string `yaml:"kind"`
+	Team string `yaml:"team"`
 	// Links plays a container created with --link.
 	Links bool `yaml:"links"`
+	// StopTimeout is the stop grace period the container was created with.
+	StopTimeout time.Duration `yaml:"stopTimeout"`
 }
 
 // Tag is the image the registry holds for one tag.
@@ -95,10 +98,10 @@ const (
 	dockerV1   = "28.0"
 )
 
-// The images, digests and groups of BaseScenario.
+// The images, digests and teams of BaseScenario.
 const (
-	GroupExecution = "execution"
-	GroupConsensus = "consensus"
+	TeamGeth = "geth"
+	TeamTeku = "teku"
 
 	GethImage = "ethpandaops/geth:master"
 	TekuImage = "consensys/teku:develop"
@@ -122,7 +125,7 @@ const (
 )
 
 // BaseScenario is an up-to-date Debian 13 host with geth, teku and a
-// validator in managed groups, an unmanaged dora, and the blocked packages
+// validator labelled with their kinds and teams, a dora labelled none, and the blocked packages
 // docker-ce and containerd.io installed.
 func BaseScenario() *Scenario {
 	return &Scenario{
@@ -131,13 +134,10 @@ func BaseScenario() *Scenario {
 		RunningKernel: "6.12.41-amd64",
 		NewestKernel:  "6.12.41-amd64",
 		Containers: []Container{
-			{Name: "validator", Image: VCImage, Digest: VCV1, Group: GroupConsensus, Kind: "vc"},
-			{Name: "geth", Image: GethImage, Digest: GethV1, Group: GroupExecution, Kind: "el"},
-			{Name: "teku", Image: TekuImage, Digest: TekuV1, Group: GroupConsensus, Kind: "cl"},
-			{
-				Name: "dora", Image: "ethpandaops/dora:latest", Digest: "sha256:dora-1",
-				Group: protocol.GroupNone,
-			},
+			{Name: "validator", Image: VCImage, Digest: VCV1, Kind: "vc", Team: TeamTeku},
+			{Name: "geth", Image: GethImage, Digest: GethV1, Kind: "el", Team: TeamGeth},
+			{Name: "teku", Image: TekuImage, Digest: TekuV1, Kind: "cl", Team: TeamTeku},
+			{Name: "dora", Image: "ethpandaops/dora:latest", Digest: "sha256:dora-1", Kind: "none"},
 		},
 		Packages: Packages{
 			Blocked: []string{docker, containerd},

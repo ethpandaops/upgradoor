@@ -27,9 +27,6 @@ describe('the client table of the mock', () => {
         CLIENT_HOST_STATES.reduce((n, s) => n + c[s], 0),
         c.name
       ).toBe(c.hosts);
-      // A client's containers belong to the team of its name, on every host.
-      expect(c.owners, c.name).toEqual([c.name]);
-      expect(c.allOwned, c.name).toEqual([c.name]);
     }
   });
 
@@ -113,7 +110,7 @@ describe('the hosts of a client in the mock', () => {
     for (const row of list(first.hosts)) {
       expect(list(row.containers).length).toBeGreaterThan(0);
       for (const c of list(row.containers)) {
-        expect(c).toMatchObject({ client: 'lighthouse', managed: true, owners: ['lighthouse'] });
+        expect(c).toMatchObject({ team: 'lighthouse', managed: true });
         expect(c.command?.length).toBeGreaterThan(0);
       }
     }

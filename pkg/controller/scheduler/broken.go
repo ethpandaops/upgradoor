@@ -7,8 +7,8 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// A host is broken for a group (the rollouts of one roll group of one
-// client, GroupName, or the packages rollouts) when its last lease for the
+// A host is broken for a group (the rollouts of one unit, UnitName, or the
+// packages rollouts) when its last lease for the
 // group failed. The mark is kept with the host (fleet.Host.Broken): set where
 // a lease fails, cleared where a lease is released with the group's steps
 // done, gone with the host when it is forgotten. A host that is broken for
@@ -20,7 +20,7 @@ import (
 const reasonEndedByOperator = "ended by operator"
 
 // needGroup names the group of rollouts that serve needs like this one: the
-// rollouts of its roll group, or of the packages kind. The need of a manual
+// rollouts of its unit, or of the packages kind. The need of a manual
 // directive and a reboot need belong to no group.
 func needGroup(n *protocol.Need) string {
 	switch {
@@ -34,7 +34,7 @@ func needGroup(n *protocol.Need) string {
 }
 
 // rolloutGroup names the rollouts that are about the same thing: those of one
-// roll group, whatever the target, and those of the packages kind. Reboot and
+// unit, whatever the target, and those of the packages kind. Reboot and
 // manual rollouts belong to no group.
 func rolloutGroup(r *fleet.Rollout) string {
 	switch r.Kind {

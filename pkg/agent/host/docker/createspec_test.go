@@ -620,42 +620,20 @@ func TestCreateSpecApply(t *testing.T) {
 		assert.Equal(t, `["--deployed"]`, spec.Config.Labels[labelOverrideCommand])
 	})
 
-	t.Run("group labels", func(t *testing.T) {
+	t.Run("extra labels", func(t *testing.T) {
 		spec := build(t)
-		spec.apply(&Change{Group: "execution", Kind: protocol.KindEL})
+		spec.apply(&Change{Labels: map[string]string{protocol.LabelKind: "el", protocol.LabelTeam: "geth"}})
 
-		assert.Equal(t, "execution", spec.Config.Labels[protocol.LabelGroup])
 		assert.Equal(t, "el", spec.Config.Labels[protocol.LabelKind])
-		assert.Equal(t, "ethpandaops/geth:deployed", spec.Config.Labels[labelOverrideImage])
+		assert.Equal(t, "geth", spec.Config.Labels[protocol.LabelTeam])
+		assert.Equal(t, "ethpandaops/geth:deployed", spec.Config.Labels[labelOverrideImage], "the others stay")
 	})
 
-	t.Run("group without kind writes an empty kind", func(t *testing.T) {
+	t.Run("a spec without labels gets a map", func(t *testing.T) {
 		spec := build(t)
-		spec.apply(&Change{Group: "tooling"})
+		spec.Config.Labels = nil
+		spec.apply(&Change{Base: &protocol.OverrideBase{Image: "a/b:c"}, SetBase: true})
 
-		assert.Equal(t, "tooling", spec.Config.Labels[protocol.LabelGroup])
-		assert.Contains(t, spec.Config.Labels, protocol.LabelKind)
-		assert.Empty(t, spec.Config.Labels[protocol.LabelKind])
+		assert.Equal(t, map[string]string{labelOverrideImage: "a/b:c"}, spec.Config.Labels)
 	})
-
-	for name, change := range map[string]*Change{
-		"SetBase": {Base: &protocol.OverrideBase{Image: "a/b:c"}, SetBase: true},
-		"Group":   {Group: "execution", Kind: protocol.KindEL},
-	} {
-		t.Run("a spec without labels gets a map: "+name, func(t *testing.T) {
-			spec := build(t)
-			spec.Config.Labels = nil
-			spec.apply(change)
-
-			require.NotNil(t, spec.Config.Labels)
-
-			if change.SetBase {
-				assert.Equal(t, map[string]string{labelOverrideImage: "a/b:c"}, spec.Config.Labels)
-			} else {
-				assert.Equal(t, map[string]string{
-					protocol.LabelGroup: "execution", protocol.LabelKind: "el",
-				}, spec.Config.Labels)
-			}
-		})
-	}
 }

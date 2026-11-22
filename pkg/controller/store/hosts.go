@@ -8,27 +8,20 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
 	"sync"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
-	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-const hostColumns = `name, cert_hash, validators_start, validators_end, roles,
+const hostColumns = `name, cert_hash, roles,
 	first_seen, last_seen, remote_addr, status, inventory_hash, hold_wanted, hold_reason, hold_by,
 	offline, broken, sync_interval, status_hash, hold_actor, unproven`
 
 // RecordSync upserts the host named by the certificate subject. first_seen
 // is kept for a known host. With a nil Request only the identity, last_seen
-// and remote address are updated; the stored status and validator
-// range stay.
-//
-// The validator range of the row is what the controller counts for the host
-// (fleet.Host.Validators). It follows the range the request reports: see
-// countedValidators.
+// and remote address are updated; the stored status stays.
 //
 // A host seen for the first time that reports a controller hold is created
 // with hold_wanted set. The hold was put there by a controller whose database
@@ -57,25 +50,15 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 	result := &SyncResult{}
 
 	err = s.write(ctx, func(tx *sql.Tx) error {
-		var (
-			prev             storedSync
-			valStart, valEnd sql.NullInt64
-		)
+		var prev storedSync
 
 		txErr := tx.QueryRowContext(ctx, `
-			SELECT cert_hash, validators_start, validators_end, roles, remote_addr,
-				status_hash, last_seen
+			SELECT cert_hash, roles, remote_addr, status_hash, last_seen
 			FROM hosts WHERE name = ?`,
-			cert.Subject).Scan(&prev.certHash, &valStart, &valEnd, &prev.roles,
+			cert.Subject).Scan(&prev.certHash, &prev.roles,
 			&prev.remoteAddr, &prev.statusHash, &prev.lastSeen)
 		if txErr == nil {
 			result.PreviousSeen = fromMillis(prev.lastSeen)
-
-			if valStart.Valid && valEnd.Valid {
-				result.ValidatorsBefore = &identity.ValidatorRange{
-					Start: uint64(valStart.Int64), End: uint64(valEnd.Int64),
-				}
-			}
 		}
 
 		switch {
@@ -88,7 +71,7 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 			result.PreviousCertHash = prev.certHash
 		}
 
-		if !result.Created && prev.confirms(in, rolesJSON, statusHash, result.ValidatorsBefore) {
+		if !result.Created && prev.confirms(in, rolesJSON, statusHash) {
 			result.Host, txErr = s.confirmSync(ctx, tx, in, at, status)
 
 			return txErr
@@ -101,37 +84,23 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 			holdReason = HoldReasonAdopted
 		}
 
-		counted, overlaps, txErr := countedValidators(ctx, tx, in, result.ValidatorsBefore, at, s.openedAt())
-		if txErr != nil {
-			return txErr
-		}
-
-		result.ValidatorOverlaps = overlaps
-		valStart, valEnd = sql.NullInt64{}, sql.NullInt64{}
-
-		if counted != nil {
-			valStart = sql.NullInt64{Int64: int64(counted.Start), Valid: true}
-			valEnd = sql.NullInt64{Int64: int64(counted.End), Valid: true}
-		}
-
 		// hold_wanted and hold_reason are only written for a new row.
 		_, txErr = tx.ExecContext(ctx, `
-			INSERT INTO hosts (name, cert_hash, validators_start, validators_end,
+			INSERT INTO hosts (name, cert_hash,
 				roles, first_seen, last_seen, remote_addr, status, hold_wanted, hold_reason,
 				status_hash, sync_interval)
-			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 			ON CONFLICT(name) DO UPDATE SET
 				cert_hash = excluded.cert_hash,
-				validators_start = excluded.validators_start,
-				validators_end = excluded.validators_end,
-				roles = excluded.roles,
+				roles = CASE WHEN excluded.status IS NULL
+					THEN hosts.roles ELSE excluded.roles END,
 				last_seen = excluded.last_seen,
 				remote_addr = excluded.remote_addr,
 				status = COALESCE(excluded.status, hosts.status),
 				status_hash = CASE WHEN excluded.status IS NULL
 					THEN hosts.status_hash ELSE excluded.status_hash END,
 				sync_interval = excluded.sync_interval`,
-			cert.Subject, cert.Hash, valStart, valEnd,
+			cert.Subject, cert.Hash,
 			rolesJSON, millis(at), millis(at), in.RemoteAddr, status,
 			result.HoldAdopted, holdReason, statusHash, in.SyncInterval.Milliseconds())
 		if txErr != nil {
@@ -156,28 +125,10 @@ type storedSync struct {
 }
 
 // confirms reports whether the sync only restates the stored row: same
-// certificate, roles and address, a status with the same hash, and a
-// validator range that is counted as reported (or not known, which keeps the
-// counted one). A range of which part is counted for another host goes the
-// full way, so it picks up validators that host has given up since.
-func (p *storedSync) confirms(
-	in *HostSync, roles, statusHash string, counted *identity.ValidatorRange,
-) bool {
-	if in.Request == nil || statusHash == "" || p.statusHash != statusHash ||
-		p.certHash != in.Cert.Hash || p.roles != roles || p.remoteAddr != in.RemoteAddr {
-		return false
-	}
-
-	reported := in.Request.Validators
-
-	switch {
-	case reported == nil || (reported.Known() && reported.Count() == 0):
-		return counted == nil
-	case !reported.Known() || reported.Validate() != nil:
-		return true
-	default:
-		return counted != nil && counted.Start == reported.Start && counted.End == reported.End
-	}
+// certificate, roles and address, and a status with the same hash.
+func (p *storedSync) confirms(in *HostSync, roles, statusHash string) bool {
+	return in.Request != nil && statusHash != "" && p.statusHash == statusHash &&
+		p.certHash == in.Cert.Hash && p.roles == roles && p.remoteAddr == in.RemoteAddr
 }
 
 // confirmSync writes what a confirming sync changes: the time, the asked
@@ -197,123 +148,12 @@ func (s *sqliteStore) confirmSync(
 	return s.getHost(ctx, tx, in.Cert.Subject)
 }
 
-// countedValidators decides the validator range counted for the host of a
-// sync, and names the other hosts for which validators of the reported
-// range are counted.
-//
-//   - No request (an identity-only update), or a host that does not know its
-//     range (marker missing or invalid): the range counted before stays. A
-//     host whose keys are being reshuffled keeps its weight for those
-//     minutes, and its stopped validators count as unavailable, which is
-//     what they are.
-//   - A request without a range, or with an empty one: none.
-//   - A known range: the range, without the validators counted for other
-//     hosts (fleet.UnclaimedRange). A host that has not synced for
-//     ValidatorClaimTTL loses the validators another host reports. Its
-//     silence counts from its last sync or from opened, whichever is later:
-//     while the controller was down, no host could sync.
-//
-// The store only bounds the range (protocol.Validators.Validate); a range
-// that fails is treated as not known. The API checks it before.
-func countedValidators(
-	ctx context.Context, tx *sql.Tx, in *HostSync, before *identity.ValidatorRange,
-	at, opened time.Time,
-) (counted *identity.ValidatorRange, overlaps []string, err error) {
-	if in.Request == nil {
-		return before, nil, nil
-	}
-
-	reported := in.Request.Validators
-	countable := reported.Known() && reported.Validate() == nil
-
-	switch {
-	case reported == nil:
-		return nil, nil, nil
-	case !countable:
-		return before, nil, nil
-	case reported.Count() == 0:
-		return nil, nil, nil
-	}
-
-	want := identity.ValidatorRange{Start: reported.Start, End: reported.End}
-
-	type claim struct {
-		host     string
-		lastSeen int64
-		held     identity.ValidatorRange
-	}
-
-	claims := make([]claim, 0, 2)
-
-	err = queryRows(ctx, tx, `
-		SELECT name, last_seen, validators_start, validators_end FROM hosts
-		WHERE name != ? AND validators_start < ? AND validators_end > ?
-		ORDER BY validators_start, name`,
-		[]any{in.Cert.Subject, int64(want.End), int64(want.Start)},
-		func(rows rowScanner) error {
-			var (
-				c          claim
-				start, end int64
-			)
-
-			if scanErr := rows.Scan(&c.host, &c.lastSeen, &start, &end); scanErr != nil {
-				return scanErr
-			}
-
-			c.held = identity.ValidatorRange{Start: uint64(start), End: uint64(end)}
-			claims = append(claims, c)
-
-			return nil
-		})
-	if err != nil {
-		return nil, nil, fmt.Errorf("validator ranges of other hosts: %w", err)
-	}
-
-	taken := make([]identity.ValidatorRange, 0, len(claims))
-	overlaps = make([]string, 0, len(claims))
-
-	for _, c := range claims {
-		overlaps = append(overlaps, c.host)
-
-		silentSince := fromMillis(c.lastSeen)
-		if opened.After(silentSince) {
-			silentSince = opened
-		}
-
-		if at.Sub(silentSince) <= ValidatorClaimTTL {
-			taken = append(taken, c.held)
-
-			continue
-		}
-
-		// The silent host gives its validators up; it claims what is left
-		// when it syncs again.
-		_, err = tx.ExecContext(ctx, `UPDATE hosts
-			SET validators_start = NULL, validators_end = NULL WHERE name = ?`, c.host)
-		if err != nil {
-			return nil, nil, fmt.Errorf("release validators of %s: %w", c.host, err)
-		}
-	}
-
-	slices.Sort(overlaps)
-
-	return fleet.UnclaimedRange(want, taken), overlaps, nil
-}
-
-// openedAt returns when Start opened the database.
-func (s *sqliteStore) openedAt() time.Time {
-	s.mu.RLock()
-	defer s.mu.RUnlock()
-
-	return s.opened
-}
-
-// encodeSync returns the roles and status columns of a sync. The status is
-// NULL without a request.
+// encodeSync returns the roles and status columns of a sync. Without a
+// request the status is NULL and the stored roles stay.
 func encodeSync(in *HostSync) (roles string, status sql.NullString, hash string, err error) {
-	list := in.Cert.Roles
-	if list == nil {
-		list = []string{}
+	list := []string{}
+	if in.Request != nil && in.Request.Roles != nil {
+		list = in.Request.Roles
 	}
 
 	raw, err := json.Marshal(list)
@@ -398,7 +238,18 @@ func (s *sqliteStore) getHost(ctx context.Context, tx *sql.Tx, name string) (*fl
 		return nil, ErrNotFound
 	}
 
-	return host, err
+	if err != nil {
+		return nil, err
+	}
+
+	ranges, err := hostValidators(ctx, tx, name)
+	if err != nil {
+		return nil, err
+	}
+
+	host.Validators = ranges[name]
+
+	return host, nil
 }
 
 // ListHosts returns all hosts ordered by name.
@@ -406,7 +257,7 @@ func (s *sqliteStore) ListHosts(ctx context.Context) ([]*fleet.Host, error) {
 	hosts := make([]*fleet.Host, 0, 32)
 
 	err := s.read(ctx, func(tx *sql.Tx) error {
-		return queryRows(ctx, tx, `SELECT `+hostColumns+` FROM hosts ORDER BY name`, nil,
+		err := queryRows(ctx, tx, `SELECT `+hostColumns+` FROM hosts ORDER BY name`, nil,
 			func(row rowScanner) error {
 				host, err := s.scanHost(row)
 				if err != nil {
@@ -417,6 +268,20 @@ func (s *sqliteStore) ListHosts(ctx context.Context) ([]*fleet.Host, error) {
 
 				return nil
 			})
+		if err != nil {
+			return err
+		}
+
+		ranges, err := hostValidators(ctx, tx, "")
+		if err != nil {
+			return err
+		}
+
+		for _, host := range hosts {
+			host.Validators = ranges[host.Name]
+		}
+
+		return nil
 	})
 	if err != nil {
 		return nil, fmt.Errorf("store: list hosts: %w", err)
@@ -428,7 +293,6 @@ func (s *sqliteStore) ListHosts(ctx context.Context) ([]*fleet.Host, error) {
 func (s *sqliteStore) scanHost(row rowScanner) (*fleet.Host, error) {
 	var (
 		host                fleet.Host
-		valStart, valEnd    sql.NullInt64
 		roles               string
 		firstSeen, lastSeen int64
 		status              sql.NullString
@@ -437,7 +301,7 @@ func (s *sqliteStore) scanHost(row rowScanner) (*fleet.Host, error) {
 		unproven            sql.NullInt64
 	)
 
-	err := row.Scan(&host.Name, &host.CertHash, &valStart, &valEnd, &roles,
+	err := row.Scan(&host.Name, &host.CertHash, &roles,
 		&firstSeen, &lastSeen, &host.RemoteAddr, &status, &host.InventoryHash,
 		&host.HoldWanted, &host.HoldReason, &host.HoldBy, &offline, &broken, &syncInterval,
 		&host.StatusHash, &host.HoldActor, &unproven)
@@ -465,13 +329,6 @@ func (s *sqliteStore) scanHost(row rowScanner) (*fleet.Host, error) {
 	host.SyncInterval = time.Duration(syncInterval) * time.Millisecond
 	host.FirstSeen = fromMillis(firstSeen)
 	host.LastSeen = fromMillis(lastSeen)
-
-	if valStart.Valid && valEnd.Valid {
-		host.Validators = &identity.ValidatorRange{
-			Start: uint64(valStart.Int64),
-			End:   uint64(valEnd.Int64),
-		}
-	}
 
 	if err := json.Unmarshal([]byte(roles), &host.Roles); err != nil {
 		return nil, fmt.Errorf("decode roles of %s: %w", host.Name, err)

@@ -538,7 +538,7 @@ export class MockController {
       leaseHost: id => this.data.leases.find(l => l.id === id)?.host,
       rolloutClient: id => {
         const r = this.data.rollouts.find(x => x.id === id);
-        return r ? (r.client ?? '') : undefined;
+        return r ? (r.team ?? '') : undefined;
       },
     });
     if (!verdict.allowed) throw new HttpError(403, `forbidden: ${verdict.reason}`);
@@ -833,10 +833,9 @@ export class MockController {
     const s = this.data.settings;
     switch (r.kind) {
       case 'group':
-        // A group rollout answers to the image policy of its client where one
-        // is set; one of the default group to the default group's policy.
-        if (r.group === 'default') return s.policyDefaultGroup;
-        return imagePolicy(s, r.client);
+        // A group rollout answers to the image policy of its team where one
+        // is set, else to policyImage.
+        return imagePolicy(s, r.team);
       case 'packages':
         return s.policyPackages;
       case 'reboot':
@@ -892,7 +891,7 @@ export class MockController {
 
   /**
    * rolloutNeeds are the needs of a host that a rollout serves: for a group
-   * rollout those of its group and client, for another the need its member
+   * rollout those of its kind and team, for another the need its member
    * names, for a manual or local one every need of the host.
    */
   private rolloutNeeds(r: Rollout, host: HostDetail): readonly Need[] {
@@ -901,7 +900,12 @@ export class MockController {
       case 'group':
         return needs.filter(n => {
           const of = n.image ?? n.spec;
-          return !n.directiveId && !n.local && of?.group === r.group && (of?.client ?? '') === (r.client ?? '');
+          return (
+            !n.directiveId &&
+            !n.local &&
+            (of?.kind ?? '') === (r.containerKind ?? '') &&
+            (of?.team ?? '') === (r.team ?? '')
+          );
         });
       case 'manual':
       case 'local':
@@ -1138,21 +1142,20 @@ export class MockController {
 
   /**
    * summary is a host as the host table has it. Its containers come without
-   * what only the details and the client views carry (the client, the command
-   * line, an override and what may be overridden), unless whole is set.
+   * what only the details and the client views carry (the command line, an
+   * override and what may be overridden), unless whole is set.
    */
   private summary(host: HostDetail, plan: Plan, whole = false): HostSummary {
     return {
       name: host.name,
       roles: host.roles,
       validators: host.validators,
-      ...(host.validatorReport ? { validatorReport: host.validatorReport } : {}),
       lastSeen: this.iso(this.now() - this.seenAgo(host.name) * 1000),
       stale: this.isStale(host.name),
       agentVersion: host.agentVersion,
       containers: whole
         ? host.containers
-        : list(host.containers).map(c => without(c, 'client', 'command', 'override', 'overridable')),
+        : list(host.containers).map(c => without(c, 'command', 'override', 'overridable')),
       node: host.node,
       os: host.os,
       pending: host.pending,
@@ -1546,8 +1549,7 @@ export class MockController {
     const c = list(host.containers).find(x => x.name === req.container);
     if (!c?.managed) throw new HttpError(409, `${host.name} does not manage a container ${req.container}`);
 
-    const allowed = what === 'image' ? c.overridable?.image === true : c.overridable?.flags === true;
-    if (!allowed) throw new HttpError(409, `${host.name} does not allow ${what} overrides of ${c.name}`);
+    if (c.overridable !== true) throw new HttpError(409, `${host.name} does not allow ${what} overrides of ${c.name}`);
 
     return c;
   }
@@ -1579,7 +1581,7 @@ export class MockController {
 
     for (const name of hosts) {
       const container = list(this.data.hosts.get(name)?.containers).find(
-        c => c.managed && c.client === req.client && c.kind === req.kind
+        c => c.managed && c.team === req.client && c.kind === req.kind
       );
       if (!this.data.hosts.has(name)) {
         rejected[name] = 'unknown host';
@@ -1954,8 +1956,8 @@ export class MockController {
             directiveId: directive,
             image: {
               container: c.name,
-              group: c.group,
-              client: c.client,
+              kind: c.kind,
+              team: c.team,
               image: c.image,
               fromDigest: c.digest,
               toDigest: to,
@@ -2029,7 +2031,7 @@ export class MockController {
       const viaTeam = this.authorization?.authorizedBy.startsWith(TEAM_PREFIX) === true;
       const asTeam = viaTeam && (!host.holdWanted || host.holdBy?.startsWith('team:') === true);
       const login = this.authorization?.teams ?? [];
-      const owning = login.filter(t => list(host.containers).some(c => c.managed && (c.owners ?? []).includes(t)));
+      const owning = login.filter(t => list(host.containers).some(c => c.managed && c.team === t));
       const teams = (owning.length > 0 ? owning : login).slice().sort();
       host.holdBy = action === 'hold' ? (asTeam ? `team:${teams.join(',')}` : 'staff') : undefined;
       host.holdWanted = action === 'hold';
@@ -2370,7 +2372,7 @@ function hostListing(s: HostSummary): HostListing {
       managed: c.managed,
       ...(c.kind ? { kind: c.kind } : {}),
       ...(c.impact ? { impact: c.impact } : {}),
-      ...(list(c.owners).length > 0 ? { owners: c.owners } : {}),
+      ...(c.team ? { team: c.team } : {}),
     })),
     os: s.os,
     pending: s.pending,

@@ -12,8 +12,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// DefaultStopTimeout is the stop grace period when neither group nor
-// container names one.
+// DefaultStopTimeout is the stop grace period when the container names none.
 const DefaultStopTimeout = 300 * time.Second
 
 // LeasePlan is what a lease will do, and the verdict on each granted need it
@@ -52,8 +51,7 @@ type Recreate struct {
 	Target string
 }
 
-// Recreation is what a recreate changes about a container; it mirrors
-// host.Change.
+// Recreation is what a recreate changes about a container (host.Change).
 type Recreation struct {
 	// Image is the replacement's image; empty keeps the container's own.
 	Image string
@@ -64,9 +62,6 @@ type Recreation struct {
 	// them); without SetBase the labels stay as they are.
 	Base    *protocol.OverrideBase
 	SetBase bool
-	// Group and Kind, when Group is set, are written as the group labels.
-	Group string
-	Kind  protocol.ContainerKind
 }
 
 // Validate checks every granted need against the policy, a fresh view and
@@ -307,7 +302,7 @@ func (v *validation) image(n *protocol.Need) {
 }
 
 // wasRunning are the containers the starting phase brings back, sorted;
-// default-group containers only when the lease recreates them.
+// unlabelled containers only when the lease recreates them.
 func wasRunning(p *LeasePlan, containers []protocol.Container) []string {
 	out := make([]string, 0, len(containers))
 
@@ -317,7 +312,7 @@ func wasRunning(p *LeasePlan, containers []protocol.Container) []string {
 			continue
 		}
 
-		if c.Group != protocol.DefaultGroup ||
+		if c.Kind != "" ||
 			slices.ContainsFunc(p.Recreates, func(r Recreate) bool { return r.Container == c.Name }) {
 			out = append(out, c.Name)
 		}
@@ -393,46 +388,32 @@ func Recheck(task *Recreate, view *View) (rec Recreation, reason string) {
 		return Recreation{}, reason
 	}
 
-	// Labels can only be set at create time.
-	if c.Unlabelled {
-		rec.Group, rec.Kind = c.Group, c.Kind
-	}
-
 	return rec, ""
 }
 
-// StopTimeout is a classified container's stop grace period: its group's,
-// else its own, else DefaultStopTimeout.
-func StopTimeout(policy *Policy, c *protocol.Container) time.Duration {
-	switch {
-	case c == nil:
-		return DefaultStopTimeout
-	case c.Group != "" && policy.group(c.Group).StopTimeout > 0:
-		return policy.group(c.Group).StopTimeout
-	case c.StopTimeout > 0:
-		return c.StopTimeout
-	default:
+// StopTimeout is a container's stop grace period: its own, else
+// DefaultStopTimeout.
+func StopTimeout(c *protocol.Container) time.Duration {
+	if c == nil || c.StopTimeout <= 0 {
 		return DefaultStopTimeout
 	}
+
+	return c.StopTimeout
 }
 
 // Start the execution client first and the validator client last; stop
-// in reverse.
+// in reverse. Every other kind, and an unlabelled container, comes after.
 var (
-	startOrder = []protocol.ContainerKind{
-		protocol.KindEL, protocol.KindCL, protocol.KindVC, protocol.KindOther,
-	}
-	drainOrder = []protocol.ContainerKind{
-		protocol.KindVC, protocol.KindCL, protocol.KindEL, protocol.KindOther,
-	}
+	startOrder = []protocol.ContainerKind{protocol.KindEL, protocol.KindCL, protocol.KindVC}
+	drainOrder = []protocol.ContainerKind{protocol.KindVC, protocol.KindCL, protocol.KindEL}
 )
 
-// StartOrder sorts container names el, cl, vc, other, then by name.
+// StartOrder sorts container names el, cl, vc, the rest, then by name.
 func StartOrder(names []string, containers []protocol.Container) []string {
 	return ordered(names, containers, startOrder)
 }
 
-// DrainOrder sorts container names vc, cl, el, other, then by name.
+// DrainOrder sorts container names vc, cl, el, the rest, then by name.
 func DrainOrder(names []string, containers []protocol.Container) []string {
 	return ordered(names, containers, drainOrder)
 }
@@ -452,15 +433,16 @@ func compareOrder(a, b string, containers []protocol.Container, order []protocol
 	)
 }
 
-// kindOf is a container's kind; other when it is not found or in no group.
+// kindOf is a managed container's kind; empty when it is not found or
+// unlabelled.
 func kindOf(name string, containers []protocol.Container) protocol.ContainerKind {
 	for i := range containers {
-		if c := &containers[i]; c.Name == name && c.Group != "" {
-			return protocol.ParseKind(string(c.Kind))
+		if c := &containers[i]; c.Name == name && c.Managed {
+			return c.Kind
 		}
 	}
 
-	return protocol.KindOther
+	return ""
 }
 
 func kindRank(order []protocol.ContainerKind, kind protocol.ContainerKind) int {

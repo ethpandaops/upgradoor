@@ -10,29 +10,28 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-func TestPolicyPermits(t *testing.T) {
+// Only a labelled container with a team may be overridden, image and command
+// line alike.
+func TestOverridable(t *testing.T) {
 	image := &Entry{Image: "ethpandaops/geth:fix"}
-	flags := &Entry{Add: []string{"--verbosity=4"}}
-	both := []string{protocol.OverrideImage, protocol.OverrideFlags}
+	flags := &Entry{Command: []string{"--verbosity=4"}, HasCommand: true}
 
 	for _, tc := range []struct {
 		name  string
-		group Group
-		in    string
+		c     protocol.Container
 		entry *Entry
 		want  string
 	}{
-		{"tooling refuses an image", Group{}, "execution", image, "allows no overrides"},
-		{"tooling refuses flags", Group{}, "execution", flags, "allows no overrides"},
-		{"tooling takes an empty entry", Group{}, "execution", &Entry{}, ""},
-		{"image only", Group{Overrides: []string{"image"}}, "execution", image, ""},
-		{"image only refuses flags", Group{Overrides: []string{"image"}}, "execution", flags, "flag overrides"},
-		{"flags only refuses an image", Group{Overrides: []string{"flags"}}, "execution", image, "image overrides"},
-		{"both", Group{Overrides: both}, "execution", &Entry{Image: image.Image, Add: flags.Add}, ""},
-		{"the default group allows nothing", Group{Overrides: both}, protocol.DefaultGroup, image, "default group"},
+		{"a team takes an image", protocol.Container{Kind: protocol.KindEL, Team: "geth"}, image, ""},
+		{"a team takes flags", protocol.Container{Kind: protocol.KindEL, Team: "geth"}, flags, ""},
+		{"no team", protocol.Container{Kind: "snooper-el"}, image, "no " + protocol.LabelTeam + " label"},
+		{"no team takes an empty entry", protocol.Container{Kind: "snooper-el"}, &Entry{}, ""},
+		{"unlabelled", protocol.Container{}, flags, "no " + protocol.LabelKind + " label"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			err := partsPermitted(&tc.group, tc.in, "geth", tc.entry)
+			tc.c.Name = "geth"
+
+			err := overridable(&tc.c, tc.entry)
 			if tc.want == "" {
 				require.NoError(t, err)
 			} else {
@@ -42,16 +41,14 @@ func TestPolicyPermits(t *testing.T) {
 	}
 }
 
-// permitsView: geth overridable, nginx tooling, dora default, debug unmanaged.
+// permitsView: geth with a team, snooper without, dora unlabelled, debug
+// unmanaged.
 func permitsView() (*Policy, *View) {
-	p := &Policy{
-		Verbs:  []protocol.Verb{protocol.VerbRoll},
-		Groups: map[string]Group{"execution": {Overrides: []string{protocol.OverrideImage, protocol.OverrideFlags}}},
-	}
+	p := &Policy{Verbs: []protocol.Verb{protocol.VerbRoll}}
 	v := &View{Containers: []protocol.Container{
-		{Name: "geth", Managed: true, Group: "execution", Kind: protocol.KindEL},
-		{Name: "nginx", Managed: true, Group: "proxy", Kind: protocol.KindOther},
-		{Name: "dora", Managed: true, Group: protocol.DefaultGroup, Kind: protocol.KindOther},
+		{Name: "geth", Managed: true, Kind: protocol.KindEL, Team: "geth", Command: []string{"geth", "--a"}},
+		{Name: "snooper", Managed: true, Kind: "snooper-el"},
+		{Name: "dora", Managed: true},
 		{Name: "debug"},
 	}}
 
@@ -88,19 +85,19 @@ func TestPermits(t *testing.T) {
 		{"not managed", "debug", image(nil), image(nil), FromLocal, false, "container debug is not managed on this host"},
 		{"gone", "ghost", nil, nil, FromLocal, false, "container ghost is not managed"},
 		{"the last view's file error is local's to check", "geth", nil, nil, FromLocal, true, ""},
-		{"an invalid entry", "geth", &Entry{}, nil, FromLocal, false, "names an image, flags or both"},
-		{"tooling", "nginx", image(nil), image(nil), FromLocal, false, "allows no overrides"},
-		{"the default group", "dora", image(nil), image(nil), FromLocal, false, "default group"},
-		{"a removal asks nothing", "nginx", nil, nil, FromController, false, ""},
-		{"what is not asked is not bounded", "nginx", image(nil), nil, FromController, false, ""},
+		{"an invalid entry", "geth", &Entry{}, nil, FromLocal, false, "names an image, a command or both"},
+		{"no team", "snooper", image(nil), image(nil), FromLocal, false, "no " + protocol.LabelTeam + " label"},
+		{"unlabelled", "dora", image(nil), image(nil), FromLocal, false, "no " + protocol.LabelKind + " label"},
+		{"a removal asks nothing", "snooper", nil, nil, FromController, false, ""},
+		{"what is not asked is not bounded", "snooper", image(nil), nil, FromController, false, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			p, v := permitsView()
+			_, v := permitsView()
 			if tc.broken {
 				v.OverridesError = "bad"
 			}
 
-			err := Permits(p, v, tc.container, tc.next, tc.asked, tc.origin, testNow)
+			err := Permits(v, tc.container, tc.next, tc.asked, tc.origin, testNow)
 			if tc.want == "" {
 				require.NoError(t, err)
 
@@ -116,15 +113,16 @@ func TestPermits(t *testing.T) {
 func TestInstruct(t *testing.T) {
 	until := testNow.Add(time.Hour)
 	prev := &Entry{
-		Image: "ethpandaops/geth:fix", Add: []string{"--a"}, By: "sam", Reason: "old",
+		Image: "ethpandaops/geth:fix", Command: []string{"geth", "--old"}, HasCommand: true, By: "sam", Reason: "old",
 		Until: &until,
 	}
+	deployed := &Deployed{Image: "ethpandaops/geth:master", Command: []string{"geth", "--a", "--d"}, HasCommand: true}
 	later := testNow.Add(2 * time.Hour)
 
 	setImage := &protocol.OverrideInstruction{Part: protocol.OverrideImage, Image: " ethpandaops/geth:new ", Until: &later}
 	clearImage := &protocol.OverrideInstruction{Part: protocol.OverrideImage}
 	setFlags := &protocol.OverrideInstruction{
-		Part: protocol.OverrideFlags, AddFlags: []string{"--b"}, RemoveFlags: []string{"--c"}, Until: &later,
+		Part: protocol.OverrideFlags, AddFlags: []string{"--b"}, RemoveFlags: []string{"--a"}, Until: &later,
 	}
 	clearFlags := &protocol.OverrideInstruction{Part: protocol.OverrideFlags}
 
@@ -134,27 +132,43 @@ func TestInstruct(t *testing.T) {
 		container string
 		inst      *protocol.OverrideInstruction
 		prev      *Entry
+		deployed  *Deployed
 		want      *Entry
 		refusal   string
 	}{
 		{
-			name: "set the image, keep the flags", container: "geth", inst: setImage, prev: prev,
-			want: &Entry{Image: "ethpandaops/geth:new", Add: []string{"--a"}, By: "pk", Reason: "why", Until: &later},
-		},
-		{
-			name: "set the flags, keep the image", container: "geth", inst: setFlags, prev: prev,
+			name: "set the image, keep the command", container: "geth", inst: setImage, prev: prev,
 			want: &Entry{
-				Image: "ethpandaops/geth:fix", Add: []string{"--b"}, Remove: []string{"--c"},
+				Image: "ethpandaops/geth:new", Command: []string{"geth", "--old"}, HasCommand: true,
 				By: "pk", Reason: "why", Until: &later,
 			},
 		},
 		{
-			name: "take the image away: the old end stays", container: "geth", inst: clearImage, prev: prev,
-			want: &Entry{Add: []string{"--a"}, By: "pk", Reason: "why", Until: &until},
+			name: "flags apply to the deployed command, keep the image", container: "geth", inst: setFlags,
+			prev: prev, deployed: deployed,
+			want: &Entry{
+				Image: "ethpandaops/geth:fix", Command: []string{"geth", "--d", "--b"}, HasCommand: true,
+				By: "pk", Reason: "why", Until: &later,
+			},
 		},
-		{name: "take the last part away", container: "geth", inst: clearFlags, prev: &Entry{Add: []string{"--a"}}},
 		{
-			name: "take away on a tooling group: no opt-in needed", container: "nginx", inst: clearImage,
+			name: "flags apply to what the container was created with without a deployed one", container: "geth",
+			inst: setFlags,
+			want: &Entry{Command: []string{"geth", "--b"}, HasCommand: true, By: "pk", Reason: "why", Until: &later},
+		},
+		{
+			name: "take the image away: the old end stays", container: "geth", inst: clearImage, prev: prev,
+			want: &Entry{Command: []string{"geth", "--old"}, HasCommand: true, By: "pk", Reason: "why", Until: &until},
+		},
+		{
+			name: "take the last part away", container: "geth", inst: clearFlags,
+			prev: &Entry{Command: []string{"--a"}, HasCommand: true},
+		},
+		{name: "malformed flags", container: "geth", inst: &protocol.OverrideInstruction{
+			Part: protocol.OverrideFlags, RemoveFlags: []string{"--a b c"}, Until: &later,
+		}, refusal: "one value"},
+		{
+			name: "take away without a team: allowed", container: "snooper", inst: clearImage,
 			prev: &Entry{Image: "x/y:z"},
 		},
 		{name: "no instruction", container: "geth", refusal: "names no container or no override"},
@@ -170,7 +184,7 @@ func TestInstruct(t *testing.T) {
 		}, refusal: "pinned to a digest", want: &Entry{
 			Image: "ethpandaops/geth@sha256:" + sha64, By: "pk", Reason: "why", Until: &later,
 		}},
-		{name: "tooling", container: "nginx", inst: setImage, refusal: "allows no overrides", want: &Entry{
+		{name: "no team", container: "snooper", inst: setImage, refusal: "no " + protocol.LabelTeam + " label", want: &Entry{
 			Image: "ethpandaops/geth:new", By: "pk", Reason: "why", Until: &later,
 		}},
 		{name: "no end", container: "geth", inst: &protocol.OverrideInstruction{
@@ -183,7 +197,7 @@ func TestInstruct(t *testing.T) {
 				p.Verbs = tc.verbs
 			}
 
-			got, err := Instruct(p, v, tc.container, tc.inst, tc.prev, "pk", "why\nsecond line", testNow)
+			got, err := Instruct(p, v, tc.container, tc.inst, tc.prev, tc.deployed, "pk", "why\nsecond line", testNow)
 			if tc.refusal != "" {
 				require.ErrorIs(t, err, ErrRefused)
 				require.ErrorContains(t, err, tc.refusal)
@@ -197,14 +211,14 @@ func TestInstruct(t *testing.T) {
 		})
 	}
 
-	assert.Equal(t, []string{"--a"}, prev.Add, "the entry that is there is not changed")
+	assert.Equal(t, []string{"geth", "--old"}, prev.Command, "the entry that is there is not changed")
 
 	// The entry returned shares no list with the one that is there.
 	p, v := permitsView()
-	got, err := Instruct(p, v, "geth", setImage, prev, "pk", "why", testNow)
+	got, err := Instruct(p, v, "geth", setImage, prev, nil, "pk", "why", testNow)
 	require.NoError(t, err)
-	got.Add[0] = "--changed"
-	assert.Equal(t, []string{"--a"}, prev.Add)
+	got.Command[0] = "--changed"
+	assert.Equal(t, []string{"geth", "--old"}, prev.Command)
 }
 
 const sha64 = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -218,24 +232,41 @@ func TestHoldSource(t *testing.T) {
 
 func TestLocalEntry(t *testing.T) {
 	until := testNow.Add(time.Hour)
-	p, v := permitsView()
+	_, v := permitsView()
 
-	got, err := LocalEntry(p, v, &LocalRequest{
-		Container: "geth", Image: " ethpandaops/geth:fix ", Add: []string{"--a"}, User: "local:pk",
+	got, err := LocalEntry(v, &LocalRequest{
+		Container: "geth", Image: " ethpandaops/geth:fix ", Add: []string{"--b"}, User: "local:pk",
 		Reason: "why\nsecond line",
-	}, testNow)
+	}, nil, testNow)
 	require.NoError(t, err, "one set on the host may have no end")
-	assert.Equal(t, &Entry{Image: "ethpandaops/geth:fix", Add: []string{"--a"}, By: "pk", Reason: "why"}, got)
+	assert.Equal(t, &Entry{
+		Image: "ethpandaops/geth:fix", Command: []string{"geth", "--a", "--b"}, HasCommand: true, By: "pk", Reason: "why",
+	}, got, "flags apply to what the container was created with")
 
-	got, err = LocalEntry(p, v, &LocalRequest{Container: "geth", Clear: true, User: "local:pk"}, testNow)
+	deployed := &Deployed{Image: "ethpandaops/geth:master", Command: []string{"geth", "--a", "--d"}, HasCommand: true}
+	got, err = LocalEntry(v, &LocalRequest{
+		Container: "geth", Add: []string{"--b"}, Remove: []string{"--a"}, User: "local:pk",
+	}, deployed, testNow)
+	require.NoError(t, err)
+	assert.Equal(t, &Entry{Command: []string{"geth", "--d", "--b"}, HasCommand: true, By: "pk"}, got,
+		"flags apply to the deployed command")
+
+	got, err = LocalEntry(v, &LocalRequest{Container: "geth", Image: "a/b:c", User: "local:pk"}, deployed, testNow)
+	require.NoError(t, err)
+	assert.Equal(t, &Entry{Image: "a/b:c", By: "pk"}, got, "an image alone keeps the default command")
+
+	_, err = LocalEntry(v, &LocalRequest{Container: "geth", Remove: []string{"--a b c"}, User: "local:pk"}, nil, testNow)
+	require.ErrorContains(t, err, "one value")
+
+	got, err = LocalEntry(v, &LocalRequest{Container: "geth", Clear: true, User: "local:pk"}, nil, testNow)
 	require.NoError(t, err)
 	assert.Nil(t, got)
 
-	got, err = LocalEntry(p, v, &LocalRequest{Container: "nginx", Image: "a/b:c", User: "local:pk", Until: &until}, testNow)
+	got, err = LocalEntry(v, &LocalRequest{Container: "snooper", Image: "a/b:c", User: "local:pk", Until: &until}, nil, testNow)
 	require.ErrorIs(t, err, ErrRefused)
 	assert.Equal(t, &Entry{Image: "a/b:c", By: "pk", Until: &until}, got, "the entry refused")
 
-	_, err = LocalEntry(p, v, &LocalRequest{Container: "debug", Clear: true}, testNow)
+	_, err = LocalEntry(v, &LocalRequest{Container: "debug", Clear: true}, nil, testNow)
 	require.ErrorContains(t, err, "not managed")
 }
 

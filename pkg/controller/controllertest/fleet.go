@@ -35,12 +35,12 @@ func RolloutRow(id string, state fleet.RolloutState, members map[string]fleet.Ho
 
 // The fleet of the authorization tests.
 const (
-	// HostMixed runs geth (owner geth), lighthouse and lighthouse-validator
-	// (owner lighthouse) and an unmanaged container "debug".
+	// HostMixed runs geth (team geth), lighthouse and lighthouse-validator
+	// (team lighthouse) and an unmanaged container "debug".
 	HostMixed = "lighthouse-geth-1"
-	// HostTeku runs geth (owner geth) and teku (owners teku and nimbus).
+	// HostTeku runs geth (team geth) and teku (team teku).
 	HostTeku = "teku-geth-1"
-	// HostUnowned runs one managed container, "bootnode", nobody owns.
+	// HostUnowned runs one managed container, "bootnode", without a team.
 	HostUnowned = "bootnode-1"
 	// HostFresh has registered and never synced.
 	HostFresh = "fresh-1"
@@ -55,16 +55,9 @@ const (
 	LeaseGhost   = "lease-ghost"
 )
 
-// Owned is a running managed container with owners.
-func Owned(name string, owners ...string) protocol.Container {
-	return protocol.Container{Name: name, State: "running", Managed: true, Owners: owners}
-}
-
-// OfClient is a managed container of a client.
-func OfClient(c protocol.Container, kind protocol.ContainerKind, client string) protocol.Container {
-	c.Kind, c.Client = kind, client
-
-	return c
+// Owned is a running labelled container of a team; none without one.
+func Owned(name string, kind protocol.ContainerKind, team string) protocol.Container {
+	return protocol.Container{Name: name, State: "running", Managed: true, Kind: kind, Team: team}
 }
 
 // OwnershipFixture fills the fake store with the fleet above.
@@ -80,17 +73,17 @@ func OwnershipFixture(st *Store) {
 	defer st.Unlock()
 
 	st.Hosts[HostMixed] = &fleet.Host{Name: HostMixed, LastSeen: Epoch, Status: status(
-		Owned("geth", "geth"),
-		OfClient(Owned("lighthouse", "lighthouse"), protocol.KindCL, "lighthouse"),
-		OfClient(Owned("lighthouse-validator", "lighthouse"), protocol.KindVC, "lighthouse"),
+		Owned("geth", protocol.KindEL, "geth"),
+		Owned("lighthouse", protocol.KindCL, "lighthouse"),
+		Owned("lighthouse-validator", protocol.KindVC, "lighthouse"),
 		protocol.Container{Name: "debug", State: "exited"},
 	)}
 	st.Hosts[HostTeku] = &fleet.Host{Name: HostTeku, LastSeen: Epoch, Status: status(
-		OfClient(Owned("geth", "geth"), protocol.KindEL, "geth"),
-		OfClient(Owned("teku", "nimbus", "teku"), protocol.KindCL, "teku"),
+		Owned("geth", protocol.KindEL, "geth"),
+		Owned("teku", protocol.KindCL, "teku"),
 	)}
 	st.Hosts[HostUnowned] = &fleet.Host{Name: HostUnowned, LastSeen: Epoch, Status: status(
-		Owned("bootnode"),
+		Owned("bootnode", "bootnode", ""),
 	)}
 	st.Hosts[HostFresh] = &fleet.Host{Name: HostFresh, LastSeen: Epoch}
 
@@ -99,7 +92,7 @@ func OwnershipFixture(st *Store) {
 	st.Rollouts = []*fleet.Rollout{
 		{ID: "r-1", State: fleet.RolloutHalted},
 		{ID: "r-aborted", State: fleet.RolloutAborted},
-		{ID: "r-lighthouse", Kind: fleet.RolloutGroup, Client: "lighthouse", State: fleet.RolloutActive},
+		{ID: "r-lighthouse", Kind: fleet.RolloutGroup, ContainerKind: protocol.KindCL, Team: "lighthouse", State: fleet.RolloutActive},
 	}
 
 	st.Leases = []*fleet.Lease{

@@ -10,7 +10,7 @@
 #      the slot.
 #   2. A staggered reboot of the whole fleet from the API: both hosts
 #      reboot, one after the other, never together.
-#   3. A local hold (overrides.yaml) keeps a host out of a fleet reboot, and the
+#   3. A local hold (upgradoor hold) keeps a host out of a fleet reboot, and the
 #      controller cannot lift it.
 #
 # Nothing on this machine is upgraded or rebooted: the hosts are containers
@@ -132,7 +132,7 @@ for h in "${hosts[@]}"; do
     # The container this host manages: it must be stopped before the reboot
     # and running again after it.
     docker run -d --name "$name-app" --label upgradoor.test=reboot \
-        --label io.ethpandaops.upgradoor.group=app --label io.ethpandaops.upgradoor.kind=other --restart unless-stopped \
+        --label io.ethpandaops.upgradoor.kind=app --stop-timeout 5 --restart unless-stopped \
         busybox:stable sleep 1000000 >/dev/null
 
     "$work/upgradoor-controller" keygen host-key --network "$network" --hostname "$h" \
@@ -150,8 +150,6 @@ controller:
   maxSyncInterval: 3s
 overridesFile: /etc/upgradoor/overrides.yaml
 verbs: [roll, packages, reboot]
-groups:
-  app: {stopTimeout: 5s}
 docker:
   host: unix:///run/docker.sock
 packages:
@@ -308,7 +306,7 @@ pass "staggered fleet reboot: both hosts rebooted, one after the other"
 
 # --- 3: a local hold keeps a host out, and the controller cannot lift it ---------
 
-sysbox_exec "$id-host-2" sh -c 'printf "hold:\n  local:\n    by: test\n    reason: \"debugging, hands off\"\n" >> /etc/upgradoor/overrides.yaml'
+sysbox_exec "$id-host-2" /usr/local/bin/upgradoor hold "debugging, hands off" >/dev/null
 wait_until "host-2 reports the local hold" 30 \
     jq_true /api/v1/hosts/host-2 '.hold.local == true and .hold.localReason == "debugging, hands off"'
 post /api/v1/actions/unhold '{"hosts":["host-2"],"reason":"reboot test: try to lift a local hold"}' >/dev/null

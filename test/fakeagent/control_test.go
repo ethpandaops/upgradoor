@@ -25,7 +25,7 @@ func TestNewControlLoopbackOnly(t *testing.T) {
 }
 
 func TestControlHandler(t *testing.T) {
-	host, err := agenttest.NewHost(agenttest.BaseScenario(), nil)
+	host, err := agenttest.NewHost(agenttest.BaseScenario())
 	require.NoError(t, err)
 
 	h := (&control{host: host}).handler()

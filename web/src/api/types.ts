@@ -30,17 +30,6 @@ export function dict<T>(v: Record<string, T> | null | undefined): Record<string,
 /** protocol.Verb */
 type Verb = 'roll' | 'packages' | 'reboot';
 
-/** protocol.Validators: the validator range a host reports with its sync. */
-interface ValidatorReport {
-  start: number;
-  end: number;
-  /** Where the agent read the range: the marker file of the validator keys, or its configuration. */
-  source: 'marker' | 'config' | (string & {});
-  /** known: start and end are the range. missing: the marker file is not there. invalid: the range cannot be used. */
-  state: 'known' | 'missing' | 'invalid' | (string & {});
-  error?: string;
-}
-
 /** protocol.Hold */
 export interface Hold {
   local: boolean;
@@ -48,15 +37,18 @@ export interface Hold {
   controller: boolean;
 }
 
-/** protocol.ContainerKind */
-export type ContainerKind = 'el' | 'cl' | 'vc' | 'other';
+/**
+ * protocol.ContainerKind: the io.ethpandaops.upgradoor.kind label, a free-form
+ * name; el, cl and vc are the node's clients.
+ */
+export type ContainerKind = string;
 
 /**
- * protocol.Impact: how the controller schedules work on a container. node: the
- * validator budget, the host limit and the gate; slot: the host limit and the
- * gate; independent: a limit of its own.
+ * protocol.Impact: how the controller schedules work on a container. node (a
+ * labelled container): the validator budget, the host limit and the gate;
+ * independent (an unlabelled one): a limit of its own.
  */
-export type Impact = 'node' | 'slot' | 'independent';
+export type Impact = 'node' | 'independent';
 
 /** protocol.RegistryCheck */
 interface RegistryCheck {
@@ -84,31 +76,27 @@ export interface Container {
   restartCount: number;
   startedAt: string;
   managed: boolean;
+  /** kind is the kind label of a managed container; absent for an unlabelled one. */
   kind?: ContainerKind;
+  /**
+   * team is the team label of a managed container: the client ("geth",
+   * "lighthouse") that owns it; absent for a container without one (staff's).
+   */
+  team?: string;
   impact?: Impact;
   configuredImage?: string;
   registry?: RegistryCheck;
-  /** owners are the teams that own a managed container; absent when nobody does. */
-  owners?: string[];
   /**
-   * client is the client software a managed container runs ("geth",
-   * "lighthouse"); a validator client carries the client of its consensus
-   * client. This and the three fields below are in a host's details and in
-   * the rows of a client's host list, never in the rows of the host table.
+   * command is the command line of a managed container: what a flag
+   * override changes. This and the two fields below are in a host's details
+   * and in the rows of a client's host list, never in the rows of the host
+   * table.
    */
-  client?: string;
-  /** command is the command line of a managed container: what a flag override changes. */
   command?: string[];
   /** override is the entry of the host's overrides file for the container, or what is left to undo of one. */
   override?: ContainerOverride;
-  /** overridable says what the container's group lets anybody override; absent when nothing (tooling). */
-  overridable?: Overridable;
-  /**
-   * group is the roll group of a managed container: its
-   * io.ethpandaops.upgradoor.group label, its entry in the name map of the
-   * host's agent.yaml, or "default".
-   */
-  group?: string;
+  /** overridable: image and command line may be overridden (a container with a team, overrides on). */
+  overridable?: boolean;
   /** notRolled says why the agent rolls this container to nothing (its updates are still reported). */
   notRolled?: string;
 }
@@ -132,12 +120,6 @@ export interface ContainerOverride {
   error?: string;
 }
 
-/** protocol.Overridable: what the container's group allows to override; absent for tooling. */
-interface Overridable {
-  image?: boolean;
-  flags?: boolean;
-}
-
 /** protocol.ELHealth */
 export interface ELHealth {
   reachable: boolean;
@@ -159,10 +141,19 @@ export interface CLHealth {
   error?: string;
 }
 
+/** protocol.KindHealth: the HTTP probe of one kind; a 2xx answer is healthy. */
+export interface KindHealth {
+  kind: ContainerKind;
+  healthy: boolean;
+  error?: string;
+}
+
 /** protocol.NodeHealth */
 interface NodeHealth {
   el?: ELHealth;
   cl?: CLHealth;
+  /** The probes of the other kinds, sorted by kind. */
+  probes?: KindHealth[];
 }
 
 /** protocol.OSSummary */
@@ -190,10 +181,9 @@ export type NeedKind = 'image' | 'override' | 'spec' | 'packages' | 'reboot';
 /** protocol.ImageNeed */
 interface ImageNeed {
   container: string;
-  /** The roll group of the container: the needs of one group and client are one rollout. */
-  group?: string;
-  /** The client the container runs; the group rollouts of each client are their own. */
-  client?: string;
+  /** The kind and team of the container: the needs of one team and kind are one rollout. */
+  kind?: ContainerKind;
+  team?: string;
   image: string;
   fromDigest?: string;
   toDigest: string;
@@ -222,10 +212,9 @@ interface OverrideNeed {
  */
 interface SpecNeed {
   container: string;
-  /** The roll group of the container: the needs of one group and client are one rollout. */
-  group?: string;
-  /** The client the container runs; the group rollouts of each client are their own. */
-  client?: string;
+  /** The kind and team of the container: the needs of one team and kind are one rollout. */
+  kind?: ContainerKind;
+  team?: string;
   key: string;
   image: string;
   fromImage?: string;
@@ -385,12 +374,14 @@ export interface NetworkHealth {
   livenessError?: string;
   tracked: number;
   live: number;
+  /** Why the last fetch of the validator ranges inventory failed; the last good version stays in use. */
+  validatorRangesError?: string;
 }
 
 /**
- * fleet.RolloutKind. `group` moves the containers of one roll group of one
- * client (a beacon node and its validator client, an execution client) onto
- * what the hosts' image and spec needs of it ask for. `local` is a rollout of one host for what was asked for
+ * fleet.RolloutKind. `group` moves the containers of one kind of one team (of
+ * the kind alone without a team, of one image when unlabelled) onto what the
+ * hosts' image and spec needs of it ask for. `local` is a rollout of one host for what was asked for
  * on the host itself (an override, a roll from its command line): it has one
  * member, answers to no policy and has no canary.
  */
@@ -431,7 +422,7 @@ export interface RolloutHost {
   updatedAt: string;
 }
 
-/** fleet.RolloutTarget: one part of what a group rollout moves its group to. */
+/** fleet.RolloutTarget: one part of what a group rollout moves its containers to. */
 export interface RolloutTarget {
   /** The tag reference, and the digest and revision it moves to. */
   image: string;
@@ -449,14 +440,13 @@ export interface RolloutTarget {
 export interface Rollout {
   id: string;
   kind: RolloutKind;
-  /** group:<group>#<client>@<hash of the targets> (group:default/<image>@<hash> for the default group), packages:<key>, reboot, manual:<id>, local:<host>:<hash>. */
+  /** unit:<kind>[#<team>]@<hash of the targets> (unit:/<image>@<hash> for unlabelled containers), packages:<key>, reboot, manual:<id>, local:<host>:<hash>. */
   key: string;
   title: string;
-  /** The roll group a group rollout moves, and what it moves the group's containers to, sorted. */
-  group?: string;
+  /** The kind and team a group rollout moves (no kind: unlabelled containers; no team: staff's, answering to policyImage), and what it moves them to, sorted. */
+  containerKind?: ContainerKind;
+  team?: string;
   targets?: List<RolloutTarget>;
-  /** The client whose image policy a group rollout answers to; absent when it answers to policyImage. */
-  client?: string;
   packages?: PackageChange[];
   state: RolloutState;
   reason?: string;
@@ -572,8 +562,6 @@ export interface Settings {
   policyImage: Policy;
   policyPackages: Policy;
   policyReboot: Policy;
-  /** The policy of the default group's rollouts: one per image, of the containers no label or name map puts in a group. */
-  policyDefaultGroup: Policy;
   /**
    * The image policy per client ("geth": "manual"); always an object. The
    * image rollouts of a client that is listed answer to its entry, the
@@ -953,7 +941,7 @@ interface SlotRows {
 /** api.ContainerListing: a container as the host list shows it. */
 export type ContainerListing = Pick<
   Container,
-  'name' | 'image' | 'digest' | 'revision' | 'state' | 'managed' | 'kind' | 'impact' | 'owners' | 'group'
+  'name' | 'image' | 'digest' | 'revision' | 'state' | 'managed' | 'kind' | 'impact' | 'team'
 >;
 
 /**
@@ -996,8 +984,6 @@ export interface HostListing {
 
 /** api.HostSummary: a host in full, as its details carry it. */
 export interface HostSummary extends HostListing {
-  /** What the host's last sync said about its validator range; absent when it reports none. */
-  validatorReport?: ValidatorReport;
   containers: List<Container>;
   node: NodeHealth;
   /**
@@ -1022,11 +1008,8 @@ export interface HostDetail extends HostSummary {
   certHash: string;
   firstSeen: string;
   remoteAddr: string;
-  /** The [start, end) range counted for the host. It follows validatorReport and differs while the host does not know its range. */
-  validatorStart?: number;
-  validatorEnd?: number;
-  /** The other hosts that report validators this host reports too. */
-  validatorOverlaps?: string[];
+  /** The validators the validator ranges inventory assigns to the host, active or not. */
+  assignedValidators: number;
   inventory?: Inventory;
   leases: List<Lease>;
   history: List<AuditEntry>;
@@ -1070,9 +1053,6 @@ export interface ClientView {
   /** The image policy the client's rollouts answer to; policySet is false when that is policyImage. */
   policy: Policy;
   policySet: boolean;
-  /** owners own a container of the client on some host; allOwned own every one of them. */
-  owners: List<string>;
-  allOwned: List<string>;
   images: List<ClientImage>;
   /** The hosts that run the client; the counts below are those hosts by their state and add up to it. */
   hosts: number;

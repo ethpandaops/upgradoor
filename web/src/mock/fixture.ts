@@ -1,11 +1,11 @@
 // The mock fleet: a devnet with 24 hosts in the states an operator meets.
 //
-//   - a group rollout in progress (lighthouse's consensus group): the canary
+//   - a group rollout in progress (lighthouse cl): the canary
 //     and a host without validators are done, one host is verifying, the
 //     rest waits, one of them to pull the new image again after a failed
 //     pull;
-//   - a halted group rollout (nethermind's execution group) with a failed
-//     host, which is broken for the group;
+//   - a halted group rollout (nethermind el) with a failed host, which is
+//     broken for it;
 //   - a reboot rollout that waits for approval (policy manual);
 //   - a stale host, a host on local hold and a host with a custom image.
 //
@@ -65,7 +65,8 @@ interface ImageSpec {
   /** container is the container name Ansible deploys. */
   container: string;
   image: string;
-  kind: ContainerKind;
+  /** kind is the kind label; absent for an unlabelled container. */
+  kind?: ContainerKind;
 }
 
 const EL: Record<string, ImageSpec> = {
@@ -341,7 +342,6 @@ export function defaultSettings(): Settings {
     policyImage: 'auto',
     policyPackages: 'auto',
     policyReboot: 'manual',
-    policyDefaultGroup: 'auto',
     policyClients: {},
     pauseAfterCanaryImage: false,
     pauseAfterCanaryPackages: false,
@@ -356,15 +356,15 @@ function container(
   host: string,
   spec: ImageSpec,
   at: (secondsAgo: number) => string,
-  o: { behind: boolean; name?: string; image?: string; kind?: ContainerKind; fixed?: boolean; group?: string }
+  o: { behind: boolean; name?: string; image?: string; kind?: ContainerKind; fixed?: boolean }
 ): Container {
   const image = o.image ?? spec.image;
   const cur = currentDigest(image);
   const running = o.behind ? previousDigest(image) : cur;
   const name = o.name ?? spec.container;
-  // A container's client is the client software it runs; a validator client
-  // carries the client of its consensus client.
-  const client = spec.kind === 'el' || spec.kind === 'cl' ? spec.container : undefined;
+  // A client's containers carry its name as their team label; a validator
+  // client the team of its consensus client. Tooling has no team.
+  const team = spec.kind === 'el' || spec.kind === 'cl' ? spec.container : undefined;
   const kind = o.kind ?? spec.kind;
 
   return {
@@ -380,10 +380,10 @@ function container(
     restartCount: 0,
     startedAt: at(o.behind ? 3 * 86400 + (hash(host) % 40000) : 1800 + (hash(host + name) % 5000)),
     managed: true,
-    // The roll group Ansible labels the container with: a beacon node with its
-    // validator client, an execution client, a tool of its own.
-    group: o.group ?? (kind === 'el' ? 'execution' : kind === 'cl' || kind === 'vc' ? 'consensus' : name),
     kind,
+    team,
+    // Labelled: part of the node; unlabelled (defaultPolicy roll): independent.
+    impact: kind ? 'node' : 'independent',
     configuredImage: image,
     registry: {
       digest: cur,
@@ -391,14 +391,10 @@ function container(
       checkedAt: at(20 + (hash(`check/${host}/${name}`) % 240)),
       pulled: true,
     },
-    // A client's containers belong to the client's team (the validator
-    // client to the consensus client's); the tooling belongs to nobody.
-    owners: client ? [client] : undefined,
     // What follows is in a host's details and in the rows of a client's host
     // list; the rows of the host table do not carry it (MockController.summary).
-    client,
-    command: client ? baseCommand(kind, name) : undefined,
-    overridable: client && !o.fixed ? { image: true, flags: true } : undefined,
+    command: team ? baseCommand(kind, name) : undefined,
+    overridable: team && !o.fixed ? true : undefined,
   };
 }
 
@@ -458,8 +454,8 @@ function imageNeed(c: Container, pullFailed = false): Need {
     ...(pullFailed ? { pullError: PULL_ERROR } : {}),
     image: {
       container: c.name,
-      group: c.group,
-      client: c.client,
+      kind: c.kind,
+      team: c.team,
       image: c.image,
       fromDigest: c.digest,
       toDigest: to,
@@ -478,8 +474,8 @@ function specNeed(c: Container): Need {
     kind: 'spec',
     spec: {
       container: c.name,
-      group: c.group,
-      client: c.client,
+      kind: c.kind,
+      team: c.team,
       key,
       image,
       fromImage: c.image,
@@ -489,7 +485,7 @@ function specNeed(c: Container): Need {
   };
 }
 
-function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s: number) => string): HostDetail {
+function buildHost(spec: HostSpec, index: number, at: (s: number) => string): HostDetail {
   const behind = new Set(spec.behind ?? []);
   const containers: Container[] = [];
 
@@ -531,22 +527,21 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
     }
   }
 
-  // An RPC host has a proxy in front of its nodes: tooling of a group of its own, which nobody may override.
+  // An RPC host has a snooper in front of its EL: a kind without a team, which nobody may override.
   if (spec.roles.includes('rpc')) {
     containers.push(
-      container(spec.name, { container: 'nginx', image: 'nginx:1.27-alpine', kind: 'other' }, at, {
+      container(spec.name, { container: 'snooper', image: 'ethpandaops/rpc-snooper:latest', kind: 'snooper-el' }, at, {
         behind: false,
-        group: 'proxy',
       })
     );
   }
 
   if (!el && !cl) {
     containers.push(
-      container(spec.name, { container: 'dora', image: 'ethpandaops/dora:master', kind: 'other' }, at, {
+      container(spec.name, { container: 'dora', image: 'ethpandaops/dora:master' }, at, {
         behind: false,
       }),
-      container(spec.name, { container: 'spamoor', image: 'ethpandaops/spamoor:latest', kind: 'other' }, at, {
+      container(spec.name, { container: 'spamoor', image: 'ethpandaops/spamoor:latest' }, at, {
         behind: false,
       })
     );
@@ -702,14 +697,7 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
     certHash: hex(`cert/${spec.name}`),
     firstSeen: at(19 * 86400 + (hash(`first/${spec.name}`) % 3600)),
     remoteAddr: `203.0.113.${10 + index}`,
-    // One host has lost its marker file: the controller keeps counting the range it last knew.
-    validatorReport: spec.validators
-      ? index === 5
-        ? { start: 0, end: 0, source: 'marker', state: 'missing' }
-        : { start: validatorStart, end: validatorStart + VALIDATORS_PER_HOST, source: 'marker', state: 'known' }
-      : undefined,
-    validatorStart: spec.validators ? validatorStart : undefined,
-    validatorEnd: spec.validators ? validatorStart + VALIDATORS_PER_HOST : undefined,
+    assignedValidators: spec.validators ? VALIDATORS_PER_HOST : 0,
     inventory: {
       hash: hex(`inventory/${spec.name}`),
       collectedAt: at(3600 + (hash(`inv/${spec.name}`) % 7200)),
@@ -735,10 +723,10 @@ function buildHost(spec: HostSpec, index: number, validatorStart: number, at: (s
 
 /** A group rollout's key and title, as the scheduler writes them (groupKey, groupTitle). */
 function groupRollout(
-  group: string,
-  client: string,
+  kind: ContainerKind,
+  team: string,
   targets: RolloutTarget[]
-): Pick<Rollout, 'kind' | 'key' | 'title' | 'group' | 'client' | 'targets'> {
+): Pick<Rollout, 'kind' | 'key' | 'title' | 'containerKind' | 'team' | 'targets'> {
   const parts = targets.map(t => {
     const part = `${t.image} to ${t.digest.slice(7, 19)}`;
     if (!t.spec) return part;
@@ -746,10 +734,10 @@ function groupRollout(
   });
   return {
     kind: 'group',
-    key: `group:${group}#${client}@${hex(JSON.stringify(targets), 16)}`,
-    title: `${client} ${group}: ${parts.join('; ')}`,
-    group,
-    client,
+    key: `unit:${kind}#${team}@${hex(JSON.stringify(targets), 16)}`,
+    title: `${team} ${kind}: ${parts.join('; ')}`,
+    containerKind: kind,
+    team,
     targets,
   };
 }
@@ -775,11 +763,9 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
 
   const hosts = new Map<string, HostDetail>();
   const seenAgo = new Map<string, number>();
-  let validatorStart = 0;
 
   specs().forEach((spec, index) => {
-    const host = buildHost(spec, index, validatorStart, at);
-    if (spec.validators) validatorStart += VALIDATORS_PER_HOST;
+    const host = buildHost(spec, index, at);
     hosts.set(host.name, host);
     seenAgo.set(host.name, spec.stale ? 14 * 60 + 12 : hash(`seen/${spec.name}`) % 28);
   });
@@ -800,8 +786,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     kind: 'image',
     image: {
       container: c,
-      group: 'consensus',
-      client: 'lighthouse',
+      kind: c.endsWith('-validator') ? 'vc' : 'cl',
+      team: 'lighthouse',
       image: LIGHTHOUSE_IMAGE,
       fromDigest: previousDigest(LIGHTHOUSE_IMAGE),
       toDigest: lhDigest,
@@ -813,8 +799,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     kind: 'image',
     image: {
       container: 'nethermind',
-      group: 'execution',
-      client: 'nethermind',
+      kind: 'el',
+      team: 'nethermind',
       image: NETHERMIND_IMAGE,
       fromDigest: previousDigest(NETHERMIND_IMAGE),
       toDigest: nmDigest,
@@ -828,8 +814,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     kind: 'image',
     image: {
       container: c,
-      group: 'consensus',
-      client: 'grandine',
+      kind: c.endsWith('-validator') ? 'vc' : 'cl',
+      team: 'grandine',
       image: GRANDINE_IMAGE,
       fromDigest: previousDigest(GRANDINE_IMAGE),
       toDigest: grDigest,
@@ -853,7 +839,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
 
   // The lease that failed on nimbus-nethermind-1 left its mark on the host.
   const brokenHost = hosts.get('nimbus-nethermind-1');
-  if (brokenHost) brokenHost.broken = { 'group:execution#nethermind': leaseFailed };
+  if (brokenHost) brokenHost.broken = { 'unit:el#nethermind': leaseFailed };
 
   const withLease = (m: RolloutHost, leaseId: string, needId: string): RolloutHost => ({ ...m, leaseId, needId });
   const pending = (host: string, stage: RolloutHost['stage'], prefix: string, ago: number): RolloutHost => ({
@@ -864,7 +850,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
   const rollouts: Rollout[] = [
     {
       id: lighthouseRollout,
-      ...groupRollout('consensus', 'lighthouse', [imageTarget(LIGHTHOUSE_IMAGE, lhDigest)]),
+      ...groupRollout('cl', 'lighthouse', [imageTarget(LIGHTHOUSE_IMAGE, lhDigest)]),
       state: 'active',
       paused: false,
       approved: false,
@@ -886,7 +872,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     },
     {
       id: nethermindRollout,
-      ...groupRollout('execution', 'nethermind', [imageTarget(NETHERMIND_IMAGE, nmDigest)]),
+      ...groupRollout('el', 'nethermind', [imageTarget(NETHERMIND_IMAGE, nmDigest)]),
       state: 'halted',
       reason: 'nimbus-nethermind-1: container nethermind restarted 14 times while verifying',
       paused: false,
@@ -913,7 +899,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       // The canary is done and ready; with pauseAfterCanaryImage on, the
       // rollout waits for a person before the second host goes.
       id: grandineRollout,
-      ...groupRollout('consensus', 'grandine', [imageTarget(GRANDINE_IMAGE, grDigest)]),
+      ...groupRollout('cl', 'grandine', [imageTarget(GRANDINE_IMAGE, grDigest)]),
       state: 'active',
       paused: true,
       pauseReason: 'paused after the canary; resume to continue',
@@ -978,9 +964,9 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     },
     {
       id: oldLighthouseRollout,
-      ...groupRollout('consensus', 'lighthouse', [{ image: LIGHTHOUSE_IMAGE, digest: digest('lighthouse/older') }]),
+      ...groupRollout('cl', 'lighthouse', [{ image: LIGHTHOUSE_IMAGE, digest: digest('lighthouse/older') }]),
       state: 'superseded',
-      reason: `the group's target changed: consensus: ${LIGHTHOUSE_IMAGE} to ${previousDigest(LIGHTHOUSE_IMAGE).slice(7, 19)}`,
+      reason: `the target changed: lighthouse cl: ${LIGHTHOUSE_IMAGE} to ${previousDigest(LIGHTHOUSE_IMAGE).slice(7, 19)}`,
       paused: false,
       approved: false,
       force: false,
@@ -1214,8 +1200,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
   log(8 * 3600, 'alice@example.org', 'action.hold', 'grandine-erigon-2', { reason: 'testing a debug build' });
   log(7 * 3600, 'alice@example.org', 'action.unhold', 'grandine-erigon-2', { reason: 'custom image is enough' });
   log(3 * 3600 + 12 * 60, 'scheduler', 'rollout.created', nethermindRollout, {
-    group: 'execution',
-    client: 'nethermind',
+    containerKind: 'el',
+    team: 'nethermind',
     targets: [imageTarget(NETHERMIND_IMAGE, nmDigest)],
   });
   log(3 * 3600 + 10 * 60, 'scheduler', 'lease.granted', 'nimbus-nethermind-1', {
@@ -1234,8 +1220,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     after: { ...defaults, pauseAfterCanaryImage: true, readyPeerShare: 0.25 },
   });
   log(95 * 60, 'scheduler', 'rollout.created', grandineRollout, {
-    group: 'consensus',
-    client: 'grandine',
+    containerKind: 'cl',
+    team: 'grandine',
     targets: [imageTarget(GRANDINE_IMAGE, grDigest)],
   });
   log(93 * 60, 'scheduler', 'lease.granted', 'grandine-erigon-1', {
@@ -1252,8 +1238,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     lease: leaseGrandine,
   });
   log(47 * 60, 'scheduler', 'rollout.created', lighthouseRollout, {
-    group: 'consensus',
-    client: 'lighthouse',
+    containerKind: 'cl',
+    team: 'lighthouse',
     targets: [imageTarget(LIGHTHOUSE_IMAGE, lhDigest)],
   });
   log(46 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-1', {
@@ -1301,14 +1287,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     gateFailing: false,
     offline:
       fleet === 'large' || fleet === 'huge'
-        ? largeFleet(
-            now,
-            hosts,
-            seenAgo,
-            leases,
-            validatorStart,
-            fleet === 'huge' ? HUGE_FLEET_HOSTS : LARGE_FLEET_HOSTS
-          )
+        ? largeFleet(now, hosts, seenAgo, leases, fleet === 'huge' ? HUGE_FLEET_HOSTS : LARGE_FLEET_HOSTS)
         : new Map<string, [number, number][]>(),
     seq: 1000,
   };
@@ -1331,7 +1310,6 @@ function largeFleet(
   hosts: Map<string, HostDetail>,
   seenAgo: Map<string, number>,
   leases: Lease[],
-  validatorStart: number,
   count: number
 ): Map<string, [number, number][]> {
   const at = (secondsAgo: number) => new Date(now - secondsAgo * 1000).toISOString();
@@ -1351,7 +1329,7 @@ function largeFleet(
       validators: true,
       roles: ['ethereum_node'],
     };
-    hosts.set(name, buildHost(spec, 100 + i, validatorStart + i * VALIDATORS_PER_HOST, at));
+    hosts.set(name, buildHost(spec, 100 + i, at));
     seenAgo.set(name, hash(`seen/${name}`) % 28);
     names.push(name);
   }
@@ -1362,8 +1340,8 @@ function largeFleet(
     kind: 'image',
     image: {
       container: 'geth',
-      group: 'execution',
-      client: 'geth',
+      kind: 'el',
+      team: 'geth',
       image: 'ethpandaops/geth:master',
       fromDigest: 'sha256:0ld',
       toDigest: 'sha256:new',

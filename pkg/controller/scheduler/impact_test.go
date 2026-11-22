@@ -12,15 +12,14 @@ import (
 func TestNeedImpact(t *testing.T) {
 	h := &fleet.Host{Status: &protocol.SyncRequest{Containers: []protocol.Container{
 		{Name: "exporter", Impact: protocol.ImpactIndependent},
-		{Name: "mev", Impact: protocol.ImpactSlot},
+		{Name: "proxy", Impact: protocol.ImpactIndependent},
 		{Name: "old"},
 	}}}
 
 	exporter := imageNeed("exporter", "org/exporter:1", digestA)
-	mev := imageNeed("mev", "org/mev:1", digestA)
+	proxy := imageNeed("proxy", "org/proxy:1", digestA)
 
 	assert.Equal(t, protocol.ImpactIndependent, needImpact(h, &exporter))
-	assert.Equal(t, protocol.ImpactSlot, needImpact(h, &mev))
 
 	for name, n := range map[string]protocol.Need{
 		"no class reported":  imageNeed("old", "org/old:1", digestA),
@@ -30,7 +29,7 @@ func TestNeedImpact(t *testing.T) {
 		assert.Equal(t, protocol.ImpactNode, needImpact(h, &n), name)
 	}
 
-	assert.Equal(t, protocol.ImpactSlot, needsImpact(h, []protocol.Need{exporter, mev}))
+	assert.Equal(t, protocol.ImpactIndependent, needsImpact(h, []protocol.Need{exporter, proxy}))
 	assert.Equal(t, protocol.ImpactNode, needsImpact(h, []protocol.Need{exporter, packagesNeed("2")}))
 	assert.Equal(t, protocol.ImpactNode, needImpact(&fleet.Host{}, &exporter), "a host that never synced")
 }

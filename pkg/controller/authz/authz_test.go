@@ -65,12 +65,12 @@ func TestFeatureNames(t *testing.T) {
 }
 
 // A roll of the whole host is a team's when the team owns every container
-// the roll touches: one the host rolls to nothing (a default-group container
-// on a host that does not roll its default group) does not count.
+// the roll touches: one the host rolls to nothing (pinned to a digest) does
+// not count, a container without a team does.
 func TestUncoveredOnSkipsContainersNotRolled(t *testing.T) {
 	host := &fleet.Host{Name: "h", Status: &protocol.SyncRequest{Containers: []protocol.Container{
-		{Name: "geth", Managed: true, Owners: []string{"geth"}},
-		{Name: "cadvisor", Managed: true, Group: protocol.DefaultGroup, NotRolled: "not rolled"},
+		{Name: "geth", Managed: true, Kind: protocol.KindEL, Team: "geth"},
+		{Name: "cadvisor", Managed: true, NotRolled: "pinned to a digest"},
 	}}}
 	own := OwnershipOf([]*fleet.Host{host})["h"]
 	whole := ContainerTargets([]string{"h"}, false, nil)

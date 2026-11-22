@@ -398,10 +398,10 @@ func TestContainersLabels(t *testing.T) {
 
 	for id, labels := range map[string]map[string]string{
 		"labelled": {
-			protocol.LabelGroup: "proxy", protocol.LabelKind: "whatever",
+			protocol.LabelKind: "Whatever", protocol.LabelTeam: "geth",
 			labelOverrideImage: "x", labelOverrideCommand: "not a list",
 		},
-		"kind-only": {protocol.LabelKind: "el"},
+		"team-only": {protocol.LabelTeam: "geth"},
 	} {
 		f.containers[id] = &container.InspectResponse{
 			ID: id, Name: "/" + id, Image: fakeNewImage,
@@ -419,15 +419,15 @@ func TestContainersLabels(t *testing.T) {
 	}
 
 	labelled := byName["labelled"]
-	assert.Equal(t, "proxy", labelled.Group)
-	assert.Equal(t, protocol.ContainerKind("whatever"), labelled.Kind, "raw: plan.Classify parses it")
+	assert.Equal(t, protocol.ContainerKind("Whatever"), labelled.Kind, "raw: plan.Classify checks it")
+	assert.Equal(t, "geth", labelled.Team)
 	assert.Equal(t, &protocol.OverrideBase{Image: "x"}, labelled.Base,
 		"a command label that does not parse is no record")
 
-	kindOnly := byName["kind-only"]
-	assert.Empty(t, kindOnly.Group)
-	assert.Empty(t, kindOnly.Kind, "a kind without a group label is nobody's")
-	assert.Nil(t, kindOnly.Base)
+	teamOnly := byName["team-only"]
+	assert.Empty(t, teamOnly.Kind)
+	assert.Equal(t, "geth", teamOnly.Team, "raw: without a kind plan.Classify drops it")
+	assert.Nil(t, teamOnly.Base)
 }
 
 func TestLocalImage(t *testing.T) {

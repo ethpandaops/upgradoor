@@ -23,9 +23,9 @@ type Client interface {
 	Hold(ctx context.Context, req *HoldRequest) (*Answer, error)
 	// Roll requests a roll of one container.
 	Roll(ctx context.Context, container string) (*Answer, error)
-	// InitOverrides writes the generated block of the overrides file.
+	// InitOverrides lays out the overrides file.
 	InitOverrides(ctx context.Context) (*Answer, error)
-	// Deploy writes what a container is deployed as.
+	// Deploy has the agent read managed.yaml again.
 	Deploy(ctx context.Context, req *DeployRequest) (*DeployResult, error)
 }
 

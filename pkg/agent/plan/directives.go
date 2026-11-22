@@ -52,7 +52,7 @@ func RollNeed(
 		ID:   id,
 		Kind: protocol.NeedImage,
 		Image: &protocol.ImageNeed{
-			Container: c.Name, Group: c.Group, Client: c.Client, Image: c.Image,
+			Container: c.Name, Kind: c.Kind, Team: c.Team, Image: c.Image,
 			FromDigest: c.Digest, ToDigest: check.Digest, ToRevision: check.Revision,
 		},
 	}, ""

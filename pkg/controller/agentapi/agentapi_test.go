@@ -28,7 +28,6 @@ func validatorAgent(t *testing.T) *controllertest.Agent {
 
 	return controllertest.NewAgent(t, identity.CertificateSpec{
 		Hostname: "lighthouse-geth-1",
-		Roles:    []string{"ethereum_node"},
 	})
 }
 
@@ -53,8 +52,11 @@ func TestSyncPlainAndGzip(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			h := newHarness(t, nil)
 			agent := validatorAgent(t)
+			h.store.Ranges.Ranges = []fleet.HostRange{{
+				Host: agent.Name, ValidatorRange: identity.ValidatorRange{Start: 0, End: 100},
+			}}
 
-			rec := h.agentPost(agent, protocol.PathSync, controllertest.ValidatorSyncRequest(),
+			rec := h.agentPost(agent, protocol.PathSync, controllertest.SyncRequest(),
 				controllertest.CallOpts{Gzip: gz})
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
@@ -80,17 +82,17 @@ func TestAgentAuthentication(t *testing.T) {
 	body, err := json.Marshal(controllertest.SyncRequest())
 	require.NoError(t, err)
 
+	hostKey, err := identity.GenerateHostKey()
+	require.NoError(t, err)
+
 	otherSeedCert, err := identity.IssueCertificate(
-		[]byte("another seed that is at least 32 bytes long ......"),
+		[]byte("another seed that is at least 32 bytes long ......"), identity.PublicKey(hostKey),
 		identity.CertificateSpec{Network: controllertest.Network, Hostname: "lighthouse-geth-1"})
 	require.NoError(t, err)
 
 	// A certificate for another network, signed by this network's signer:
 	// the signature is good, the network claim is not.
 	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed), controllertest.Network)
-	require.NoError(t, err)
-
-	hostKey, err := identity.DeriveHostKey([]byte(controllertest.Seed), controllertest.Network, "lighthouse-geth-1")
 	require.NoError(t, err)
 
 	wrongNetCert, err := identity.SignCertificate(signer, identity.PublicKey(hostKey),
@@ -493,8 +495,11 @@ func TestAgentIsVerifiedBeforeSlotAndBody(t *testing.T) {
 	body, err := json.Marshal(controllertest.SyncRequest())
 	require.NoError(t, err)
 
+	hostKey, err := identity.GenerateHostKey()
+	require.NoError(t, err)
+
 	otherSeedCert, err := identity.IssueCertificate(
-		[]byte("another seed that is at least 32 bytes long ......"),
+		[]byte("another seed that is at least 32 bytes long ......"), identity.PublicKey(hostKey),
 		identity.CertificateSpec{Network: controllertest.Network, Hostname: "lighthouse-geth-1"})
 	require.NoError(t, err)
 
@@ -799,12 +804,16 @@ func TestSyncAuditsIdentity(t *testing.T) {
 	h := newHarness(t, nil)
 	agent := validatorAgent(t)
 
+	req := controllertest.SyncRequest()
+	req.Roles = []string{"ethereum_node"}
+
 	require.Equal(t, http.StatusOK,
-		h.agentPost(agent, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
+		h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{}).Code)
 
 	audit := h.store.AuditEntries()
 	require.Len(t, audit, 1)
 	assert.Equal(t, "host.registered", audit[0].Action)
+	assert.Equal(t, []string{"ethereum_node"}, audit[0].Detail["roles"])
 	assert.Equal(t, "agent:lighthouse-geth-1", audit[0].Actor)
 	assert.Equal(t, "lighthouse-geth-1", audit[0].Target)
 	assert.True(t, audit[0].Time.Equal(controllertest.Epoch))
@@ -814,17 +823,16 @@ func TestSyncAuditsIdentity(t *testing.T) {
 
 	// The same certificate again: nothing new.
 	require.Equal(t, http.StatusOK,
-		h.agentPost(agent, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
+		h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{}).Code)
 	require.Len(t, h.store.AuditEntries(), 1)
 
 	// Another certificate of the host: accepted, and audited with both hashes.
-	reissued := controllertest.NewAgent(t, identity.CertificateSpec{
-		Hostname: "lighthouse-geth-1",
-		Roles:    []string{"ethereum_node", "mev_relay"},
-	})
+	// The reported roles are stored sorted, without duplicates and invalid names.
+	reissued := controllertest.NewAgent(t, identity.CertificateSpec{Hostname: "lighthouse-geth-1"})
+	req.Roles = []string{"mev_relay", "ethereum_node", "mev_relay", "not a role"}
 
 	require.Equal(t, http.StatusOK,
-		h.agentPost(reissued, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
+		h.agentPost(reissued, protocol.PathSync, req, controllertest.CallOpts{}).Code)
 
 	audit = h.store.AuditEntries()
 	require.Len(t, audit, 2)
@@ -913,10 +921,7 @@ func TestSyncAuditsIdentityAfterClientWentAway(t *testing.T) {
 	require.Equal(t, http.StatusOK,
 		h.agentPost(agent, protocol.PathSync, controllertest.SyncRequest(), controllertest.CallOpts{}).Code)
 
-	reissued := controllertest.NewAgent(t, identity.CertificateSpec{
-		Hostname: "lighthouse-geth-1",
-		Roles:    []string{"ethereum_node", "mev_relay"},
-	})
+	reissued := controllertest.NewAgent(t, identity.CertificateSpec{Hostname: "lighthouse-geth-1"})
 
 	body, err := json.Marshal(controllertest.SyncRequest())
 	require.NoError(t, err)
@@ -1170,183 +1175,6 @@ func TestAgentAnswersAreSigned(t *testing.T) {
 	})
 }
 
-// The validators counted for a host follow what the host reports, sync by
-// sync, and nothing in its certificate.
-func TestSyncCountsTheReportedValidators(t *testing.T) {
-	h := newHarness(t, nil)
-	agent := validatorAgent(t)
-
-	sync := func(t *testing.T, a *controllertest.Agent, v *protocol.Validators) *fleet.Host {
-		t.Helper()
-
-		req := controllertest.SyncRequest()
-		req.Validators = v
-
-		rec := h.agentPost(a, protocol.PathSync, req, controllertest.CallOpts{})
-		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-
-		// Past the limit on audit entries about one host's range.
-		h.clock.Advance(2 * validatorAuditInterval)
-
-		return h.store.Host(a.Name)
-	}
-
-	actions := func() []string {
-		out := make([]string, 0, 4)
-		for _, e := range h.store.AuditEntries() {
-			out = append(out, e.Action)
-		}
-
-		return out
-	}
-
-	host := sync(t, agent, controllertest.KnownValidators(0, 100))
-	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 100}, host.Validators)
-	assert.Equal(t, []string{"host.registered"}, actions())
-	assert.Equal(t, uint64(100), h.store.AuditEntries()[0].Detail["validators"])
-
-	// The range changes while the controller runs: keys were moved.
-	host = sync(t, agent, controllertest.KnownValidators(50, 250))
-	assert.Equal(t, uint64(200), host.Weight())
-	assert.Equal(t, []string{"host.registered", "host.validators-changed"}, actions())
-
-	changed := h.store.AuditEntries()[1]
-	assert.Equal(t, map[string]any{"start": uint64(0), "end": uint64(100)}, changed.Detail["before"])
-	assert.Equal(t, map[string]any{"start": uint64(50), "end": uint64(250)}, changed.Detail["counted"])
-
-	// The same range again changes nothing and audits nothing.
-	sync(t, agent, controllertest.KnownValidators(50, 250))
-	assert.Len(t, actions(), 2)
-
-	// A host that does not know its range (its keys are being reshuffled, or
-	// the marker is damaged) keeps what was counted: it is not "none".
-	for _, unknown := range []*protocol.Validators{
-		{Source: protocol.ValidatorsFromMarker, State: protocol.ValidatorsMissing},
-		{Source: protocol.ValidatorsFromMarker, State: protocol.ValidatorsInvalid, Error: "garbage"},
-	} {
-		host = sync(t, agent, unknown)
-		assert.Equal(t, &identity.ValidatorRange{Start: 50, End: 250}, host.Validators)
-		assert.Equal(t, unknown.State, host.Status.Validators.State)
-	}
-
-	// A range out of bounds is not counted: it is stored as refused, and the
-	// host counts as one that does not know its range.
-	for _, bad := range []*protocol.Validators{
-		controllertest.KnownValidators(300, 200),
-		controllertest.KnownValidators(0, protocol.MaxHostValidators+1),
-		controllertest.KnownValidators(protocol.MaxValidatorIndex, protocol.MaxValidatorIndex+10),
-		{Start: 0, End: 10, Source: protocol.ValidatorsFromMarker, State: "certain"},
-	} {
-		host = sync(t, agent, bad)
-		assert.Equal(t, &identity.ValidatorRange{Start: 50, End: 250}, host.Validators)
-		assert.Equal(t, protocol.ValidatorsInvalid, host.Status.Validators.State)
-		assert.Contains(t, host.Status.Validators.Error, "refused by the controller")
-		assert.Zero(t, host.Status.Validators.End, "a refused range is not shown as one")
-	}
-
-	assert.Len(t, actions(), 2, "nothing changed meanwhile")
-
-	// An empty range, and no range at all (also an agent built before the
-	// field), say that the host has no validators.
-	host = sync(t, agent, controllertest.KnownValidators(0, 0))
-	assert.Nil(t, host.Validators)
-
-	host = sync(t, agent, controllertest.KnownValidators(50, 250))
-	assert.Equal(t, uint64(200), host.Weight())
-
-	host = sync(t, agent, nil)
-	assert.Nil(t, host.Validators)
-	assert.Zero(t, host.Weight())
-}
-
-// Two hosts that report the same validators: no validator is counted twice,
-// the one who held it first keeps it, and the overlap is shown and audited
-// once for as long as it lasts.
-func TestOverlappingValidatorRangesAreCountedOnce(t *testing.T) {
-	h := newHarness(t, nil)
-	first := validatorAgent(t)
-	second := controllertest.NewAgent(t, identity.CertificateSpec{Hostname: "prysm-besu-1"})
-
-	sync := func(t *testing.T, a *controllertest.Agent, start, end uint64) {
-		t.Helper()
-
-		req := controllertest.SyncRequest()
-		req.Validators = controllertest.KnownValidators(start, end)
-
-		rec := h.agentPost(a, protocol.PathSync, req, controllertest.CallOpts{})
-		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-		h.clock.Advance(2 * validatorAuditInterval)
-	}
-
-	overlapAudits := func() []fleet.AuditEntry {
-		out := make([]fleet.AuditEntry, 0, 2)
-
-		for _, e := range h.store.AuditEntries() {
-			if e.Action == "host.validators-overlap" {
-				out = append(out, e)
-			}
-		}
-
-		return out
-	}
-
-	total := func() uint64 {
-		return h.store.Host(first.Name).Weight() + h.store.Host(second.Name).Weight()
-	}
-
-	sync(t, first, 0, 100)
-	sync(t, second, 50, 150)
-
-	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 100}, h.store.Host(first.Name).Validators)
-	assert.Equal(t, &identity.ValidatorRange{Start: 100, End: 150}, h.store.Host(second.Name).Validators,
-		"the validators 50 to 99 stay with the host that had them")
-	assert.Equal(t, uint64(150), total(), "150 validators exist, not 200")
-
-	// Said once, however long both keep reporting it.
-	for range 3 {
-		sync(t, first, 0, 100)
-		sync(t, second, 50, 150)
-	}
-
-	// It is audited for the host that reports validators counted for
-	// another one; the host that holds them loses nothing.
-	audits := overlapAudits()
-	require.Len(t, audits, 1)
-	assert.Equal(t, second.Name, audits[0].Target)
-	assert.Equal(t, []string{first.Name}, audits[0].Detail["with"])
-	assert.Equal(t, map[string]any{"start": uint64(100), "end": uint64(150)}, audits[0].Detail["counted"])
-	assert.Equal(t, uint64(150), total())
-
-	// Both host views show what is reported, what is counted and with whom
-	// the report overlaps.
-	detail := h.detail(second.Name)
-	assert.Equal(t, uint64(50), detail.Validators)
-	assert.Equal(t, controllertest.KnownValidators(50, 150), detail.ValidatorReport)
-	assert.Equal(t, uint64(100), *detail.ValidatorStart)
-	assert.Equal(t, uint64(150), *detail.ValidatorEnd)
-	assert.Equal(t, []string{first.Name}, detail.ValidatorOverlaps)
-
-	detail = h.detail(first.Name)
-	assert.Equal(t, []string{second.Name}, detail.ValidatorOverlaps)
-
-	// The first host gives the validators up (the reshuffle is through): the
-	// second one now counts all it reports, and the episode is over.
-	sync(t, first, 0, 50)
-	sync(t, second, 50, 150)
-
-	assert.Equal(t, uint64(50), h.store.Host(first.Name).Weight())
-	assert.Equal(t, uint64(100), h.store.Host(second.Name).Weight())
-	assert.Len(t, overlapAudits(), 1)
-	assert.Empty(t, h.detail(second.Name).ValidatorOverlaps)
-
-	// A host cannot take validators from another by reporting them: a range
-	// over everything counts only what nobody holds.
-	sync(t, second, 0, 1000)
-	assert.Equal(t, uint64(50), h.store.Host(first.Name).Weight())
-	assert.Equal(t, &identity.ValidatorRange{Start: 50, End: 1000}, h.store.Host(second.Name).Validators)
-	assert.Len(t, overlapAudits(), 2, "a new overlap is a new episode")
-}
-
 // TestDuplicateContainerNames: a host that reports one name twice does not
 // get to pick the owners afterwards. The first entry is the container; the
 // later ones are dropped when the sync is stored.
@@ -1355,12 +1183,12 @@ func TestDuplicateContainerNames(t *testing.T) {
 
 	req := controllertest.SyncRequest()
 	req.Containers = []protocol.Container{
-		controllertest.Owned("lighthouse", "lighthouse"),
-		controllertest.Owned("geth", "geth"),
+		controllertest.Owned("lighthouse", protocol.KindCL, "lighthouse"),
+		controllertest.Owned("geth", protocol.KindEL, "geth"),
 		// The same name again, for another team, and once more unmanaged.
-		controllertest.Owned("lighthouse", "teku"),
+		controllertest.Owned("lighthouse", protocol.KindCL, "teku"),
 		{Name: "lighthouse", State: "exited"},
-		controllertest.Owned("geth"),
+		controllertest.Owned("geth", protocol.KindEL, ""),
 	}
 
 	rec := h.agentPost(controllertest.NewAgent(t, identity.CertificateSpec{Hostname: controllertest.HostMixed}), protocol.PathSync,
@@ -1369,8 +1197,8 @@ func TestDuplicateContainerNames(t *testing.T) {
 
 	stored := h.store.Host(controllertest.HostMixed).Status.Containers
 	require.Len(t, stored, 2)
-	assert.Equal(t, controllertest.Owned("lighthouse", "lighthouse"), stored[0])
-	assert.Equal(t, controllertest.Owned("geth", "geth"), stored[1])
+	assert.Equal(t, controllertest.Owned("lighthouse", protocol.KindCL, "lighthouse"), stored[0])
+	assert.Equal(t, controllertest.Owned("geth", protocol.KindEL, "geth"), stored[1])
 
 	// The view shows what was stored.
 	detail := h.detail(controllertest.HostMixed)
@@ -1388,7 +1216,7 @@ func TestSyncAnswersTheDigestsOfTheHostsTags(t *testing.T) {
 		f.Assignments[agent.Name] = &scheduler.Assignment{LookupInterval: 7 * time.Minute}
 	})
 
-	req := controllertest.ValidatorSyncRequest()
+	req := controllertest.SyncRequest()
 	req.Tags = []string{want.Ref, "ethpandaops/lighthouse:unstable"}
 
 	rec := h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{})

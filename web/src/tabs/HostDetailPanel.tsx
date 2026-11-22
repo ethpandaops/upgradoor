@@ -87,7 +87,7 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
           <Facts>
             <Fact label="roles">{list(h.roles).join(', ') || <Dash />}</Fact>
             <Fact label="validators">
-              <ValidatorRange host={h} />
+              <AssignedValidators host={h} />
             </Fact>
             <Fact label="certificate">
               <ShortId value={h.certHash} label="certificate hash" />
@@ -139,7 +139,7 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
                       tone="danger"
                       title={`Lease ${lease} failed on it: the host goes first in the next rollout of it`}
                     >
-                      {group.replace(/^group:/, '')}
+                      {group.replace(/^unit:/, '')}
                     </Badge>
                   ))}
                 </span>
@@ -220,11 +220,11 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
         )}
       </Section>
 
-      {containers.some(c => c.managed && c.client) && (
+      {containers.some(c => c.managed && c.team) && (
         <Section title="Clients, overrides and command lines">
           <ul className="flex flex-col rounded-sm border border-border bg-surface text-xs/5">
             {containers
-              .filter(c => c.managed && c.client)
+              .filter(c => c.managed && c.team)
               .map(c => (
                 <ClientContainer key={c.name} host={name} container={c} stale={h.stale} onAction={onAction} />
               ))}
@@ -272,56 +272,15 @@ export function HostDetailPanel({ name, onAction }: { name: string; onAction: (i
 }
 
 /**
- * ValidatorRange shows the range the controller counts for the host and
- * where the host's agent read it. A host that does not know its range
- * (missing, invalid) and a range that another host reports too are warnings:
- * the budget is then computed from a range that may be wrong.
+ * AssignedValidators shows how many validators the validator ranges inventory
+ * assigns to the host and how many of them are active on chain.
  */
-function ValidatorRange({ host: h }: { host: HostDetail }) {
-  const report = h.validatorReport;
-  const overlaps = list(h.validatorOverlaps);
-  const counted = h.validatorStart !== undefined && h.validatorEnd !== undefined;
+function AssignedValidators({ host: h }: { host: HostDetail }) {
+  if (!h.assignedValidators) return <>none</>;
 
   return (
-    <span className="flex flex-wrap items-center gap-x-2 gap-y-0.5">
-      {counted ? (
-        <span className="font-mono" title="The range the controller counts for this host">
-          [{h.validatorStart}, {h.validatorEnd}) = {h.validators}
-        </span>
-      ) : (
-        'none'
-      )}
-      {report && report.state === 'known' && (
-        <span className="text-muted" title="Where the agent read the range it reports">
-          from the{' '}
-          {report.source === 'marker'
-            ? 'marker file'
-            : report.source === 'config'
-              ? 'agent configuration'
-              : report.source}
-        </span>
-      )}
-      {report && report.state !== 'known' && (
-        <Badge
-          tone="warning"
-          title={
-            report.state === 'missing'
-              ? 'The marker file of the validator keys is not on the host. The controller keeps counting the last range it knew.'
-              : `The host reports a range that cannot be used${report.error ? `: ${report.error}` : ''}. The controller keeps counting the last range it knew.`
-          }
-        >
-          range {report.state}
-          {report.error ? `: ${report.error}` : ''}
-        </Badge>
-      )}
-      {overlaps.length > 0 && (
-        <Badge
-          tone="danger"
-          title="These hosts report validators this host reports too: keys are being moved, or one of them is wrong"
-        >
-          overlaps with {overlaps.join(', ')}
-        </Badge>
-      )}
+    <span title="Assigned to this host by the validator ranges inventory; active: with an attestation duty">
+      {h.assignedValidators} assigned, {h.validators} active
     </span>
   );
 }
@@ -394,15 +353,10 @@ function ClientContainer({
       {/* The actions stand at the left edge: the panel can be wider than the window. */}
       <div className="flex flex-wrap items-center gap-x-3 gap-y-1">
         <span className="font-medium">{c.name}</span>
-        <span className="text-muted" title="The client software the container runs">
-          {c.client}
+        <span className="text-muted" title="The team (client) and kind labels of the container">
+          {c.team}
           {c.kind ? ` · ${c.kind.toUpperCase()}` : ''}
         </span>
-        {c.group && (
-          <span className="text-muted" title="The roll group: its containers are rolled together, by one lease">
-            group <span className="font-medium text-foreground">{c.group}</span>
-          </span>
-        )}
         {c.impact && <ImpactBadge impact={c.impact} />}
         <span role="group" aria-label={`Overrides of ${c.name}`} className="flex shrink-0 items-center gap-1.5">
           <OverrideButtons host={host} containers={[c]} stale={stale} onAction={onAction} />
@@ -436,8 +390,7 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
         <tr>
           <Th>Name</Th>
           <Th>Kind</Th>
-          <Th title="The roll group of a managed container: its containers are rolled together, by one lease">Group</Th>
-          <Th title="The teams that own the container: their members may roll it">Owners</Th>
+          <Th title="The team label of the container: its members may roll it; without one, staff only">Team</Th>
           <Th>Image</Th>
           <Th>State</Th>
           <Th>Health</Th>
@@ -456,7 +409,7 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
             <tr key={c.id || c.name} className="hover:bg-surface-hover">
               <Td className="font-medium">{c.name}</Td>
               <Td>
-                {c.kind ? c.kind.toUpperCase() : <Dash />}
+                {c.kind ? c.kind.toUpperCase() : c.managed ? <span className="text-muted">unlabelled</span> : <Dash />}
                 {c.impact && (
                   <span className="ml-1.5">
                     <ImpactBadge impact={c.impact} />
@@ -465,13 +418,12 @@ function ContainerTable({ containers }: { containers: readonly Container[] }) {
               </Td>
               <Td>
                 <span className="inline-flex items-center gap-1.5">
-                  {c.group || <Dash />}
+                  {c.team || <Dash />}
                   {c.notRolled && (
                     <Badge title={`The agent rolls this container to nothing: ${c.notRolled}`}>not rolled</Badge>
                   )}
                 </span>
               </Td>
-              <Td>{list(c.owners).length > 0 ? list(c.owners).join(', ') : <Dash />}</Td>
               <Td>
                 <span className="font-mono">{c.image}</span>
                 {c.managed && c.configuredImage && c.configuredImage !== c.image && !c.override && (

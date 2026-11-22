@@ -31,9 +31,8 @@ func newFixture(t *testing.T) *fixture {
 
 	f.signer = PublicKey(signer)
 
-	key, err := DeriveHostKey(seed, "net", "host-1")
-	require.NoError(t, err)
-	cert, err := IssueCertificate(seed, CertificateSpec{Network: "net", Hostname: "host-1"})
+	key := hostKey(t, "host-1")
+	cert, err := IssueCertificate(seed, PublicKey(key), CertificateSpec{Network: "net", Hostname: "host-1"})
 	require.NoError(t, err)
 
 	f.creds, err = NewCredentials(key, cert)
@@ -57,8 +56,6 @@ func TestVerifyRequest(t *testing.T) {
 	cert, _, err := f.verifier.Verify(f.creds.Certificate(), proof, f.request("body"))
 	require.NoError(t, err)
 	assert.Equal(t, "host-1", cert.Subject)
-	assert.Empty(t, cert.Roles)
-	assert.NotNil(t, cert.Roles)
 
 	t.Run("replay", func(t *testing.T) {
 		_, _, err := f.verifier.Verify(f.creds.Certificate(), proof, f.request("body"))
@@ -143,8 +140,7 @@ func TestVerifyKnownCertificateStillChecksProof(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, f.verifier.certs, 1)
 
-	other, err := DeriveHostKey([]byte(testSeed), "net", "host-2")
-	require.NoError(t, err)
+	other := hostKey(t, "host-2")
 
 	forged, err := SignProof(other, &ProofClaims{
 		ID: "forged", Method: "POST", URL: fixtureURL, BodyHash: BodyHash([]byte("body")),
@@ -165,9 +161,9 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 	seed := []byte(testSeed)
 
 	t.Run("other network", func(t *testing.T) {
-		key, err := DeriveHostKey(seed, "net2", "host-1")
-		require.NoError(t, err)
-		cert, err := IssueCertificate(seed, CertificateSpec{Network: "net2", Hostname: "host-1"})
+		key := hostKey(t, "host-1")
+		cert, err := IssueCertificate(seed, PublicKey(key),
+			CertificateSpec{Network: "net2", Hostname: "host-1"})
 		require.NoError(t, err)
 		creds, err := NewCredentials(key, cert)
 		require.NoError(t, err)
@@ -189,8 +185,7 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 	})
 
 	t.Run("self-signed certificate", func(t *testing.T) {
-		key, err := DeriveHostKey(seed, "net", "evil")
-		require.NoError(t, err)
+		key := hostKey(t, "evil")
 		cert, err := SignCertificate(key, PublicKey(key),
 			CertificateSpec{Network: "net", Hostname: "host-2"})
 		require.NoError(t, err)
@@ -203,10 +198,9 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 	})
 
 	t.Run("stolen certificate, other key", func(t *testing.T) {
-		thief, err := DeriveHostKey(seed, "net", "host-2")
-		require.NoError(t, err)
+		thief := hostKey(t, "host-2")
 
-		_, err = NewCredentials(thief, f.creds.Certificate())
+		_, err := NewCredentials(thief, f.creds.Certificate())
 		require.ErrorIs(t, err, ErrBadCertificate)
 
 		proof, err := SignProof(thief, &ProofClaims{
@@ -230,9 +224,7 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 	})
 
 	t.Run("over-long proof lifetime", func(t *testing.T) {
-		key, err := DeriveHostKey(seed, "net", "host-1")
-		require.NoError(t, err)
-		proof, err := SignProof(key, &ProofClaims{
+		proof, err := SignProof(hostKey(t, "host-1"), &ProofClaims{
 			IssuedAt: f.now.Unix(), ExpiresAt: f.now.Unix() + 3600, ID: "y",
 			Method: "POST", URL: fixtureURL, BodyHash: BodyHash(nil),
 		})

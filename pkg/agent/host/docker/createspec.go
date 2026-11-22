@@ -11,8 +11,6 @@ import (
 	"github.com/moby/moby/api/types/container"
 	"github.com/moby/moby/api/types/mount"
 	"github.com/moby/moby/api/types/network"
-
-	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 // shortIDLength is the length of the short container ID Docker uses as the
@@ -82,7 +80,7 @@ func (s *createSpec) apply(change *Change) {
 		s.Config.Cmd = slices.Clone(change.Command)
 	}
 
-	if !change.SetBase && change.Group == "" {
+	if !change.SetBase && len(change.Labels) == 0 {
 		return
 	}
 
@@ -95,10 +93,7 @@ func (s *createSpec) apply(change *Change) {
 		setBaseLabels(labels, change.Base)
 	}
 
-	if change.Group != "" {
-		labels[protocol.LabelGroup] = change.Group
-		labels[protocol.LabelKind] = string(change.Kind)
-	}
+	maps.Copy(labels, change.Labels)
 
 	s.Config.Labels = labels
 }

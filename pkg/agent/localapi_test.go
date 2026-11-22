@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"os/user"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -94,15 +95,21 @@ func TestLocalOverride(t *testing.T) {
 		Container: "geth", Image: agenttest.FixImage, AddFlags: []string{"--pprof"}, Until: &until, Reason: "sync",
 	})
 	require.NoError(t, err)
-	assert.Contains(t, answer.Message, "image "+agenttest.FixImage+", flags +--pprof")
+	set := "image " + agenttest.FixImage + ", command --http --maxpeers=50 --pprof"
+	assert.Contains(t, answer.Message, set, "the flag is applied to the deployed command")
 
 	content := e.readOverrides()
-	assert.True(t, strings.HasPrefix(content, "# >>> upgradoor generated block"))
-	assert.Contains(t, content, "#   upgradoor override set <container>")
-	assert.Contains(t, content, "deployed:\n  \"geth\":\n    image: \""+agenttest.GethImage+"\"\n"+
-		"    command: [\"--http\", \"--maxpeers=50\"]\n")
-	assert.Contains(t, content, "local:"+me(t)+": set image "+agenttest.FixImage+", flags +--pprof; was nothing\n")
-	assert.Contains(t, content, "    by: \""+me(t)+"\"\n    reason: \"sync\"\n    until: "+until.Format(time.RFC3339)+"\n")
+	assert.True(t, strings.HasPrefix(content, "# upgradoor overrides: "))
+	assert.Contains(t, content, "#   upgradoor list | status | override set/clear <container>")
+	assert.Contains(t, content, "local:"+me(t)+": set "+set+"; was nothing\n"+
+		"  geth:\n    # default image: "+agenttest.GethImage+"\n"+
+		"    # default command:\n    #   - --http\n    #   - --maxpeers=50\n"+
+		"    image: "+agenttest.FixImage+"\n"+
+		"    command:\n      - --http\n      - --maxpeers=50\n      - --pprof\n"+
+		"    by: "+me(t)+"\n    reason: sync\n    until: "+until.Format(time.RFC3339)+"\n")
+	assert.Contains(t, content, "  teku:\n    # default image: "+agenttest.TekuImage+"\n"+
+		"    # default command: []\n    # image:\n", "an entry for a container without an override")
+	assert.NotContains(t, content, "dora:", "no entry for a container without overrides")
 
 	need := awaitOverrideNeed(t, e, "geth", false)
 	e.ctrl.Grant(e.lease("lease-local", need))
@@ -136,7 +143,7 @@ func TestLocalOverride(t *testing.T) {
 	assert.Equal(t, "local:"+me(t), records[1].User)
 	assert.Equal(t, "local", records[1].Source)
 	assert.Equal(t, "nothing", records[1].Before)
-	assert.Equal(t, "image "+agenttest.FixImage+", flags +--pprof", records[1].After)
+	assert.Equal(t, set, records[1].After)
 }
 
 func TestLocalClearOfNothing(t *testing.T) {
@@ -198,7 +205,7 @@ func TestLocalHoldThroughTheSocket(t *testing.T) {
 
 	req := e.ctrl.Await("the hold", func(req *protocol.SyncRequest) bool { return req.Hold.Local })
 	assert.Equal(t, "debugging", req.Hold.LocalReason)
-	assert.Contains(t, e.readOverrides(), "  local:\n    by: \""+me(t)+"\"\n", "the hold says who set it")
+	assert.Equal(t, me(t), field(t, e.stateOnDisk(), "holds", "local", "by"), "the hold says who set it")
 	assert.Empty(t, req.Needs, "a held host reports no needs")
 
 	_, err = c.Roll(t.Context(), "geth")
@@ -403,21 +410,33 @@ func TestLocalRollStates(t *testing.T) {
 	state(local.RollDone)
 }
 
-// A deploy writes the block and tells Ansible what to leave to the agent; it
-// wakes the loop only for a container off its target.
+// A deploy reads managed.yaml again, lays out the overrides file and tells
+// Ansible what to leave to the agent; it wakes the loop only for a container
+// off its target.
 func TestLocalDeploy(t *testing.T) {
 	t.Parallel()
 
 	e := overrideEnv(t)
 	a, ok := e.newAgent().(*agent)
 	require.True(t, ok)
+	require.NoError(t, a.open())
 
 	api := localAPI{a}
-	deploy := func(req *local.DeployRequest) *local.DeployResult {
+	deploy := func(container string, d plan.Deployed, reset bool) *local.DeployResult {
 		t.Helper()
 
-		res, err := api.Deploy(t.Context(), "local:root", req)
-		require.NoError(t, err)
+		var res *local.DeployResult
+
+		require.NoError(t, local.WriteManaged(e.cfg.Local.ManagedFile, container, d, func(changed bool) error {
+			var err error
+
+			res, err = api.Deploy(t.Context(), "local:root", &local.DeployRequest{Container: container, Reset: reset})
+			if err == nil {
+				res.Changed = res.Changed || changed
+			}
+
+			return err
+		}))
 
 		return res
 	}
@@ -432,58 +451,106 @@ func TestLocalDeploy(t *testing.T) {
 	gethCommand := []string{"--http", "--maxpeers=50"}
 	managed := []string{"image", "command", "labels"}
 
-	res := deploy(&local.DeployRequest{Container: "geth", Image: agenttest.GethImage, Command: gethCommand})
+	res := deploy("geth", plan.Deployed{Image: agenttest.GethImage, Command: gethCommand, HasCommand: true}, false)
 	assert.Equal(t, local.DeployResult{
 		Container: "geth", Exists: true, Managed: true, Changed: true, Roll: local.DeployRollNone, Ignore: managed,
 	}, *res)
 	assert.False(t, woken(), "in line with the target")
-	assert.Contains(t, e.readOverrides(), "  \"geth\":\n    image: \""+agenttest.GethImage+"\"\n"+
-		"    command: [\"--http\", \"--maxpeers=50\"]\n")
+	assert.Contains(t, e.readOverrides(), "  geth:\n    # default image: "+agenttest.GethImage+"\n"+
+		"    # default command:\n    #   - --http\n    #   - --maxpeers=50\n    # image:\n")
 
-	res = deploy(&local.DeployRequest{Container: "geth", Image: agenttest.FixImage, Command: gethCommand})
+	res = deploy("geth", plan.Deployed{Image: agenttest.FixImage, Command: gethCommand, HasCommand: true}, false)
 	assert.Equal(t, local.DeployResult{
 		Container: "geth", Exists: true, Managed: true, Changed: true, Roll: local.DeployRollRequested,
 		Ignore: managed,
 	}, *res)
 	assert.True(t, woken())
+	assert.Contains(t, e.readOverrides(), "    # default image: "+agenttest.FixImage+"\n", "the default lines follow")
 
-	// An override is kept by a deploy and dropped by a reset.
+	// An override is kept by a deploy and cleared by a reset.
 	_, _, err := a.files.SetEntry("geth", "dev", func(*plan.Entry) (*plan.Entry, error) {
-		return &plan.Entry{Add: []string{"--pprof"}, By: "dev", Reason: "debug"}, nil
+		return &plan.Entry{
+			Command: []string{"--http", "--maxpeers=50", "--pprof"}, HasCommand: true, By: "dev", Reason: "debug",
+		}, nil
 	})
 	require.NoError(t, err)
 
-	res = deploy(&local.DeployRequest{Container: "geth", Image: agenttest.GethImage, Command: gethCommand})
+	res = deploy("geth", plan.Deployed{Image: agenttest.GethImage, Command: gethCommand, HasCommand: true}, false)
 	assert.True(t, res.Changed)
 	assert.Equal(t, local.DeployRollRequested, res.Roll, "the override's flags are not applied yet")
 	assert.True(t, woken())
+	assert.Contains(t, e.readOverrides(), "      - --pprof\n")
 
-	res = deploy(&local.DeployRequest{
-		Container: "geth", Image: agenttest.GethImage, Command: gethCommand, Reset: true,
-	})
-	assert.True(t, res.Changed)
+	res = deploy("geth", plan.Deployed{Image: agenttest.GethImage, Command: gethCommand, HasCommand: true}, true)
+	assert.True(t, res.Changed, "the override was cleared")
 	assert.Equal(t, local.DeployRollNone, res.Roll)
-	assert.NotContains(t, e.readOverrides(), "--pprof\"]")
+	assert.Empty(t, a.files.Load().Entries)
+	assert.Contains(t, e.readOverrides(), "    #   - --maxpeers=50\n    # image:\n    # command:\n")
 
-	res = deploy(&local.DeployRequest{Container: "dora", Image: "ethpandaops/dora:latest"})
+	res = deploy("geth", plan.Deployed{Image: agenttest.GethImage, Command: gethCommand, HasCommand: true}, true)
+	assert.False(t, res.Changed, "nothing to change")
+
+	res = deploy("dora", plan.Deployed{Image: "ethpandaops/dora:latest"}, false)
 	assert.Equal(t, local.DeployResult{
 		Container: "dora", Exists: true, Changed: true, Roll: local.DeployRollNone, Ignore: []string{}, Pull: true,
 	}, *res)
+	assert.NotContains(t, e.readOverrides(), "dora:")
 
-	res = deploy(&local.DeployRequest{Container: "erigon", Image: "erigontech/erigon:latest", Command: []string{}})
+	res = deploy("erigon", plan.Deployed{Image: "erigontech/erigon:latest", Command: []string{}, HasCommand: true}, false)
 	assert.Equal(t, local.DeployResult{
 		Container: "erigon", Changed: true, Roll: local.DeployRollNone, Ignore: []string{}, Pull: true,
 	}, *res)
-	assert.Contains(t, e.readOverrides(), "  \"erigon\":\n    image: \"erigontech/erigon:latest\"\n    command: []\n")
 
-	res = deploy(&local.DeployRequest{Container: "erigon", Image: "erigontech/erigon:latest", Command: []string{}})
-	assert.False(t, res.Changed)
+	raw, err := os.ReadFile(e.cfg.Local.ManagedFile)
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), "  erigon:\n    image: erigontech/erigon:latest\n    command: []\n")
 
-	_, err = api.Deploy(t.Context(), "local:root", &local.DeployRequest{Container: "geth", Image: "Bad Image"})
-	require.Error(t, err)
+	_, err = api.Deploy(t.Context(), "local:root", &local.DeployRequest{Container: "nethermind"})
+	require.ErrorContains(t, err, "managed.yaml has no entry for container nethermind")
 
 	assert.Equal(t, []string{
 		"deploy accepted", "deploy accepted", "deploy accepted", "deploy accepted", "deploy accepted",
 		"deploy accepted",
 	}, auditActions(e.auditRecords()))
+}
+
+// Without an overrides file nothing can be overridden: the socket and the
+// controller are refused, and the sync offers no override.
+func TestOverridesDisabled(t *testing.T) {
+	t.Parallel()
+
+	e := overrideEnv(t)
+	e.cfg.Local.OverridesFile = ""
+	e.deploy(map[string]plan.Deployed{"geth": {Image: agenttest.GethImage}})
+	e.start()
+
+	c := local.NewClient(e.cfg.Local.Socket.Path)
+	st := awaitLocal(t, c, "the containers", func(st *local.Status) bool { return len(st.Containers) == 3 })
+	assert.Empty(t, st.OverridesFile)
+
+	req := e.ctrl.Await("a sync", func(req *protocol.SyncRequest) bool { return len(req.Containers) > 0 })
+	for _, ct := range req.Containers {
+		assert.False(t, ct.Overridable, ct.Name)
+	}
+
+	_, err := c.Override(t.Context(), &local.OverrideRequest{Container: "geth", Image: agenttest.FixImage})
+	require.EqualError(t, err, "overrides are disabled on this host")
+
+	_, err = c.Override(t.Context(), &local.OverrideRequest{Container: "geth", Clear: true})
+	require.EqualError(t, err, "overrides are disabled on this host")
+
+	_, err = c.InitOverrides(t.Context())
+	require.EqualError(t, err, "overrides are disabled on this host")
+
+	until := e.now().Add(time.Hour)
+	e.ctrl.Direct(protocol.Directive{
+		ID: "d-o", Kind: protocol.DirectiveOverride, Container: "geth",
+		Override: &protocol.OverrideInstruction{Part: protocol.OverrideImage, Image: agenttest.FixImage, Until: &until},
+	})
+	req = e.ctrl.Await("the answer", func(req *protocol.SyncRequest) bool { return agenttest.AckOf(req, "d-o") != nil })
+	assert.Equal(t, protocol.DirectiveRejected, agenttest.AckOf(&req, "d-o").Status)
+	assert.Equal(t, "overrides are disabled on this host", agenttest.AckOf(&req, "d-o").Error)
+
+	home := filepath.Join(filepath.Dir(filepath.Dir(e.cfg.Local.ManagedFile)), "home")
+	assert.NoFileExists(t, filepath.Join(home, "overrides.yaml"), "no overrides file is written")
 }

@@ -225,3 +225,17 @@ func (a *audit) LeaseResult(lease string, need *protocol.Need, step *protocol.St
 
 	a.Record(&rec)
 }
+
+// lines cuts every item to one line; nil stays nil.
+func lines(items []string) []string {
+	if items == nil {
+		return nil
+	}
+
+	out := make([]string, 0, len(items))
+	for _, s := range items {
+		out = append(out, plan.Line(s))
+	}
+
+	return out
+}

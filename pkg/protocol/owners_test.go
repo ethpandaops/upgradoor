@@ -39,19 +39,20 @@ func TestCleanOwners(t *testing.T) {
 	assert.Equal(t, "i", many[0])
 }
 
-// TestOwnersOnTheWire: the field is left out when a container has no owners,
-// and a body without it decodes to no owners.
-func TestOwnersOnTheWire(t *testing.T) {
+func TestValidKind(t *testing.T) {
+	assert.True(t, ValidKind("snooper-el"))
+	assert.True(t, ValidKind(KindVC))
+	assert.False(t, ValidKind(""))
+	assert.False(t, ValidKind("EL"))
+}
+
+// TestTeamOnTheWire: the field is left out when a container has no team.
+func TestTeamOnTheWire(t *testing.T) {
 	raw, err := json.Marshal(Container{Name: "geth", Managed: true})
 	require.NoError(t, err)
-	assert.NotContains(t, string(raw), "owners")
+	assert.NotContains(t, string(raw), "team")
 
-	raw, err = json.Marshal(Container{Name: "geth", Managed: true, Owners: []string{"geth"}})
+	raw, err = json.Marshal(Container{Name: "geth", Managed: true, Kind: KindEL, Team: "geth"})
 	require.NoError(t, err)
-	assert.Contains(t, string(raw), `"owners":["geth"]`)
-
-	var c Container
-
-	require.NoError(t, json.Unmarshal([]byte(`{"name":"geth","managed":true}`), &c))
-	assert.Nil(t, c.Owners)
+	assert.Contains(t, string(raw), `"kind":"el","team":"geth"`)
 }

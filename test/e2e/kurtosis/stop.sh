@@ -6,7 +6,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/../../.." || exit 1
 work=$PWD/.tmp/e2e
 prefix=upgradoor-e2e
 
-for f in controller authstub; do
+for f in controller authstub ranges; do
     if [ -f "$work/$f.pid" ]; then
         kill "$(cat "$work/$f.pid")" 2>/dev/null
         rm -f "$work/$f.pid"

@@ -1532,9 +1532,9 @@ func TestImageRolloutPerClient(t *testing.T) {
 
 		for _, name := range []string{tt.client + "-1", tt.client + "-2"} {
 			c := container("cl", image, digestOld, digestA, b.w.Now)
-			c.Client = tt.client
+			c.Team = tt.client
 			n := imageNeed("cl", image, digestA)
-			n.Image.Client = tt.client
+			n.Image.Team = tt.client
 
 			h := b.host(name, 0)
 			h.Status.Containers = []protocol.Container{c}
@@ -1548,7 +1548,7 @@ func TestImageRolloutPerClient(t *testing.T) {
 	for _, tt := range clients {
 		t.Run(tt.client, func(t *testing.T) {
 			r := b.mustRollout(imageKey(tt.client, image, digestA))
-			assert.Equal(t, tt.client, r.Client)
+			assert.Equal(t, tt.client, r.Team)
 			members := slices.Collect(maps.Keys(memberStates(r)))
 			assert.ElementsMatch(t, []string{tt.client + "-1", tt.client + "-2"}, members)
 

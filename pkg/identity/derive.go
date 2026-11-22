@@ -4,14 +4,14 @@
 // signature with which the controller authenticates to the host.
 //
 // There are two seeds, and they are different secrets. The devnet seed, one
-// per devnet, yields the signer key and the host keys of that devnet. The
-// controller seed, one per group of devnets (one devnet repository), yields
-// the controller key of each devnet of the group. A function takes the one
-// or the other, never both.
+// per devnet, yields the signer key of that devnet. The controller seed, one
+// per group of devnets (one devnet repository), yields the controller key of
+// each devnet of the group. A function takes the one or the other, never
+// both. A host key is generated on its host (GenerateHostKey).
 //
 // Keys and signatures are ML-DSA-44 (FIPS 204), a post-quantum scheme.
 // Signatures are deterministic: the same input gives the same certificate.
-// Ansible derives keys and certificates with upgradoor-controller keygen;
+// Ansible issues certificates with upgradoor-controller keygen;
 // testdata/vectors.json pins the encoding.
 package identity
 
@@ -22,6 +22,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"regexp"
 	"strings"
@@ -35,7 +36,6 @@ const (
 	MinSeedLength = 32
 
 	infoSignerPrefix = "upgradoor/signer/"
-	infoHostPrefix   = "upgradoor/host/"
 )
 
 var (
@@ -69,14 +69,38 @@ func ValidateName(s string) error {
 // decoding; only one trailing newline (LF or CRLF), which editors and "echo"
 // add, is dropped. The error never carries the content.
 func ReadSeedFile(path string) ([]byte, error) {
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrNoSeed, err)
 	}
 
+	defer func() { _ = f.Close() }()
+
+	seed, err := ReadSeed(f)
+	if err != nil {
+		return nil, fmt.Errorf("%s: %w", path, err)
+	}
+
+	return seed, nil
+}
+
+// maxSeed bounds the seed ReadSeed reads.
+const maxSeed = 64 << 10
+
+// ReadSeed reads a seed like ReadSeedFile from r, such as standard input.
+func ReadSeed(r io.Reader) ([]byte, error) {
+	raw, err := io.ReadAll(io.LimitReader(r, maxSeed+1))
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", ErrNoSeed, err)
+	}
+
+	if len(raw) > maxSeed {
+		return nil, fmt.Errorf("%w: longer than %d bytes", ErrNoSeed, maxSeed)
+	}
+
 	seed := strings.TrimSuffix(strings.TrimSuffix(string(raw), "\n"), "\r")
 	if len(seed) < MinSeedLength {
-		return nil, fmt.Errorf("%s: %w", path, ErrSeedTooShort)
+		return nil, ErrSeedTooShort
 	}
 
 	return []byte(seed), nil
@@ -94,17 +118,14 @@ func DeriveSignerKey(seed []byte, network string) (*mldsa.PrivateKey, error) {
 	return derive(seed, infoSignerPrefix+network)
 }
 
-// DeriveHostKey derives the key of one host.
-func DeriveHostKey(seed []byte, network, hostname string) (*mldsa.PrivateKey, error) {
-	if err := ValidateName(network); err != nil {
-		return nil, err
+// GenerateHostKey returns a new random host key.
+func GenerateHostKey() (*mldsa.PrivateKey, error) {
+	key, err := mldsa.GenerateKey(params())
+	if err != nil {
+		return nil, fmt.Errorf("identity: generate key: %w", err)
 	}
 
-	if err := ValidateName(hostname); err != nil {
-		return nil, err
-	}
-
-	return derive(seed, infoHostPrefix+network+"/"+hostname)
+	return key, nil
 }
 
 func derive(seed []byte, info string) (*mldsa.PrivateKey, error) {

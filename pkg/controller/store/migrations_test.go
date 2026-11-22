@@ -6,9 +6,12 @@ import (
 	"fmt"
 	"path/filepath"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 )
 
 func TestLoadMigrations(t *testing.T) {
@@ -179,4 +182,61 @@ func TestStartRefusesANewerDatabase(t *testing.T) {
 	require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM hosts`).Scan(&hosts))
 	assert.Equal(t, len(steps)+1, userVersion(t, db))
 	assert.Equal(t, 1, hosts)
+}
+
+// Step 2 closes the open rollouts of roll groups, drops the broken marks of
+// the old units and the policy of the default group; everything else stays.
+func TestMigrateContainerLabels(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	path := filepath.Join(t.TempDir(), "upgradoor.db")
+
+	steps, err := loadMigrations()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(steps), 2)
+
+	s, ok := New(quietLog(), path).(*sqliteStore)
+	require.True(t, ok)
+
+	db := fileDB(t, path)
+	require.NoError(t, s.migrate(ctx, db, steps[:1]))
+
+	_, err = db.Exec(`
+		INSERT INTO hosts (name, cert_hash, first_seen, last_seen, broken)
+		VALUES ('node-1', 'h', 1, 1, '{"group:execution#geth":"l-1","packages":"l-2"}');
+		INSERT INTO rollouts (id, kind, key, state, created_at, updated_at, data) VALUES
+			('r-open', 'group', 'group:execution#geth@aa', 'active', 1, 1767225600000,
+			 '{"id":"r-open","kind":"group","key":"group:execution#geth@aa","state":"active","group":"execution","client":"geth","hosts":[]}'),
+			('r-done', 'group', 'group:execution#geth@bb', 'completed', 1, 2, '{"id":"r-done","kind":"group","state":"completed"}'),
+			('r-pkg', 'packages', 'packages:x', 'active', 1, 2, '{"id":"r-pkg","kind":"packages","state":"active"}');
+		INSERT INTO settings (key, value) VALUES ('policyDefaultGroup', '"manual"'), ('policyImage', '"manual"');`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.migrate(ctx, db, steps))
+
+	require.NoError(t, s.Start(ctx))
+	t.Cleanup(func() { _ = s.Stop() })
+
+	r, err := s.GetRollout(ctx, "r-open")
+	require.NoError(t, err)
+	assert.Equal(t, fleet.RolloutSuperseded, r.State)
+	assert.Contains(t, r.Reason, "kinds and teams")
+	require.NotNil(t, r.EndedAt)
+	assert.Equal(t, time.UnixMilli(1767225600000).UTC(), r.EndedAt.UTC())
+
+	for id, want := range map[string]fleet.RolloutState{"r-done": fleet.RolloutCompleted, "r-pkg": fleet.RolloutActive} {
+		r, err = s.GetRollout(ctx, id)
+		require.NoError(t, err)
+		assert.Equal(t, want, r.State, id)
+	}
+
+	hosts, err := s.ListHosts(ctx)
+	require.NoError(t, err)
+	require.Len(t, hosts, 1)
+	assert.Equal(t, map[string]string{"packages": "l-2"}, hosts[0].Broken)
+
+	settings, err := s.LoadSettings(ctx, fleet.DefaultSettings())
+	require.NoError(t, err, "the removed setting is gone")
+	assert.Equal(t, fleet.PolicyManual, settings.PolicyImage)
 }

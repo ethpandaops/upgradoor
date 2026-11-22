@@ -90,7 +90,7 @@ describe('the host actions', () => {
     expect(within(table).getAllByTitle('Owners: the teams that own a container of this host')[0]).toHaveTextContent(
       /\w+ · \w+/
     );
-    expect(await screen.findByRole('table', { name: 'Containers' })).toHaveTextContent('Owners');
+    expect(await screen.findByRole('table', { name: 'Containers' })).toHaveTextContent('Team');
   });
 
   it('are disabled when the auth client cannot say what the login may do', async () => {

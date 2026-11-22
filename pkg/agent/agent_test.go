@@ -41,7 +41,7 @@ type env struct {
 func newEnv(t *testing.T, sc *agenttest.Scenario) *env {
 	t.Helper()
 
-	h, err := agenttest.NewHost(sc, nil)
+	h, err := agenttest.NewHost(sc)
 	require.NoError(t, err)
 
 	e := &env{t: t, host: h, log: logrus.New(), creds: agenttest.Credentials(t)}
@@ -50,7 +50,6 @@ func newEnv(t *testing.T, sc *agenttest.Scenario) *env {
 	e.ctrl.Lookup = h.Resolve
 
 	dir := t.TempDir()
-	overrides := []string{protocol.OverrideImage, protocol.OverrideFlags}
 
 	e.cfg = &Config{
 		Controller: link.Config{
@@ -65,14 +64,11 @@ func newEnv(t *testing.T, sc *agenttest.Scenario) *env {
 		StateDir: filepath.Join(dir, "state"),
 		Local: local.Config{
 			OverridesFile: filepath.Join(dir, "home", "overrides.yaml"),
+			ManagedFile:   filepath.Join(dir, "etc", "managed.yaml"),
 			Socket:        local.Socket{Path: socketPath(t)},
 		},
 		Policy: plan.Policy{
-			Verbs: []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages, protocol.VerbReboot},
-			Groups: map[string]plan.Group{
-				agenttest.GroupExecution: {Overrides: overrides},
-				agenttest.GroupConsensus: {Overrides: overrides},
-			},
+			Verbs:    []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages, protocol.VerbReboot},
 			Packages: plan.Packages{Blocked: []string{"docker-ce", "containerd.io"}},
 		},
 		Verify: lease.Config{Window: 30 * time.Millisecond, Timeout: 3 * time.Second},
@@ -80,6 +76,7 @@ func newEnv(t *testing.T, sc *agenttest.Scenario) *env {
 	e.cfg.ApplyDefaults()
 
 	require.NoError(t, os.MkdirAll(filepath.Dir(e.cfg.Local.OverridesFile), 0o755))
+	require.NoError(t, os.MkdirAll(filepath.Dir(e.cfg.Local.ManagedFile), 0o755))
 
 	return e
 }
@@ -147,19 +144,31 @@ func (e *env) lease(id string, needs ...protocol.Need) *protocol.Lease {
 	return agenttest.Lease(e.now(), id, needs...)
 }
 
-// deploy writes the generated block as Ansible does.
+// deploy writes managed.yaml as upgradoor deploy does, before the agent starts.
 func (e *env) deploy(deployed map[string]plan.Deployed) {
 	e.t.Helper()
 
-	files := local.NewFiles(e.log, e.cfg.Local.OverridesFile, local.NewAudit(e.log, &local.AuditConfig{
-		File: filepath.Join(e.t.TempDir(), "audit.log"), MaxSizeBytes: 1 << 20, MaxFiles: 1,
-	}, e.now), e.now)
-	require.NoError(e.t, files.InitBlock(deployed))
+	for name, d := range deployed {
+		require.NoError(e.t, local.WriteManaged(e.cfg.Local.ManagedFile, name, d, func(bool) error { return nil }))
+	}
 }
 
 func (e *env) writeOverrides(content string) {
 	e.t.Helper()
 	require.NoError(e.t, os.WriteFile(e.cfg.Local.OverridesFile, []byte(content), 0o600))
+}
+
+// overrideEntries are the overrides the overrides file holds.
+func (e *env) overrideEntries() map[string]plan.Entry {
+	e.t.Helper()
+
+	audit := local.NewAudit(e.log, &local.AuditConfig{
+		File: filepath.Join(e.t.TempDir(), "audit.log"), MaxSizeBytes: 1 << 20, MaxFiles: 1,
+	}, e.now)
+	files := local.NewFiles(e.log, e.cfg.Local.OverridesFile, audit, e.now).Load()
+	require.True(e.t, files.Known, files.Err)
+
+	return files.Entries
 }
 
 func (e *env) readOverrides() string {

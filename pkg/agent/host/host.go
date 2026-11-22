@@ -50,8 +50,6 @@ type Host interface {
 
 	// Probe checks the local EL and CL.
 	Probe(ctx context.Context) protocol.NodeHealth
-	// Validators reads the host's validator range.
-	Validators(ctx context.Context) *protocol.Validators
 
 	// Close releases the Docker client.
 	Close() error
@@ -79,10 +77,9 @@ func New(log logrus.FieldLogger, cfg *Config, blocked []string, login Login) (Ho
 	}
 
 	return &machine{
-		Runtime:    runtime,
-		system:     system.New(log, blocked, cfg.Commands),
-		Prober:     probe.New(log, &cfg.Probes),
-		validators: cfg.Validators,
+		Runtime: runtime,
+		system:  system.New(log, blocked, cfg.Commands),
+		Prober:  probe.New(log, cfg.Probes),
 	}, nil
 }
 
@@ -93,8 +90,6 @@ type machine struct {
 
 	// system is a named field: its Status is Host's System.
 	system system.System
-
-	validators Validators
 }
 
 var _ Host = (*machine)(nil)
@@ -117,9 +112,4 @@ func (m *machine) UpgradePackages(ctx context.Context, names []string) error {
 // Reboot implements Host.
 func (m *machine) Reboot(ctx context.Context) error {
 	return m.system.Reboot(ctx)
-}
-
-// Validators implements Host.
-func (m *machine) Validators(context.Context) *protocol.Validators {
-	return ReadValidators(&m.validators)
 }

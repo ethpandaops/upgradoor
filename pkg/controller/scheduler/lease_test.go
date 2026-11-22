@@ -873,6 +873,33 @@ func TestProbeReadiness(t *testing.T) {
 		assert.False(t, out.Plan.Gate.OK)
 	})
 
+	t.Run("a rolled kind waits for its own probe", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.host("a", 0)
+		b.wantsInGroup("a", "snooper", "snooper-el", "", "ethpandaops/snooper:latest", digestA)
+		b.step()
+		b.finish("a")
+
+		failing := synced
+		failing.Probes = []protocol.KindHealth{{Kind: "snooper-el", Error: "status 503"}}
+		b.get("a").Status.Node = failing
+
+		b.step()
+		b.advance(5 * time.Second)
+		b.step()
+		b.advance(testEpoch)
+		b.step()
+		require.NotNil(t, b.lease("a"), "the node is at head, the snooper's probe fails")
+		assert.Equal(t, "probe snooper-el: status 503", b.lease("a").Readiness)
+
+		healthy := synced
+		healthy.Probes = []protocol.KindHealth{{Kind: "snooper-el", Healthy: true}}
+		b.get("a").Status.Node = healthy
+		b.advance(5 * time.Second)
+		b.step()
+		assert.Nil(t, b.lease("a"))
+	})
+
 	t.Run("a host that went silent is not ready", func(t *testing.T) {
 		b := start(t, 0)
 		b.get("a").Status.Node = synced

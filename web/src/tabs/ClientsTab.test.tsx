@@ -441,13 +441,10 @@ describe('ClientsTab: changes for a group of hosts', () => {
 });
 
 describe('the helpers of the Clients tab', () => {
-  it('open on the first client a team of the login owns, else on the first', () => {
-    const clients = [
-      { name: 'grandine', owners: ['grandine'] },
-      { name: 'teku', owners: ['teku', 'besu'] },
-    ] as unknown as Parameters<typeof defaultClient>[0];
+  it('open on the first client that is a team of the login, else on the first', () => {
+    const clients = [{ name: 'grandine' }, { name: 'teku' }] as unknown as Parameters<typeof defaultClient>[0];
 
-    expect(defaultClient(clients, ['besu'])).toBe('teku');
+    expect(defaultClient(clients, ['besu', 'teku'])).toBe('teku');
     expect(defaultClient(clients, ['geth'])).toBe('grandine');
     expect(defaultClient([], ['geth'])).toBeUndefined();
   });

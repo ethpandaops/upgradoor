@@ -56,14 +56,13 @@ type SyncRequest struct {
 
 	// Verbs are the verbs the local configuration allows.
 	Verbs []Verb `json:"verbs"`
+	// Roles are the host's roles from its configuration, at most MaxRoles.
+	Roles []string `json:"roles,omitempty"`
 	// Hold reports the hold state. While held the agent reports no needs and
 	// refuses leases.
 	Hold Hold `json:"hold"`
 
 	Containers []Container `json:"containers"`
-	// Validators is the host's validator range, read locally. Absent: the
-	// host has no validators.
-	Validators *Validators `json:"validators,omitempty"`
 	Node       NodeHealth  `json:"node"`
 	OS         OSSummary   `json:"os"`
 	Pending    Pending     `json:"pending"`
@@ -87,8 +86,8 @@ type SyncRequest struct {
 
 // Hold is the agent's hold state.
 type Hold struct {
-	// Local is true when the overrides file holds a local hold (or cannot be
-	// read). Only a person on the
+	// Local is true when the agent holds a local hold (or a file of the host
+	// cannot be read). Only a person on the
 	// host can lift it; the controller cannot.
 	Local bool `json:"local"`
 	// LocalReason is the reason of the local hold.
@@ -101,15 +100,21 @@ type Hold struct {
 // Active reports whether any hold is in effect.
 func (h Hold) Active() bool { return h.Local || h.Controller }
 
-// ContainerKind classifies a managed container.
+// ContainerKind is what a managed container is, by its LabelKind label: a
+// free-form name (ValidKind) such as el, cl, vc or snooper-el. An unlabelled
+// container has none.
 type ContainerKind string
 
-// Container kinds.
+// The kinds with a meaning of their own.
 const (
-	KindEL    ContainerKind = "el"
-	KindCL    ContainerKind = "cl"
-	KindVC    ContainerKind = "vc"
-	KindOther ContainerKind = "other"
+	// KindEL, KindCL and KindVC are the node's clients: the EL and CL layers
+	// of the clients page, the probes with their own checks, and the start
+	// order el, cl, vc.
+	KindEL ContainerKind = "el"
+	KindCL ContainerKind = "cl"
+	KindVC ContainerKind = "vc"
+	// KindNone as the value of LabelKind leaves a container out of everything.
+	KindNone ContainerKind = "none"
 )
 
 // Impact says what restarting a managed container takes away, and so how
@@ -123,10 +128,6 @@ const (
 	// the host limit, waits for the network gate, and is ready when the node
 	// is back at head with peers and its validators attest.
 	ImpactNode Impact = "node"
-	// ImpactSlot: the container counts for the host limit and the network
-	// gate, not for the validator budget; it is ready when it ran through the
-	// verify window.
-	ImpactSlot Impact = "slot"
 	// ImpactIndependent: the container touches neither the node nor the
 	// network. Work on it has its own limit (Settings.MaxIndependentPercent),
 	// no gate and no budget; it is ready when it ran through the verify
@@ -134,32 +135,19 @@ const (
 	ImpactIndependent Impact = "independent"
 )
 
-// DefaultImpact is the impact of a container of a kind that names none:
-// independent for KindOther, node for the node's own containers.
-func DefaultImpact(kind ContainerKind) Impact {
-	if kind == KindOther {
-		return ImpactIndependent
-	}
-
-	return ImpactNode
-}
-
 // Valid reports whether the impact is one of the classes.
 func (i Impact) Valid() bool {
-	return i == ImpactNode || i == ImpactSlot || i == ImpactIndependent
+	return i == ImpactNode || i == ImpactIndependent
 }
 
 // rank orders the classes: a lease that serves several is as heavy as the
 // heaviest.
 func (i Impact) rank() int {
-	switch i {
-	case ImpactIndependent:
+	if i == ImpactIndependent {
 		return 0
-	case ImpactSlot:
-		return 1
-	default:
-		return 2
 	}
+
+	return 1
 }
 
 // Heavier returns the heavier of two classes. The empty class counts as
@@ -176,47 +164,20 @@ func (i Impact) Heavier(o Impact) Impact {
 	return i
 }
 
-// The labels Ansible sets on a container that upgradoor rolls. The agent
-// finds its containers by them; a recreate keeps a container's labels.
+// The labels Ansible sets on a container: the only per-container
+// configuration of upgradoor. The agent finds its containers by them; a
+// recreate keeps a container's labels.
 //
-// A container without the labels is in the group its name has in agent.yaml
-// (the name map, for containers deployed before the labels; the next
-// recreate adds them), or else in DefaultGroup.
+// A container with any kind but KindNone is managed with impact node. A
+// container without LabelKind follows the host's defaultPolicy.
 const (
-	// LabelGroup marks a managed container; its value is the roll group.
-	// GroupNone leaves the container out of everything.
-	LabelGroup = "io.ethpandaops.upgradoor.group"
-	// LabelKind is the container's kind: el, cl, vc or other.
+	// LabelKind is the container's kind (ContainerKind).
 	LabelKind = "io.ethpandaops.upgradoor.kind"
+	// LabelTeam is the team that owns the container, the client name
+	// ("geth"): it keys the client's image policy and the team features.
+	// Optional; a container without it is staff's.
+	LabelTeam = "io.ethpandaops.upgradoor.team"
 )
-
-// The group names with a meaning of their own.
-const (
-	// DefaultGroup is the group of every container that neither a label nor
-	// the name map puts in one: kind other, impact independent, admin-only,
-	// nothing overridable. Its containers follow their tag only where the
-	// host's agent.yaml says so (defaultGroup.roll); all hosts' needs of one
-	// image are one rollout.
-	DefaultGroup = "default"
-	// GroupNone as the value of LabelGroup leaves a container out of
-	// everything: it is neither managed nor in the default group.
-	GroupNone = "none"
-)
-
-// ReservedGroup reports whether name is a group name that agent.yaml cannot
-// configure (DefaultGroup, GroupNone).
-func ReservedGroup(name string) bool { return name == DefaultGroup || name == GroupNone }
-
-// ParseKind reads the value of a LabelKind label: other for anything that
-// is not el, cl or vc.
-func ParseKind(v string) ContainerKind {
-	switch k := ContainerKind(v); k {
-	case KindEL, KindCL, KindVC:
-		return k
-	default:
-		return KindOther
-	}
-}
 
 // Docker container states.
 const (
@@ -256,59 +217,44 @@ type Container struct {
 	RestartCount int       `json:"restartCount"`
 	StartedAt    time.Time `json:"startedAt"`
 
-	// Managed is true for every container the agent looks after: one in a
-	// group by its label or the name map of agent.yaml, or in DefaultGroup.
-	// A container labelled GroupNone, or left out of the default group by
-	// agent.yaml, is not managed.
+	// Managed is true for every container the agent looks after: one with a
+	// kind label other than KindNone, and an unlabelled one on a host whose
+	// defaultPolicy is roll.
 	Managed bool `json:"managed"`
-	// Group is the roll group of a managed container (its LabelGroup label,
-	// its entry in the name map, or DefaultGroup): the containers of one
-	// group on a host are rolled together, under one lease.
-	Group string `json:"group,omitempty"`
-	// Kind is the kind of a managed container: its LabelKind label or the
-	// name map's kind (other when absent or unknown, and in DefaultGroup).
+	// Kind is the LabelKind label of a managed container; empty for an
+	// unlabelled one.
 	Kind ContainerKind `json:"kind,omitempty"`
+	// Team is the LabelTeam label of a labelled managed container; empty
+	// when it has none. The controller authorizes team features with it and
+	// serves it to authenticated users only.
+	Team string `json:"team,omitempty"`
 	// NotRolled says why the agent rolls this managed container to nothing:
-	// it is pinned to a digest, it has links, or it is in DefaultGroup on a
-	// host that does not roll that group. Its updates are still reported.
-	// Absent for a container the agent rolls.
+	// it is pinned to a digest or it has links. Its updates are still
+	// reported. Absent for a container the agent rolls.
 	NotRolled string `json:"notRolled,omitempty"`
-	// Impact is the impact class of the container's group; absent for
-	// unmanaged containers.
+	// Impact is node for a labelled container, independent for an
+	// unlabelled one; absent for unmanaged containers.
 	Impact Impact `json:"impact,omitempty"`
 	// ConfiguredImage is the image Ansible deployed the container with: its
-	// entry in the deployed block of the overrides file or, without one, the
-	// image it was created with.
+	// entry in the host's managed.yaml or, without one, the image it was
+	// created with.
 	ConfiguredImage string `json:"configuredImage,omitempty"`
 
 	// Registry is the last registry check for Image; nil for unmanaged
 	// containers.
 	Registry *RegistryCheck `json:"registry,omitempty"`
 
-	// Owners are the teams that own a managed container, from the agent
-	// configuration: sorted, at most MaxOwners, each a team name (ValidOwner).
-	// Absent for unmanaged containers and for containers nobody owns. The
-	// controller authorizes the actions of team members with it and serves it
-	// to authenticated users only.
-	Owners []string `json:"owners,omitempty"`
-
-	// Client is the client software a managed container runs ("geth",
-	// "lighthouse"), from the agent configuration (ValidClient). A validator
-	// client container carries the client of its consensus client. Absent for
-	// containers that are not listed under a client.
-	Client string `json:"client,omitempty"`
-
 	// Command is the command line of a managed container (the arguments
 	// after the entrypoint), which is what a flag override changes. Like the
-	// owners it is served to authenticated users only.
+	// team it is served to authenticated users only.
 	Command []string `json:"command,omitempty"`
 	// Override is the entry of the host's overrides file for a managed
 	// container, or what is left to undo of one that is gone. Absent when
 	// the container runs what the agent configuration says.
 	Override *ContainerOverride `json:"override,omitempty"`
-	// Overridable says what the agent configuration lets the controller
-	// override on this container. Absent when nothing.
-	Overridable *Overridable `json:"overridable,omitempty"`
+	// Overridable: the image and the command line may be overridden, on a
+	// host with overrides enabled, for a container with a team.
+	Overridable bool `json:"overridable,omitempty"`
 
 	// Base is what the container's own labels say it was before an override
 	// changed it. It is not part of the wire format: the agent's container
@@ -320,18 +266,6 @@ type Container struct {
 	// Linked is true for a container created with links (--link), which a
 	// recreate cannot keep. Not part of the wire format.
 	Linked bool `json:"-"`
-	// Unlabelled is true for a managed container that the name map of
-	// agent.yaml puts in its group: the next recreate adds the labels. Not
-	// part of the wire format.
-	Unlabelled bool `json:"-"`
-}
-
-// GroupLabels are the labels that put a container in its group and kind,
-// for a recreate to set.
-func (c *Container) GroupLabels() map[string]*string {
-	group, kind := c.Group, string(c.Kind)
-
-	return map[string]*string{LabelGroup: &group, LabelKind: &kind}
 }
 
 // OverrideBase is a container's form before an override, as its labels
@@ -369,17 +303,6 @@ type ContainerOverride struct {
 	Restoring bool `json:"restoring,omitempty"`
 	// Error says why the override cannot be applied as written.
 	Error string `json:"error,omitempty"`
-}
-
-// Overridable is what the container's group lets anybody override: the
-// controller, the local commands and a hand edit of the overrides file
-// alike. A container of a group that allows nothing is tooling: it runs
-// exactly what Ansible deployed.
-type Overridable struct {
-	// Image is true when image overrides are on.
-	Image bool `json:"image,omitempty"`
-	// Flags is true when flag overrides are on.
-	Flags bool `json:"flags,omitempty"`
 }
 
 // ShouldRun reports whether the container is meant to be running: it runs,
@@ -423,11 +346,39 @@ type RegistryCheck struct {
 	PullFailed bool `json:"pullFailed,omitempty"`
 }
 
-// NodeHealth is the result of the agent's local EL and CL probes. A nil
-// member means the probe is not configured.
+// NodeHealth is the result of the agent's local probes. A nil EL or CL
+// means the probe is not configured.
 type NodeHealth struct {
 	EL *ELHealth `json:"el,omitempty"`
 	CL *CLHealth `json:"cl,omitempty"`
+	// Probes are the HTTP probes of the other kinds, sorted by kind.
+	Probes []KindHealth `json:"probes,omitempty"`
+}
+
+// KindHealth is the HTTP probe of one kind: a GET that answers 2xx is
+// healthy.
+type KindHealth struct {
+	Kind    ContainerKind `json:"kind"`
+	Healthy bool          `json:"healthy"`
+	Error   string        `json:"error,omitempty"`
+}
+
+// KindMissing says why the probe of a kind does not count as healthy; empty
+// when it does or when the kind has no probe.
+func (n NodeHealth) KindMissing(kind ContainerKind) string {
+	for _, p := range n.Probes {
+		if p.Kind != kind || p.Healthy {
+			continue
+		}
+
+		if p.Error != "" {
+			return "probe " + string(kind) + ": " + p.Error
+		}
+
+		return "probe " + string(kind) + " is not healthy"
+	}
+
+	return ""
 }
 
 // Synced reports whether the node is at head with peers: every configured
@@ -540,6 +491,9 @@ type SyncResponse struct {
 
 // MaxTags bounds SyncRequest.Tags.
 const MaxTags = 64
+
+// MaxRoles bounds SyncRequest.Roles.
+const MaxRoles = 32
 
 // TagDigest is what one tag points at, by the controller's newest lookup.
 type TagDigest struct {

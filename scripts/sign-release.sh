@@ -17,7 +17,8 @@
 # 5. prints the manifest and its hash, signs it with one touch of the key (ssh-keygen -Y sign,
 #    namespace upgradoor-release): the key shows only its application name, so what was printed
 #    here is what you approve;
-# 6. checks the signature against deploy/allowed_signers and uploads upgradoor-manifest.txt.sig.
+# 6. checks the signature against deploy/allowed_signers, uploads upgradoor-manifest.txt.sig and
+#    removes the "Unsigned draft" line from the release notes (the release stays a draft).
 # Publishing the release then verifies the signature in CI and tags the signed image.
 #
 # RELEASE_KEY      the key handle of your security key (default ~/.ssh/upgradoor-release; create
@@ -152,5 +153,9 @@ if [ -n "$LOCAL" ]; then
   echo "signature written to $LOCAL"
 else
   gh release upload "$VERSION" "$MANIFEST.sig" --clobber
+  # The draft's notes lose the "Unsigned draft" line and the blank line after it; it stays a draft.
+  gh release view "$VERSION" --json body -q .body |
+    awk 'skip && /^$/ { skip = 0; next } /^Unsigned draft\./ { skip = 1; next } { skip = 0; print }' > notes.md
+  gh release edit "$VERSION" --notes-file notes.md >/dev/null
   echo "signature uploaded to release $VERSION; publish the release to tag the image"
 fi

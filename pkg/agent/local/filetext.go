@@ -20,65 +20,75 @@ import (
 // The overrides file is changed as lines so that every other byte stays as it is.
 
 const (
-	// blockBegin and blockEnd start the first and the last line of the
-	// generated block; only this prefix is compared, so that Ansible's text
-	// after it may differ.
-	blockBegin = "# >>> upgradoor generated block"
-	blockEnd   = "# <<< upgradoor generated block"
+	// The header is the file's first two lines; a line starting with the
+	// prefix is replaced, so that its text may change.
+	headerLine     = "# upgradoor overrides: uncomment to override, the agent applies changes within a minute."
+	commandsLine   = `#   upgradoor list | status | override set/clear <container> | roll <container> | hold "why" | release`
+	headerPrefix   = "# upgradoor overrides:"
+	commandsPrefix = "#   upgradoor "
 
-	blockBeginLine = blockBegin + ": written by Ansible through upgradoor deploy, do not edit >>>"
-	blockEndLine   = blockEnd + " <<<"
-
-	keyDeployed  = "deployed"
 	keyOverrides = "overrides"
-	keyHold      = "hold"
 
-	// maxHistory bounds the history comment lines kept per tag.
+	// The default lines of an entry show its container's default; the
+	// agent owns them.
+	defaultImagePrefix   = "# default image:"
+	defaultCommandPrefix = "# default command:"
+	defaultArgPrefix     = "#   - "
+
+	// oldBlockMarker starts the generated block of the old layout.
+	oldBlockMarker = "# >>> upgradoor generated block"
+
+	// maxHistory bounds the history comment lines kept per container.
 	maxHistory = 5
 )
 
-// entryYAML, deployedYAML and holdYAML are the entries as the file writes
-// them; the decoder refuses any other key.
+// structureLines are the commented fields of an entry without an override.
+var structureLines = []string{"# image:", "# command:", "# reason:", "# until:"}
+
+// errOldFormat refuses a file of the old layout.
+var errOldFormat = errors.New("the overrides file is in an old format (deployed:, hold:, flags: " +
+	"or a generated block); delete it, the agent writes a new one")
+
+// entryYAML is an override as the file writes it; the decoder refuses any
+// other key.
 type entryYAML struct {
-	Image string `yaml:"image"`
-	Flags struct {
-		Add    []string `yaml:"add"`
-		Remove []string `yaml:"remove"`
-	} `yaml:"flags"`
+	Image   string    `yaml:"image"`
+	Command *[]string `yaml:"command"`
+	// Flags is only read to refuse it.
+	Flags  present    `yaml:"flags"`
 	By     string     `yaml:"by"`
 	Reason string     `yaml:"reason"`
 	Until  *time.Time `yaml:"until"`
 }
 
-type deployedYAML struct {
-	Image   string    `yaml:"image"`
-	Command *[]string `yaml:"command"`
-}
+// present records that a key is there, whatever its value.
+type present bool
 
-type holdYAML struct {
-	By      string     `yaml:"by"`
-	Reason  string     `yaml:"reason"`
-	Teams   []string   `yaml:"teams"`
-	Feature string     `yaml:"feature"`
-	Until   *time.Time `yaml:"until"`
+// UnmarshalYAML implements yaml.Unmarshaler.
+func (p *present) UnmarshalYAML(*yaml.Node) error {
+	*p = true
+
+	return nil
 }
 
 // noOverrides is a file that is not there, or says nothing.
 func noOverrides() plan.Overrides {
-	return plan.Overrides{
-		Known: true, Deployed: map[string]plan.Deployed{}, Entries: map[string]plan.Entry{},
-		Holds: map[string]plan.Hold{},
-	}
+	return plan.Overrides{Known: true, Entries: map[string]plan.Entry{}}
 }
 
 // parse reads the content of an overrides file strictly: an unknown key is
 // an error, not "no overrides", because a typo must not put every container
 // back. Free text read by hand is cut to one line.
 func parse(raw []byte) (plan.Overrides, error) {
+	if bytes.Contains(raw, []byte(oldBlockMarker)) {
+		return plan.Overrides{}, errOldFormat
+	}
+
 	var doc struct {
-		Deployed  map[string]*deployedYAML `yaml:"deployed"`
-		Overrides map[string]*entryYAML    `yaml:"overrides"`
-		Hold      map[string]*holdYAML     `yaml:"hold"`
+		Overrides map[string]*entryYAML `yaml:"overrides"`
+		// Deployed and Hold are only read to refuse them.
+		Deployed present `yaml:"deployed"`
+		Hold     present `yaml:"hold"`
 	}
 
 	dec := yaml.NewDecoder(bytes.NewReader(raw))
@@ -99,36 +109,11 @@ func parse(raw []byte) (plan.Overrides, error) {
 		}
 	}
 
+	if doc.Deployed || doc.Hold {
+		return plan.Overrides{}, errOldFormat
+	}
+
 	out := noOverrides()
-
-	for source, y := range doc.Hold {
-		if source != plan.HoldLocal && source != plan.HoldController {
-			return plan.Overrides{}, fmt.Errorf("unknown hold %q (local or controller)", source)
-		}
-
-		h := plan.Hold{}
-		if y != nil {
-			h = plan.Hold{
-				By: plan.Line(y.By), Reason: plan.Line(y.Reason), Teams: lines(y.Teams),
-				Feature: plan.Line(y.Feature), Until: y.Until,
-			}
-		}
-
-		out.Holds[source] = h
-	}
-
-	for name, y := range doc.Deployed {
-		if y == nil || strings.TrimSpace(y.Image) == "" {
-			return plan.Overrides{}, fmt.Errorf("deployed entry %q names no image", name)
-		}
-
-		d := plan.Deployed{Image: strings.TrimSpace(y.Image)}
-		if y.Command != nil {
-			d.Command, d.HasCommand = append([]string{}, *y.Command...), true
-		}
-
-		out.Deployed[name] = d
-	}
 
 	for name, y := range doc.Overrides {
 		if y == nil {
@@ -136,35 +121,29 @@ func parse(raw []byte) (plan.Overrides, error) {
 			continue
 		}
 
-		out.Entries[name] = plan.Entry{
-			Image: strings.TrimSpace(y.Image), Add: y.Flags.Add, Remove: y.Flags.Remove,
-			By: plan.Line(y.By), Reason: plan.Line(y.Reason), Until: y.Until,
+		if y.Flags {
+			return plan.Overrides{}, errOldFormat
 		}
+
+		e := plan.Entry{
+			Image: strings.TrimSpace(y.Image), By: plan.Line(y.By), Reason: plan.Line(y.Reason), Until: y.Until,
+		}
+		if y.Command != nil {
+			e.Command, e.HasCommand = append([]string{}, *y.Command...), true
+		}
+
+		if e.Empty() && e.By == "" && e.Reason == "" && e.Until == nil {
+			continue
+		}
+
+		out.Entries[name] = e
 	}
 
 	return out, nil
 }
 
-// lines cuts every item to one line; nil stays nil.
-func lines(items []string) []string {
-	if items == nil {
-		return nil
-	}
-
-	out := make([]string, 0, len(items))
-	for _, s := range items {
-		out = append(out, plan.Line(s))
-	}
-
-	return out
-}
-
 // text is the content of an overrides file as lines.
-type text struct {
-	lines []string
-	// body is the index of the first line after the generated block.
-	body int
-}
+type text struct{ lines []string }
 
 // newText splits an overrides file into lines, reading CRLF as LF.
 func newText(raw []byte) *text {
@@ -175,20 +154,14 @@ func newText(raw []byte) *text {
 		t.lines = strings.Split(strings.TrimSuffix(s, "\n"), "\n")
 	}
 
-	begin := -1
-
-	for i, line := range t.lines {
-		switch {
-		case begin < 0 && strings.HasPrefix(line, blockBegin):
-			begin = i
-		case begin >= 0 && strings.HasPrefix(line, blockEnd):
-			t.body = i + 1
-
-			return t
-		}
-	}
-
 	return t
+}
+
+func (t *text) clone() *text { return &text{lines: slices.Clone(t.lines)} }
+
+// splice replaces lines [start, end) by with.
+func (t *text) splice(start, end int, with []string) {
+	t.lines = slices.Concat(t.lines[:start], with, t.lines[end:])
 }
 
 func (t *text) bytes() []byte {
@@ -202,6 +175,10 @@ func (t *text) bytes() []byte {
 func indentOf(line string) int { return len(line) - len(strings.TrimLeft(line, " ")) }
 
 func isBlank(line string) bool { return strings.TrimSpace(line) == "" }
+
+func trimmed(line string) string { return strings.TrimLeft(line, " ") }
+
+func isComment(line string) bool { return strings.HasPrefix(trimmed(line), "#") }
 
 // blockEnd returns the index after the last line of the block that starts at
 // line start and is indented deeper than indent: its lines, the comments
@@ -224,26 +201,27 @@ func (t *text) blockEnd(start, indent int) int {
 	return end
 }
 
-// located is where a top-level mapping and one entry of it are.
+// located is where the overrides mapping and one entry of it are.
 type located struct {
-	// key is the line of the mapping's key; -1 when there is none.
+	// key is the line of "overrides:"; -1 when there is none.
 	key int
 	// childIndent is the indentation of the entries' names.
 	childIndent int
 	// entry is the line of the entry's name; -1 when there is none.
 	entry int
+	// inner is the indentation of the entry's fields.
+	inner int
 }
 
-// locate finds the mapping key and its entry child below the generated
-// block. A flow-style mapping with content cannot be changed line by line
-// and is refused; an empty one ("overrides:", "{}", "null") is rewritten as
-// the key alone.
-func (t *text) locate(key, child string) (located, error) {
+// locate finds the overrides mapping and the entry of container. A flow-style
+// mapping with content cannot be changed line by line and is refused; an
+// empty one ("{}", "null") is rewritten as the key alone.
+func (t *text) locate(container string) (located, error) {
 	loc := located{key: -1, entry: -1, childIndent: 2}
 
 	var doc yaml.Node
 
-	if err := yaml.Unmarshal([]byte(strings.Join(t.lines[t.body:], "\n")), &doc); err != nil {
+	if err := yaml.Unmarshal([]byte(strings.Join(t.lines, "\n")), &doc); err != nil {
 		return loc, fmt.Errorf("overrides file: %w", err)
 	}
 
@@ -258,19 +236,18 @@ func (t *text) locate(key, child string) (located, error) {
 
 	for i := 0; i+1 < len(root.Content); i += 2 {
 		k, v := root.Content[i], root.Content[i+1]
-		if k.Value != key {
+		if k.Value != keyOverrides {
 			continue
 		}
 
-		loc.key = t.body + k.Line - 1
+		loc.key = k.Line - 1
 
-		switch {
-		case v.Kind == yaml.MappingNode && v.Style&yaml.FlowStyle != 0 && len(v.Content) > 0,
-			v.Kind != yaml.MappingNode && v.Kind != yaml.ScalarNode,
-			v.Kind == yaml.ScalarNode && v.Tag != "!!null":
-			return loc, fmt.Errorf("overrides file: write %q as an indented block, one entry per name", key)
-		case v.Kind != yaml.MappingNode || len(v.Content) == 0:
-			t.lines[loc.key] = strings.Repeat(" ", k.Column-1) + key + ":"
+		if !blockMapping(v) {
+			return loc, fmt.Errorf("overrides file: write %q as an indented block, one entry per name", keyOverrides)
+		}
+
+		if len(v.Content) == 0 {
+			t.keyAlone(k, v, keyOverrides)
 
 			return loc, nil
 		}
@@ -278,8 +255,21 @@ func (t *text) locate(key, child string) (located, error) {
 		loc.childIndent = v.Content[0].Column - 1
 
 		for j := 0; j+1 < len(v.Content); j += 2 {
-			if v.Content[j].Value == child {
-				loc.entry = t.body + v.Content[j].Line - 1
+			ck, cv := v.Content[j], v.Content[j+1]
+			if ck.Value != container {
+				continue
+			}
+
+			if !blockMapping(cv) {
+				return loc, fmt.Errorf("overrides file: write %q as an indented block, one field per line", container)
+			}
+
+			loc.entry, loc.inner = ck.Line-1, loc.childIndent+2
+
+			if len(cv.Content) > 0 {
+				loc.inner = cv.Content[0].Column - 1
+			} else {
+				t.keyAlone(ck, cv, container)
 			}
 		}
 	}
@@ -287,83 +277,169 @@ func (t *text) locate(key, child string) (located, error) {
 	return loc, nil
 }
 
-// historyPattern matches the history lines of a tag.
+// blockMapping reports whether a node can be changed line by line: a block
+// mapping, an empty flow mapping or null.
+func blockMapping(n *yaml.Node) bool {
+	switch n.Kind {
+	case yaml.MappingNode:
+		return n.Style&yaml.FlowStyle == 0 || len(n.Content) == 0
+	case yaml.ScalarNode:
+		return n.Tag == "!!null"
+	default:
+		return false
+	}
+}
+
+// keyAlone rewrites "name: {}" or "name: null" as "name:".
+func (t *text) keyAlone(k, v *yaml.Node, name string) {
+	if v.Kind == yaml.MappingNode || v.Value != "" {
+		t.lines[k.Line-1] = strings.Repeat(" ", k.Column-1) + scalar(name) + ":"
+	}
+}
+
+// historyPattern matches the history lines of a container.
 func historyPattern(tag string) *regexp.Regexp {
 	return regexp.MustCompile(`^\s*# \[` + regexp.QuoteMeta(tag) + `\] `)
 }
 
-// setEntry replaces the child of the mapping key (or removes it, when render
-// returns nothing) and adds a history line under tag; the oldest beyond
-// maxHistory go. Nothing else changes.
-func (t *text) setEntry(
-	key, child, tag string, at time.Time, who, note string, render func(pad string) []string,
-) error {
-	tag = plan.Line(tag)
+// span is the lines [start, end).
+type span struct{ start, end int }
 
-	loc, err := t.locate(key, child)
-	if err != nil {
-		return err
+// insertApart inserts line at index at with a blank line between it and any
+// line next to it; it returns the line's index.
+func (t *text) insertApart(at int, line string) int {
+	add := []string{line}
+	pos := at
+
+	if at > 0 && !isBlank(t.lines[at-1]) {
+		add, pos = slices.Insert(add, 0, ""), at+1
 	}
 
-	if loc.key < 0 {
-		if n := len(t.lines); n > 0 && !isBlank(t.lines[n-1]) {
-			t.lines = append(t.lines, "")
+	if at < len(t.lines) && !isBlank(t.lines[at]) {
+		add = append(add, "")
+	}
+
+	t.splice(at, at, add)
+
+	return pos
+}
+
+// parts are the lines of one entry by kind.
+type parts struct {
+	// defaults are the default lines.
+	defaults []span
+	// structure are the commented fields of an entry without an override.
+	structure []span
+	// fields are the active fields, each with its nested lines.
+	fields []span
+}
+
+// isDefault reports whether a line starts a default line group.
+func isDefault(line string) bool {
+	s := trimmed(line)
+
+	return strings.HasPrefix(s, defaultImagePrefix) || strings.HasPrefix(s, defaultCommandPrefix)
+}
+
+func isStructure(line string) bool { return slices.Contains(structureLines, strings.TrimSpace(line)) }
+
+// partsOf sorts the lines [start, end) of an entry whose fields are indented
+// by inner. Every other line is the user's and stays.
+func (t *text) partsOf(start, end, inner int) parts {
+	var p parts
+
+	for i := start; i < end; i++ {
+		line := t.lines[i]
+
+		switch {
+		case isBlank(line):
+		case strings.HasPrefix(trimmed(line), defaultCommandPrefix):
+			j := i + 1
+			for j < end && strings.HasPrefix(trimmed(t.lines[j]), defaultArgPrefix) {
+				j++
+			}
+
+			p.defaults = append(p.defaults, span{i, j})
+			i = j - 1
+		case isDefault(line):
+			p.defaults = append(p.defaults, span{i, i + 1})
+		case isStructure(line):
+			p.structure = append(p.structure, span{i, i + 1})
+		case isComment(line) || indentOf(line) != inner:
+		default:
+			j := t.fieldEnd(i, end, inner)
+			p.fields = append(p.fields, span{i, j})
+			i = j - 1
 		}
-
-		t.lines = append(t.lines, key+":")
-		loc.key = len(t.lines) - 1
 	}
 
-	pad := strings.Repeat(" ", loc.childIndent)
+	return p
+}
 
-	// Where the entry is, or where a new one goes: the end of the mapping.
-	start, end := loc.entry, 0
-	if start >= 0 {
-		end = t.blockEnd(start, loc.childIndent)
-	} else {
-		start = t.blockEnd(loc.key, indentOf(t.lines[loc.key]))
-		end = start
-	}
+// fieldEnd is the line after the field that starts at line i: its deeper
+// lines and the items of an indentless sequence.
+func (t *text) fieldEnd(i, end, inner int) int {
+	j := i + 1
 
-	t.lines = slices.Concat(t.lines[:start], render(pad), t.lines[end:])
+	for k := i + 1; k < end; k++ {
+		line := t.lines[k]
 
-	// The history line goes after the tag's last one, or right above where
-	// the entry is (or was).
-	history := historyPattern(tag)
-	insert := start
+		switch {
+		case isBlank(line):
+			continue
+		case isDefault(line) || isStructure(line):
+		case indentOf(line) > inner,
+			indentOf(line) == inner && strings.HasPrefix(trimmed(line), "- "):
+			j = k + 1
 
-	for i := t.body; i < len(t.lines); i++ {
-		if history.MatchString(t.lines[i]) {
-			insert = i + 1
-		}
-	}
-
-	t.lines = slices.Insert(t.lines, insert, fmt.Sprintf("%s# [%s] %s %s: %s",
-		pad, tag, at.UTC().Format(time.RFC3339), plan.Line(who), plan.Line(note)))
-
-	kept := 0
-
-	for i := len(t.lines) - 1; i >= t.body; i-- {
-		if !history.MatchString(t.lines[i]) {
 			continue
 		}
 
-		kept++
-		if kept > maxHistory {
-			t.lines = slices.Delete(t.lines, i, i+1)
+		break
+	}
+
+	return j
+}
+
+// remove takes out the spans, which do not overlap.
+func (t *text) remove(spans []span) {
+	sorted := slices.SortedFunc(slices.Values(spans), func(a, b span) int { return b.start - a.start })
+	for _, s := range sorted {
+		t.splice(s.start, s.end, nil)
+	}
+}
+
+// addEntry adds a container's name at the end of the overrides mapping,
+// adding the mapping when there is none, and returns where it is.
+func (t *text) addEntry(container string) (located, error) {
+	loc, err := t.locate(container)
+	if err != nil || loc.entry >= 0 {
+		return loc, err
+	}
+
+	if loc.key < 0 {
+		t.insertApart(len(t.lines), keyOverrides+":")
+
+		if loc, err = t.locate(container); err != nil {
+			return loc, err
 		}
 	}
 
-	return nil
+	end := t.blockEnd(loc.key, indentOf(t.lines[loc.key]))
+	t.splice(end, end, []string{strings.Repeat(" ", loc.childIndent) + scalar(container) + ":"})
+
+	return t.locate(container)
 }
 
-// containerName is a valid container name; nothing else is a tag of a
-// history line.
+// containerName is a valid container name; nothing else is the name of an
+// entry the agent writes.
 var containerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
 
-// setOverride writes the entry of a container (nil removes it) and reads
-// the result back: it must hold the entry as written and everything else as
-// it was, or an error is returned.
+// setOverride writes the active fields of a container's entry (e nil takes
+// them out and puts the commented structure back), adds a history line and
+// reads the result back: it must hold the entry as written and everything
+// else as it was, or an error is returned. Default lines and other comments
+// stay.
 func (t *text) setOverride(container string, e *plan.Entry, at time.Time, who, note string) error {
 	if !containerName.MatchString(container) {
 		return plan.Refusal("%q is not a valid container name", container)
@@ -374,23 +450,41 @@ func (t *text) setOverride(container string, e *plan.Entry, at time.Time, who, n
 		return err
 	}
 
-	err = t.setEntry(keyOverrides, container, container, at, who, note, func(pad string) []string {
-		if e == nil {
-			return nil
-		}
-
-		return renderEntry(container, e, pad)
-	})
+	loc, err := t.addEntry(container)
 	if err != nil {
 		return err
 	}
+
+	end := t.blockEnd(loc.entry, loc.childIndent)
+	p := t.partsOf(loc.entry+1, end, loc.inner)
+	in := strings.Repeat(" ", loc.inner)
+
+	// The new lines go where the first old one was, else below the defaults.
+	removed := slices.Concat(p.fields, p.structure)
+	pos := loc.entry + 1
+
+	if len(removed) > 0 {
+		pos = slices.MinFunc(removed, func(a, b span) int { return a.start - b.start }).start
+	} else if len(p.defaults) > 0 {
+		pos = p.defaults[len(p.defaults)-1].end
+	}
+
+	t.remove(removed)
+
+	if e != nil {
+		t.splice(pos, pos, renderEntry(e, in))
+	} else {
+		t.splice(pos, pos, renderStructure(in))
+	}
+
+	t.addHistory(container, loc.entry, strings.Repeat(" ", loc.childIndent), at, who, note)
 
 	set, err := parse(t.bytes())
 	if err != nil {
 		return fmt.Errorf("the change would break the overrides file: %w", err)
 	}
 
-	if err := unchanged(&before, &set, []string{container}, nil); err != nil {
+	if err := unchanged(&before, &set, container); err != nil {
 		return err
 	}
 
@@ -403,8 +497,8 @@ func (t *text) setOverride(container string, e *plan.Entry, at time.Time, who, n
 		return errors.New("the change did not take in the overrides file")
 	}
 
-	same := got.Image == e.Image && slices.Equal(got.Add, e.Add) && slices.Equal(got.Remove, e.Remove) &&
-		got.By == plan.Line(e.By) && got.Reason == plan.Line(e.Reason) && sameSecond(got.Until, e.Until)
+	same := got.Image == e.Image && sameCommand(&got, e) && got.By == plan.Line(e.By) &&
+		got.Reason == plan.Line(e.Reason) && sameSecond(got.Until, e.Until)
 	if !same {
 		return errors.New("the entry reads back differently from what was written")
 	}
@@ -412,50 +506,130 @@ func (t *text) setOverride(container string, e *plan.Entry, at time.Time, who, n
 	return nil
 }
 
-// setHold writes the hold of a source (nil removes it) and reads it back.
-func (t *text) setHold(source string, h *plan.Hold, at time.Time, who, note string) error {
-	before, err := parse(t.bytes())
+// addHistory adds a history line after the container's last one, or right
+// above its name at line name; the oldest beyond maxHistory go.
+func (t *text) addHistory(container string, name int, pad string, at time.Time, who, note string) {
+	history := historyPattern(container)
+	insert := name
+
+	for i := range t.lines {
+		if history.MatchString(t.lines[i]) {
+			insert = i + 1
+		}
+	}
+
+	t.splice(insert, insert, []string{fmt.Sprintf("%s# [%s] %s %s: %s",
+		pad, container, at.UTC().Format(time.RFC3339), plan.Line(who), plan.Line(note))})
+
+	kept := 0
+
+	for i := len(t.lines) - 1; i >= 0; i-- {
+		if !history.MatchString(t.lines[i]) {
+			continue
+		}
+
+		kept++
+		if kept > maxHistory {
+			t.splice(i, i+1, nil)
+		}
+	}
+}
+
+// setDefaults replaces the default lines of a container's entry by those of
+// d, or (d nil) takes them out. A container without an entry gets one with
+// its default lines and the commented structure; nil adds nothing.
+func (t *text) setDefaults(container string, d *plan.Deployed) error {
+	loc, err := t.locate(container)
 	if err != nil {
 		return err
 	}
 
-	err = t.setEntry(keyHold, source, keyHold+":"+source, at, who, note, func(pad string) []string {
-		if h == nil {
+	if loc.entry < 0 {
+		if d == nil {
 			return nil
 		}
 
-		return renderHold(source, h, pad)
-	})
-	if err != nil {
-		return err
-	}
+		if loc, err = t.addEntry(container); err != nil {
+			return err
+		}
 
-	set, err := parse(t.bytes())
-	if err != nil {
-		return fmt.Errorf("the change would break the overrides file: %w", err)
-	}
+		in := strings.Repeat(" ", loc.inner)
+		t.splice(loc.entry+1, loc.entry+1, slices.Concat(renderDefaults(d, in), renderStructure(in)))
 
-	if err := unchanged(&before, &set, nil, []string{source}); err != nil {
-		return err
-	}
-
-	got, ok := set.Holds[source]
-
-	switch {
-	case h == nil && !ok:
 		return nil
-	case (h == nil) != !ok:
-		return errors.New("the hold did not take in the overrides file")
 	}
 
-	same := got.By == plan.Line(h.By) && got.Reason == plan.Line(h.Reason) &&
-		slices.Equal(got.Teams, lines(h.Teams)) && got.Feature == plan.Line(h.Feature) &&
-		sameSecond(got.Until, h.Until)
-	if !same {
-		return errors.New("the hold reads back differently from what was written")
+	p := t.partsOf(loc.entry+1, t.blockEnd(loc.entry, loc.childIndent), loc.inner)
+
+	pos := loc.entry + 1
+	if len(p.defaults) > 0 {
+		pos = p.defaults[0].start
+	}
+
+	t.remove(p.defaults)
+
+	if d != nil {
+		t.splice(pos, pos, renderDefaults(d, strings.Repeat(" ", loc.inner)))
 	}
 
 	return nil
+}
+
+// layout puts the file in its form: the header on top, the overrides
+// mapping, an entry with default lines for each container of keep, and no
+// default lines for those of drop. Every other line stays as it is.
+func (t *text) layout(keep map[string]plan.Deployed, drop []string) error {
+	t.header()
+
+	loc, err := t.locate("")
+	if err != nil {
+		return err
+	}
+
+	if loc.key < 0 {
+		t.insertApart(min(2, len(t.lines)), keyOverrides+":")
+	}
+
+	for _, name := range slices.Sorted(maps.Keys(keep)) {
+		d := keep[name]
+		if err := t.setDefaults(name, &d); err != nil {
+			return err
+		}
+	}
+
+	for _, name := range drop {
+		if _, ok := keep[name]; ok {
+			continue
+		}
+
+		if err := t.setDefaults(name, nil); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// header writes the two header lines, replacing those that are there.
+func (t *text) header() {
+	if len(t.lines) == 0 || !strings.HasPrefix(t.lines[0], headerPrefix) {
+		add := []string{headerLine, commandsLine}
+		if len(t.lines) > 0 && !isBlank(t.lines[0]) {
+			add = append(add, "")
+		}
+
+		t.splice(0, 0, add)
+
+		return
+	}
+
+	t.lines[0] = headerLine
+
+	if len(t.lines) > 1 && strings.HasPrefix(t.lines[1], commandsPrefix) {
+		t.lines[1] = commandsLine
+	} else {
+		t.splice(1, 1, []string{commandsLine})
+	}
 }
 
 // sameSecond compares an end read back with the one written; the file holds
@@ -464,78 +638,53 @@ func sameSecond(got, want *time.Time) bool {
 	return (got == nil) == (want == nil) && (got == nil || got.Equal(want.Truncate(time.Second)))
 }
 
-// unchanged reports an error when after differs from before in anything
-// but the named entries and holds: a change of one entry must not write any
-// other part of the document.
-func unchanged(before, after *plan.Overrides, entries, holds []string) error {
-	if !sameMap(before.Deployed, after.Deployed, sameDeployed, nil) ||
-		!sameMap(before.Entries, after.Entries, sameEntry, entries) ||
-		!sameMap(before.Holds, after.Holds, sameHold, holds) {
-		return errors.New("the change would alter other parts of the overrides file")
+// unchanged reports an error when after differs from before in any entry but
+// except: a change of one entry must not write any other.
+func unchanged(before, after *plan.Overrides, except string) error {
+	for name, a := range before.Entries {
+		if name == except {
+			continue
+		}
+
+		if b, ok := after.Entries[name]; !ok || !sameEntry(&a, &b) {
+			return errors.New("the change would alter other parts of the overrides file")
+		}
+	}
+
+	for name := range after.Entries {
+		if _, ok := before.Entries[name]; !ok && name != except {
+			return errors.New("the change would alter other parts of the overrides file")
+		}
 	}
 
 	return nil
 }
 
-// sameMap compares two maps but for the keys in except.
-func sameMap[V any](a, b map[string]V, same func(x, y *V) bool, except []string) bool {
-	for k, x := range a {
-		if slices.Contains(except, k) {
-			continue
-		}
-
-		if y, ok := b[k]; !ok || !same(&x, &y) {
-			return false
-		}
-	}
-
-	for k := range b {
-		if _, ok := a[k]; !ok && !slices.Contains(except, k) {
-			return false
-		}
-	}
-
-	return true
-}
-
-func sameDeployed(a, b *plan.Deployed) bool {
-	return a.Image == b.Image && a.HasCommand == b.HasCommand && slices.Equal(a.Command, b.Command)
-}
-
 func sameEntry(a, b *plan.Entry) bool {
-	return a.Image == b.Image && slices.Equal(a.Add, b.Add) && slices.Equal(a.Remove, b.Remove) &&
-		a.By == b.By && a.Reason == b.Reason && sameEnd(a.Until, b.Until)
+	return a.Image == b.Image && sameCommand(a, b) && a.By == b.By && a.Reason == b.Reason &&
+		sameEnd(a.Until, b.Until)
 }
 
-func sameHold(a, b *plan.Hold) bool {
-	return a.By == b.By && a.Reason == b.Reason && slices.Equal(a.Teams, b.Teams) &&
-		a.Feature == b.Feature && sameEnd(a.Until, b.Until)
+func sameCommand(a, b *plan.Entry) bool {
+	return a.HasCommand == b.HasCommand && slices.Equal(a.Command, b.Command)
 }
 
 func sameEnd(a, b *time.Time) bool { return (a == nil) == (b == nil) && (a == nil || a.Equal(*b)) }
 
-// renderEntry writes one override entry; free text cut to one line.
-func renderEntry(container string, e *plan.Entry, pad string) []string {
-	in := pad + "  "
-	out := []string{pad + jsonString(container) + ":"}
+// renderEntry writes the active fields of an override; free text cut to one
+// line.
+func renderEntry(e *plan.Entry, in string) []string {
+	var out []string
 
 	if e.Image != "" {
-		out = append(out, in+"image: "+jsonString(e.Image))
+		out = append(out, in+"image: "+scalar(e.Image))
 	}
 
-	if len(e.Add)+len(e.Remove) > 0 {
-		out = append(out, in+"flags:")
-
-		if len(e.Add) > 0 {
-			out = append(out, in+"  add: "+jsonList(e.Add))
-		}
-
-		if len(e.Remove) > 0 {
-			out = append(out, in+"  remove: "+jsonList(e.Remove))
-		}
+	if e.HasCommand {
+		out = append(out, commandLines(in, e.Command)...)
 	}
 
-	out = append(out, in+"by: "+jsonString(plan.Line(e.By)), in+"reason: "+jsonString(plan.Line(e.Reason)))
+	out = append(out, in+"by: "+scalar(plan.Line(e.By)), in+"reason: "+scalar(plan.Line(e.Reason)))
 
 	if e.Until != nil {
 		out = append(out, in+"until: "+e.Until.UTC().Format(time.RFC3339))
@@ -544,112 +693,64 @@ func renderEntry(container string, e *plan.Entry, pad string) []string {
 	return out
 }
 
-// renderHold writes one hold entry; free text cut to one line.
-func renderHold(source string, h *plan.Hold, pad string) []string {
-	in := pad + "  "
-	out := []string{
-		pad + source + ":",
-		in + "by: " + jsonString(plan.Line(h.By)),
-		in + "reason: " + jsonString(plan.Line(h.Reason)),
-	}
+// renderDefaults writes the default lines of d.
+func renderDefaults(d *plan.Deployed, in string) []string {
+	out := []string{in + defaultImagePrefix + " " + scalar(d.Image)}
 
-	if len(h.Teams) > 0 {
-		out = append(out, in+"teams: "+jsonList(lines(h.Teams)))
-	}
+	switch {
+	case !d.HasCommand:
+	case len(d.Command) == 0:
+		out = append(out, in+defaultCommandPrefix+" []")
+	default:
+		out = append(out, in+defaultCommandPrefix)
 
-	if f := plan.Line(h.Feature); f != "" {
-		out = append(out, in+"feature: "+jsonString(f))
-	}
-
-	if h.Until != nil {
-		out = append(out, in+"until: "+h.Until.UTC().Format(time.RFC3339))
+		for _, arg := range d.Command {
+			out = append(out, in+defaultArgPrefix+scalar(arg))
+		}
 	}
 
 	return out
 }
 
-// setBlock replaces the generated block (or puts one at the top) and keeps
-// the rest of the file as it is.
-func (t *text) setBlock(block []string) {
-	rest := t.lines[t.body:]
-
-	if t.body == 0 && len(rest) > 0 && !isBlank(rest[0]) {
-		rest = append([]string{""}, rest...)
+func renderStructure(in string) []string {
+	out := make([]string, 0, len(structureLines))
+	for _, line := range structureLines {
+		out = append(out, in+line)
 	}
 
-	t.lines = slices.Concat(block, rest)
-	t.body = len(block)
+	return out
 }
 
-// generatedBlock renders the generated block.
-func generatedBlock(deployed map[string]plan.Deployed) []string {
-	out := []string{
-		blockBeginLine,
-		"#",
-		"# What Ansible deployed the containers upgradoor manages on this host as",
-		"# (\"deployed:\" below), and their temporary overrides.",
-		"#",
-		"# Only Ansible changes this block, through upgradoor deploy. A soft deploy",
-		"# changes the image or command line here and leaves the restart to upgradoor,",
-		"# which rolls the containers staggered across the devnet. Do not edit the block.",
-		"#",
-		"# Add an entry under \"overrides:\" below this block (by hand, with the commands",
-		"# below, or from the upgradoor page). The agent notices a change within a",
-		"# minute, asks the controller for a slot and recreates the container; it",
-		"# puts the container back when the entry is removed or its \"until\" has",
-		"# passed. Everything outside this block is yours: the agent only ever",
-		"# changes the entry it is asked to change and adds a comment line above it.",
-		"# What may be overridden is up to the container's group in agent.yaml.",
-		"#",
-		"#   upgradoor list                           containers, images, flags, overrides",
-		"#   upgradoor override set <container> [--image REF] [--add-flag F]...",
-		"#            [--remove-flag F]... [--until 24h] --reason \"why\"",
-		"#   upgradoor override clear <container>",
-		"#   upgradoor roll <container>...            recreate on the current image; waits",
-		"#            and prints the progress (--no-wait; see: upgradoor status)",
-		"#   upgradoor hold \"why\" / upgradoor release",
-		"#   upgradoor status",
-		"#",
-		"# An entry (image, flags or both; \"until\" is optional when written by hand):",
-		"#",
-		"# overrides:",
-		"#   <container>:",
-		"#     image: <registry/repository:tag>",
-		"#     flags:",
-		"#       add: [\"--name=value\", \"--name value\", \"--switch\"]",
-		"#       remove: [\"--name\"]     # by name: any value; or the exact argument",
-		"#     by: <you>",
-		"#     reason: <why>",
-		"#     until: 2030-01-31T12:00:00Z",
-		"#",
-		"# A hold keeps upgradoor off this host: no needs, no work. \"local\" is yours",
-		"# (by hand or with upgradoor hold); the controller cannot lift it.",
-		"# \"controller\" is written by the agent on the controller's hold:",
-		"#",
-		"# hold:",
-		"#   local:",
-		"#     by: <you>",
-		"#     reason: <why>",
-		"#     until: 2030-01-31T12:00:00Z     # optional",
-		"#",
+// commandLines writes a command line as a YAML list, one argument per line.
+func commandLines(pad string, command []string) []string {
+	if len(command) == 0 {
+		return []string{pad + "command: []"}
 	}
 
-	if len(deployed) == 0 {
-		out = append(out, keyDeployed+": {}")
-	} else {
-		out = append(out, keyDeployed+":")
+	out := make([]string, 0, len(command)+1)
+	out = append(out, pad+"command:")
+
+	for _, arg := range command {
+		out = append(out, pad+"  - "+scalar(arg))
 	}
 
-	for _, name := range slices.Sorted(maps.Keys(deployed)) {
-		d := deployed[name]
-		out = append(out, "  "+jsonString(name)+":", "    image: "+jsonString(d.Image))
+	return out
+}
 
-		if d.HasCommand {
-			out = append(out, "    command: "+jsonList(d.Command))
+// scalar writes a string as a plain YAML scalar when it reads back as that
+// string, else as a JSON string.
+func scalar(s string) string {
+	var doc yaml.Node
+
+	if s != "" && !strings.ContainsAny(s, "\n\r\t") && yaml.Unmarshal([]byte(s), &doc) == nil &&
+		len(doc.Content) == 1 {
+		n := doc.Content[0]
+		if n.Kind == yaml.ScalarNode && n.Style == 0 && n.Tag == "!!str" && n.Value == s {
+			return s
 		}
 	}
 
-	return append(out, blockEndLine)
+	return jsonString(s)
 }
 
 // jsonString writes a string as a JSON string, which is a YAML string too:
@@ -663,13 +764,4 @@ func jsonString(s string) string {
 	_ = enc.Encode(s)
 
 	return strings.TrimSuffix(buf.String(), "\n")
-}
-
-func jsonList(items []string) string {
-	quoted := make([]string, 0, len(items))
-	for _, item := range items {
-		quoted = append(quoted, jsonString(item))
-	}
-
-	return "[" + strings.Join(quoted, ", ") + "]"
 }

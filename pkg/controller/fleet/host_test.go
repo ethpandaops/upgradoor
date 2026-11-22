@@ -6,9 +6,6 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-
-	"github.com/ethpandaops/upgradoor/pkg/identity"
-	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 // TestEpochTimes: epochs are placed by the chain's slot phases, exactly, also
@@ -202,99 +199,6 @@ func TestValidateTiming(t *testing.T) {
 			assert.Zero(t, n.EpochDuration())
 		})
 	}
-}
-
-func TestUnclaimedRange(t *testing.T) {
-	r := func(start, end uint64) identity.ValidatorRange {
-		return identity.ValidatorRange{Start: start, End: end}
-	}
-
-	tests := []struct {
-		name  string
-		want  identity.ValidatorRange
-		taken []identity.ValidatorRange
-		out   *identity.ValidatorRange
-	}{
-		{name: "nothing taken", want: r(0, 64), out: &identity.ValidatorRange{Start: 0, End: 64}},
-		{name: "empty", want: r(5, 5)},
-		{
-			name: "taken elsewhere", want: r(64, 128),
-			taken: []identity.ValidatorRange{r(0, 64), r(128, 200)},
-			out:   &identity.ValidatorRange{Start: 64, End: 128},
-		},
-		{
-			name: "head taken", want: r(32, 96), taken: []identity.ValidatorRange{r(0, 64)},
-			out: &identity.ValidatorRange{Start: 64, End: 96},
-		},
-		{
-			name: "tail taken", want: r(0, 64), taken: []identity.ValidatorRange{r(32, 96)},
-			out: &identity.ValidatorRange{Start: 0, End: 32},
-		},
-		{name: "all taken", want: r(10, 20), taken: []identity.ValidatorRange{r(0, 64)}},
-		{
-			name: "all taken by several", want: r(10, 100),
-			taken: []identity.ValidatorRange{r(0, 50), r(50, 100)},
-		},
-		{
-			name: "the larger of two free parts", want: r(0, 100),
-			taken: []identity.ValidatorRange{r(10, 20)},
-			out:   &identity.ValidatorRange{Start: 20, End: 100},
-		},
-		{
-			name: "the first of two free parts of one size", want: r(0, 30),
-			taken: []identity.ValidatorRange{r(10, 20)},
-			out:   &identity.ValidatorRange{Start: 0, End: 10},
-		},
-		{
-			name: "a gap between two others", want: r(0, 1000),
-			taken: []identity.ValidatorRange{r(0, 100), r(600, 1000)},
-			out:   &identity.ValidatorRange{Start: 100, End: 600},
-		},
-	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			got := UnclaimedRange(tt.want, tt.taken)
-			assert.Equal(t, tt.out, got)
-
-			// Never a validator that is taken, never one that was not asked for.
-			if got != nil {
-				assert.GreaterOrEqual(t, got.Start, tt.want.Start)
-				assert.LessOrEqual(t, got.End, tt.want.End)
-
-				for _, taken := range tt.taken {
-					assert.False(t, got.Start < taken.End && taken.Start < got.End)
-				}
-			}
-		})
-	}
-}
-
-func TestReportedOverlaps(t *testing.T) {
-	host := func(name string, v *protocol.Validators) *Host {
-		return &Host{Name: name, Status: &protocol.SyncRequest{Validators: v}}
-	}
-
-	known := func(start, end uint64) *protocol.Validators {
-		return &protocol.Validators{Start: start, End: end, State: protocol.ValidatorsKnown}
-	}
-
-	a := host("a", known(0, 64))
-	b := host("b", known(32, 96))
-	c := host("c", known(64, 128))
-	none := host("none", nil)
-	reshuffling := host("reshuffling", &protocol.Validators{
-		Start: 0, End: 64, State: protocol.ValidatorsMissing,
-	})
-	silent := &Host{Name: "silent"}
-	all := []*Host{a, b, c, none, reshuffling, silent}
-
-	assert.Equal(t, []string{"b"}, a.ReportedOverlaps(all))
-	assert.Equal(t, []string{"a", "c"}, b.ReportedOverlaps(all))
-	assert.Equal(t, []string{"b"}, c.ReportedOverlaps(all), "ranges that only touch do not overlap")
-	assert.Empty(t, none.ReportedOverlaps(all))
-	assert.Empty(t, reshuffling.ReportedOverlaps(all), "a range that is not known is not a claim")
-	assert.Empty(t, silent.ReportedOverlaps(all))
 }
 
 // A host the controller asked to sync rarely is stale only after missing two

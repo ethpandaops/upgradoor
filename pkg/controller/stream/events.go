@@ -1133,8 +1133,7 @@ func (s *Handler) hostDetailDoc(ctx context.Context, name string) (wireDoc, erro
 	b.one(tableDetail, wireDetail{
 		HostSummary: detail.HostSummary, CertHash: detail.CertHash,
 		FirstSeen: detail.FirstSeen, RemoteAddr: detail.RemoteAddr,
-		ValidatorStart: detail.ValidatorStart, ValidatorEnd: detail.ValidatorEnd,
-		ValidatorOverlaps: detail.ValidatorOverlaps, HasInventory: detail.Inventory != nil,
+		Assigned: detail.Assigned, HasInventory: detail.Inventory != nil,
 	})
 
 	if detail.Inventory != nil {

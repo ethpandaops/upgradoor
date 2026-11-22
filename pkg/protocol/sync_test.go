@@ -8,12 +8,10 @@ import (
 
 func TestImpactHeavier(t *testing.T) {
 	assert.Equal(t, ImpactNode, ImpactIndependent.Heavier(ImpactNode))
-	assert.Equal(t, ImpactSlot, ImpactSlot.Heavier(ImpactIndependent))
+	assert.Equal(t, ImpactNode, ImpactNode.Heavier(ImpactIndependent))
 	assert.Equal(t, ImpactIndependent, ImpactIndependent.Heavier(ImpactIndependent))
-	assert.Equal(t, ImpactNode, ImpactSlot.Heavier(""), "no class counts as node")
-	assert.Equal(t, ImpactIndependent, DefaultImpact(KindOther))
-	assert.Equal(t, ImpactNode, DefaultImpact(KindVC))
-	assert.False(t, Impact("none").Valid())
+	assert.Equal(t, ImpactNode, ImpactIndependent.Heavier(""), "no class counts as node")
+	assert.False(t, Impact("slot").Valid())
 }
 
 func TestNodeHealthSynced(t *testing.T) {
@@ -85,6 +83,20 @@ func TestNodeHealthSynced(t *testing.T) {
 			assert.Equal(t, tt.missing == "", tt.node.Synced(tt.minPeers))
 		})
 	}
+}
+
+func TestNodeHealthKindMissing(t *testing.T) {
+	n := NodeHealth{Probes: []KindHealth{
+		{Kind: "snooper-el", Healthy: true},
+		{Kind: "snooper-cl", Error: "status 503"},
+		{Kind: "exporter"},
+	}}
+
+	assert.Empty(t, n.KindMissing("snooper-el"))
+	assert.Equal(t, "probe snooper-cl: status 503", n.KindMissing("snooper-cl"))
+	assert.Equal(t, "probe exporter is not healthy", n.KindMissing("exporter"))
+	assert.Empty(t, n.KindMissing(KindVC), "a kind without a probe")
+	assert.True(t, n.Synced(3), "the kind probes are not part of the node's EL and CL")
 }
 
 func TestContainerShouldRun(t *testing.T) {

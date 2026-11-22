@@ -81,7 +81,7 @@ func run(
 		return err
 	}
 
-	host, err := agenttest.NewHost(sc, &cfg.Host.Validators)
+	host, err := agenttest.NewHost(sc)
 	if err != nil {
 		return err
 	}

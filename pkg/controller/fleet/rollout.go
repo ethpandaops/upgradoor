@@ -11,10 +11,11 @@ type RolloutKind string
 
 // Rollout kinds.
 const (
-	// RolloutGroup: the containers of one roll group of one client moving to
-	// one target: the new digests of their tags and what a soft deploy
-	// changed (the deployed block of the overrides file). One lease per host
-	// serves the whole group.
+	// RolloutGroup: the containers of one kind of one team (or of the kind
+	// alone for containers without a team, of one image for unlabelled ones)
+	// moving to one target: the new digests of their tags and what a soft
+	// deploy changed (managed.yaml on the host). One lease per host serves
+	// the whole unit.
 	RolloutGroup RolloutKind = "group"
 	// RolloutPackages: one set of blocked package target versions.
 	RolloutPackages RolloutKind = "packages"
@@ -84,7 +85,8 @@ type Rollout struct {
 	Kind RolloutKind `json:"kind"`
 	// Key identifies the cause. At most one non-terminal rollout exists per
 	// key:
-	//   group:<group>#<client>@<digest of the targets>
+	//   unit:<kind>[#<team>]@<digest of the targets>
+	//   unit:/<image>@<digest of the targets> (unlabelled containers)
 	//   packages:<protocol.PackagesKey>
 	//   reboot
 	//   manual:<rollout id>
@@ -93,14 +95,12 @@ type Rollout struct {
 	// Title is a one-line description for people.
 	Title string `json:"title"`
 
-	// Group is the roll group a group rollout moves; Targets what it moves
-	// the group's containers to, sorted.
-	Group   string          `json:"group,omitempty"`
-	Targets []RolloutTarget `json:"targets,omitempty"`
-	// Client is the client whose image policy a group rollout answers to:
-	// the client of the group. Empty when the group has none; the rollout
-	// then answers to policyImage.
-	Client string `json:"client,omitempty"`
+	// ContainerKind and Team are the unit a group rollout moves (empty kind:
+	// unlabelled containers, empty team: containers without one); Targets
+	// what it moves the unit's containers to, sorted.
+	ContainerKind protocol.ContainerKind `json:"containerKind,omitempty"`
+	Team          string                 `json:"team,omitempty"`
+	Targets       []RolloutTarget        `json:"targets,omitempty"`
 	// Packages is set for packages rollouts.
 	Packages []protocol.PackageChange `json:"packages,omitempty"`
 
@@ -187,7 +187,7 @@ type Stage int
 
 // Stages, in serving order. The zero value is no stage.
 const (
-	// StageRepair: a member whose host is broken for the rollout's group: its
+	// StageRepair: a member whose host is broken for the rollout's unit: its
 	// last lease for the same thing (the image reference, the packages)
 	// failed. It waits for no canary, and the other members wait for it.
 	StageRepair Stage = iota + 1

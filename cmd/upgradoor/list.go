@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"io"
-	"strings"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -15,7 +14,7 @@ import (
 func newListCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "list",
-		Short: "List the managed containers with image, digest, revision, flags and overrides",
+		Short: "List the managed containers with image, digest, revision, command and overrides",
 		Args:  cobra.NoArgs,
 	}
 
@@ -39,14 +38,13 @@ func newListCmd() *cobra.Command {
 // changed about it marked.
 func printContainers(w io.Writer, st *local.Status) {
 	if st.OverridesError != "" {
-		fmt.Fprintf(w, "! the overrides file %s cannot be read: %s\n\n", st.OverridesFile, st.OverridesError)
+		fmt.Fprintf(w, "! %s\n\n", st.OverridesError)
 	}
 
 	for i := range st.Containers {
 		c := &st.Containers[i]
 
-		fmt.Fprintf(w, "%s  (%s%s, %s)\n", c.Name, c.Kind, clientOf(c), c.State)
-		fmt.Fprintf(w, "  group:    %s\n", groupOf(c))
+		fmt.Fprintf(w, "%s  (%s, %s)\n", c.Name, labelsOf(c), c.State)
 
 		if c.NotRolled != "" {
 			fmt.Fprintf(w, "  rolled:   no, %s\n", c.NotRolled)
@@ -71,32 +69,28 @@ func printContainers(w io.Writer, st *local.Status) {
 			fmt.Fprintf(w, "  target:   %s (under the next lease)\n", c.Target)
 		}
 
-		printFlags(w, c)
+		printCommand(w, c)
 		printOverride(w, c.Override)
 		fmt.Fprintln(w)
 	}
 
-	fmt.Fprintf(w, "overrides file: %s\n", st.OverridesFile)
+	if st.OverridesFile == "" {
+		fmt.Fprintln(w, "overrides: disabled on this host")
+	} else {
+		fmt.Fprintf(w, "overrides file: %s\n", st.OverridesFile)
+	}
 }
 
-// groupOf is the container's group and where it comes from.
-func groupOf(c *local.Container) string {
+// labelsOf is the container's kind and team, or that it has no labels.
+func labelsOf(c *local.Container) string {
 	switch {
-	case c.Group == protocol.DefaultGroup:
-		return c.Group + " (no label, not in the name map)"
-	case c.Unlabelled:
-		return c.Group + " (name map of agent.yaml; the next recreate adds the labels)"
+	case c.Kind == "":
+		return "unlabelled, impact " + string(c.Impact)
+	case c.Team == "":
+		return string(c.Kind) + ", no team"
 	default:
-		return c.Group
+		return string(c.Kind) + " of " + c.Team
 	}
-}
-
-func clientOf(c *local.Container) string {
-	if c.Client == "" {
-		return ""
-	}
-
-	return " " + c.Client
 }
 
 func orDash(s string) string {
@@ -107,10 +101,10 @@ func orDash(s string) string {
 	return s
 }
 
-// printFlags writes the command line, one argument per line; an argument an
-// override added is marked "+", one it removed "-".
-func printFlags(w io.Writer, c *local.Container) {
-	fmt.Fprintln(w, "  flags:")
+// printCommand writes the command line, one argument per line; an argument
+// an override added is marked "+", one it removed "-".
+func printCommand(w io.Writer, c *local.Container) {
+	fmt.Fprintln(w, "  command:")
 
 	if c.BaseCommand == nil {
 		for _, arg := range c.Command {
@@ -180,12 +174,16 @@ func printOverride(w io.Writer, o *protocol.ContainerOverride) {
 		fmt.Fprintf(w, "    image:  %s\n", o.Image)
 	}
 
-	if len(o.AddFlags) > 0 {
-		fmt.Fprintf(w, "    add:    %s\n", strings.Join(o.AddFlags, "  "))
-	}
+	if len(o.AddFlags)+len(o.RemoveFlags) > 0 {
+		fmt.Fprintln(w, "    command, against the default:")
 
-	if len(o.RemoveFlags) > 0 {
-		fmt.Fprintf(w, "    remove: %s\n", strings.Join(o.RemoveFlags, "  "))
+		for _, arg := range o.AddFlags {
+			fmt.Fprintf(w, "      + %s\n", arg)
+		}
+
+		for _, arg := range o.RemoveFlags {
+			fmt.Fprintf(w, "      - %s\n", arg)
+		}
 	}
 
 	until := "no end"

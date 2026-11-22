@@ -140,8 +140,8 @@ func (s *sim) count() {
 	for _, r := range rollouts {
 		byID[r.ID] = r
 
-		if r.Group == protocol.DefaultGroup && r.State == fleet.RolloutCompleted {
-			s.stats["completed default-group rollouts"]++
+		if r.Kind == fleet.RolloutGroup && r.ContainerKind == "" && r.State == fleet.RolloutCompleted {
+			s.stats["completed unlabelled rollouts"]++
 		}
 	}
 
@@ -222,13 +222,6 @@ func newSim(seed uint64) (*sim, error) {
 		PolicyPackages:          policy(),
 		PolicyReboot:            policy(),
 		LookupInterval:          fleet.Duration(5 * time.Minute),
-	}
-
-	// From the seed, not from the random stream: every fifth seed asks a
-	// person to approve the rollouts of the default group.
-	s.defaults.PolicyDefaultGroup = fleet.PolicyAuto
-	if seed%5 == 2 {
-		s.defaults.PolicyDefaultGroup = fleet.PolicyManual
 	}
 
 	// From the seed, not from the random stream, so that the other seeds keep
@@ -1353,7 +1346,6 @@ func (s *sim) converge() error {
 
 	set.Paused = false
 	set.PolicyImage, set.PolicyPackages, set.PolicyReboot = fleet.PolicyAuto, fleet.PolicyAuto, fleet.PolicyAuto
-	set.PolicyDefaultGroup = fleet.PolicyAuto
 	set.LeaseTTL = fleet.Duration(5 * time.Minute)
 
 	// A retried host is done only through a readiness check (a recheck), so
@@ -1687,7 +1679,7 @@ func TestSimulation(t *testing.T) {
 			"hosts seen working without a lease",
 			"slot-duration forks", "leases ended by a person: granted", "leases ended by a person: running",
 			"leases ended by a person: verifying", "waits: verb", "waits: budget", "waits: host",
-			"waits: network", "waits: after", "completed default-group rollouts",
+			"waits: network", "waits: after", "completed unlabelled rollouts",
 		} {
 			if total[what] == 0 {
 				t.Errorf("the simulation never produced any %s", what)
@@ -1726,9 +1718,9 @@ type simContainer struct {
 	image   string
 	managed bool
 	custom  bool
-	// group is the roll group of a managed container: a group may hold
-	// containers of several images.
-	group string
+	// kind is the kind label of a managed container (empty: unlabelled): a
+	// kind may hold containers of several images.
+	kind protocol.ContainerKind
 	// impact is the class of a managed container. Only work on node
 	// containers takes the node down.
 	impact protocol.Impact
@@ -1750,7 +1742,7 @@ type simManual struct {
 // way pkg/protocol describes it.
 type simAgent struct {
 	name   string
-	val    *identity.ValidatorRange
+	val    []identity.ValidatorRange
 	weight uint64
 	probes bool
 	// peerMax is how many peers the host's clients have once they found them
@@ -1921,7 +1913,7 @@ type simWorld struct {
 // simImpacts are the classes a managed container is drawn from: mostly the
 // node's own containers.
 var simImpacts = []protocol.Impact{
-	protocol.ImpactNode, protocol.ImpactNode, protocol.ImpactNode, protocol.ImpactSlot, protocol.ImpactIndependent,
+	protocol.ImpactNode, protocol.ImpactNode, protocol.ImpactNode, protocol.ImpactNode, protocol.ImpactIndependent,
 }
 
 // simLeaseImpact is the world's own class of the work of a lease: node when
@@ -2008,7 +2000,7 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 				a.weight = uint64(100 + rng.IntN(400))
 			}
 
-			a.val = &identity.ValidatorRange{Start: next, End: next + a.weight}
+			a.val = []identity.ValidatorRange{{Start: next, End: next + a.weight}}
 			next += a.weight
 		}
 
@@ -2018,7 +2010,7 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 				name:    fmt.Sprintf("c%d", c),
 				image:   image,
 				managed: true,
-				group:   fmt.Sprintf("g%d", c%2),
+				kind:    protocol.ContainerKind(fmt.Sprintf("g%d", c%2)),
 				custom:  rng.IntN(12) == 0,
 				// From the host and the container, not from the random
 				// stream, so that the seeds keep their histories.
@@ -2030,13 +2022,13 @@ func newSimWorld(rng *rand.Rand, start time.Time) *simWorld {
 		}
 
 		// From the host, not from the random stream, so that the seeds keep
-		// their histories: every third host runs a container of the default
-		// group on one of the devnet's images, which moves in a rollout of
-		// that image of its own, next to the roll groups' rollouts.
+		// their histories: every third host runs an unlabelled container on
+		// one of the devnet's images, which moves in a rollout of that image
+		// of its own, next to the rollouts of the kinds.
 		if i%3 == 0 {
 			image := w.images[i%len(w.images)]
 			a.containers = append(a.containers, &simContainer{
-				name: "tools", image: image, managed: true, group: protocol.DefaultGroup,
+				name: "tools", image: image, managed: true,
 				impact: protocol.ImpactIndependent, running: w.registry[image],
 				seen: w.registry[image], checkedAt: w.now,
 			})
@@ -2794,7 +2786,7 @@ func (w *simWorld) needs(a *simAgent) []protocol.Need {
 				ID:   protocol.ImageNeedID(c.name, c.seen),
 				Kind: protocol.NeedImage,
 				Image: &protocol.ImageNeed{
-					Container: c.name, Group: c.group, Image: c.image, FromDigest: c.running, ToDigest: c.seen,
+					Container: c.name, Kind: c.kind, Image: c.image, FromDigest: c.running, ToDigest: c.seen,
 				},
 			})
 		}
@@ -2835,7 +2827,7 @@ func (w *simWorld) needs(a *simAgent) []protocol.Need {
 		if m.kind == protocol.NeedImage {
 			c := a.container(m.container)
 			n.Image = &protocol.ImageNeed{
-				Container: c.name, Group: c.group, Image: c.image, FromDigest: c.running, ToDigest: c.seen,
+				Container: c.name, Kind: c.kind, Image: c.image, FromDigest: c.running, ToDigest: c.seen,
 			}
 		} else {
 			n.Reboot = &protocol.RebootNeed{Reasons: []string{protocol.RebootReasonManual}}
@@ -2870,7 +2862,7 @@ func (w *simWorld) request(a *simAgent) *protocol.SyncRequest {
 		if c.managed {
 			pc.ConfiguredImage = c.image
 			pc.Impact = c.impact
-			pc.Group = c.group
+			pc.Kind = c.kind
 		}
 
 		if c.custom {
@@ -3078,14 +3070,14 @@ func (w *simWorld) onTarget(a *simAgent) error {
 //
 // 1, 2 and 4 hold per impact class, by the class of the containers the
 // lease's needs are about as the host reported them: a node lease is what
-// they say; a slot lease costs no validator weight; an independent lease
+// they say; an independent lease
 // counts for neither budget nor host limit and passes a closed gate.
 //
 //  7. At every grant of an independent lease fewer hosts than the
 //     independent limit hold one.
-//  8. A lease that serves an image need of a roll group (group and client
-//     as the host reports them) serves every such need the host reported
-//     in its last sync: one lease per host per group target.
+//  8. A lease that serves an image need of a unit (kind and team as the
+//     host reports them) serves every such need the host reported in its
+//     last sync: one lease per host per unit target.
 //  5. After a lease failed, nothing is granted in the rollouts it served
 //     until a person retries them (or they are closed).
 //  6. A lease is released only after its agent reported the operation done.
@@ -3162,12 +3154,12 @@ func (f *simFacts) charged(h *simHostFact) bool {
 }
 
 // chargedOthers counts the charged hosts other than host that do not hold a
-// node or slot lease (those count by their lease already).
+// node lease (those count by their lease already).
 func (f *simFacts) chargedOthers(leased map[string]protocol.Impact, host string) int {
 	n := 0
 
 	for name, h := range f.hosts {
-		if name != host && f.charged(h) && leased[name] != protocol.ImpactNode && leased[name] != protocol.ImpactSlot {
+		if name != host && f.charged(h) && leased[name] != protocol.ImpactNode {
 			n++
 		}
 	}
@@ -3488,7 +3480,7 @@ func oracleBudget(f *simFacts, leased map[string]protocol.Impact, host string, i
 
 	percent := f.settings.MaxUnavailablePercent
 	allowed := percent * float64(total) / 100
-	others := oracleCount(leased, protocol.ImpactNode, protocol.ImpactSlot) + f.chargedOthers(leased, host)
+	others := oracleCount(leased, protocol.ImpactNode) + f.chargedOthers(leased, host)
 
 	cost := f.hosts[host].live
 	if impact != protocol.ImpactNode {
@@ -3505,7 +3497,7 @@ func oracleBudget(f *simFacts, leased map[string]protocol.Impact, host string, i
 
 	limit := max(1, int(math.Floor(f.settings.MaxLeasedPercent*float64(len(f.hosts))/100+budgetEpsilon)))
 	if others >= limit {
-		return fmt.Errorf("host limit: %d hosts already hold a node or slot lease, at most %d of %d may",
+		return fmt.Errorf("host limit: %d hosts already hold a node lease, at most %d of %d may",
 			others, limit, len(f.hosts))
 	}
 
@@ -3588,7 +3580,7 @@ func (o *oracle) checkGrant(
 				gate, host.live, host.weight)
 		}
 
-		if n := oracleCount(leased, protocol.ImpactNode, protocol.ImpactSlot) + f.chargedOthers(leased, l.Host); n > 0 {
+		if n := oracleCount(leased, protocol.ImpactNode) + f.chargedOthers(leased, l.Host); n > 0 {
 			return fmt.Errorf("the network gate is closed (%v) and %d hosts are leased already", gate, n)
 		}
 
@@ -3607,21 +3599,21 @@ func oracleSucceeded(r *fleet.Rollout) bool {
 }
 
 // oracleWholeGroups is invariant 8: a lease that serves a need of a roll
-// group serves every observed image need of that group the host reported in
-// its last sync, so that a group goes down once and is checked once. The
-// group is what the host reports of the need (its group, its client), not
-// what the scheduler made of it.
+// unit serves every observed image need of that unit the host reported in
+// its last sync, so that a unit goes down once and is checked once. The
+// unit is what the host reports of the need (its kind, its team), not what
+// the scheduler made of it.
 func oracleWholeGroups(h *simHostFact, l *fleet.Lease) error {
 	in := make(map[string]bool, len(l.Needs))
 	groups := make(map[[2]string]bool, len(l.Needs))
 
-	// The default group is a group per image.
+	// Unlabelled containers are a unit per image.
 	key := func(n *protocol.ImageNeed) [2]string {
-		if n.Group == protocol.DefaultGroup {
-			return [2]string{n.Group, imageref.Normalize(n.Image)}
+		if n.Kind == "" {
+			return [2]string{"", imageref.Normalize(n.Image)}
 		}
 
-		return [2]string{n.Group, n.Client}
+		return [2]string{string(n.Kind), n.Team}
 	}
 
 	for i := range l.Needs {
@@ -3640,8 +3632,8 @@ func oracleWholeGroups(h *simHostFact, l *fleet.Lease) error {
 		}
 
 		if !in[n.ID] {
-			return fmt.Errorf("the lease serves group %q and leaves out the host's need %s of it",
-				n.Image.Group, n.ID)
+			return fmt.Errorf("the lease serves kind %q and leaves out the host's need %s of it",
+				n.Image.Kind, n.ID)
 		}
 	}
 
@@ -3658,10 +3650,7 @@ func (o *oracle) checkRollout(f *simFacts, r *fleet.Rollout, l *fleet.Lease, gat
 
 	switch r.Kind {
 	case fleet.RolloutGroup:
-		policy = f.settings.PolicyImage
-		if r.Group == protocol.DefaultGroup {
-			policy = f.settings.PolicyDefaultGroup
-		}
+		policy = f.settings.ImagePolicy(r.Team)
 	case fleet.RolloutPackages:
 		policy = f.settings.PolicyPackages
 	case fleet.RolloutReboot:

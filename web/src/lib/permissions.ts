@@ -69,7 +69,8 @@ export interface Login {
 interface OwnedContainer {
   name: string;
   managed: boolean;
-  owners?: readonly string[] | null;
+  /** team is the container's team label: its only owner; none makes it staff's. */
+  team?: string;
 }
 
 /** OwnedHost is the part of a host the rule reads; a HostListing is one. */
@@ -86,10 +87,6 @@ export interface OwnedClient {
   name: string;
   /** hosts is how many hosts run the client: a client nobody runs has no container and no owner. */
   hosts: number;
-  /** allOwned are the teams that own every container of the client. */
-  allOwned?: readonly string[] | null;
-  /** owners are the teams that own a container of the client. */
-  owners?: readonly string[] | null;
 }
 
 /** Ownership is what the page knows about who owns what. */
@@ -268,6 +265,11 @@ function ownedBy(teams: readonly string[], owners: readonly string[]): boolean {
   return owners.some(o => teams.includes(o));
 }
 
+/** ownersOf is a container's owners: its team, if it has one. */
+function ownersOf(c: OwnedContainer): string[] {
+  return c.team ? [c.team] : [];
+}
+
 function managedContainers(host: OwnedHost | undefined): OwnedContainer[] {
   return (host?.containers ?? []).filter(c => c.managed);
 }
@@ -282,7 +284,7 @@ function holdSetBy(holdBy: string | undefined, teams: readonly string[]): string
 /** uncoveredOn applies the target rule to one host; empty when the host is covered. */
 function uncoveredOn(teams: readonly string[], name: string, host: OwnedHost | undefined, t: Targets): string {
   const containers = managedContainers(host);
-  const all = [...new Set(containers.flatMap(c => c.owners ?? []))].sort();
+  const all = [...new Set(containers.flatMap(ownersOf))].sort();
   const onHost = `does not cover host ${echo(name)} (owners: ${ownerList(all)})`;
   const onContainer = (container: string, owners: readonly string[]) =>
     `does not cover container ${echo(container)} on host ${echo(name)} (owners: ${ownerList(owners)})`;
@@ -305,39 +307,29 @@ function uncoveredOn(teams: readonly string[], name: string, host: OwnedHost | u
   if (t.containers.length === 0) {
     // A roll of the whole host touches every managed container.
     if (containers.length === 0) return onHost;
-    const foreign = containers.find(c => !ownedBy(teams, c.owners ?? []));
-    return foreign ? onContainer(foreign.name, foreign.owners ?? []) : '';
+    const foreign = containers.find(c => !ownedBy(teams, ownersOf(c)));
+    return foreign ? onContainer(foreign.name, ownersOf(foreign)) : '';
   }
 
   for (const wanted of t.containers) {
     const c = containers.find(x => x.name === wanted);
     if (!c) return onContainer(wanted, []);
-    if (!ownedBy(teams, c.owners ?? [])) return onContainer(c.name, c.owners ?? []);
+    if (!ownedBy(teams, ownersOf(c))) return onContainer(c.name, ownersOf(c));
   }
 
   return '';
 }
 
-/**
- * uncoveredClient applies the rule of a client: a team of the login owns
- * every container of it. The page reads that off the client's row (allOwned)
- * and cannot name the container that is somebody else's; the controller does.
- */
-function uncoveredClient(teams: readonly string[], name: string, ownership: Ownership): string {
+/** clientOwners is the owner of a client: the client is the team of its containers; none while nobody runs it. */
+function clientOwners(name: string, ownership: Ownership): string[] {
   const client = ownership.clients?.find(c => c.name === name);
-  const all = client && client.hosts > 0 ? [...(client.allOwned ?? [])].sort() : [];
-  if (ownedBy(teams, all)) return '';
+  return client && client.hosts > 0 ? [name] : [];
+}
 
-  const reason = `does not cover client ${echo(name)} (owners of all of it: ${ownerList(all)})`;
-
-  // The controller asks whether every container is owned by a team of the
-  // login. Several teams that each own a part satisfy that, and a client's
-  // row does not say whether they do: the page offers nothing it cannot
-  // show to be allowed, and says who decides.
-  const parts = (client?.owners ?? []).filter(o => teams.includes(o));
-  return parts.length > 1
-    ? `${reason}; your teams ${echo(parts.join(', '))} own parts of it, which the page cannot add up: the controller decides, ask it through the API`
-    : reason;
+/** uncoveredClient applies the rule of a client: the client is one of the login's teams. */
+function uncoveredClient(teams: readonly string[], name: string, ownership: Ownership): string {
+  const owners = clientOwners(name, ownership);
+  return ownedBy(teams, owners) ? '' : `does not cover client ${echo(name)} (owners: ${ownerList(owners)})`;
 }
 
 /** uncovered names the first target no team of the login owns; empty when all are covered. */
@@ -348,11 +340,11 @@ function uncovered(teams: readonly string[], t: Targets, ownership: Ownership): 
   if (t.rule === 'rollout') {
     const client = ownership.rolloutClient?.(t.rollout);
     if (client === undefined) return `does not cover rollout ${echo(t.rollout)} (owners: none)`;
-    if (client === '') return `does not cover rollout ${echo(t.rollout)}: it is for no client`;
+    if (client === '') return `does not cover rollout ${echo(t.rollout)}: it is for no team`;
     return uncoveredClient(teams, client, ownership);
   }
   if (t.rule === 'someOf') {
-    const owners = [...(ownership.clients?.find(c => c.name === t.client)?.owners ?? [])].sort();
+    const owners = clientOwners(t.client, ownership);
     return ownedBy(teams, owners)
       ? ''
       : `does not cover any container of client ${echo(t.client)} (owners: ${ownerList(owners)})`;

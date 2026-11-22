@@ -119,8 +119,8 @@ type budgetState struct {
 // the validators with a duty (hostView.duty): validators without one can
 // neither go down nor widen what may. A host that works on an operation
 // without a lease, and a charged host, count like one that holds a node
-// lease. Only a node lease takes the host's validators out of the budget; a
-// slot lease takes a place in the host limit, an independent one in the
+// lease. A node lease takes the host's validators out of the budget and a
+// place in the host limit; an independent one takes a place in the
 // independent limit.
 func (p *pass) budget() *budgetState {
 	b := &budgetState{percent: p.set.MaxUnavailablePercent}
@@ -145,15 +145,11 @@ func (p *pass) budget() *budgetState {
 			impact = protocol.ImpactNode
 		}
 
-		switch impact {
-		case protocol.ImpactNode:
+		if impact == protocol.ImpactNode {
 			b.unavailable += hv.duty
 			b.leased++
 
 			continue
-		case protocol.ImpactSlot:
-			b.leased++
-		default:
 		}
 
 		b.unavailable += hv.duty - hv.live

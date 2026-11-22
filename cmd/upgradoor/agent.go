@@ -41,7 +41,7 @@ func runAgent(ctx context.Context, log *logrus.Logger, configFile string) error 
 		return err
 	}
 
-	logins, err := registryauth.LoadLogins(log, cfg.Registry.AuthFile)
+	logins, err := registryauth.LoadLogins(log, cfg.Host.Docker.AuthFile)
 	if err != nil {
 		return err
 	}

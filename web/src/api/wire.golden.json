@@ -25,16 +25,14 @@
      "startedAt": "2026-11-14T11:00:00Z",
      "managed": true,
      "kind": "el",
+     "team": "qq-stealth-el-team",
      "configuredImage": "ethereum/client-go:stable",
      "registry": {
       "digest": "sha256:e1e1",
       "revision": "rev-geth-1",
       "checkedAt": "2026-11-14T11:59:00Z",
       "pulled": true
-     },
-     "owners": [
-      "qq-stealth-el-team"
-     ]
+     }
     },
     {
      "name": "lighthouse",
@@ -48,16 +46,14 @@
      "startedAt": "2026-11-14T11:00:00Z",
      "managed": true,
      "kind": "cl",
+     "team": "qq-stealth-cl-team",
      "configuredImage": "sigp/lighthouse:unstable",
      "registry": {
       "digest": "sha256:c2c2",
       "checkedAt": "2026-11-14T11:59:00Z",
       "error": "zz registry said 401 for token ghp_zzzz",
       "pulled": false
-     },
-     "owners": [
-      "qq-stealth-cl-team"
-     ]
+     }
     },
     {
      "name": "lighthouse-validator",
@@ -166,8 +162,7 @@
    "certHash": "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
    "firstSeen": "2026-11-12T12:00:00Z",
    "remoteAddr": "203.0.113.77",
-   "validatorStart": 0,
-   "validatorEnd": 100,
+   "assignedValidators": 100,
    "inventory": {
     "hash": "inv-hash",
     "collectedAt": "2026-11-14T12:00:00Z",
@@ -325,9 +320,7 @@
        "state": "running",
        "managed": true,
        "kind": "el",
-       "owners": [
-        "qq-stealth-el-team"
-       ]
+       "team": "qq-stealth-el-team"
       },
       {
        "name": "lighthouse",
@@ -337,9 +330,7 @@
        "state": "running",
        "managed": true,
        "kind": "cl",
-       "owners": [
-        "qq-stealth-cl-team"
-       ]
+       "team": "qq-stealth-cl-team"
       },
       {
        "name": "lighthouse-validator",
@@ -421,9 +412,7 @@
        "state": "running",
        "managed": true,
        "kind": "el",
-       "owners": [
-        "qq-stealth-el-team"
-       ]
+       "team": "qq-stealth-el-team"
       },
       {
        "name": "lighthouse",
@@ -433,9 +422,7 @@
        "state": "running",
        "managed": true,
        "kind": "cl",
-       "owners": [
-        "qq-stealth-cl-team"
-       ]
+       "team": "qq-stealth-cl-team"
       },
       {
        "name": "lighthouse-validator",
@@ -732,7 +719,6 @@
     "policyPackages": "auto",
     "policyReboot": "manual",
     "policyClients": {},
-    "policyDefaultGroup": "auto",
     "pauseAfterCanaryImage": false,
     "pauseAfterCanaryPackages": false,
     "pauseAfterCanaryReboot": false,
@@ -755,7 +741,6 @@
     "policyPackages": "auto",
     "policyReboot": "manual",
     "policyClients": {},
-    "policyDefaultGroup": "auto",
     "pauseAfterCanaryImage": false,
     "pauseAfterCanaryPackages": false,
     "pauseAfterCanaryReboot": false,
@@ -846,6 +831,7 @@
       0,
       200,
       190,
+      0,
       1,
       5
      ]
@@ -875,13 +861,73 @@
    ]
   },
   "t": 1794657600,
-  "v": "658d817e61d2"
+  "v": "6f7f3b77fde2"
  },
  "user": {
   "a": {
    "r": [
     [
      1
+    ]
+   ]
+  },
+  "c": {
+   "r": [
+    [
+     "qq-stealth-cl-team",
+     49,
+     50,
+     0,
+     [
+      [
+       16,
+       13,
+       35,
+       0,
+       2,
+       1,
+       0,
+       2
+      ]
+     ],
+     2,
+     0,
+     0,
+     0,
+     0,
+     2,
+     0,
+     0,
+     0,
+     51
+    ],
+    [
+     "qq-stealth-el-team",
+     52,
+     50,
+     0,
+     [
+      [
+       11,
+       7,
+       8,
+       9,
+       2,
+       0,
+       0,
+       2
+      ]
+     ],
+     2,
+     0,
+     0,
+     0,
+     0,
+     2,
+     0,
+     0,
+     0,
+     53
     ]
    ]
   },
@@ -1023,7 +1069,6 @@
         "ethereum_node"
        ],
        100,
-       0,
        1794657600,
        0,
        "agent-zz-0.4.2",
@@ -1042,8 +1087,8 @@
          2,
          1794654000,
          1,
-         0,
          "el",
+         "qq-stealth-el-team",
          0,
          0,
          "ethereum/client-go:stable",
@@ -1053,9 +1098,6 @@
           1794657540,
           0,
           1
-         ],
-         [
-          "qq-stealth-el-team"
          ]
         ],
         [
@@ -1072,8 +1114,8 @@
          0,
          1794654000,
          1,
-         0,
          "cl",
+         "qq-stealth-cl-team",
          0,
          0,
          "sigp/lighthouse:unstable",
@@ -1082,9 +1124,6 @@
           0,
           1794657540,
           "zz registry said 401 for token ghp_zzzz"
-         ],
-         [
-          "qq-stealth-cl-team"
          ]
         ],
         [
@@ -1101,8 +1140,8 @@
          0,
          0,
          1,
-         0,
          "vc",
+         0,
          0,
          0,
          "sigp/zz-validator:unstable"
@@ -1214,13 +1253,7 @@
        "c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00c0ffee00",
        1794484800,
        "203.0.113.77",
-       [
-        0
-       ],
-       [
-        100
-       ],
-       0,
+       100,
        1
       ]
      ]
@@ -1275,50 +1308,46 @@
        1,
        11,
        0,
-       [
-        12
-       ]
+       "qq-stealth-el-team"
       ],
       [
+       12,
        13,
        14,
        15,
+       10,
+       1,
        16,
-       10,
-       1,
+       0,
+       "qq-stealth-cl-team"
+      ],
+      [
        17,
-       0,
-       [
-        18
-       ]
-      ],
-      [
+       18,
        19,
-       20,
-       21,
        0,
        10,
        1,
-       22
+       20
       ],
       [
-       23,
-       24,
+       21,
+       22,
        0,
        0,
-       25
+       23
       ]
      ],
      [
       "zzdebian",
+      24,
+      25,
       26,
       27,
       28,
-      29,
-      30,
       1,
       [
-       31
+       29
       ]
      ],
      [
@@ -1329,31 +1358,31 @@
      0,
      [
       1,
-      32
+      30
      ],
      1,
-     32,
+     30,
      "staff",
      0,
      [
-      33,
-      34
+      31,
+      32
      ],
      [
       [
-       34
+       32
       ],
       [
-       35
+       33
       ]
      ],
      [
-      36,
+      34,
       100,
       90,
       1,
       "lease-zz",
-      32
+      30
      ],
      1794571200
     ],
@@ -1376,50 +1405,46 @@
        1,
        11,
        0,
-       [
-        12
-       ]
+       "qq-stealth-el-team"
       ],
       [
+       12,
        13,
-       14,
-       37,
-       38,
+       35,
+       36,
        10,
        1,
+       16,
+       0,
+       "qq-stealth-cl-team"
+      ],
+      [
        17,
-       0,
-       [
-        18
-       ]
-      ],
-      [
+       18,
        19,
-       20,
-       21,
        0,
        10,
        1,
-       22
+       20
       ],
       [
-       23,
-       24,
+       21,
+       22,
        0,
        0,
-       25
+       23
       ]
      ],
      [
       "zzdebian",
+      24,
+      25,
       26,
       27,
       28,
-      29,
-      30,
       1,
       [
-       31
+       29
       ]
      ],
      [
@@ -1430,15 +1455,15 @@
      0,
      [
       1,
-      32
+      30
      ],
      0,
      0,
      0,
      0,
      [
-      33,
-      34
+      31,
+      32
      ],
      [],
      [
@@ -1460,8 +1485,8 @@
     ],
     [
      "cl sigp/lighthouse:unstable",
-     37,
-     38
+     35,
+     36
     ]
    ]
   },
@@ -1469,12 +1494,12 @@
    "r": [
     [
      "lease-zz",
-     40,
-     44,
+     38,
+     42,
      [
       [
        "packages/03cc7f406059e2fc",
-       34,
+       32,
        0,
        0,
        0,
@@ -1485,15 +1510,15 @@
         [
          [
           "zzdocker-ce",
-          45,
-          46
+          43,
+          44
          ]
         ]
        ]
       ],
       [
        "reboot",
-       35,
+       33,
        0,
        0,
        0,
@@ -1503,7 +1528,7 @@
        0,
        [
         [
-         47
+         45
         ]
        ]
       ]
@@ -1521,16 +1546,16 @@
      0,
      0,
      0,
-     48,
+     46,
      [
       [
-       49,
+       47,
        4,
        31,
        16
       ]
      ],
-     50
+     48
     ]
    ],
    "o": [
@@ -1546,8 +1571,8 @@
      "rollout-zz/lighthouse-geth-1",
      "rollout-zz",
      0,
-     40,
-     43
+     38,
+     41
     ]
    ]
   },
@@ -1582,6 +1607,7 @@
       0,
       200,
       190,
+      0,
       1,
       5
      ]
@@ -1603,9 +1629,9 @@
   "q": {
    "r": [
     [
-     40,
+     38,
      1,
-     32
+     30
     ]
    ]
   },
@@ -1613,17 +1639,17 @@
    "r": [
     [
      "rollout-zz",
-     35,
+     33,
      "reboot",
      "reboot",
      0,
      0,
      0,
      0,
-     41,
+     39,
      0,
      1,
-     42
+     40
     ]
    ],
    "o": [
@@ -1646,13 +1672,11 @@
    "rev-geth-1",
    "running",
    "el",
-   "qq-stealth-el-team",
    "lighthouse",
    "sigp/lighthouse:unstable",
    "sha256:c1c1",
    "rev-lh-c1c1",
    "cl",
-   "qq-stealth-cl-team",
    "lighthouse-validator",
    "sigp/zz-validator:unstable",
    "sha256:v1v1",
@@ -1685,7 +1709,11 @@
    "zz EL peers 4, the fleet's median is 31 (needs 16)",
    "zzEL",
    "zz container exited 137",
+   "consensus",
    "auto",
+   "f13f1da5dd40d8d4",
+   "execution",
+   "79c41df8e43eb99f",
    "manual"
   ],
   "se": {
@@ -1708,13 +1736,12 @@
       [
        "30m0s"
       ],
-      51,
-      51,
-      52,
+      50,
+      50,
+      54,
       [
        {}
       ],
-      51,
       0,
       0,
       0,
@@ -1740,13 +1767,12 @@
       [
        "30m0s"
       ],
-      51,
-      51,
-      52,
+      50,
+      50,
+      54,
       [
        {}
       ],
-      51,
       0,
       0,
       0,
@@ -1767,7 +1793,7 @@
      3,
      [
       [
-       39,
+       37,
        2,
        1
       ]
@@ -1776,7 +1802,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "658d817e61d2"
+  "v": "6f7f3b77fde2"
  },
  "patch": {
   "h": {
@@ -1786,7 +1812,7 @@
      11,
      1,
      12,
-     53,
+     55,
      13,
      "staff"
     ]
@@ -1878,9 +1904,7 @@
       "state": "running",
       "managed": true,
       "kind": "el",
-      "owners": [
-       "qq-stealth-el-team"
-      ]
+      "team": "qq-stealth-el-team"
      },
      {
       "name": "lighthouse",
@@ -1890,9 +1914,7 @@
       "state": "running",
       "managed": true,
       "kind": "cl",
-      "owners": [
-       "qq-stealth-cl-team"
-      ]
+      "team": "qq-stealth-cl-team"
      },
      {
       "name": "lighthouse-validator",
@@ -1974,9 +1996,7 @@
       "state": "running",
       "managed": true,
       "kind": "el",
-      "owners": [
-       "qq-stealth-el-team"
-      ]
+      "team": "qq-stealth-el-team"
      },
      {
       "name": "lighthouse",
@@ -1986,9 +2006,7 @@
       "state": "running",
       "managed": true,
       "kind": "cl",
-      "owners": [
-       "qq-stealth-cl-team"
-      ]
+      "team": "qq-stealth-cl-team"
      },
      {
       "name": "lighthouse-validator",

@@ -1,7 +1,6 @@
 package userapi
 
 import (
-	"fmt"
 	"net/http"
 	"testing"
 	"time"
@@ -23,8 +22,8 @@ func clientContainerOn(
 	name string, kind protocol.ContainerKind, client, image, digest, want string,
 ) protocol.Container {
 	return protocol.Container{
-		Name: name, Kind: kind, Client: client, Managed: true, State: protocol.StateRunning,
-		Image: image, ConfiguredImage: image, Digest: digest, Owners: []string{client},
+		Name: name, Kind: kind, Team: client, Managed: true, State: protocol.StateRunning,
+		Image: image, ConfiguredImage: image, Digest: digest,
 		Registry: &protocol.RegistryCheck{Digest: want, Revision: "rev-" + want, CheckedAt: controllertest.Epoch},
 	}
 }
@@ -75,16 +74,16 @@ func clientFixture(h *harness) {
 		host.Status.Containers[0].Image = "me/geth:fix"
 		host.Status.Needs = []protocol.Need{{
 			ID: protocol.SpecNeedID("geth", "k1"), Kind: protocol.NeedSpec,
-			Spec: &protocol.SpecNeed{Container: "geth", Client: "geth", Key: "k1", Image: "ethpandaops/geth:master", ToDigest: "sha256:g2"},
+			Spec: &protocol.SpecNeed{Container: "geth", Kind: protocol.KindEL, Team: "geth", Key: "k1", Image: "ethpandaops/geth:master", ToDigest: "sha256:g2"},
 		}}
 	})
 	host("n-broken", func(host *fleet.Host) {
-		host.Broken = map[string]string{scheduler.GroupName("", "geth"): "lease-1"}
+		host.Broken = map[string]string{scheduler.UnitName(protocol.KindEL, "geth"): "lease-1"}
 	})
 	host("n-rolling", nil)
 	host("n-plain", func(host *fleet.Host) {
 		for i := range host.Status.Containers {
-			host.Status.Containers[i].Client = ""
+			host.Status.Containers[i].Team = ""
 		}
 	})
 
@@ -112,8 +111,6 @@ func TestClients(t *testing.T) {
 	assert.Equal(t, views.LayerConsensus, lighthouse.Layer)
 	assert.Equal(t, fleet.PolicyAuto, lighthouse.Policy)
 	assert.False(t, lighthouse.PolicySet)
-	assert.Equal(t, []string{"lighthouse"}, lighthouse.Owners)
-	assert.Equal(t, []string{"lighthouse"}, lighthouse.AllOwned)
 	assert.Equal(t, []views.ClientImage{
 		{
 			Kind: protocol.KindCL, Image: "sigp/lighthouse:latest", Digest: "sha256:l1",
@@ -247,11 +244,6 @@ func TestUncoveredClient(t *testing.T) {
 	assert.Contains(t, authz.UncoveredClient([]string{"lighthouse"}, "geth", hosts),
 		"does not cover client geth: container geth on host ")
 
-	h.store.Lock()
-	h.store.Hosts["n-held"].Status.Containers[0].Owners = []string{"somebody"}
-	h.store.Unlock()
-
-	assert.Equal(t, fmt.Sprintf(
-		"does not cover client geth: container geth on host %s (owners: somebody)", "n-held"),
-		authz.UncoveredClient([]string{"geth"}, "geth", hosts))
+	assert.Contains(t, authz.UncoveredClient([]string{"somebody"}, "geth", hosts),
+		"(owners: geth)", "the team of a container is its only owner")
 }

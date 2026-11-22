@@ -242,25 +242,29 @@ const (
 
 // ready evaluates the readiness check for a verifying lease and returns a
 // one-line note saying what is still missing. The node must be back at head
-// with peers; a host with validators must also attest again: while the
-// beacon service has no settled epoch yet, it is not ready.
+// with peers, and the probe of every other kind the lease rolled healthy; a
+// host with validators must also attest again: while the beacon service has
+// no settled epoch yet, it is not ready.
 func (p *pass) ready(l *fleet.Lease, hv *hostView) (ready bool, note string) {
-	// A slot or independent container has nothing of the node to wait for:
-	// the agent's verify window, which it ran through, is its readiness.
+	// An independent container has nothing of the node to wait for: the
+	// agent's verify window, which it ran through, is its readiness.
 	if impact := leaseImpact(l); impact != protocol.ImpactNode {
 		return true, noteReadyPrefix + string(impact) + " work ran through the verify window"
 	}
 
 	// Validators that attest prove the node is back; the run of healthy syncs
 	// only has to span readyEpochs where there are no attestations to go by:
-	// the host has no validators, or none of them had a duty in the newest
-	// liveness epoch.
-	noAttestations := hv.weight == 0 || (hv.liveKnown && hv.duty == 0)
+	// the host has no active validators.
+	noAttestations := hv.weight == 0
 
 	// Always evaluated: it keeps the run of healthy syncs.
 	nodeOK, nodeNote := p.nodeReady(l, hv, noAttestations)
 	if !nodeOK {
 		return false, nodeNote
+	}
+
+	if missing := kindsMissing(l, hv.h.Status); missing != "" {
+		return false, missing
 	}
 
 	switch {
@@ -275,6 +279,28 @@ func (p *pass) ready(l *fleet.Lease, hv *hostView) (ready bool, note string) {
 	}
 
 	return true, noteReadyPrefix + nodeNote + ", " + noteAttesting
+}
+
+// kindsMissing says which probe of a kind whose container the lease rolled
+// is not healthy; empty when every one is, or has none. el and cl are part
+// of the node's own check.
+func kindsMissing(l *fleet.Lease, st *protocol.SyncRequest) string {
+	for i := range l.Needs {
+		name := l.Needs[i].Container()
+		if name == "" {
+			continue
+		}
+
+		for j := range st.Containers {
+			if c := &st.Containers[j]; c.Name == name && c.Managed {
+				if missing := st.Node.KindMissing(c.Kind); missing != "" {
+					return missing
+				}
+			}
+		}
+	}
+
+	return ""
 }
 
 // minPeers is the number of peers each of EL and CL must have for a node to

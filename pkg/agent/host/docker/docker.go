@@ -27,19 +27,29 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// defaultHost is the daemon address when agent.yaml names none.
-const defaultHost = "unix:///var/run/docker.sock"
+// Defaults of the docker section.
+const (
+	defaultHost     = "unix:///var/run/docker.sock"
+	defaultAuthFile = "/root/.docker/config.json"
+)
 
 // Config is the docker section of agent.yaml.
 type Config struct {
 	// Host is the daemon address.
 	Host string `yaml:"host"`
+	// AuthFile is a Docker config.json with the credentials for pulls; a
+	// missing file means anonymous.
+	AuthFile string `yaml:"authFile"`
 }
 
-// ApplyDefaults sets the default daemon address when none is given.
+// ApplyDefaults fills unset fields.
 func (c *Config) ApplyDefaults() {
 	if c.Host == "" {
 		c.Host = defaultHost
+	}
+
+	if c.AuthFile == "" {
+		c.AuthFile = defaultAuthFile
 	}
 }
 
@@ -92,9 +102,9 @@ type Change struct {
 	// Base, when SetBase, replaces the override labels; nil removes them.
 	Base    *protocol.OverrideBase
 	SetBase bool
-	// Group and Kind, when Group is set, are written as the group labels.
-	Group string
-	Kind  protocol.ContainerKind
+	// Labels are set on the replacement next to its own. The agent sets
+	// none; test tooling labels containers it did not create with them.
+	Labels map[string]string
 }
 
 // Login returns the pull credentials for a registry host; ok false pulls
@@ -289,10 +299,8 @@ func (r *dockerRuntime) describe(
 		out.Base = baseFromLabels(ctr.Config.Labels)
 
 		// Raw; plan.Classify interprets them.
-		if group := ctr.Config.Labels[protocol.LabelGroup]; group != "" {
-			out.Group = group
-			out.Kind = protocol.ContainerKind(ctr.Config.Labels[protocol.LabelKind])
-		}
+		out.Kind = protocol.ContainerKind(ctr.Config.Labels[protocol.LabelKind])
+		out.Team = ctr.Config.Labels[protocol.LabelTeam]
 
 		if ctr.Config.StopTimeout != nil && *ctr.Config.StopTimeout > 0 {
 			out.StopTimeout = time.Duration(*ctr.Config.StopTimeout) * time.Second

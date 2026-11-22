@@ -15,6 +15,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -352,6 +353,30 @@ func TestManualNeedBookkeeping(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, want, reopened.Manual())
 	assert.True(t, reopened.Answered("d-2"))
+}
+
+// Holds are kept in the state file across a restart; a cleared one is gone.
+func TestHoldsSurviveReopen(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+
+	st, err := openStore(quietLog(), dir)
+	require.NoError(t, err)
+	assert.Empty(t, st.Holds())
+
+	until := time.Date(2030, 1, 1, 0, 0, 0, 0, time.UTC)
+	controller := plan.Hold{By: "alice", Reason: "fork", Teams: []string{"geth"}, Until: &until}
+	require.NoError(t, st.SetHold(plan.HoldController, &controller))
+	require.NoError(t, st.SetHold(plan.HoldLocal, &plan.Hold{By: "ops", Reason: "debugging"}))
+	require.NoError(t, st.SetHold(plan.HoldLocal, nil))
+
+	holds := st.Holds()
+	holds[plan.HoldController].Teams[0] = "changed"
+
+	reopened, err := openStore(quietLog(), dir)
+	require.NoError(t, err)
+	assert.Equal(t, map[string]plan.Hold{plan.HoldController: controller}, reopened.Holds())
 }
 
 // After the rename memory follows the file, whatever the directory fsync says.

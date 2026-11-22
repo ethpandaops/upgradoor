@@ -99,3 +99,16 @@ func TestValidateFlags(t *testing.T) {
 
 	require.ErrorContains(t, validateFlags(many, nil), "more than")
 }
+
+func TestCommandDelta(t *testing.T) {
+	added, removed := commandDelta(
+		[]string{"geth", "--http", "--maxpeers=50", "--x", "--x"},
+		[]string{"geth", "--pprof", "--http", "--x", "--verbosity=4"},
+	)
+	assert.Equal(t, []string{"--pprof", "--verbosity=4"}, added)
+	assert.Equal(t, []string{"--maxpeers=50", "--x"}, removed)
+
+	added, removed = commandDelta([]string{"--a"}, []string{"--a"})
+	assert.Empty(t, added)
+	assert.Empty(t, removed)
+}

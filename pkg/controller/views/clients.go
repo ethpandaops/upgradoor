@@ -15,10 +15,10 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// The client views group the fleet by client software ("geth",
-// "lighthouse"): what a managed container's agent configuration names as its
-// client. A validator client container belongs to the client of its
-// consensus client.
+// The client views group the fleet by client ("geth", "lighthouse"): the
+// team label of the managed containers. A validator client container carries
+// the team of its consensus client. The layer comes from the kinds: cl or vc
+// make a consensus client.
 //
 // A client is one row on the event stream (tableClients): its images, its
 // policy and how many of its hosts are in which state. The hosts themselves
@@ -94,11 +94,6 @@ type ClientView struct {
 	// is false when that is the global default (policyImage).
 	Policy    fleet.Policy `json:"policy"`
 	PolicySet bool         `json:"policySet"`
-	// Owners are the teams that own a container of the client on any host;
-	// AllOwned names the teams that own every one of them, which is what the
-	// team feature for the client's policy asks for.
-	Owners   []string `json:"owners"`
-	AllOwned []string `json:"allOwned"`
 	// Images are the configured image references of the client's
 	// containers, by kind and reference.
 	Images []ClientImage `json:"images"`
@@ -204,7 +199,6 @@ func NewClientIndex(hosts []HostSummary, settings *fleet.Settings) *ClientIndex 
 
 		view.count(rows)
 		view.Images = clientImages(rows)
-		view.Owners, view.AllOwned = clientOwners(rows)
 		view.Version = clientVersion(rows)
 
 		idx.Views = append(idx.Views, view)
@@ -217,14 +211,15 @@ func NewClientIndex(hosts []HostSummary, settings *fleet.Settings) *ClientIndex 
 	return idx
 }
 
-// hostClients names the clients of a host's managed containers, sorted.
+// hostClients names the clients (teams) of a host's managed containers,
+// sorted.
 func hostClients(sum *HostSummary) []string {
 	var names []string
 
 	for i := range sum.Containers {
 		c := &sum.Containers[i]
-		if c.Managed && c.Client != "" && !slices.Contains(names, c.Client) {
-			names = append(names, c.Client)
+		if c.Managed && c.Team != "" && !slices.Contains(names, c.Team) {
+			names = append(names, c.Team)
 		}
 	}
 
@@ -238,7 +233,7 @@ func newClientHost(sum *HostSummary, client string) ClientHost {
 	row := ClientHost{Host: sum.Name, Stale: sum.Stale, Slot: sum.Plan.Slot}
 
 	for i := range sum.Containers {
-		if c := &sum.Containers[i]; c.Managed && c.Client == client {
+		if c := &sum.Containers[i]; c.Managed && c.Team == client {
 			row.Containers = append(row.Containers, *c)
 		}
 	}
@@ -287,7 +282,7 @@ func clientFailure(sum *HostSummary, containers []protocol.Container) string {
 	for i := range containers {
 		c := &containers[i]
 
-		if _, broken := sum.Broken[scheduler.ContainerGroupName(c)]; broken {
+		if _, broken := sum.Broken[scheduler.ContainerUnitName(c)]; broken {
 			return "the last lease for " + c.Image + " failed"
 		}
 
@@ -482,38 +477,6 @@ func commonCommand(counts map[string]int) (command []string, hosts int) {
 
 func kindOrder(k protocol.ContainerKind) int {
 	return slices.Index([]protocol.ContainerKind{protocol.KindEL, protocol.KindCL, protocol.KindVC}, k)
-}
-
-// clientOwners returns the teams that own a container of the client, and
-// those among them that own every container of it.
-func clientOwners(rows []ClientHost) (some, all []string) {
-	some = []string{}
-	first := true
-
-	for i := range rows {
-		for j := range rows[i].Containers {
-			owners := rows[i].Containers[j].Owners
-
-			for _, o := range owners {
-				if !slices.Contains(some, o) {
-					some = append(some, o)
-				}
-			}
-
-			if first {
-				all, first = slices.Clone(owners), false
-
-				continue
-			}
-
-			all = slices.DeleteFunc(all, func(o string) bool { return !slices.Contains(owners, o) })
-		}
-	}
-
-	slices.Sort(some)
-	slices.Sort(all)
-
-	return some, NonNil(all)
 }
 
 // clientVersion is a digest of a client's host list: it differs whenever a

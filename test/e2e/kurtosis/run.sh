@@ -47,6 +47,7 @@ image=$registry/lighthouse:example
 network=kurtosis-e2e
 port=${E2E_PORT:-8099}
 auth_port=18099
+ranges_port=18100
 ctl=http://127.0.0.1:$port
 auth=http://127.0.0.1:$auth_port
 nodes=4
@@ -212,6 +213,19 @@ controller_pub=$("$work/upgradoor-controller" keygen controller-pubkey --network
 echo $! >"$work/authstub.pid"
 wait_until "auth stub up" 20 curl -fsS "$auth/jwks.json"
 
+# The validator ranges inventory that a devnet's config service publishes:
+# inclusive validator index ranges by hostname.
+mkdir -p "$work/ranges"
+ranges=$(for i in $(seq 1 $nodes); do
+    printf '"%d-%d": "node-%d"\n' $(((i - 1) * validators)) $((i * validators - 1)) "$i"
+done | paste -sd, -)
+echo "{\"ranges\": {$ranges}}" >"$work/ranges/validator-ranges.json"
+python3 -m http.server --bind 127.0.0.1 --directory "$work/ranges" "$ranges_port" \
+    >"$work/ranges.log" 2>&1 &
+echo $! >"$work/ranges.pid"
+wait_until "validator ranges served" 20 \
+    curl -fsS "http://127.0.0.1:$ranges_port/validator-ranges.json"
+
 mkdir -p "$work/data"
 "$work/upgradoor-controller" run \
     --listen "127.0.0.1:$port" --data-dir "$work/data" \
@@ -221,6 +235,7 @@ mkdir -p "$work/data"
     --auth-provider-url "$auth" \
     --registry-plain-http "$registry" --registry-allow-private \
     "${beacon_args[@]}" \
+    --validator-ranges-url "http://127.0.0.1:$ranges_port/validator-ranges.json" \
     --default-setting maxUnavailablePercent=25 \
     --default-setting readyEpochs=1 \
     --default-setting leaseTtl=5m \
@@ -248,9 +263,8 @@ for i in $(seq 1 $nodes); do
     vc=$(container "vc-$i-geth-lighthouse")
     [ -n "$el" ] && [ -n "$cl" ] && [ -n "$vc" ] || die "containers of node $i not found"
     # Kurtosis created them: give them the labels Ansible would set.
-    "$work/relabel" "$el=execution/el" "$cl=consensus/cl" "$vc=consensus/vc" || die "relabel node $i"
+    "$work/relabel" "$el=el/geth" "$cl=cl/lighthouse" "$vc=vc/lighthouse" || die "relabel node $i"
 
-    start=$(((i - 1) * validators))
     "$work/upgradoor-controller" keygen host-key --network "$network" --hostname "node-$i" \
         >"$dir/host.key"
     "$work/upgradoor-controller" keygen host-cert --network "$network" --hostname "node-$i" \
@@ -269,13 +283,7 @@ certFile: /etc/upgradoor/host.crt
 stateDir: /var/lib/upgradoor
 # Only image rolls: this "host" shares the real machine's kernel.
 verbs: [roll]
-# The host's validator range. A devnet deployed with Ansible reads it from the
-# marker file of the validator_keys role instead (validators.markerFile).
-validators: {start: $start, end: $((start + validators))}
-# The containers carry the group and kind labels (relabel above).
-groups:
-  execution: {client: geth, owners: [geth], stopTimeout: 30s}
-  consensus: {client: lighthouse, owners: [lighthouse], stopTimeout: 30s}
+# The containers carry the kind and team labels (relabel above).
 probes:
   el: http://$(ip_of "$el"):8545
   cl: http://$(ip_of "$cl"):4000
@@ -351,12 +359,12 @@ pass "authenticated host detail has kernel, packages and validator range"
 
 say "permissions: reader, team member, staff"
 jq_true /api/v1/hosts 'all(.hosts[];
-        ([.containers[] | select(.kind == "el") | .owners] == [["geth"]]) and
-        ([.containers[] | select(.kind == "cl") | .owners] == [["lighthouse"]]))' ||
-    die "the authenticated host view does not carry the owners of the agent configuration"
-grep -q owners "$work/public-hosts.json" "$work/public-images.json" &&
-    die "a public view carries owners"
-pass "owners reach the authenticated view and no public view"
+        ([.containers[] | select(.kind == "el") | .team] == ["geth"]) and
+        ([.containers[] | select(.kind == "cl") | .team] == ["lighthouse"]))' ||
+    die "the authenticated host view does not carry the team labels"
+grep -q '"team"' "$work/public-hosts.json" "$work/public-images.json" &&
+    die "a public view carries teams"
+pass "teams reach the authenticated view and no public view"
 
 el1=$(container "el-1-geth-lighthouse")
 cl1=$(container "cl-1-lighthouse-geth")

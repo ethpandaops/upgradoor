@@ -289,9 +289,18 @@ func (s *Handler) slotOutages(
 		return err
 	}
 
+	// The active validators of the plan; the counted range before the first.
+	plan := s.opts.Scheduler.Plan()
 	validators := make(map[string]uint64, len(hosts))
+
 	for _, host := range hosts {
 		validators[host.Name] = host.Weight()
+
+		if plan != nil {
+			if hp, ok := plan.Hosts[host.Name]; ok {
+				validators[host.Name] = hp.Weight
+			}
+		}
 	}
 
 	spans := outageSpans(&outageInput{

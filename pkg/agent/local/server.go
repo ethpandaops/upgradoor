@@ -331,11 +331,11 @@ func (s *server) handleInit(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	s.answer(w, http.StatusOK, Answer{Message: "generated block written to " + file})
+	s.answer(w, http.StatusOK, Answer{Message: "overrides file laid out: " + file})
 }
 
-// handleDeploy serves only root: the deployed block is Ansible's, which runs
-// as root; the socket's group changes containers through overrides.
+// handleDeploy serves only root: managed.yaml is Ansible's, which runs as
+// root; the socket's group changes containers through overrides.
 func (s *server) handleDeploy(w http.ResponseWriter, r *http.Request) {
 	if peerOfRequest(r).uid != s.deployer {
 		s.answer(w, http.StatusForbidden, Answer{Error: "deploy is for root only"})

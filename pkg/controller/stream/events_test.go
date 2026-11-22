@@ -206,11 +206,6 @@ func TestPublicEventStream(t *testing.T) {
 	fastStreams(h)
 	controllertest.LeakFixture(t, h.store, h.sched, h.beacon)
 
-	// What a host says about its validator range is not public either.
-	h.store.Hosts["lighthouse-geth-1"].Status.Validators = &protocol.Validators{
-		Start: 4242, End: 4343, Source: protocol.ValidatorsFromMarker,
-		State: protocol.ValidatorsInvalid, Error: "zz range file unreadable",
-	}
 	h.start()
 
 	st := h.stream(PathPublicEvents+"?host=lighthouse-geth-1", "Bearer whatever")
@@ -221,7 +216,7 @@ func TestPublicEventStream(t *testing.T) {
 
 	noLeak := func(event map[string]json.RawMessage) {
 		for key, data := range event {
-			for _, secret := range append([]string{"4242", "4343"}, controllertest.LeakSecrets...) {
+			for _, secret := range controllertest.LeakSecrets {
 				assert.NotContains(t, string(data), secret, key)
 			}
 		}
@@ -291,10 +286,10 @@ func TestUserEventStream(t *testing.T) {
 
 	snapshot := st.event(eventSnapshot)
 	assert.Equal(t, []string{
-		tableAudit, wireKeyDetails, tableHosts, wireKeyVersion, tableImages, tableLeases, tableMembers,
+		tableAudit, tableClients, wireKeyDetails, tableHosts, wireKeyVersion, tableImages, tableLeases, tableMembers,
 		tableNetwork, tablePlan, tableQueue, tableRollouts, wireKeyStrings, tableSettings, tableSlots,
 		wireKeyTime, wireKeySchema,
-	}, keysOf(snapshot))
+	}, keysOf(snapshot), "the teams of the containers are clients")
 
 	// A login sees which hosts missed attestations in a slot; a host that
 	// attested everything is not named.
@@ -530,7 +525,7 @@ func TestEventStreamSlotOfALargeFleet(t *testing.T) {
 		name := fmt.Sprintf("node-%04d", i)
 		h.store.Hosts[name] = &fleet.Host{
 			Name: name, LastSeen: controllertest.Epoch,
-			Validators: &identity.ValidatorRange{Start: uint64(1000 + i*32), End: uint64(1032 + i*32)},
+			Validators: []identity.ValidatorRange{{Start: uint64(1000 + i*32), End: uint64(1032 + i*32)}},
 		}
 	}
 

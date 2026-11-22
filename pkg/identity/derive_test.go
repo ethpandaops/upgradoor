@@ -23,10 +23,6 @@ func TestVectors(t *testing.T) {
 	computed := vectorInputs()
 	for i := range computed {
 		require.NoError(t, computed[i].compute())
-
-		if computed[i].Roles == nil {
-			computed[i].Roles = []string{}
-		}
 	}
 
 	var buf bytes.Buffer
@@ -43,8 +39,8 @@ func TestVectors(t *testing.T) {
 	stored, err := os.ReadFile(vectorsPath)
 	require.NoError(t, err)
 	require.Equal(t, string(stored), buf.String(),
-		"vectors changed: the identity encoding is a wire contract shared with the "+
-			"Ansible filter plugin; run with -update only for a deliberate change")
+		"vectors changed: the identity encoding is a wire contract; run with -update "+
+			"only for a deliberate change")
 
 	var vectors []vector
 	require.NoError(t, json.Unmarshal(stored, &vectors))
@@ -97,24 +93,23 @@ func TestVectors(t *testing.T) {
 	}
 }
 
-// vector is one fixed identity test vector. The Go tests and the Ansible
-// filter plugin tests both recompute every output from the inputs and compare
-// byte for byte against testdata/vectors.json.
+// vector is one fixed identity test vector. The test recomputes every output
+// from the inputs and compares byte for byte against testdata/vectors.json.
 type vector struct {
 	Name string `json:"name"`
 
 	// Inputs.
-	Seed     string   `json:"seed"`
-	Network  string   `json:"network"`
-	Hostname string   `json:"hostname"`
-	Roles    []string `json:"roles"`
+	Seed     string `json:"seed"`
+	Network  string `json:"network"`
+	Hostname string `json:"hostname"`
+	// HostKey is the host's key, generated on the host.
+	HostKey string `json:"hostKey"`
 	// ControllerSeed is the controller seed, a secret of its own: the
 	// controller outputs are derived from it and from nothing of Seed.
 	ControllerSeed string `json:"controllerSeed"`
 
 	// Outputs.
 	SignerPublicKey string `json:"signerPublicKey"`
-	HostKey         string `json:"hostKey"`
 	HostPublicKey   string `json:"hostPublicKey"`
 	Certificate     string `json:"certificate"`
 	CertificateHash string `json:"certificateHash"`
@@ -146,15 +141,14 @@ func (v *vector) compute() error {
 		return err
 	}
 
-	host, err := DeriveHostKey(seed, v.Network, v.Hostname)
+	host, err := DecodePrivateKey(v.HostKey)
 	if err != nil {
 		return err
 	}
 
-	cert, err := IssueCertificate(seed, CertificateSpec{
+	cert, err := IssueCertificate(seed, PublicKey(host), CertificateSpec{
 		Network:  v.Network,
 		Hostname: v.Hostname,
-		Roles:    v.Roles,
 	})
 	if err != nil {
 		return err
@@ -173,7 +167,6 @@ func (v *vector) compute() error {
 	}
 
 	v.SignerPublicKey = EncodePublicKey(PublicKey(signer))
-	v.HostKey = EncodePrivateKey(host)
 	v.HostPublicKey = EncodePublicKey(PublicKey(host))
 	v.Certificate = cert
 	v.CertificateHash = CertificateHash(cert)
@@ -211,11 +204,10 @@ func vectorInputs() []vector {
 	}
 
 	const (
-		seedA    = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-		netA     = "testnet-devnet-0"
-		domainA  = netA + ".ethpandaops.io"
-		roleNode = "ethereum_node"
-		answerA  = `{"serverTime":"2027-01-15T08:00:00Z","wantInventory":false}`
+		seedA   = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+		netA    = "testnet-devnet-0"
+		domainA = netA + ".ethpandaops.io"
+		answerA = `{"serverTime":"2027-01-15T08:00:00Z","wantInventory":false}`
 		// The controller seed is another secret than the devnet seed.
 		ctrlSeedA = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 		ctrlSeedB = "a controller seed is used as raw UTF-8 bytes too ✓ ünïcödé"
@@ -225,7 +217,7 @@ func vectorInputs() []vector {
 		{
 			Name: "validator-host", Seed: seedA, ControllerSeed: ctrlSeedA,
 			Network: netA, Hostname: "lighthouse-geth-1",
-			Roles:       []string{roleNode},
+			HostKey:     "JvfSWw6E6Y5GTrMknXzjsGp1AZ7zviOKOFKXLWhZ5Lc",
 			ProofClaims: proof(domainA),
 			ProofBody:   `{"protocolVersion":1}`,
 			AnswerBody:  answerA,
@@ -233,27 +225,27 @@ func vectorInputs() []vector {
 		{
 			Name: "bootnode-no-validators", Seed: seedA, ControllerSeed: ctrlSeedA,
 			Network: netA, Hostname: "bootnode-1",
-			Roles:       []string{"bootnode"},
+			HostKey:     "pT38ueA7Qv0512P99l_dCYSH3Bs5vfY8xd-dSUQrkIc",
 			ProofClaims: proof(domainA),
 			ProofBody:   "",
 			AnswerBody:  "",
 		},
 		{
-			Name:           "roles-sorted-and-deduplicated",
+			Name:           "other-network",
 			Seed:           "correct horse battery staple, but at least 32 bytes long!",
 			ControllerSeed: ctrlSeedA,
 			Network:        "glamsterdam-devnet-8", Hostname: "prysm-besu-1",
-			Roles:       []string{roleNode, "bootnode", roleNode, "Mev.relay_1"},
+			HostKey:     "gXglNnhGaKHc8KWeDEx_YBqGmeivXjhFEXKklV41EHc",
 			ProofClaims: proof("glamsterdam-devnet-8.ethpandaops.io"),
 			ProofBody:   "non-ASCII body ✓ with a newline\n",
 			AnswerBody:  "non-ASCII answer ✓ with a newline\n",
 		},
 		{
-			Name:           "no-roles",
+			Name:           "mixed-case-names",
 			Seed:           "ünïcödé seed bytes are used as raw UTF-8 input ✓",
 			ControllerSeed: ctrlSeedB,
 			Network:        "net.with.dots", Hostname: "Host_With-Mixed.Case01",
-			Roles:       nil,
+			HostKey:     "CU__vBsCiYmCDA4sKCsB_80P83ogGMX99efbWwzBeEM",
 			ProofClaims: proof("net.with.dots.example"),
 			ProofBody:   "x",
 			AnswerBody:  "x",
@@ -264,12 +256,6 @@ func vectorInputs() []vector {
 func TestDerivationIsolation(t *testing.T) {
 	seed := []byte(testSeed)
 
-	a, err := DeriveHostKey(seed, "net", "a")
-	require.NoError(t, err)
-	b, err := DeriveHostKey(seed, "net", "b")
-	require.NoError(t, err)
-	other, err := DeriveHostKey(seed, "net2", "a")
-	require.NoError(t, err)
 	signer, err := DeriveSignerKey(seed, "net")
 	require.NoError(t, err)
 
@@ -277,13 +263,10 @@ func TestDerivationIsolation(t *testing.T) {
 	require.NoError(t, err)
 	ctrlOther, err := DeriveControllerKey(seed, "net2")
 	require.NoError(t, err)
-	// A host named like the controller's info string cannot collide with it.
-	hostNamedController, err := DeriveHostKey(seed, "net", "controller")
+	signerOther, err := DeriveSignerKey(seed, "net2")
 	require.NoError(t, err)
 
-	keys := []*mldsa.PrivateKey{
-		a, b, other, signer, ctrl, ctrlOther, hostNamedController,
-	}
+	keys := []*mldsa.PrivateKey{signer, signerOther, ctrl, ctrlOther}
 	for i := range keys {
 		for j := i + 1; j < len(keys); j++ {
 			assert.False(t, keys[i].Equal(keys[j]))
@@ -294,8 +277,6 @@ func TestDerivationIsolation(t *testing.T) {
 	require.ErrorIs(t, err, ErrSeedTooShort)
 
 	for _, bad := range []string{"", "a/b", "-a", "a b", `a"b`, "ü", strings.Repeat("a", 254)} {
-		_, err = DeriveHostKey(seed, "net", bad)
-		require.ErrorIs(t, err, ErrInvalidName, bad)
 		_, err = DeriveSignerKey(seed, bad)
 		require.ErrorIs(t, err, ErrInvalidName, bad)
 		_, err = DeriveControllerKey(seed, bad)
@@ -304,7 +285,7 @@ func TestDerivationIsolation(t *testing.T) {
 }
 
 func TestKeyEncoding(t *testing.T) {
-	key, err := DeriveHostKey([]byte(testSeed), "net", "host-1")
+	key, err := GenerateHostKey()
 	require.NoError(t, err)
 
 	decoded, err := DecodePrivateKey(EncodePrivateKey(key) + "\n")

@@ -280,16 +280,11 @@ type wireMember struct {
 type wireDetail struct {
 	views.HostSummary
 
-	CertHash       string    `json:"certHash"`
-	FirstSeen      time.Time `json:"firstSeen"`
-	RemoteAddr     string    `json:"remoteAddr"`
-	ValidatorStart *uint64   `json:"validatorStart,omitempty"`
-	ValidatorEnd   *uint64   `json:"validatorEnd,omitempty"`
-	// ValidatorOverlaps names the other hosts that report validators this
-	// host reports too. It is found by comparing all hosts, so it is part
-	// of the details and not of the host's row.
-	ValidatorOverlaps []string `json:"validatorOverlaps,omitempty"`
-	HasInventory      bool     `json:"hasInventory,omitempty"`
+	CertHash     string    `json:"certHash"`
+	FirstSeen    time.Time `json:"firstSeen"`
+	RemoteAddr   string    `json:"remoteAddr"`
+	Assigned     uint64    `json:"assignedValidators"`
+	HasInventory bool      `json:"hasInventory,omitempty"`
 }
 
 // wireTables names the row schema of every table. Tables of a host's details

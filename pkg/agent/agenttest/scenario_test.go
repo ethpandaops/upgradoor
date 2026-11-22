@@ -28,13 +28,13 @@ func TestLoadScenarioRejectsBadInput(t *testing.T) {
 
 			sc, loadErr := LoadScenario(path)
 			if loadErr == nil {
-				_, loadErr = NewHost(sc, nil)
+				_, loadErr = NewHost(sc)
 			}
 
 			require.Error(t, loadErr)
 		})
 	}
 
-	_, err = NewHost(nil, nil)
+	_, err = NewHost(nil)
 	require.Error(t, err)
 }

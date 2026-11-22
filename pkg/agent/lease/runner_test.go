@@ -128,7 +128,7 @@ type env struct {
 func newEnv(t *testing.T, sc *agenttest.Scenario) *env {
 	t.Helper()
 
-	h, err := agenttest.NewHost(sc, nil)
+	h, err := agenttest.NewHost(sc)
 	require.NoError(t, err)
 
 	log, logs := test.NewNullLogger()
@@ -137,8 +137,7 @@ func newEnv(t *testing.T, sc *agenttest.Scenario) *env {
 	e := &env{
 		t: t, dir: t.TempDir(), host: h, machine: h, log: log, logs: logs,
 		policy: &plan.Policy{
-			Verbs:  []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages, protocol.VerbReboot},
-			Groups: map[string]plan.Group{agenttest.GroupExecution: {}, agenttest.GroupConsensus: {}},
+			Verbs: []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages, protocol.VerbReboot},
 			Packages: plan.Packages{
 				Blocked: []string{"docker-ce", "containerd.io"},
 			},

@@ -10,16 +10,19 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
-// Overrides is the host's overrides file: what Ansible deployed each managed
-// container as, their overrides, and the holds.
+// Overrides is what the host's files say: what Ansible deployed each managed
+// container as (managed.yaml), their overrides (the overrides file) and the
+// holds (the state file).
 type Overrides struct {
-	// Known is false when the file exists but cannot be read. Nothing is
-	// then applied or restored and the host is held, so a briefly broken
-	// file does not put every container back.
+	// Known is false when managed.yaml or the overrides file exists but
+	// cannot be read. Nothing is then applied or restored and the host is
+	// held, so a briefly broken file does not put every container back.
 	Known bool
-	// Err says what is wrong with the file; one line.
+	// Err says what is wrong; one line.
 	Err string
-	// Deployed is the generated block, by container name.
+	// Disabled: the host takes no overrides (no overridesFile in agent.yaml).
+	Disabled bool
+	// Deployed is managed.yaml, by container name.
 	Deployed map[string]Deployed
 	// Entries are the unexpired overrides, by container name.
 	Entries map[string]Entry
@@ -27,7 +30,7 @@ type Overrides struct {
 	Holds map[string]Hold
 }
 
-// Deployed is what Ansible deployed one container as.
+// Deployed is what Ansible deployed one container as: its default.
 type Deployed struct {
 	Image string
 	// Command is the arguments after the entrypoint, when HasCommand;
@@ -36,13 +39,29 @@ type Deployed struct {
 	HasCommand bool
 }
 
+// Validate checks a deployed entry before managed.yaml is written: the image
+// is a reference and the command is well formed.
+func (d *Deployed) Validate() error {
+	if _, err := imageref.Parse(d.Image); err != nil {
+		return fmt.Errorf("image: %w", err)
+	}
+
+	if d.HasCommand {
+		if err := validateCommand(d.Command); err != nil {
+			return fmt.Errorf("command: %w", err)
+		}
+	}
+
+	return nil
+}
+
 // Entry is the override of one container.
 type Entry struct {
 	// Image replaces the deployed image reference; empty keeps it.
 	Image string
-	// Add and Remove change the command line (applyFlags).
-	Add    []string
-	Remove []string
+	// Command replaces the deployed command line as a whole, when HasCommand.
+	Command    []string
+	HasCommand bool
 	// By and Reason say who set it and why; one line each.
 	By     string
 	Reason string
@@ -50,18 +69,18 @@ type Entry struct {
 	Until *time.Time
 }
 
-// Hold is one hold entry of the overrides file.
+// Hold is one hold of the state file.
 type Hold struct {
 	// By, Reason, Teams and Feature say who set it and why.
-	By      string
-	Reason  string
-	Teams   []string
-	Feature string
+	By      string   `json:"by"`
+	Reason  string   `json:"reason"`
+	Teams   []string `json:"teams,omitempty"`
+	Feature string   `json:"feature,omitempty"`
 	// Until is when the hold ends by itself; nil for one without an end.
-	Until *time.Time
+	Until *time.Time `json:"until,omitempty"`
 }
 
-// Hold sources: the keys of the hold mapping in the overrides file.
+// Hold sources: the keys of the holds in the state file.
 const (
 	HoldLocal      = "local"
 	HoldController = "controller"
@@ -89,7 +108,7 @@ func Refusal(format string, args ...any) error {
 
 // Empty reports whether the entry changes nothing (nil included).
 func (e *Entry) Empty() bool {
-	return e == nil || (e.Image == "" && len(e.Add) == 0 && len(e.Remove) == 0)
+	return e == nil || (e.Image == "" && !e.HasCommand)
 }
 
 // Expired reports whether the entry's end has passed at now.
@@ -98,7 +117,7 @@ func (e *Entry) Expired(now time.Time) bool {
 }
 
 // Describe says what the entry changes, e.g. "image ethpandaops/geth:fix,
-// flags +--verbosity=4 ---maxpeers"; NoOverride for an empty entry.
+// command geth --http"; NoOverride for an empty entry.
 func (e *Entry) Describe() string {
 	if e.Empty() {
 		return NoOverride
@@ -110,18 +129,8 @@ func (e *Entry) Describe() string {
 		parts = append(parts, "image "+e.Image)
 	}
 
-	if len(e.Add)+len(e.Remove) > 0 {
-		flags := make([]string, 0, len(e.Add)+len(e.Remove))
-
-		for _, f := range e.Add {
-			flags = append(flags, "+"+f)
-		}
-
-		for _, f := range e.Remove {
-			flags = append(flags, "-"+f)
-		}
-
-		parts = append(parts, "flags "+strings.Join(flags, " "))
+	if e.HasCommand {
+		parts = append(parts, strings.TrimSpace("command "+strings.Join(e.Command, " ")))
 	}
 
 	return strings.Join(parts, ", ")
@@ -131,11 +140,11 @@ func (e *Entry) Describe() string {
 const maxEntryText = 500
 
 // Validate checks an entry before it is written or applied: it changes
-// something, the image is a tag, the flags are well formed and the texts
+// something, the image is a tag, the command is well formed and the texts
 // are bounded.
 func (e *Entry) Validate() error {
 	if e.Empty() {
-		return errors.New("an override names an image, flags or both")
+		return errors.New("an override names an image, a command or both")
 	}
 
 	if e.Image != "" {
@@ -148,8 +157,10 @@ func (e *Entry) Validate() error {
 		}
 	}
 
-	if err := validateFlags(e.Add, e.Remove); err != nil {
-		return err
+	if e.HasCommand {
+		if err := validateCommand(e.Command); err != nil {
+			return err
+		}
 	}
 
 	if len(e.By) > maxEntryText || len(e.Reason) > maxEntryText {

@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"slices"
+	"io"
 	"strings"
 )
 
@@ -35,9 +35,8 @@ var (
 )
 
 // ValidatorRange is the half-open range [Start, End) of beacon validator
-// indices operated by a host. It is not part of the certificate: a host
-// reports its range itself (protocol.Validators), and the controller keeps
-// the range it counts for the host in this form.
+// indices operated by a host. It is not part of the certificate: the
+// controller takes it from the devnet's validator ranges inventory.
 type ValidatorRange struct {
 	Start uint64 `json:"start"`
 	End   uint64 `json:"end"`
@@ -71,7 +70,6 @@ type Claims struct {
 	Network string       `json:"net"`
 	Subject string       `json:"sub"`
 	Cnf     Confirmation `json:"cnf"`
-	Roles   []string     `json:"roles"`
 }
 
 // HostKey returns the host public key the certificate is bound to.
@@ -92,25 +90,18 @@ func (c *Claims) HostKey() (*mldsa.PublicKey, error) {
 type CertificateSpec struct {
 	Network  string
 	Hostname string
-	// Roles are sorted and de-duplicated before encoding.
-	Roles []string
 }
 
-// IssueCertificate derives the signer and host keys from seed and returns the
-// host certificate as a compact JWT. The output is deterministic: the same
-// inputs always yield the same bytes.
-func IssueCertificate(seed []byte, spec CertificateSpec) (string, error) {
+// IssueCertificate derives the signer key from seed and returns the
+// certificate of hostKey as a compact JWT. The output is deterministic: the
+// same inputs always yield the same bytes.
+func IssueCertificate(seed []byte, hostKey *mldsa.PublicKey, spec CertificateSpec) (string, error) {
 	signer, err := DeriveSignerKey(seed, spec.Network)
 	if err != nil {
 		return "", err
 	}
 
-	host, err := DeriveHostKey(seed, spec.Network, spec.Hostname)
-	if err != nil {
-		return "", err
-	}
-
-	return SignCertificate(signer, PublicKey(host), spec)
+	return SignCertificate(signer, hostKey, spec)
 }
 
 // SignCertificate signs a certificate for hostKey with the signer key.
@@ -125,19 +116,6 @@ func SignCertificate(
 		return "", err
 	}
 
-	roles := make([]string, 0, len(spec.Roles))
-
-	for _, role := range spec.Roles {
-		if err := ValidateName(role); err != nil {
-			return "", err
-		}
-
-		roles = append(roles, role)
-	}
-
-	slices.Sort(roles)
-	roles = slices.Compact(roles)
-
 	claims := Claims{
 		Issuer:  Issuer,
 		Network: spec.Network,
@@ -147,7 +125,6 @@ func SignCertificate(
 			Alg: Algorithm,
 			Pub: EncodePublicKey(hostKey),
 		}},
-		Roles: roles,
 	}
 
 	// All string members are restricted to nameRe or base64url, so
@@ -199,10 +176,6 @@ func VerifyCertificate(
 
 	if claims.Network != network {
 		return nil, ErrWrongNetwork
-	}
-
-	if claims.Roles == nil {
-		claims.Roles = []string{}
 	}
 
 	return &Certificate{Claims: claims, Raw: raw, Hash: CertificateHash(raw)}, nil
@@ -278,4 +251,45 @@ func splitCompact(raw string) ([]string, error) {
 	}
 
 	return parts, nil
+}
+
+// maxCertificate bounds the certificate ReadCertificate reads.
+const maxCertificate = 64 << 10
+
+// CertificateInfo is what a host certificate certifies.
+type CertificateInfo struct {
+	Hostname  string `json:"hostname"`
+	Network   string `json:"network"`
+	PublicKey string `json:"publicKey"`
+}
+
+// ReadCertificate reads a certificate from r, verifies it against the
+// encoded signer key and network and returns what it certifies.
+func ReadCertificate(r io.Reader, signerKey, network string) (*CertificateInfo, error) {
+	if network == "" {
+		return nil, errors.New("--network is required")
+	}
+
+	signer, err := DecodePublicKey(signerKey)
+	if err != nil {
+		return nil, fmt.Errorf("--signer-public-key: %w", err)
+	}
+
+	raw, err := io.ReadAll(io.LimitReader(r, maxCertificate+1))
+	if err != nil {
+		return nil, fmt.Errorf("read certificate: %w", err)
+	}
+
+	if len(raw) > maxCertificate {
+		return nil, fmt.Errorf("certificate is larger than %d bytes", maxCertificate)
+	}
+
+	cert, err := VerifyCertificate(signer, network, strings.TrimSpace(string(raw)))
+	if err != nil {
+		return nil, err
+	}
+
+	return &CertificateInfo{
+		Hostname: cert.Subject, Network: cert.Network, PublicKey: cert.Cnf.JWK.Pub,
+	}, nil
 }

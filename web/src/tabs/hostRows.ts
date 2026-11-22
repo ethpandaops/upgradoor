@@ -187,11 +187,11 @@ export function sortHostRows(rows: readonly HostRow[], key: SortKey, direction: 
   });
 }
 
-/** hostOwners lists the teams that own a managed container of the host, sorted. */
+/** hostOwners lists the teams of the managed containers of the host, sorted. */
 export function hostOwners(summary: Pick<HostListing, 'containers'>): string[] {
   const owners = new Set<string>();
   for (const c of list(summary.containers)) {
-    if (c.managed) for (const owner of list(c.owners)) owners.add(owner);
+    if (c.managed && c.team) owners.add(c.team);
   }
   return [...owners].sort();
 }

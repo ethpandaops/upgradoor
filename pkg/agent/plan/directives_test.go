@@ -23,8 +23,7 @@ func TestRollRefusal(t *testing.T) {
 		{name: "then the hold", hold: protocol.Hold{Local: true, LocalReason: "x"}, want: "host is on local hold: x"},
 		{name: "no container", want: "roll directive names no container"},
 		{name: "gone", container: "ghost", want: "container ghost does not exist"},
-		{name: "not rolled", container: "dora",
-			want: "container dora is in the default group, which this host does not roll (defaultGroup.roll)"},
+		{name: "unlabelled and ignored", container: "dora", want: "container dora is not managed"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			p := needsPolicy(allVerbs...)
@@ -68,7 +67,7 @@ func TestRollNeed(t *testing.T) {
 	assert.Equal(t, protocol.Need{
 		ID: "manual/d1", Kind: protocol.NeedImage,
 		Image: &protocol.ImageNeed{
-			Container: "geth", Group: "execution", Client: "geth", Image: ref,
+			Container: "geth", Kind: protocol.KindEL, Team: "geth", Image: ref,
 			FromDigest: "sha256:a", ToDigest: "sha256:a", ToRevision: "r1",
 		},
 	}, *need, "a roll at the running digest restarts the container")

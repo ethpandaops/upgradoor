@@ -1,7 +1,6 @@
 package scheduler
 
 import (
-	"cmp"
 	"crypto/sha256"
 	"encoding/hex"
 	"slices"
@@ -13,67 +12,68 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// A roll group is what Ansible labels a set of containers with
-// (protocol.LabelGroup): a beacon node and its validator client, an
-// execution client, a proxy and its companions. The image and spec needs of
-// one group and client are one rollout, whatever moved in it: the new digests
-// of the group's tags and what a soft deploy changed. A host's needs of the
-// group are served together, by one lease: one canary, one readiness check,
-// one halt for the group.
+// The image and spec needs of one team and kind (the protocol.LabelTeam and
+// protocol.LabelKind labels of the containers) are one rollout, whatever
+// moved in it: the new digests of their tags and what a soft deploy changed.
+// Containers without a team form one rollout per kind across the fleet;
+// unlabelled containers one per image. A host's needs of a rollout are
+// served together, by one lease: one canary, one readiness check, one halt.
+// Needs of several rollouts that are active together ride along in one lease.
 
-// prefixGroup starts the name of a group (GroupName) and the key of its
-// rollouts.
-const prefixGroup = "group:"
+// prefixUnit starts the name of a rollout unit (UnitName) and the key of
+// its rollouts.
+const prefixUnit = "unit:"
 
-// GroupName names the rollouts of one roll group of one client, whatever
-// they move it to. A host's broken mark for the rollouts carries the name.
-func GroupName(group, client string) string {
-	if client == "" {
-		return prefixGroup + group
+// UnitName names the rollouts of one kind of one team, or of the kind alone
+// for containers without a team, whatever they move it to. A host's broken
+// mark for the rollouts carries the name.
+func UnitName(kind protocol.ContainerKind, team string) string {
+	if team == "" {
+		return prefixUnit + string(kind)
 	}
 
-	return prefixGroup + group + "#" + client
+	return prefixUnit + string(kind) + "#" + team
 }
 
-// DefaultGroupName names the rollouts of one image of the default group
-// (protocol.DefaultGroup): its containers have nothing in common but their
-// image, so all hosts' needs of one image are one rollout.
-func DefaultGroupName(image string) string {
-	return prefixGroup + protocol.DefaultGroup + "/" + imageref.Normalize(image)
+// UnlabelledUnitName names the rollouts of one image of unlabelled
+// containers: they have nothing in common but their image, so all hosts'
+// needs of one image are one rollout.
+func UnlabelledUnitName(image string) string {
+	return prefixUnit + "/" + imageref.Normalize(image)
 }
 
-// groupNameOf is GroupName, or DefaultGroupName for the default group.
-func groupNameOf(group, client, image string) string {
-	if group == protocol.DefaultGroup {
-		return DefaultGroupName(image)
+// unitNameOf is UnitName, or UnlabelledUnitName without a kind.
+func unitNameOf(kind protocol.ContainerKind, team, image string) string {
+	if kind == "" {
+		return UnlabelledUnitName(image)
 	}
 
-	return GroupName(group, client)
+	return UnitName(kind, team)
 }
 
-// ContainerGroupName names the rollouts that roll a managed container.
-func ContainerGroupName(c *protocol.Container) string {
-	return groupNameOf(c.Group, c.Client, c.Image)
+// ContainerUnitName names the rollouts that roll a managed container.
+func ContainerUnitName(c *protocol.Container) string {
+	return unitNameOf(c.Kind, c.Team, c.Image)
 }
 
-// rolloutGroupName names the rollouts of a group rollout's group.
+// rolloutGroupName names the rollouts of a group rollout's unit.
 func rolloutGroupName(r *fleet.Rollout) string {
 	image := ""
 	if len(r.Targets) > 0 {
 		image = r.Targets[0].Image
 	}
 
-	return groupNameOf(r.Group, r.Client, image)
+	return unitNameOf(r.ContainerKind, r.Team, image)
 }
 
-// needGroupName is the group name of an image or spec need; empty for
+// needGroupName is the unit name of an image or spec need; empty for
 // another need.
 func needGroupName(n *protocol.Need) string {
 	switch {
 	case n.Kind == protocol.NeedImage && n.Image != nil:
-		return groupNameOf(n.Image.Group, n.Image.Client, n.Image.Image)
+		return unitNameOf(n.Image.Kind, n.Image.Team, n.Image.Image)
 	case n.Kind == protocol.NeedSpec && n.Spec != nil:
-		return groupNameOf(n.Spec.Group, n.Spec.Client, n.Spec.Image)
+		return unitNameOf(n.Spec.Kind, n.Spec.Team, n.Spec.Image)
 	default:
 		return ""
 	}
@@ -84,7 +84,7 @@ func isGroupNeed(n *protocol.Need) bool {
 	return n.DirectiveID == "" && !isLocal(n) && needGroupName(n) != ""
 }
 
-// targetOf is the part of a group's target an image or spec need asks for.
+// targetOf is the part of a unit's target an image or spec need asks for.
 func targetOf(n *protocol.Need) fleet.RolloutTarget {
 	if s := n.Spec; s != nil {
 		return fleet.RolloutTarget{
@@ -106,9 +106,10 @@ func targetID(t *fleet.RolloutTarget) string {
 	return "image " + imageref.Normalize(t.Image)
 }
 
-// groupTarget is what the hosts' needs of one group and client ask for.
+// groupTarget is what the hosts' needs of one unit ask for.
 type groupTarget struct {
-	group, client string
+	kind protocol.ContainerKind
+	team string
 	// parts by targetID; checked is, per tag, the freshest registry check
 	// that named its digest.
 	parts   map[string]fleet.RolloutTarget
@@ -155,8 +156,8 @@ func covers(r *fleet.Rollout, t *fleet.RolloutTarget) bool {
 	})
 }
 
-// groupKey is the rollout key of a group's target.
-func groupKey(group, client string, targets []fleet.RolloutTarget) string {
+// groupKey is the rollout key of a unit's target.
+func groupKey(kind protocol.ContainerKind, team string, targets []fleet.RolloutTarget) string {
 	parts := make([]string, 0, len(targets))
 	for i := range targets {
 		parts = append(parts, targetID(&targets[i])+"@"+targets[i].Digest)
@@ -165,11 +166,24 @@ func groupKey(group, client string, targets []fleet.RolloutTarget) string {
 	slices.Sort(parts)
 	sum := sha256.Sum256([]byte(strings.Join(parts, "\n")))
 
-	return groupNameOf(group, client, targets[0].Image) + "@" + hex.EncodeToString(sum[:8])
+	return unitNameOf(kind, team, targets[0].Image) + "@" + hex.EncodeToString(sum[:8])
+}
+
+// unitTitle names a unit for people: "<team> <kind>", "<kind>" for one
+// without a team, "unlabelled" for unlabelled containers.
+func unitTitle(kind protocol.ContainerKind, team string) string {
+	switch {
+	case kind == "":
+		return "unlabelled"
+	case team == "":
+		return string(kind)
+	default:
+		return team + " " + string(kind)
+	}
 }
 
 // groupTitle says what a group rollout does, for people.
-func groupTitle(group, client string, targets []fleet.RolloutTarget) string {
+func groupTitle(kind protocol.ContainerKind, team string, targets []fleet.RolloutTarget) string {
 	parts := make([]string, 0, len(targets))
 
 	for i := range targets {
@@ -186,30 +200,25 @@ func groupTitle(group, client string, targets []fleet.RolloutTarget) string {
 		parts = append(parts, part)
 	}
 
-	title := cmp.Or(group, "(no group)") + ": " + strings.Join(parts, "; ")
-	if client != "" {
-		title = client + " " + title
-	}
-
-	return title
+	return unitTitle(kind, team) + ": " + strings.Join(parts, "; ")
 }
 
-// groupRollout is the rollout of a group's target.
+// groupRollout is the rollout of a unit's target.
 func groupRollout(g *groupTarget) *fleet.Rollout {
 	targets := g.sorted()
 
 	return &fleet.Rollout{
-		Kind:    fleet.RolloutGroup,
-		Key:     groupKey(g.group, g.client, targets),
-		Title:   groupTitle(g.group, g.client, targets),
-		Group:   g.group,
-		Client:  g.client,
-		Targets: targets,
+		Kind:          fleet.RolloutGroup,
+		Key:           groupKey(g.kind, g.team, targets),
+		Title:         groupTitle(g.kind, g.team, targets),
+		ContainerKind: g.kind,
+		Team:          g.team,
+		Targets:       targets,
 	}
 }
 
-// supersedeGroup closes a group rollout whose group the hosts now ask more
-// of, or something else: a tag of the group moved again, another tag of it
+// supersedeGroup closes a group rollout whose unit the hosts now ask more
+// of, or something else: a tag of the unit moved again, another tag of it
 // moved, Ansible changed another container of it. The rollout that follows
 // has the combined target of what the hosts ask for.
 func (p *pass) supersedeGroup(r *fleet.Rollout, rep *reportedNeeds) {
@@ -221,7 +230,8 @@ func (p *pass) supersedeGroup(r *fleet.Rollout, rep *reportedNeeds) {
 	for _, id := range sortedKeys(g.parts) {
 		t := g.parts[id]
 		if !covers(r, &t) {
-			p.closeRollout(r, fleet.RolloutSuperseded, "the group's target changed: "+groupTitle(r.Group, "", []fleet.RolloutTarget{t}))
+			p.closeRollout(r, fleet.RolloutSuperseded,
+				"the target changed: "+groupTitle(r.ContainerKind, r.Team, []fleet.RolloutTarget{t}))
 
 			return
 		}
@@ -229,8 +239,8 @@ func (p *pass) supersedeGroup(r *fleet.Rollout, rep *reportedNeeds) {
 }
 
 // assignGroupNeeds sorts the group needs of one host to the open rollouts of
-// their groups: all needs of a group or none, so that one lease serves the
-// whole group. A host that asks for a part the rollout does not hold (it
+// their units: all needs of a unit or none, so that one lease serves the
+// whole unit. A host that asks for a part the rollout does not hold (it
 // has not heard of the newest digest yet) waits until it asks for the same.
 func (p *pass) assignGroupNeeds(name string, all []protocol.Need, open map[string]*fleet.Rollout) {
 	byGroup := make(map[string][]protocol.Need, 2)
@@ -272,8 +282,8 @@ func (p *pass) addNeeds(r *fleet.Rollout, host string, needs []protocol.Need) {
 }
 
 // groupContainer reports whether the host runs a managed container of the
-// rollout's group and client on one of its tags, at the tag's target digest
-// (onTarget) or at another.
+// rollout's unit on one of its tags, at the tag's target digest (onTarget)
+// or at another.
 func groupContainer(r *fleet.Rollout, hv *hostView, onTarget bool) bool {
 	if hv.h.Status == nil {
 		return false
@@ -281,7 +291,7 @@ func groupContainer(r *fleet.Rollout, hv *hostView, onTarget bool) bool {
 
 	for i := range hv.h.Status.Containers {
 		c := &hv.h.Status.Containers[i]
-		if !c.Managed || c.Group != r.Group || c.Client != r.Client {
+		if !c.Managed || c.Kind != r.ContainerKind || c.Team != r.Team {
 			continue
 		}
 

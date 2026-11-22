@@ -62,11 +62,11 @@ type PageView = 'hosts' | 'rollouts';
 const FILTER_STATES: readonly ClientHostState[] = ['current', 'pending', 'rolling', 'overridden', 'held', 'failed'];
 
 /**
- * defaultClient is the client the tab opens on: the first one a team of the
- * login owns a container of, otherwise the first of the list.
+ * defaultClient is the client the tab opens on: the first one that is a team
+ * of the login, otherwise the first of the list.
  */
 export function defaultClient(clients: readonly ClientView[], teams: readonly string[]): string | undefined {
-  return (clients.find(c => list(c.owners).some(o => teams.includes(o))) ?? clients[0])?.name;
+  return (clients.find(c => teams.includes(c.name)) ?? clients[0])?.name;
 }
 
 /**
@@ -248,8 +248,8 @@ function ClientPage({
   const actions = useActions();
   const hostTable = useLive('hosts');
   const rollouts = useRolloutData();
-  const open = list(rollouts.rollouts.data?.open).filter(r => r.client === client.name);
-  const recent = list(rollouts.rollouts.data?.recent).filter(r => r.client === client.name);
+  const open = list(rollouts.rollouts.data?.open).filter(r => r.team === client.name);
+  const recent = list(rollouts.rollouts.data?.recent).filter(r => r.team === client.name);
   const approvals = open.filter(r => waitsForApproval(r, policyFor(rollouts.settings, r)));
 
   // Kept while another tab is shown, per client.
@@ -650,7 +650,7 @@ function ApprovalCallout({
                 icon={r.paused ? 'resume' : 'check'}
                 label={r.paused ? 'Resume and approve…' : 'Approve…'}
                 onAction={onAction}
-                intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.client)}
+                intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.team)}
               />
             </span>
           </li>
@@ -769,7 +769,6 @@ function ClientConfig({
   onAction: (intent: ActionIntent) => void;
 }) {
   const permissions = usePermissions();
-  const owners = list(client.owners);
   const kinds = clientKinds(client);
   const overrides = client.imageOverrides + client.flagOverrides;
 
@@ -820,9 +819,6 @@ function ClientConfig({
           <h2 className="text-lg/7 font-semibold">{client.name}</h2>
           <span className="text-xs/5 text-muted">
             {client.layer} client · {plural(client.hosts, 'host')}
-            {owners.length > 0 && (
-              <span title="The teams that own a container of this client"> · owned by {owners.join(', ')}</span>
-            )}
           </span>
         </div>
         <PolicySetting client={client} onAction={onAction} />
@@ -1242,7 +1238,7 @@ function ContainerLine({ container: c }: { container: Container }) {
     <span className="flex h-5 items-center gap-2">
       <span
         className={cx(KIND_WIDTH, 'font-semibold text-muted uppercase')}
-        title={`container ${c.name}${c.group ? `, group ${c.group}` : ''}`}
+        title={`container ${c.name}, team ${c.team ?? ''}`}
       >
         {c.kind ?? '–'}
       </span>
@@ -1276,11 +1272,6 @@ function ContainerLine({ container: c }: { container: Container }) {
         <CopyValue value={c.revision} short={shortRevision(c.revision)} label="revision" />
       ) : (
         <span className="text-faint">–</span>
-      )}
-      {c.group && (
-        <span className="truncate text-muted" title="The roll group: its containers are rolled together, by one lease">
-          group {c.group}
-        </span>
       )}
     </span>
   );

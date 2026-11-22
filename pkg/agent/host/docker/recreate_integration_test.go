@@ -845,7 +845,7 @@ func TestIntegrationSoftDeployViaTheBlock(t *testing.T) {
 		require.NoError(t, err)
 	}
 
-	labels := map[string]string{protocol.LabelGroup: "consensus", protocol.LabelKind: "cl", "own": "yes"}
+	labels := map[string]string{protocol.LabelKind: "cl", protocol.LabelTeam: "lighthouse", "own": "yes"}
 	_, err := env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
 		Name:   name,
 		Config: &container.Config{Image: v1, Cmd: []string{"--http"}, Env: []string{"OWN=1"}, Labels: labels},
@@ -854,7 +854,8 @@ func TestIntegrationSoftDeployViaTheBlock(t *testing.T) {
 	require.NoError(t, r.Start(ctx, name))
 
 	seen := observed(t, r, name)
-	require.Equal(t, "consensus", seen.Group, "found by its label")
+	require.Equal(t, protocol.KindCL, seen.Kind, "found by its label")
+	require.Equal(t, "lighthouse", seen.Team)
 
 	require.NoError(t, r.Recreate(ctx, name, v2Digest, 5*time.Second, true, &Change{
 		Image: v2, Command: []string{"--http", "--new-flag"}, SetCommand: true, SetBase: true,
@@ -872,41 +873,4 @@ func TestIntegrationSoftDeployViaTheBlock(t *testing.T) {
 	assert.NotContains(t, now.Config.Labels, labelOverrideImage, "no override label")
 	assert.NotContains(t, now.Config.Labels, labelOverrideCommand, "no override label")
 	assert.Nil(t, observed(t, r, name).Base)
-}
-
-// The recreate of a name-mapped container adds its group labels.
-func TestIntegrationRecreateLabelsMappedContainer(t *testing.T) {
-	env.cleanup(t, "mapped")
-
-	ctx := t.Context()
-	r := env.newRuntime(t)
-	ref := env.repoRef("mapped")
-	digest := env.publish(t, ref, variantOne)
-
-	_, _, err := r.Pull(ctx, ref)
-	require.NoError(t, err)
-
-	mapped := env.prefix + "mapped"
-	_, err = env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
-		Name: mapped, Config: &container.Config{Image: ref, Labels: map[string]string{"own": "yes"}},
-	})
-	require.NoError(t, err)
-	require.NoError(t, r.Start(ctx, mapped))
-
-	before := observed(t, r, mapped)
-	assert.Empty(t, before.Group, "no label yet")
-	assert.Empty(t, before.Kind)
-
-	require.NoError(t, r.Recreate(ctx, mapped, digest, 5*time.Second, true,
-		&Change{Group: "execution", Kind: protocol.KindEL}))
-
-	now := env.inspect(t, mapped)
-	assert.True(t, now.State.Running)
-	assert.Equal(t, "execution", now.Config.Labels[protocol.LabelGroup])
-	assert.Equal(t, "el", now.Config.Labels[protocol.LabelKind])
-	assert.Equal(t, "yes", now.Config.Labels["own"], "its own labels stay")
-
-	after := observed(t, r, mapped)
-	assert.Equal(t, "execution", after.Group)
-	assert.Equal(t, protocol.KindEL, after.Kind)
 }

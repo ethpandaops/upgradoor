@@ -26,12 +26,13 @@ func TestRecordSync(t *testing.T) {
 
 			s := backend.open(t)
 
-			validators := &identity.ValidatorRange{Start: 100, End: 200}
+			validators := []identity.ValidatorRange{{Start: 100, End: 200}}
+			assign(t, s, fleet.HostRange{Host: "node-1", ValidatorRange: validators[0]})
 
 			res, err := s.RecordSync(ctx, &HostSync{
-				Cert:       testCert("node-1", "bootnode", "rpc"),
+				Cert:       testCert("node-1"),
 				RemoteAddr: "10.0.0.1:1234",
-				Request:    reporting(100, 200, imageNeed("a"), imageNeed("b")),
+				Request:    withRoles(testRequest(imageNeed("a"), imageNeed("b")), "bootnode", "rpc"),
 				At:         at(0),
 			})
 			require.NoError(t, err)
@@ -46,7 +47,7 @@ func TestRecordSync(t *testing.T) {
 				FirstSeen:  at(0),
 				LastSeen:   at(0),
 				RemoteAddr: "10.0.0.1:1234",
-				Status:     reporting(100, 200, imageNeed("a"), imageNeed("b")),
+				Status:     withRoles(testRequest(imageNeed("a"), imageNeed("b")), "bootnode", "rpc"),
 			}
 			assert.Len(t, res.Host.StatusHash, 32)
 			want.StatusHash = res.Host.StatusHash
@@ -60,10 +61,11 @@ func TestRecordSync(t *testing.T) {
 
 			// Same certificate again: first_seen kept, the rest follows the sync.
 			res, err = s.RecordSync(ctx, &HostSync{
-				Cert:       testCert("node-1", "bootnode", "rpc"),
+				Cert:       testCert("node-1"),
 				RemoteAddr: "10.0.0.2:999",
-				Request:    reporting(100, 200, imageNeed("b"), imageNeed("c"), imageNeed("c")),
-				At:         at(60),
+				Request: withRoles(testRequest(imageNeed("b"), imageNeed("c"), imageNeed("c")),
+					"bootnode", "rpc"),
+				At: at(60),
 			})
 			require.NoError(t, err)
 			assert.False(t, res.Created)
@@ -73,8 +75,8 @@ func TestRecordSync(t *testing.T) {
 			assert.Equal(t, "10.0.0.2:999", res.Host.RemoteAddr)
 			assert.Len(t, res.Host.Status.Needs, 3, "the status is stored verbatim")
 
-			// A re-issued certificate: new hash and roles. The
-			// sync reports no validators any more.
+			// A re-issued certificate: a new hash. The sync reports no
+			// roles any more; the validators stay with the name.
 			reissued := testCert("node-1")
 			reissued.Hash = "hash-2"
 
@@ -83,16 +85,10 @@ func TestRecordSync(t *testing.T) {
 			assert.False(t, res.Created)
 			assert.Equal(t, "hash-node-1", res.PreviousCertHash)
 			assert.Equal(t, "hash-2", res.Host.CertHash)
-			assert.Nil(t, res.Host.Validators)
+			assert.Equal(t, validators, res.Host.Validators)
 			assert.Equal(t, []string{}, res.Host.Roles)
 			assert.Empty(t, res.Host.RemoteAddr)
 			assert.Equal(t, at(0), res.Host.FirstSeen)
-
-			// And back to a range.
-			res, err = s.RecordSync(ctx, &HostSync{Cert: reissued, Request: reporting(5, 6), At: at(180)})
-			require.NoError(t, err)
-			assert.Empty(t, res.PreviousCertHash)
-			assert.Equal(t, &identity.ValidatorRange{Start: 5, End: 6}, res.Host.Validators)
 		})
 	}
 }
@@ -125,11 +121,11 @@ func TestRecordSyncConfirms(t *testing.T) {
 				return res
 			}
 
-			res := sync(0, reporting(100, 200, imageNeed("a")))
+			res := sync(0, testRequest(imageNeed("a")))
 			assert.True(t, res.Changed)
 			assert.True(t, res.PreviousSeen.IsZero())
 
-			res = sync(30, reporting(100, 200, imageNeed("a")))
+			res = sync(30, testRequest(imageNeed("a")))
 			assert.False(t, res.Changed, "same status apart from its clock")
 			assert.Equal(t, at(0), res.PreviousSeen)
 			assert.Equal(t, at(30), res.Host.LastSeen)
@@ -139,7 +135,7 @@ func TestRecordSyncConfirms(t *testing.T) {
 
 			// The heads, the sync distance and the peer counts move on a
 			// healthy node: stored, but not a change.
-			moved := reporting(100, 200, imageNeed("a"))
+			moved := testRequest(imageNeed("a"))
 			moved.Node.EL.Head, moved.Node.EL.Peers = 101, 13
 			moved.Node.CL.HeadSlot, moved.Node.CL.SyncDistance, moved.Node.CL.Peers = 3201, 1, 29
 			res = sync(40, moved)
@@ -156,18 +152,14 @@ func TestRecordSyncConfirms(t *testing.T) {
 				"CL EL offline":    func(n *protocol.NodeHealth) { n.CL.ELOffline = true },
 				"EL without peers": func(n *protocol.NodeHealth) { n.EL.Peers = 0 },
 			} {
-				req := reporting(100, 200, imageNeed("a"))
+				req := testRequest(imageNeed("a"))
 				change(&req.Node)
 				assert.True(t, sync(45, req).Changed, name)
-				assert.True(t, sync(50, reporting(100, 200, imageNeed("a"))).Changed, name+" ends")
+				assert.True(t, sync(50, testRequest(imageNeed("a"))).Changed, name+" ends")
 			}
 
-			res = sync(60, reporting(100, 200, imageNeed("a"), imageNeed("b")))
+			res = sync(60, testRequest(imageNeed("a"), imageNeed("b")))
 			assert.True(t, res.Changed, "a new need")
-
-			res = sync(90, reporting(100, 201, imageNeed("a"), imageNeed("b")))
-			assert.True(t, res.Changed, "another range")
-			assert.Equal(t, &identity.ValidatorRange{Start: 100, End: 201}, res.Host.Validators)
 		})
 	}
 }
@@ -250,39 +242,6 @@ func TestRecordSyncAdoptsControllerHold(t *testing.T) {
 	}
 }
 
-func TestRecordSyncWithoutValidators(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	s := newFileStore(t)
-
-	res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("bootnode-1"), Request: testRequest(), At: at(0)})
-	require.NoError(t, err)
-	assert.Nil(t, res.Host.Validators)
-	assert.Zero(t, res.Host.Weight())
-	assert.Equal(t, []string{}, res.Host.Roles, "roles are never nil")
-
-	var start, end any
-
-	require.NoError(t, rawDB(t, s).QueryRow(
-		`SELECT validators_start, validators_end FROM hosts WHERE name = 'bootnode-1'`).Scan(&start, &end))
-	assert.Nil(t, start, "stored as NULL")
-	assert.Nil(t, end, "stored as NULL")
-
-	got, err := s.GetHost(ctx, "bootnode-1")
-	require.NoError(t, err)
-	assert.Nil(t, got.Validators)
-
-	// A range that starts at validator 0 is not confused with "none".
-	res, err = s.RecordSync(ctx, &HostSync{
-		Cert:    testCert("node-0"),
-		Request: reporting(0, 1),
-		At:      at(0),
-	})
-	require.NoError(t, err)
-	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 1}, res.Host.Validators)
-}
-
 func TestRecordSyncEdgeCases(t *testing.T) {
 	ctx := context.Background()
 	s := newFileStore(t)
@@ -316,16 +275,17 @@ func TestRecordSyncEdgeCases(t *testing.T) {
 		assert.Equal(t, res.Host.FirstSeen, res.Host.LastSeen)
 	})
 
-	t.Run("nil request keeps status and needs", func(t *testing.T) {
+	t.Run("nil request keeps status, needs and roles", func(t *testing.T) {
 		_, err := s.RecordSync(ctx, &HostSync{
-			Cert: testCert("node-keep"), Request: testRequest(imageNeed("a")), At: at(0),
+			Cert: testCert("node-keep"), Request: withRoles(testRequest(imageNeed("a")), "rpc"), At: at(0),
 		})
 		require.NoError(t, err)
 
 		res, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-keep"), At: at(30)})
 		require.NoError(t, err)
 		assert.Equal(t, at(30), res.Host.LastSeen)
-		assert.Equal(t, testRequest(imageNeed("a")), res.Host.Status)
+		assert.Equal(t, withRoles(testRequest(imageNeed("a")), "rpc"), res.Host.Status)
+		assert.Equal(t, []string{"rpc"}, res.Host.Roles)
 
 		// A host first seen without a request has no status.
 		res, err = s.RecordSync(ctx, &HostSync{Cert: testCert("node-bare"), At: at(0)})
@@ -555,213 +515,6 @@ func TestDeleteHost(t *testing.T) {
 	}
 }
 
-// The range counted for a host follows what the host reports: a range, none,
-// or "I do not know", which keeps what was counted.
-func TestRecordSyncCountsTheReportedValidators(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	s := newFileStore(t)
-
-	sync := func(t *testing.T, host string, req *protocol.SyncRequest, sec int) *SyncResult {
-		t.Helper()
-
-		res, err := s.RecordSync(ctx, &HostSync{Cert: testCert(host), Request: req, At: at(sec)})
-		require.NoError(t, err)
-
-		return res
-	}
-
-	unknown := func(state string) *protocol.SyncRequest {
-		req := testRequest()
-		req.Validators = &protocol.Validators{Source: protocol.ValidatorsFromMarker, State: state}
-
-		return req
-	}
-
-	res := sync(t, "node-1", reporting(0, 64), 0)
-	assert.Nil(t, res.ValidatorsBefore)
-	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 64}, res.Host.Validators)
-
-	// The range changes between two syncs.
-	res = sync(t, "node-1", reporting(32, 128), 30)
-	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 64}, res.ValidatorsBefore)
-	assert.Equal(t, &identity.ValidatorRange{Start: 32, End: 128}, res.Host.Validators)
-
-	// The marker is gone (keys are being reshuffled) or unreadable: the host
-	// keeps its weight. So does an update without a request.
-	for i, req := range []*protocol.SyncRequest{
-		unknown(protocol.ValidatorsMissing), unknown(protocol.ValidatorsInvalid), nil,
-	} {
-		res = sync(t, "node-1", req, 60+i)
-		assert.Equal(t, &identity.ValidatorRange{Start: 32, End: 128}, res.Host.Validators)
-		assert.Equal(t, uint64(96), res.Host.Weight())
-	}
-
-	// A range the store would not count is not counted either: the bounds
-	// are checked here too, whatever the caller checked.
-	bad := reporting(10, 5)
-	res = sync(t, "node-1", bad, 70)
-	assert.Equal(t, uint64(96), res.Host.Weight())
-
-	// "0-0", and no range at all, are statements: no validators.
-	res = sync(t, "node-1", reporting(0, 0), 90)
-	assert.Nil(t, res.Host.Validators)
-	assert.Equal(t, &identity.ValidatorRange{Start: 32, End: 128}, res.ValidatorsBefore)
-
-	sync(t, "node-1", reporting(32, 128), 100)
-	res = sync(t, "node-1", testRequest(), 120)
-	assert.Nil(t, res.Host.Validators)
-
-	// A host that never had a range and does not know one has none.
-	res = sync(t, "node-new", unknown(protocol.ValidatorsMissing), 120)
-	assert.True(t, res.Created)
-	assert.Nil(t, res.Host.Validators)
-}
-
-// No validator is counted for two hosts, whatever they report.
-func TestRecordSyncCountsOverlappingValidatorsOnce(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	s := newFileStore(t)
-	impl, ok := s.(*sqliteStore)
-	require.True(t, ok)
-
-	impl.opened = base
-
-	sync := func(t *testing.T, host string, start, end uint64, sec int) *SyncResult {
-		t.Helper()
-
-		res, err := s.RecordSync(ctx, &HostSync{
-			Cert: testCert(host), Request: reporting(start, end), At: at(sec),
-		})
-		require.NoError(t, err)
-
-		return res
-	}
-
-	// counted checks that the ranges of all hosts are disjoint and returns
-	// their sum, which is then the number of distinct validators.
-	counted := func(t *testing.T) uint64 {
-		t.Helper()
-
-		hosts, err := s.ListHosts(ctx)
-		require.NoError(t, err)
-
-		var total uint64
-
-		for i, a := range hosts {
-			total += a.Weight()
-
-			for _, b := range hosts[i+1:] {
-				if a.Validators != nil && b.Validators != nil {
-					assert.False(t, a.Validators.Start < b.Validators.End &&
-						b.Validators.Start < a.Validators.End,
-						"%s %v and %s %v overlap", a.Name, a.Validators, b.Name, b.Validators)
-				}
-			}
-		}
-
-		return total
-	}
-
-	sync(t, "node-a", 0, 64, 0)
-
-	// node-b reports half of node-a's validators too.
-	res := sync(t, "node-b", 32, 96, 1)
-	assert.Equal(t, []string{"node-a"}, res.ValidatorOverlaps)
-	assert.Equal(t, &identity.ValidatorRange{Start: 64, End: 96}, res.Host.Validators)
-	assert.Equal(t, uint64(96), counted(t), "96 validators exist, not 128")
-
-	// node-a holds its validators; its own report runs into nothing that is
-	// counted for another host.
-	res = sync(t, "node-a", 0, 64, 2)
-	assert.Empty(t, res.ValidatorOverlaps)
-	assert.Equal(t, uint64(64), res.Host.Weight())
-
-	// A range inside another host's counts for nothing; one around it
-	// counts its larger free part.
-	res = sync(t, "node-c", 10, 20, 3)
-	assert.Nil(t, res.Host.Validators)
-	assert.Equal(t, []string{"node-a"}, res.ValidatorOverlaps)
-
-	res = sync(t, "node-c", 90, 1000, 4)
-	assert.Equal(t, &identity.ValidatorRange{Start: 96, End: 1000}, res.Host.Validators)
-	assert.Equal(t, []string{"node-b"}, res.ValidatorOverlaps)
-
-	res = sync(t, "node-c", 0, 200, 5)
-	assert.Equal(t, &identity.ValidatorRange{Start: 96, End: 200}, res.Host.Validators)
-	assert.Equal(t, []string{"node-a", "node-b"}, res.ValidatorOverlaps)
-	assert.Equal(t, uint64(200), counted(t))
-
-	// The reshuffle ends: node-a reports its new, smaller range, and node-b
-	// counts all of its own at its next sync.
-	sync(t, "node-a", 0, 32, 6)
-	res = sync(t, "node-b", 32, 96, 7)
-	assert.Empty(t, res.ValidatorOverlaps)
-	assert.Equal(t, &identity.ValidatorRange{Start: 32, End: 96}, res.Host.Validators)
-	assert.Equal(t, uint64(200), counted(t))
-
-	// A host that has been silent for longer than ValidatorClaimTTL gives up
-	// the validators another host reports: a host that is gone for good does
-	// not keep those of its successor uncounted.
-	late := 7 + int(ValidatorClaimTTL/time.Second) + 1
-
-	res = sync(t, "node-d", 0, 32, late)
-	assert.Equal(t, []string{"node-a"}, res.ValidatorOverlaps)
-	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 32}, res.Host.Validators)
-
-	gone, err := s.GetHost(ctx, "node-a")
-	require.NoError(t, err)
-	assert.Nil(t, gone.Validators)
-	counted(t)
-
-	// Should it come back, it gets what is left, which is nothing.
-	res = sync(t, "node-a", 0, 32, late+1)
-	assert.Nil(t, res.Host.Validators)
-	assert.Equal(t, []string{"node-d"}, res.ValidatorOverlaps)
-}
-
-// A host's silence counts from the store's start at the earliest: after an
-// outage longer than ValidatorClaimTTL, nobody's validators are up for grabs
-// until the hosts had ValidatorClaimTTL to sync again.
-func TestRecordSyncClaimSurvivesAnOutage(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	s := newFileStore(t)
-	impl, ok := s.(*sqliteStore)
-	require.True(t, ok)
-
-	ttl := int(ValidatorClaimTTL / time.Second)
-
-	sync := func(host string, start, end uint64, sec int) *SyncResult {
-		t.Helper()
-
-		res, err := s.RecordSync(ctx, &HostSync{
-			Cert: testCert(host), Request: reporting(start, end), At: at(sec),
-		})
-		require.NoError(t, err)
-
-		return res
-	}
-
-	impl.opened = base
-	sync("node-a", 0, 64, 0)
-
-	// The controller was down for twice the TTL and is back.
-	impl.opened = at(2 * ttl)
-
-	res := sync("node-b", 0, 32, 2*ttl+1)
-	assert.Equal(t, []string{"node-a"}, res.ValidatorOverlaps)
-	assert.Nil(t, res.Host.Validators, "node-a keeps its validators")
-
-	res = sync("node-b", 0, 32, 3*ttl+1)
-	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 32}, res.Host.Validators,
-		"node-a stayed silent for the TTL after the start")
-}
-
 // setHold sets the controller-side hold switch of one host, as staff does.
 func setHold(ctx context.Context, s Store, name string, wanted bool, reason string) error {
 	return s.Commit(ctx, &Changes{Holds: []HostHold{{Host: name, Wanted: wanted, Reason: reason}}})
@@ -912,7 +665,7 @@ func TestHoldBy(t *testing.T) {
 // TestContainerOwnersAreStored: the owners an agent reports come back with
 // the host, also after the store was read again from its row, and are gone
 // when a later sync reports none.
-func TestContainerOwnersAreStored(t *testing.T) {
+func TestContainerTeamsAreStored(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -924,29 +677,29 @@ func TestContainerOwnersAreStored(t *testing.T) {
 			s := backend.open(t)
 
 			req := testRequest()
-			req.Containers[0].Owners = []string{"geth", "panda"}
+			req.Containers[0].Kind, req.Containers[0].Team = protocol.KindEL, "geth"
 
 			res, err := s.RecordSync(ctx, &HostSync{
 				Cert: testCert("node-1"), Request: req, At: at(0),
 			})
 			require.NoError(t, err)
-			assert.Equal(t, []string{"geth", "panda"}, res.Host.Status.Containers[0].Owners)
+			assert.Equal(t, "geth", res.Host.Status.Containers[0].Team)
 
 			host, err := s.GetHost(ctx, "node-1")
 			require.NoError(t, err)
-			assert.Equal(t, []string{"geth", "panda"}, host.Status.Containers[0].Owners)
+			assert.Equal(t, "geth", host.Status.Containers[0].Team)
 
 			hosts, err := s.ListHosts(ctx)
 			require.NoError(t, err)
 			require.Len(t, hosts, 1)
-			assert.Equal(t, []string{"geth", "panda"}, hosts[0].Status.Containers[0].Owners)
+			assert.Equal(t, "geth", hosts[0].Status.Containers[0].Team)
 
-			// The next sync reports none: the owners are gone.
+			// The next sync reports none: the team is gone.
 			res, err = s.RecordSync(ctx, &HostSync{
 				Cert: testCert("node-1"), Request: testRequest(), At: at(30),
 			})
 			require.NoError(t, err)
-			assert.Nil(t, res.Host.Status.Containers[0].Owners)
+			assert.Empty(t, res.Host.Status.Containers[0].Team)
 		})
 	}
 }

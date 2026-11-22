@@ -381,7 +381,7 @@ func newFakeStore(hosts ...*fleet.Host) *fakeStore {
 func host(name string, start, end uint64) *fleet.Host {
 	h := &fleet.Host{Name: name}
 	if end > start {
-		h.Validators = &identity.ValidatorRange{Start: start, End: end}
+		h.Validators = []identity.ValidatorRange{{Start: start, End: end}}
 	}
 
 	return h

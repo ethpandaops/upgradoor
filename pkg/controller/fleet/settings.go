@@ -93,16 +93,11 @@ type Settings struct {
 	PolicyImage    Policy `json:"policyImage"`
 	PolicyPackages Policy `json:"policyPackages"`
 	PolicyReboot   Policy `json:"policyReboot"`
-	// PolicyClients is the image policy per client ("geth": "manual"). The
-	// image rollouts of a client that is listed answer to its entry; those
-	// of every other client, and of containers without a client, to
-	// PolicyImage.
+	// PolicyClients is the image policy per client, which is the team of
+	// the containers ("geth": "manual"). The image rollouts of a team that is
+	// listed answer to its entry; those of every other team, and of
+	// containers without a team, to PolicyImage.
 	PolicyClients ClientPolicies `json:"policyClients"`
-	// PolicyDefaultGroup is the policy of the rollouts of the default group
-	// (protocol.DefaultGroup): the new digests of the tags of containers that
-	// neither a label nor a name map puts in a group, on the hosts that roll
-	// them (defaultGroup.roll in agent.yaml).
-	PolicyDefaultGroup Policy `json:"policyDefaultGroup"`
 
 	// PauseAfterCanaryImage, PauseAfterCanaryPackages and
 	// PauseAfterCanaryReboot pause a rollout that serves needs of that kind
@@ -142,7 +137,6 @@ func DefaultSettings() Settings {
 		PolicyImage:             PolicyAuto,
 		PolicyPackages:          PolicyAuto,
 		PolicyReboot:            PolicyManual,
-		PolicyDefaultGroup:      PolicyAuto,
 		LookupInterval:          Duration(5 * time.Minute),
 	}
 }
@@ -285,7 +279,7 @@ func (s *Settings) Validate() error {
 		return errors.New("lookupInterval must be between 30s and 24h")
 	}
 
-	for _, p := range []Policy{s.PolicyImage, s.PolicyPackages, s.PolicyReboot, s.PolicyDefaultGroup} {
+	for _, p := range []Policy{s.PolicyImage, s.PolicyPackages, s.PolicyReboot} {
 		if p != PolicyAuto && p != PolicyManual {
 			return fmt.Errorf("invalid policy %q", p)
 		}

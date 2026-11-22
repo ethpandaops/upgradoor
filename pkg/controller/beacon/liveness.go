@@ -10,12 +10,12 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 )
 
-// maxHostValidators bounds one host's validator range. A larger range is a
-// broken certificate, not a host.
+// maxHostValidators bounds the validators of one host. More are a broken
+// inventory, not a host.
 const maxHostValidators = 1 << 20
 
-// trackedHost is a host with validators: the half-open index range from its
-// certificate.
+// trackedHost is one validator range of a host: half-open indices. A host
+// with several ranges is tracked once per range.
 type trackedHost struct {
 	name  string
 	start uint64
@@ -94,7 +94,15 @@ func (t *slotTracker) settledLiveness(
 		// Every tracked host has a row: one whose validators had no duty
 		// (not active yet, or exited) has nothing live.
 		rows := make([]fleet.Liveness, 0, len(t.hosts))
+		seen := make(map[string]struct{}, len(t.hosts))
+
 		for _, host := range t.hosts {
+			if _, dup := seen[host.name]; dup {
+				continue
+			}
+
+			seen[host.name] = struct{}{}
+
 			row := fleet.Liveness{Host: host.name, Epoch: epoch}
 			if counted := counts[host.name]; counted != nil {
 				row = *counted
@@ -170,30 +178,31 @@ func (s *service) Liveness(epochs int) []fleet.Liveness {
 	return out
 }
 
-// trackedHosts returns the hosts with validators ordered by range start and
-// warns once about ranges that overlap or are implausibly large.
+// trackedHosts returns the validator ranges of the hosts ordered by start
+// and warns once about ranges of two hosts that overlap and about hosts with
+// implausibly many validators.
 func (s *service) trackedHosts(hosts []*fleet.Host) []trackedHost {
 	tracked := make([]trackedHost, 0, len(hosts))
 
 	for _, host := range hosts {
-		if host == nil || host.Validators.Count() == 0 {
+		if host == nil || host.Weight() == 0 {
 			continue
 		}
 
-		if host.Validators.Count() > maxHostValidators {
+		if host.Weight() > maxHostValidators {
 			s.warnOnce("range:"+host.Name, logrus.Fields{
 				"host":       host.Name,
-				"validators": host.Validators.Count(),
-			}, "Host validator range is implausibly large; its liveness is not tracked")
+				"validators": host.Weight(),
+			}, "Host has implausibly many validators; its liveness is not tracked")
 
 			continue
 		}
 
-		tracked = append(tracked, trackedHost{
-			name:  host.Name,
-			start: host.Validators.Start,
-			end:   host.Validators.End,
-		})
+		for _, r := range host.Validators {
+			if r.Count() > 0 {
+				tracked = append(tracked, trackedHost{name: host.Name, start: r.Start, end: r.End})
+			}
+		}
 	}
 
 	sort.Slice(tracked, func(i, j int) bool {
@@ -206,7 +215,7 @@ func (s *service) trackedHosts(hosts []*fleet.Host) []trackedHost {
 
 	// The host reaching furthest so far is the one a later range overlaps.
 	for i, furthest := 1, 0; i < len(tracked); i++ {
-		if tracked[i].start < tracked[furthest].end {
+		if tracked[i].start < tracked[furthest].end && tracked[i].name != tracked[furthest].name {
 			s.warnOnce("overlap:"+tracked[furthest].name+"|"+tracked[i].name, logrus.Fields{
 				"host":       tracked[furthest].name,
 				"other_host": tracked[i].name,

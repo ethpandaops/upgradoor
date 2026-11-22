@@ -94,7 +94,7 @@ func (h *harness) addHost(name string, weight uint64, needs ...protocol.Need) *f
 	}
 
 	if weight > 0 {
-		host.Validators = &identity.ValidatorRange{Start: h.nextV, End: h.nextV + weight}
+		host.Validators = []identity.ValidatorRange{{Start: h.nextV, End: h.nextV + weight}}
 		h.nextV += weight
 	}
 
@@ -1067,16 +1067,26 @@ func storedFleet(b *testing.B, n int) (svc *service, st store.Store, sync func(i
 
 	b.Cleanup(func() { _ = st.Stop() })
 
+	ranges := &fleet.ValidatorRanges{Ranges: make([]fleet.HostRange, 0, n)}
+	for i := range n {
+		ranges.Ranges = append(ranges.Ranges, fleet.HostRange{
+			Host:           fmt.Sprintf("host-%05d", i),
+			ValidatorRange: identity.ValidatorRange{Start: uint64(i) * 32, End: uint64(i+1) * 32},
+		})
+	}
+
+	if err := st.SetValidatorRanges(ctx, ranges); err != nil {
+		b.Fatal(err)
+	}
+
 	sync = func(i int) *store.HostSync {
 		name := fmt.Sprintf("host-%05d", i)
-		start := uint64(i) * 32
 
 		return &store.HostSync{
 			Cert: &identity.Certificate{Claims: identity.Claims{Subject: name}, Hash: "hash-" + name},
 			At:   now,
 			Request: &protocol.SyncRequest{
 				Verbs: allVerbs, Needs: []protocol.Need{packagesNeed("2.0")},
-				Validators: &protocol.Validators{Start: start, End: start + 32, State: protocol.ValidatorsKnown},
 				Node: protocol.NodeHealth{
 					EL: &protocol.ELHealth{Reachable: true, Peers: 20},
 					CL: &protocol.CLHealth{Reachable: true, Peers: 20},

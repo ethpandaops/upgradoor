@@ -9,32 +9,36 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// tgt is targetOf for a container of a group that allows every override.
+// tgt is targetOf for a container with a team, which may be overridden.
 func tgt(d *Deployed, c *protocol.Container, entry *Entry) Target {
-	return targetOf(d, c, entry, &Group{Overrides: []string{protocol.OverrideImage, protocol.OverrideFlags}}, "execution")
+	owned := *c
+	owned.Kind, owned.Team = protocol.KindEL, "geth"
+
+	return targetOf(d, &owned, entry)
 }
 
-// A tooling container runs what was deployed; its entry is reported as refused.
-func TestTargetOfTooling(t *testing.T) {
+// A container without a team runs what was deployed; its entry is reported
+// as refused.
+func TestTargetOfWithoutTeam(t *testing.T) {
 	d := &Deployed{Image: "ethpandaops/tool:v2", Command: []string{"--a"}, HasCommand: true}
 	entry := &Entry{Image: "me/tool:debug", By: "sam"}
 
-	c := &protocol.Container{Name: "tool", Image: "ethpandaops/tool:v2", Command: []string{"--a"}}
-	got := targetOf(d, c, entry, &Group{}, "proxy")
+	c := &protocol.Container{Name: "tool", Image: "ethpandaops/tool:v2", Command: []string{"--a"}, Kind: "tool"}
+	got := targetOf(d, c, entry)
 	assert.True(t, got.InSync)
-	assert.Contains(t, got.Refused, "allows no overrides")
+	assert.Contains(t, got.Refused, "no "+protocol.LabelTeam+" label")
 	assert.Empty(t, got.Err)
 
 	report := got.report(c, entry)
 	assert.False(t, report.Applied)
-	assert.Contains(t, report.Error, "allows no overrides")
+	assert.Contains(t, report.Error, "no "+protocol.LabelTeam+" label")
 
 	// A container that still runs an override goes back to what was deployed.
 	onOverride := &protocol.Container{
-		Name: "tool", Image: "me/tool:debug", Command: []string{"--a"},
+		Name: "tool", Image: "me/tool:debug", Command: []string{"--a"}, Kind: "tool",
 		Base: &protocol.OverrideBase{Image: "ethpandaops/tool:v2"},
 	}
-	got = targetOf(d, onOverride, entry, &Group{}, "proxy")
+	got = targetOf(d, onOverride, entry)
 	assert.True(t, got.Restore)
 	assert.Equal(t, "ethpandaops/tool:v2", got.Image)
 	assert.Nil(t, got.Base, "the override labels are removed")
@@ -60,8 +64,8 @@ func TestTargetOf(t *testing.T) {
 	assert.True(t, got.InSync)
 	assert.Nil(t, got.report(running(m.Image, base, nil), nil))
 
-	// An image and flags, not applied yet.
-	entry := &Entry{Image: "ethpandaops/geth:fix", Add: []string{"--pprof"}, Remove: []string{"--maxpeers"}, By: "sam"}
+	// An image and a command, not applied yet.
+	entry := &Entry{Image: "ethpandaops/geth:fix", Command: []string{"--http", "--pprof"}, HasCommand: true, By: "sam"}
 	got = tgt(m, running(m.Image, base, nil), entry)
 	assert.False(t, got.InSync)
 	assert.True(t, got.Flags)
@@ -69,7 +73,11 @@ func TestTargetOf(t *testing.T) {
 	assert.Equal(t, []string{"--http", "--pprof"}, got.Command)
 	assert.Equal(t, &protocol.OverrideBase{Image: m.Image, Command: base, HasCommand: true}, got.Base,
 		"the labels record what the container was")
-	assert.False(t, got.report(running(m.Image, base, nil), entry).Applied)
+
+	report := got.report(running(m.Image, base, nil), entry)
+	assert.False(t, report.Applied)
+	assert.Equal(t, []string{"--pprof"}, report.AddFlags, "reported against the default command")
+	assert.Equal(t, []string{"--maxpeers=50"}, report.RemoveFlags)
 
 	// Applied: the labels say what the container was.
 	ob := &protocol.OverrideBase{Image: m.Image, Command: base, HasCommand: true}
@@ -98,14 +106,14 @@ func TestTargetOf(t *testing.T) {
 	assert.False(t, got.Restore)
 	assert.Equal(t, m.Image, got.Image)
 
-	got = tgt(m, running("me/geth:mine", base, nil), &Entry{Add: []string{"--x"}})
+	got = tgt(m, running("me/geth:mine", base, nil), &Entry{Command: []string{"--x"}, HasCommand: true})
 	assert.True(t, got.Spec)
 	assert.Empty(t, got.Err)
-	assert.Equal(t, []string{"--http", "--maxpeers=50", "--x"}, got.Command)
+	assert.Equal(t, []string{"--x"}, got.Command, "the command replaces the whole line")
 
 	// Ansible created the container with the override applied, no labels.
 	got = tgt(m, running("ethpandaops/geth:fix", []string{"--http", "--pprof"}, nil), entry)
-	assert.True(t, got.InSync, "applying the flags to what has them changes nothing")
+	assert.True(t, got.InSync, "a container that runs the override's command is in sync")
 	assert.False(t, got.Spec)
 
 	// An entry that cannot be applied changes nothing.
@@ -143,26 +151,30 @@ func TestTargetOfSpec(t *testing.T) {
 	assert.Equal(t, []string{"--http", "--syncmode=full"}, got.Command)
 	assert.Nil(t, got.Base, "it runs what was deployed: no override labels")
 
-	// An override stays while the base moves underneath it.
-	entry := &Entry{Image: "ethpandaops/geth:fix", Add: []string{"--pprof"}}
-	onOverride := running("ethpandaops/geth:fix", "--http", "--pprof")
+	// An override's command stays as written while the base moves underneath it.
+	entry := &Entry{Image: "ethpandaops/geth:fix", Command: []string{"--http", "--pprof"}, HasCommand: true}
+	onOverride := running("ethpandaops/geth:v1", "--http")
 	onOverride.Base = &protocol.OverrideBase{Image: "ethpandaops/geth:v1", Command: []string{"--http"}, HasCommand: true}
 
 	got = tgt(m, onOverride, entry)
 	assert.True(t, got.Spec)
 	assert.Equal(t, "ethpandaops/geth:fix", got.Image)
-	assert.Equal(t, []string{"--http", "--syncmode=full", "--pprof"}, got.Command)
+	assert.Equal(t, []string{"--http", "--pprof"}, got.Command)
 	assert.Equal(t, &protocol.OverrideBase{
 		Image: "ethpandaops/geth:v2", Command: []string{"--http", "--syncmode=full"}, HasCommand: true,
 	}, got.Base, "the labels record the new deployed form")
 
 	// After that recreate the container is in sync.
-	recreated := running("ethpandaops/geth:fix", "--http", "--syncmode=full", "--pprof")
+	recreated := running("ethpandaops/geth:fix", "--http", "--pprof")
 	recreated.Base = got.Base
 	got = tgt(m, recreated, entry)
 	assert.True(t, got.InSync)
 	assert.False(t, got.Spec)
 	assert.False(t, got.Restore)
+
+	// Only an image: the deployed command.
+	got = tgt(m, running("ethpandaops/geth:v2", "--http", "--syncmode=full"), &Entry{Image: "ethpandaops/geth:fix"})
+	assert.Equal(t, []string{"--http", "--syncmode=full"}, got.Command)
 
 	// Without a command line in agent.yaml the container's own is the base.
 	plain := &Deployed{Image: "ethpandaops/geth:v2"}

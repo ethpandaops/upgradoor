@@ -48,7 +48,7 @@ func loadHost(t *testing.T) *Host {
 	sc, err := LoadScenario(path)
 	require.NoError(t, err)
 
-	h, err := NewHost(sc, nil)
+	h, err := NewHost(sc)
 	require.NoError(t, err)
 
 	return h
@@ -123,7 +123,7 @@ func TestRuntime(t *testing.T) {
 	require.Error(t, h.Start(ctx, "nimbus"))
 	assert.Nil(t, h.Container("nimbus"))
 
-	// A recreate onto an override writes image, command, override and group labels.
+	// A recreate onto an override writes image, command and override labels.
 	_, _, err = h.Pull(ctx, "ethpandaops/geth:fix")
 	require.NoError(t, err)
 	require.NoError(t, h.Recreate(ctx, "geth", "sha256:fff", time.Second, true, &host.Change{
@@ -132,7 +132,6 @@ func TestRuntime(t *testing.T) {
 			Image: "ethpandaops/geth:master", Command: []string{"--http"}, HasCommand: true,
 		},
 		SetBase: true,
-		Group:   "execution", Kind: protocol.KindEL,
 	}))
 
 	geth := h.Container("geth")
@@ -141,8 +140,6 @@ func TestRuntime(t *testing.T) {
 	assert.Equal(t, &protocol.OverrideBase{
 		Image: "ethpandaops/geth:master", Command: []string{"--http"}, HasCommand: true,
 	}, geth.Base)
-	assert.Equal(t, "execution", geth.Group)
-	assert.Equal(t, protocol.KindEL, geth.Kind)
 	assert.Equal(t, protocol.StateRunning, geth.State)
 
 	// The restore removes the labels.
@@ -291,12 +288,6 @@ func TestRecreate(t *testing.T) {
 			wantKind: "el",
 		},
 		{
-			name:     "relabel only",
-			change:   &host.Change{Group: "renamed", Kind: "weird"},
-			wantCall: "recreate geth sha256:geth-1 start=true image=" + GethImage,
-			wantKind: "weird",
-		},
-		{
 			name:     "SetBase false keeps the base",
 			before:   &host.Change{Base: overridden, SetBase: true},
 			change:   &host.Change{Command: []string{"--b"}, SetCommand: true},
@@ -318,7 +309,7 @@ func TestRecreate(t *testing.T) {
 			sc := BaseScenario()
 			sc.Containers[1].Command = []string{"--http"}
 
-			h, err := NewHost(sc, nil)
+			h, err := NewHost(sc)
 			require.NoError(t, err)
 
 			require.NoError(t, h.Stop(ctx, "geth", time.Second))

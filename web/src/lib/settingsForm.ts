@@ -176,12 +176,6 @@ export const FIELDS: readonly FieldSpec[] = [
   { key: 'policyImage', label: 'Policy: images', kind: 'policy', hint: POLICY_HINT },
   { key: 'policyPackages', label: 'Policy: packages', kind: 'policy', hint: POLICY_HINT },
   { key: 'policyReboot', label: 'Policy: reboots', kind: 'policy', hint: POLICY_HINT },
-  {
-    key: 'policyDefaultGroup',
-    label: 'Policy: default group',
-    kind: 'policy',
-    hint: `What the scheduler does with a new rollout of the default group: a new digest of a container that neither a label nor the name map of agent.yaml puts in a group, on the hosts that roll it. ${POLICIES.map(p => `${p}: ${POLICY_MEANING[p]}`).join('; ')}.`,
-  },
   { key: 'pauseAfterCanaryImage', label: 'Pause after canary: images', kind: 'switch', hint: CANARY_HINT },
   { key: 'pauseAfterCanaryPackages', label: 'Pause after canary: packages', kind: 'switch', hint: CANARY_HINT },
   { key: 'pauseAfterCanaryReboot', label: 'Pause after canary: reboots', kind: 'switch', hint: CANARY_HINT },
@@ -253,7 +247,7 @@ export const GROUPS: readonly GroupSpec[] = [
     about:
       'The switch for everything, how many hosts may update independent containers at once, and what happens to a new rollout of each kind.',
     wide: true,
-    keys: ['paused', 'maxIndependentPercent', 'policyDefaultGroup'],
+    keys: ['paused', 'maxIndependentPercent'],
     kinds: ROLLOUT_KINDS,
   },
   {
@@ -394,7 +388,6 @@ export function fromForm(form: SettingsForm): FormSettings {
     policyImage: form.policyImage as Policy,
     policyPackages: form.policyPackages as Policy,
     policyReboot: form.policyReboot as Policy,
-    policyDefaultGroup: form.policyDefaultGroup as Policy,
     pauseAfterCanaryImage: form.pauseAfterCanaryImage === 'true',
     pauseAfterCanaryPackages: form.pauseAfterCanaryPackages === 'true',
     pauseAfterCanaryReboot: form.pauseAfterCanaryReboot === 'true',

@@ -1,10 +1,10 @@
 // Command relabel gives containers that something other than Ansible
 // created (the Kurtosis devnet of the end-to-end run) the labels Ansible
-// sets: the roll group and the kind. It recreates each container with its
-// own configuration and image plus the two labels, as Ansible's recreate
-// would, so the agent finds it.
+// sets: the kind and the team. It recreates each container with its own
+// configuration and image plus the labels, as Ansible's recreate would, so
+// the agent finds it.
 //
-//	relabel <container>=<group>/<kind> ...
+//	relabel <container>=<kind>[/<team>] ...
 package main
 
 import (
@@ -30,7 +30,7 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: relabel <container>=<group>/<kind> [<container>=<group>/<kind>]")
+		return errors.New("usage: relabel <container>=<kind>[/<team>] [<container>=<kind>[/<team>]]")
 	}
 
 	log := logrus.New()
@@ -57,10 +57,15 @@ func run(args []string) error {
 
 	for _, arg := range args {
 		name, spec, ok := strings.Cut(arg, "=")
-		group, kind, ok2 := strings.Cut(spec, "/")
+		kind, team, _ := strings.Cut(spec, "/")
 
-		if !ok || !ok2 {
-			return fmt.Errorf("%q is not <container>=<group>/<kind>", arg)
+		if !ok || kind == "" {
+			return fmt.Errorf("%q is not <container>=<kind>[/<team>]", arg)
+		}
+
+		labels := map[string]string{protocol.LabelKind: kind}
+		if team != "" {
+			labels[protocol.LabelTeam] = team
 		}
 
 		var digest string
@@ -75,7 +80,7 @@ func run(args []string) error {
 			return fmt.Errorf("container %s: not found or its image has no registry digest", name)
 		}
 
-		change := &host.Change{Group: group, Kind: protocol.ContainerKind(kind)}
+		change := &host.Change{Labels: labels}
 
 		if err := machine.Recreate(ctx, name, digest, 30*time.Second, true, change); err != nil {
 			return fmt.Errorf("container %s: %w", name, err)

@@ -33,7 +33,7 @@ func imageNeedFor(container, image, to string) protocol.Need {
 func TestLeaseCannotWidenWhatTheAgentDoes(t *testing.T) {
 	p := needsPolicy(protocol.VerbRoll, protocol.VerbPackages)
 	facts := hostFacts()
-	facts.Containers[2].Group = protocol.GroupNone // dora is not managed
+	facts.Containers[2].Kind = protocol.KindNone // dora is not managed
 
 	needs := []protocol.Need{
 		// reboot is not an allowed verb on this host
@@ -88,18 +88,18 @@ func TestLeaseCannotWidenWhatTheAgentDoes(t *testing.T) {
 	}
 }
 
-// validateFacts adds a validator client, a stopped container and a rolled
-// default group to hostFacts.
+// validateFacts adds a validator client and a stopped container of a kind
+// without a team to hostFacts.
 func validateFacts() *Facts {
 	facts := hostFacts()
 	facts.Containers = append(facts.Containers,
 		protocol.Container{
 			Name: "lh-vc", Image: "sigp/lighthouse:latest", Digest: "sha256:v", State: protocol.StateRunning,
-			Group: "consensus", Kind: protocol.KindVC,
+			Kind: protocol.KindVC, Team: "lighthouse",
 		},
 		protocol.Container{
 			Name: "exporter", Image: "exporter:1", Digest: "sha256:x", State: protocol.StateExited,
-			Group: "execution", Kind: protocol.KindOther,
+			Kind: "exporter",
 		},
 	)
 
@@ -108,8 +108,7 @@ func validateFacts() *Facts {
 
 func validatePolicy() *Policy {
 	p := needsPolicy(allVerbs...)
-	p.Groups["execution"] = Group{Client: "geth", Overrides: []string{protocol.OverrideImage, protocol.OverrideFlags}}
-	p.DefaultGroup.Roll = true
+	p.DefaultPolicy = DefaultRoll
 
 	return p
 }
@@ -206,7 +205,7 @@ func TestValidate(t *testing.T) {
 			wasRunning: []string{"geth", "lh-vc", "teku"},
 		},
 		{
-			name: "recreates in start order, default group running only when rolled",
+			name: "recreates in start order, unlabelled running only when rolled",
 			needs: []protocol.Need{
 				imageNeedFor("dora", "ethpandaops/dora:latest", "sha256:e"),
 				imageNeedFor("lh-vc", "sigp/lighthouse:latest", "sha256:v2"),
@@ -339,7 +338,7 @@ func TestValidate(t *testing.T) {
 		},
 		{
 			name: "the container is not managed", files: overrideFiles("ethpandaops/geth:fix"), needs: []protocol.Need{override},
-			mutate:   func(f *Facts, _ *Overrides) { f.Containers[0].Group = protocol.GroupNone },
+			mutate:   func(f *Facts, _ *Overrides) { f.Containers[0].Kind = protocol.KindNone },
 			verdicts: map[string]verdict{override.ID: {protocol.StepRefused, "container geth is not managed"}},
 		},
 		{
@@ -432,17 +431,18 @@ func TestValidateDeclinesAndWaits(t *testing.T) {
 	require.Error(t, err, "never planned on the last good list")
 }
 
-// No need of a container excluded by defaultGroup.exclude is served.
+// No need of a container labelled none is served.
 func TestValidateExcluded(t *testing.T) {
 	p := validatePolicy()
-	p.DefaultGroup.Exclude = []string{"dora"}
+	facts := validateFacts()
+	facts.Containers[2].Kind = protocol.KindNone
 	image := imageNeedFor("dora", "ethpandaops/dora:latest", "sha256:e")
 	target := protocol.Need{
 		ID: "override/dora/x", Kind: protocol.NeedOverride, Local: true,
 		Override: &protocol.OverrideNeed{Container: "dora", Image: "ethpandaops/dora:fix", ToDigest: "sha256:f"},
 	}
 
-	got, err := Validate(p, leaseOf(image, target), leaseView(p, validateFacts(), known()), nil)
+	got, err := Validate(p, leaseOf(image, target), leaseView(p, facts, known()), nil)
 	require.NoError(t, err)
 	assert.True(t, got.Empty())
 	assert.Equal(t, map[string]protocol.Step{
@@ -451,21 +451,25 @@ func TestValidateExcluded(t *testing.T) {
 	}, got.Verdicts)
 }
 
-// A name-mapped container uses its mapped kind and group stopTimeout.
-func TestNameMappedContainers(t *testing.T) {
+// The kinds order the recreates, the start and the drain; a container stops
+// within its own stop timeout.
+func TestKindOrder(t *testing.T) {
 	p := needsPolicy(protocol.VerbRoll)
-	p.Groups["execution"] = Group{StopTimeout: 45 * time.Second}
-	p.Containers = map[string]MappedContainer{"execution": {Group: "execution", Kind: protocol.KindEL}}
 
 	facts := &Facts{Fresh: true, Containers: []protocol.Container{
-		{Name: "vc", Image: "sigp/lighthouse:latest", Group: "consensus", Kind: protocol.KindVC, State: protocol.StateRunning},
-		{Name: "beacon", Image: "sigp/lighthouse:latest", Group: "consensus", Kind: protocol.KindCL, State: protocol.StateRunning},
-		{Name: "execution", Image: "ethpandaops/geth:master", State: protocol.StateRunning, StopTimeout: 10 * time.Second},
+		{Name: "vc", Image: "sigp/lighthouse:latest", Kind: protocol.KindVC, State: protocol.StateRunning},
+		{Name: "snooper", Image: "snooper:latest", Kind: "snooper-el", State: protocol.StateRunning},
+		{Name: "beacon", Image: "sigp/lighthouse:latest", Kind: protocol.KindCL, State: protocol.StateRunning},
+		{
+			Name: "execution", Image: "ethpandaops/geth:master", Kind: protocol.KindEL,
+			State: protocol.StateRunning, StopTimeout: 10 * time.Second,
+		},
 	}}
 	view := leaseView(p, facts, known())
 
 	got, err := Validate(p, leaseOf(
 		imageNeedFor("vc", "sigp/lighthouse:latest", "sha256:2"),
+		imageNeedFor("snooper", "snooper:latest", "sha256:2"),
 		imageNeedFor("beacon", "sigp/lighthouse:latest", "sha256:2"),
 		imageNeedFor("execution", "ethpandaops/geth:master", "sha256:2"),
 	), view, nil)
@@ -476,10 +480,10 @@ func TestNameMappedContainers(t *testing.T) {
 		order = append(order, r.Container)
 	}
 
-	assert.Equal(t, []string{"execution", "beacon", "vc"}, order, "recreated first")
-	assert.Equal(t, []string{"execution", "beacon", "vc"}, StartOrder(got.WasRunning, view.Containers), "started first")
-	assert.Equal(t, []string{"vc", "beacon", "execution"}, DrainOrder(got.WasRunning, view.Containers), "drained last")
-	assert.Equal(t, 45*time.Second, StopTimeout(p, view.Container("execution")), "its group's stopTimeout")
+	assert.Equal(t, []string{"execution", "beacon", "vc", "snooper"}, order, "recreated first")
+	assert.Equal(t, []string{"execution", "beacon", "vc", "snooper"}, StartOrder(got.WasRunning, view.Containers))
+	assert.Equal(t, []string{"vc", "beacon", "execution", "snooper"}, DrainOrder(got.WasRunning, view.Containers))
+	assert.Equal(t, 10*time.Second, StopTimeout(view.Container("execution")), "its own stop timeout")
 }
 
 func TestRecheck(t *testing.T) {
@@ -520,14 +524,6 @@ func TestRecheck(t *testing.T) {
 
 	_, reason = Recheck(&Recreate{Container: "ghost"}, leaseView(p, validateFacts(), known()))
 	assert.Equal(t, "container ghost does not exist", reason)
-
-	// A container of the name map gets its labels.
-	p.Containers = map[string]MappedContainer{"teku": {Group: "consensus", Kind: protocol.KindCL}}
-	facts = validateFacts()
-	facts.Containers[1].Group, facts.Containers[1].Kind = "", ""
-	rec, reason = Recheck(plain, leaseView(p, facts, known()))
-	assert.Empty(t, reason)
-	assert.Equal(t, Recreation{Group: "consensus", Kind: protocol.KindCL}, rec)
 }
 
 // targetNeedOfFacts is geth's target need with an empty overrides file.
@@ -549,22 +545,18 @@ func targetNeedOfFacts(t *testing.T, p *Policy, facts *Facts, ref string) protoc
 }
 
 func TestStopTimeout(t *testing.T) {
-	p := &Policy{Groups: map[string]Group{"proxy": {StopTimeout: 30 * time.Second}}}
-
-	assert.Equal(t, DefaultStopTimeout, StopTimeout(p, nil))
-	assert.Equal(t, 30*time.Second, StopTimeout(p, &protocol.Container{Group: "proxy", StopTimeout: time.Minute}))
-	assert.Equal(t, time.Minute, StopTimeout(p, &protocol.Container{Group: "other", StopTimeout: time.Minute}))
-	assert.Equal(t, time.Minute, StopTimeout(p, &protocol.Container{StopTimeout: time.Minute}))
-	assert.Equal(t, DefaultStopTimeout, StopTimeout(p, &protocol.Container{Group: "other"}))
+	assert.Equal(t, DefaultStopTimeout, StopTimeout(nil))
+	assert.Equal(t, time.Minute, StopTimeout(&protocol.Container{StopTimeout: time.Minute}))
+	assert.Equal(t, DefaultStopTimeout, StopTimeout(&protocol.Container{}))
 }
 
 func TestStartAndDrainOrder(t *testing.T) {
 	containers := []protocol.Container{
-		{Name: "vc", Group: "consensus", Kind: protocol.KindVC},
-		{Name: "beacon", Group: "consensus", Kind: protocol.KindCL},
-		{Name: "geth", Group: "execution", Kind: protocol.KindEL},
-		{Name: "exporter", Group: "execution", Kind: protocol.KindOther},
-		{Name: "loose", Kind: protocol.KindEL}, // in no group: other
+		{Name: "vc", Managed: true, Kind: protocol.KindVC},
+		{Name: "beacon", Managed: true, Kind: protocol.KindCL},
+		{Name: "geth", Managed: true, Kind: protocol.KindEL},
+		{Name: "exporter", Managed: true, Kind: "exporter"},
+		{Name: "loose", Kind: protocol.KindEL}, // not managed: last
 	}
 	names := []string{"zz-gone", "loose", "exporter", "vc", "geth", "beacon"}
 

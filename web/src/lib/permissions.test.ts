@@ -14,7 +14,7 @@ const UNOWNED = 'bootnode-1';
 const FRESH = 'fresh-1';
 const GHOST = 'ghost-1';
 
-const owned = (name: string, ...owners: string[]) => ({ name, managed: true, owners });
+const owned = (name: string, team?: string) => ({ name, managed: true, team });
 
 /** The fleet of the controller's table. */
 const HOSTS: OwnedHost[] = [
@@ -27,7 +27,7 @@ const HOSTS: OwnedHost[] = [
       { name: 'debug', managed: false },
     ],
   },
-  { name: TEKU, containers: [owned('geth', 'geth'), owned('teku', 'nimbus', 'teku')] },
+  { name: TEKU, containers: [owned('geth', 'geth'), owned('teku', 'teku')] },
   { name: UNOWNED, containers: [{ name: 'bootnode', managed: true }] },
   // Registered, never synced.
   { name: FRESH, containers: null },
@@ -40,7 +40,7 @@ const ROLLOUT_CLIENTS: Record<string, string> = { 'r-lighthouse': 'lighthouse', 
 
 const OWNERSHIP = {
   hosts: HOSTS,
-  clients: [{ name: 'lighthouse', hosts: 1, allOwned: ['lighthouse'], owners: ['lighthouse'] }],
+  clients: [{ name: 'lighthouse', hosts: 1 }],
   leaseHost: (id: string) => LEASES[id],
   rolloutClient: (id: string) => ROLLOUT_CLIENTS[id],
 };
@@ -235,12 +235,12 @@ describe('can, what the team twins cover', () => {
       roll([MIXED], ['lighthouse', 'geth']),
       { by: 'team_roll' },
     ],
-    ['roll, a container of two teams', teamRoll('nimbus'), roll([TEKU], ['teku']), { by: 'team_roll' }],
+    ['roll, a container of its team', teamRoll('teku'), roll([TEKU], ['teku']), { by: 'team_roll' }],
     [
-      'roll, a container of two teams, a third team',
+      'roll, a container of another team',
       teamRoll('lighthouse'),
       roll([TEKU], ['teku']),
-      { reason: 'upgradoor:team_roll does not cover container teku on host teku-geth-1 (owners: nimbus, teku)' },
+      { reason: 'upgradoor:team_roll does not cover container teku on host teku-geth-1 (owners: teku)' },
     ],
     ['roll, one container on two hosts', teamRoll('geth'), roll([MIXED, TEKU], ['geth']), { by: 'team_roll' }],
     [
@@ -275,7 +275,7 @@ describe('can, what the team twins cover', () => {
       'roll hosts, second not covered',
       teamRoll('geth', 'lighthouse'),
       roll([MIXED, TEKU]),
-      { reason: 'upgradoor:team_roll does not cover container teku on host teku-geth-1 (owners: nimbus, teku)' },
+      { reason: 'upgradoor:team_roll does not cover container teku on host teku-geth-1 (owners: teku)' },
     ],
     [
       'roll a host nobody owns',
@@ -318,7 +318,7 @@ describe('can, what the team twins cover', () => {
       'reboot two hosts, second not covered',
       teamReboot('lighthouse'),
       reboot([MIXED, TEKU]),
-      { reason: 'upgradoor:team_reboot does not cover host teku-geth-1 (owners: geth, nimbus, teku)' },
+      { reason: 'upgradoor:team_reboot does not cover host teku-geth-1 (owners: geth, teku)' },
     ],
     [
       'reboot a host nobody owns',
@@ -399,7 +399,7 @@ describe('can, what the team twins cover', () => {
       'roll all, team twin and admin: not every host is covered',
       login(['team_roll', 'admin'], ['geth', 'lighthouse']),
       roll([], [], { all: true }),
-      { reason: 'upgradoor:team_roll does not cover container teku on host teku-geth-1 (owners: nimbus, teku)' },
+      { reason: 'upgradoor:team_roll does not cover container teku on host teku-geth-1 (owners: teku)' },
     ],
     ['reboot all, plain', login(['reboot']), reboot([], { all: true }), { reason: 'Needs upgradoor:admin (for all)' }],
     ['reboot all, admin', login(['reboot', 'admin']), reboot([], { all: true }), { by: 'reboot,admin' }],
@@ -457,7 +457,7 @@ describe('can, what the team twins cover', () => {
       'skip, team, not covered',
       teamRecover('lighthouse'),
       rolloutHosts('skip', [TEKU]),
-      { reason: 'upgradoor:team_recover does not cover host teku-geth-1 (owners: geth, nimbus, teku)' },
+      { reason: 'upgradoor:team_recover does not cover host teku-geth-1 (owners: geth, teku)' },
     ],
 
     // A lease stands for its host.
@@ -526,10 +526,10 @@ describe('can, what the review of the first version found', () => {
     expect(can(team, scope('pause', 'r-lighthouse'), OWNERSHIP).by).toBe('team_supervise');
     expect(can(team, scope('abort', 'r-lighthouse'), OWNERSHIP).reason).toBe('Needs upgradoor:supervise');
     expect(can(login(['team_supervise'], ['geth']), scope('resume', 'r-lighthouse'), OWNERSHIP).reason).toBe(
-      'upgradoor:team_supervise does not cover client lighthouse (owners of all of it: lighthouse)'
+      'upgradoor:team_supervise does not cover client lighthouse (owners: lighthouse)'
     );
     expect(can(team, scope('resume', 'r-1'), OWNERSHIP).reason).toBe(
-      'upgradoor:team_supervise does not cover rollout r-1: it is for no client'
+      'upgradoor:team_supervise does not cover rollout r-1: it is for no team'
     );
     expect(can(team, scope('resume', 'r-ghost'), OWNERSHIP).reason).toBe(
       'upgradoor:team_supervise does not cover rollout r-ghost (owners: none)'
@@ -620,8 +620,8 @@ describe('can, what the review of the first version found', () => {
     const ownership = {
       ...OWNERSHIP,
       clients: [
-        { name: 'lighthouse', hosts: 2, owners: ['lighthouse'] },
-        { name: 'teku', hosts: 2, owners: ['nimbus', 'teku'] },
+        { name: 'lighthouse', hosts: 2 },
+        { name: 'teku', hosts: 2 },
       ],
     };
 
@@ -644,15 +644,13 @@ describe('can, what the review of the first version found', () => {
     );
   });
 
-  it('covers the policy of a client for a team that owns every container of it', () => {
+  it('covers the policy of a client for its team', () => {
     const policy = (client: string) =>
       ({ action: 'client-policy', body: { client, policy: 'manual', reason: '' } }) satisfies ActionCall;
-    // lighthouse owns its client throughout; on one host the teku container is nimbus's alone.
     const clients = [
-      { name: 'lighthouse', hosts: 2, allOwned: ['lighthouse'] },
-      { name: 'teku', hosts: 2, allOwned: ['nimbus'] },
-      { name: 'geth', hosts: 3, allOwned: [] },
-      { name: 'retired', hosts: 0, allOwned: ['lighthouse'] },
+      { name: 'lighthouse', hosts: 2 },
+      { name: 'teku', hosts: 2 },
+      { name: 'retired', hosts: 0 },
     ];
     const ownership = { ...OWNERSHIP, clients };
     const twin = TEAM_PREFIX + FEATURE.client_policy;
@@ -667,14 +665,12 @@ describe('can, what the review of the first version found', () => {
       by: 'team_client_policy',
       staggered: false,
     });
-    expect(can(login([twin], ['teku', 'nimbus']), policy('teku'), ownership).allowed).toBe(true);
-
-    expect(can(login([twin], ['teku']), policy('teku'), ownership).reason).toBe(
-      'upgradoor:team_client_policy does not cover client teku (owners of all of it: nimbus)'
+    expect(can(login([twin], ['nimbus']), policy('teku'), ownership).reason).toBe(
+      'upgradoor:team_client_policy does not cover client teku (owners: teku)'
     );
-    for (const client of ['geth', 'retired', 'unknown']) {
-      expect(can(login([twin], ['lighthouse']), policy(client), ownership).reason, client).toBe(
-        `upgradoor:team_client_policy does not cover client ${client} (owners of all of it: none)`
+    for (const client of ['retired', 'unknown']) {
+      expect(can(login([twin], [client]), policy(client), ownership).reason, client).toBe(
+        `upgradoor:team_client_policy does not cover client ${client} (owners: none)`
       );
     }
     // Without the client table nobody owns a client; without a team neither.
@@ -729,25 +725,6 @@ describe('can, what the review of the first version found', () => {
         `Needs upgradoor:${feature} or upgradoor:${twin} for a team that owns this container`
       );
     }
-  });
-
-  it('says that the controller decides when several teams of the login own parts of a client', () => {
-    const policy = {
-      action: 'client-policy',
-      body: { client: 'teku', policy: 'manual', reason: '' },
-    } satisfies ActionCall;
-    const clients = [{ name: 'teku', hosts: 2, allOwned: [], owners: ['nimbus', 'teku'] }];
-    const twin = TEAM_PREFIX + FEATURE.client_policy;
-
-    const both = can(login([twin], ['teku', 'nimbus']), policy, { ...OWNERSHIP, clients });
-    expect(both.allowed).toBe(false);
-    expect(both.reason).toMatch(
-      /owners of all of it: none\); your teams nimbus, teku own parts of it.*the controller decides/
-    );
-    // One team that owns a part does not cover it, and nothing is left open.
-    expect(can(login([twin], ['teku']), policy, { ...OWNERSHIP, clients }).reason).toBe(
-      'upgradoor:team_client_policy does not cover client teku (owners of all of it: none)'
-    );
   });
 
   it('names admin for "now" through a team feature, and only then', () => {

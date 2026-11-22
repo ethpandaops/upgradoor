@@ -31,7 +31,7 @@ func operatorSkipped(m *fleet.RolloutHost) bool {
 
 // needKey is the key of the rollout an observed need belongs to; empty for
 // the need of a manual directive, a local need and a group need (which
-// belongs to its group's rollout when that holds it: assignGroupNeeds).
+// belongs to its unit's rollout when that holds it: assignGroupNeeds).
 func needKey(n *protocol.Need) string {
 	switch {
 	case n.DirectiveID != "", isLocal(n), isGroupNeed(n):
@@ -123,12 +123,14 @@ func Reconcile(w *World) *Outcome {
 
 // hostView is one host with what the pass derives about it.
 type hostView struct {
-	h      *fleet.Host
+	h *fleet.Host
+	// weight is the host's validators that are active on chain: those of its
+	// counted range with an attestation duty in the newest stored liveness
+	// epoch, the whole range while there is no row. Validators without a
+	// duty (pending, exited, unknown to the beacon state) count for nothing.
 	weight uint64
-	// duty is how many of the host's validators had an attestation duty in
-	// the newest stored liveness epoch, live how many of those attested;
-	// both the full weight when there is no row. Validators without a duty
-	// (exited, pending, beyond the validator set) count for nothing.
+	// duty is the weight, live how many of the host's validators attested in
+	// the newest stored liveness epoch (the weight when there is no row).
 	duty      uint64
 	live      uint64
 	liveKnown bool
@@ -298,6 +300,7 @@ func newPass(w *World) *pass {
 		}
 
 		hv.duty, hv.live, hv.liveKnown = p.liveOf(h.Name, hv.weight)
+		hv.weight = hv.duty
 
 		p.hosts[h.Name] = hv
 		p.names = append(p.names, h.Name)

@@ -14,7 +14,8 @@ import (
 // how the running container compares.
 type Target struct {
 	// Spec: the deployed image or command line differs from what the
-	// container was created with; the need is rolled in the group's rollout.
+	// container was created with; the need is rolled in the rollout of the
+	// container's team and kind.
 	Spec bool
 	// Image and Command are what the container is to run.
 	Image   string
@@ -29,48 +30,35 @@ type Target struct {
 	Restore bool
 	// Err says why the entry cannot be applied; nothing is changed then.
 	Err string
-	// Refused says why the group's policy does not permit the entry; the
-	// container goes back to what was deployed.
+	// Refused says why the container may not be overridden; it goes back to
+	// what was deployed.
 	Refused string
+
+	// defaultCommand is the command line without an override.
+	defaultCommand []string
 }
 
 // targetOf compares a managed container with what it is to run; a nil
 // deployed counts as deployed with what the container was created with.
-func targetOf(deployed *Deployed, c *protocol.Container, entry *Entry, g *Group, group string) Target {
+func targetOf(deployed *Deployed, c *protocol.Container, entry *Entry) Target {
 	if entry.Empty() {
 		entry = nil
 	}
 
-	// What the container was created as, before an override changed it.
-	createdImage, createdCommand := c.Image, c.Command
-
-	if base := c.Base; base != nil {
-		if base.Image != "" {
-			createdImage = base.Image
-		}
-
-		if base.HasCommand {
-			createdCommand = base.Command
-		}
-	}
-
-	image, baseCommand := createdImage, createdCommand
+	createdImage, createdCommand := created(c)
+	image, baseCommand := createdImage, defaultCommand(deployed, c)
 
 	if deployed != nil {
 		image = deployed.Image
-
-		if deployed.HasCommand {
-			baseCommand = deployed.Command
-		}
 	}
 
 	t := Target{
-		Image: image, Command: slices.Clone(baseCommand),
+		Image: image, Command: slices.Clone(baseCommand), defaultCommand: slices.Clone(baseCommand),
 		Spec: !imageref.Same(createdImage, image) || !slices.Equal(createdCommand, baseCommand),
 	}
 
 	if entry != nil {
-		if err := partsPermitted(g, group, c.Name, entry); err != nil {
+		if err := overridable(c, entry); err != nil {
 			t.Refused, entry = err.Error(), nil
 		}
 	}
@@ -89,7 +77,9 @@ func targetOf(deployed *Deployed, c *protocol.Container, entry *Entry, g *Group,
 			t.Image = entry.Image
 		}
 
-		t.Command = applyFlags(baseCommand, entry.Add, entry.Remove)
+		if entry.HasCommand {
+			t.Command = slices.Clone(entry.Command)
+		}
 	}
 
 	var base protocol.OverrideBase
@@ -113,6 +103,35 @@ func targetOf(deployed *Deployed, c *protocol.Container, entry *Entry, g *Group,
 	t.Restore = entry == nil && !t.InSync && !t.Spec
 
 	return t
+}
+
+// created is what the container was created as, before an override changed it.
+func created(c *protocol.Container) (image string, command []string) {
+	image, command = c.Image, c.Command
+
+	if base := c.Base; base != nil {
+		if base.Image != "" {
+			image = base.Image
+		}
+
+		if base.HasCommand {
+			command = base.Command
+		}
+	}
+
+	return image, command
+}
+
+// defaultCommand is the command line a container runs without an override:
+// the deployed one, else the one it was created with.
+func defaultCommand(deployed *Deployed, c *protocol.Container) []string {
+	if deployed != nil && deployed.HasCommand {
+		return deployed.Command
+	}
+
+	_, command := created(c)
+
+	return command
 }
 
 // keyBytes is how much of the hash a target key keeps.
@@ -198,8 +217,15 @@ func (t *Target) report(c *protocol.Container, entry *Entry) *protocol.Container
 		return out
 	}
 
+	// The controller sees a command as the arguments it adds to and removes
+	// from the default.
+	var added, removed []string
+	if entry.HasCommand {
+		added, removed = commandDelta(t.defaultCommand, entry.Command)
+	}
+
 	return &protocol.ContainerOverride{
-		Image: entry.Image, AddFlags: slices.Clone(entry.Add), RemoveFlags: slices.Clone(entry.Remove),
+		Image: entry.Image, AddFlags: added, RemoveFlags: removed,
 		By: entry.By, Reason: entry.Reason, Until: entry.Until,
 		Applied: t.InSync && t.Err == "" && t.Refused == "", Restoring: t.Restore,
 		Error: cmp.Or(t.Err, t.Refused),

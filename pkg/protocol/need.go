@@ -19,9 +19,9 @@ const (
 	// file: onto an override, or back off one.
 	NeedOverride NeedKind = "override"
 	// NeedSpec brings a container in line with what Ansible deployed it as
-	// (the image and command line in the deployed block of the overrides
-	// file), overrides applied: the soft deploy. It is rolled in the rollout
-	// of the container's group.
+	// (the image and command line in the host's managed.yaml), overrides
+	// applied: the soft deploy. It is rolled in the rollout of the
+	// container's team and kind.
 	NeedSpec NeedKind = "spec"
 )
 
@@ -72,12 +72,10 @@ type Need struct {
 // is then recreated on the same image.
 type ImageNeed struct {
 	Container string `json:"container"`
-	// Group is the roll group of the container: the needs of one group and
-	// client on a host are served together.
-	Group string `json:"group,omitempty"`
-	// Client is the client the container runs (Container.Client); the image
-	// rollouts of each client are their own.
-	Client string `json:"client,omitempty"`
+	// Kind and Team are the container's (Container.Kind, Container.Team):
+	// the needs of one team and kind are one rollout.
+	Kind ContainerKind `json:"kind,omitempty"`
+	Team string        `json:"team,omitempty"`
 	// Image is the container's image reference (tag form).
 	Image      string `json:"image"`
 	FromDigest string `json:"fromDigest,omitempty"`
@@ -122,17 +120,15 @@ func (n *Need) Container() string {
 }
 
 // SpecNeed asks to recreate one managed container with the image and the
-// command line the deployed block of the overrides file names now, overrides
+// command line the host's managed.yaml names now, overrides
 // applied: Ansible changed them and left the restart to the agent. Like an override need it
 // names the target for people; the agent takes the image and the command
 // line from its own files when it serves the lease.
 type SpecNeed struct {
 	Container string `json:"container"`
-	// Group is the roll group of the container (ImageNeed.Group).
-	Group string `json:"group,omitempty"`
-	// Client is the client the container runs (Container.Client); the spec
-	// rollouts of each client are their own.
-	Client string `json:"client,omitempty"`
+	// Kind and Team are the container's (ImageNeed.Kind, ImageNeed.Team).
+	Kind ContainerKind `json:"kind,omitempty"`
+	Team string        `json:"team,omitempty"`
 	// Key identifies the target across hosts: the image at its digest and
 	// the arguments the command line gains and loses. Hosts whose rendered
 	// command lines differ only in what stays the same share it.

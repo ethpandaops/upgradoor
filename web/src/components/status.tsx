@@ -20,7 +20,6 @@ import { Badge, Dash, type Tone } from './primitives';
 
 const IMPACT_TITLE: Record<Impact, string> = {
   node: 'Impact node: counts against the validator budget, the host limit and the network gate',
-  slot: 'Impact slot: counts against the host limit and the network gate, not the validator budget',
   independent: 'Impact independent: no gate and no validator budget; a limit of its own',
 };
 
@@ -43,14 +42,14 @@ const ROLLOUT_TONE: Record<RolloutState, Tone> = {
 
 /**
  * RolloutKindBadge names the kind of a rollout. A group rollout moves the
- * containers of one roll group of one client. A local rollout is what a host
+ * containers of one kind of one team. A local rollout is what a host
  * asked for itself (an override, a roll from its command line): one host, no
  * policy, no canary.
  */
 export function RolloutKindBadge({ kind }: { kind: RolloutKind }) {
   if (kind === 'group') {
     return (
-      <Badge title="Moves the containers of one roll group of one client together, by one lease per host: the new digests of the group's tags and Ansible's soft deploys of its containers, under the image policy">
+      <Badge title="Moves the containers of one kind of one team (of the kind alone without a team, of one image when unlabelled) together, by one lease per host: the new digests of their tags and Ansible's soft deploys of them, under the image policy">
         group
       </Badge>
     );

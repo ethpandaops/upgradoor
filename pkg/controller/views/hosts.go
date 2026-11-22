@@ -37,20 +37,7 @@ func (v *Views) HostDetail(ctx context.Context, name string) (*HostDetail, error
 		CertHash:   host.CertHash,
 		FirstSeen:  host.FirstSeen,
 		RemoteAddr: host.RemoteAddr,
-	}
-
-	if host.Validators != nil {
-		start, end := host.Validators.Start, host.Validators.End
-		detail.ValidatorStart, detail.ValidatorEnd = &start, &end
-	}
-
-	if host.ReportedValidators() != nil {
-		all, listErr := v.opts.Store.ListHosts(ctx)
-		if listErr != nil {
-			return nil, listErr
-		}
-
-		detail.ValidatorOverlaps = host.ReportedOverlaps(all)
+		Assigned:   host.Weight(),
 	}
 
 	inv, err := v.opts.Store.GetInventory(ctx, name)
@@ -109,7 +96,6 @@ func Summarize(
 	}
 
 	if status := host.Status; status != nil {
-		sum.ValidatorReport = status.Validators
 		sum.AgentVersion = status.AgentVersion
 		sum.Containers = NonNil(status.Containers)
 		sum.Node = status.Node
@@ -124,6 +110,7 @@ func Summarize(
 	if plan != nil {
 		if hp, ok := plan.Hosts[host.Name]; ok {
 			sum.Plan = hp
+			sum.Validators = hp.Weight
 		}
 	}
 
@@ -145,7 +132,7 @@ func Listing(sum *HostSummary) HostListing {
 		c := &sum.Containers[i]
 		out.Containers = append(out.Containers, ContainerListing{
 			Name: ContainerName(c.Name), Image: c.Image, Digest: c.Digest, Revision: c.Revision,
-			State: c.State, Managed: c.Managed, Kind: c.Kind, Impact: c.Impact, Owners: c.Owners, Group: c.Group,
+			State: c.State, Managed: c.Managed, Kind: c.Kind, Impact: c.Impact, Team: c.Team,
 		})
 	}
 

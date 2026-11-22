@@ -56,7 +56,6 @@ func TestRecreate(t *testing.T) {
 		require.NoError(t, r.Recreate(t.Context(), "geth", digestB, time.Second, true, &Change{
 			Command: []string{"serve", "--fix"}, SetCommand: true,
 			Base: &protocol.OverrideBase{Command: []string{"serve"}, HasCommand: true}, SetBase: true,
-			Group: "execution", Kind: protocol.KindEL,
 		}))
 
 		require.Len(t, f.created, 1)
@@ -67,8 +66,6 @@ func TestRecreate(t *testing.T) {
 		assert.Equal(t, map[string]string{
 			"role":               "el",
 			labelOverrideCommand: `["serve"]`,
-			protocol.LabelGroup:  "execution",
-			protocol.LabelKind:   "el",
 		}, created.Config.Labels, "the image label Base does not name is gone")
 	})
 }

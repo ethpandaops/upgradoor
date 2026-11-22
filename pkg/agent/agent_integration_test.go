@@ -17,6 +17,7 @@ import (
 	"net/http"
 	"net/netip"
 	"os"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -46,7 +47,7 @@ const (
 	itRegistryRef = "registry:2"
 	itSetup       = 5 * time.Minute
 	itStopTimeout = 10 * time.Second
-	itGroup       = "execution"
+	itTeam        = "geth"
 	// itLoop keeps a container alive and lets it stop at once on TERM.
 	itLoop = "trap 'exit 0' TERM; while :; do sleep 0.2; done"
 	// itOverrideLabels starts the labels that record an override.
@@ -370,8 +371,8 @@ func targetNeed(t *testing.T, policy *plan.Policy, view *plan.View, name string)
 	return protocol.Need{}
 }
 
-func groupLabels(group string, kind protocol.ContainerKind) map[string]string {
-	return map[string]string{protocol.LabelGroup: group, protocol.LabelKind: string(kind)}
+func kindLabels(kind protocol.ContainerKind, team string) map[string]string {
+	return map[string]string{protocol.LabelKind: string(kind), protocol.LabelTeam: team}
 }
 
 // plan's rules applied through the real host to containers of the local Docker daemon.
@@ -383,17 +384,14 @@ func TestRulesOnDocker(t *testing.T) {
 	app, fix := e.ref("app"), e.ref("fix")
 
 	policy := plan.Policy{
-		Verbs: []protocol.Verb{protocol.VerbRoll},
-		Groups: map[string]plan.Group{
-			itGroup: {Overrides: []string{protocol.OverrideImage, protocol.OverrideFlags}},
-		},
-		DefaultGroup: plan.DefaultGroup{Roll: true, Exclude: []string{e.prefix + "excluded"}},
+		Verbs:         []protocol.Verb{protocol.VerbRoll},
+		DefaultPolicy: plan.DefaultIgnore,
 	}
 	policy.ApplyDefaults()
 	require.NoError(t, policy.Validate())
 
 	t.Run("soft deploy", func(t *testing.T) {
-		name := e.create(t, "soft", app, cmdV1, groupLabels(itGroup, protocol.KindEL))
+		name := e.create(t, "soft", app, cmdV1, kindLabels(protocol.KindEL, itTeam))
 		files := plan.Overrides{Known: true, Deployed: map[string]plan.Deployed{
 			name: {Image: app, Command: cmdV2, HasCommand: true},
 		}}
@@ -415,14 +413,14 @@ func TestRulesOnDocker(t *testing.T) {
 	})
 
 	t.Run("override and its restore", func(t *testing.T) {
-		name := e.create(t, "override", app, cmdV1, groupLabels(itGroup, protocol.KindEL))
+		name := e.create(t, "override", app, cmdV1, kindLabels(protocol.KindEL, itTeam))
 		files := plan.Overrides{
 			Known: true,
 			Deployed: map[string]plan.Deployed{
 				name: {Image: app, Command: cmdV1, HasCommand: true},
 			},
 			Entries: map[string]plan.Entry{
-				name: {Image: fix, Add: []string{"--debug"}, By: "it"},
+				name: {Image: fix, Command: append(slices.Clone(cmdV1), "--debug"), HasCommand: true, By: "it"},
 			},
 		}
 
@@ -465,34 +463,8 @@ func TestRulesOnDocker(t *testing.T) {
 		}
 	})
 
-	t.Run("name-mapped container gets its labels", func(t *testing.T) {
-		name := e.create(t, "mapped", app, cmdV1, nil)
-		mapped := policy
-		mapped.Containers = map[string]plan.MappedContainer{
-			name: {Group: itGroup, Kind: protocol.KindEL},
-		}
-		files := plan.Overrides{Known: true}
-
-		view := e.classify(t, &mapped, &files)
-		require.True(t, view.Container(name).Unlabelled)
-		require.Equal(t, itGroup, view.Container(name).Group)
-
-		e.recreate(t, &mapped, &files, &plan.Recreate{Container: name, Digest: e.digest})
-
-		view = e.classify(t, &mapped, &files)
-		c := view.Container(name)
-		assert.False(t, c.Unlabelled)
-		assert.Equal(t, itGroup, c.Group)
-		assert.Equal(t, protocol.KindEL, c.Kind)
-		assert.Equal(t, groupLabels(itGroup, protocol.KindEL),
-			map[string]string{
-				protocol.LabelGroup: e.labels(t, name)[protocol.LabelGroup],
-				protocol.LabelKind:  e.labels(t, name)[protocol.LabelKind],
-			})
-	})
-
-	t.Run("none and excluded are left alone", func(t *testing.T) {
-		noneLabels := groupLabels(protocol.GroupNone, protocol.KindOther)
+	t.Run("none and unlabelled are left alone", func(t *testing.T) {
+		noneLabels := kindLabels(protocol.KindNone, itTeam)
 		none := e.create(t, "none", e.ref("none"), cmdV1, noneLabels)
 		excluded := e.create(t, "excluded", e.ref("excluded"), cmdV1, nil)
 		files := plan.Overrides{Known: true}

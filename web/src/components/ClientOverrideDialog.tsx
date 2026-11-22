@@ -31,7 +31,7 @@ const FOR: Record<Duration, string> = {
 
 const KIND_ORDER: readonly ContainerKind[] = ['el', 'cl', 'vc'];
 
-export const KIND_LABEL: Record<string, string> = { el: 'execution', cl: 'beacon', vc: 'validator', other: 'other' };
+export const KIND_LABEL: Record<string, string> = { el: 'execution', cl: 'beacon', vc: 'validator' };
 
 /** clientKinds are the container kinds of a client, in the page's order. */
 export function clientKinds(client: ClientView): ContainerKind[] {

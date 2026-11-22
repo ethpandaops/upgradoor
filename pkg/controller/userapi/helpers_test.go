@@ -198,10 +198,6 @@ func syncOwned(t *testing.T, st store.Store, host string, containers ...protocol
 	req := controllertest.SyncRequest()
 	req.Containers = containers
 
-	for i := range req.Containers {
-		req.Containers[i].Owners = protocol.CleanOwners(req.Containers[i].Owners)
-	}
-
 	_, err := st.RecordSync(context.Background(), &store.HostSync{
 		Cert:    &identity.Certificate{Subject: host, Network: controllertest.Network, Hash: "cert-" + host},
 		Request: req,

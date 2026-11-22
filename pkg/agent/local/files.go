@@ -1,6 +1,7 @@
 package local
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -20,42 +21,57 @@ import (
 )
 
 // Files is the host's overrides file, behind one lock shared by every reader
-// and writer. A change replaces one entry or hold and nothing else, adds a
-// history comment line above it, is parsed back and compared with what was
-// meant, and is written atomically with the file's owner and mode kept,
-// because the entry user edits it; an agent that is not root keeps the group
-// and lets it write. The generated block is kept byte for byte; only
-// InitBlock and SetDeployed render it.
+// and writer. A change replaces the active fields of one entry and nothing
+// else, adds a history comment line above it, is parsed back and compared
+// with what was meant, and is written atomically with the file's owner and
+// mode kept, because the entry user edits it; an agent that is not root keeps
+// the group and lets it write. Only Layout writes the header and the default
+// lines.
 //
 // The file is read only as a regular file with one name, not reached through
 // a symbolic link and, for root, in a directory whose ancestors only root can
-// change.
+// change. Without a path, overrides are disabled.
 type Files interface {
-	// Path is the overrides file.
+	// Path is the overrides file; empty when overrides are disabled.
 	Path() string
 	// Load reads the file; one that cannot be read or parsed is Known false
 	// with the reason in Err. Expired entries are left out and taken out of
 	// the file; changes made without the agent go to the audit log.
 	Load() plan.Overrides
 	// SetEntry changes one container's override: build gets the current
-	// unexpired entry (or nil) and returns the one to write (nil removes it)
+	// unexpired entry (or nil) and returns the one to write (nil clears it)
 	// or a refusal, which writes nothing. prev and next are for the caller's
 	// audit record; next is what build returned even when the write failed.
-	// An unreadable file is an error that is not a refusal; build is not called.
-	SetEntry(
-		container, who string, build func(prev *plan.Entry) (*plan.Entry, error),
-	) (prev, next *plan.Entry, err error)
-	// SetHold writes or (h nil) takes out the hold of origin's source. The
-	// source is derived here so that the local hold is written only from the
-	// host.
-	SetHold(origin plan.Origin, h *plan.Hold, who, note string) error
-	// InitBlock writes the generated block and keeps whatever is below it.
-	InitBlock(deployed map[string]plan.Deployed) error
-	// SetDeployed writes one container's entry of the generated block; reset
-	// also takes out its override entry, holds stay. It reports whether the
+	// An unreadable file is an error that is not a refusal; build is not
+	// called.
+	SetEntry(container, who string, build func(prev *plan.Entry) (*plan.Entry, error)) (prev, next *plan.Entry, err error)
+	// Layout creates the file when it is missing and writes the header, an
+	// entry with default lines for each container of keep and no default
+	// lines for those of drop; nothing else changes. It reports whether the
 	// file changed.
-	SetDeployed(container string, d plan.Deployed, reset bool, who string) (bool, error)
+	Layout(keep map[string]plan.Deployed, drop []string) (bool, error)
 }
+
+// errDisabled refuses a change of an override on a host without overrides.
+var errDisabled = plan.Refusal("overrides are disabled on this host")
+
+// disabled is Files without an overrides file.
+type disabled struct{}
+
+func (disabled) Path() string { return "" }
+
+func (disabled) Load() plan.Overrides {
+	out := noOverrides()
+	out.Disabled = true
+
+	return out
+}
+
+func (disabled) SetEntry(string, string, func(*plan.Entry) (*plan.Entry, error)) (prev, next *plan.Entry, err error) {
+	return nil, nil, errDisabled
+}
+
+func (disabled) Layout(map[string]plan.Deployed, []string) (bool, error) { return false, errDisabled }
 
 const (
 	maxFileSize = 1 << 20
@@ -88,13 +104,20 @@ type files struct {
 	seen  map[string]plan.Entry
 	stuck map[string]bool
 	err   string
+	// layoutErr is the last error of Layout, logged once.
+	layoutErr string
 }
 
 var _ Files = (*files)(nil)
 
 // NewFiles returns the overrides file at path; it checks the directory's
-// ancestors and removes temp files of writes cut short.
+// ancestors and removes temp files of writes cut short. An empty path
+// disables overrides.
 func NewFiles(log logrus.FieldLogger, path string, audit Audit, now func() time.Time) Files {
+	if path == "" {
+		return disabled{}
+	}
+
 	f := &files{
 		log:  log.WithFields(logrus.Fields{"component": "overrides", "file": path}),
 		path: path, audit: audit, now: now, unsafe: replaceableAncestor(path, os.Geteuid(), []int{0}),
@@ -191,7 +214,7 @@ func (f *files) Load() plan.Overrides {
 
 		f.err = err.Error()
 
-		return plan.Overrides{Err: err.Error()}
+		return plan.Overrides{Err: "the overrides file cannot be read: " + err.Error()}
 	}
 
 	if f.err != "" {
@@ -237,7 +260,7 @@ func (f *files) Load() plan.Overrides {
 // failed check leaves the text as it was.
 func (f *files) expire(cur *current, name string, entry *plan.Entry, now time.Time) error {
 	next := *cur
-	next.text = &text{lines: slices.Clone(cur.text.lines), body: cur.text.body}
+	next.text = cur.text.clone()
 
 	note := "expired; was " + entry.Describe() + " by " + entry.By
 	if err := next.text.setOverride(name, nil, now, expiryWho, note); err != nil {
@@ -378,123 +401,52 @@ func (f *files) SetEntry(
 	return prev, next, nil
 }
 
-// SetHold implements Files.
-func (f *files) SetHold(origin plan.Origin, h *plan.Hold, who, note string) error {
-	source := plan.HoldSource(origin)
-
+// Layout implements Files. Nothing is written when nothing changes; a file
+// that cannot be read is left as it is.
+func (f *files) Layout(keep map[string]plan.Deployed, drop []string) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	cur, set, err := f.readParsed()
-	if err != nil {
-		return fmt.Errorf("the overrides file cannot be read: %w", err)
+	changed, err := f.layout(keep, drop)
+
+	switch {
+	case err == nil:
+		f.layoutErr = ""
+	case err.Error() != f.layoutErr:
+		f.layoutErr = err.Error()
+		f.log.WithError(err).Error("cannot lay out the overrides file")
 	}
 
-	if _, ok := set.Holds[source]; h == nil && !ok {
-		return nil
-	}
-
-	if err := cur.text.setHold(source, h, f.now(), who, note); err != nil {
-		return err
-	}
-
-	return f.write(cur)
+	return changed, err
 }
 
-// InitBlock implements Files. The old block is not parsed: a broken block is
-// what init-overrides repairs.
-func (f *files) InitBlock(deployed map[string]plan.Deployed) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	cur, err := f.read()
-	if err != nil {
-		return fmt.Errorf("the overrides file cannot be read: %w", err)
-	}
-
-	rest, err := parse((&text{lines: cur.text.lines[cur.text.body:]}).bytes())
-	if err != nil {
-		return fmt.Errorf("the overrides file cannot be read: %s", oneLine(err.Error()))
-	}
-
-	cur.text.setBlock(generatedBlock(deployed))
-
-	after, err := parse(cur.text.bytes())
-	if err != nil {
-		return fmt.Errorf("the change would break the overrides file: %w", err)
-	}
-
-	want := plan.Overrides{Deployed: make(map[string]plan.Deployed, len(deployed)), Entries: rest.Entries, Holds: rest.Holds}
-	for name, d := range deployed {
-		if !d.HasCommand {
-			d.Command = nil
-		}
-
-		want.Deployed[name] = d
-	}
-
-	if err := unchanged(&want, &after, nil, nil); err != nil {
-		return err
-	}
-
-	return f.write(cur)
-}
-
-// SetDeployed implements Files. Nothing is written when nothing changes.
-func (f *files) SetDeployed(container string, d plan.Deployed, reset bool, who string) (bool, error) {
-	if !containerName.MatchString(container) {
-		return false, plan.Refusal("%q is not a valid container name", container)
-	}
-
-	if !d.HasCommand {
-		d.Command = nil
-	}
-
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
+func (f *files) layout(keep map[string]plan.Deployed, drop []string) (bool, error) {
 	cur, set, readErr := f.readParsed()
 	if readErr != nil {
 		return false, fmt.Errorf("the overrides file cannot be read: %w", readErr)
 	}
 
-	prev, had := set.Deployed[container]
-	entry, drop := set.Entries[container]
-	drop = drop && reset
+	before := cur.text.bytes()
 
-	if had && sameDeployed(&prev, &d) && !drop {
+	if err := cur.text.layout(keep, drop); err != nil {
+		return false, err
+	}
+
+	if cur.exists && bytes.Equal(before, cur.text.bytes()) {
 		return false, nil
 	}
 
-	want := plan.Overrides{Deployed: maps.Clone(set.Deployed), Entries: set.Entries, Holds: set.Holds}
-	want.Deployed[container] = d
-
-	cur.text.setBlock(generatedBlock(want.Deployed))
-
-	if drop {
-		delete(want.Entries, container)
-
-		note := "cleared by deploy --reset; was " + entry.Describe()
-		if err := cur.text.setOverride(container, nil, f.now(), who, note); err != nil {
-			return false, err
-		}
+	after, parseErr := parse(cur.text.bytes())
+	if parseErr != nil {
+		return false, fmt.Errorf("the change would break the overrides file: %w", parseErr)
 	}
 
-	after, err := parse(cur.text.bytes())
-	if err != nil {
-		return false, fmt.Errorf("the change would break the overrides file: %w", err)
-	}
-
-	if err := unchanged(&want, &after, nil, nil); err != nil {
+	if err := unchanged(&set, &after, ""); err != nil {
 		return false, err
 	}
 
 	if err := f.write(cur); err != nil {
 		return false, err
-	}
-
-	if drop && f.seen != nil {
-		delete(f.seen, container)
 	}
 
 	return true, nil

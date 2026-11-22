@@ -63,14 +63,14 @@ function needContainer(n: Need): string {
   return n.image?.container ?? n.override?.container ?? n.spec?.container ?? '';
 }
 
-/** scheduler.GroupName: the group rollouts of one roll group of one client. */
-function groupName(group: string | undefined, client: string | undefined): string {
-  return client ? `group:${group ?? ''}#${client}` : `group:${group ?? ''}`;
+/** scheduler.UnitName: the group rollouts of one kind of one team, or of the kind alone. */
+export function unitName(kind: string | undefined, team: string | undefined): string {
+  return team ? `unit:${kind ?? ''}#${team}` : `unit:${kind ?? ''}`;
 }
 
 function failure(sum: HostSummary, containers: readonly Container[]): string {
   for (const c of containers) {
-    if (sum.broken && groupName(c.group, c.client) in sum.broken) return `the last lease for ${c.image} failed`;
+    if (sum.broken && unitName(c.kind, c.team) in sum.broken) return `the last lease for ${c.image} failed`;
     if (c.state !== 'running' && shouldRun(c)) return `container ${c.name} is ${c.state}`;
   }
 
@@ -102,7 +102,7 @@ function hostState(sum: HostSummary, containers: readonly Container[]): { state:
 }
 
 function clientHost(sum: HostSummary, client: string): ClientHost {
-  const containers = list(sum.containers).filter(c => c.managed && c.client === client);
+  const containers = list(sum.containers).filter(c => c.managed && c.team === client);
   const { state, reason } = hostState(sum, containers);
 
   return {
@@ -194,22 +194,6 @@ function overrideParts(row: ClientHost): { image: boolean; flags: boolean } {
   };
 }
 
-/** owners returns the teams that own a container of the client, and those that own every one of them (clientOwners). */
-function owners(rows: readonly ClientHost[]): { some: string[]; all: string[] } {
-  const some = new Set<string>();
-  let all: string[] | undefined;
-
-  for (const row of rows) {
-    for (const c of list(row.containers)) {
-      const of = c.owners ?? [];
-      for (const o of of) some.add(o);
-      all = all === undefined ? [...of] : all.filter(o => of.includes(o));
-    }
-  }
-
-  return { some: [...some].sort(), all: [...(all ?? [])].sort() };
-}
-
 /** version is a digest of a client's host list: it differs whenever a page of the list would (clientVersion). */
 function version(rows: readonly ClientHost[]): string {
   // The time of the registry check moves with every sync without saying anything new.
@@ -221,13 +205,13 @@ function version(rows: readonly ClientHost[]): string {
 
 /**
  * clientIndex groups the hosts by the clients of their managed containers.
- * The hosts are the summaries with their containers whole (client, override).
+ * The hosts are the summaries with their containers whole (team, override).
  */
 export function clientIndex(hosts: readonly HostSummary[], settings: Settings): ClientIndex {
   const byClient = new Map<string, ClientHost[]>();
 
   for (const sum of hosts) {
-    const names = new Set(list(sum.containers).flatMap(c => (c.managed && c.client ? [c.client] : [])));
+    const names = new Set(list(sum.containers).flatMap(c => (c.managed && c.team ? [c.team] : [])));
     for (const name of names) {
       const rows = byClient.get(name) ?? [];
       rows.push(clientHost(sum, name));
@@ -241,7 +225,6 @@ export function clientIndex(hosts: readonly HostSummary[], settings: Settings): 
     rows.sort((a, b) => compare(a.host, b.host));
 
     const count = (state: ClientHostState) => rows.filter(r => r.state === state).length;
-    const { some, all } = owners(rows);
     const consensus = rows.some(r => list(r.containers).some(c => c.kind === 'cl' || c.kind === 'vc'));
 
     views.push({
@@ -249,8 +232,6 @@ export function clientIndex(hosts: readonly HostSummary[], settings: Settings): 
       layer: consensus ? 'consensus' : 'execution',
       policy: imagePolicy(settings, name),
       policySet: name in settings.policyClients,
-      owners: some,
-      allOwned: all,
       images: images(rows),
       hosts: rows.length,
       current: count('current'),

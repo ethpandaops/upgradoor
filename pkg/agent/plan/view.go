@@ -40,8 +40,7 @@ type View struct {
 	Containers []protocol.Container
 	// Fresh is Facts.Fresh.
 	Fresh bool
-	// Targets are the targets of managed containers outside the default
-	// group, by name.
+	// Targets are the targets of labelled managed containers, by name.
 	Targets map[string]Target
 	// Tags are the tags to follow, by normalised reference: every managed
 	// container's tag and the tag of each pending valid target.
@@ -87,7 +86,7 @@ func Classify(
 	for i := range list {
 		c := &list[i]
 		// Deep copy: nothing written through the view may reach the facts.
-		c.Command, c.Owners = slices.Clone(c.Command), slices.Clone(c.Owners)
+		c.Command = slices.Clone(c.Command)
 
 		if c.Base != nil {
 			base := *c.Base
@@ -95,15 +94,9 @@ func Classify(
 			c.Base = &base
 		}
 
-		resolveGroup(policy, c)
-	}
-
-	impacts := groupImpacts(policy, list)
-
-	for i := range list {
-		c := &list[i]
+		resolveLabels(policy, c)
 		c.Impact, c.ConfiguredImage, c.Registry, c.NotRolled = "", "", nil, ""
-		c.Owners, c.Client, c.Override, c.Overridable = nil, "", nil, nil
+		c.Override, c.Overridable = nil, false
 
 		if !c.Managed {
 			// An unmanaged container's command line is nobody's business.
@@ -112,14 +105,16 @@ func Classify(
 			continue
 		}
 
-		c.Impact = impacts[c.Group]
+		c.Impact = protocol.ImpactNode
 		c.ConfiguredImage = c.Image
-		c.NotRolled = notRolled(policy, c)
+		c.NotRolled = notRolled(c)
 
 		target := Target{Image: c.Image, InSync: true}
 
-		if c.Group != protocol.DefaultGroup {
-			target = classifyTarget(policy, c, files, now)
+		if c.Kind == "" {
+			c.Impact = protocol.ImpactIndependent
+		} else {
+			target = classifyTarget(c, files, now)
 			view.Targets[c.Name] = target
 
 			if d, ok := files.Deployed[c.Name]; ok {
@@ -128,10 +123,7 @@ func Classify(
 				c.ConfiguredImage = c.Base.Image
 			}
 
-			g := policy.group(c.Group)
-			c.Owners = protocol.CleanOwners(g.Owners)
-			c.Client = g.Client
-			c.Overridable = g.overridable()
+			c.Overridable = c.Team != "" && !files.Disabled
 			c.Override = target.report(c, currentEntry(files, c.Name, now))
 		}
 
@@ -175,89 +167,48 @@ func currentEntry(files *Overrides, name string, now time.Time) *Entry {
 
 // classifyTarget is targetOf for the overrides file as read; while the file
 // cannot be read, the container is left as it is.
-func classifyTarget(policy *Policy, c *protocol.Container, files *Overrides, now time.Time) Target {
+func classifyTarget(c *protocol.Container, files *Overrides, now time.Time) Target {
 	var deployed *Deployed
 	if d, ok := files.Deployed[c.Name]; ok {
 		deployed = &d
 	}
 
-	g := policy.group(c.Group)
-	target := targetOf(deployed, c, currentEntry(files, c.Name, now), &g, c.Group)
+	target := targetOf(deployed, c, currentEntry(files, c.Name, now))
 
 	if !files.Known && !target.InSync {
 		return Target{
 			Image: c.Image, Command: slices.Clone(c.Command), InSync: true,
-			Err: "the overrides file cannot be read (" + files.Err + "); nothing is changed",
+			Err: files.Err + "; nothing is changed",
 		}
 	}
 
 	return target
 }
 
-// resolveGroup sets Managed, Group, Kind and Unlabelled: by label, else by
-// the name map, else the default group unless excluded; the label value
-// protocol.GroupNone leaves the container out of everything.
-func resolveGroup(policy *Policy, c *protocol.Container) {
-	c.Managed, c.Unlabelled = true, false
-	m, mapped := policy.Containers[c.Name]
-
-	switch {
-	case c.Group == protocol.GroupNone:
-		c.Managed = false
-	case c.Group != "":
-		c.Kind = protocol.ParseKind(string(c.Kind))
-	case mapped:
-		c.Group, c.Kind, c.Unlabelled = m.Group, protocol.ParseKind(string(m.Kind)), true
-	case policy.DefaultGroup.excludes(c.Name):
-		c.Managed = false
-	default:
-		c.Group = protocol.DefaultGroup
+// resolveLabels sets Managed, Kind and Team from the labels: a valid kind
+// label other than none manages the container with its team label, if any;
+// without a kind label defaultPolicy decides. A label that is not a name
+// leaves the container out.
+func resolveLabels(policy *Policy, c *protocol.Container) {
+	if c.Kind == "" {
+		c.Managed, c.Team = policy.rollsUnlabelled(), ""
+	} else {
+		c.Managed = c.Kind != protocol.KindNone && protocol.ValidKind(c.Kind) &&
+			(c.Team == "" || protocol.ValidOwner(c.Team))
 	}
 
-	switch {
-	case !c.Managed:
-		c.Group, c.Kind = "", ""
-	case c.Group == protocol.DefaultGroup:
-		c.Kind = protocol.KindOther
+	if !c.Managed {
+		c.Kind, c.Team = "", ""
 	}
-}
-
-// groupImpacts is each group's impact: agent.yaml's, else node when the
-// group has an el, cl or vc container, else independent.
-func groupImpacts(policy *Policy, list []protocol.Container) map[string]protocol.Impact {
-	out := make(map[string]protocol.Impact, len(policy.Groups)+2)
-
-	for i := range list {
-		c := &list[i]
-		if !c.Managed {
-			continue
-		}
-
-		if g := policy.group(c.Group); g.Impact != "" {
-			out[c.Group] = g.Impact
-
-			continue
-		}
-
-		if out[c.Group] == "" {
-			out[c.Group] = protocol.ImpactIndependent
-		}
-
-		out[c.Group] = out[c.Group].Heavier(protocol.DefaultImpact(c.Kind))
-	}
-
-	return out
 }
 
 // notRolled says why a managed container is never rolled; empty when it is.
-func notRolled(policy *Policy, c *protocol.Container) string {
+func notRolled(c *protocol.Container) string {
 	switch {
 	case !imageref.IsTag(c.Image):
 		return "pinned to a digest"
 	case c.Linked:
 		return "created with links (--link), which a recreate cannot keep"
-	case c.Group == protocol.DefaultGroup && !policy.DefaultGroup.Roll:
-		return "in the default group, which this host does not roll (defaultGroup.roll)"
 	default:
 		return ""
 	}
@@ -278,11 +229,11 @@ func rollable(c *protocol.Container, name string) (reason string, refused bool) 
 	}
 }
 
-// HoldState is the hold state the overrides file says at now. A file that
-// cannot be read holds the host locally: when in doubt the agent does nothing.
+// HoldState is the hold state at now. A file that cannot be read holds the
+// host locally: when in doubt the agent does nothing.
 func HoldState(files *Overrides, now time.Time) protocol.Hold {
 	if !files.Known {
-		return protocol.Hold{Local: true, LocalReason: "the overrides file cannot be read: " + Line(files.Err)}
+		return protocol.Hold{Local: true, LocalReason: Line(files.Err)}
 	}
 
 	var out protocol.Hold
@@ -310,34 +261,46 @@ func HoldReason(h protocol.Hold) string {
 	}
 }
 
-// Deployment is the generated block init-overrides writes: each managed
-// container's configured image and its command line before any override.
-func Deployment(view *View) map[string]Deployed {
-	out := make(map[string]Deployed, len(view.Containers))
+// OverrideKeys says which containers the overrides file has a key for, with
+// the default its default lines show (managed.yaml's, else what the container
+// was created with), and which lose their default lines. A container the view
+// does not show is in neither.
+func OverrideKeys(view *View, files *Overrides) (keep map[string]Deployed, drop []string) {
+	keep = make(map[string]Deployed, len(view.Containers))
+	drop = make([]string, 0, len(view.Containers))
 
 	for i := range view.Containers {
 		c := &view.Containers[i]
-		if !c.Managed {
+		if !c.Managed || !c.Overridable {
+			drop = append(drop, c.Name)
+
 			continue
 		}
 
-		command := c.Command
-		if c.Base != nil && c.Base.HasCommand {
-			command = c.Base.Command
+		image, command := created(c)
+		d := Deployed{Image: image, Command: slices.Clone(command), HasCommand: true}
+
+		if m, ok := files.Deployed[c.Name]; ok {
+			d.Image = m.Image
+
+			if m.HasCommand {
+				d.Command = slices.Clone(m.Command)
+			}
 		}
 
-		out[c.Name] = Deployed{
-			Image: c.ConfiguredImage, Command: append([]string{}, command...), HasCommand: true,
-		}
+		keep[c.Name] = d
 	}
 
-	return out
+	slices.Sort(drop)
+
+	return keep, drop
 }
 
 // DeployState is what a deploy finds of a container: whether it exists,
-// whether the agent rolls it to its target (outside the default group, not
-// linked, the target a tag, the roll verb allowed), and whether it runs
-// another image, digest or command line than that target.
+// whether the agent rolls it to its target (labelled, not linked, the target
+// a tag, the roll verb allowed), and whether it runs another image, digest or
+// command line than that target. An unlabelled container is not rolled to a
+// target: Ansible recreates it, with its labels.
 func DeployState(policy *Policy, view *View, name string) (exists, managed, differs bool) {
 	c := view.Container(name)
 	if c == nil {

@@ -26,6 +26,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/registry"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
+	"github.com/ethpandaops/upgradoor/pkg/controller/validators"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/registryauth"
 )
@@ -75,6 +76,9 @@ type Config struct {
 	AuthService string
 	// BeaconEndpoints are beacon API base URLs, tried in order.
 	BeaconEndpoints []string
+	// ValidatorRangesURL is the devnet's validator ranges inventory, from
+	// which hosts get their validators; empty gives no host validators.
+	ValidatorRangesURL string
 	// RegistryAuthFile is a Docker config.json with the credentials for the
 	// registry lookups; empty or missing means anonymous.
 	RegistryAuthFile string
@@ -99,13 +103,14 @@ type controller struct {
 	log logrus.FieldLogger
 	cfg Config
 
-	store     store.Store
-	beacon    beacon.Service
-	scheduler scheduler.Service
-	lookups   discovery.Tracker
-	api       *api.Server
-	server    *http.Server
-	served    chan error
+	store      store.Store
+	beacon     beacon.Service
+	validators validators.Service
+	scheduler  scheduler.Service
+	lookups    discovery.Tracker
+	api        *api.Server
+	server     *http.Server
+	served     chan error
 }
 
 var _ Service = (*controller)(nil)
@@ -154,9 +159,15 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Endpoints: cfg.BeaconEndpoints,
 		Store:     c.store,
 	})
+	c.validators = validators.New(log, validators.Options{
+		URL:       cfg.ValidatorRangesURL,
+		Store:     c.store,
+		UserAgent: "upgradoor-controller/" + cfg.Version,
+		Changed:   func() { c.api.Notify() },
+	})
 	c.scheduler = scheduler.New(log, scheduler.Options{
 		Store:    c.store,
-		Health:   c.beacon.Health,
+		Health:   c.health,
 		Liveness: c.beacon.Liveness,
 		Defaults: defaults,
 		NewID:    newID,
@@ -278,30 +289,35 @@ func (c *controller) Start(ctx context.Context) error {
 		return fmt.Errorf("store: %w", err)
 	}
 
+	if err := c.validators.Start(ctx); err != nil {
+		return errors.Join(fmt.Errorf("validator ranges: %w", err), c.store.Stop())
+	}
+
 	if err := c.beacon.Start(ctx); err != nil {
-		return errors.Join(fmt.Errorf("beacon: %w", err), c.store.Stop())
+		return errors.Join(fmt.Errorf("beacon: %w", err), c.validators.Stop(), c.store.Stop())
 	}
 
 	if err := c.scheduler.Start(ctx); err != nil {
-		return errors.Join(fmt.Errorf("scheduler: %w", err), c.beacon.Stop(), c.store.Stop())
+		return errors.Join(fmt.Errorf("scheduler: %w", err),
+			c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
 	}
 
 	if err := c.lookups.Start(ctx); err != nil {
 		return errors.Join(fmt.Errorf("lookups: %w", err),
-			c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
+			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
 	}
 
 	if err := c.api.Start(ctx); err != nil {
 		return errors.Join(fmt.Errorf("api: %w", err),
-			c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
+			c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
 	}
 
 	var lc net.ListenConfig
 
 	listener, err := lc.Listen(ctx, "tcp", c.cfg.Listen)
 	if err != nil {
-		return errors.Join(fmt.Errorf("listen: %w", err),
-			c.api.Stop(), c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
+		return errors.Join(fmt.Errorf("listen: %w", err), c.api.Stop(), c.lookups.Stop(),
+			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
 	}
 
 	// WriteTimeout is that of a request. An event stream sets its own
@@ -348,9 +364,19 @@ func (c *controller) Stop() error {
 		errs = append(errs, c.server.Shutdown(ctx), <-c.served)
 	}
 
-	errs = append(errs, c.api.Stop(), c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.store.Stop())
+	errs = append(errs, c.api.Stop(), c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(),
+		c.validators.Stop(), c.store.Stop())
 
 	return errors.Join(errs...)
+}
+
+// health is the beacon service's view with the state of the validator ranges
+// inventory.
+func (c *controller) health() fleet.NetworkHealth {
+	h := c.beacon.Health()
+	h.ValidatorRangesError = c.validators.Error()
+
+	return h
 }
 
 // ParseDefaultSettings applies "key=value" overrides to the built-in

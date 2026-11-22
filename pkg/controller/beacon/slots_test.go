@@ -210,6 +210,16 @@ func TestSlotTrackerParticipation(t *testing.T) {
 		},
 	}, missed, "a slot without a block, and nothing included of it")
 
+	// A host with two ranges is one host.
+	split := []trackedHost{
+		{name: "a", start: 0, end: 2}, {name: "b", start: 2, end: 4}, {name: "a", start: 4, end: 8},
+	}
+	_, duties, err = tracker.participation(42, [][]uint64{{6, 2, 1}}, split)
+	require.NoError(t, err)
+	assert.Equal(t, []fleet.HostSlotParticipation{
+		{Host: "a", Assigned: 2}, {Host: "b", Assigned: 1},
+	}, duties)
+
 	// An aggregate that does not fit is reported and left out; the rest of
 	// the slot is counted.
 	tracker.extend([]*chainBlock{

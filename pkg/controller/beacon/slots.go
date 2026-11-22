@@ -413,7 +413,7 @@ func (t *slotTracker) participation(
 	row.Assigned = uint64(len(included))
 
 	// Per host: its duties and how many of them were included.
-	counts := make(map[int]*fleet.HostSlotParticipation, 8)
+	counts := make(map[string]*fleet.HostSlotParticipation, 8)
 
 	for validator, got := range included {
 		if got {
@@ -421,10 +421,12 @@ func (t *slotTracker) participation(
 		}
 
 		eachOwner(hosts, reach, validator, func(host int) {
-			c := counts[host]
+			name := hosts[host].name
+
+			c := counts[name]
 			if c == nil {
-				c = &fleet.HostSlotParticipation{Host: hosts[host].name}
-				counts[host] = c
+				c = &fleet.HostSlotParticipation{Host: name}
+				counts[name] = c
 			}
 
 			c.Assigned++
@@ -438,10 +440,13 @@ func (t *slotTracker) participation(
 	duties = make([]fleet.HostSlotParticipation, 0, len(counts))
 
 	for i := range hosts {
-		c := counts[i]
+		c := counts[hosts[i].name]
 		if c == nil {
 			continue
 		}
+
+		// A host with several ranges is listed once.
+		delete(counts, hosts[i].name)
 
 		duties = append(duties, *c)
 

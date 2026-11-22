@@ -157,7 +157,7 @@ func TestManualRoll(t *testing.T) {
 	need := findNeed(t, &req, needID)
 	assert.Equal(t, "d-roll", need.DirectiveID)
 	assert.Equal(t, &protocol.ImageNeed{
-		Container: "geth", Group: agenttest.GroupExecution, Image: agenttest.GethImage,
+		Container: "geth", Kind: protocol.KindEL, Team: agenttest.TeamGeth, Image: agenttest.GethImage,
 		FromDigest: agenttest.GethV1, ToDigest: agenttest.GethV1,
 	}, need.Image)
 	assert.Empty(t, agenttest.Disruptive(e.host.Calls()), "a directive does not bypass the lease")
@@ -203,7 +203,7 @@ func TestManualRollWaitsForItsLeaseToPull(t *testing.T) {
 		"one container, one image need: the manual one")
 
 	assert.Equal(t, &protocol.ImageNeed{
-		Container: "geth", Group: agenttest.GroupExecution, Image: agenttest.GethImage,
+		Container: "geth", Kind: protocol.KindEL, Team: agenttest.TeamGeth, Image: agenttest.GethImage,
 		FromDigest: agenttest.GethV1, ToDigest: agenttest.GethV2,
 	}, req.Needs[0].Image)
 	assert.Empty(t, e.host.Calls())
@@ -424,13 +424,17 @@ func TestDirectivesSeeTheHoldOfTheirOwnResponse(t *testing.T) {
 	assert.Empty(t, e.host.Calls())
 }
 
-// An override directive is taken within the group's policy, written and audited.
+// An override directive is taken for a container with a team, written and
+// audited.
 func TestOverrideDirective(t *testing.T) {
 	t.Parallel()
 
-	e := overrideEnv(t)
-	e.cfg.Policy.Groups[agenttest.GroupExecution] = plan.Group{Overrides: []string{protocol.OverrideImage}}
-	e.cfg.Policy.Groups[agenttest.GroupConsensus] = plan.Group{Overrides: []string{protocol.OverrideFlags}}
+	sc := agenttest.BaseScenario()
+	sc.Containers[0].Team = "" // the validator
+	sc.Containers[1].Command = []string{"--http", "--maxpeers=50"}
+
+	e := newEnv(t, sc)
+	e.host.SetRegistry(agenttest.FixImage, agenttest.FixV1, "rev-fix")
 	e.start()
 	e.ctrl.AwaitSyncs(2)
 
@@ -454,12 +458,12 @@ func TestOverrideDirective(t *testing.T) {
 		d    protocol.Directive
 		want string
 	}{
-		"no opt-in for images": {image("r2", "teku", "consensys/teku:fix", &until), `group "consensus" of container teku does not allow image overrides`},
-		"no opt-in for flags":  {flags("r3", "geth", []string{"--x"}, &until), `group "execution" of container geth does not allow flag overrides`},
-		"no end":               {image("r4", "geth", agenttest.FixImage, nil), "needs an end"},
-		"an end too far away":  {image("r5", "geth", agenttest.FixImage, &tooFar), "ends more than"},
-		"not managed":          {image("r6", "dora", agenttest.FixImage, &until), "is not managed"},
-		"a digest":             {image("r7", "geth", "ethpandaops/geth@sha256:abc", &until), ""},
+		"no team":             {image("r2", "validator", "sigp/lighthouse:fix", &until), "no " + protocol.LabelTeam + " label"},
+		"no team for flags":   {flags("r3", "validator", []string{"--x"}, &until), "no " + protocol.LabelTeam + " label"},
+		"no end":              {image("r4", "geth", agenttest.FixImage, nil), "needs an end"},
+		"an end too far away": {image("r5", "geth", agenttest.FixImage, &tooFar), "ends more than"},
+		"not managed":         {image("r6", "dora", agenttest.FixImage, &until), "is not managed"},
+		"a digest":            {image("r7", "geth", "ethpandaops/geth@sha256:abc", &until), ""},
 		"nothing in it": {
 			protocol.Directive{ID: "r8", Kind: protocol.DirectiveOverride, Container: "geth"},
 			"names no container or no override",
@@ -484,12 +488,11 @@ func TestOverrideDirective(t *testing.T) {
 		assert.Contains(t, ack.Error, tt.want, name)
 	}
 
-	_, err := os.Stat(e.cfg.Local.OverridesFile)
-	require.ErrorIs(t, err, os.ErrNotExist, "a refused instruction writes nothing")
+	assert.Empty(t, e.overrideEntries(), "a refused instruction writes nothing")
 	assert.Empty(t, req.Needs)
 
 	// The controller's override is taken next to a hand-written one.
-	e.writeOverrides("overrides:\n  teku:\n    flags: {add: [\"--hand\"]}\n    by: me\n")
+	e.writeOverrides("overrides:\n  teku:\n    command: [\"--hand\"]\n    by: me\n")
 	e.ctrl.Direct(image("ok-1", "geth", agenttest.FixImage, &until), flags("ok-2", "teku", []string{"--ui"}, &until))
 
 	req = e.ctrl.Await("both answers", func(req *protocol.SyncRequest) bool {
@@ -500,9 +503,10 @@ func TestOverrideDirective(t *testing.T) {
 
 	content := e.readOverrides()
 	assert.Contains(t, content, " sam@example.org: set image "+agenttest.FixImage+"; was nothing\n")
-	assert.Contains(t, content, "  \"geth\":\n    image: \""+agenttest.FixImage+"\"\n    by: \"sam@example.org\"\n"+
-		"    reason: \"sync\"\n    until: "+until.Format(time.RFC3339)+"\n")
-	assert.Contains(t, content, " sam@example.org: set flags +--ui; was flags +--hand\n")
+	assert.Contains(t, content, "    image: "+agenttest.FixImage+"\n    by: sam@example.org\n"+
+		"    reason: sync\n    until: "+until.Format(time.RFC3339)+"\n")
+	assert.Contains(t, content, " sam@example.org: set command --ui; was command --hand\n",
+		"the flag is applied to the default command, not to the entry's")
 
 	need := awaitOverrideNeed(t, e, "geth", false)
 	assert.Equal(t, agenttest.FixImage, need.Override.Image)
@@ -512,7 +516,7 @@ func TestOverrideDirective(t *testing.T) {
 	e.ctrl.Await("the clear", func(req *protocol.SyncRequest) bool { return agenttest.AckOf(req, "ok-3") != nil })
 
 	content = e.readOverrides()
-	assert.NotContains(t, content, "\"geth\":")
+	assert.NotContains(t, e.overrideEntries(), "geth")
 	assert.Contains(t, content, " sam@example.org: cleared; was image "+agenttest.FixImage+"\n")
 
 	var refusals, accepted []string
@@ -548,7 +552,7 @@ func TestOverrideDirective(t *testing.T) {
 	assert.Equal(t, []string{"ok-1 override.set", "ok-2 override.set", "ok-3 override.clear"}, accepted)
 }
 
-// An unwritten hold is tried again; an unwritten override is rejected.
+// An unwritten override is rejected; an unwritten hold is tried again.
 func TestDirectivesWhoseWriteFails(t *testing.T) {
 	t.Parallel()
 
@@ -565,13 +569,11 @@ func TestDirectivesWhoseWriteFails(t *testing.T) {
 	t.Cleanup(func() { _ = os.Chmod(dir, 0o755) })
 
 	until := e.now().Add(time.Hour)
-	e.ctrl.Direct(
-		protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Reason: "maintenance"},
-		protocol.Directive{
-			ID: "d-override", Kind: protocol.DirectiveOverride, Container: "geth",
-			Override: &protocol.OverrideInstruction{Part: protocol.OverrideImage, Image: agenttest.FixImage, Until: &until},
-		},
-	)
+	override := protocol.Directive{
+		ID: "d-override", Kind: protocol.DirectiveOverride, Container: "geth",
+		Override: &protocol.OverrideInstruction{Part: protocol.OverrideImage, Image: agenttest.FixImage, Until: &until},
+	}
+	e.ctrl.Direct(override)
 
 	req := e.ctrl.Await("the override answered", func(req *protocol.SyncRequest) bool {
 		return agenttest.AckOf(req, "d-override") != nil
@@ -580,11 +582,19 @@ func TestDirectivesWhoseWriteFails(t *testing.T) {
 	assert.Equal(t, protocol.DirectiveRejected, ack.Status)
 	assert.NotEmpty(t, ack.Error)
 
+	require.NoError(t, os.Chmod(dir, 0o755))
+
+	// The hold lives in the state file.
+	require.NoError(t, os.Chmod(e.cfg.StateDir, 0o500))
+	t.Cleanup(func() { _ = os.Chmod(e.cfg.StateDir, 0o700) })
+
+	e.ctrl.Direct(override, protocol.Directive{ID: "d-hold", Kind: protocol.DirectiveHold, Reason: "maintenance"})
+
 	req = e.ctrl.AwaitSyncs(3)
 	assert.Nil(t, agenttest.AckOf(&req, "d-hold"), "a hold that is not written is not answered")
 	assert.False(t, req.Hold.Controller)
 
-	require.NoError(t, os.Chmod(dir, 0o755))
+	require.NoError(t, os.Chmod(e.cfg.StateDir, 0o700))
 
 	req = e.ctrl.Await("the hold answered", func(req *protocol.SyncRequest) bool {
 		return agenttest.AckOf(req, "d-hold") != nil

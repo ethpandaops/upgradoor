@@ -27,13 +27,14 @@ func newOverrideCmd() *cobra.Command {
 
 	set := &cobra.Command{
 		Use:   "set <container>",
-		Short: "Override the image, the flags or both of a container for a while",
+		Short: "Override the image, the command line or both of a container for a while",
 		Long: "Writes the container's entry in the overrides file; an entry that is there is\n" +
 			"replaced as a whole. The container is recreated under the next lease.\n\n" +
-			"Flags: --remove-flag takes arguments out first (\"--name\" removes the flag\n" +
-			"with any value, \"--name=value\" or \"--name value\" exactly that), then\n" +
-			"--add-flag appends (\"--name=value\", \"--switch\", or \"--name value\" as two\n" +
-			"arguments) what is not there yet.",
+			"Flags change the deployed command line, and the result is written as the\n" +
+			"entry's whole command: --remove-flag takes arguments out first (\"--name\"\n" +
+			"removes the flag with any value, \"--name=value\" or \"--name value\" exactly\n" +
+			"that), then --add-flag appends (\"--name=value\", \"--switch\", or\n" +
+			"\"--name value\" as two arguments) what is not there yet.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			req.Container = args[0]
@@ -115,10 +116,10 @@ func parseUntil(value string, now time.Time) (*time.Time, error) {
 func newInitOverridesCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "init-overrides",
-		Short: "Write the generated block of the overrides file (where Ansible does not)",
-		Long: "Writes the block at the top of the overrides file: the how-to, these commands\n" +
-			"and what the agent's configuration deploys on this host. Entries below the\n" +
-			"block are kept. Ansible writes the same block with upgradoor deploy.",
+		Short: "Lay out the overrides file now (the agent also does it by itself)",
+		Long: "Creates the overrides file when it is missing and writes an entry with the\n" +
+			"default image and command line of each container that can be overridden.\n" +
+			"Every other line is kept.",
 		Args: cobra.NoArgs,
 	}
 

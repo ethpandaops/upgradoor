@@ -873,7 +873,7 @@ func (b *worldBuilder) host(name string, weight uint64, roles ...string) *fleet.
 	}
 
 	if weight > 0 {
-		h.Validators = &identity.ValidatorRange{Start: b.nextValidator, End: b.nextValidator + weight}
+		h.Validators = []identity.ValidatorRange{{Start: b.nextValidator, End: b.nextValidator + weight}}
 		b.nextValidator += weight
 	}
 
@@ -1188,14 +1188,14 @@ func queueReasons(p *Plan) map[string]string {
 	return out
 }
 
-// testGroup is the roll group the tests put the containers of an image in:
-// one group per image.
-func testGroup(image string) string { return "g-" + image }
+// testKind is the kind the tests label the containers of an image with:
+// one rollout unit per image.
+func testKind(image string) protocol.ContainerKind { return protocol.ContainerKind("g-" + image) }
 
 // imageKey is the key of the group rollout of one tag that moved, for the
-// needs of containers without a group.
-func imageKey(client, image, digest string) string {
-	return groupKey(testGroup(image), client, []fleet.RolloutTarget{{Image: image, Digest: digest}})
+// needs of containers of a team (none: empty).
+func imageKey(team, image, digest string) string {
+	return groupKey(testKind(image), team, []fleet.RolloutTarget{{Image: image, Digest: digest}})
 }
 
 func imageNeed(container, image, to string) protocol.Need {
@@ -1203,7 +1203,7 @@ func imageNeed(container, image, to string) protocol.Need {
 		ID:   protocol.ImageNeedID(container, to),
 		Kind: protocol.NeedImage,
 		Image: &protocol.ImageNeed{
-			Container: container, Group: testGroup(image), Image: image, FromDigest: digestOld, ToDigest: to,
+			Container: container, Kind: testKind(image), Image: image, FromDigest: digestOld, ToDigest: to,
 		},
 	}
 }
@@ -1236,7 +1236,7 @@ func rebootNeed() protocol.Need {
 func container(name, image, running, registryDigest string, checked time.Time) protocol.Container {
 	return protocol.Container{
 		Name: name, Image: image, Digest: running, State: "running",
-		Managed: true, ConfiguredImage: image, Group: testGroup(image),
+		Managed: true, ConfiguredImage: image, Kind: testKind(image), Impact: protocol.ImpactNode,
 		Registry: &protocol.RegistryCheck{Digest: registryDigest, CheckedAt: checked, Pulled: true},
 	}
 }

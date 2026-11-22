@@ -144,10 +144,6 @@ func (o *operation) recreate(ctx context.Context, task *plan.Recreate) {
 		log = log.WithFields(logrus.Fields{keyImage: rec.Image, "flags": rec.SetCommand})
 	}
 
-	if rec.Group != "" {
-		log = log.WithField("group", rec.Group)
-	}
-
 	ref := cmp.Or(rec.Image, view.Container(name).Image)
 	wasDisrupted := o.disrupted()
 	// After a drain the container stays stopped until the host is back; a
@@ -161,7 +157,9 @@ func (o *operation) recreate(ctx context.Context, task *plan.Recreate) {
 
 	log.WithField("start", start).Info("recreating container")
 
-	change := host.Change(rec)
+	change := host.Change{
+		Image: rec.Image, Command: rec.Command, SetCommand: rec.SetCommand, Base: rec.Base, SetBase: rec.SetBase,
+	}
 	cctx, cancel := context.WithTimeout(ctx, timeout+recreateGrace)
 	err = o.r.deps.Host.Recreate(cctx, name, task.Digest, timeout, start, &change)
 

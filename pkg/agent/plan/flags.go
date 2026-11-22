@@ -7,10 +7,11 @@ import (
 	"strings"
 )
 
-// Bounds of the flags of one override.
+// Bounds of the flags and the command of one override.
 const (
 	maxFlags   = 64
 	maxFlagLen = 2048
+	maxArgs    = 512
 )
 
 // applyFlags returns a copy of command with remove, then add applied; it is
@@ -105,4 +106,48 @@ func validateFlags(add, remove []string) error {
 	}
 
 	return nil
+}
+
+// validateCommand checks the command line of an override.
+func validateCommand(command []string) error {
+	if len(command) > maxArgs {
+		return fmt.Errorf("a command of more than %d arguments", maxArgs)
+	}
+
+	for _, arg := range command {
+		switch {
+		case len(arg) > maxFlagLen:
+			return errors.New("a command argument is too long")
+		case strings.ContainsAny(arg, "\x00\r\n"):
+			return fmt.Errorf("command argument %q has a control character", arg)
+		}
+	}
+
+	return nil
+}
+
+// commandDelta lists the arguments of to that from lacks and those of from
+// that to lacks, each in its order, counting repeated arguments.
+func commandDelta(from, to []string) (added, removed []string) {
+	left := make(map[string]int, len(from))
+	for _, arg := range from {
+		left[arg]++
+	}
+
+	for _, arg := range to {
+		if left[arg] > 0 {
+			left[arg]--
+		} else {
+			added = append(added, arg)
+		}
+	}
+
+	for _, arg := range from {
+		if left[arg] > 0 {
+			left[arg]--
+			removed = append(removed, arg)
+		}
+	}
+
+	return added, removed
 }

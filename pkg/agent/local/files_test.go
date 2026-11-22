@@ -4,10 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"maps"
 	"os"
 	"path/filepath"
-	"slices"
 	"strings"
 	"sync"
 	"syscall"
@@ -17,6 +15,7 @@ import (
 	"github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"gopkg.in/yaml.v3"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -92,16 +91,10 @@ func (tf *testFiles) set(container string, entry *plan.Entry, who string) error 
 	return err
 }
 
-func blockText(deployed map[string]plan.Deployed) string {
-	return strings.Join(generatedBlock(deployed), "\n") + "\n"
-}
-
-// A change replaces one entry and no other byte.
+// A change replaces the fields of one entry and no other byte.
 func TestSetEntryKeepsEveryOtherByte(t *testing.T) {
 	tf := newTestFiles(t)
-	block := blockText(nil)
-	tf.write(t, block+`
-# my notes
+	tf.write(t, `# my notes
 overrides:
 
   # keep an eye on this one
@@ -111,6 +104,8 @@ overrides:
 
       by: me
   geth:
+    # default image: ethpandaops/geth:master
+    # mine
     image: ethpandaops/geth:old
     by: me
 
@@ -118,13 +113,12 @@ overrides:
 `)
 
 	entry := &plan.Entry{
-		Image: "ethpandaops/geth:fix", Add: []string{"--a=b", "--c \"d\""}, By: "sam@example.org",
+		Image: "ethpandaops/geth:fix", Command: []string{"--a=b", "--c \"d\"", "x: y"}, HasCommand: true, By: "sam@example.org",
 		Reason: "why: because", Until: untilOf(time.Hour),
 	}
 	require.NoError(t, tf.set("geth", entry, "sam@example.org"))
 
-	assert.Equal(t, block+`
-# my notes
+	assert.Equal(t, `# my notes
 overrides:
 
   # keep an eye on this one
@@ -133,12 +127,16 @@ overrides:
       reason: testing
 
       by: me
-  # [geth] 2026-11-20T16:00:00Z sam@example.org: set image ethpandaops/geth:fix, flags +--a=b +--c "d"; was image ethpandaops/geth:old
-  "geth":
-    image: "ethpandaops/geth:fix"
-    flags:
-      add: ["--a=b", "--c \"d\""]
-    by: "sam@example.org"
+  # [geth] 2026-11-20T16:00:00Z sam@example.org: set image ethpandaops/geth:fix, command --a=b --c "d" x: y; was image ethpandaops/geth:old
+  geth:
+    # default image: ethpandaops/geth:master
+    # mine
+    image: ethpandaops/geth:fix
+    command:
+      - --a=b
+      - --c "d"
+      - "x: y"
+    by: sam@example.org
     reason: "why: because"
     until: 2026-11-20T17:00:00Z
 
@@ -146,19 +144,19 @@ overrides:
 `, tf.read(t))
 
 	files := tf.Load()
-	assert.Equal(t, entry.Add, files.Entries["geth"].Add)
+	assert.Equal(t, entry.Command, files.Entries["geth"].Command)
 
-	// Removing it keeps the history and the other entry.
+	// Clearing it puts the commented structure back and keeps the rest.
 	tf.now = fileTime.Add(30 * time.Minute)
 	require.NoError(t, tf.set("geth", nil, "upgradoor"))
 
 	files = tf.Load()
 	assert.NotContains(t, files.Entries, "geth")
 	assert.Equal(t, "sigp/lighthouse:unstable", files.Entries["beacon"].Image)
-	assert.Contains(t, tf.read(t), "--c \"d\"; was image ethpandaops/geth:old\n"+
-		"  # [geth] 2026-11-20T16:30:00Z upgradoor: cleared; was image ethpandaops/geth:fix, flags +--a=b +--c \"d\"\n"+
-		"\n# the end\n")
-	assert.True(t, strings.HasPrefix(tf.read(t), block), "the generated block is kept byte for byte")
+	assert.Contains(t, tf.read(t), "x: y; was image ethpandaops/geth:old\n"+
+		"  # [geth] 2026-11-20T16:30:00Z upgradoor: cleared; was image ethpandaops/geth:fix, command --a=b --c \"d\" x: y\n"+
+		"  geth:\n    # default image: ethpandaops/geth:master\n    # mine\n"+
+		"    # image:\n    # command:\n    # reason:\n    # until:\n\n# the end\n")
 
 	// Only the newest history lines are kept.
 	for i := range 2 * maxHistory {
@@ -168,16 +166,18 @@ overrides:
 	assert.Equal(t, maxHistory, strings.Count(tf.read(t), "# [geth] "))
 	assert.NotContains(t, tf.read(t), "cleared")
 	assert.Contains(t, tf.read(t), "# keep an eye on this one\n  beacon:\n")
+	assert.Equal(t, 1, strings.Count(tf.read(t), "image: a/b:"))
 }
 
 func TestSetEntryWhereThereIsNothing(t *testing.T) {
 	entry := &plan.Entry{Image: "a/b:c", By: "x", Reason: "y"}
 	added := "  # [geth] 2026-11-20T16:00:00Z x: set image a/b:c; was nothing\n" +
-		"  \"geth\":\n    image: \"a/b:c\"\n    by: \"x\"\n    reason: \"y\"\n"
+		"  geth:\n    image: a/b:c\n    by: x\n    reason: y\n"
 
 	for name, tt := range map[string]struct{ before, want string }{
 		"no file":          {"", "overrides:\n" + added},
 		"an empty mapping": {"overrides: {}\n", "overrides:\n" + added},
+		"an empty entry":   {"overrides:\n  geth: {}\n", "overrides:\n" + added},
 		"comments only":    {"# notes", "# notes\n\noverrides:\n" + added},
 		"CRLF":             {"# notes\r\noverrides:\r\n", "# notes\noverrides:\n" + added},
 	} {
@@ -194,6 +194,9 @@ func TestSetEntryWhereThereIsNothing(t *testing.T) {
 
 	tf := newTestFiles(t)
 	tf.write(t, "overrides: {geth: {image: a}}\n")
+	require.ErrorContains(t, tf.set("geth", entry, "x"), "indented block")
+
+	tf.write(t, "overrides:\n  geth: {image: a}\n")
 	require.ErrorContains(t, tf.set("geth", entry, "x"), "indented block")
 }
 
@@ -262,30 +265,18 @@ func TestTextIsOneLine(t *testing.T) {
 	require.True(t, files.Known)
 	assert.Equal(t, "sam", files.Entries["geth"].By)
 	assert.Equal(t, "why", files.Entries["geth"].Reason)
-	assert.Empty(t, files.Holds)
-
-	hold := &plan.Hold{By: "c\nx", Reason: "r\ny", Teams: []string{"t\nz"}, Feature: "f\nq"}
-	require.NoError(t, tf.SetHold(plan.FromController, hold, "controller:c\nx", "set: r\ny"))
-
-	files = tf.Load()
-	assert.Equal(t, plan.Hold{By: "c", Reason: "r", Teams: []string{"t"}, Feature: "f"},
-		files.Holds[plan.HoldController])
-	assert.Equal(t, 2, strings.Count(tf.read(t), "# ["), "one history line per change")
+	assert.Equal(t, 1, strings.Count(tf.read(t), "# ["), "one history line per change")
 }
 
 func TestParse(t *testing.T) {
-	block := blockText(map[string]plan.Deployed{
-		"geth":   {Image: "ethpandaops/geth:master", Command: []string{"--http", "--a=b c"}, HasCommand: true},
-		"beacon": {Image: "sigp/lighthouse:latest", Command: []string{}, HasCommand: true},
-	})
-
 	for name, content := range map[string]string{
 		"empty":                "",
-		"the generated block":  block,
-		"the key alone":        block + "\noverrides:\n",
+		"the key alone":        "overrides:\n",
 		"an empty mapping":     "overrides: {}\n",
 		"only comments in it":  "overrides:\n  # [geth] 2026-11-20T16:00:00Z sam: cleared\n",
 		"an entry without any": "overrides:\n  geth:\n",
+		"the structure":        "overrides:\n  geth:\n    # default image: a/b:c\n    # image:\n    # command:\n",
+		"fields without value": "overrides:\n  geth:\n    image:\n    command:\n",
 	} {
 		t.Run(name, func(t *testing.T) {
 			files, err := parse([]byte(content))
@@ -295,47 +286,37 @@ func TestParse(t *testing.T) {
 		})
 	}
 
-	files, err := parse([]byte(block + `
+	files, err := parse([]byte(`
 overrides:
   geth:
     image: ethpandaops/geth:fix
-    flags:
-      add: ["--verbosity=4", --pprof]
-      remove:
-        - --maxpeers
+    command:
+      - geth
+      - "--verbosity=4"
+      - --pprof
     by: sam
     reason: "sync: stuck"
     until: 2026-11-21T16:00:00Z
   beacon:
     image: sigp/lighthouse:unstable
+  teku:
+    command: []
 `))
 	require.NoError(t, err)
 
-	assert.Equal(t, plan.Deployed{
-		Image: "ethpandaops/geth:master", Command: []string{"--http", "--a=b c"}, HasCommand: true,
-	}, files.Deployed["geth"])
-	assert.Equal(t, plan.Deployed{Image: "sigp/lighthouse:latest", Command: []string{}, HasCommand: true},
-		files.Deployed["beacon"])
-
-	// An entry without a command keeps the container's.
-	own, err := parse([]byte("deployed:\n  geth:\n    image: \"a/geth:1\"\n"))
-	require.NoError(t, err)
-	assert.Equal(t, plan.Deployed{Image: "a/geth:1"}, own.Deployed["geth"])
-
-	_, err = parse([]byte("deployed:\n  geth:\n    command: []\n"))
-	require.ErrorContains(t, err, "names no image")
-
 	assert.Equal(t, plan.Entry{
-		Image: "ethpandaops/geth:fix", Add: []string{"--verbosity=4", "--pprof"},
-		Remove: []string{"--maxpeers"}, By: "sam", Reason: "sync: stuck", Until: untilOf(24 * time.Hour),
+		Image: "ethpandaops/geth:fix", Command: []string{"geth", "--verbosity=4", "--pprof"}, HasCommand: true,
+		By: "sam", Reason: "sync: stuck", Until: untilOf(24 * time.Hour),
 	}, files.Entries["geth"])
 	assert.Nil(t, files.Entries["beacon"].Until, "an end is optional by hand")
+	assert.False(t, files.Entries["beacon"].HasCommand, "an image alone keeps the default command")
+	assert.Equal(t, plan.Entry{Command: []string{}, HasCommand: true}, files.Entries["teku"])
 
 	_, err = parse([]byte("overrides: [geth\n"))
 	require.Error(t, err)
 }
 
-// Unknown fields in the overrides file are errors.
+// Unknown fields in the overrides file are errors; the old layout is refused.
 func TestParseIsStrict(t *testing.T) {
 	_, err := parse([]byte("overrides:\n  geth:\n    flag: [a]\n"))
 	require.ErrorContains(t, err, "field flag not found")
@@ -343,11 +324,19 @@ func TestParseIsStrict(t *testing.T) {
 	_, err = parse([]byte("overides:\n  geth:\n    image: a/b:c\n"))
 	require.ErrorContains(t, err, "field overides not found")
 
-	_, err = parse([]byte("hold:\n  somebody: {reason: x}\n"))
-	require.ErrorContains(t, err, "unknown hold")
-
 	_, err = parse([]byte("overrides:\n  beacon:\n    image: x/y:z\n---\noverrides:\n  geth:\n    image: a/b:c\n"))
 	require.EqualError(t, err, "the overrides file holds more than one YAML document")
+
+	for name, content := range map[string]string{
+		"flags":    "overrides:\n  geth:\n    flags:\n      add: [--a]\n",
+		"deployed": "deployed:\n  geth:\n    image: a/geth:1\n",
+		"hold":     "overrides:\nhold: {}\n",
+		"block": "overrides:\n\n# >>> upgradoor generated block: written by Ansible through upgradoor deploy, do not edit >>>\n" +
+			"# <<< upgradoor generated block <<<\n",
+	} {
+		_, err := parse([]byte(content))
+		require.ErrorIs(t, err, errOldFormat, name)
+	}
 }
 
 func TestLoad(t *testing.T) {
@@ -355,18 +344,25 @@ func TestLoad(t *testing.T) {
 
 	files := tf.Load()
 	assert.True(t, files.Known, "no file is no overrides")
+	assert.False(t, files.Disabled)
 
 	tf.write(t, "overrides: [geth\n")
 
 	files = tf.Load()
 	assert.False(t, files.Known, "a broken file is not no overrides")
 	assert.NotContains(t, files.Err, "\n")
-	assert.True(t, strings.HasPrefix(files.Err, "yaml: "), files.Err)
+	assert.True(t, strings.HasPrefix(files.Err, "the overrides file cannot be read: yaml: "), files.Err)
 
 	_, _, err := tf.SetEntry("geth", "x", func(*plan.Entry) (*plan.Entry, error) { return nil, plan.Refusal("x") })
-	require.EqualError(t, err, "the overrides file cannot be read: "+files.Err)
-	assert.Equal(t, protocol.Hold{Local: true, LocalReason: "the overrides file cannot be read: " + files.Err},
-		plan.HoldState(&files, fileTime))
+	require.EqualError(t, err, files.Err)
+	assert.Equal(t, protocol.Hold{Local: true, LocalReason: files.Err}, plan.HoldState(&files, fileTime))
+
+	tf.write(t, "deployed: {}\n")
+	assert.Equal(t, "the overrides file cannot be read: "+errOldFormat.Error(), tf.Load().Err)
+
+	_, err = tf.Layout(map[string]plan.Deployed{"geth": {Image: "a/geth:1"}}, nil)
+	require.ErrorContains(t, err, "old format")
+	assert.Equal(t, "deployed: {}\n", tf.read(t), "an old file is left as it is")
 }
 
 // The overrides file is read only up to 1 MiB.
@@ -394,7 +390,7 @@ func TestLoadExpiresAndAuditsHandEdits(t *testing.T) {
 	assert.Empty(t, tf.audit.recs)
 
 	// A hand edit is.
-	tf.write(t, strings.Replace(tf.read(t), `"a/beacon:fix"`, `"a/beacon:other"`, 1))
+	tf.write(t, strings.Replace(tf.read(t), `image: a/beacon:fix`, `image: a/beacon:other`, 1))
 	tf.Load()
 	require.Len(t, tf.audit.recs, 1)
 	assert.Equal(t, Record{
@@ -402,12 +398,13 @@ func TestLoadExpiresAndAuditsHandEdits(t *testing.T) {
 		Before: "image a/beacon:fix", After: "image a/beacon:other", Reason: "r", Result: Accepted,
 	}, tf.audit.recs[0])
 
-	// At its end the entry is gone and taken out of the file.
+	// At its end the entry's fields are taken out of the file.
 	tf.now = fileTime.Add(time.Hour)
 	files = tf.Load()
 	assert.NotContains(t, files.Entries, "geth")
-	assert.NotContains(t, tf.read(t), "a/geth:fix\n")
-	assert.Contains(t, tf.read(t), "# mine\noverrides:\n  # [geth] 2026-11-20T17:00:00Z upgradoor: expired; was image a/geth:fix by sam\n")
+	assert.Contains(t, tf.read(t), "# mine\noverrides:\n"+
+		"  # [geth] 2026-11-20T17:00:00Z upgradoor: expired; was image a/geth:fix by sam\n"+
+		"  geth:\n    # image:\n    # command:\n    # reason:\n    # until:\n")
 	require.Len(t, tf.audit.recs, 2)
 	assert.Equal(t, Record{
 		Action: "override.expire", Source: SourceAgent, Container: "geth", User: "sam",
@@ -425,121 +422,179 @@ func TestLoadExpiresAndAuditsHandEdits(t *testing.T) {
 	assert.Equal(t, plan.NoOverride, tf.audit.recs[2].After)
 }
 
-func TestHolds(t *testing.T) {
-	tf := newTestFiles(t)
-	hold := func() protocol.Hold {
-		files := tf.Load()
+// header is the first lines of a file the agent laid out.
+const header = headerLine + "\n" + commandsLine + "\n\n"
 
-		return plan.HoldState(&files, tf.now)
+var (
+	beaconDefault = plan.Deployed{
+		Image: "sigp/lighthouse:latest", Command: []string{"lighthouse", "beacon_node"}, HasCommand: true,
 	}
+	gethDefault = plan.Deployed{Image: "ethereum/client-go:stable", Command: []string{"--datadir=/data"}, HasCommand: true}
+)
 
-	assert.Equal(t, protocol.Hold{}, hold(), "no file is no hold")
+// emptyEntry is a laid-out entry without an override.
+const emptyEntry = "    # image:\n    # command:\n    # reason:\n    # until:\n"
 
-	sam := plan.ControllerHold("maintenance\nwindow",
-		&protocol.Actor{User: "sam@example.org", Teams: []string{"lighthouse"}, Feature: "team_hold"})
-	require.NoError(t, tf.SetHold(plan.FromController, &sam, "controller:"+sam.By, "set: "+sam.Reason))
-	assert.Equal(t, protocol.Hold{Controller: true}, hold())
-
-	raw := tf.read(t)
-	assert.Contains(t, raw, "hold:\n  # [hold:controller] 2026-11-20T16:00:00Z controller:sam@example.org: set: maintenance\n"+
-		"  controller:\n    by: \"sam@example.org\"\n    reason: \"maintenance\"\n    teams: [\"lighthouse\"]\n"+
-		"    feature: \"team_hold\"\n")
-
-	// The local hold, by hand, next to it.
-	tf.write(t, raw+"  local:\n    by: pk\n    reason: debugging teku\n")
-	assert.Equal(t, protocol.Hold{Local: true, LocalReason: "debugging teku", Controller: true}, hold())
-
-	// Releasing the controller hold leaves the local one alone.
-	require.NoError(t, tf.SetHold(plan.FromController, nil, "controller", "released"))
-	require.NoError(t, tf.SetHold(plan.FromController, nil, "controller", "released"), "releasing twice is fine")
-	assert.Equal(t, protocol.Hold{Local: true, LocalReason: "debugging teku"}, hold())
-
-	// A local hold whose end has passed holds no more.
-	require.NoError(t, tf.SetHold(plan.FromLocal, &plan.Hold{By: "pk", Reason: "until noon", Until: untilOf(-4 * time.Hour)},
-		"pk", "set: until noon"))
-	assert.False(t, hold().Active())
-
-	require.NoError(t, tf.SetHold(plan.FromLocal, nil, "local:pk", "released"))
-	assert.NotContains(t, tf.Load().Holds, plan.HoldLocal)
-
-	// A file that cannot be read holds, and is not written.
-	tf.write(t, "hold: [broken\n")
-	assert.True(t, hold().Local)
-	require.ErrorContains(t, tf.SetHold(plan.FromLocal, nil, "pk", "released"), "cannot be read")
-}
-
-func TestInitBlock(t *testing.T) {
+// A missing file is created with an entry per container; an override fills
+// one, a clear puts the structure back.
+func TestLayout(t *testing.T) {
 	tf := newTestFiles(t)
-	old := blockText(map[string]plan.Deployed{"geth": {Image: "a/geth:1"}})
-	rest := "\noverrides:\n  geth:\n    image: a/geth:2\n"
-	tf.write(t, old+rest)
+	both := map[string]plan.Deployed{"beacon": beaconDefault, "execution": gethDefault}
 
-	deployed := map[string]plan.Deployed{
-		"geth":   {Image: "a/geth:3", Command: []string{"--x"}, HasCommand: true},
-		"beacon": {Image: "a/beacon:1", Command: nil, HasCommand: true},
-	}
-	require.NoError(t, tf.InitBlock(deployed))
-	assert.Equal(t, blockText(deployed)+rest, tf.read(t))
-	assert.Contains(t, tf.read(t), "deployed:\n  \"beacon\":\n    image: \"a/beacon:1\"\n    command: []\n"+
-		"  \"geth\":\n    image: \"a/geth:3\"\n    command: [\"--x\"]\n# <<<")
-	assert.Contains(t, tf.read(t), "#   upgradoor override clear <container>\n")
-	assert.NotContains(t, tf.read(t), "upgradoor host")
-
-	files := tf.Load()
-	assert.Equal(t, deployed["geth"], files.Deployed["geth"])
-
-	tf.write(t, "overrides:\n")
-	require.NoError(t, tf.InitBlock(nil))
-	assert.Equal(t, blockText(nil)+"\noverrides:\n", tf.read(t))
-}
-
-// A deploy writes one entry of the block; reset takes out the override and
-// keeps the holds; nothing changed is not written.
-func TestSetDeployed(t *testing.T) {
-	tf := newTestFiles(t)
-	beacon := plan.Deployed{Image: "a/beacon:1"}
-	rest := "\noverrides:\n  geth:\n    image: a/geth:fix\n    by: me\n" +
-		"hold:\n  local:\n    by: me\n    reason: disk\n"
-	tf.write(t, blockText(map[string]plan.Deployed{"beacon": beacon})+rest)
-
-	geth := plan.Deployed{Image: "a/geth:2", Command: []string{"--x"}, HasCommand: true}
-	changed, err := tf.SetDeployed("geth", geth, false, "local:root")
+	changed, err := tf.Layout(both, []string{"dora"})
 	require.NoError(t, err)
 	assert.True(t, changed)
-	assert.Equal(t, blockText(map[string]plan.Deployed{"beacon": beacon, "geth": geth})+rest, tf.read(t))
 
-	before, err := os.Stat(tf.path)
-	require.NoError(t, err)
+	beacon := "  beacon:\n    # default image: sigp/lighthouse:latest\n    # default command:\n" +
+		"    #   - lighthouse\n    #   - beacon_node\n" + emptyEntry
+	execution := "  execution:\n    # default image: ethereum/client-go:stable\n    # default command:\n" +
+		"    #   - --datadir=/data\n"
+	assert.Equal(t, header+"overrides:\n"+beacon+execution+emptyEntry, tf.read(t))
+	assert.Empty(t, tf.Load().Entries)
 
-	changed, err = tf.SetDeployed("geth", geth, false, "local:root")
+	require.NoError(t, tf.set("execution", &plan.Entry{
+		Image: "ethpandaops/geth:fix", Command: []string{"--datadir=/data", "--verbosity=5"}, HasCommand: true,
+		By: "lh-dev", Reason: "debug", Until: untilOf(44 * time.Hour),
+	}, "lh-dev"))
+
+	set := "  # [execution] 2026-11-20T16:00:00Z lh-dev: set image ethpandaops/geth:fix, " +
+		"command --datadir=/data --verbosity=5; was nothing\n"
+	assert.Equal(t, header+"overrides:\n"+beacon+set+execution+`    image: ethpandaops/geth:fix
+    command:
+      - --datadir=/data
+      - --verbosity=5
+    by: lh-dev
+    reason: debug
+    until: 2026-11-22T12:00:00Z
+`, tf.read(t))
+
+	// Once more: nothing moves.
+	changed, err = tf.Layout(both, nil)
 	require.NoError(t, err)
 	assert.False(t, changed)
 
-	after, err := os.Stat(tf.path)
-	require.NoError(t, err)
-	assert.True(t, os.SameFile(before, after), "not written again")
+	// Clearing it puts the structure back under the default lines.
+	require.NoError(t, tf.set("execution", nil, "lh-dev"))
+	assert.Equal(t, header+"overrides:\n"+beacon+set+
+		"  # [execution] 2026-11-20T16:00:00Z lh-dev: cleared; was image ethpandaops/geth:fix, "+
+		"command --datadir=/data --verbosity=5\n"+execution+emptyEntry, tf.read(t))
+	assert.Empty(t, tf.Load().Entries)
+}
 
-	changed, err = tf.SetDeployed("geth", geth, true, "local:root")
+// The default lines follow the default; active fields and every other
+// comment stay. A container no longer overridable loses its default lines,
+// a new one gets an entry.
+func TestLayoutRefreshesDefaults(t *testing.T) {
+	tf := newTestFiles(t)
+	tf.write(t, `# upgradoor overrides: edit below, the agent applies changes within a minute.
+# my own notes
+overrides:
+  beacon:
+    # default image: sigp/lighthouse:v1
+    # keep this
+    image: sigp/lighthouse:fix
+    by: me
+  # old notes
+  dora:
+    # default image: ethpandaops/dora:1
+    # default command: []
+    image: ethpandaops/dora:mine
+`)
+
+	changed, err := tf.Layout(map[string]plan.Deployed{"beacon": beaconDefault, "execution": gethDefault}, []string{"dora"})
 	require.NoError(t, err)
 	assert.True(t, changed)
 
+	assert.Equal(t, headerLine+"\n"+commandsLine+`
+# my own notes
+overrides:
+  beacon:
+    # default image: sigp/lighthouse:latest
+    # default command:
+    #   - lighthouse
+    #   - beacon_node
+    # keep this
+    image: sigp/lighthouse:fix
+    by: me
+  # old notes
+  dora:
+    image: ethpandaops/dora:mine
+  execution:
+    # default image: ethereum/client-go:stable
+    # default command:
+    #   - --datadir=/data
+`+emptyEntry, tf.read(t))
+
 	files := tf.Load()
-	assert.Empty(t, files.Entries)
-	assert.Contains(t, files.Holds, plan.HoldLocal)
-	assert.Equal(t, map[string]plan.Deployed{"beacon": beacon, "geth": geth}, files.Deployed)
-	assert.Contains(t, tf.read(t), "# [geth] 2026-11-20T16:00:00Z local:root: cleared by deploy --reset; "+
-		"was image a/geth:fix\n")
+	assert.Equal(t, "sigp/lighthouse:fix", files.Entries["beacon"].Image)
+	assert.Equal(t, "ethpandaops/dora:mine", files.Entries["dora"].Image)
 
-	changed, err = tf.SetDeployed("geth", geth, true, "local:root")
+	// A container without a command shows only its image; an entry without
+	// default lines gets them right below its name.
+	tf.write(t, header+"overrides:\n  beacon:\n    # mine\n    image: a/b:c\n")
+	_, err = tf.Layout(map[string]plan.Deployed{"beacon": {Image: "a/b:1"}}, nil)
 	require.NoError(t, err)
-	assert.False(t, changed, "nothing left to reset")
+	assert.Equal(t, header+"overrides:\n  beacon:\n    # default image: a/b:1\n    # mine\n    image: a/b:c\n", tf.read(t))
 
-	_, err = tf.SetDeployed("../x", geth, false, "local:root")
+	_, err = tf.Layout(map[string]plan.Deployed{"beacon": {Image: "a/b:1", Command: []string{}, HasCommand: true}}, nil)
+	require.NoError(t, err)
+	assert.Contains(t, tf.read(t), "    # default image: a/b:1\n    # default command: []\n    # mine\n")
+}
+
+func TestDisabled(t *testing.T) {
+	f := NewFiles(quiet(), "", &recorder{}, time.Now)
+
+	assert.Empty(t, f.Path())
+
+	files := f.Load()
+	assert.True(t, files.Known)
+	assert.True(t, files.Disabled)
+
+	_, _, err := f.SetEntry("geth", "x", func(*plan.Entry) (*plan.Entry, error) {
+		t.Fatal("build called")
+
+		return nil, nil //nolint:nilnil // never called.
+	})
+	require.EqualError(t, err, "refused: overrides are disabled on this host")
 	require.ErrorIs(t, err, plan.ErrRefused)
 
-	tf.write(t, "hold: [broken\n")
-	_, err = tf.SetDeployed("geth", geth, false, "local:root")
-	require.ErrorContains(t, err, "cannot be read")
+	_, err = f.Layout(map[string]plan.Deployed{"geth": {Image: "a/b:c"}}, nil)
+	require.ErrorIs(t, err, plan.ErrRefused)
+}
+
+func TestScalar(t *testing.T) {
+	for in, want := range map[string]string{
+		"--datadir=/data":    "--datadir=/data",
+		"sigp/lighthouse:v1": "sigp/lighthouse:v1",
+		"lighthouse":         "lighthouse",
+		"":                   `""`,
+		"true":               `"true"`,
+		"8545":               `"8545"`,
+		"a: b":               `"a: b"`,
+		"a #b":               `"a #b"`,
+		"- x":                `"- x"`,
+		" x":                 `" x"`,
+		"*x":                 `"*x"`,
+		"--name value":       "--name value",
+		"--graffiti=\"x\"":   "--graffiti=\"x\"",
+		"'quoted'":           `"'quoted'"`,
+		"{a}":                `"{a}"`,
+		"x\ny":               `"x\ny"`,
+	} {
+		assert.Equal(t, want, scalar(in), in)
+		assert.Equal(t, in, yamlString(t, scalar(in)), in)
+	}
+}
+
+// yamlString reads a scalar as the file would.
+func yamlString(t *testing.T, s string) string {
+	t.Helper()
+
+	var out []string
+	require.NoError(t, yaml.Unmarshal([]byte("- "+s), &out))
+	require.Len(t, out, 1)
+
+	return out[0]
 }
 
 // Files in the entry user's home are replaced by rename, owner and mode kept.
@@ -597,7 +652,7 @@ func TestFileWithTwoNamesIsNotRead(t *testing.T) {
 
 	files := tf.Load()
 	assert.False(t, files.Known)
-	assert.Equal(t, "the overrides file has more than one name", files.Err)
+	assert.Equal(t, "the overrides file cannot be read: the overrides file has more than one name", files.Err)
 	require.ErrorContains(t, tf.set("geth", &plan.Entry{Image: "a/b:c"}, "x"), "more than one name")
 	assert.Equal(t, "overrides:\n", tf.read(t))
 }
@@ -643,13 +698,14 @@ func TestFileInAReplaceableDirectoryIsNotRead(t *testing.T) {
 	f.unsafe = unsafe
 	got := f.Load()
 	assert.False(t, got.Known)
-	assert.Equal(t, unsafe, got.Err)
+	assert.Equal(t, "the overrides file cannot be read: "+unsafe, got.Err)
 
 	_, _, err := f.SetEntry("geth", "x", func(*plan.Entry) (*plan.Entry, error) {
 		return &plan.Entry{Image: "a/b:c"}, nil
 	})
 	require.ErrorContains(t, err, "can be replaced")
-	require.ErrorContains(t, f.InitBlock(nil), "can be replaced")
+	_, err = f.Layout(nil, nil)
+	require.ErrorContains(t, err, "can be replaced")
 
 	// A sticky directory is fine.
 	require.NoError(t, os.Chmod(open, os.ModeSticky|0o777))
@@ -668,16 +724,12 @@ func TestNewFilesRemovesTempFiles(t *testing.T) {
 	assert.FileExists(t, filepath.Join(dir, "other.tmp-1"))
 }
 
-// Text from the controller or the socket cannot add a hold or another entry.
+// Text from the controller or the socket cannot add another entry or key.
 func TestTextCannotBreakOut(t *testing.T) {
-	for name, sep := range map[string]string{"newline": "\n", "line separator": " ", "paragraph separator": " "} {
+	for name, sep := range map[string]string{"newline": "\n", "line separator": "\u2028", "paragraph separator": "\u2029"} {
 		t.Run(name, func(t *testing.T) {
 			tf := newTestFiles(t)
 			tf.write(t, "overrides:\n  geth:\n    image: a/b:c\n")
-
-			h := plan.ControllerHold("maintenance"+sep+"  local:"+sep+"    by: \"evil\""+sep+
-				"    reason: \"injected\" #", nil)
-			require.NoError(t, tf.SetHold(plan.FromController, &h, "controller:"+h.By, "set: "+h.Reason))
 
 			who := "sam" + sep + "  beacon:" + sep + "    image: \"evil/img:tag\"" + sep + "    by: x #"
 			require.NoError(t, tf.set("geth", &plan.Entry{Image: "a/b:d", By: who, Reason: "y"}, who))
@@ -692,16 +744,14 @@ func TestTextCannotBreakOut(t *testing.T) {
 
 			files := tf.Load()
 			require.True(t, files.Known, files.Err)
-			assert.Equal(t, []string{plan.HoldController}, slices.Collect(maps.Keys(files.Holds)))
 			assert.Empty(t, files.Entries)
 		})
 	}
 }
 
-// A change that would alter any other part of the document is not written.
+// A change that would alter any other entry is not written.
 func TestChangeOfOtherPartsIsRefused(t *testing.T) {
-	doc := "deployed:\n  geth:\n    image: a/geth:1\n" +
-		"overrides:\n  geth:\n    image: a/b:c\nhold:\n  controller:\n    by: c\n"
+	doc := "overrides:\n  geth:\n    image: a/b:c\n  beacon:\n    image: a/beacon:1\n"
 	read := func(content string) plan.Overrides {
 		t.Helper()
 
@@ -711,28 +761,21 @@ func TestChangeOfOtherPartsIsRefused(t *testing.T) {
 		return out
 	}
 	before := read(doc)
-	named := []string{"geth"}
 
-	withHold := read(doc + "  local:\n    by: evil\n")
-	require.ErrorContains(t, unchanged(&before, &withHold, named, nil), "would alter other parts")
+	withEntry := read(doc + "  teku:\n    image: evil/img:tag\n")
+	require.ErrorContains(t, unchanged(&before, &withEntry, "geth"), "would alter other parts")
 
-	withEntry := read(doc)
-	withEntry.Entries["beacon"] = plan.Entry{Image: "evil/img:tag"}
-	require.ErrorContains(t, unchanged(&before, &withEntry, named, nil), "would alter other parts")
+	other := read(doc)
+	other.Entries["beacon"] = plan.Entry{Image: "evil/img:tag"}
+	require.ErrorContains(t, unchanged(&before, &other, "geth"), "would alter other parts")
 
-	withDeployed := read(doc)
-	withDeployed.Deployed["geth"] = plan.Deployed{Image: "evil/img:tag"}
-	require.ErrorContains(t, unchanged(&before, &withDeployed, named, nil), "would alter other parts")
+	gone := read(doc)
+	delete(gone.Entries, "beacon")
+	require.ErrorContains(t, unchanged(&before, &gone, "geth"), "would alter other parts")
 
 	changed := read(doc)
 	changed.Entries["geth"] = plan.Entry{Image: "a/b:d"}
-	require.NoError(t, unchanged(&before, &changed, named, nil), "the named entry may change")
-
-	// The generated block must read back as asked.
-	tf := newTestFiles(t)
-	require.ErrorContains(t, tf.InitBlock(map[string]plan.Deployed{"geth": {Image: " a/geth:1"}}),
-		"would alter other parts")
-	assert.NoFileExists(t, tf.path)
+	require.NoError(t, unchanged(&before, &changed, "geth"), "the named entry may change")
 }
 
 // An expired entry that cannot be taken out is recorded once, and is no hand edit.
@@ -760,7 +803,7 @@ func TestFileIsNeverReadThroughALink(t *testing.T) {
 
 	files := tf.Load()
 	assert.False(t, files.Known)
-	assert.Equal(t, "the overrides file is a symbolic link", files.Err)
+	assert.Equal(t, "the overrides file cannot be read: the overrides file is a symbolic link", files.Err)
 
 	_, _, err := tf.SetEntry("geth", "x", func(*plan.Entry) (*plan.Entry, error) {
 		return &plan.Entry{Image: "a/b:c"}, nil
@@ -776,11 +819,11 @@ func TestFileIsNeverReadThroughALink(t *testing.T) {
 
 	files = fifo.Load()
 	assert.False(t, files.Known, "a FIFO does not block the loop")
-	assert.Equal(t, "the overrides file is not a regular file", files.Err)
+	assert.Equal(t, "the overrides file cannot be read: the overrides file is not a regular file", files.Err)
 
 	dir := newTestFiles(t)
 	require.NoError(t, os.Mkdir(dir.path, 0o700))
-	assert.Equal(t, "the overrides file is not a regular file", dir.Load().Err)
+	assert.Equal(t, "the overrides file cannot be read: the overrides file is not a regular file", dir.Load().Err)
 }
 
 func TestOneLine(t *testing.T) {

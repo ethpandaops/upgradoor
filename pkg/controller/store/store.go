@@ -33,6 +33,12 @@ type Store interface {
 	GetHost(ctx context.Context, name string) (*fleet.Host, error)
 	// ListHosts returns all hosts ordered by name.
 	ListHosts(ctx context.Context) ([]*fleet.Host, error)
+	// ValidatorRanges returns the stored validator ranges inventory; one
+	// with no URL and no ranges before the first SetValidatorRanges.
+	ValidatorRanges(ctx context.Context) (*fleet.ValidatorRanges, error)
+	// SetValidatorRanges replaces the stored validator ranges inventory.
+	// The ranges are what GetHost and ListHosts put into Host.Validators.
+	SetValidatorRanges(ctx context.Context, ranges *fleet.ValidatorRanges) error
 	// DeleteHost removes a host with its inventory, packages and per-slot
 	// participation. Rollout, lease and audit history
 	// is kept.
@@ -118,7 +124,7 @@ type SyncResult struct {
 	// Created is true when the host was not known before.
 	Created bool
 	// Changed is false when the sync only confirmed the stored row: the same
-	// certificate, address, validator range and status apart from its clock
+	// certificate, address and status apart from its clock
 	// fields. Only last_seen, the uptime and the sync interval were written.
 	Changed bool
 	// PreviousSeen is the host's last_seen before this sync; zero for a new
@@ -129,22 +135,7 @@ type SyncResult struct {
 	// HoldAdopted is true when the host was created on hold because its
 	// agent reported a controller hold (see HoldReasonAdopted).
 	HoldAdopted bool
-	// ValidatorsBefore is the validator range counted for the host before
-	// this sync; Host.Validators is the one counted now.
-	ValidatorsBefore *identity.ValidatorRange
-	// ValidatorOverlaps names the other hosts for which validators of the
-	// range this sync reported are counted, ordered by name. Those
-	// validators stay with them, unless such a host has been silent for
-	// ValidatorClaimTTL: then they are counted for this host from now on.
-	ValidatorOverlaps []string
 }
-
-// ValidatorClaimTTL is how long the validators counted for a host are kept
-// from other hosts that report them, measured from the host's last sync. A
-// host that is gone for good must not keep the validators of its successor
-// uncounted; a host that is only being worked on (its keys reshuffled) keeps
-// syncing and keeps its claim.
-const ValidatorClaimTTL = 10 * time.Minute
 
 // HoldReasonAdopted is the hold reason of a host that reported a controller
 // hold in the sync that created its row: a controller that does not know the

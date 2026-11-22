@@ -326,6 +326,7 @@ function GateTile({ gate }: { gate: Gate | undefined }) {
         </span>
       )}
       {n.error && <span className="text-warning">beacon error: {n.error}</span>}
+      {n.validatorRangesError && <span className="text-warning">validator ranges: {n.validatorRangesError}</span>}
     </Tile>
   );
 }
@@ -551,7 +552,7 @@ function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (inte
           icon="check"
           label="Approve…"
           onAction={onAction}
-          intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.client)}
+          intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.team)}
         />
       );
       break;
@@ -561,7 +562,7 @@ function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (inte
           icon="resume"
           label="Resume…"
           onAction={onAction}
-          intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.client)}
+          intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.team)}
         />
       );
       break;

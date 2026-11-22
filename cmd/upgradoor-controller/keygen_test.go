@@ -6,7 +6,10 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/upgradoor/pkg/identity"
 )
 
 const testSeed = "keygen-test-seed-0123456789abcdef0123456789"
@@ -31,86 +34,109 @@ func runKeygen(t *testing.T, stdin string, args ...string) (string, error) {
 	return out.String(), err
 }
 
-func TestHostCertsMatchesSingleCommands(t *testing.T) {
-	in := `[
-		{"hostname": "lighthouse-geth-1", "roles": ["validator", "bootnode"]},
-		{"hostname": "teku-besu-2"},
-		{"hostname": "bootnode-1", "roles": []}
-	]`
-
-	out, err := runKeygen(t, in, "host-certs", "--network", "devnet-1")
+// A certificate issued for a host's public key verifies against the signer
+// key and certifies that key.
+func TestHostCertCertifiesThePublicKey(t *testing.T) {
+	key, err := identity.GenerateHostKey()
 	require.NoError(t, err)
 
-	var got map[string]hostFiles
-	require.NoError(t, json.Unmarshal([]byte(out), &got))
-	require.Len(t, got, 3)
+	pub := identity.EncodePublicKey(identity.PublicKey(key))
 
-	single := []struct {
-		hostname string
-		flags    []string
-	}{
-		{"lighthouse-geth-1", []string{"--role", "validator", "--role", "bootnode"}},
-		{"teku-besu-2", nil},
-		{"bootnode-1", nil},
-	}
+	cert, err := runKeygen(t, "", "host-cert", "--network", "devnet-1",
+		"--hostname", "lighthouse-geth-1", "--public-key", pub)
+	require.NoError(t, err)
 
-	for _, h := range single {
-		base := []string{"--network", "devnet-1", "--hostname", h.hostname}
+	signer, err := runKeygen(t, "", "signer-pubkey", "--network", "devnet-1")
+	require.NoError(t, err)
 
-		key, err := runKeygen(t, "", append(append([]string{"host-key"}, base...),
-			flagsWithoutRoles(h.flags)...)...)
-		require.NoError(t, err)
+	out, err := runKeygen(t, cert, "verify-cert", "--network", "devnet-1",
+		"--signer-public-key", strings.TrimSpace(signer))
+	require.NoError(t, err)
 
-		cert, err := runKeygen(t, "", append(append([]string{"host-cert"}, base...), h.flags...)...)
-		require.NoError(t, err)
+	var info identity.CertificateInfo
+	require.NoError(t, json.Unmarshal([]byte(out), &info))
+	assert.Equal(t, identity.CertificateInfo{
+		Hostname: "lighthouse-geth-1", Network: "devnet-1", PublicKey: pub,
+	}, info)
 
-		require.Equal(t, hostFiles{Key: key, Cert: cert}, got[h.hostname], h.hostname)
-	}
+	_, err = runKeygen(t, cert, "verify-cert", "--network", "devnet-2",
+		"--signer-public-key", strings.TrimSpace(signer))
+	require.ErrorIs(t, err, identity.ErrWrongNetwork)
 }
 
-// flagsWithoutRoles drops the --role pairs host-key does not take.
-func flagsWithoutRoles(flags []string) []string {
-	out := make([]string, 0, len(flags))
+func TestHostCertRejectsInput(t *testing.T) {
+	key, err := identity.GenerateHostKey()
+	require.NoError(t, err)
 
-	for i := 0; i < len(flags); i++ {
-		if flags[i] == "--role" {
-			i++
+	pub := identity.EncodePublicKey(identity.PublicKey(key))
 
-			continue
-		}
-
-		out = append(out, flags[i])
-	}
-
-	return out
-}
-
-func TestHostCertsRejectsInput(t *testing.T) {
 	tests := []struct {
-		name, in, want string
+		name string
+		args []string
 	}{
-		{"duplicate", `[{"hostname": "a"}, {"hostname": "b"}, {"hostname": "a"}]`,
-			"host 2 (a): duplicate of host 0"},
-		{"bad hostname", `[{"hostname": "a"}, {"hostname": "a/b"}]`, "host 1: hostname"},
-		{"empty hostname", `[{"roles": []}]`, "host 0: hostname"},
-		{"bad role", `[{"hostname": "a", "roles": ["x y"]}]`, "host 0 (a): role"},
-		{"unknown field", `[{"hostname": "a", "seed": "x"}]`, "host 0:"},
-		{"not an array", `{"hostname": "a"}`, "not a JSON array"},
+		{"no public key", []string{"--hostname", "a"}},
+		{"private key", []string{"--hostname", "a", "--public-key", identity.EncodePrivateKey(key)}},
+		{"bad hostname", []string{"--hostname", "a/b", "--public-key", pub}},
+		{"seed argument", []string{"--hostname", "a", "--public-key", pub, testSeed}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := runKeygen(t, tt.in, "host-certs", "--network", "devnet-1")
-			require.ErrorContains(t, err, tt.want)
+			out, err := runKeygen(t, "", append([]string{"host-cert", "--network", "devnet-1"},
+				tt.args...)...)
+			require.Error(t, err)
 			require.Empty(t, out)
 		})
 	}
 }
 
-func TestHostCertsRefusesSeedArgument(t *testing.T) {
-	_, err := runKeygen(t, "[]", "host-certs", "--network", "devnet-1", testSeed)
-	require.Error(t, err)
+// A seed file of - is standard input; the seeds still cannot be mixed up.
+func TestSeedFromStdin(t *testing.T) {
+	const ctrlSeed = "keygen-test-controller-seed-0123456789abcdef"
 
-	_, err = runKeygen(t, "[]", "host-certs", "--network", "devnet-1", "--seed", testSeed)
-	require.Error(t, err)
+	run := func(stdin string, args ...string) (string, error) {
+		var out bytes.Buffer
+
+		cmd := newKeygenCmd()
+		cmd.SetArgs(args)
+		cmd.SetIn(strings.NewReader(stdin))
+		cmd.SetOut(&out)
+		cmd.SetErr(&bytes.Buffer{})
+
+		err := cmd.Execute()
+
+		return out.String(), err
+	}
+
+	t.Setenv(seedEnv, testSeed)
+	t.Setenv(controllerSeedEnv, ctrlSeed)
+
+	fromEnv, err := run("", "signer-pubkey", "--network", "devnet-1")
+	require.NoError(t, err)
+
+	ctrlFromEnv, err := run("", "controller-pubkey", "--network", "devnet-1")
+	require.NoError(t, err)
+
+	t.Setenv(seedEnv, "")
+	t.Setenv(controllerSeedEnv, "")
+
+	out, err := run(testSeed+"\n", "signer-pubkey", "--network", "devnet-1", "--seed-file", "-")
+	require.NoError(t, err)
+	assert.Equal(t, fromEnv, out)
+
+	out, err = run(ctrlSeed, "controller-pubkey", "--network", "devnet-1",
+		"--controller-seed-file", "-")
+	require.NoError(t, err)
+	assert.Equal(t, ctrlFromEnv, out)
+
+	_, err = run(ctrlSeed, "controller-pubkey", "--network", "devnet-1", "--seed-file", "-")
+	require.ErrorContains(t, err, "is the devnet seed")
+
+	_, err = run("short", "signer-pubkey", "--network", "devnet-1", "--seed-file", "-")
+	require.ErrorIs(t, err, identity.ErrSeedTooShort)
+
+	t.Setenv(controllerSeedEnv, testSeed)
+
+	_, err = run(testSeed, "signer-pubkey", "--network", "devnet-1", "--seed-file", "-")
+	require.ErrorIs(t, err, errSameSeed)
 }

@@ -152,8 +152,8 @@ func validateClientOverride(req *scheduler.ClientOverrideRequest) error {
 		return httpjson.BadRequestf("invalid client name")
 	}
 
-	if !slices.Contains([]protocol.ContainerKind{protocol.KindEL, protocol.KindCL, protocol.KindVC}, req.Kind) {
-		return httpjson.BadRequestf("kind must be el, cl or vc")
+	if !protocol.ValidKind(req.Kind) || req.Kind == protocol.KindNone {
+		return httpjson.BadRequestf("invalid kind %q", req.Kind)
 	}
 
 	if err := validateHosts(req.Hosts, true); err != nil {

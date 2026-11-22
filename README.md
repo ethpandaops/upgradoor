@@ -78,8 +78,10 @@ one place to see which host runs what.
   sign answers for the devnets of that group, which lets them order the
   closed verb set below, and nothing else.
 - **Two seeds, two purposes.** The *devnet seed*, `secret_upgradoor_seed` in
-  the devnet's sops file, yields the signer key and one key per host. It
-  never reaches a host or the cluster. The *controller seed*,
+  the devnet's sops file, yields the signer key that certifies the hosts. It
+  never reaches a host or the cluster. A host creates its own key
+  (`upgradoor key`), which never leaves it; the certificate binds the host's
+  name and network to its public key. The *controller seed*,
   `secret_upgradoor_controller_seed`, yields the controller key of each
   devnet of a group. It is in the cluster and in the devnet repository's
   sops file, never on a host: a host holds only its own key and the
@@ -130,9 +132,9 @@ one place to see which host runs what.
 
 Hosts install only releases whose `upgradoor-manifest.txt` is signed by a key
 in `deploy/allowed_signers`. The manifest lists the sha256 of every binary and
-the controller image digest. Ansible checks the signature against its own
-pinned copy of that file, then installs a binary only if its hash matches.
-CI builds, but never signs.
+the controller image digest. The installer checks the signature against its
+own pinned copy of that file, then installs a binary only if its hash matches
+(see Installing on a host). CI builds, but never signs.
 
 1. Run the `Build release` workflow with version `X.Y.Z`. CI builds
    reproducible binaries, pushes the controller image by digest, writes the
@@ -149,6 +151,40 @@ creates a key on your security key (`~/.ssh/upgradoor-release`), checks that
 it signs, and adds your line to `deploy/allowed_signers`. The same line must
 also go into `roles/upgradoor_agent/files/allowed_signers` of
 ansible-collection-general, through review in both repositories.
+
+## Installing on a host
+
+The `upgradoor_agent` role of ansible-collection-general installs the agent.
+Per host it copies `install.sh`, which runs on the host: it downloads the
+manifest, its signature and the binary for the host's architecture, verifies
+them (`ssh-keygen -Y verify` against the pinned `allowed_signers`, the sha256
+of the binary, no downgrade), installs the binary, creates the host key with
+`upgradoor key` if there is none and reports the key's public half. The key
+is mode 0640, owned by root and the group `upgradoor` of `/etc/upgradoor`,
+through which the agent (user `upgradoor`) reads it.
+
+Only when the host has no certificate for that key and name does the role
+issue one on the Ansible controller, from the devnet seed in the release
+image:
+
+```sh
+docker run --rm -i --network none -e UPGRADOOR_SEED ghcr.io/ethpandaops/upgradoor@<digest> \
+  keygen host-cert --network <network> --hostname <host> --public-key <public key>
+```
+
+`upgradoor verify-cert --network <network> --signer-public-key <key> < host.crt`
+on the host prints the hostname, network and public key a certificate
+certifies. The public keys the role and the controller need are derived once
+and kept as inventory variables; a seed file of `-` reads the seed from
+standard input:
+
+```sh
+sops -d --extract '["secret_upgradoor_seed"]' all.sops.yaml |
+  docker run --rm -i ghcr.io/ethpandaops/upgradoor keygen signer-pubkey --network <network> --seed-file -
+sops -d --extract '["secret_upgradoor_controller_seed"]' all.sops.yaml |
+  docker run --rm -i ghcr.io/ethpandaops/upgradoor keygen controller-pubkey --network <network> \
+    --controller-seed-file -
+```
 
 ## Build, test, lint
 
@@ -187,7 +223,8 @@ ignored by git.
 make build
 mkdir -p .tmp/dev/data
 
-# A throwaway seed. keygen reads it from the environment, never from a flag.
+# A throwaway seed. keygen reads it from the environment or a file (- is
+# standard input), never from an argument.
 export UPGRADOOR_SEED=$(openssl rand -hex 32)
 bin/upgradoor-controller keygen signer-pubkey --network dev > .tmp/dev/signer.pub
 
@@ -206,9 +243,9 @@ for h in node-1 node-2 bootnode-1; do
   mkdir -p .tmp/dev/$h
   role=ethereum_node; [ $h = bootnode-1 ] && role=bootnode
 
-  bin/upgradoor-controller keygen host-key  --network dev --hostname $h \
-      > .tmp/dev/$h/host.key
-  bin/upgradoor-controller keygen host-cert --network dev --hostname $h --role $role \
+  # The host creates its key; the certificate is issued for its public half.
+  pub=$(bin/upgradoor key --path .tmp/dev/$h/host.key)
+  bin/upgradoor-controller keygen host-cert --network dev --hostname $h --public-key "$pub" \
       > .tmp/dev/$h/host.crt
 
   cat > .tmp/dev/$h/agent.yaml <<EOF
@@ -219,6 +256,7 @@ controller:
   syncInterval: 5s
 keyFile: .tmp/dev/$h/host.key
 certFile: .tmp/dev/$h/host.crt
+roles: [$role]
 stateDir: .tmp/dev/$h/state
 overridesFile: .tmp/dev/$h/overrides.yaml
 socket: {path: .tmp/dev/$h/agent.sock}
@@ -358,14 +396,15 @@ notices within a sync. What the host recorded of all this is in
 100 characters; from a deeply nested checkout give `socket.path` a shorter
 one.)
 
-The fake hosts have no validators on purpose. Add
-`validators: {start: 0, end: 32}` to an `agent.yaml` to give one some: the
+The fake hosts have no validators on purpose. Serve a validator ranges
+inventory such as `{"ranges": {"0-31": "node-1"}}` (inclusive index ranges by
+hostname) and pass its URL with `--validator-ranges-url` to give one some: the
 fake beacon node's blocks carry a full attestation of every committee, so the
 controller counts those validators as attesting, slot by slot and per epoch,
-and the gate opens on that participation (a host reports its validator range
-itself; on a real host the agent reads it from the marker file of the
-`validator_keys` Ansible role, `validators.markerFile`). For validators that
-really attest, use the Kurtosis run (`make e2e`).
+and the gate opens on that participation. On a devnet the controller reads the
+inventory the config service publishes,
+`https://config.<network_subdomain>/api/v1/nodes/validator-ranges`. For
+validators that really attest, use the Kurtosis run (`make e2e`).
 
 ## License
 

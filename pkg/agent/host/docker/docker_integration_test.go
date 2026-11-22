@@ -653,7 +653,7 @@ func observed(t *testing.T, r *dockerRuntime, name string) protocol.Container {
 	return all[idx]
 }
 
-// Group, kind and stop timeout come from the container; no group label means unmanaged.
+// Kind, team and stop timeout come from the container's labels and config.
 func TestIntegrationLabels(t *testing.T) {
 	env.cleanup(t, "labelled")
 	env.cleanup(t, "plain")
@@ -669,7 +669,7 @@ func TestIntegrationLabels(t *testing.T) {
 	timeout := 42
 
 	for name, labels := range map[string]map[string]string{
-		env.prefix + "labelled": {protocol.LabelGroup: "proxy", protocol.LabelKind: "whatever"},
+		env.prefix + "labelled": {protocol.LabelKind: "whatever", protocol.LabelTeam: "geth"},
 		env.prefix + "plain":    {"own": "yes"},
 	} {
 		_, err := env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -680,11 +680,11 @@ func TestIntegrationLabels(t *testing.T) {
 	}
 
 	labelled := observed(t, r, env.prefix+"labelled")
-	assert.Equal(t, "proxy", labelled.Group)
-	assert.Equal(t, protocol.ContainerKind("whatever"), labelled.Kind, "raw: plan.Classify parses it")
+	assert.Equal(t, protocol.ContainerKind("whatever"), labelled.Kind)
+	assert.Equal(t, "geth", labelled.Team)
 	assert.Equal(t, 42*time.Second, labelled.StopTimeout)
 
 	plain := observed(t, r, env.prefix+"plain")
-	assert.Empty(t, plain.Group)
 	assert.Empty(t, plain.Kind)
+	assert.Empty(t, plain.Team)
 }

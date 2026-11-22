@@ -218,15 +218,16 @@ func (r *ClientOverrideRequest) Sets() bool {
 	return len(r.AddFlags)+len(r.RemoveFlags) > 0
 }
 
-// ClientContainer names the managed container of the client and kind on the
-// host, by what its agent last reported; empty when there is none.
+// ClientContainer names the managed container of the client (its team) and
+// kind on the host, by what its agent last reported; empty when there is
+// none.
 func ClientContainer(h *fleet.Host, client string, kind protocol.ContainerKind) string {
 	if h.Status == nil {
 		return ""
 	}
 
 	for i := range h.Status.Containers {
-		if c := &h.Status.Containers[i]; c.Managed && c.Client == client && c.Kind == kind {
+		if c := &h.Status.Containers[i]; c.Managed && c.Team == client && c.Kind == kind {
 			return c.Name
 		}
 	}
@@ -409,7 +410,8 @@ const (
 // HostPlan is one host's availability view.
 type HostPlan struct {
 	Slot SlotState `json:"slot"`
-	// Weight is the host's validator count; Live how many attested in the
+	// Weight is the host's count of validators active on chain (its counted
+	// range while there is no liveness data); Live how many attested in the
 	// last complete epoch (LiveKnown false when there is no data yet).
 	Weight    uint64 `json:"weight"`
 	Live      uint64 `json:"live"`

@@ -15,7 +15,6 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/agent/link"
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
-	"github.com/ethpandaops/upgradoor/pkg/agent/registry"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -36,9 +35,11 @@ func TestLoadConfigReadsEveryKey(t *testing.T) {
 	require.NoError(t, err)
 
 	assert.Equal(t, "unix:///run/docker-test.sock", cfg.Host.Docker.Host)
-	assert.Equal(t, "http://127.0.0.1:8545", cfg.Host.Probes.EL)
-	assert.Equal(t, "http://127.0.0.1:5052", cfg.Host.Probes.CL)
-	assert.Equal(t, host.Validators{MarkerFile: "/data/.validator_keyrange"}, cfg.Host.Validators)
+	assert.Equal(t, "/root/.docker/test.json", cfg.Host.Docker.AuthFile)
+	assert.Equal(t, map[protocol.ContainerKind]string{
+		protocol.KindEL: "http://127.0.0.1:8545", protocol.KindCL: "http://127.0.0.1:5052",
+		"snooper-el": "http://127.0.0.1:9000/health",
+	}, map[protocol.ContainerKind]string(cfg.Host.Probes))
 	assert.Equal(t, []string{"/usr/bin/sudo", "-n", "/usr/local/lib/upgradoor/upgrade-packages"},
 		cfg.Host.Commands.UpgradePackages)
 	assert.Equal(t, []string{"/usr/bin/sudo", "-n", "/usr/bin/systemctl", "reboot"}, cfg.Host.Commands.Reboot)
@@ -54,37 +55,27 @@ func TestLoadConfigReadsEveryKey(t *testing.T) {
 		},
 		KeyFile:  "/etc/upgradoor/test.key",
 		CertFile: "/etc/upgradoor/test.crt",
+		Roles:    []string{"ethereum_node", "rpc"},
 		StateDir: "/var/lib/upgradoor-test",
 		Local: local.Config{
 			EntryUser:     "ops",
 			OverridesFile: "/home/ops/custom-overrides.yaml",
+			ManagedFile:   "/etc/upgradoor/test-managed.yaml",
 			Socket:        local.Socket{Path: "/run/upgradoor/test.sock", Group: "ops"},
 			AuditLog: local.AuditConfig{
 				File: "/var/log/upgradoor/audit.log", MaxSizeBytes: 2 << 20, MaxFiles: 3,
 			},
 		},
 		Policy: plan.Policy{
-			Verbs: []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages, protocol.VerbReboot},
-			Groups: map[string]plan.Group{
-				"execution": {
-					Client: "geth", Owners: []string{"geth", "panda"},
-					Overrides: []string{protocol.OverrideImage, protocol.OverrideFlags},
-					Impact:    protocol.ImpactNode, StopTimeout: 10 * time.Minute,
-				},
-				"tooling": {Impact: protocol.ImpactIndependent},
+			Verbs:         []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages, protocol.VerbReboot},
+			DefaultPolicy: plan.DefaultRoll,
+			KindPolicies: map[protocol.ContainerKind]plan.KindPolicy{
+				protocol.KindEL: {Roll: true}, "snooper-el": {Roll: false},
 			},
-			Containers: map[string]plan.MappedContainer{
-				"execution": {Group: "execution", Kind: protocol.KindEL},
-				"exporter":  {Group: "tooling", Kind: protocol.KindOther},
-			},
-			DefaultGroup: plan.DefaultGroup{Roll: true, Exclude: []string{"tmp-*", "debug"}},
-			Packages:     plan.Packages{Blocked: []string{"docker-ce", "containerd.io"}},
-			Fallback: plan.Fallback{
-				Containers: []string{"execution", "exp*"}, After: 2 * time.Hour, Interval: 20 * time.Minute,
-			},
+			Packages: plan.Packages{Blocked: []string{"docker-ce", "containerd.io"}},
+			Fallback: plan.Fallback{After: 2 * time.Hour, Interval: 20 * time.Minute},
 		},
-		Registry: registry.Config{AuthFile: "/root/.docker/test.json"},
-		Verify:   lease.Config{Window: 30 * time.Second, Timeout: 5 * time.Minute},
+		Verify: lease.Config{Window: 30 * time.Second, Timeout: 5 * time.Minute},
 	}, cfg)
 }
 
@@ -103,7 +94,8 @@ func TestLoadConfigAppliesTheDefaults(t *testing.T) {
 	assert.Equal(t, local.DefaultSocket, cfg.Local.Socket.Path)
 	assert.Equal(t, filepath.Join(DefaultStateDir, "audit.log"), cfg.Local.AuditLog.File)
 	assert.Equal(t, "unix:///var/run/docker.sock", cfg.Host.Docker.Host)
-	assert.Equal(t, "/root/.docker/config.json", cfg.Registry.AuthFile)
+	assert.Equal(t, "/root/.docker/config.json", cfg.Host.Docker.AuthFile)
+	assert.Equal(t, plan.DefaultIgnore, cfg.Policy.DefaultPolicy)
 	assert.Equal(t, 45*time.Second, cfg.Verify.Window)
 }
 
@@ -116,18 +108,24 @@ func TestLoadConfigRefusesWhatItDoesNotKnow(t *testing.T) {
 		yaml string
 		want string
 	}{
-		"an unknown top-level key":     {head + "containerz: {}\n", "not found"},
-		"an unknown controller key":    {head + "  pubKeys: []\n", "not found"},
-		"an unknown key of an inline":  {head + "socket:\n  mode: 0777\n", "not found"},
-		"an image in the name map":     {head + "containers:\n  a: {group: g, image: x}\n", "not found"},
-		"an unknown key in a group":    {head + "groups:\n  g: {owner: x}\n", "not found"},
-		"an unknown defaultGroup key":  {head + "defaultGroup:\n  rolls: true\n", "not found"},
-		"an unknown verify key":        {head + "verify:\n  grace: 1s\n", "not found"},
-		"no controller url":            {"controller:\n  allowUnsignedAnswers: true\n", "absolute URL"},
-		"no controller key":            {"controller:\n  url: https://upgradoor.example\n", "publicKey is required"},
-		"an unknown verb":              {head + "verbs: [exec]\n", `unknown verb "exec"`},
-		"a static range start and end": {head + "validators: {start: 5, end: 5}\n", "validators"},
-		"not yaml":                     {"controller: [\n", "parse config"},
+		"an unknown top-level key":    {head + "containerz: {}\n", "not found"},
+		"an unknown controller key":   {head + "  pubKeys: []\n", "not found"},
+		"an unknown key of an inline": {head + "socket:\n  mode: 0777\n", "not found"},
+		"an unknown kind policy key":  {head + "kindPolicies:\n  el: {rolls: true}\n", "not found"},
+		"an unknown docker key":       {head + "docker:\n  auth: x\n", "not found"},
+		"a probe of no kind":          {head + "probes:\n  EL: http://a\n", `"EL" is not a kind`},
+		"groups":                      {head + "groups: {}\n", "groups: no longer supported: containers are configured by their labels"},
+		"the name map":                {head + "containers: {}\n", "containers: no longer supported"},
+		"defaultGroup":                {head + "defaultGroup:\n  roll: true\n", "defaultGroup: no longer supported: defaultPolicy"},
+		"validators":                  {head + "validators: {}\n", "validators: no longer supported"},
+		"registry":                    {head + "registry:\n  authFile: x\n", "registry: no longer supported: the pull credentials are docker.authFile"},
+		"fallback.containers":         {head + "fallback:\n  containers: [geth]\n", "fallback.containers: no longer supported"},
+		"an unknown verify key":       {head + "verify:\n  grace: 1s\n", "not found"},
+		"no controller url":           {"controller:\n  allowUnsignedAnswers: true\n", "absolute URL"},
+		"no controller key":           {"controller:\n  url: https://upgradoor.example\n", "publicKey is required"},
+		"an unknown verb":             {head + "verbs: [exec]\n", `unknown verb "exec"`},
+		"not yaml":                    {"controller: [\n", "parse config"},
+		"a role that is no name":      {head + "roles: [a/b]\n", "roles"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

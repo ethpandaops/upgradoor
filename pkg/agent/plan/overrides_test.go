@@ -28,19 +28,22 @@ func TestLine(t *testing.T) {
 
 func TestEntryValidate(t *testing.T) {
 	require.NoError(t, (&Entry{Image: "ethpandaops/geth:fix"}).Validate())
-	require.NoError(t, (&Entry{Add: []string{"--a"}, By: strings.Repeat("x", maxEntryText)}).Validate())
+	require.NoError(t, (&Entry{Command: []string{"--a"}, HasCommand: true, By: strings.Repeat("x", maxEntryText)}).Validate())
+	require.NoError(t, (&Entry{Command: []string{}, HasCommand: true}).Validate(), "an empty command line")
 
 	for name, tt := range map[string]struct {
 		entry *Entry
 		want  string
 	}{
-		"nil":            {nil, "names an image, flags or both"},
-		"empty":          {&Entry{By: "sam"}, "names an image, flags or both"},
-		"no reference":   {&Entry{Image: "UPPER/case:x"}, "invalid"},
-		"a digest":       {&Entry{Image: "ethpandaops/geth@sha256:" + strings.Repeat("a", 64)}, "pinned to a digest"},
-		"a bad flag":     {&Entry{Remove: []string{"--a b c"}}, "one value"},
-		"a long by":      {&Entry{Add: []string{"--a"}, By: strings.Repeat("x", maxEntryText+1)}, "too long"},
-		"a long reason:": {&Entry{Add: []string{"--a"}, Reason: strings.Repeat("x", maxEntryText+1)}, "too long"},
+		"nil":             {nil, "names an image, a command or both"},
+		"empty":           {&Entry{By: "sam"}, "names an image, a command or both"},
+		"no reference":    {&Entry{Image: "UPPER/case:x"}, "invalid"},
+		"a digest":        {&Entry{Image: "ethpandaops/geth@sha256:" + strings.Repeat("a", 64)}, "pinned to a digest"},
+		"a bad argument":  {&Entry{Command: []string{"--a\nb"}, HasCommand: true}, "control character"},
+		"a long argument": {&Entry{Command: []string{strings.Repeat("x", maxFlagLen+1)}, HasCommand: true}, "too long"},
+		"too many":        {&Entry{Command: make([]string, maxArgs+1), HasCommand: true}, "more than"},
+		"a long by":       {&Entry{Image: "a/b:c", By: strings.Repeat("x", maxEntryText+1)}, "too long"},
+		"a long reason:":  {&Entry{Image: "a/b:c", Reason: strings.Repeat("x", maxEntryText+1)}, "too long"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			require.ErrorContains(t, tt.entry.Validate(), tt.want)
@@ -52,7 +55,7 @@ func TestEntryDescribe(t *testing.T) {
 	assert.Equal(t, NoOverride, (*Entry)(nil).Describe())
 	assert.Equal(t, NoOverride, (&Entry{By: "sam"}).Describe())
 	assert.Equal(t, "image ethpandaops/geth:fix", (&Entry{Image: "ethpandaops/geth:fix"}).Describe())
-	assert.Equal(t, "image ethpandaops/geth:fix, flags +--verbosity=4 ---maxpeers",
-		(&Entry{Image: "ethpandaops/geth:fix", Add: []string{"--verbosity=4"}, Remove: []string{"--maxpeers"}}).Describe())
-	assert.Equal(t, "flags ---maxpeers", (&Entry{Remove: []string{"--maxpeers"}}).Describe())
+	assert.Equal(t, "image ethpandaops/geth:fix, command geth --verbosity=4",
+		(&Entry{Image: "ethpandaops/geth:fix", Command: []string{"geth", "--verbosity=4"}, HasCommand: true}).Describe())
+	assert.Equal(t, "command", (&Entry{Command: []string{}, HasCommand: true}).Describe())
 }

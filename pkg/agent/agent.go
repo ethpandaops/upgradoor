@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"maps"
+	"strings"
 	"sync"
 	"time"
 
@@ -66,6 +68,12 @@ type agent struct {
 	// inventoryTimeout bounds the collection of the inventory.
 	inventoryTimeout time.Duration
 
+	// managedMu guards managed.yaml as last read; managedErr says why it
+	// cannot be read.
+	managedMu  sync.Mutex
+	managed    map[string]plan.Deployed
+	managedErr string
+
 	// mu guards what the socket reads of the last cycle.
 	mu     sync.Mutex
 	view   *plan.View
@@ -76,11 +84,10 @@ type agent struct {
 	// Owned by the loop goroutine.
 	directives directives
 	// tags are the followed tags as last reported.
-	tags           []string
-	facts          plan.Facts
-	lastValidators *protocol.Validators
-	queue          protocol.Queue
-	syncFailing    bool
+	tags        []string
+	facts       plan.Facts
+	queue       protocol.Queue
+	syncFailing bool
 	// lastAnswer is when the controller last answered; the start before that.
 	lastAnswer time.Time
 	// fallbackTried are the needs the fallback has given a lease during this
@@ -171,6 +178,8 @@ func (a *agent) Start(ctx context.Context) error {
 		return err
 	}
 
+	a.reloadManaged()
+
 	runCtx, cancel := context.WithCancel(ctx)
 
 	if err := a.runner.Start(runCtx); err != nil {
@@ -187,7 +196,7 @@ func (a *agent) Start(ctx context.Context) error {
 
 	a.log.WithFields(logrus.Fields{
 		"controller": a.cfg.Controller.URL, "verbs": a.cfg.Policy.Verbs,
-		"groups": len(a.cfg.Policy.Groups), "version": a.version,
+		"defaultPolicy": a.cfg.Policy.DefaultPolicy, "version": a.version,
 	}).Info("agent started")
 
 	if err := a.server.Start(runCtx); err != nil {
@@ -217,7 +226,7 @@ func (a *agent) open() error {
 
 	a.state = state
 	a.runner = lease.New(a.log, &a.cfg.Verify, state, &lease.Deps{
-		Host: a.host, Policy: &a.cfg.Policy, Overrides: a.files, Registry: a.tracker,
+		Host: a.host, Policy: &a.cfg.Policy, Overrides: inputs{a}, Registry: a.tracker,
 		Audit: a.audit, Notify: a.wake, Now: a.now,
 	})
 
@@ -249,6 +258,58 @@ func (a *agent) Stop() error {
 	a.log.Info("agent stopped")
 
 	return errors.Join(serverErr, trackerErr, runnerErr)
+}
+
+// inputs is lease.Overrides over agent.inputs.
+type inputs struct{ a *agent }
+
+// Load implements lease.Overrides.
+func (i inputs) Load() plan.Overrides { return i.a.inputs() }
+
+// inputs is what the host's files say now: the overrides file as it reads,
+// managed.yaml as last read and the holds of the state file.
+func (a *agent) inputs() plan.Overrides {
+	out := a.files.Load()
+
+	a.managedMu.Lock()
+	out.Deployed = maps.Clone(a.managed)
+	managedErr := a.managedErr
+	a.managedMu.Unlock()
+
+	if managedErr != "" {
+		out.Known = false
+		out.Err = strings.TrimPrefix(out.Err+"; "+managedErr, "; ")
+	}
+
+	out.Holds = a.state.Holds()
+
+	return out
+}
+
+// reloadManaged reads managed.yaml again; one that cannot be read keeps the
+// last content and holds the host until it reads.
+func (a *agent) reloadManaged() {
+	m, err := local.ReadManaged(a.cfg.Local.ManagedFile)
+
+	a.managedMu.Lock()
+	defer a.managedMu.Unlock()
+
+	if err != nil {
+		text := plan.Line("managed.yaml cannot be read: " + err.Error())
+		if text != a.managedErr {
+			a.log.WithField("file", a.cfg.Local.ManagedFile).Error(text)
+		}
+
+		a.managedErr = text
+
+		return
+	}
+
+	if a.managedErr != "" {
+		a.log.WithField("file", a.cfg.Local.ManagedFile).Info("managed.yaml reads again")
+	}
+
+	a.managed, a.managedErr = m, ""
 }
 
 // wake asks the loop for a sync now.

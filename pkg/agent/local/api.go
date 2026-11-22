@@ -31,9 +31,10 @@ type Agent interface {
 	Hold(user string, req *HoldRequest) error
 	// Roll requests a roll of one container.
 	Roll(user, container string) (*Roll, error)
-	// InitOverrides writes the generated block and returns the file's path.
+	// InitOverrides lays out the overrides file and returns its path.
 	InitOverrides(user string) (string, error)
-	// Deploy writes what a container is deployed as; only root reaches it.
+	// Deploy reads managed.yaml again after upgradoor deploy wrote a
+	// container's entry; only root reaches it.
 	Deploy(ctx context.Context, user string, req *DeployRequest) (*DeployResult, error)
 }
 
@@ -56,7 +57,8 @@ type Status struct {
 	Operation *protocol.Operation `json:"operation,omitempty"`
 	// Rolls are the rolls requested through the socket, oldest first.
 	Rolls []Roll `json:"rolls"`
-	// OverridesError says why OverridesFile cannot be read.
+	// OverridesFile is empty when overrides are disabled; OverridesError
+	// says why it or managed.yaml cannot be read.
 	OverridesFile  string `json:"overridesFile"`
 	OverridesError string `json:"overridesError,omitempty"`
 	// SyncError is set while the controller cannot be reached.
@@ -71,8 +73,6 @@ type Container struct {
 	BaseCommand []string `json:"baseCommand,omitempty"`
 	// Target is the image the container is to run when not in sync.
 	Target string `json:"target,omitempty"`
-	// Unlabelled: agent.yaml's name map groups it; the next recreate labels it.
-	Unlabelled bool `json:"unlabelled,omitempty"`
 }
 
 // ContainersOf is the managed containers of a view as the status lists them.
@@ -85,7 +85,7 @@ func ContainersOf(view *plan.View) []Container {
 			continue
 		}
 
-		lc := Container{Container: *c, Unlabelled: c.Unlabelled}
+		lc := Container{Container: *c}
 
 		if t, ok := view.Targets[c.Name]; ok {
 			if c.Base != nil && c.Base.HasCommand && !slices.Equal(c.Base.Command, c.Command) {
@@ -174,14 +174,11 @@ type RollRequest struct {
 	Container string `json:"container"`
 }
 
-// DeployRequest is the body of POST /v1/deploy.
+// DeployRequest is the body of POST /v1/deploy, sent after managed.yaml was
+// written.
 type DeployRequest struct {
 	Container string `json:"container"`
-	Image     string `json:"image"`
-	// Command is the command line; null keeps the one the container was
-	// created with.
-	Command []string `json:"command"`
-	// Reset also removes the container's override entry.
+	// Reset also clears the container's override.
 	Reset bool `json:"reset,omitempty"`
 }
 
@@ -191,7 +188,7 @@ type DeployResult struct {
 	Exists    bool   `json:"exists"`
 	// Managed: the agent rolls the container to its target.
 	Managed bool `json:"managed"`
-	// Changed: the deployed block or the overrides changed.
+	// Changed: managed.yaml or the override changed.
 	Changed bool `json:"changed"`
 	// Roll is DeployRollRequested or DeployRollNone.
 	Roll string `json:"roll"`

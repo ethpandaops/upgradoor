@@ -4,10 +4,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io/fs"
+	"path/filepath"
 
 	"github.com/spf13/cobra"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
+	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
 )
 
 func newDeployCmd() *cobra.Command {
@@ -15,14 +18,15 @@ func newDeployCmd() *cobra.Command {
 		image   string
 		command string
 		reset   bool
+		managed string
 	)
 
 	cmd := &cobra.Command{
 		Use:   "deploy <container>",
 		Short: "Write what Ansible deploys a container as (root only)",
-		Long: "Writes the container's image and command line into the generated block of\n" +
-			"the overrides file; --reset also removes its override entry. A container the\n" +
-			"agent rolls and that runs something else is rolled in its group's rollout.\n" +
+		Long: "Writes the container's image and command line into managed.yaml and has the\n" +
+			"agent read it again; --reset also clears its override. A container the agent\n" +
+			"rolls and that runs something else is rolled in its group's rollout.\n" +
 			"Prints one JSON object: container, exists, managed, changed, roll\n" +
 			"(requested or none), ignore (the docker_container comparisons to leave to\n" +
 			"the agent) and pull. Needs the running agent; only root may call it.",
@@ -32,16 +36,35 @@ func newDeployCmd() *cobra.Command {
 	client := socketFlag(cmd)
 
 	cmd.RunE = func(cmd *cobra.Command, args []string) error {
-		req := &local.DeployRequest{Container: args[0], Image: image, Reset: reset}
+		d := plan.Deployed{Image: image}
 
 		if cmd.Flags().Changed("command") {
-			if err := json.Unmarshal([]byte(command), &req.Command); err != nil || req.Command == nil {
+			if err := json.Unmarshal([]byte(command), &d.Command); err != nil || d.Command == nil {
 				return errors.New("--command is a JSON array of strings")
 			}
+
+			d.HasCommand = true
 		}
 
-		res, err := client().Deploy(cmd.Context(), req)
-		if err != nil {
+		var res *local.DeployResult
+
+		err := local.WriteManaged(managed, args[0], d, func(changed bool) error {
+			var err error
+
+			res, err = client().Deploy(cmd.Context(), &local.DeployRequest{Container: args[0], Reset: reset})
+			if err != nil {
+				return err
+			}
+
+			res.Changed = res.Changed || changed
+
+			return nil
+		})
+
+		switch {
+		case errors.Is(err, fs.ErrPermission):
+			return fmt.Errorf("deploy is for root only: cannot write %s", filepath.Dir(managed))
+		case err != nil:
 			return fmt.Errorf("deploy %s: %w", args[0], err)
 		}
 
@@ -51,7 +74,8 @@ func newDeployCmd() *cobra.Command {
 	cmd.Flags().StringVar(&image, "image", "", "the image reference (required)")
 	cmd.Flags().StringVar(&command, "command", "",
 		"the command line as a JSON array of strings; without it the container's own")
-	cmd.Flags().BoolVar(&reset, "reset", false, "also remove the container's override entry")
+	cmd.Flags().BoolVar(&reset, "reset", false, "also clear the container's override")
+	cmd.Flags().StringVar(&managed, "managed-file", local.DefaultManagedFile, "managed.yaml")
 	_ = cmd.MarkFlagRequired("image")
 
 	return cmd

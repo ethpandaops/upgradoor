@@ -37,17 +37,22 @@ import { endLeaseIntent, hostsIntent, scopeIntent } from '../lib/intents';
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
+/** unitLabel names what a group rollout moves: "<team> <kind>", "<kind>" or "unlabelled". */
+export function unitLabel(r: Rollout): string {
+  if (!r.containerKind) return 'unlabelled';
+  return r.team ? `${r.team} ${r.containerKind}` : r.containerKind;
+}
+
 /**
  * policyFor mirrors the scheduler's rolloutPolicy: the policy of the kind,
- * and for a group rollout the image policy of its client where one is set,
- * or the default group's policy. Manual rollouts have no policy.
+ * and for a group rollout the image policy of its team where one is set,
+ * else policyImage. Manual rollouts have no policy.
  */
 export function policyFor(settings: Settings | undefined, rollout: Rollout): Policy | undefined {
   if (!settings) return undefined;
   switch (rollout.kind) {
     case 'group':
-      if (rollout.group === 'default') return settings.policyDefaultGroup;
-      return (rollout.client ? settings.policyClients[rollout.client] : undefined) ?? settings.policyImage;
+      return (rollout.team ? settings.policyClients[rollout.team] : undefined) ?? settings.policyImage;
     case 'packages':
       return settings.policyPackages;
     case 'reboot':
@@ -345,7 +350,7 @@ export function RolloutCard({
               icon="check"
               label="Approve…"
               onAction={onAction}
-              intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.client)}
+              intent={scopeIntent('resume', `Approve rollout: ${r.title}`, r.id, r.team)}
             />
           )}
           {r.paused ? (
@@ -353,14 +358,14 @@ export function RolloutCard({
               icon="resume"
               label="Resume…"
               onAction={onAction}
-              intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.client)}
+              intent={scopeIntent('resume', `Resume rollout: ${r.title}`, r.id, r.team)}
             />
           ) : (
             <IntentAction
               icon="pause"
               label="Pause…"
               onAction={onAction}
-              intent={scopeIntent('pause', `Pause rollout: ${r.title}`, r.id, r.client)}
+              intent={scopeIntent('pause', `Pause rollout: ${r.title}`, r.id, r.team)}
             />
           )}
           {(r.state === 'halted' || failed.length > 0) && (
@@ -385,14 +390,14 @@ export function RolloutCard({
         <span>
           id <ShortId value={r.id} label="rollout" />
         </span>
-        {r.group && (
+        {r.kind === 'group' && (
           <span>
-            group <span className="font-medium text-foreground">{r.group}</span>
+            kind <span className="font-medium text-foreground">{r.containerKind || 'unlabelled'}</span>
           </span>
         )}
-        {r.client && (
+        {r.team && (
           <span>
-            client <span className="font-medium text-foreground">{r.client}</span>
+            team <span className="font-medium text-foreground">{r.team}</span>
           </span>
         )}
         {list(r.packages).length > 0 && (
@@ -555,9 +560,7 @@ export function RecentRollouts({
           return (
             <tr key={r.id} className="hover:bg-surface-hover">
               <Td className="font-medium">{r.title}</Td>
-              <Td>
-                {r.kind === 'local' ? 'host request' : r.kind === 'group' && r.group ? `group ${r.group}` : r.kind}
-              </Td>
+              <Td>{r.kind === 'local' ? 'host request' : r.kind === 'group' ? unitLabel(r) : r.kind}</Td>
               <Td>
                 <RolloutStateBadge state={r.state} />
               </Td>

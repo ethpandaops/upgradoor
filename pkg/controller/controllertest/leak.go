@@ -42,7 +42,7 @@ const (
 	SecretPeerLayer     = "zzEL"
 	SecretPauseReason   = "zz paused after the canary; resume to continue"
 	SecretAuditActor    = "zz-admin@ethpandaops.io"
-	// Owners are team names; these two carry no "zz", so the catch-all below
+	// Teams are team names; these two carry no "zz", so the catch-all below
 	// is not what finds them.
 	SecretOwnerEL = "qq-stealth-el-team"
 	SecretOwnerCL = "qq-stealth-cl-team"
@@ -73,7 +73,7 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 				ImageID: SecretImageID, Digest: "sha256:e1e1", Revision: "rev-geth-1",
 				Version: "1.16.4", State: "running", Health: "healthy", RestartCount: 2,
 				StartedAt: Epoch.Add(-time.Hour), Managed: true, Kind: protocol.KindEL,
-				ConfiguredImage: "ethereum/client-go:stable", Owners: []string{SecretOwnerEL},
+				ConfiguredImage: "ethereum/client-go:stable", Team: SecretOwnerEL,
 				Registry: &protocol.RegistryCheck{
 					Digest: "sha256:e1e1", Revision: "rev-geth-1", CheckedAt: checked,
 					Pulled: true,
@@ -84,7 +84,7 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 				ImageID: SecretImageID, Digest: clDigest, Revision: "rev-lh-" + clDigest[7:],
 				State: "running", StartedAt: Epoch.Add(-time.Hour), Managed: true,
 				Kind: protocol.KindCL, ConfiguredImage: "sigp/lighthouse:unstable",
-				Owners: []string{SecretOwnerCL},
+				Team: SecretOwnerCL,
 				Registry: &protocol.RegistryCheck{
 					Digest: "sha256:c2c2", CheckedAt: checked, Error: SecretRegistryError,
 				},
@@ -142,7 +142,7 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 
 	st.Hosts["lighthouse-geth-1"] = &fleet.Host{
 		Name: "lighthouse-geth-1", CertHash: SecretCertHash,
-		Validators: &identity.ValidatorRange{Start: 0, End: 100},
+		Validators: []identity.ValidatorRange{{Start: 0, End: 100}},
 		Roles:      []string{"ethereum_node"},
 		FirstSeen:  Epoch.Add(-48 * time.Hour), LastSeen: Epoch,
 		RemoteAddr: SecretAddr, Status: status("sha256:c1c1", needs),
@@ -150,7 +150,7 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 	}
 	st.Hosts["lighthouse-geth-2"] = &fleet.Host{
 		Name: "lighthouse-geth-2", CertHash: SecretCertHash,
-		Validators: &identity.ValidatorRange{Start: 100, End: 200},
+		Validators: []identity.ValidatorRange{{Start: 100, End: 200}},
 		Roles:      []string{"ethereum_node"},
 		FirstSeen:  Epoch.Add(-48 * time.Hour), LastSeen: Epoch,
 		RemoteAddr: SecretAddr6, Status: status("sha256:c2c2", nil),

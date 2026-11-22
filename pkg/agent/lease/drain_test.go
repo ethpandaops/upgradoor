@@ -13,7 +13,6 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/agenttest"
 	"github.com/ethpandaops/upgradoor/pkg/agent/host"
-	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -97,19 +96,15 @@ func (h *timeoutHost) Recreate(
 	return h.Host.Recreate(ctx, name, digest, timeout, start, change)
 }
 
-// Drain and recreate use the stop timeout of the container's classified group.
-func TestStopTimeoutsOfTheClassifiedContainer(t *testing.T) {
+// Drain and recreate use the container's own stop timeout.
+func TestStopTimeoutsOfTheContainer(t *testing.T) {
 	t.Parallel()
 
 	sc := agenttest.BaseScenario()
 	sc.RebootRequired = true
-	sc.Containers[1].Group, sc.Containers[1].Kind = "", ""
+	sc.Containers[1].StopTimeout = 30 * time.Second
 
 	e := newEnv(t, sc)
-	e.policy.Containers = map[string]plan.MappedContainer{
-		"geth": {Group: agenttest.GroupExecution, Kind: protocol.KindEL},
-	}
-	e.policy.Groups[agenttest.GroupExecution] = plan.Group{StopTimeout: 30 * time.Second}
 
 	recording := &timeoutHost{Host: e.host}
 	e.machine = recording

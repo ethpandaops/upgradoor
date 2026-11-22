@@ -35,9 +35,9 @@ function byKind(containers: readonly Container[]): Container[] {
   return [...containers].sort((a, b) => rank(a) - rank(b) || (a.name < b.name ? -1 : 1));
 }
 
-/** allows reports whether the agent configuration of the host lets the controller override this on the container. */
-export function allows(c: Container, kind: OverrideKind): boolean {
-  return kind === 'image-override' ? c.overridable?.image === true : c.overridable?.flags === true;
+/** allows reports whether the container may be overridden: it has a team and the host has overrides on. */
+export function allows(c: Container, _kind: OverrideKind): boolean {
+  return c.overridable === true;
 }
 
 const WHAT: Record<OverrideKind, string> = { 'image-override': 'image', 'flag-override': 'flag' };
@@ -46,7 +46,7 @@ const WHAT: Record<OverrideKind, string> = { 'image-override': 'image', 'flag-ov
 export function notAllowed(containers: readonly Container[], kind: OverrideKind): string {
   if (containers.some(c => allows(c, kind))) return '';
   const names = containers.map(c => c.name).join(', ') || 'its containers';
-  return `This host does not allow ${WHAT[kind]} overrides of ${names} (agent.yaml)`;
+  return `This host does not allow ${WHAT[kind]} overrides of ${names} (a container needs a team label, the host overrides on)`;
 }
 
 /** hasFlags reports whether an override changes the command line. */

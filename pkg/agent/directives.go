@@ -88,10 +88,10 @@ func (a *agent) applyDirective(d *protocol.Directive, view *plan.View) bool {
 	switch d.Kind {
 	case protocol.DirectiveHold:
 		hold := plan.ControllerHold(d.Reason, d.By)
-		err = a.files.SetHold(plan.FromController, &hold, "controller:"+hold.By, "set: "+plan.Line(hold.Reason))
+		err = a.state.SetHold(plan.HoldSource(plan.FromController), &hold)
 		a.refreshHold(view)
 	case protocol.DirectiveReleaseHold:
-		err = a.files.SetHold(plan.FromController, nil, "controller", "released")
+		err = a.state.SetHold(plan.HoldSource(plan.FromController), nil)
 		a.refreshHold(view)
 	case protocol.DirectiveReboot:
 		n, why := plan.ManualReboot(&a.cfg.Policy, view, d.ID)
@@ -129,10 +129,10 @@ func (a *agent) applyDirective(d *protocol.Directive, view *plan.View) bool {
 	return a.answer(log, d.ID, need, reject)
 }
 
-// refreshHold sets the view's hold from the file as it is now, for the
-// directives that follow in the same answer.
+// refreshHold sets the view's hold as it is now, for the directives that
+// follow in the same answer.
 func (a *agent) refreshHold(view *plan.View) {
-	files := a.files.Load()
+	files := a.inputs()
 	view.Hold = plan.HoldState(&files, a.now())
 }
 
@@ -147,9 +147,11 @@ func (a *agent) overrideDirective(d *protocol.Directive, view *plan.View) string
 
 	var built overrideBuild
 
+	deployed := a.deployed(d.Container)
+
 	prev, next, err := a.files.SetEntry(d.Container, who.User, built.wrap(
 		func(prev *plan.Entry) (*plan.Entry, error) {
-			return plan.Instruct(&a.cfg.Policy, view, d.Container, d.Override, prev,
+			return plan.Instruct(&a.cfg.Policy, view, d.Container, d.Override, prev, deployed,
 				who.User, d.Reason, a.now())
 		}))
 

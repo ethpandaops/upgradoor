@@ -9,9 +9,11 @@ controller:
   allowUnsignedAnswers: false
 keyFile: /etc/upgradoor/test.key
 certFile: /etc/upgradoor/test.crt
+roles: [ethereum_node, rpc]
 stateDir: /var/lib/upgradoor-test
 entryUser: ops
 overridesFile: /home/ops/custom-overrides.yaml
+managedFile: /etc/upgradoor/test-managed.yaml
 socket:
   path: /run/upgradoor/test.sock
   group: ops
@@ -20,41 +22,25 @@ auditLog:
   maxSizeBytes: 2097152
   maxFiles: 3
 verbs: [roll, packages, reboot]
-groups:
-  execution:
-    client: geth
-    owners: [geth, panda]
-    overrides: [image, flags]
-    impact: node
-    stopTimeout: 600s
-  tooling:
-    impact: independent
-containers:
-  execution: {group: execution, kind: el}
-  exporter: {group: tooling}
-defaultGroup:
-  roll: true
-  exclude: [tmp-*, debug]
+defaultPolicy: roll
+kindPolicies:
+  el: {roll: true}
+  snooper-el: {roll: false}
 packages:
   blocked: [docker-ce, containerd.io]
 fallback:
-  containers: [execution, exp*]
   after: 2h
   interval: 20m
 docker:
   host: unix:///run/docker-test.sock
+  authFile: /root/.docker/test.json
 probes:
   el: http://127.0.0.1:8545
   cl: http://127.0.0.1:5052
-validators:
-  markerFile: /data/.validator_keyrange
-  start: 0
-  end: 0
+  snooper-el: http://127.0.0.1:9000/health
 commands:
   upgradePackages: [/usr/bin/sudo, -n, /usr/local/lib/upgradoor/upgrade-packages]
   reboot: [/usr/bin/sudo, -n, /usr/bin/systemctl, reboot]
-registry:
-  authFile: /root/.docker/test.json
 verify:
   window: 30s
   timeout: 5m

@@ -116,15 +116,12 @@ type PublicImages struct {
 type HostSummary struct {
 	Name  string   `json:"name"`
 	Roles []string `json:"roles"`
-	// Validators is the number of validators counted for the host.
-	Validators uint64 `json:"validators"`
-	// ValidatorReport is what the host's last sync said about its validator
-	// range: the range, where it was read from, and whether the host knows
-	// it at all. Absent when the host reports none.
-	ValidatorReport *protocol.Validators `json:"validatorReport,omitempty"`
-	LastSeen        time.Time            `json:"lastSeen"`
-	Stale           bool                 `json:"stale"`
-	AgentVersion    string               `json:"agentVersion"`
+	// Validators is the number of the host's validators active on chain, as
+	// the scheduler's plan counts them (HostPlan.Weight).
+	Validators   uint64    `json:"validators"`
+	LastSeen     time.Time `json:"lastSeen"`
+	Stale        bool      `json:"stale"`
+	AgentVersion string    `json:"agentVersion"`
 
 	Containers    []protocol.Container `json:"containers"`
 	Node          protocol.NodeHealth  `json:"node"`
@@ -146,7 +143,7 @@ type HostSummary struct {
 	// lease. Absent otherwise.
 	Offline *fleet.OfflineMark `json:"offline,omitempty"`
 	// Broken says what the host's last lease failed on (fleet.Host.Broken):
-	// per group of rollouts (scheduler.ImageGroup, "packages") the ID of the
+	// per group of rollouts (scheduler.UnitName, "packages") the ID of the
 	// lease that failed. Such a host goes first in the next rollout of the
 	// group. Absent when the host is in order.
 	Broken map[string]string `json:"broken,omitempty"`
@@ -160,7 +157,7 @@ type HostSummary struct {
 
 // HostListing is one row of the host list: what the overview, the host
 // table and the selection need of a host. The rest of a HostSummary (the
-// container internals, the node health, the validator report, the needs in
+// container internals, the node health, the needs in
 // full, the broken marks) is in the host's details.
 type HostListing struct {
 	Name          string             `json:"name"`
@@ -198,10 +195,9 @@ type ContainerListing struct {
 	Managed  bool                   `json:"managed"`
 	Kind     protocol.ContainerKind `json:"kind,omitempty"`
 	Impact   protocol.Impact        `json:"impact,omitempty"`
-	Owners   []string               `json:"owners,omitempty"`
-	// Group is the roll group of a managed container (DefaultGroup for one
-	// that neither a label nor the name map puts in a group).
-	Group string `json:"group,omitempty"`
+	// Team is the team label of a managed container; served to
+	// authenticated users only.
+	Team string `json:"team,omitempty"`
 }
 
 // NeedListing is an open need as the host list shows it.
@@ -221,15 +217,9 @@ type HostDetail struct {
 	CertHash   string    `json:"certHash"`
 	FirstSeen  time.Time `json:"firstSeen"`
 	RemoteAddr string    `json:"remoteAddr"`
-	// ValidatorStart and ValidatorEnd are the [start, end) range counted for
-	// the host. It follows the range the host reports (ValidatorReport) and
-	// differs from it while the host does not know its range (the last one
-	// is kept) and where another host holds validators of it.
-	ValidatorStart *uint64 `json:"validatorStart,omitempty"`
-	ValidatorEnd   *uint64 `json:"validatorEnd,omitempty"`
-	// ValidatorOverlaps names the other hosts that report validators this
-	// host reports too.
-	ValidatorOverlaps []string `json:"validatorOverlaps,omitempty"`
+	// Assigned is the number of validators the validator ranges inventory
+	// assigns to the host, active or not.
+	Assigned uint64 `json:"assignedValidators"`
 
 	// Inventory is nil until the agent has uploaded one.
 	Inventory *protocol.Inventory `json:"inventory,omitempty"`

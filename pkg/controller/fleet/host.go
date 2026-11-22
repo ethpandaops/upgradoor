@@ -21,17 +21,11 @@ type Host struct {
 	// CertHash is the hash of the certificate last presented. A change is
 	// audited, not rejected.
 	CertHash string `json:"certHash"`
-	// Validators is the range of validators the controller counts for the
-	// host: its weight, and the validators whose attestations are tracked
-	// for it. It comes from what the host reports (Status.Validators), not
-	// from the certificate, and differs from the report in two cases. While
-	// the host does not know its range (its marker file is missing or
-	// unreadable) the range counted last is kept. And no validator is
-	// counted for two hosts: where the reported range runs into validators
-	// that are counted for another host, only the part nobody else holds is
-	// counted (UnclaimedRange). The ranges of all hosts are therefore
-	// disjoint.
-	Validators *identity.ValidatorRange `json:"validators,omitempty"`
+	// Validators are the validator index ranges the validator ranges
+	// inventory assigns to the host by name, ordered by start; nil when it
+	// assigns none. They are the host's weight and the validators whose
+	// attestations are tracked for it.
+	Validators []identity.ValidatorRange `json:"validators,omitempty"`
 	// Roles are copied from the certificate.
 	Roles []string `json:"roles"`
 
@@ -69,7 +63,7 @@ type Host struct {
 	Offline *OfflineMark `json:"offline,omitempty"`
 
 	// Broken says what the host's last lease failed on: per group of rollouts
-	// (a roll group as "group:<group>#<client>", or "packages") the ID of the
+	// (a unit as "unit:<kind>#<team>", or "packages") the ID of the
 	// lease that failed. A host that is broken for the group of a rollout goes
 	// first in it. The scheduler sets the mark where a lease fails and clears
 	// it where a lease is released with the group's steps done; it goes with
@@ -128,87 +122,15 @@ func (h *Host) KnownOffline(now time.Time) bool {
 	return h.Offline != nil && (h.Offline.Until == nil || now.Before(*h.Offline.Until))
 }
 
-// Weight is the number of validators counted for the host.
-func (h *Host) Weight() uint64 { return h.Validators.Count() }
+// Weight is the number of validators assigned to the host.
+func (h *Host) Weight() uint64 {
+	var n uint64
 
-// ReportedValidators is the validator range the host's last sync stated, or
-// nil when it stated none or does not know it.
-func (h *Host) ReportedValidators() *identity.ValidatorRange {
-	if h.Status == nil || h.Status.Validators.Count() == 0 {
-		return nil
+	for i := range h.Validators {
+		n += h.Validators[i].Count()
 	}
 
-	return &identity.ValidatorRange{
-		Start: h.Status.Validators.Start, End: h.Status.Validators.End,
-	}
-}
-
-// ReportedOverlaps names the hosts of all, other than h, whose reported
-// validator range shares validators with the one h reports, ordered as all
-// is. Two hosts say they run the same validators: for a moment while keys
-// are moved between them, or because one of them is wrong.
-func (h *Host) ReportedOverlaps(all []*Host) []string {
-	mine := h.ReportedValidators()
-	if mine == nil {
-		return nil
-	}
-
-	var out []string
-
-	for _, other := range all {
-		if other == nil || other.Name == h.Name {
-			continue
-		}
-
-		theirs := other.ReportedValidators()
-		if theirs != nil && theirs.Start < mine.End && mine.Start < theirs.End {
-			out = append(out, other.Name)
-		}
-	}
-
-	return out
-}
-
-// UnclaimedRange returns the largest part of want that none of taken covers,
-// the first one of several of that size; nil when all of want is taken or
-// want is empty. taken must be ordered by Start.
-//
-// It decides what is counted for a host whose reported range overlaps what
-// is counted for other hosts: whoever held a validator first keeps it, so a
-// host cannot take validators away from another by reporting them.
-func UnclaimedRange(
-	want identity.ValidatorRange, taken []identity.ValidatorRange,
-) *identity.ValidatorRange {
-	var best *identity.ValidatorRange
-
-	consider := func(start, end uint64) {
-		if end > start && (best == nil || end-start > best.End-best.Start) {
-			best = &identity.ValidatorRange{Start: start, End: end}
-		}
-	}
-
-	cursor := want.Start
-
-	for _, t := range taken {
-		if t.End <= cursor || t.End <= t.Start {
-			continue
-		}
-
-		if t.Start >= want.End {
-			break
-		}
-
-		consider(cursor, min(t.Start, want.End))
-
-		cursor = t.End
-		if cursor >= want.End {
-			return best
-		}
-	}
-
-	consider(cursor, want.End)
-
-	return best
+	return n
 }
 
 // staleSlack is what StaleAfter adds to two asked sync intervals: one
@@ -286,6 +208,11 @@ type NetworkHealth struct {
 	// LivenessEpoch, Live the ones whose attestation a block carries.
 	Tracked uint64 `json:"tracked"`
 	Live    uint64 `json:"live"`
+
+	// ValidatorRangesError says why the last fetch of the validator ranges
+	// inventory failed; the last good version stays in use. The controller
+	// sets it, not the beacon service.
+	ValidatorRangesError string `json:"validatorRangesError,omitempty"`
 }
 
 // SlotPhase is a stretch of the chain with one slot duration.

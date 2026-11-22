@@ -12,8 +12,8 @@ function rollout(p: Partial<Rollout>): Rollout {
   return {
     id: 'ro-1',
     kind: 'group',
-    key: 'group:consensus#prysm@0011223344556677',
-    title: 'prysm consensus',
+    key: 'unit:cl#prysm@0011223344556677',
+    title: 'prysm cl',
     state: 'active',
     paused: false,
     approved: false,
@@ -28,14 +28,14 @@ function rollout(p: Partial<Rollout>): Rollout {
 }
 
 describe('RolloutsTab', () => {
-  it('shows a group rollout with its group, its client and what it moves the group to', async () => {
+  it('shows a group rollout with its kind, its team and what it moves them to', async () => {
     const h = await createHarness({ mode: 'open' });
     renderWithApp(<RolloutsTab />, h);
 
-    const card = await screen.findByRole('article', { name: /^lighthouse consensus: sigp\/lighthouse:unstable to / });
-    expect(within(card).getByTitle(/^Moves the containers of one roll group of one client/)).toHaveTextContent('group');
-    expect(card).toHaveTextContent('group consensus');
-    expect(card).toHaveTextContent('client lighthouse');
+    const card = await screen.findByRole('article', { name: /^lighthouse cl: sigp\/lighthouse:unstable to / });
+    expect(within(card).getByTitle(/^Moves the containers of one kind of one team/)).toHaveTextContent('group');
+    expect(card).toHaveTextContent('kind cl');
+    expect(card).toHaveTextContent('team lighthouse');
 
     const targets = within(card).getByRole('list', { name: /^Targets of / });
     expect(
@@ -78,10 +78,11 @@ describe('RolloutTargets', () => {
 });
 
 describe('policyFor', () => {
-  it('gives a group rollout the image policy of its client where one is set', () => {
-    const settings = { ...defaultSettings(), policyClients: { besu: 'manual' as const } };
-    expect(policyFor(settings, rollout({ client: 'besu' }))).toBe('manual');
-    expect(policyFor(settings, rollout({ client: 'prysm' }))).toBe('auto');
+  it('gives a group rollout the image policy of its team where one is set, policyImage without a team', () => {
+    const settings = { ...defaultSettings(), policyClients: { besu: 'manual' as const }, policyImage: 'auto' as const };
+    expect(policyFor(settings, rollout({ team: 'besu' }))).toBe('manual');
+    expect(policyFor(settings, rollout({ team: 'prysm' }))).toBe('auto');
+    expect(policyFor({ ...settings, policyImage: 'manual' }, rollout({ containerKind: 'snooper-el' }))).toBe('manual');
     expect(policyFor(settings, rollout({ kind: 'local' }))).toBeUndefined();
   });
 });

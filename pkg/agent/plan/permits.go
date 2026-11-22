@@ -26,9 +26,7 @@ const (
 // for now (nil when a part is only taken away). An override from the
 // controller needs an end within MaxOverride; one set on the host may have
 // none.
-func Permits(
-	policy *Policy, view *View, container string, next, asked *Entry, origin Origin, now time.Time,
-) error {
+func Permits(view *View, container string, next, asked *Entry, origin Origin, now time.Time) error {
 	c := view.Container(container)
 	if c == nil || !c.Managed {
 		return Refusal("container %s is not managed on this host", container)
@@ -44,8 +42,7 @@ func Permits(
 		return nil
 	}
 
-	g := policy.group(c.Group)
-	if err := partsPermitted(&g, c.Group, container, asked); err != nil {
+	if err := overridable(c, asked); err != nil {
 		return Refusal("%s", err)
 	}
 
@@ -68,37 +65,37 @@ func Permits(
 // overrideClockSlack allows for the controller's clock differing from ours.
 const overrideClockSlack = time.Minute
 
-// partsPermitted checks an entry's parts against the group's policy; it
+// overridable checks that a container may take an entry: only a labelled
+// container with a team may be overridden, image and command line alike. It
 // bounds the controller, the local commands and hand edits alike.
-func partsPermitted(g *Group, group, container string, entry *Entry) error {
+func overridable(c *protocol.Container, entry *Entry) error {
 	switch {
 	case entry.Empty():
 		return nil
-	case group == protocol.DefaultGroup:
-		return fmt.Errorf("container %s cannot be overridden: it is in the default group, "+
-			"which allows no overrides", container)
-	case len(g.Overrides) == 0:
-		return fmt.Errorf("container %s cannot be overridden: its group %q allows no overrides "+
-			"(groups.%s.overrides in agent.yaml)", container, group, group)
-	case entry.Image != "" && !g.mayOverride(protocol.OverrideImage):
-		return fmt.Errorf("the group %q of container %s does not allow image overrides", group, container)
-	case len(entry.Add)+len(entry.Remove) > 0 && !g.mayOverride(protocol.OverrideFlags):
-		return fmt.Errorf("the group %q of container %s does not allow flag overrides", group, container)
+	case c.Kind == "":
+		return fmt.Errorf("container %s cannot be overridden: it has no %s label", c.Name, protocol.LabelKind)
+	case c.Team == "":
+		return fmt.Errorf("container %s cannot be overridden: it has no %s label", c.Name, protocol.LabelTeam)
 	default:
 		return nil
 	}
 }
 
-// Instruct decides an override directive against the current entry prev.
-// It returns the entry to write (nil removes it) or a Refusal, checked in
-// this order: no container or no override; container not managed; roll verb
-// not allowed; unknown part; Permits on what is asked, whose refusal comes
-// with the refused entry. The part not named keeps prev's value.
+// Instruct decides an override directive against the current entry prev
+// and the container's deployed entry (nil when it has none). It returns the
+// entry to write (nil removes it) or a Refusal, checked in this order: no
+// container or no override; container not managed; roll verb not allowed;
+// unknown part; malformed flags; Permits on what is asked, whose refusal
+// comes with the refused entry. The part not named keeps prev's value. Flags
+// are applied to the default command line, and the result is the entry's
+// command.
 func Instruct(
 	policy *Policy, view *View, container string, inst *protocol.OverrideInstruction,
-	prev *Entry, by, reason string, now time.Time,
+	prev *Entry, deployed *Deployed, by, reason string, now time.Time,
 ) (*Entry, error) {
-	switch c := view.Container(container); {
+	c := view.Container(container)
+
+	switch {
 	case inst == nil || container == "":
 		return nil, Refusal("the override directive names no container or no override")
 	case c == nil || !c.Managed:
@@ -111,7 +108,7 @@ func Instruct(
 	if prev != nil {
 		// Copies: the returned entry must not share the caller's lists.
 		next.Image, next.Until = prev.Image, prev.Until
-		next.Add, next.Remove = slices.Clone(prev.Add), slices.Clone(prev.Remove)
+		next.Command, next.HasCommand = slices.Clone(prev.Command), prev.HasCommand
 	}
 
 	asked := &Entry{Until: inst.Until}
@@ -121,8 +118,18 @@ func Instruct(
 		next.Image = strings.TrimSpace(inst.Image)
 		asked.Image = next.Image
 	case protocol.OverrideFlags:
-		next.Add, next.Remove = slices.Clone(inst.AddFlags), slices.Clone(inst.RemoveFlags)
-		asked.Add, asked.Remove = next.Add, next.Remove
+		if err := validateFlags(inst.AddFlags, inst.RemoveFlags); err != nil {
+			return nil, Refusal("%s", err)
+		}
+
+		next.Command, next.HasCommand = nil, false
+
+		if len(inst.AddFlags)+len(inst.RemoveFlags) > 0 {
+			next.Command = applyFlags(defaultCommand(deployed, c), inst.AddFlags, inst.RemoveFlags)
+			next.HasCommand = true
+		}
+
+		asked.Command, asked.HasCommand = next.Command, next.HasCommand
 	default:
 		return nil, Refusal("unknown part %q of an override", inst.Part)
 	}
@@ -139,7 +146,7 @@ func Instruct(
 		entry = nil
 	}
 
-	if err := Permits(policy, view, container, entry, asked, FromController, now); err != nil {
+	if err := Permits(view, container, entry, asked, FromController, now); err != nil {
 		return entry, err
 	}
 
@@ -150,9 +157,10 @@ func Instruct(
 type LocalRequest struct {
 	Container string
 	Image     string
-	Add       []string
-	Remove    []string
-	Until     *time.Time
+	// Add and Remove change the default command line (applyFlags).
+	Add    []string
+	Remove []string
+	Until  *time.Time
 	// User is the socket's caller, "local:<name>".
 	User   string
 	Reason string
@@ -160,18 +168,28 @@ type LocalRequest struct {
 	Clear bool
 }
 
-// LocalEntry decides an override asked for on the host: the entry to write
-// (nil for a clear) and Permits' refusal, if any.
-func LocalEntry(policy *Policy, view *View, req *LocalRequest, now time.Time) (*Entry, error) {
+// LocalEntry decides an override asked for on the host against the
+// container's deployed entry (nil when it has none): the entry to write (nil
+// for a clear) and the refusal of malformed flags or of Permits, if any.
+// Flags are applied to the default command line, and the result is the
+// entry's command.
+func LocalEntry(view *View, req *LocalRequest, deployed *Deployed, now time.Time) (*Entry, error) {
 	var entry *Entry
 	if !req.Clear {
 		entry = &Entry{
-			Image: strings.TrimSpace(req.Image), Add: slices.Clone(req.Add), Remove: slices.Clone(req.Remove),
-			By: bareUser(req.User), Reason: Line(req.Reason), Until: req.Until,
+			Image: strings.TrimSpace(req.Image), By: bareUser(req.User), Reason: Line(req.Reason), Until: req.Until,
+		}
+
+		if c := view.Container(req.Container); c != nil && len(req.Add)+len(req.Remove) > 0 {
+			if err := validateFlags(req.Add, req.Remove); err != nil {
+				return nil, Refusal("%s", err)
+			}
+
+			entry.Command, entry.HasCommand = applyFlags(defaultCommand(deployed, c), req.Add, req.Remove), true
 		}
 	}
 
-	return entry, Permits(policy, view, req.Container, entry, entry, FromLocal, now)
+	return entry, Permits(view, req.Container, entry, entry, FromLocal, now)
 }
 
 // defaultLocalHoldReason is the reason of a local hold set without one.

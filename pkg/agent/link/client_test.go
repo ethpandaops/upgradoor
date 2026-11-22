@@ -167,10 +167,10 @@ func sign(t *testing.T, s *identity.AnswerSigner, host, id string, body []byte) 
 func credentials(t *testing.T) *identity.Credentials {
 	t.Helper()
 
-	key, err := identity.DeriveHostKey([]byte(testSeed), testNetwork, testHost)
+	key, err := identity.GenerateHostKey()
 	require.NoError(t, err)
 
-	cert, err := identity.IssueCertificate([]byte(testSeed), identity.CertificateSpec{
+	cert, err := identity.IssueCertificate([]byte(testSeed), identity.PublicKey(key), identity.CertificateSpec{
 		Network: testNetwork, Hostname: testHost,
 	})
 	require.NoError(t, err)

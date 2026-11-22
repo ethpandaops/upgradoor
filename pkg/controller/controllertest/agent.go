@@ -20,7 +20,7 @@ type Agent struct {
 	Creds *identity.Credentials
 }
 
-// NewAgent issues a certificate for a host of the test network.
+// NewAgent issues a certificate for a new key of a host of the test network.
 func NewAgent(t *testing.T, spec identity.CertificateSpec) *Agent {
 	t.Helper()
 
@@ -28,12 +28,10 @@ func NewAgent(t *testing.T, spec identity.CertificateSpec) *Agent {
 		spec.Network = Network
 	}
 
-	seed := []byte(Seed)
-
-	cert, err := identity.IssueCertificate(seed, spec)
+	key, err := identity.GenerateHostKey()
 	require.NoError(t, err)
 
-	key, err := identity.DeriveHostKey(seed, spec.Network, spec.Hostname)
+	cert, err := identity.IssueCertificate([]byte(Seed), identity.PublicKey(key), spec)
 	require.NoError(t, err)
 
 	creds, err := identity.NewCredentials(key, cert)
@@ -119,24 +117,6 @@ func SyncRequest() *protocol.SyncRequest {
 	}
 }
 
-// KnownValidators is a validator range as a host reports it from its marker
-// file.
-func KnownValidators(start, end uint64) *protocol.Validators {
-	return &protocol.Validators{
-		Start: start, End: end,
-		Source: protocol.ValidatorsFromMarker, State: protocol.ValidatorsKnown,
-	}
-}
-
-// ValidatorSyncRequest is SyncRequest of a host that reports the validators
-// 0 to 99.
-func ValidatorSyncRequest() *protocol.SyncRequest {
-	req := SyncRequest()
-	req.Validators = KnownValidators(0, 100)
-
-	return req
-}
-
 // InventoryFor returns an inventory with a correct hash.
 func InventoryFor(t *testing.T, pkgs ...protocol.Package) *protocol.Inventory {
 	t.Helper()
@@ -169,6 +149,5 @@ func ValidatorAgent(t *testing.T) *Agent {
 
 	return NewAgent(t, identity.CertificateSpec{
 		Hostname: "lighthouse-geth-1",
-		Roles:    []string{"ethereum_node"},
 	})
 }

@@ -56,9 +56,6 @@ type sqliteStore struct {
 	mu     sync.RWMutex
 	writer *sql.DB
 	reader *sql.DB
-	// opened is when Start opened the database: a host's silence is not
-	// counted from before it (countedValidators).
-	opened time.Time
 
 	statuses statusCache
 }
@@ -126,7 +123,6 @@ func (s *sqliteStore) Start(ctx context.Context) error {
 	}
 
 	s.writer, s.reader = writer, reader
-	s.opened = time.Now()
 
 	s.log.WithFields(logrus.Fields{"path": s.path, "schema": len(steps)}).Info("database open")
 

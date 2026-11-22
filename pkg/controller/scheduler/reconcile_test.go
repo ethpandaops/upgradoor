@@ -122,7 +122,7 @@ func largeWorld(tb testing.TB, n int) *World {
 		start := uint64(i) * 32
 		w.Hosts = append(w.Hosts, &fleet.Host{
 			Name: name, LastSeen: now,
-			Validators: &identity.ValidatorRange{Start: start, End: start + 32},
+			Validators: []identity.ValidatorRange{{Start: start, End: start + 32}},
 			Status: &protocol.SyncRequest{
 				Verbs: allVerbs, Needs: []protocol.Need{packagesNeed("2.0")},
 				Node: protocol.NodeHealth{

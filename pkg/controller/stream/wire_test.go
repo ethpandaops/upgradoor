@@ -224,13 +224,13 @@ func TestWireRowsAreCompact(t *testing.T) {
 }
 
 // What only a client's page and a host's details show of a container (its
-// client, command line and override) is not in the host table: a host's row
-// is byte for byte what it is without them.
+// command line and override) is not in the host table: a host's row is byte
+// for byte what it is without them.
 func TestWireHostRowLeavesOutWhatTheClientPageServes(t *testing.T) {
 	row := func(change func(c *protocol.Container)) string {
 		c := protocol.Container{
 			Name: "geth", Image: "ethpandaops/geth:master", Managed: true, Kind: protocol.KindEL,
-			Owners: []string{"geth"},
+			Team: "geth",
 		}
 		change(&c)
 
@@ -248,10 +248,9 @@ func TestWireHostRowLeavesOutWhatTheClientPageServes(t *testing.T) {
 	until := controllertest.Epoch.Add(time.Hour)
 
 	assert.Equal(t, row(func(*protocol.Container) {}), row(func(c *protocol.Container) {
-		c.Client = "geth"
 		c.Command = []string{"--http", "--syncmode=snap"}
 		c.Override = &protocol.ContainerOverride{Image: "me/geth:fix", By: "sam", Until: &until}
-		c.Overridable = &protocol.Overridable{Image: true, Flags: true}
+		c.Overridable = true
 	}))
 }
 
@@ -509,8 +508,8 @@ func largeFleet(n int) []views.HostSummary {
 				Name: cname, ID: fleetHash(name, cname), Image: image, ImageID: "sha256:" + fleetHash(image),
 				Digest: "sha256:" + fleetHash("digest", image), Revision: fleetHash("rev", image)[:12],
 				Version: "v1.2.3", State: protocol.StateRunning, RestartCount: i % 3,
-				StartedAt: controllertest.Epoch.Add(-time.Duration(i) * time.Minute), Managed: kind != protocol.KindOther,
-				Kind: kind, ConfiguredImage: image, Owners: []string{"devops"},
+				StartedAt: controllertest.Epoch.Add(-time.Duration(i) * time.Minute), Managed: kind != "",
+				Kind: kind, ConfiguredImage: image, Team: "devops",
 				Registry: &protocol.RegistryCheck{
 					Digest: "sha256:" + fleetHash("digest", image), CheckedAt: controllertest.Epoch, Pulled: true,
 				},
@@ -518,15 +517,12 @@ func largeFleet(n int) []views.HostSummary {
 		}
 		sum := views.HostSummary{
 			Name: name, Roles: []string{"validator"}, Validators: 256,
-			ValidatorReport: &protocol.Validators{
-				Start: uint64(i * 256), End: uint64(i*256 + 256), Source: "marker", State: "known",
-			},
 			LastSeen: controllertest.Epoch, AgentVersion: "v0.1.0-abcdef",
 			Containers: []protocol.Container{
 				container("execution", pair[0], protocol.KindEL),
 				container("beacon", pair[1], protocol.KindCL),
 				container("validator", pair[1], protocol.KindVC),
-				container("node-exporter", "prom/node-exporter:latest", protocol.KindOther),
+				container("node-exporter", "prom/node-exporter:latest", ""),
 			},
 			Node: protocol.NodeHealth{
 				EL: &protocol.ELHealth{Reachable: true, Peers: 50, Head: 123456},

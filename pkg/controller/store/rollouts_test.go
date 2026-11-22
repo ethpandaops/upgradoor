@@ -22,9 +22,9 @@ func testRollout(id string, state fleet.RolloutState, sec int, hosts ...string) 
 	r := &fleet.Rollout{
 		ID:    id,
 		Kind:  fleet.RolloutGroup,
-		Key:   "group:execution#geth@" + id,
+		Key:   "unit:el#geth@" + id,
 		Title: "geth master -> " + id,
-		Group: "execution",
+		Team:  "geth", ContainerKind: protocol.KindEL,
 		Targets: []fleet.RolloutTarget{
 			{Image: "ethpandaops/geth:master", Digest: "sha256:" + id, Revision: "abcdef0"},
 		},
@@ -144,7 +144,7 @@ func TestRollouts(t *testing.T) {
 			packages := testRollout("r-packages", fleet.RolloutHalted, 30, "node-1", "node-2")
 			packages.Kind = fleet.RolloutPackages
 			packages.Key = "packages:abc"
-			packages.Group, packages.Targets = "", nil
+			packages.Team, packages.ContainerKind, packages.Targets = "", "", nil
 			packages.Packages = []protocol.PackageChange{{Name: "docker-ce", From: "1", To: "2"}}
 			packages.Reason = "node-2 failed: \"exit 1\""
 			packages.Paused, packages.Force, packages.IgnoreBudget = true, true, true

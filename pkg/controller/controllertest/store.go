@@ -27,6 +27,9 @@ type Store struct {
 	Leases      []*fleet.Lease            // newest first
 	Audit       []fleet.AuditEntry
 	Packages    []store.PackageMatch
+	// Ranges is the validator ranges inventory; SetValidatorRanges assigns
+	// its ranges to the hosts, RecordSync to a new host.
+	Ranges fleet.ValidatorRanges
 
 	// Err, when set, fails every call.
 	Err error
@@ -59,7 +62,7 @@ func (f *Store) RecordSync(_ context.Context, sync *store.HostSync) (*store.Sync
 
 	host, ok := f.Hosts[name]
 	if !ok {
-		host = &fleet.Host{Name: name, FirstSeen: sync.At}
+		host = &fleet.Host{Name: name, FirstSeen: sync.At, Validators: f.assigned(name)}
 		f.Hosts[name] = host
 		res.Created = true
 
@@ -75,9 +78,15 @@ func (f *Store) RecordSync(_ context.Context, sync *store.HostSync) (*store.Sync
 	}
 
 	host.CertHash = sync.Cert.Hash
-	res.ValidatorsBefore = host.Validators
-	host.Validators, res.ValidatorOverlaps = f.countedValidators(name, sync, host.Validators)
-	host.Roles = sync.Cert.Roles
+
+	// Like the real store: a sync without a request keeps the roles.
+	switch {
+	case sync.Request != nil:
+		host.Roles = append([]string{}, sync.Request.Roles...)
+	case host.Roles == nil:
+		host.Roles = []string{}
+	}
+
 	host.LastSeen = sync.At
 	host.RemoteAddr = sync.RemoteAddr
 	host.Status = sync.Request
@@ -88,58 +97,49 @@ func (f *Store) RecordSync(_ context.Context, sync *store.HostSync) (*store.Sync
 	return res, nil
 }
 
-// countedValidators is the real store's rule: the reported range without the
-// validators counted for other hosts, and the range counted before while the
-// host does not know its own.
-func (f *Store) countedValidators(
-	name string, sync *store.HostSync, before *identity.ValidatorRange,
-) (*identity.ValidatorRange, []string) {
-	if sync.Request == nil {
-		return before, nil
+// ValidatorRanges returns Ranges.
+func (f *Store) ValidatorRanges(context.Context) (*fleet.ValidatorRanges, error) {
+	f.Lock()
+	defer f.Unlock()
+
+	if f.Err != nil {
+		return nil, f.Err
 	}
 
-	reported := sync.Request.Validators
+	out := f.Ranges
 
-	switch {
-	case reported == nil:
-		return nil, nil
-	case !reported.Known():
-		return before, nil
-	case reported.Count() == 0:
-		return nil, nil
+	return &out, nil
+}
+
+// SetValidatorRanges replaces Ranges and the validators of every host.
+func (f *Store) SetValidatorRanges(_ context.Context, ranges *fleet.ValidatorRanges) error {
+	f.Lock()
+	defer f.Unlock()
+
+	if f.Err != nil {
+		return f.Err
 	}
 
-	names := make([]string, 0, len(f.Hosts))
-	for other := range f.Hosts {
-		names = append(names, other)
+	f.Ranges = *ranges
+
+	for name, host := range f.Hosts {
+		host.Validators = f.assigned(name)
 	}
 
-	sort.Slice(names, func(i, j int) bool {
-		return f.Hosts[names[i]].Validators.Count() > 0 &&
-			(f.Hosts[names[j]].Validators.Count() == 0 ||
-				f.Hosts[names[i]].Validators.Start < f.Hosts[names[j]].Validators.Start)
-	})
+	return nil
+}
 
-	var (
-		taken    []identity.ValidatorRange
-		overlaps []string
-	)
+// assigned returns the ranges of Ranges that name the host.
+func (f *Store) assigned(name string) []identity.ValidatorRange {
+	var out []identity.ValidatorRange
 
-	for _, other := range names {
-		held := f.Hosts[other].Validators
-		if other == name || held.Count() == 0 ||
-			held.Start >= reported.End || reported.Start >= held.End {
-			continue
+	for _, r := range f.Ranges.Ranges {
+		if r.Host == name {
+			out = append(out, r.ValidatorRange)
 		}
-
-		taken = append(taken, *held)
-		overlaps = append(overlaps, other)
 	}
 
-	sort.Strings(overlaps)
-
-	return fleet.UnclaimedRange(
-		identity.ValidatorRange{Start: reported.Start, End: reported.End}, taken), overlaps
+	return out
 }
 
 func (f *Store) GetHost(_ context.Context, name string) (*fleet.Host, error) {

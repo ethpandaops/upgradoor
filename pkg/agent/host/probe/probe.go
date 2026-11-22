@@ -1,8 +1,8 @@
-// Package probe checks the local execution client (JSON-RPC) and consensus
-// client (beacon API) on the configured URLs. It changes nothing, follows
-// no redirect, never fails (an unreachable client is a result) and imports
-// no other package of the agent. Every answer is bounded in size
-// (maxProbeAnswer) and time (probeTimeout).
+// Package probe checks the local execution client (JSON-RPC), consensus
+// client (beacon API) and the HTTP endpoints of other kinds on the
+// configured URLs. It changes nothing, follows no redirect, never fails (an
+// unreachable client is a result) and imports no other package of the agent.
+// Every answer is bounded in size (maxProbeAnswer) and time (probeTimeout).
 package probe
 
 import (
@@ -12,7 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
+	"net/url"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -32,26 +35,54 @@ const (
 	maxProbeAnswer = 1 << 20
 )
 
-// Config is the probes section of agent.yaml: the local node endpoints. An
-// empty URL disables a probe.
-type Config struct {
-	// EL is the execution client JSON-RPC URL, e.g. http://127.0.0.1:8545.
-	EL string `yaml:"el"`
-	// CL is the beacon API URL, e.g. http://127.0.0.1:5052.
-	CL string `yaml:"cl"`
+// Config is the probes section of agent.yaml: a URL per container kind. el
+// is the execution client JSON-RPC URL (http://127.0.0.1:8545), cl the beacon
+// API URL (http://127.0.0.1:5052); any other kind is probed with a GET that
+// must answer 2xx. An empty URL disables a probe.
+type Config map[protocol.ContainerKind]string
+
+// Validate checks the kinds and the URLs.
+func (c Config) Validate() error {
+	for _, kind := range slices.Sorted(maps.Keys(c)) {
+		if !protocol.ValidKind(kind) || kind == protocol.KindNone {
+			return fmt.Errorf("probes: %q is not a kind ([a-z0-9][a-z0-9._-]{0,62}, not none)", kind)
+		}
+
+		raw := strings.TrimSpace(c[kind])
+		if raw == "" {
+			continue
+		}
+
+		if u, err := url.Parse(raw); err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+			return fmt.Errorf("probes.%s: %q is not an http or https URL", kind, raw)
+		}
+	}
+
+	return nil
 }
 
 // Prober checks the local nodes.
 type Prober interface {
-	// Probe checks the local EL and CL on their configured URLs; a
-	// probe without a URL is left out.
+	// Probe checks every kind with a configured URL; a probe without a URL
+	// is left out.
 	Probe(ctx context.Context) protocol.NodeHealth
 }
 
 // New returns the prober of the URLs cfg configures; an empty URL disables
 // that probe.
-func New(log logrus.FieldLogger, cfg *Config) Prober {
-	return newProber(log, cfg.EL, cfg.CL)
+func New(log logrus.FieldLogger, cfg Config) Prober {
+	others := make(map[protocol.ContainerKind]string, len(cfg))
+
+	for kind, raw := range cfg {
+		if raw = strings.TrimSpace(raw); raw != "" && kind != protocol.KindEL && kind != protocol.KindCL {
+			others[kind] = raw
+		}
+	}
+
+	p := newProber(log, cfg[protocol.KindEL], cfg[protocol.KindCL])
+	p.others = others
+
+	return p
 }
 
 var _ Prober = (*prober)(nil)
@@ -59,9 +90,11 @@ var _ Prober = (*prober)(nil)
 // prober probes the local EL (JSON-RPC) and CL (beacon API). Requests go
 // only to the configured EL and CL URLs.
 type prober struct {
-	log     logrus.FieldLogger
-	elURL   string
-	clURL   string
+	log   logrus.FieldLogger
+	elURL string
+	clURL string
+	// others are the URLs of the other kinds.
+	others  map[protocol.ContainerKind]string
 	timeout time.Duration
 	client  *http.Client
 }
@@ -84,8 +117,8 @@ func newProber(log logrus.FieldLogger, elURL, clURL string) *prober {
 	}
 }
 
-// Probe asks both clients at the same time and returns what they said. It
-// never fails: an unreachable client is a result.
+// Probe asks every configured endpoint at the same time and returns what
+// they said. It never fails: an unreachable endpoint is a result.
 func (p *prober) Probe(ctx context.Context) protocol.NodeHealth {
 	var (
 		out protocol.NodeHealth
@@ -100,9 +133,42 @@ func (p *prober) Probe(ctx context.Context) protocol.NodeHealth {
 		wg.Go(func() { out.CL = p.probeCL(ctx) })
 	}
 
+	kinds := slices.Sorted(maps.Keys(p.others))
+	if len(kinds) > 0 {
+		out.Probes = make([]protocol.KindHealth, len(kinds))
+	}
+
+	for i, kind := range kinds {
+		wg.Go(func() { out.Probes[i] = p.probeKind(ctx, kind, p.others[kind]) })
+	}
+
 	wg.Wait()
 
 	return out
+}
+
+// probeKind GETs the URL of one kind: a 2xx answer is healthy.
+func (p *prober) probeKind(ctx context.Context, kind protocol.ContainerKind, target string) protocol.KindHealth {
+	ctx, cancel := context.WithTimeout(ctx, p.timeout)
+	defer cancel()
+
+	h := protocol.KindHealth{Kind: kind}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, target, http.NoBody)
+	if err == nil {
+		_, err = p.do(req)
+	}
+
+	if err != nil {
+		h.Error = err.Error()
+		p.log.WithError(err).WithField("kind", kind).Debug("probe failed")
+
+		return h
+	}
+
+	h.Healthy = true
+
+	return h
 }
 
 // probeEL calls eth_syncing, net_peerCount and eth_blockNumber. The client

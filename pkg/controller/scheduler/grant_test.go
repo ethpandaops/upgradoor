@@ -1033,32 +1033,6 @@ func TestIndependentWorkNeitherWaitsNorBlocks(t *testing.T) {
 	assert.Equal(t, 2, out.Plan.Budget.MaxIndependent)
 }
 
-// Slot work takes a place in the host limit and waits for the gate, but
-// costs no validator weight and is ready when the agent is done.
-func TestSlotWorkCostsNoWeight(t *testing.T) {
-	b := newWorldBuilder(t)
-	b.host("s1", 60)
-	b.host("s2", 40)
-	b.wantsImageOf("s1", "org/mev-boost:latest", digestA, protocol.ImpactSlot)
-	b.wantsImageOf("s2", "org/mev-boost:latest", digestA, protocol.ImpactSlot)
-
-	out := b.step()
-	require.Equal(t, []string{"s2"}, b.leasedHosts(), "the lighter host is the canary")
-	assert.Equal(t, protocol.ImpactSlot, b.lease("s2").Impact)
-	assert.Zero(t, b.lease("s2").Charged)
-	assert.Zero(t, out.Plan.Budget.UnavailableWeight, "a slot lease costs no weight")
-	assert.Equal(t, 1, out.Plan.Budget.LeasedHosts)
-
-	b.finish("s2")
-	b.step()
-	b.advance(5 * time.Second)
-	b.step()
-	require.Nil(t, b.lease("s2"))
-
-	b.step()
-	assert.Equal(t, []string{"s1"}, b.leasedHosts())
-}
-
 // A lease that serves node and independent work is a node lease.
 func TestMixedLeaseIsNode(t *testing.T) {
 	b := newWorldBuilder(t)
@@ -1188,6 +1162,8 @@ func TestValidatorsWithoutDutyCountForNothing(t *testing.T) {
 	out := b.step()
 	assert.True(t, out.Plan.Gate.OK, "participation is 30 of the 30 with a duty")
 	assert.Equal(t, uint64(30), out.Plan.Budget.TotalWeight)
+	assert.Equal(t, uint64(10), out.Plan.Hosts["half"].Weight, "the active validators")
+	assert.Equal(t, uint64(10), out.Plan.Hosts["half"].Live)
 	require.Equal(t, []string{"half"}, b.leasedHosts())
 	assert.Equal(t, uint64(10), b.lease("half").Charged)
 
@@ -1197,6 +1173,26 @@ func TestValidatorsWithoutDutyCountForNothing(t *testing.T) {
 	out = b.step()
 	assert.True(t, out.Plan.Gate.OK)
 	assert.Zero(t, out.Plan.Budget.UnavailableWeight)
+
+	t.Run("a host none of whose validators has a duty is a host without validators", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.host("exited", 10)
+		b.host("a", 10)
+		b.dutyOverride["exited"] = 0
+		b.liveOverride["exited"] = 0
+		b.wants("exited", packagesNeed("2.0"))
+
+		out := b.step()
+		assert.Zero(t, out.Plan.Hosts["exited"].Weight)
+		assert.Equal(t, uint64(10), out.Plan.Budget.TotalWeight)
+		require.Equal(t, []string{"exited"}, b.leasedHosts())
+		assert.Zero(t, b.lease("exited").Charged)
+
+		b.serve("exited")
+		ended := b.lastLease("exited")
+		assert.Equal(t, fleet.LeaseReleased, ended.State)
+		assert.NotContains(t, ended.Readiness, noteAttesting, "no wait for attestations")
+	})
 
 	t.Run("a host none of whose validators has a duty does not pass the closed gate", func(t *testing.T) {
 		b := newWorldBuilder(t)

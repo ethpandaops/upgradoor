@@ -46,7 +46,7 @@ func TestRegistry(t *testing.T) {
 }
 
 func TestHostPullFrom(t *testing.T) {
-	h, err := NewHost(BaseScenario(), nil)
+	h, err := NewHost(BaseScenario())
 	require.NoError(t, err)
 
 	h.PullFrom(func(context.Context, string) (string, error) { return GethV3, nil })

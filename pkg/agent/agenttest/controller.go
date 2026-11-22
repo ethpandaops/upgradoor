@@ -399,10 +399,10 @@ func (c *Controller) Inventories() []protocol.Inventory {
 func Credentials(t *testing.T) *identity.Credentials {
 	t.Helper()
 
-	key, err := identity.DeriveHostKey([]byte(Seed), Network, HostName)
+	key, err := identity.GenerateHostKey()
 	require.NoError(t, err)
 
-	cert, err := identity.IssueCertificate([]byte(Seed), identity.CertificateSpec{
+	cert, err := identity.IssueCertificate([]byte(Seed), identity.PublicKey(key), identity.CertificateSpec{
 		Network: Network, Hostname: HostName,
 	})
 	require.NoError(t, err)

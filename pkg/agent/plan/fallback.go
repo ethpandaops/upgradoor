@@ -2,8 +2,6 @@ package plan
 
 import (
 	"fmt"
-	"path"
-	"slices"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/imageref"
@@ -18,14 +16,11 @@ const (
 	minFallbackInterval     = time.Minute
 )
 
-// Fallback lets the listed containers follow their tags while the
-// controller cannot be reached: the agent pulls their images itself and
-// recreates them without a lease. Nothing staggers the hosts then and no
-// network health is checked.
+// Fallback lets managed containers follow their tags while the controller
+// cannot be reached, as kindPolicies and defaultPolicy say: the agent pulls
+// their images itself and recreates them without a lease. Nothing staggers
+// the hosts then and no network health is checked.
 type Fallback struct {
-	// Containers are the containers it applies to: names or path.Match
-	// patterns. Empty turns the fallback off.
-	Containers []string `yaml:"containers"`
 	// After is how long the controller must have been silent.
 	After time.Duration `yaml:"after"`
 	// Interval is the time between two pulls of a tag; each host starts at
@@ -33,8 +28,8 @@ type Fallback struct {
 	Interval time.Duration `yaml:"interval"`
 }
 
-// Enabled reports whether any container is listed.
-func (f *Fallback) Enabled() bool { return len(f.Containers) > 0 }
+// FallbackEnabled reports whether the fallback rolls anything.
+func (p *Policy) FallbackEnabled() bool { return p.fallbackRolls() }
 
 func (f *Fallback) applyDefaults() {
 	if f.After <= 0 {
@@ -46,15 +41,9 @@ func (f *Fallback) applyDefaults() {
 	}
 }
 
-func (f *Fallback) validate() error {
-	for _, pattern := range f.Containers {
-		if _, err := path.Match(pattern, ""); err != nil || pattern == "" {
-			return fmt.Errorf("fallback.containers: %q is not a name or pattern", pattern)
-		}
-	}
-
+func (f *Fallback) validate(enabled bool) error {
 	switch {
-	case !f.Enabled():
+	case !enabled:
 		return nil
 	case f.After < minFallbackAfter:
 		return fmt.Errorf("fallback.after is below %s", minFallbackAfter)
@@ -65,16 +54,8 @@ func (f *Fallback) validate() error {
 	}
 }
 
-func (f *Fallback) covers(name string) bool {
-	return slices.ContainsFunc(f.Containers, func(pattern string) bool {
-		ok, _ := path.Match(pattern, name)
-
-		return ok
-	})
-}
-
 // FallbackTags are the tags the fallback pulls, by normalised reference: the
-// tag of every covered container that is rolled, and of its pending target.
+// tag of every container it rolls, and of its pending target.
 func FallbackTags(policy *Policy, view *View) map[string]string {
 	tags := make(map[string]string, len(view.Containers))
 
@@ -84,7 +65,7 @@ func FallbackTags(policy *Policy, view *View) map[string]string {
 
 	for i := range view.Containers {
 		c := &view.Containers[i]
-		if !c.Managed || c.NotRolled != "" || !policy.Fallback.covers(c.Name) {
+		if !c.Managed || c.NotRolled != "" || !policy.fallbackCovers(c) {
 			continue
 		}
 
@@ -99,27 +80,17 @@ func FallbackTags(policy *Policy, view *View) map[string]string {
 }
 
 // FallbackNeeds are the needs the fallback serves without a lease of the
-// controller: the image, spec and override needs of covered containers,
-// but for one whose pull has just failed. Packages and reboots always wait
-// for the controller.
-func FallbackNeeds(policy *Policy, needs []protocol.Need) []protocol.Need {
+// controller: the image, spec and override needs of the containers it
+// rolls, but for one whose pull has just failed. Packages and reboots always
+// wait for the controller.
+func FallbackNeeds(policy *Policy, view *View, needs []protocol.Need) []protocol.Need {
 	out := make([]protocol.Need, 0, len(needs))
 
 	for i := range needs {
 		n := &needs[i]
 
-		name := ""
-
-		switch {
-		case n.Image != nil:
-			name = n.Image.Container
-		case n.Spec != nil:
-			name = n.Spec.Container
-		case n.Override != nil:
-			name = n.Override.Container
-		}
-
-		if name == "" || n.PullError != "" || !policy.Fallback.covers(name) {
+		c := view.Container(n.Container())
+		if c == nil || !c.Managed || n.PullError != "" || !policy.fallbackCovers(c) {
 			continue
 		}
 

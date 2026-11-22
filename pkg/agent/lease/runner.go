@@ -39,7 +39,7 @@ const (
 // stops; the persisted phase says where to go on.
 var errInterrupted = errors.New("lease: operation interrupted")
 
-// Overrides is the overrides file as it is now; local.Files satisfies it.
+// Overrides is what the host's files and the holds say now.
 type Overrides interface {
 	Load() plan.Overrides
 }
@@ -696,7 +696,7 @@ func (o *operation) stopTimeout(name string) time.Duration {
 		c = o.view.Container(name)
 	}
 
-	return plan.StopTimeout(o.r.deps.Policy, c)
+	return plan.StopTimeout(c)
 }
 
 func (o *operation) hold() protocol.Hold {
@@ -717,6 +717,3 @@ func sleep(ctx context.Context, d time.Duration) bool {
 		return true
 	}
 }
-
-// host.Change and plan.Recreation must stay convertible.
-var _ = host.Change(plan.Recreation{})

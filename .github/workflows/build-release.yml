@@ -147,6 +147,11 @@ jobs:
       if: ${{ vars.OPENROUTER_MODEL != '' }}
       run: |
         prev_tag=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vx "$TAG" | head -n 1 || true)
+        # The script summarises merged pull requests; without any the model would invent changes.
+        if ! git log --merges --first-parent --oneline ${prev_tag:+$prev_tag..HEAD} | grep -q "Merge pull request #"; then
+          echo "no merged pull requests since ${prev_tag:-the first commit}: no AI release notes"
+          exit 0
+        fi
         ./.github/scripts/ai-release-notes.sh "$prev_tag"
       env:
         OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}

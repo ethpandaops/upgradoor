@@ -1,5 +1,5 @@
 {
- "version": "658d817e61d2",
+ "version": "6f7f3b77fde2",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -192,14 +192,6 @@
     "t": "b"
    },
    {
-    "n": "owners",
-    "t": "l"
-   },
-   {
-    "n": "allOwned",
-    "t": "l"
-   },
-   {
     "n": "images",
     "t": "a",
     "of": "ClientImage"
@@ -304,13 +296,13 @@
     "t": "b"
    },
    {
-    "n": "group",
-    "t": "s",
+    "n": "kind",
+    "t": "r",
     "omit": true
    },
    {
-    "n": "kind",
-    "t": "r",
+    "n": "team",
+    "t": "s",
     "omit": true
    },
    {
@@ -335,16 +327,6 @@
     "omit": true
    },
    {
-    "n": "owners",
-    "t": "l",
-    "omit": true
-   },
-   {
-    "n": "client",
-    "t": "s",
-    "omit": true
-   },
-   {
     "n": "command",
     "t": "l",
     "omit": true
@@ -357,8 +339,7 @@
    },
    {
     "n": "overridable",
-    "t": "o",
-    "of": "Overridable",
+    "t": "b",
     "omit": true
    }
   ],
@@ -400,12 +381,7 @@
     "omit": true
    },
    {
-    "n": "owners",
-    "t": "l",
-    "omit": true
-   },
-   {
-    "n": "group",
+    "n": "team",
     "t": "s",
     "omit": true
    }
@@ -542,12 +518,12 @@
     "t": "s"
    },
    {
-    "n": "group",
-    "t": "s",
+    "n": "kind",
+    "t": "r",
     "omit": true
    },
    {
-    "n": "client",
+    "n": "team",
     "t": "s",
     "omit": true
    },
@@ -612,6 +588,21 @@
    {
     "n": "installed",
     "t": "l"
+   }
+  ],
+  "KindHealth": [
+   {
+    "n": "kind",
+    "t": "r"
+   },
+   {
+    "n": "healthy",
+    "t": "b"
+   },
+   {
+    "n": "error",
+    "t": "r",
+    "omit": true
    }
   ],
   "Lease": [
@@ -811,6 +802,12 @@
     "t": "o",
     "of": "CLHealth",
     "omit": true
+   },
+   {
+    "n": "probes",
+    "t": "a",
+    "of": "KindHealth",
+    "omit": true
    }
   ],
   "OSInfo": [
@@ -916,18 +913,6 @@
    {
     "n": "disrupted",
     "t": "b"
-   }
-  ],
-  "Overridable": [
-   {
-    "n": "image",
-    "t": "b",
-    "omit": true
-   },
-   {
-    "n": "flags",
-    "t": "b",
-    "omit": true
    }
   ],
   "OverrideNeed": [
@@ -1160,7 +1145,12 @@
     "t": "s"
    },
    {
-    "n": "group",
+    "n": "containerKind",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "team",
     "t": "s",
     "omit": true
    },
@@ -1168,11 +1158,6 @@
     "n": "targets",
     "t": "a",
     "of": "RolloutTarget",
-    "omit": true
-   },
-   {
-    "n": "client",
-    "t": "s",
     "omit": true
    },
    {
@@ -1365,10 +1350,6 @@
     "t": "j"
    },
    {
-    "n": "policyDefaultGroup",
-    "t": "r"
-   },
-   {
     "n": "pauseAfterCanaryImage",
     "t": "b"
    },
@@ -1449,12 +1430,12 @@
     "t": "s"
    },
    {
-    "n": "group",
-    "t": "s",
+    "n": "kind",
+    "t": "r",
     "omit": true
    },
    {
-    "n": "client",
+    "n": "team",
     "t": "s",
     "omit": true
    },
@@ -1536,29 +1517,6 @@
     "t": "b"
    }
   ],
-  "Validators": [
-   {
-    "n": "start",
-    "t": "n"
-   },
-   {
-    "n": "end",
-    "t": "n"
-   },
-   {
-    "n": "source",
-    "t": "s"
-   },
-   {
-    "n": "state",
-    "t": "r"
-   },
-   {
-    "n": "error",
-    "t": "r",
-    "omit": true
-   }
-  ],
   "wireDetail": [
    {
     "n": "name",
@@ -1571,12 +1529,6 @@
    {
     "n": "validators",
     "t": "n"
-   },
-   {
-    "n": "validatorReport",
-    "t": "o",
-    "of": "Validators",
-    "omit": true
    },
    {
     "n": "lastSeen",
@@ -1671,19 +1623,8 @@
     "t": "s"
    },
    {
-    "n": "validatorStart",
-    "t": "j",
-    "omit": true
-   },
-   {
-    "n": "validatorEnd",
-    "t": "j",
-    "omit": true
-   },
-   {
-    "n": "validatorOverlaps",
-    "t": "l",
-    "omit": true
+    "n": "assignedValidators",
+    "t": "n"
    },
    {
     "n": "hasInventory",
@@ -1939,6 +1880,11 @@
    {
     "n": "live",
     "t": "n"
+   },
+   {
+    "n": "validatorRangesError",
+    "t": "s",
+    "omit": true
    },
    {
     "n": "clocked",

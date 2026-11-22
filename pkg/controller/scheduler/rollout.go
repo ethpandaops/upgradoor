@@ -24,7 +24,7 @@ const (
 // reportedNeeds is what the hosts' observed needs (those without a
 // directive) ask for.
 type reportedNeeds struct {
-	// groups are the targets of the roll groups, by GroupName.
+	// groups are the targets of the rollout units, by UnitName.
 	groups   map[string]*groupTarget
 	packages map[string][]protocol.PackageChange
 	reboot   bool
@@ -213,7 +213,7 @@ func (p *pass) settleOverride(d *fleet.Directive) {
 
 // holdActor is who set the controller hold of a host, as the hold directive
 // tells the agent: the person, and whether through a team feature or as
-// staff. The agent writes it into the hold entry of its overrides file.
+// staff. The agent keeps it in its state file.
 func holdActor(h *fleet.Host) *protocol.Actor {
 	if !h.HoldWanted {
 		return nil
@@ -385,7 +385,7 @@ func (p *pass) reported() *reportedNeeds {
 	return rep
 }
 
-// group offers one image or spec need as a part of its group's target.
+// group offers one image or spec need as a part of its unit's target.
 func (rep *reportedNeeds) group(n *protocol.Need, checked time.Time) {
 	name := needGroupName(n)
 
@@ -396,9 +396,9 @@ func (rep *reportedNeeds) group(n *protocol.Need, checked time.Time) {
 		}
 
 		if n.Image != nil {
-			g.group, g.client = n.Image.Group, n.Image.Client
+			g.kind, g.team = n.Image.Kind, n.Image.Team
 		} else {
-			g.group, g.client = n.Spec.Group, n.Spec.Client
+			g.kind, g.team = n.Spec.Kind, n.Spec.Team
 		}
 
 		rep.groups[name] = g

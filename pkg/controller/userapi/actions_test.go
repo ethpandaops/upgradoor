@@ -316,8 +316,8 @@ func TestActionsEndToEnd(t *testing.T) {
 	h, provider, st := realHarness(t)
 	ctx := context.Background()
 
-	syncOwned(t, st, controllertest.HostMixed, controllertest.Owned("geth", "geth"), controllertest.Owned("lighthouse", "lighthouse"))
-	syncOwned(t, st, controllertest.HostUnowned, controllertest.Owned("bootnode"))
+	syncOwned(t, st, controllertest.HostMixed, controllertest.Owned("geth", protocol.KindEL, "geth"), controllertest.Owned("lighthouse", protocol.KindCL, "lighthouse"))
+	syncOwned(t, st, controllertest.HostUnowned, controllertest.Owned("bootnode", "bootnode", ""))
 
 	audit := func() []fleet.AuditEntry {
 		entries, err := st.ListAudit(ctx, store.AuditFilter{ActionPrefix: "action."})
@@ -500,9 +500,9 @@ func TestRolloutActionRequirements(t *testing.T) {
 				"lighthouse on host lighthouse-geth-1 (owners: lighthouse)",
 		},
 		{
-			name: "pause a rollout for no client", action: "pause", body: `{"rollout":"r-1"}`,
+			name: "pause a rollout for no team", action: "pause", body: `{"rollout":"r-1"}`,
 			services: "+upgradoor:team_supervise", teams: lighthouse,
-			refusal: "forbidden: upgradoor:team_supervise does not cover rollout r-1: it is for no client",
+			refusal: "forbidden: upgradoor:team_supervise does not cover rollout r-1: it is for no team",
 		},
 		{
 			name: "pause an unknown rollout", action: "pause", body: `{"rollout":"r-ghost"}`,
@@ -618,7 +618,7 @@ func TestTeamTwinDoesNotTouchStaffHolds(t *testing.T) {
 		{
 			name: "unhold a team's hold, a team without a container there", action: "unhold",
 			body: hosts(controllertest.HostTeku), services: twin, teams: []string{"lighthouse"},
-			refusal: "forbidden: upgradoor:team_hold does not cover host teku-geth-1 (owners: geth, nimbus, teku)",
+			refusal: "forbidden: upgradoor:team_hold does not cover host teku-geth-1 (owners: geth, teku)",
 		},
 		{
 			name: "hold again what the team holds", action: "hold", body: hosts(controllertest.HostTeku),
@@ -877,12 +877,12 @@ func TestDuplicateContainerNames(t *testing.T) {
 
 	req := controllertest.SyncRequest()
 	req.Containers = []protocol.Container{
-		controllertest.Owned("lighthouse", "lighthouse"),
-		controllertest.Owned("geth", "geth"),
+		controllertest.Owned("lighthouse", protocol.KindCL, "lighthouse"),
+		controllertest.Owned("geth", protocol.KindEL, "geth"),
 		// The same name again, for another team, and once more unmanaged.
-		controllertest.Owned("lighthouse", "teku"),
+		controllertest.Owned("lighthouse", protocol.KindCL, "teku"),
 		{Name: "lighthouse", State: "exited"},
-		controllertest.Owned("geth"),
+		controllertest.Owned("geth", protocol.KindEL, ""),
 	}
 
 	// What the agent API stores of it (its TestDuplicateContainerNames).
@@ -976,9 +976,9 @@ func TestRetryAndHoldEndToEnd(t *testing.T) {
 	h, provider, st := realHarness(t)
 	ctx := context.Background()
 
-	syncOwned(t, st, controllertest.HostMixed, controllertest.Owned("geth", "geth"), controllertest.Owned("lighthouse", "lighthouse"))
-	syncOwned(t, st, controllertest.HostTeku, controllertest.Owned("geth", "geth"), controllertest.Owned("teku", "teku"))
-	syncOwned(t, st, controllertest.HostUnowned, controllertest.Owned("bootnode"))
+	syncOwned(t, st, controllertest.HostMixed, controllertest.Owned("geth", protocol.KindEL, "geth"), controllertest.Owned("lighthouse", protocol.KindCL, "lighthouse"))
+	syncOwned(t, st, controllertest.HostTeku, controllertest.Owned("geth", protocol.KindEL, "geth"), controllertest.Owned("teku", protocol.KindCL, "teku"))
+	syncOwned(t, st, controllertest.HostUnowned, controllertest.Owned("bootnode", "bootnode", ""))
 
 	require.NoError(t, st.Commit(ctx, &store.Changes{Rollouts: []*fleet.Rollout{
 		controllertest.RolloutRow("r-aborted", fleet.RolloutAborted, map[string]fleet.HostState{
@@ -1222,7 +1222,7 @@ func TestEndLeaseLeavesATeamsHoldTheTeams(t *testing.T) {
 	h, provider, st := realHarness(t)
 	ctx := context.Background()
 
-	syncOwned(t, st, controllertest.HostMixed, controllertest.Owned("geth", "geth"), controllertest.Owned("lighthouse", "lighthouse"))
+	syncOwned(t, st, controllertest.HostMixed, controllertest.Owned("geth", protocol.KindEL, "geth"), controllertest.Owned("lighthouse", protocol.KindCL, "lighthouse"))
 
 	require.NoError(t, st.Commit(ctx, &store.Changes{Leases: []*fleet.Lease{{
 		ID: "lease-1", Host: controllertest.HostMixed, State: fleet.LeaseRunning, GrantedBy: "scheduler",
@@ -1448,16 +1448,16 @@ func TestAuthorizeTargets(t *testing.T) {
 				"on host lighthouse-geth-1 (owners: geth)",
 		},
 		{
-			name: "roll, a container of two teams", action: "roll",
+			name: "roll, a container of its team", action: "roll",
 			body:     `{"hosts":` + hosts(controllertest.HostTeku) + `,"containers":["teku"]}`,
-			services: teamRoll, teams: []string{"nimbus"}, by: "team_roll",
+			services: teamRoll, teams: []string{"teku"}, by: "team_roll",
 		},
 		{
-			name: "roll, a container of two teams, a third team", action: "roll",
+			name: "roll, a container of another team", action: "roll",
 			body:     `{"hosts":` + hosts(controllertest.HostTeku) + `,"containers":["teku"]}`,
 			services: teamRoll, teams: lighthouse,
 			refusal: "forbidden: upgradoor:team_roll does not cover container teku " +
-				"on host teku-geth-1 (owners: nimbus, teku)",
+				"on host teku-geth-1 (owners: teku)",
 		},
 		{
 			name: "roll, one container on two hosts", action: "roll",
@@ -1504,7 +1504,7 @@ func TestAuthorizeTargets(t *testing.T) {
 			body:     `{"hosts":` + hosts(controllertest.HostMixed, controllertest.HostTeku) + `}`,
 			services: teamRoll, teams: both,
 			refusal: "forbidden: upgradoor:team_roll does not cover container teku " +
-				"on host teku-geth-1 (owners: nimbus, teku)",
+				"on host teku-geth-1 (owners: teku)",
 		},
 		{
 			name: "roll a host nobody owns", action: "roll", body: `{"hosts":` + hosts(controllertest.HostUnowned) + `}`,
@@ -1566,7 +1566,7 @@ func TestAuthorizeTargets(t *testing.T) {
 			body:     `{"hosts":` + hosts(controllertest.HostMixed, controllertest.HostTeku) + `}`,
 			services: teamReboot, teams: lighthouse,
 			refusal: "forbidden: upgradoor:team_reboot does not cover host teku-geth-1 " +
-				"(owners: geth, nimbus, teku)",
+				"(owners: geth, teku)",
 		},
 		{
 			name: "reboot a host nobody owns", action: "reboot", body: `{"hosts":` + hosts(controllertest.HostUnowned) + `}`,
@@ -1743,7 +1743,7 @@ func TestAuthorizeTargets(t *testing.T) {
 			body:     `{"rollout":"r-1","hosts":` + hosts(controllertest.HostTeku) + `}`,
 			services: teamRecover, teams: lighthouse,
 			refusal: "forbidden: upgradoor:team_recover does not cover host teku-geth-1 " +
-				"(owners: geth, nimbus, teku)",
+				"(owners: geth, teku)",
 		},
 
 		// A lease stands for its host.

@@ -325,7 +325,7 @@ function images(
 ): PublicImage[] {
   const out = rows.map(row => {
     const space = row.key.indexOf(' ');
-    const kind = row.key.slice(0, space) as PublicImage['kind'];
+    const kind = row.key.slice(0, space);
     const image = row.key.slice(space + 1);
     const hostsOn: string[] = [];
     const hostsBehind: string[] = [];

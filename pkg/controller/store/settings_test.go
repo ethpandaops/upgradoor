@@ -164,7 +164,7 @@ func TestSettingsFieldsCoverEveryField(t *testing.T) {
 	assert.ElementsMatch(t, []string{
 		"maxUnavailablePercent", "maxLeasedPercent", "maxIndependentPercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyEpochs", "minPeers",
 		"leaseTtl", "hostStaleAfter", "readinessTimeout",
-		"policyImage", "policyPackages", "policyReboot", "policyDefaultGroup", "paused",
+		"policyImage", "policyPackages", "policyReboot", "paused",
 		"pauseAfterCanaryImage", "pauseAfterCanaryPackages", "pauseAfterCanaryReboot", "readyPeerShare",
 		"lookupInterval",
 		"policyClients",

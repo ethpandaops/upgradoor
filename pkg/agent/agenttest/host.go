@@ -61,8 +61,6 @@ type Host struct {
 	installed  []protocol.Package
 	upgradable []protocol.Upgradable
 
-	validators *host.Validators
-
 	failures map[string]error
 	resolves int
 	// remote, when set, is asked for a tag's digest by every pull.
@@ -74,9 +72,8 @@ type Host struct {
 
 var _ host.Host = (*Host)(nil)
 
-// NewHost builds a host from a scenario; validators is agent.yaml's
-// validators section, read with host.ReadValidators (nil: none).
-func NewHost(sc *Scenario, validators *host.Validators) (*Host, error) {
+// NewHost builds a host from a scenario.
+func NewHost(sc *Scenario) (*Host, error) {
 	if sc == nil {
 		return nil, errors.New("agenttest: no scenario")
 	}
@@ -97,7 +94,6 @@ func NewHost(sc *Scenario, validators *host.Validators) (*Host, error) {
 		local:          make(map[string]Tag, len(sc.Containers)),
 		blocked:        slices.Clone(sc.Packages.Blocked),
 		installed:      slices.Clone(sc.Packages.Installed),
-		validators:     validators,
 		failures:       make(map[string]error, 4),
 	}
 
@@ -115,9 +111,11 @@ func NewHost(sc *Scenario, validators *host.Validators) (*Host, error) {
 			State:     cmp.Or(c.State, protocol.StateRunning),
 			StartedAt: h.bootedAt,
 			Command:   slices.Clone(c.Command),
-			Group:     c.Group,
 			Kind:      protocol.ContainerKind(c.Kind),
+			Team:      c.Team,
 			Linked:    c.Links,
+
+			StopTimeout: c.StopTimeout,
 		})
 
 		key := imageref.Normalize(c.Image)
@@ -301,7 +299,7 @@ func (h *Host) Recreate(
 	}
 
 	call := fmt.Sprintf("recreate %s %s start=%t", name, digest, start)
-	if ch.Image != "" || ch.SetCommand || ch.SetBase || ch.Group != "" {
+	if ch.Image != "" || ch.SetCommand || ch.SetBase {
 		call += " image=" + image
 		if ch.SetCommand {
 			call += " command=" + strings.Join(ch.Command, " ")
@@ -334,11 +332,6 @@ func (h *Host) Recreate(
 	// The override labels, read back as host reads them.
 	if ch.SetBase {
 		c.Base = cloneBase(ch.Base)
-	}
-
-	if ch.Group != "" {
-		c.Group = ch.Group
-		c.Kind = ch.Kind
 	}
 
 	c.Digest = local.Digest
@@ -588,15 +581,6 @@ func (h *Host) bootIDLocked() string {
 // Probe implements host.Host: no node health.
 func (h *Host) Probe(context.Context) protocol.NodeHealth {
 	return protocol.NodeHealth{}
-}
-
-// Validators implements host.Host with host.ReadValidators.
-func (h *Host) Validators(context.Context) *protocol.Validators {
-	if h.validators == nil {
-		return nil
-	}
-
-	return host.ReadValidators(h.validators)
 }
 
 // Close implements host.Host.

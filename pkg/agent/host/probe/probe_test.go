@@ -288,3 +288,42 @@ func TestProbeCancelledContext(t *testing.T) {
 	require.NotNil(t, got.EL)
 	assert.False(t, got.EL.Reachable)
 }
+
+// Any kind but el and cl is probed with a GET that must answer 2xx; el and
+// cl keep their own checks.
+func TestProbeKinds(t *testing.T) {
+	healthy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		assert.Equal(t, http.MethodGet, r.Method)
+		assert.Equal(t, "/health", r.URL.Path)
+	}))
+	t.Cleanup(healthy.Close)
+
+	failing := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(failing.Close)
+
+	el := elServer(t, map[string]string{"eth_syncing": "false", "net_peerCount": `"0x5"`, "eth_blockNumber": `"0x10"`})
+
+	got := New(testLog(), Config{
+		protocol.KindEL: el.URL,
+		"snooper-el":    healthy.URL + "/health",
+		"snooper-cl":    failing.URL,
+		"exporter":      " ",
+	}).Probe(context.Background())
+
+	require.NotNil(t, got.EL)
+	assert.True(t, got.EL.Reachable)
+	assert.Nil(t, got.CL)
+	assert.Equal(t, []protocol.KindHealth{
+		{Kind: "snooper-cl", Error: "status 503"},
+		{Kind: "snooper-el", Healthy: true},
+	}, got.Probes, "sorted by kind; an empty URL is no probe")
+}
+
+func TestConfigValidate(t *testing.T) {
+	require.NoError(t, Config{protocol.KindEL: "http://127.0.0.1:8545", "snooper-el": "", "x": "https://a/b"}.Validate())
+	require.ErrorContains(t, Config{"EL": "http://a"}.Validate(), `"EL" is not a kind`)
+	require.ErrorContains(t, Config{protocol.KindNone: "http://a"}.Validate(), `"none" is not a kind`)
+	require.ErrorContains(t, Config{"snooper-el": "127.0.0.1:9000"}.Validate(), "not an http or https URL")
+}

@@ -53,7 +53,7 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 	f.StringVar(&cfg.DataDir, "data-dir", "/data", "directory for the SQLite database")
 	f.StringVar(&cfg.Network, "network", "", "network name; certificates must be issued for it")
 	f.StringVar(&cfg.SignerPublicKey, "signer-public-key", "",
-		"signer public key (output of the upgradoor_signer_pubkey filter or 'keygen signer-pubkey')")
+		"signer public key (output of 'keygen signer-pubkey')")
 	f.StringVar(&cfg.ControllerSeedFile, "controller-seed-file", "",
 		"file holding the controller seed (never the devnet seed): "+
 			"the key that signs answers to agents is derived from it for --network")
@@ -75,6 +75,11 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 			"its features (roll, team_roll, ...) are what allows actions")
 	f.StringArrayVar(&cfg.BeaconEndpoints, "beacon-endpoint", nil,
 		"beacon API base URL (repeatable; tried in order)")
+	f.StringVar(&cfg.ValidatorRangesURL, "validator-ranges-url", "",
+		"validator ranges inventory of the devnet (validator index ranges by inventory host name), "+
+			"e.g. https://config.<network>/api/v1/nodes/validator-ranges; fetched every 2 minutes. "+
+			"Without it no host has validators: the gate still follows the network's "+
+			"participation and the budget is only the host limit")
 	f.StringVar(&cfg.RegistryAuthFile, "registry-auth-file", "",
 		"Docker config.json with credentials for the registry lookups (anonymous when empty)")
 	f.StringVar(&cfg.Registry.CAFile, "registry-ca-file", "",

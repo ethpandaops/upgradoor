@@ -121,7 +121,7 @@ func targetNeed(
 		return protocol.Need{
 			ID: protocol.SpecNeedID(c.Name, key), Kind: protocol.NeedSpec,
 			Spec: &protocol.SpecNeed{
-				Container: c.Name, Group: c.Group, Client: c.Client, Key: key,
+				Container: c.Name, Kind: c.Kind, Team: c.Team, Key: key,
 				Image: t.Image, FromImage: fromImage, FromDigest: c.Digest,
 				ToDigest: rc.Digest, ToRevision: rc.Revision, Flags: t.Flags,
 			},
@@ -149,7 +149,7 @@ func imageNeed(c *protocol.Container) (protocol.Need, bool) {
 		ID:   protocol.ImageNeedID(c.Name, rc.Digest),
 		Kind: protocol.NeedImage,
 		Image: &protocol.ImageNeed{
-			Container: c.Name, Group: c.Group, Client: c.Client, Image: c.Image,
+			Container: c.Name, Kind: c.Kind, Team: c.Team, Image: c.Image,
 			FromDigest: c.Digest, ToDigest: rc.Digest, ToRevision: rc.Revision,
 		},
 	}, true

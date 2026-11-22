@@ -227,9 +227,9 @@ describe('HostsTab, logged in', () => {
     expect(h.calls.at(-1)?.path).toBe('/api/v1/events?host=lighthouse-geth-2');
     expect(h.calls.every(c => c.path.startsWith('/api/v1/events'))).toBe(true);
 
-    // The range the controller counts, and where the agent read it.
+    // The validators the inventory assigns, and how many are active.
     expect(screen.getByRole('group', { name: 'Actions for lighthouse-geth-2' }).parentElement).toHaveTextContent(
-      /\[128, 256\) = 128\s*from the marker file/
+      /128 assigned, 128 active/
     );
 
     await user.click(screen.getByRole('button', { name: 'Expand prysm-erigon-1' }));

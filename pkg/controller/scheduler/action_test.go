@@ -623,8 +623,8 @@ func TestTeamLiftsOnlyItsOwnHold(t *testing.T) {
 	h := newHarness(t)
 	host := h.addHost("a", 0)
 	host.Status.Containers = []protocol.Container{
-		{Name: "geth", Managed: true, Owners: []string{"geth"}},
-		{Name: "beacon", Managed: true, Owners: []string{"lighthouse"}},
+		{Name: "geth", Managed: true, Kind: protocol.KindEL, Team: "geth"},
+		{Name: "beacon", Managed: true, Kind: protocol.KindCL, Team: "lighthouse"},
 	}
 	h.store.putHost(host)
 
@@ -1483,10 +1483,10 @@ func TestClientPolicyAction(t *testing.T) {
 		h.addHost(tt.host, 0)
 		h.sync(tt.host, func(st *protocol.SyncRequest) {
 			c := container("c", tt.image, digestOld, digestA, h.now)
-			c.Client = tt.client
+			c.Team = tt.client
 			st.Containers = []protocol.Container{c}
 			n := imageNeed("c", tt.image, digestA)
-			n.Image.Client = tt.client
+			n.Image.Team = tt.client
 			st.Needs = []protocol.Need{n}
 		})
 	}
@@ -1511,7 +1511,7 @@ func TestClientPolicyAction(t *testing.T) {
 	h.tick()
 
 	geth := h.openRollout(imageKey("geth", "ethpandaops/geth:master", digestA))
-	assert.Equal(t, "geth", geth.Client)
+	assert.Equal(t, "geth", geth.Team)
 	assert.Equal(t, "waiting for approval (policy manual)", h.assignment("a").Queue.Reason)
 	assert.NotNil(t, h.assignment("b").Lease, "lighthouse follows policyImage, which is auto")
 
@@ -1538,10 +1538,9 @@ func TestClientOverride(t *testing.T) {
 		h.addHost(name, 0)
 	}
 
-	beacon := func(name string, flags bool) protocol.Container {
+	beacon := func(name string, overridable bool) protocol.Container {
 		return protocol.Container{
-			Name: name, Managed: true, Kind: protocol.KindCL, Client: "teku",
-			Overridable: &protocol.Overridable{Flags: flags},
+			Name: name, Managed: true, Kind: protocol.KindCL, Team: "teku", Overridable: overridable,
 		}
 	}
 
@@ -1549,7 +1548,7 @@ func TestClientOverride(t *testing.T) {
 	h.sync("b", func(st *protocol.SyncRequest) { st.Containers = []protocol.Container{beacon("beacon", true)} })
 	h.sync("c", func(st *protocol.SyncRequest) { st.Containers = []protocol.Container{beacon("teku", false)} })
 	h.sync("d", func(st *protocol.SyncRequest) {
-		st.Containers = []protocol.Container{{Name: "geth", Managed: true, Kind: protocol.KindEL, Client: "geth"}}
+		st.Containers = []protocol.Container{{Name: "geth", Managed: true, Kind: protocol.KindEL, Team: "geth"}}
 	})
 
 	res, err := h.svc.ClientOverride(h.ctx, "sam@example.org", ClientOverrideRequest{
@@ -1559,7 +1558,7 @@ func TestClientOverride(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []string{"a", "b"}, res.Hosts)
 	assert.Equal(t, map[string]string{
-		"c":     `the group "" of teku on host c does not allow flag overrides`,
+		"c":     "container teku on host c cannot be overridden: overrides are off on the host",
 		"d":     "host d runs no cl container of teku",
 		"ghost": "unknown host",
 	}, res.Rejected)
@@ -1599,9 +1598,9 @@ func TestOverrideActions(t *testing.T) {
 	h.addHost("a", 0)
 	h.sync("a", func(st *protocol.SyncRequest) {
 		st.Containers = []protocol.Container{
-			{Name: "geth", Managed: true, Overridable: &protocol.Overridable{Image: true}},
-			{Name: "beacon", Managed: true, Overridable: &protocol.Overridable{Flags: true}},
-			{Name: "plain", Managed: true},
+			{Name: "geth", Managed: true, Kind: protocol.KindEL, Team: "geth", Overridable: true},
+			{Name: "beacon", Managed: true, Kind: protocol.KindCL, Team: "teku", Overridable: true},
+			{Name: "plain", Managed: true, Kind: "snooper-el"},
 			{Name: "debug"},
 		}
 	})
@@ -1640,16 +1639,16 @@ func TestOverrideActions(t *testing.T) {
 		call func() error
 		want string
 	}{
-		"the host allows no image override of it": {func() error {
+		"a container without a team": {func() error {
 			_, callErr := h.svc.ImageOverride(ctx, "sam", ImageOverrideRequest{Host: "a", Container: "plain", Image: "x/y:z"})
 
 			return callErr
-		}, "container plain on host a cannot be overridden"},
-		"the host allows no flag override of it": {func() error {
-			_, callErr := h.svc.FlagOverride(ctx, "sam", FlagOverrideRequest{Host: "a", Container: "geth", AddFlags: []string{"--x"}})
+		}, "container plain on host a cannot be overridden: it has no team"},
+		"flags of a container without a team": {func() error {
+			_, callErr := h.svc.FlagOverride(ctx, "sam", FlagOverrideRequest{Host: "a", Container: "plain", AddFlags: []string{"--x"}})
 
 			return callErr
-		}, "of geth on host a does not allow flag overrides"},
+		}, "container plain on host a cannot be overridden: it has no team"},
 		"not a managed container": {func() error {
 			_, callErr := h.svc.ImageOverride(ctx, "sam", ImageOverrideRequest{Host: "a", Container: "debug", Image: "x/y:z"})
 

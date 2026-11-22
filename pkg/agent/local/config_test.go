@@ -12,7 +12,7 @@ func TestApplyDefaults(t *testing.T) {
 	c.ApplyDefaults("/var/lib/upgradoor")
 
 	assert.Equal(t, Config{
-		EntryUser: "nobody-here", OverridesFile: "/home/nobody-here/overrides.yaml",
+		EntryUser: "nobody-here", ManagedFile: DefaultManagedFile,
 		Socket:   Socket{Path: DefaultSocket},
 		AuditLog: AuditConfig{File: "/var/lib/upgradoor/audit.log", MaxSizeBytes: 1 << 20, MaxFiles: 5},
 	}, c)
@@ -20,4 +20,5 @@ func TestApplyDefaults(t *testing.T) {
 	c = Config{}
 	c.ApplyDefaults("/s")
 	assert.Equal(t, DefaultEntryUser, c.EntryUser)
+	assert.Empty(t, c.OverridesFile, "overrides are opt-in")
 }

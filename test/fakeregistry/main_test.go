@@ -26,7 +26,7 @@ func TestTheControllerResolvesTheScenariosTags(t *testing.T) {
 	file := filepath.Join(t.TempDir(), "host.yaml")
 	require.NoError(t, os.WriteFile(file, []byte(`
 containers:
-  - {name: geth, image: "127.0.0.1:5050/ethpandaops/geth:master", digest: "`+digestA+`", group: execution, kind: el}
+  - {name: geth, image: "127.0.0.1:5050/ethpandaops/geth:master", digest: "`+digestA+`", kind: el, team: geth}
 registry:
   "127.0.0.1:5050/ethpandaops/geth:fix": {digest: "`+digestF+`"}
 `), 0o600))

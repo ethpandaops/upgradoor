@@ -95,42 +95,39 @@ func TestFailedPullDefersTheLease(t *testing.T) {
 	e.assertPhases("lease-1", protocol.PhasePulling, protocol.PhaseDone)
 }
 
-// A name-mapped container gets its group labels on recreate; a default-group one none.
-func TestRecreateLabelsMappedContainers(t *testing.T) {
+// A recreate keeps the labels; an unlabelled container under defaultPolicy
+// roll is rolled after the labelled kinds.
+func TestRecreateKeepsLabels(t *testing.T) {
 	t.Parallel()
 
 	sc := agenttest.BaseScenario()
-	sc.Containers[1].Group, sc.Containers[1].Kind = "", ""
-	sc.Containers[3].Group = ""
+	sc.Containers[3].Kind = ""
 
 	e := newEnv(t, sc)
-	e.policy.Containers = map[string]plan.MappedContainer{
-		"geth": {Group: agenttest.GroupExecution, Kind: protocol.KindEL},
-	}
-	e.policy.DefaultGroup.Roll = true
+	e.policy.DefaultPolicy = plan.DefaultRoll
 	e.pull(agenttest.GethImage, agenttest.GethV2)
 	e.pull("ethpandaops/dora:latest", "sha256:dora-2")
 	e.start(t.Context())
 
-	e.grant("lease-mapped",
+	e.grant("lease-labels",
 		agenttest.ImageNeedFor("dora", "ethpandaops/dora:latest", "sha256:dora-1", "sha256:dora-2"),
 		gethNeed(agenttest.GethV2))
 
-	op := e.awaitFinished("lease-mapped")
+	op := e.awaitFinished("lease-labels")
 	require.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
 
 	geth := e.host.Container("geth")
 	assert.Equal(t, agenttest.GethV2, geth.Digest)
-	assert.Equal(t, agenttest.GroupExecution, geth.Group, "the recreate set the group label")
 	assert.Equal(t, protocol.KindEL, geth.Kind)
+	assert.Equal(t, agenttest.TeamGeth, geth.Team)
 
 	dora := e.host.Container("dora")
 	assert.Equal(t, "sha256:dora-2", dora.Digest)
-	assert.Empty(t, dora.Group, "the default group is no label")
+	assert.Empty(t, dora.Kind, "no labels are added")
 
-	// Ordered by the mapped kind: the execution client first.
+	// The execution client first, the unlabelled container last.
 	assert.Equal(t, []string{
-		"recreate geth " + agenttest.GethV2 + " start=true image=" + agenttest.GethImage,
+		"recreate geth " + agenttest.GethV2 + " start=true",
 		"recreate dora sha256:dora-2 start=true",
 		"start geth", "start teku", "start validator", "start dora",
 	}, e.disruptive())
@@ -212,7 +209,6 @@ func TestRecreateTakesTheTargetFromTheHostsFiles(t *testing.T) {
 	t.Parallel()
 
 	e := newEnv(t, agenttest.BaseScenario())
-	e.policy.Groups[agenttest.GroupExecution] = plan.Group{Overrides: []string{protocol.OverrideImage}}
 	e.files.set(func(o *plan.Overrides) {
 		o.Entries = map[string]plan.Entry{"geth": {Image: agenttest.FixImage, By: "alice", Reason: "test"}}
 	})
@@ -244,7 +240,6 @@ func TestRecreateRereadsTheFilesRightBefore(t *testing.T) {
 	sc.Packages.Upgradable = agenttest.DockerUpgrade()
 
 	e := newEnv(t, sc)
-	e.policy.Groups[agenttest.GroupExecution] = plan.Group{Overrides: []string{protocol.OverrideImage}}
 	e.files.set(func(o *plan.Overrides) {
 		o.Entries = map[string]plan.Entry{"geth": {Image: agenttest.FixImage, By: "alice", Reason: "test"}}
 	})

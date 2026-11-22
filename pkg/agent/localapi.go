@@ -3,17 +3,17 @@ package agent
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
-	"github.com/ethpandaops/upgradoor/pkg/imageref"
 )
 
 // deployIgnored are the docker_container comparisons Ansible leaves to the
-// agent for a container the agent rolls; labels too, so that a container the
-// name map groups is not recreated to get them.
+// agent for a container the agent rolls; labels too, since a recreate adds
+// the override labels.
 var deployIgnored = []string{"image", "command", "labels"}
 
 // localAPI is the agent behind the CLI socket. A change writes an override
@@ -23,8 +23,8 @@ type localAPI struct{ a *agent }
 var _ local.Agent = localAPI{}
 
 // Status returns the last published status with the rolls as they are now,
-// and the containers, hold and needs from its facts and the overrides file
-// as it is now.
+// and the containers, hold and needs from its facts and the host's files as
+// they are now.
 func (l localAPI) Status() local.Status {
 	a := l.a
 
@@ -38,7 +38,7 @@ func (l localAPI) Status() local.Status {
 		return out
 	}
 
-	files := a.files.Load()
+	files := a.inputs()
 	view := plan.Classify(&a.cfg.Policy, facts, &files, a.tracker.Checks(), a.now())
 	manual, _ := a.state.ManualAndCurrent()
 
@@ -64,9 +64,11 @@ func (l localAPI) Override(user string, req *local.OverrideRequest) (string, err
 
 	var built overrideBuild
 
+	deployed := a.deployed(req.Container)
+
 	prev, next, err := a.files.SetEntry(req.Container, user, built.wrap(
 		func(*plan.Entry) (*plan.Entry, error) {
-			return plan.LocalEntry(&a.cfg.Policy, view, asked, a.now())
+			return plan.LocalEntry(view, asked, deployed, a.now())
 		}))
 
 	a.auditOverride(&rec, &built, prev, next, err)
@@ -84,9 +86,8 @@ func (l localAPI) Override(user string, req *local.OverrideRequest) (string, err
 	return next.Describe(), nil
 }
 
-// Hold sets the local hold plan.LocalHold builds, or releases it. The
-// history line names the bare user for a set and "local:<user>" for a
-// release.
+// Hold sets the local hold plan.LocalHold builds in the state file, or
+// releases it.
 func (l localAPI) Hold(user string, req *local.HoldRequest) error {
 	a := l.a
 	rec := &local.Record{
@@ -99,17 +100,17 @@ func (l localAPI) Hold(user string, req *local.HoldRequest) error {
 	if req.Release {
 		rec.Action = "hold.release"
 
-		if reason := noLocalHold(a.files.Load(), a.now()); reason != "" {
+		if reason := noLocalHold(a.state.Holds(), a.now()); reason != "" {
 			rec.Result, rec.Error = local.Refused, reason
 			a.audit.Record(rec)
 
 			return plan.Refusal("%s", reason)
 		}
 
-		err = a.files.SetHold(plan.FromLocal, nil, user, "released")
+		err = a.state.SetHold(plan.HoldSource(plan.FromLocal), nil)
 	} else {
 		hold := plan.LocalHold(user, req.Reason)
-		err = a.files.SetHold(plan.FromLocal, &hold, hold.By, "set: "+hold.Reason)
+		err = a.state.SetHold(plan.HoldSource(plan.FromLocal), &hold)
 	}
 
 	if err != nil {
@@ -126,14 +127,13 @@ func (l localAPI) Hold(user string, req *local.HoldRequest) error {
 }
 
 // noLocalHold says why a release has nothing to release, naming the
-// controller's hold that stays; empty when there is a local hold or the
-// file cannot be read.
-func noLocalHold(files plan.Overrides, now time.Time) string {
-	if _, ok := files.Holds[plan.HoldLocal]; ok || !files.Known {
+// controller's hold that stays; empty when there is a local hold.
+func noLocalHold(holds map[string]plan.Hold, now time.Time) string {
+	if _, ok := holds[plan.HoldLocal]; ok {
 		return ""
 	}
 
-	h, ok := files.Holds[plan.HoldController]
+	h, ok := holds[plan.HoldController]
 	if !ok || h.Expired(now) {
 		return "there is no local hold"
 	}
@@ -152,7 +152,7 @@ func noLocalHold(files plan.Overrides, now time.Time) string {
 }
 
 // Roll adds a roll unless plan.RollRefusal refuses it against the last view
-// with the hold as the file says now.
+// with the hold as it is now.
 func (l localAPI) Roll(user, container string) (*local.Roll, error) {
 	a := l.a
 	rec := &local.Record{
@@ -161,7 +161,7 @@ func (l localAPI) Roll(user, container string) (*local.Roll, error) {
 	}
 
 	view := *l.lastView()
-	files := a.files.Load()
+	files := a.inputs()
 	view.Hold = plan.HoldState(&files, a.now())
 
 	var (
@@ -188,12 +188,13 @@ func (l localAPI) Roll(user, container string) (*local.Roll, error) {
 	return &roll, nil
 }
 
-// InitOverrides writes the generated block from what the managed containers
-// of the last view are deployed as.
+// InitOverrides lays out the overrides file from the last view.
 func (l localAPI) InitOverrides(user string) (string, error) {
 	a := l.a
+	files := a.inputs()
 
-	if err := a.files.InitBlock(plan.Deployment(l.lastView())); err != nil {
+	keep, drop := plan.OverrideKeys(l.lastView(), &files)
+	if _, err := a.files.Layout(keep, drop); err != nil {
 		return "", err
 	}
 
@@ -204,25 +205,42 @@ func (l localAPI) InitOverrides(user string) (string, error) {
 	return a.files.Path(), nil
 }
 
-// Deploy writes what Ansible deployed a container as and, with Reset, drops
-// its override. A container the agent rolls and that runs something else
-// than its target is reported now, in its group's staggered rollout.
+// Deploy reads managed.yaml again after upgradoor deploy wrote the
+// container's entry and, with Reset, clears its override; the overrides
+// file's default lines follow. A container the agent rolls and that runs
+// something else than its target is reported now, in the staggered rollout
+// of its team and kind.
 func (l localAPI) Deploy(
 	ctx context.Context, user string, req *local.DeployRequest,
 ) (*local.DeployResult, error) {
 	a := l.a
 
-	if _, err := imageref.Parse(req.Image); err != nil {
-		return nil, plan.Refusal("image: %v", err)
+	before := a.deployed(req.Container)
+
+	a.reloadManaged()
+
+	d := a.deployed(req.Container)
+	if d == nil {
+		return nil, plan.Refusal("managed.yaml has no entry for container %s", req.Container)
 	}
 
-	d := plan.Deployed{Image: req.Image, Command: req.Command, HasCommand: req.Command != nil}
+	changed := before == nil || !sameDeployed(before, d)
 
-	changed, err := a.files.SetDeployed(req.Container, d, req.Reset, user)
+	var err error
+
+	if req.Reset && a.files.Path() != "" {
+		var prev *plan.Entry
+
+		prev, _, err = a.files.SetEntry(req.Container, user, func(*plan.Entry) (*plan.Entry, error) {
+			return nil, nil //nolint:nilnil // nil clears the override.
+		})
+		changed = changed || prev != nil
+	}
+
 	if err != nil || changed {
 		rec := &local.Record{
 			Action: "deploy", Source: local.SourceLocal, User: user, Container: req.Container,
-			After: deployedText(&d), Result: local.Accepted,
+			After: deployedText(d), Result: local.Accepted,
 		}
 
 		if req.Reset {
@@ -249,10 +267,12 @@ func (l localAPI) Deploy(
 		return nil, fmt.Errorf("list containers: %w", err)
 	}
 
-	files := a.files.Load()
+	files := a.inputs()
 	facts := plan.Facts{Containers: list, Fresh: true}
 	view := plan.Classify(&a.cfg.Policy, &facts, &files, a.tracker.Checks(), a.now())
 	exists, managed, differs := plan.DeployState(&a.cfg.Policy, &view, req.Container)
+
+	a.layout(&view, &files)
 
 	out := &local.DeployResult{
 		Container: req.Container, Exists: exists, Managed: managed, Changed: changed,
@@ -270,6 +290,25 @@ func (l localAPI) Deploy(
 	}
 
 	return out, nil
+}
+
+// deployed is a container's entry of managed.yaml as last read, or nil.
+func (a *agent) deployed(container string) *plan.Deployed {
+	a.managedMu.Lock()
+	defer a.managedMu.Unlock()
+
+	d, ok := a.managed[container]
+	if !ok {
+		return nil
+	}
+
+	d.Command = slices.Clone(d.Command)
+
+	return &d
+}
+
+func sameDeployed(a, b *plan.Deployed) bool {
+	return a.Image == b.Image && a.HasCommand == b.HasCommand && slices.Equal(a.Command, b.Command)
 }
 
 // deployedText is a deployed entry for the audit log.

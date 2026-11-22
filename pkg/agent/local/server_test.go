@@ -60,8 +60,7 @@ func (f *fakeAgent) InitOverrides(user string) (string, error) {
 }
 
 func (f *fakeAgent) Deploy(_ context.Context, user string, req *DeployRequest) (*DeployResult, error) {
-	if err := f.record(fmt.Sprintf("deploy %s %s %s %q reset=%t",
-		user, req.Container, req.Image, req.Command, req.Reset)); err != nil {
+	if err := f.record(fmt.Sprintf("deploy %s %s reset=%t", user, req.Container, req.Reset)); err != nil {
 		return nil, err
 	}
 
@@ -169,7 +168,7 @@ func TestServer(t *testing.T) {
 
 	answer, err = c.InitOverrides(t.Context())
 	require.NoError(t, err)
-	assert.Equal(t, "generated block written to /home/devops/overrides.yaml", answer.Message)
+	assert.Equal(t, "overrides file laid out: /home/devops/overrides.yaml", answer.Message)
 
 	assert.Equal(t, []string{
 		"override " + who + " geth clear=false",
@@ -291,10 +290,10 @@ func TestServerDeploy(t *testing.T) {
 			require.NoError(t, srv.Start(t.Context()))
 			t.Cleanup(func() { _ = srv.Stop() })
 
-			body := `{"container":"geth","image":"a/b:c","command":["--x"],"reset":true}`
+			body := `{"container":"geth","reset":true}`
 			assert.Equal(t, tc.status, post(t, cfg.Socket.Path, PathDeploy, body))
 
-			res, err := NewClient(cfg.Socket.Path).Deploy(t.Context(), &DeployRequest{Container: "geth", Image: "a/b:c"})
+			res, err := NewClient(cfg.Socket.Path).Deploy(t.Context(), &DeployRequest{Container: "geth"})
 			if tc.status != http.StatusOK {
 				require.EqualError(t, err, "deploy is for root only")
 				assert.Empty(t, agent.calls)
@@ -309,8 +308,8 @@ func TestServerDeploy(t *testing.T) {
 			require.NoError(t, err)
 
 			assert.Equal(t, []string{
-				"deploy local:" + me.Username + ` geth a/b:c ["--x"] reset=true`,
-				"deploy local:" + me.Username + " geth a/b:c [] reset=false",
+				"deploy local:" + me.Username + " geth reset=true",
+				"deploy local:" + me.Username + " geth reset=false",
 			}, agent.calls)
 		})
 	}

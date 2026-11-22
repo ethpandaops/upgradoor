@@ -275,7 +275,7 @@ func TestMetrics(t *testing.T) {
 	agent := controllertest.ValidatorAgent(t)
 
 	// One good sync (which also refreshes the host) and one rejected one.
-	req := controllertest.ValidatorSyncRequest()
+	req := controllertest.SyncRequest()
 	req.OS.RebootRequired = true
 	req.Pending.Security = 4
 
@@ -427,53 +427,52 @@ func TestEveryUserRouteIsGuarded(t *testing.T) {
 	}
 }
 
-// TestOwnersFromAgentToViews: what an agent reports as owners reaches the
-// authenticated host views, cleaned, and no public view.
-func TestOwnersFromAgentToViews(t *testing.T) {
+// TestTeamFromAgentToViews: what an agent reports as a container's team
+// reaches the authenticated host views, cleaned, and no public view.
+func TestTeamFromAgentToViews(t *testing.T) {
 	h, provider, _ := realHarness(t)
 
 	const hidden = "qq-hidden-team"
 
 	syncOwned(t, h, controllertest.HostMixed,
-		// Out of order, twice, and with names no team can have.
-		controllertest.Owned("geth", "panda", hidden, "geth", "panda", "Not A Team", "geth:all", ""),
+		controllertest.Owned("geth", protocol.KindEL, hidden),
 		protocol.Container{
 			Name: "lighthouse", Image: "sigp/lighthouse:unstable", Digest: "sha256:c1", State: "running",
-			Managed: true, Kind: protocol.KindCL, Owners: []string{"lighthouse"},
+			Managed: true, Kind: protocol.KindCL, Team: "lighthouse",
 		},
-		// Nine owners: one too many.
-		controllertest.Owned("many", "i", "h", "g", "f", "e", "d", "c", "b", "a"),
-		// Not managed: it has no owners, whatever the agent says.
-		protocol.Container{Name: "debug", State: "running", Owners: []string{"lighthouse"}},
-		controllertest.Owned("nobody"),
+		// Names no team can have.
+		controllertest.Owned("bad", protocol.KindEL, "Not A Team"),
+		controllertest.Owned("grant", protocol.KindEL, "geth:all"),
+		// A team without a kind is nobody's.
+		controllertest.Owned("unlabelled", "", "geth"),
+		// Not managed: it has no team, whatever the agent says.
+		protocol.Container{Name: "debug", State: "running", Kind: protocol.KindEL, Team: "lighthouse"},
+		controllertest.Owned("nobody", "snooper-el", ""),
 	)
 
-	// An agent built before the field existed sends none.
+	// An agent that reports no team.
 	old := controllertest.NewAgent(t, identity.CertificateSpec{Hostname: controllertest.HostUnowned})
 	body := `{"protocolVersion":1,"agentVersion":"agent-0.9.0","sentAt":"2026-11-14T12:00:00Z",` +
 		`"bootId":"boot-1","verbs":["roll"],"containers":[{"name":"bootnode","id":"1",` +
 		`"image":"ethpandaops/bootnode:latest","imageId":"sha256:1","state":"running",` +
-		`"restartCount":0,"startedAt":"2026-11-14T11:00:00Z","managed":true,"kind":"other"}]}`
+		`"restartCount":0,"startedAt":"2026-11-14T11:00:00Z","managed":true,"kind":"bootnode"}]}`
 	rec := h.serve(h.agentRequest(old, protocol.PathSync, []byte(body), controllertest.CallOpts{}))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
 	reader := provider.Grant(t, "")
 
-	owners := func(host views.HostListing) map[string][]string {
-		out := make(map[string][]string, len(host.Containers))
+	owners := func(host views.HostListing) map[string]string {
+		out := make(map[string]string, len(host.Containers))
 		for _, c := range host.Containers {
-			out[string(c.Name)] = c.Owners
+			out[string(c.Name)] = c.Team
 		}
 
 		return out
 	}
 
-	want := map[string][]string{
-		"geth":       {"geth", "panda", hidden},
-		"lighthouse": {"lighthouse"},
-		"many":       {"a", "b", "c", "d", "e", "f", "g", "h"},
-		"debug":      nil,
-		"nobody":     nil,
+	want := map[string]string{
+		"geth": hidden, "lighthouse": "lighthouse", "bad": "", "grant": "", "unlabelled": "",
+		"debug": "", "nobody": "",
 	}
 
 	rec = h.serve(userRoute{method: http.MethodGet, path: "/api/v1/hosts"}.request(reader))
@@ -482,10 +481,9 @@ func TestOwnersFromAgentToViews(t *testing.T) {
 	list := controllertest.DecodeJSON[views.Hosts](t, rec)
 	require.Len(t, list.Hosts, 2)
 	assert.Equal(t, controllertest.HostUnowned, list.Hosts[0].Name)
-	assert.Equal(t, map[string][]string{"bootnode": nil}, owners(list.Hosts[0]))
+	assert.Equal(t, map[string]string{"bootnode": ""}, owners(list.Hosts[0]))
 	assert.Equal(t, want, owners(list.Hosts[1]))
-	assert.NotContains(t, rec.Body.String(), `"owners":[]`, "no owners is no field")
-	assert.NotContains(t, rec.Body.String(), `"owners":null`)
+	assert.NotContains(t, rec.Body.String(), `"team":""`, "no team is no field")
 
 	rec = h.serve(userRoute{
 		method: http.MethodGet, path: "/api/v1/hosts/" + controllertest.HostMixed,
@@ -494,13 +492,13 @@ func TestOwnersFromAgentToViews(t *testing.T) {
 	summary := controllertest.DecodeJSON[views.HostDetail](t, rec).HostSummary
 	assert.Equal(t, want, owners(views.Listing(&summary)))
 
-	// The public views show the host and its images, and no owner.
+	// The public views show the host and its images, and no team.
 	for _, path := range []string{"/api/v1/public/hosts", "/api/v1/public/images"} {
 		rec := h.get(path)
 		require.Equal(t, http.StatusOK, rec.Code)
 		require.Contains(t, rec.Body.String(), "sigp/lighthouse:unstable")
 		assert.NotContains(t, rec.Body.String(), hidden, path)
-		assert.NotContains(t, rec.Body.String(), "owners", path)
+		assert.NotContains(t, rec.Body.String(), `"team"`, path)
 	}
 
 	// Without a token the authenticated view is closed.

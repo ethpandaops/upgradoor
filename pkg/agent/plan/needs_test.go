@@ -17,7 +17,6 @@ var allVerbs = []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages, protoco
 func needsPolicy(verbs ...protocol.Verb) *Policy {
 	return &Policy{
 		Verbs:    verbs,
-		Groups:   map[string]Group{"execution": {Client: "geth"}},
 		Packages: Packages{Blocked: []string{"docker-ce", "containerd.io"}},
 	}
 }
@@ -26,7 +25,7 @@ func needsPolicy(verbs ...protocol.Verb) *Policy {
 func known() *Overrides { return &Overrides{Known: true} }
 
 // hostFacts is a host on which geth has a pulled new image, teku is up to
-// date, dora is in the default group, docker-ce and an unblocked package can
+// date, dora is unlabelled, docker-ce and an unblocked package can
 // be upgraded and both reboot reasons apply.
 func hostFacts() *Facts {
 	return &Facts{
@@ -34,11 +33,11 @@ func hostFacts() *Facts {
 		Containers: []protocol.Container{
 			{
 				Name: "geth", Image: "ethpandaops/geth:master", Digest: "sha256:a", State: protocol.StateRunning,
-				Group: "execution", Kind: protocol.KindEL,
+				Kind: protocol.KindEL, Team: "geth",
 			},
 			{
 				Name: "teku", Image: "consensys/teku:develop", Digest: "sha256:t", State: protocol.StateRunning,
-				Group: "consensus", Kind: protocol.KindCL,
+				Kind: protocol.KindCL, Team: "teku",
 			},
 			{Name: "dora", Image: "ethpandaops/dora:latest", Digest: "sha256:d", State: protocol.StateRunning},
 		},
@@ -213,7 +212,7 @@ func TestNeeds(t *testing.T) {
 	got := Needs(p, observed(p), nil)
 	require.Len(t, got, 3)
 	assert.Equal(t, &protocol.ImageNeed{
-		Container: "geth", Group: "execution", Client: "geth", Image: "ethpandaops/geth:master",
+		Container: "geth", Kind: protocol.KindEL, Team: "geth", Image: "ethpandaops/geth:master",
 		FromDigest: "sha256:a", ToDigest: "sha256:b", ToRevision: "r2",
 	}, got[0].Image)
 	assert.Equal(t, pkgs, got[1].Packages.Packages, "sorted, and only the configured blocked set")
@@ -229,7 +228,6 @@ func TestNeeds(t *testing.T) {
 // A container off its target gets a spec or override need, never an image need.
 func TestNeedsOfTargets(t *testing.T) {
 	p := needsPolicy(protocol.VerbRoll)
-	p.Groups["execution"] = Group{Client: "geth", Overrides: []string{protocol.OverrideImage}}
 
 	spec := func(own string) protocol.Need {
 		facts := hostFacts()
@@ -252,7 +250,7 @@ func TestNeedsOfTargets(t *testing.T) {
 	assert.Equal(t, protocol.NeedSpec, n.Kind)
 	assert.Equal(t, n.ID, spec("--nat=extip:10.0.0.2").ID, "the same change on another host")
 	assert.Equal(t, &protocol.SpecNeed{
-		Container: "geth", Group: "execution", Client: "geth", Key: n.Spec.Key,
+		Container: "geth", Kind: protocol.KindEL, Team: "geth", Key: n.Spec.Key,
 		Image: "ethpandaops/geth:v2", FromImage: "ethpandaops/geth:master", FromDigest: "sha256:a",
 		ToDigest: "sha256:v2", Flags: true,
 	}, n.Spec)
@@ -355,10 +353,10 @@ func TestReconcileManualNeeds(t *testing.T) {
 			reason: "not managed",
 		},
 		{
-			name:   "container is not rolled",
+			name:   "container is not managed",
 			mutate: func(*Policy, *View) {},
 			need:   roll("dora", "ethpandaops/dora:latest", "sha256:e"),
-			reason: "does not roll",
+			reason: "is not managed",
 		},
 		{
 			name:   "container moved to another tag",

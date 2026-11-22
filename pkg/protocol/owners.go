@@ -5,7 +5,7 @@ import (
 	"slices"
 )
 
-// MaxOwners bounds the owners of one container.
+// MaxOwners bounds a list of team names.
 const MaxOwners = 8
 
 // ownerPattern is the normal form of a team name, the same as the
@@ -48,6 +48,6 @@ func CleanOwners(owners []string) []string {
 // form as a team name, so "geth" and "lighthouse" are and "Geth" is not.
 func ValidClient(name string) bool { return ownerPattern.MatchString(name) }
 
-// ValidGroup reports whether name is a roll group name in normal form (the
+// ValidKind reports whether kind is a container kind in normal form (the
 // form of a team name).
-func ValidGroup(name string) bool { return ownerPattern.MatchString(name) }
+func ValidKind(kind ContainerKind) bool { return ownerPattern.MatchString(string(kind)) }

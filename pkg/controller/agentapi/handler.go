@@ -10,7 +10,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/sirupsen/logrus"
@@ -22,13 +21,6 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
-)
-
-// Names that several encodings share: a log field and keys of audit details,
-// which the event stream's encoding and the UI read.
-const (
-	keyHost  = "host"
-	keyAfter = "after"
 )
 
 // Store is the part of store.Store the agent API needs.
@@ -84,14 +76,6 @@ type Handler struct {
 	inventorySlots       chan struct{}
 	syncReadTimeout      time.Duration
 	inventoryReadTimeout time.Duration
-
-	// overlapAudited remembers, per host, the hosts its reported validator
-	// range last overlapped with: an overlap is audited once per episode.
-	// validatorsAudited limits the audit entries about one host's range. Both
-	// are guarded by auditMu.
-	auditMu           sync.Mutex
-	overlapAudited    map[string]string
-	validatorsAudited map[string]time.Time
 }
 
 // New returns the agent API over opts.

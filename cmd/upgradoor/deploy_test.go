@@ -87,32 +87,55 @@ func run(args ...string) (string, error) {
 
 func TestDeploy(t *testing.T) {
 	res := &local.DeployResult{
-		Container: "geth", Exists: true, Managed: true, Changed: true, Roll: local.DeployRollRequested,
+		Container: "geth", Exists: true, Managed: true, Roll: local.DeployRollRequested,
 		Ignore: []string{"image", "command", "labels"},
 	}
 	socket, got := fakeSocket(t, res)
+	managed := filepath.Join(t.TempDir(), "managed.yaml")
 
-	out, err := run("deploy", "geth", "--socket", socket, "--image", "ethpandaops/geth:master",
+	out, err := run("deploy", "geth", "--socket", socket, "--managed-file", managed, "--image", "ethpandaops/geth:master",
 		"--command", `["--http","--port=30303"]`, "--reset")
 	require.NoError(t, err)
 	assert.JSONEq(t, `{"container":"geth","exists":true,"managed":true,"changed":true,`+
-		`"roll":"requested","ignore":["image","command","labels"],"pull":false}`, out)
+		`"roll":"requested","ignore":["image","command","labels"],"pull":false}`, out, "managed.yaml changed")
 
-	_, err = run("deploy", "geth", "--socket", socket, "--image", "ethpandaops/geth:master")
+	raw, err := os.ReadFile(managed)
 	require.NoError(t, err)
+	assert.Equal(t, "# written by upgradoor deploy, do not edit\ncontainers:\n  geth:\n"+
+		"    image: ethpandaops/geth:master\n    command:\n      - --http\n      - --port=30303\n", string(raw))
 
-	assert.Equal(t, []local.DeployRequest{
-		{Container: "geth", Image: "ethpandaops/geth:master", Command: []string{"--http", "--port=30303"}, Reset: true},
-		{Container: "geth", Image: "ethpandaops/geth:master"},
-	}, got())
+	out, err = run("deploy", "geth", "--socket", socket, "--managed-file", managed, "--image", "ethpandaops/geth:master",
+		"--command", `["--http","--port=30303"]`)
+	require.NoError(t, err)
+	assert.Contains(t, out, `"changed":false`, "neither managed.yaml nor the override changed")
 
-	_, err = run("deploy", "geth", "--socket", socket, "--image", "x:1", "--command", `"--http"`)
-	require.EqualError(t, err, "--command is a JSON array of strings")
+	assert.Equal(t, []local.DeployRequest{{Container: "geth", Reset: true}, {Container: "geth"}}, got())
 
-	_, err = run("deploy", "geth", "--socket", socket)
-	require.ErrorContains(t, err, `"image" not set`)
+	for _, args := range [][]string{
+		{"--image", "x:1", "--command", `"--http"`},
+		{},
+		{"--image", "Not An Image"},
+	} {
+		_, err = run(append([]string{"deploy", "geth", "--socket", socket, "--managed-file", managed}, args...)...)
+		require.Error(t, err, args)
+	}
+
 	assert.Len(t, got(), 2)
 
-	_, err = run("deploy", "geth", "--socket", filepath.Join(t.TempDir(), "none.sock"), "--image", "x:1")
+	raw2, err := os.ReadFile(managed)
+	require.NoError(t, err)
+	assert.Equal(t, raw, raw2, "a refused deploy writes nothing")
+
+	_, err = run("deploy", "geth", "--socket", filepath.Join(t.TempDir(), "none.sock"), "--managed-file", managed,
+		"--image", "x:1")
 	require.ErrorContains(t, err, "is the agent running")
+
+	if os.Geteuid() != 0 {
+		ro := filepath.Join(t.TempDir(), "ro")
+		require.NoError(t, os.Mkdir(ro, 0o500))
+
+		_, err = run("deploy", "geth", "--socket", socket, "--managed-file", filepath.Join(ro, "managed.yaml"),
+			"--image", "x:1")
+		require.EqualError(t, err, "deploy is for root only: cannot write "+ro)
+	}
 }

@@ -1,65 +1,46 @@
 package plan
 
 import (
-	"errors"
 	"fmt"
 	"maps"
-	"path"
-	"regexp"
 	"slices"
-	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 // Policy is what agent.yaml says the host manages and allows. It is set on
-// the host only, never by the controller.
+// the host only, never by the controller. Which containers are managed, and
+// how, the containers' own labels say (protocol.LabelKind, LabelTeam).
 type Policy struct {
 	// Verbs are the allowed verbs: any of roll, packages, reboot.
 	Verbs []protocol.Verb `yaml:"verbs"`
-	// Groups configure the roll groups; a group without an entry is
-	// admin-only and nothing in it may be overridden.
-	Groups map[string]Group `yaml:"groups"`
-	// Containers puts containers without a group label in a group by name;
-	// a label wins.
-	Containers map[string]MappedContainer `yaml:"containers"`
-	// DefaultGroup handles containers no label or Containers entry groups.
-	DefaultGroup DefaultGroup `yaml:"defaultGroup"`
+	// DefaultPolicy is what happens to containers without a kind label.
+	DefaultPolicy DefaultPolicy `yaml:"defaultPolicy"`
+	// KindPolicies say, by kind, which labelled containers the fallback
+	// rolls. They have no effect while the controller answers.
+	KindPolicies map[protocol.ContainerKind]KindPolicy `yaml:"kindPolicies"`
 	// Packages bounds the packages verb.
 	Packages Packages `yaml:"packages"`
 	// Fallback is what the host does while the controller cannot be reached.
 	Fallback Fallback `yaml:"fallback"`
 }
 
-// Group is the agent.yaml entry of one roll group.
-type Group struct {
-	// Client is the client software the group's containers run ("geth").
-	Client string `yaml:"client"`
-	// Owners are the teams that own the group's containers.
-	Owners []string `yaml:"owners"`
-	// Overrides lists the parts that may be overridden (image, flags); empty
-	// means the group always runs what Ansible deployed.
-	Overrides []string `yaml:"overrides"`
-	// Impact is node, slot or independent; empty derives it from the kinds.
-	Impact protocol.Impact `yaml:"impact"`
-	// StopTimeout is the stop grace period; zero uses the container's own.
-	StopTimeout time.Duration `yaml:"stopTimeout"`
-}
+// DefaultPolicy is the policy of unlabelled containers.
+type DefaultPolicy string
 
-// MappedContainer is the group and kind of an unlabelled container.
-type MappedContainer struct {
-	Group string `yaml:"group"`
-	// Kind is el, cl, vc or other (default other).
-	Kind protocol.ContainerKind `yaml:"kind"`
-}
+// Default policies.
+const (
+	// DefaultIgnore leaves unlabelled containers alone (the default).
+	DefaultIgnore DefaultPolicy = "ignore"
+	// DefaultRoll lets unlabelled containers follow their tag, rolled with
+	// impact independent.
+	DefaultRoll DefaultPolicy = "roll"
+)
 
-// DefaultGroup says what happens to the containers of protocol.DefaultGroup.
-type DefaultGroup struct {
-	// Roll lets them follow new digests of their tag; without it updates
-	// are only reported.
+// KindPolicy is the fallback's policy of one kind.
+type KindPolicy struct {
+	// Roll lets the fallback roll the containers of the kind.
 	Roll bool `yaml:"roll"`
-	// Exclude leaves containers out of everything: names or path.Match patterns.
-	Exclude []string `yaml:"exclude"`
 }
 
 // Packages bounds the packages verb.
@@ -72,22 +53,18 @@ type Packages struct {
 // Allows reports whether the policy allows a verb.
 func (p *Policy) Allows(v protocol.Verb) bool { return slices.Contains(p.Verbs, v) }
 
-// ApplyDefaults fills unset fields: the kind of a mapped container is other,
-// the fallback's times.
+// ApplyDefaults fills unset fields: the default policy and the fallback's
+// times.
 func (p *Policy) ApplyDefaults() {
-	p.Fallback.applyDefaults()
-
-	for name, m := range p.Containers {
-		if m.Kind == "" {
-			m.Kind = protocol.KindOther
-			p.Containers[name] = m
-		}
+	if p.DefaultPolicy == "" {
+		p.DefaultPolicy = DefaultIgnore
 	}
+
+	p.Fallback.applyDefaults()
 }
 
-// Validate checks verbs, groups, mapped containers, exclude patterns and the
-// fallback.
-// packages.blocked is checked by host.
+// Validate checks verbs, the default policy, the kind policies and the
+// fallback. packages.blocked is checked by host.
 func (p *Policy) Validate() error {
 	for _, v := range p.Verbs {
 		if v != protocol.VerbRoll && v != protocol.VerbPackages && v != protocol.VerbReboot {
@@ -95,110 +72,37 @@ func (p *Policy) Validate() error {
 		}
 	}
 
+	if p.DefaultPolicy != DefaultIgnore && p.DefaultPolicy != DefaultRoll {
+		return fmt.Errorf("defaultPolicy: unknown policy %q (ignore or roll)", p.DefaultPolicy)
+	}
+
 	// Sorted, so a file with several mistakes always names the same one.
-	for _, name := range slices.Sorted(maps.Keys(p.Groups)) {
-		g := p.Groups[name]
-		if err := g.validate(name); err != nil {
-			return fmt.Errorf("group %q: %w", name, err)
+	for _, kind := range slices.Sorted(maps.Keys(p.KindPolicies)) {
+		if !protocol.ValidKind(kind) || kind == protocol.KindNone {
+			return fmt.Errorf("kindPolicies: %q is not a kind ([a-z0-9][a-z0-9._-]{0,62}, not none)", kind)
 		}
 	}
 
-	for _, name := range slices.Sorted(maps.Keys(p.Containers)) {
-		m := p.Containers[name]
-		if err := m.validate(name); err != nil {
-			return fmt.Errorf("containers: %q: %w", name, err)
-		}
-	}
-
-	for _, pattern := range p.DefaultGroup.Exclude {
-		if _, err := path.Match(pattern, ""); err != nil || pattern == "" {
-			return fmt.Errorf("defaultGroup.exclude: %q is not a name or pattern", pattern)
-		}
-	}
-
-	return p.Fallback.validate()
+	return p.Fallback.validate(p.fallbackRolls())
 }
 
-// group returns a roll group's entry; the zero Group when it is not listed.
-func (p *Policy) group(name string) Group { return p.Groups[name] }
+// rollsUnlabelled reports whether unlabelled containers are managed.
+func (p *Policy) rollsUnlabelled() bool { return p.DefaultPolicy == DefaultRoll }
 
-func (d *DefaultGroup) excludes(name string) bool {
-	return slices.ContainsFunc(d.Exclude, func(pattern string) bool {
-		ok, _ := path.Match(pattern, name)
-
-		return ok
-	})
+// fallbackRolls reports whether the fallback rolls anything: a kind policy
+// with roll, or unlabelled containers by defaultPolicy.
+func (p *Policy) fallbackRolls() bool {
+	return p.rollsUnlabelled() || slices.ContainsFunc(slices.Collect(maps.Values(p.KindPolicies)),
+		func(k KindPolicy) bool { return k.Roll })
 }
 
-func (g *Group) mayOverride(part string) bool { return slices.Contains(g.Overrides, part) }
-
-// overridable is what the group lets anybody override; nil when nothing.
-func (g *Group) overridable() *protocol.Overridable {
-	image, flags := g.mayOverride(protocol.OverrideImage), g.mayOverride(protocol.OverrideFlags)
-	if !image && !flags {
-		return nil
+// fallbackCovers reports whether the fallback rolls a managed container: a
+// labelled one when its kind's policy says roll, an unlabelled one by
+// defaultPolicy.
+func (p *Policy) fallbackCovers(c *protocol.Container) bool {
+	if c.Kind == "" {
+		return p.rollsUnlabelled()
 	}
 
-	return &protocol.Overridable{Image: image, Flags: flags}
-}
-
-func (g *Group) validate(name string) error {
-	switch {
-	case !protocol.ValidGroup(name):
-		return errors.New("not a group name ([a-z0-9][a-z0-9._-]{0,62})")
-	case protocol.ReservedGroup(name):
-		return errors.New("the name is reserved: the default group cannot be configured")
-	case g.Impact != "" && !g.Impact.Valid():
-		return fmt.Errorf("unknown impact %q (node, slot or independent)", g.Impact)
-	case g.Client != "" && !protocol.ValidClient(g.Client):
-		return fmt.Errorf("client %q is not a client name ([a-z0-9][a-z0-9._-]{0,62})", g.Client)
-	}
-
-	for i, part := range g.Overrides {
-		if part != protocol.OverrideImage && part != protocol.OverrideFlags {
-			return fmt.Errorf("overrides: unknown part %q (image or flags)", part)
-		}
-
-		if slices.Contains(g.Overrides[:i], part) {
-			return fmt.Errorf("overrides: %q listed twice", part)
-		}
-	}
-
-	if g.StopTimeout < 0 {
-		return errors.New("stopTimeout is negative")
-	}
-
-	if len(g.Owners) > protocol.MaxOwners {
-		return fmt.Errorf("more than %d owners", protocol.MaxOwners)
-	}
-
-	for i, owner := range g.Owners {
-		if !protocol.ValidOwner(owner) {
-			return fmt.Errorf("owner %q is not a team name ([a-z0-9][a-z0-9._-]{0,62})", owner)
-		}
-
-		if slices.Contains(g.Owners[:i], owner) {
-			return fmt.Errorf("owner %q listed twice", owner)
-		}
-	}
-
-	return nil
-}
-
-// containerName is the form Docker gives a container name.
-var containerName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9_.-]*$`)
-
-func (m *MappedContainer) validate(name string) error {
-	switch {
-	case !containerName.MatchString(name):
-		return errors.New("not a container name")
-	case !protocol.ValidGroup(m.Group):
-		return fmt.Errorf("group %q is not a group name ([a-z0-9][a-z0-9._-]{0,62})", m.Group)
-	case protocol.ReservedGroup(m.Group):
-		return fmt.Errorf("group %q is reserved", m.Group)
-	case protocol.ParseKind(string(m.Kind)) != m.Kind:
-		return fmt.Errorf("unknown kind %q (el, cl, vc or other)", m.Kind)
-	default:
-		return nil
-	}
+	return p.KindPolicies[c.Kind].Roll
 }

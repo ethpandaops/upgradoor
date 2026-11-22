@@ -227,7 +227,10 @@ describe('the override buttons', () => {
     ] as const) {
       const button = screen.getByRole('button', { name });
       expect(button).toBeDisabled();
-      expect(button).toHaveAttribute('title', `This host does not allow ${what} overrides of prysm (agent.yaml)`);
+      expect(button).toHaveAttribute(
+        'title',
+        `This host does not allow ${what} overrides of prysm (a container needs a team label, the host overrides on)`
+      );
     }
   });
 
@@ -275,8 +278,8 @@ describe('the override buttons', () => {
     expect(overrideState({ ...base, applied: true, restoring: true }).label).toBe('restoring');
     expect(overrideState({ ...base, error: 'no' })).toMatchObject({ label: 'override error', title: 'no' });
     expect(notAllowed([{ name: 'geth' } as Container], 'image-override')).toBe(
-      'This host does not allow image overrides of geth (agent.yaml)'
+      'This host does not allow image overrides of geth (a container needs a team label, the host overrides on)'
     );
-    expect(notAllowed([{ name: 'geth', overridable: { flags: true } } as Container], 'flag-override')).toBe('');
+    expect(notAllowed([{ name: 'geth', overridable: true } as Container], 'flag-override')).toBe('');
   });
 });

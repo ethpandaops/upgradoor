@@ -277,14 +277,14 @@ func (w *world) newAgent(i int) (agent.Service, *agenttest.Host, error) {
 		return nil, nil, err
 	}
 
-	cert, err := identity.IssueCertificate(w.seed, identity.CertificateSpec{
-		Network: network, Hostname: name, Roles: []string{"ethereum_node"},
-	})
+	key, err := identity.GenerateHostKey()
 	if err != nil {
 		return nil, nil, err
 	}
 
-	key, err := identity.DeriveHostKey(w.seed, network, name)
+	cert, err := identity.IssueCertificate(w.seed, identity.PublicKey(key), identity.CertificateSpec{
+		Network: network, Hostname: name,
+	})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -299,10 +299,10 @@ func (w *world) newAgent(i int) (agent.Service, *agenttest.Host, error) {
 		OS:            agenttest.OS{ID: "debian", VersionID: "13", PrettyName: "Debian 13", Arch: "amd64"},
 		RunningKernel: "6.12.57-amd64", NewestKernel: "6.12.57-amd64",
 		Containers: []agenttest.Container{
-			{Name: "geth", Image: w.gethImage, Digest: gethOld, Group: "execution", Kind: "el"},
-			{Name: "beacon", Image: w.clImage, Digest: clDigest, Group: "consensus", Kind: "cl"},
+			{Name: "geth", Image: w.gethImage, Digest: gethOld, Kind: "el", Team: "geth"},
+			{Name: "beacon", Image: w.clImage, Digest: clDigest, Kind: "cl", Team: "lighthouse"},
 		},
-	}, nil)
+	})
 	if err != nil {
 		return nil, nil, err
 	}
@@ -318,10 +318,6 @@ func (w *world) newAgent(i int) (agent.Service, *agenttest.Host, error) {
 		},
 		Policy: plan.Policy{
 			Verbs: []protocol.Verb{protocol.VerbRoll},
-			Groups: map[string]plan.Group{
-				"execution": {Client: "geth"},
-				"consensus": {Client: "lighthouse"},
-			},
 		},
 		Verify: lease.Config{Window: time.Second, Timeout: 30 * time.Second},
 	}

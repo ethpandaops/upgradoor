@@ -68,13 +68,14 @@ func (a *agent) cycle(ctx context.Context) bool {
 		return false
 	}
 
-	files := a.files.Load()
+	files := a.inputs()
 	view := plan.Classify(&a.cfg.Policy, &facts, &files, a.tracker.Checks(), a.now())
 
 	// Stale containers change nothing of what is followed.
 	if facts.Fresh {
 		a.tracker.Track(view.Tags)
 		a.tags = followed(&view)
+		a.layout(&view, &files)
 	}
 
 	a.takeLocalRolls(&view)
@@ -126,7 +127,7 @@ func (a *agent) fallback(view *plan.View, needs []protocol.Need) bool {
 	fb := &a.cfg.Policy.Fallback
 
 	silent := a.now().Sub(a.lastAnswer)
-	if !fb.Enabled() || silent < fb.After {
+	if !a.cfg.Policy.FallbackEnabled() || silent < fb.After {
 		return false
 	}
 
@@ -143,7 +144,7 @@ func (a *agent) fallback(view *plan.View, needs []protocol.Need) bool {
 		a.tracker.SetFallback(plan.FallbackTags(&a.cfg.Policy, view), fb.Interval)
 	}
 
-	open := plan.FallbackNeeds(&a.cfg.Policy, needs)
+	open := plan.FallbackNeeds(&a.cfg.Policy, view, needs)
 	open = slices.DeleteFunc(open, func(n protocol.Need) bool {
 		_, tried := a.fallbackTried[n.ID]
 
@@ -171,7 +172,7 @@ func (a *agent) fallback(view *plan.View, needs []protocol.Need) bool {
 // backoff does not delay its start. Zero or less otherwise.
 func (a *agent) untilFallback() time.Duration {
 	fb := &a.cfg.Policy.Fallback
-	if !a.syncFailing || !fb.Enabled() || a.fallbackTried != nil {
+	if !a.syncFailing || !a.cfg.Policy.FallbackEnabled() || a.fallbackTried != nil {
 		return 0
 	}
 
@@ -225,6 +226,17 @@ func (a *agent) observe(ctx context.Context) plan.Facts {
 	}
 }
 
+// layout brings the default lines of the overrides file up to date; Files
+// logs a failure.
+func (a *agent) layout(view *plan.View, files *plan.Overrides) {
+	if files.Disabled || !files.Known {
+		return
+	}
+
+	keep, drop := plan.OverrideKeys(view, files)
+	_, _ = a.files.Layout(keep, drop)
+}
+
 // reconcileManual stores what plan.Reconcile makes of the manual needs and
 // logs each dropped one.
 func (a *agent) reconcileManual(view *plan.View) {
@@ -258,13 +270,13 @@ func (a *agent) report(ctx context.Context, view *plan.View) *protocol.SyncReque
 		AgentVersion:    a.version,
 		SentAt:          a.now().UTC(),
 		Verbs:           append([]protocol.Verb{}, a.cfg.Policy.Verbs...),
+		Roles:           a.cfg.Roles,
 		Hold:            view.Hold,
 		Containers:      slices.Clone(view.Containers),
 		Node:            a.host.Probe(ctx),
 		Needs:           plan.Needs(&a.cfg.Policy, view, manual),
 		DirectiveAcks:   a.state.Acks(a.directives.repeated),
 		Tags:            a.tags,
-		Validators:      a.validators(ctx),
 		Operation:       cur.Reported(),
 	}
 
@@ -290,32 +302,6 @@ func followed(view *plan.View) []string {
 	slices.Sort(tags)
 
 	return tags[:min(len(tags), protocol.MaxTags)]
-}
-
-// validators reads the validator range and logs it when it changed.
-func (a *agent) validators(ctx context.Context) *protocol.Validators {
-	v := a.host.Validators(ctx)
-
-	switch {
-	case v == nil && a.lastValidators == nil:
-	case v != nil && a.lastValidators != nil && *v == *a.lastValidators:
-	case v == nil:
-		a.log.Info("no validator range configured any more; reporting no validators")
-	case v.State == protocol.ValidatorsInvalid:
-		a.log.WithFields(logrus.Fields{"source": v.Source, "error": v.Error}).
-			Error("cannot read the validator range; reporting it as unknown, not as none")
-	case v.State == protocol.ValidatorsMissing:
-		a.log.WithField("marker", a.cfg.Host.Validators.MarkerFile).
-			Warn("the validator key range marker is missing (keys being reshuffled?); " +
-				"reporting the range as unknown, not as none")
-	default:
-		a.log.WithFields(logrus.Fields{"source": v.Source, "start": v.Start, "end": v.End}).
-			Info("validator range")
-	}
-
-	a.lastValidators = v
-
-	return v
 }
 
 // sendInventory uploads the inventory, collected within inventoryTimeout.

@@ -12,10 +12,8 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 	"github.com/ethpandaops/upgradoor/pkg/controller/controllertest"
-	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
-	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 func postClientOverride(h *harness, u *authz.User, body string) *httptest.ResponseRecorder {
@@ -99,27 +97,6 @@ func TestClientOverrideRefusesUncoveredHosts(t *testing.T) {
 
 	got := controllertest.DecodeJSON[scheduler.ActionResult](t, rec)
 	assert.Equal(t, []string{controllertest.HostMixed, controllertest.HostUnowned}, got.Hosts, "the fake sends what it is given")
-
-	// A second teku host whose teku the team teku does not own.
-	h.store.Lock()
-	h.store.Hosts["teku-geth-2"] = &fleet.Host{Name: "teku-geth-2", LastSeen: controllertest.Epoch, Status: &protocol.SyncRequest{
-		Containers: []protocol.Container{controllertest.OfClient(controllertest.Owned("teku", "nimbus"), protocol.KindCL, "teku")},
-	}}
-	h.store.Unlock()
-
-	u = &authz.User{Actor: controllertest.UserEmail, Teams: []string{"teku"}, Services: "+upgradoor:team_flag_override"}
-	body = fmt.Sprintf(`{"client":"teku","kind":"cl","hosts":[%q,"teku-geth-2"],"part":"flags","addFlags":["--x"]}`,
-		controllertest.HostTeku)
-
-	rec = postClientOverride(h, u, body)
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-
-	got = controllertest.DecodeJSON[scheduler.ActionResult](t, rec)
-	assert.Equal(t, []string{controllertest.HostTeku}, got.Hosts)
-	require.Contains(t, got.Rejected, "teku-geth-2")
-	assert.Contains(t, got.Rejected["teku-geth-2"], "upgradoor:team_flag_override does not cover container teku")
-	assert.Equal(t, "sent to 1 of 2 hosts: each agent decides, and its container follows under the host's next lease",
-		got.Message)
 }
 
 func overrideReq(t *testing.T, call controllertest.Call) scheduler.ClientOverrideRequest {
@@ -139,7 +116,7 @@ func TestClientOverrideValidates(t *testing.T) {
 
 	for name, body := range map[string]string{
 		"no client":       `{"kind":"cl","hosts":["a"],"part":"image","image":"x:y"}`,
-		"unknown kind":    `{"client":"teku","kind":"other","hosts":["a"],"part":"image","image":"x:y"}`,
+		"an invalid kind": `{"client":"teku","kind":"CL","hosts":["a"],"part":"image","image":"x:y"}`,
 		"no hosts":        `{"client":"teku","kind":"cl","hosts":[],"part":"image","image":"x:y"}`,
 		"unknown part":    `{"client":"teku","kind":"cl","hosts":["a"],"part":"both"}`,
 		"image and flags": `{"client":"teku","kind":"cl","hosts":["a"],"part":"image","image":"x:y","addFlags":["--x"]}`,
