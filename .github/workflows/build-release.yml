@@ -136,7 +136,21 @@ jobs:
           dist/upgradoor-linux-*
           dist/upgradoor-controller-linux-*
 
+    - name: Generate AI release notes
+      id: ai_release_notes
+      if: ${{ vars.OPENROUTER_MODEL != '' }}
+      run: |
+        prev_tag=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vx "$TAG" | head -n 1 || true)
+        ./.github/scripts/ai-release-notes.sh "$prev_tag"
+      env:
+        OPENROUTER_MODEL: ${{ vars.OPENROUTER_MODEL }}
+        OPENROUTER_TOKEN: ${{ secrets.OPENROUTER_API_KEY }}
+        GITHUB_TOKEN: ${{ github.token }}
+        GITHUB_REPOSITORY: ${{ github.repository }}
+
     - name: Generate release notes
+      env:
+        AI_NOTES: ${{ steps.ai_release_notes.outputs.release_notes }}
       run: |
         set -eu
         prev_tag=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | grep -vx "$TAG" | head -n 1 || true)
@@ -144,10 +158,20 @@ jobs:
         {
           echo "Unsigned draft. Sign the manifest (\`scripts/sign-release.sh $TAG\`), then publish: publishing verifies the signature and tags the image."
           echo
-          echo "Image: \`$IMAGE@$DIGEST\`"
+          if [ -n "$AI_NOTES" ]; then
+            echo "### Major Changes"
+            echo "$AI_NOTES"
+            echo
+          fi
+          echo "<details>"
+          echo "  <summary>Full changelog</summary>"
           echo
-          echo "### Changelog"
+          echo "### Full changelog"
           git log --oneline --no-decorate ${prev_tag:+$prev_tag..HEAD} | sed 's/^/ - /'
+          echo "</details>"
+          echo
+          echo "### Release Artifacts"
+          echo "Image: \`$IMAGE@$DIGEST\`"
         } > .cache/notes.md
 
     - name: Create tag and draft release

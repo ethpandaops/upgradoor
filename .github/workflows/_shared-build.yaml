@@ -31,7 +31,7 @@ on:
         required: false
         type: string
       additional_tags:
-        description: 'Additional Docker Image Tags (JSON)'
+        description: 'Additional Docker image tags, separated by spaces'
         default: ''
         required: false
         type: string
@@ -301,63 +301,23 @@ jobs:
 
     - name: Build multiarch docker manifest
       id: manifest
+      env:
+        REPOSITORY: ${{ inputs.docker_repository }}
+        TAGS: ${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }} ${{ inputs.additional_tags }}
       run: |
-        docker buildx imagetools create --metadata-file "$RUNNER_TEMP/manifest.json" -t ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }} \
-        ${{ inputs.docker_repository }}@${{ needs.build_amd64_docker_image.outputs.digest }} \
-        ${{ inputs.docker_repository }}@${{ needs.build_arm64_docker_image.outputs.digest }}
+        args=()
+        for tag in $TAGS; do args+=(-t "$REPOSITORY:$tag"); done
+        docker buildx imagetools create --metadata-file "$RUNNER_TEMP/manifest.json" "${args[@]}" \
+          "$REPOSITORY@${{ needs.build_amd64_docker_image.outputs.digest }}" \
+          "$REPOSITORY@${{ needs.build_arm64_docker_image.outputs.digest }}"
         digest=$(jq -er '."containerimage.descriptor".digest' "$RUNNER_TEMP/manifest.json")
         echo "digest=$digest" >> "$GITHUB_OUTPUT"
+        echo "tags=$TAGS" >> "$GITHUB_OUTPUT"
     - name: Attest multiarch docker manifest (mirror to Docker Hub when IMAGE_MIRROR is true)
       uses: ethpandaops/actions/mirror-image@738aeadbcdc54f1c9af659d35f8ef29dd5c0fae6
       with:
-        tags: ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}
+        tags: ${{ steps.manifest.outputs.tags }}
         digest: ${{ steps.manifest.outputs.digest }}
-        attest-platforms: "false"
-        mirror-url: ${{ secrets.IMAGE_MIRROR_URL }}
-        mirror: ${{ vars.IMAGE_MIRROR == 'true' && 'true' || 'false' }}
-
-  build_extra_image:
-    name: Build additional docker manifests
-    needs: [build_multiarch_image]
-    if: ${{ inputs.additional_tags }}
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-      id-token: write
-      attestations: write
-    strategy:
-      matrix:
-        tag: ${{ fromJSON(inputs.additional_tags) }}
-    steps:
-    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      with:
-        ref: ${{ inputs.ref }}
-    - name: Get build version
-      id: vars
-      run: echo "sha_short=$(git rev-parse --short HEAD)" >> $GITHUB_OUTPUT
-
-    # prepare docker
-    - name: Set up Docker Buildx
-      uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
-    - name: Login to GitHub Container Registry
-      uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
-      with:
-        registry: ghcr.io
-        username: ${{ github.actor }}
-        password: ${{ github.token }}
-
-    - name: "Build additional docker manifest: ${{ matrix.tag }}"
-      id: manifest
-      run: |
-        docker buildx imagetools create --metadata-file "$RUNNER_TEMP/multiarch.json" -t ${{ inputs.docker_repository }}:${{ matrix.tag }} \
-        ${{ inputs.docker_repository }}:${{ inputs.docker_tag_prefix }}-${{ steps.vars.outputs.sha_short }}
-        digest=$(jq -er '."containerimage.descriptor".digest' "$RUNNER_TEMP/multiarch.json")
-        echo "digest=$digest" >> "$GITHUB_OUTPUT"
-    - name: "Attest additional docker manifest (mirror to Docker Hub when IMAGE_MIRROR is true): ${{ matrix.tag }}"
-      uses: ethpandaops/actions/mirror-image@738aeadbcdc54f1c9af659d35f8ef29dd5c0fae6
-      with:
-        tags: ${{ inputs.docker_repository }}:${{ matrix.tag }}@${{ steps.manifest.outputs.digest }}
         attest-platforms: "false"
         mirror-url: ${{ secrets.IMAGE_MIRROR_URL }}
         mirror: ${{ vars.IMAGE_MIRROR == 'true' && 'true' || 'false' }}

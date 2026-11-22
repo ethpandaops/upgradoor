@@ -110,7 +110,7 @@ jobs:
       docker: false
       docker_repository: "ghcr.io/ethpandaops/upgradoor"
       docker_tag_prefix: ${{needs.prinfo.outputs.docker_tag}}
-      additional_tags: "['${{needs.prinfo.outputs.docker_tag}}','${{needs.prinfo.outputs.docker_tag}}-latest']"
+      additional_tags: "${{needs.prinfo.outputs.docker_tag}} ${{needs.prinfo.outputs.docker_tag}}-latest"
 
   build_binaries_and_docker:
     name: "Build Upgradoor and Docker image"
@@ -127,6 +127,6 @@ jobs:
       docker: true
       docker_repository: "ghcr.io/ethpandaops/upgradoor"
       docker_tag_prefix: ${{needs.prinfo.outputs.docker_tag}}
-      additional_tags: "['${{needs.prinfo.outputs.docker_tag}}','${{needs.prinfo.outputs.docker_tag}}-latest']"
+      additional_tags: "${{needs.prinfo.outputs.docker_tag}} ${{needs.prinfo.outputs.docker_tag}}-latest"
     secrets:
       IMAGE_MIRROR_URL: ${{ secrets.IMAGE_MIRROR_URL }}

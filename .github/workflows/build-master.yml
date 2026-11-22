@@ -34,6 +34,6 @@ jobs:
       docker: true
       docker_repository: "ghcr.io/ethpandaops/upgradoor"
       docker_tag_prefix: "master"
-      additional_tags: "['master','master-latest']"
+      additional_tags: "master master-latest"
     secrets:
       IMAGE_MIRROR_URL: ${{ secrets.IMAGE_MIRROR_URL }}
