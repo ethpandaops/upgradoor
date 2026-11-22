@@ -481,15 +481,19 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 		(assignment.Queue != nil && assignment.Queue.Position <= queueBusy)))
 	resp.NextSyncMillis = s.pacer.ask(cert.Subject, now, busy, pc).Milliseconds()
 
-	// A sync that only confirmed the row changes nothing a viewer or the
-	// scheduler sees, unless the host may have been stale before it: silent
-	// for longer than the shortest stale bound the settings allow. Such a
-	// sync waits for the scheduler's next tick; nudging it on every sync kept
-	// the scheduler reconciling back to back.
-	if result == nil || result.Host == nil || result.Changed ||
-		now.Sub(result.PreviousSeen) > result.Host.StaleAfter(fleet.MinHostStaleAfter) {
+	// A sync that only confirmed the row changes nothing the scheduler
+	// decides on, unless the host may have been stale before it: silent for
+	// longer than the shortest stale bound the settings allow. Such a sync
+	// waits for the scheduler's next tick; nudging it on every sync kept the
+	// scheduler reconciling back to back. Its fresh probe values show in the
+	// host's details only.
+	switch {
+	case result == nil || result.Host == nil || result.Changed ||
+		now.Sub(result.PreviousSeen) > result.Host.StaleAfter(fleet.MinHostStaleAfter):
 		s.opts.Scheduler.Nudge()
 		s.opts.Notify()
+	case s.opts.NotifyHost != nil:
+		s.opts.NotifyHost(cert.Subject)
 	}
 
 	s.pacer.observe(time.Since(started))

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net/http"
 	"strings"
 	"time"
@@ -37,7 +38,9 @@ type Client interface {
 	// Inventory uploads the package inventory, signed and verified like Sync.
 	Inventory(ctx context.Context, inv *protocol.Inventory) error
 	// Interval is the time to the next sync: what the last answer asked for,
-	// bounded; else syncInterval, or leaseSyncInterval while busy.
+	// bounded; else syncInterval, or leaseSyncInterval while busy. After
+	// failed syncs it backs off: a random wait up to that interval doubled
+	// per further failure, at most maxSyncInterval.
 	Interval(busy bool) time.Duration
 }
 
@@ -54,6 +57,10 @@ type client struct {
 	// asked is the interval the last answer asked for; zero after a failed
 	// sync, so a vanished controller is not waited for at its own pace.
 	asked time.Duration
+	// failures counts the syncs that failed since the last answer.
+	failures int
+	// jitter returns a random number in [0, n).
+	jitter func(n int64) int64
 	// failing and refused describe the current failure episode, logged once.
 	failing bool
 	refused bool
@@ -92,7 +99,8 @@ func New(
 				return http.ErrUseLastResponse
 			},
 		},
-		now: now,
+		now:    now,
+		jitter: rand.Int64N,
 	}, nil
 }
 
@@ -136,6 +144,7 @@ func (c *client) Sync(
 
 		// A sync cut short by the agent stopping is no episode.
 		if ctx.Err() == nil {
+			c.failures++
 			c.failed(err)
 		}
 
@@ -150,6 +159,7 @@ func (c *client) Sync(
 	}
 
 	c.asked = time.Duration(resp.NextSyncMillis) * time.Millisecond
+	c.failures = 0
 
 	return &resp, nil
 }
@@ -187,11 +197,23 @@ func (c *client) Interval(busy bool) time.Duration {
 		return min(max(c.asked, c.cfg.MinSyncInterval), c.cfg.MaxSyncInterval)
 	}
 
+	base, limit := c.cfg.SyncInterval, c.cfg.MaxSyncInterval
 	if busy {
-		return c.cfg.LeaseSyncInterval
+		base = c.cfg.LeaseSyncInterval
 	}
 
-	return c.cfg.SyncInterval
+	if c.failures == 0 {
+		return base
+	}
+
+	// Full jitter keeps a fleet that lost its controller from retrying in
+	// step; the first retry waits at most one interval.
+	ceiling := min(base, limit)
+	for i := 1; i < c.failures && ceiling < limit; i++ {
+		ceiling = min(2*ceiling, limit)
+	}
+
+	return max(time.Duration(c.jitter(int64(ceiling))+1), c.cfg.MinSyncInterval)
 }
 
 // post sends in as gzip JSON with the certificate and a proof over the bytes

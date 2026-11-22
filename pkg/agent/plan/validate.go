@@ -181,8 +181,8 @@ func (v *validation) target(n *protocol.Need) {
 	}
 
 	c := v.view.Container(name)
-	if c != nil && !c.Managed {
-		v.verdict(n.ID, protocol.StepRefused, "container "+name+" is not managed")
+	if reason, refused := rollable(c, name); refused {
+		v.verdict(n.ID, protocol.StepRefused, reason)
 
 		return
 	}

@@ -235,7 +235,8 @@ func TestRecreateRollsBack(t *testing.T) {
 				"stop old t=1", "rename old " + tmp, "create geth",
 				"remove new1 with volumes", "rename old geth", "start old",
 			},
-			wantErr: ErrDigestMismatch,
+			// Not ErrDigestMismatch: the old container was stopped.
+			wantErr: ErrImageMoved,
 		},
 		{
 			name:    "network connect fails",
@@ -300,6 +301,7 @@ func TestRecreateRollsBack(t *testing.T) {
 
 			err := newTestRuntime(t, f).Recreate(t.Context(), "geth", digestB, time.Second, true, nil)
 			require.ErrorIs(t, err, tt.wantErr)
+			require.NotErrorIs(t, err, ErrDigestMismatch, "found after the stop")
 			assert.ErrorContains(t, err, tt.wantInText)
 			assert.Equal(t, tt.wantCalls, f.calls)
 

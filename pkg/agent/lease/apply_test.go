@@ -1,15 +1,19 @@
 package lease
 
 import (
+	"context"
 	"errors"
+	"fmt"
 	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/ethpandaops/upgradoor/pkg/agent/agenttest"
+	"github.com/ethpandaops/upgradoor/pkg/agent/host"
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
 	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -339,3 +343,48 @@ func TestRecreateWithoutAContainerList(t *testing.T) {
 }
 
 // A digest mismatch without a known digest of the tag fails the step.
+
+// movedHost plays a recreate of geth that found the tag moved after the stop
+// and whose rollback could not start the old container again.
+type movedHost struct {
+	*agenttest.Host
+}
+
+func (h *movedHost) Recreate(
+	ctx context.Context, name, digest string, timeout time.Duration, start bool, change *host.Change,
+) error {
+	if name != "geth" {
+		return h.Host.Recreate(ctx, name, digest, timeout, start, change)
+	}
+
+	if err := h.Stop(ctx, name, timeout); err != nil {
+		return err
+	}
+
+	return fmt.Errorf("recreate container geth: %w (rollback incomplete: start old container: boom)",
+		host.ErrImageMoved)
+}
+
+// A tag that moved after the stop supersedes the step, but the container was
+// disrupted: it is brought back and watched.
+func TestImageMovedAfterTheStopIsADisruption(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.machine = &movedHost{Host: e.host}
+	e.pull(agenttest.GethImage, agenttest.GethV2)
+	e.start(t.Context())
+
+	geth := gethNeed(agenttest.GethV2)
+	e.grant("lease-1", geth)
+
+	op := e.awaitFinished("lease-1")
+	require.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.True(t, op.Disrupted, "geth was stopped")
+	assert.Equal(t, protocol.StepSuperseded, stepOf(t, op, geth.ID).Status)
+
+	assert.Equal(t, []string{"stop geth", "start geth", "start teku", "start validator"}, e.disruptive())
+	e.assertAllRunning()
+	e.assertPhases("lease-1", protocol.PhasePulling, protocol.PhaseApplying, protocol.PhaseStarting,
+		protocol.PhaseVerifying, protocol.PhaseDone)
+}

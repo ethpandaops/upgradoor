@@ -65,6 +65,7 @@ func buildCreateSpec(
 		return nil, errors.New("container has no name")
 	}
 
+	nameAnonymousMounts(spec.HostConfig.Mounts, old.Mounts)
 	spec.HostConfig.Mounts = append(spec.HostConfig.Mounts, anonymousVolumeMounts(old)...)
 	spec.setNetworks(old)
 
@@ -409,6 +410,28 @@ func anonymousVolumeMounts(old *container.InspectResponse) []mount.Mount {
 	sort.Slice(out, func(i, j int) bool { return out[i].Target < out[j].Target })
 
 	return out
+}
+
+// nameAnonymousMounts gives each volume mount without a source the name of
+// the volume the old container has at its target, so the data follows the
+// container instead of a new empty volume; read-only and options stay.
+func nameAnonymousMounts(mounts []mount.Mount, points []container.MountPoint) {
+	for i := range mounts {
+		m := &mounts[i]
+		if m.Type != mount.TypeVolume || m.Source != "" {
+			continue
+		}
+
+		target := cleanPath(m.Target)
+
+		for _, mp := range points {
+			if mp.Type == mount.TypeVolume && mp.Name != "" && cleanPath(mp.Destination) == target {
+				m.Source = mp.Name
+
+				break
+			}
+		}
+	}
 }
 
 // bindDestination returns the container path of a bind specification

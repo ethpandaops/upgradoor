@@ -17,8 +17,7 @@ build: ensure-web
 # dist/upgradoor-controller-linux-<arch> (the controller image), and their manifest
 # dist/upgradoor-manifest.txt (VERSION must be exactly vX.Y.Z). Rebuilt from the tag, it gives
 # byte-identical files: the Go of go.mod (GOTOOLCHAIN), no VCS stamp, no build id, a web UI
-# built afresh from the lock file. CI adds the image's line before the maintainer signs
-# (docs/release.md).
+# built afresh from the lock file. CI adds the image's line before the maintainer signs.
 RELEASE_PLATFORMS := linux-amd64 linux-arm64
 GO_VERSION := $(shell sed -n 's/^go //p' go.mod)
 RELEASE_GO = GOTOOLCHAIN=go$(GO_VERSION) CGO_ENABLED=0 GOOS=$${p%-*} GOARCH=$${p\#*-} \

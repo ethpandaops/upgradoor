@@ -1,5 +1,6 @@
--- upgradoor controller schema. It is applied to an empty database; a change
--- to it comes with a new schemaVersion in sqlite.go.
+-- upgradoor controller schema, step 1: every table of an empty database.
+-- A change to the schema is a further step (0002_<name>.sql, ...), never an
+-- edit of a step that was released.
 -- Times are INTEGER unix milliseconds (UTC). JSON columns hold the encoding
 -- of the matching Go type in pkg/controller/fleet or pkg/protocol.
 
@@ -31,9 +32,13 @@ CREATE TABLE hosts (
     -- the ID of the lease that failed. The scheduler writes it; a host that
     -- is broken for the group of a rollout goes first in it.
     broken           TEXT NOT NULL DEFAULT '{}',
-    -- Hash of the last status without its clock fields (sentAt,
-    -- uptimeSeconds): a sync that reports the same hash writes only
-    -- last_seen, the uptime and sync_interval.
+    -- When a lease of the host failed after it may have disrupted the host
+    -- (fleet.Host.Unproven); NULL when none or once the host is proven back.
+    -- The scheduler writes it; while it is set the host counts as down.
+    unproven         INTEGER,
+    -- Hash of the last status without what changes on every sync (sentAt,
+    -- uptimeSeconds, the probes' heads and peer counts): a sync that reports
+    -- the same hash changes nothing the scheduler decides on.
     status_hash      TEXT NOT NULL DEFAULT '',
     -- The longest sync interval the controller asked of the host in its
     -- last answer, in milliseconds; the host counts as stale only after

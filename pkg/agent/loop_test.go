@@ -1051,3 +1051,28 @@ func (e *env) readOverridesIfAny() string {
 
 	return string(raw)
 }
+
+// While syncs fail the loop wakes when the silence reaches fallback.after,
+// however far the sync backoff has grown.
+func TestUntilFallback(t *testing.T) {
+	t.Parallel()
+
+	now := time.Now()
+	a := &agent{
+		cfg:         &Config{Policy: plan.Policy{Fallback: plan.Fallback{Containers: []string{"geth"}, After: time.Hour}}},
+		now:         func() time.Time { return now },
+		syncFailing: true,
+		lastAnswer:  now.Add(-50 * time.Minute),
+	}
+
+	assert.Equal(t, 10*time.Minute, a.untilFallback())
+
+	a.fallbackTried = map[string]struct{}{}
+	assert.LessOrEqual(t, a.untilFallback(), time.Duration(0), "begun already")
+
+	a.fallbackTried, a.syncFailing = nil, false
+	assert.LessOrEqual(t, a.untilFallback(), time.Duration(0), "the controller answers")
+
+	a.syncFailing, a.cfg.Policy.Fallback.Containers = true, nil
+	assert.LessOrEqual(t, a.untilFallback(), time.Duration(0), "no fallback")
+}

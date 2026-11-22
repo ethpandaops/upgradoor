@@ -19,7 +19,7 @@ import (
 
 const hostColumns = `name, cert_hash, validators_start, validators_end, roles,
 	first_seen, last_seen, remote_addr, status, inventory_hash, hold_wanted, hold_reason, hold_by,
-	offline, broken, sync_interval, status_hash, hold_actor`
+	offline, broken, sync_interval, status_hash, hold_actor, unproven`
 
 // RecordSync upserts the host named by the certificate subject. first_seen
 // is kept for a known host. With a nil Request only the identity, last_seen
@@ -89,7 +89,7 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 		}
 
 		if !result.Created && prev.confirms(in, rolesJSON, statusHash, result.ValidatorsBefore) {
-			result.Host, txErr = s.confirmSync(ctx, tx, in, at)
+			result.Host, txErr = s.confirmSync(ctx, tx, in, at, status)
 
 			return txErr
 		}
@@ -101,7 +101,7 @@ func (s *sqliteStore) RecordSync(ctx context.Context, in *HostSync) (*SyncResult
 			holdReason = HoldReasonAdopted
 		}
 
-		counted, overlaps, txErr := countedValidators(ctx, tx, in, result.ValidatorsBefore, at)
+		counted, overlaps, txErr := countedValidators(ctx, tx, in, result.ValidatorsBefore, at, s.openedAt())
 		if txErr != nil {
 			return txErr
 		}
@@ -180,15 +180,16 @@ func (p *storedSync) confirms(
 	}
 }
 
-// confirmSync writes what a confirming sync changes: the time, the uptime
-// and the asked sync interval.
-func (s *sqliteStore) confirmSync(ctx context.Context, tx *sql.Tx, in *HostSync, at time.Time) (*fleet.Host, error) {
+// confirmSync writes what a confirming sync changes: the time, the asked
+// sync interval and the status, which differs from the stored one only in
+// what the hash leaves out (the clock, the uptime, the probes' heads and
+// peer counts).
+func (s *sqliteStore) confirmSync(
+	ctx context.Context, tx *sql.Tx, in *HostSync, at time.Time, status sql.NullString,
+) (*fleet.Host, error) {
 	_, err := tx.ExecContext(ctx, `
-		UPDATE hosts SET last_seen = ?, sync_interval = ?,
-			status = json_set(status, '$.sentAt', ?, '$.uptimeSeconds', ?)
-		WHERE name = ?`,
-		millis(at), in.SyncInterval.Milliseconds(),
-		in.Request.SentAt.Format(time.RFC3339Nano), in.Request.UptimeSeconds, in.Cert.Subject)
+		UPDATE hosts SET last_seen = ?, sync_interval = ?, status = ? WHERE name = ?`,
+		millis(at), in.SyncInterval.Milliseconds(), status, in.Cert.Subject)
 	if err != nil {
 		return nil, err
 	}
@@ -208,12 +209,15 @@ func (s *sqliteStore) confirmSync(ctx context.Context, tx *sql.Tx, in *HostSync,
 //   - A request without a range, or with an empty one: none.
 //   - A known range: the range, without the validators counted for other
 //     hosts (fleet.UnclaimedRange). A host that has not synced for
-//     ValidatorClaimTTL loses the validators another host reports.
+//     ValidatorClaimTTL loses the validators another host reports. Its
+//     silence counts from its last sync or from opened, whichever is later:
+//     while the controller was down, no host could sync.
 //
 // The store only bounds the range (protocol.Validators.Validate); a range
 // that fails is treated as not known. The API checks it before.
 func countedValidators(
-	ctx context.Context, tx *sql.Tx, in *HostSync, before *identity.ValidatorRange, at time.Time,
+	ctx context.Context, tx *sql.Tx, in *HostSync, before *identity.ValidatorRange,
+	at, opened time.Time,
 ) (counted *identity.ValidatorRange, overlaps []string, err error) {
 	if in.Request == nil {
 		return before, nil, nil
@@ -271,7 +275,12 @@ func countedValidators(
 	for _, c := range claims {
 		overlaps = append(overlaps, c.host)
 
-		if at.Sub(fromMillis(c.lastSeen)) <= ValidatorClaimTTL {
+		silentSince := fromMillis(c.lastSeen)
+		if opened.After(silentSince) {
+			silentSince = opened
+		}
+
+		if at.Sub(silentSince) <= ValidatorClaimTTL {
 			taken = append(taken, c.held)
 
 			continue
@@ -289,6 +298,14 @@ func countedValidators(
 	slices.Sort(overlaps)
 
 	return fleet.UnclaimedRange(want, taken), overlaps, nil
+}
+
+// openedAt returns when Start opened the database.
+func (s *sqliteStore) openedAt() time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	return s.opened
 }
 
 // encodeSync returns the roles and status columns of a sync. The status is
@@ -313,6 +330,7 @@ func encodeSync(in *HostSync) (roles string, status sql.NullString, hash string,
 	// The hash leaves out the fields that change on every sync.
 	steady := *in.Request
 	steady.SentAt, steady.UptimeSeconds = time.Time{}, 0
+	steady.Node = steadyNode(in.Request.Node)
 
 	raw, err = json.Marshal(&steady)
 	if err != nil {
@@ -328,6 +346,30 @@ func encodeSync(in *HostSync) (roles string, status sql.NullString, hash string,
 	}
 
 	return roles, sql.NullString{String: string(raw), Valid: true}, hash, nil
+}
+
+// steadyNode is the part of the node probes the status hash covers: the
+// flags (reachable, syncing, optimistic, EL offline), the errors and whether
+// each client has peers at all. The heads and the sync distance move with
+// every slot; the exact peer counts drift on a healthy node. Readiness
+// compares those from the stored status at the scheduler's next tick
+// (confirmSync stores them), so a change in them needs no early reconcile.
+func steadyNode(n protocol.NodeHealth) protocol.NodeHealth {
+	out := protocol.NodeHealth{}
+
+	if n.EL != nil {
+		el := *n.EL
+		el.Head, el.Peers = 0, min(max(el.Peers, 0), 1)
+		out.EL = &el
+	}
+
+	if n.CL != nil {
+		cl := *n.CL
+		cl.HeadSlot, cl.SyncDistance, cl.Peers = 0, 0, min(max(cl.Peers, 0), 1)
+		out.CL = &cl
+	}
+
+	return out
 }
 
 // GetHost returns one host or ErrNotFound.
@@ -392,14 +434,20 @@ func (s *sqliteStore) scanHost(row rowScanner) (*fleet.Host, error) {
 		status              sql.NullString
 		broken, offline     string
 		syncInterval        int64
+		unproven            sql.NullInt64
 	)
 
 	err := row.Scan(&host.Name, &host.CertHash, &valStart, &valEnd, &roles,
 		&firstSeen, &lastSeen, &host.RemoteAddr, &status, &host.InventoryHash,
 		&host.HoldWanted, &host.HoldReason, &host.HoldBy, &offline, &broken, &syncInterval,
-		&host.StatusHash, &host.HoldActor)
+		&host.StatusHash, &host.HoldActor, &unproven)
 	if err != nil {
 		return nil, err
+	}
+
+	if unproven.Valid {
+		at := fromMillis(unproven.Int64)
+		host.Unproven = &at
 	}
 
 	if offline != "" {
@@ -554,6 +602,14 @@ func setHostBroken(ctx context.Context, tx *sql.Tx, name string, marks map[strin
 	}
 
 	_, err = tx.ExecContext(ctx, `UPDATE hosts SET broken = ? WHERE name = ?`, string(raw), name)
+
+	return err
+}
+
+// setHostUnproven replaces fleet.Host.Unproven of a host. A host that does
+// not exist is passed over.
+func setHostUnproven(ctx context.Context, tx *sql.Tx, name string, at *time.Time) error {
+	_, err := tx.ExecContext(ctx, `UPDATE hosts SET unproven = ? WHERE name = ?`, nullMillis(at), name)
 
 	return err
 }

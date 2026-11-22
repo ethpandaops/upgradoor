@@ -30,13 +30,17 @@ jobs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-    - name: Exactly vX.Y.Z, tag free or at this commit, no release yet
+    - name: On master, exactly vX.Y.Z, tag free or at this commit, no release yet
       id: version
       env:
         VERSION: ${{ inputs.version }}
         GH_TOKEN: ${{ github.token }}
       run: |
         set -eu
+        if [ "$GITHUB_REF" != "refs/heads/master" ]; then
+          echo "::error::releases are built from master, not $GITHUB_REF"
+          exit 1
+        fi
         tag="v${VERSION#v}"
         ./scripts/release-manifest.sh seq "$tag"
         # the peeled line of an annotated tag sorts last

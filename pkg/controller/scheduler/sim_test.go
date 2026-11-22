@@ -576,6 +576,7 @@ func (s *sim) facts() *simFacts {
 			live:       live,
 			holdWanted: registered.HoldWanted,
 			offline:    registered.KnownOffline(w.now),
+			unproven:   registered.Unproven,
 			lastSync:   a.lastSync,
 			status:     a.lastSent,
 			reported:   a.reported,
@@ -607,29 +608,34 @@ func (s *sim) checkPlan() error {
 
 	leased := make(map[string]bool, len(open))
 	independent := 0
+	byLease := make(map[string]protocol.Impact, len(open))
 
 	for _, l := range open {
 		leased[l.Host] = true
+		byLease[l.Host] = l.Impact
 
 		if l.Impact == protocol.ImpactIndependent {
 			independent++
 		}
 	}
 
-	// A host that works without a lease takes a slot like one that holds one;
-	// an independent lease takes a place in its own limit.
+	// A host that works without a lease takes a slot like one that holds one,
+	// and so does a charged host, whatever lighter lease it holds; an
+	// independent lease takes a place in its own limit.
 	f := s.facts()
 	slots := len(leased) - independent
 
 	for name, h := range f.hosts {
-		if !leased[name] && f.working(h) {
+		switch {
+		case leased[name] && byLease[name] != protocol.ImpactIndependent:
+		case f.charged(h), !leased[name] && f.working(h):
 			slots++
 		}
 	}
 
 	if plan.Budget.LeasedHosts != slots || plan.Budget.IndependentHosts != independent {
 		return fmt.Errorf("plan counts %d leased and %d independent hosts, %d leases are open "+
-			"(%d independent) and %d hosts work without one",
+			"(%d independent) and %d hosts work without one or are charged",
 			plan.Budget.LeasedHosts, plan.Budget.IndependentHosts, len(leased), independent,
 			slots+independent-len(leased))
 	}
@@ -3058,7 +3064,14 @@ func (w *simWorld) onTarget(a *simAgent) error {
 //     not approved. Ended leases and closed rollouts stay as they ended.
 //
 // A host whose agent reports an operation that is not over while the host
-// holds no lease counts as leased in 1, 2 and 4.
+// holds no lease counts as leased in 1, 2 and 4, and so does a host that the
+// scheduler marked as not proven back after a lease (fleet.Host.Unproven),
+// with its full weight, unless it is the host granted.
+//  9. Such a mark is set, unless the host is stale, when a node lease fails
+//     after its agent reported a failure of an operation that disrupted the
+//     host.
+// 10. While the gate is open, a lease granted in a rollout that has a canary
+//     and no success yet goes to the canary or to a host in the repair stage.
 //  4. No such grant while the world's gate is closed, with one exception:
 //     the gate is closed for participation or finality (not for want of
 //     data), none of the host's validators attests and nothing is leased.
@@ -3093,6 +3106,9 @@ type simHostFact struct {
 	// operator's known-offline mark is in force.
 	holdWanted bool
 	offline    bool
+	// unproven is the scheduler's mark that the host is not proven back after
+	// a lease (fleet.Host.Unproven).
+	unproven *time.Time
 	// lastSync and status are the agent's last sync as it sent it.
 	lastSync time.Time
 	status   *protocol.SyncRequest
@@ -3137,6 +3153,26 @@ func (f *simFacts) stale(h *simHostFact) bool {
 func (f *simFacts) working(h *simHostFact) bool {
 	return !f.stale(h) && h.status != nil && h.status.Operation != nil &&
 		!h.status.Operation.Phase.Terminal()
+}
+
+// charged: the scheduler marked the host as not proven back after a lease,
+// and it is not stale.
+func (f *simFacts) charged(h *simHostFact) bool {
+	return h.unproven != nil && !f.stale(h)
+}
+
+// chargedOthers counts the charged hosts other than host that do not hold a
+// node or slot lease (those count by their lease already).
+func (f *simFacts) chargedOthers(leased map[string]protocol.Impact, host string) int {
+	n := 0
+
+	for name, h := range f.hosts {
+		if name != host && f.charged(h) && leased[name] != protocol.ImpactNode && leased[name] != protocol.ImpactSlot {
+			n++
+		}
+	}
+
+	return n
 }
 
 // simSnapshot is the committed scheduler state at one observation, in
@@ -3312,6 +3348,14 @@ func (o *oracle) checkEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) error 
 		report = host.reported[l.ID]
 	}
 
+	// Invariant 9: a node lease that failed after its agent disrupted the
+	// host leaves the host charged.
+	if host := f.hosts[l.Host]; host != nil && !f.stale(host) && host.unproven == nil &&
+		leaseImpact(l) == protocol.ImpactNode && l.State == fleet.LeaseFailed &&
+		report != nil && report.Disrupted && report.Phase == protocol.PhaseFailed {
+		return errors.New("failed after its agent disrupted the host, and the host is not charged")
+	}
+
 	switch l.State {
 	case fleet.LeaseReleased:
 		// A recheck repeats the readiness check of a lease whose agent did.
@@ -3389,8 +3433,9 @@ func oracleGate(f *simFacts, leased map[string]protocol.Impact) []string {
 	for name, h := range f.hosts {
 		tracked += h.weight
 
-		// A host marked known offline is left out, like one at work.
-		if leased[name] == "" && !h.offline {
+		// A host marked known offline is left out, like one at work, and so
+		// is a charged one.
+		if leased[name] == "" && !h.offline && !f.charged(h) {
 			total += h.weight
 			live += h.live
 		}
@@ -3424,14 +3469,17 @@ func oracleBudget(f *simFacts, leased map[string]protocol.Impact, host string, i
 	var total, unavailable uint64
 
 	for name, h := range f.hosts {
+		// The host granted is not counted by its charge: its lease charges it.
+		charged := name != host && f.charged(h)
+
 		// A host marked known offline that holds no lease is not counted.
-		if h.offline && leased[name] == "" {
+		if h.offline && leased[name] == "" && !charged {
 			continue
 		}
 
 		total += h.weight
 
-		if leased[name] == protocol.ImpactNode {
+		if leased[name] == protocol.ImpactNode || charged {
 			unavailable += h.weight
 		} else {
 			unavailable += h.weight - h.live
@@ -3440,7 +3488,7 @@ func oracleBudget(f *simFacts, leased map[string]protocol.Impact, host string, i
 
 	percent := f.settings.MaxUnavailablePercent
 	allowed := percent * float64(total) / 100
-	others := oracleCount(leased, protocol.ImpactNode, protocol.ImpactSlot)
+	others := oracleCount(leased, protocol.ImpactNode, protocol.ImpactSlot) + f.chargedOthers(leased, host)
 
 	cost := f.hosts[host].live
 	if impact != protocol.ImpactNode {
@@ -3509,7 +3557,7 @@ func (o *oracle) checkGrant(
 			return fmt.Errorf("need %s is served for no rollout", l.Needs[i].ID)
 		}
 
-		if err := o.checkRollout(f, r, l); err != nil {
+		if err := o.checkRollout(f, r, l, len(gate) == 0); err != nil {
 			return fmt.Errorf("rollout %s (%s): %w", r.ID, r.Key, err)
 		}
 
@@ -3540,7 +3588,7 @@ func (o *oracle) checkGrant(
 				gate, host.live, host.weight)
 		}
 
-		if n := oracleCount(leased, protocol.ImpactNode, protocol.ImpactSlot); n > 0 {
+		if n := oracleCount(leased, protocol.ImpactNode, protocol.ImpactSlot) + f.chargedOthers(leased, l.Host); n > 0 {
 			return fmt.Errorf("the network gate is closed (%v) and %d hosts are leased already", gate, n)
 		}
 
@@ -3548,6 +3596,14 @@ func (o *oracle) checkGrant(
 	}
 
 	return oracleBudget(f, leased, l.Host, bound)
+}
+
+// oracleSucceeded reports whether a member of the rollout is done through a
+// lease that was released.
+func oracleSucceeded(r *fleet.Rollout) bool {
+	return slices.ContainsFunc(r.Hosts, func(m fleet.RolloutHost) bool {
+		return m.State == fleet.HostDone && m.LeaseID != ""
+	})
 }
 
 // oracleWholeGroups is invariant 8: a lease that serves a need of a roll
@@ -3594,8 +3650,10 @@ func oracleWholeGroups(h *simHostFact, l *fleet.Lease) error {
 
 // checkRollout checks that a rollout may be granted in: it is open, not
 // halted, not paused and approved where its policy asks for that, and the
-// host is its member under this lease.
-func (o *oracle) checkRollout(f *simFacts, r *fleet.Rollout, l *fleet.Lease) error {
+// host is its member under this lease. While the gate is open (its one
+// exception skips the order), the host does not wait for the canary
+// (invariant 10).
+func (o *oracle) checkRollout(f *simFacts, r *fleet.Rollout, l *fleet.Lease, gateOpen bool) error {
 	policy := fleet.PolicyAuto
 
 	switch r.Kind {
@@ -3624,6 +3682,8 @@ func (o *oracle) checkRollout(f *simFacts, r *fleet.Rollout, l *fleet.Lease) err
 		return errors.New("the policy is manual and nobody approved the rollout")
 	case m == nil || m.State != fleet.HostLeased || m.LeaseID != l.ID:
 		return errors.New("the host is not a member leased by this lease")
+	case gateOpen && r.Canary != "" && r.Canary != l.Host && !oracleSucceeded(r) && m.Stage != fleet.StageRepair:
+		return fmt.Errorf("the host waits for the canary %s", r.Canary)
 	default:
 		return nil
 	}

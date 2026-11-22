@@ -15,7 +15,7 @@ import (
 // budgetEpsilon absorbs floating point noise in percent arithmetic.
 const budgetEpsilon = 1e-9
 
-// Waiting reasons, in the order of docs/scheduler.md.
+// Waiting reasons.
 const (
 	reasonHeld    = "held"
 	reasonOffline = "known offline"
@@ -115,37 +115,48 @@ type budgetState struct {
 	offlineWeight uint64
 }
 
-// budget computes the budget from the hosts' leases and liveness. A host that works on an operation without a lease counts like
-// one that holds a lease. Only a node lease takes the host's validators out
-// of the budget; a slot lease takes a place in the host limit, an
-// independent one in the independent limit.
+// budget computes the budget from the hosts' leases and liveness. It counts
+// the validators with a duty (hostView.duty): validators without one can
+// neither go down nor widen what may. A host that works on an operation
+// without a lease, and a charged host, count like one that holds a node
+// lease. Only a node lease takes the host's validators out of the budget; a
+// slot lease takes a place in the host limit, an independent one in the
+// independent limit.
 func (p *pass) budget() *budgetState {
 	b := &budgetState{percent: p.set.MaxUnavailablePercent}
 
 	for _, hv := range p.hosts {
 		if hv.offline && !hv.occupied() {
 			b.offlineHosts++
-			b.offlineWeight += hv.weight
+			b.offlineWeight += hv.duty
 
 			continue
 		}
 
-		b.total += hv.weight
+		b.total += hv.duty
+		impact := hv.occupation()
 
-		switch hv.occupation() {
+		if impact == protocol.ImpactIndependent {
+			b.independent++
+		}
+
+		// A charged host is down, whatever lighter work it is leased for.
+		if hv.charged() {
+			impact = protocol.ImpactNode
+		}
+
+		switch impact {
 		case protocol.ImpactNode:
-			b.unavailable += hv.weight
+			b.unavailable += hv.duty
 			b.leased++
 
 			continue
 		case protocol.ImpactSlot:
 			b.leased++
-		case protocol.ImpactIndependent:
-			b.independent++
 		default:
 		}
 
-		b.unavailable += hv.weight - hv.live
+		b.unavailable += hv.duty - hv.live
 	}
 
 	b.allowed = b.percent * float64(b.total) / 100
@@ -269,15 +280,16 @@ func (p *pass) gate() (g Gate, trusted bool) {
 	}
 
 	// Participation is judged among the hosts that are not occupied: a host
-	// that holds a lease, or works without one, is down because of its
-	// operation, so a rollout does not close the gate on itself.
+	// that holds a lease, works without one or is charged is down because of
+	// an operation, so a rollout does not close the gate on itself. It is the
+	// share of the validators with a duty that attested.
 	var tracked, live, total uint64
 
 	for _, hv := range p.hosts {
 		tracked += hv.weight
 
 		if !hv.occupied() && !hv.offline {
-			total += hv.weight
+			total += hv.duty
 			live += hv.live
 		}
 	}
@@ -429,10 +441,11 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 		return verdict{}, needs, excepted
 	}
 
+	// A need that waits for its place in the order is not granted, whatever
+	// else the host is leased for: the canary and the broken hosts prove the
+	// change first.
 	if v = g.orderVerdict(r, hv); v.rank != rankGrantable {
-		// The needs go with the verdict: they may ride along with a lease
-		// the host is granted anyway.
-		return v, needs, false
+		return v, nil, false
 	}
 
 	return verdict{}, needs, false
@@ -445,9 +458,26 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 // serving it cannot make the network worse and may be what brings it back.
 // Without the exception a host that keeps participation below the gate would
 // keep its own fix away for ever. Nothing is leased next to it, so one host
-// goes at a time.
+// goes at a time. A host none of whose validators has a duty does not pass:
+// it keeps nobody's participation down.
 func (g *granter) passesClosedGate(hv *hostView) bool {
-	return g.gateTrusted && g.budget.leased == 0 && hv.weight > 0 && hv.liveKnown && hv.live == 0
+	return g.gateTrusted && g.admitting(hv).leased == 0 && hv.duty > 0 && hv.liveKnown && hv.live == 0
+}
+
+// admitting is the budget a grant to the host is checked against. A charged
+// host already counts with its full weight and a place in the host limit:
+// it is checked as if it were not charged, so that the charge does not keep
+// its own repair away, and its lease charges it as usual.
+func (g *granter) admitting(hv *hostView) *budgetState {
+	if !hv.charged() {
+		return g.budget
+	}
+
+	b := *g.budget
+	b.unavailable -= hv.live
+	b.leased--
+
+	return &b
 }
 
 // consider grants the host a lease for everything grantable, or says what
@@ -471,12 +501,8 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 	var (
 		best                  verdict
 		normal, exempt, indep []part
-		// waiting are the parts that wait only for their place in their
-		// rollout's order: they ride along with a lease the host is granted
-		// anyway.
-		waiting  []part
-		excepted bool
-		impact   = protocol.ImpactIndependent
+		excepted              bool
+		impact                = protocol.ImpactIndependent
 	)
 
 	for _, r := range rollouts {
@@ -484,12 +510,6 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 		excepted = excepted || viaException
 
 		switch {
-		case rv.rank == rankOrder:
-			waiting = append(waiting, part{r, needs})
-
-			if rv.rank > best.rank {
-				best, about = rv, r.ID
-			}
 		case rv.rank != rankGrantable:
 			if rv.rank > best.rank {
 				best, about = rv, r.ID
@@ -505,7 +525,7 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 	}
 
 	if len(normal) > 0 {
-		if bv := g.budget.admit(nodeCost(hv, impact)); bv.rank != rankGrantable {
+		if bv := g.admitting(hv).admit(nodeCost(hv, impact)); bv.rank != rankGrantable {
 			best, about, normal, excepted = bv, "", nil, false
 		}
 	}
@@ -527,31 +547,9 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 		return best, about
 	}
 
-	g.lease(hv, slices.Concat(parts, rideAlong(hv, slices.Concat(normal, indep), waiting)), excepted)
+	g.lease(hv, parts, excepted)
 
 	return verdict{}, ""
-}
-
-// rideAlong returns the parts that go with a lease the host is granted
-// anyway: needs of rollouts that are active, not paused and approved where
-// their policy asks for it, that wait only for their place in the order
-// (a canary, a broken host), and whose work is of the lease's class or
-// lighter. The host goes down once; the lease costs nothing more.
-func rideAlong(hv *hostView, granted, waiting []part) []part {
-	impact := protocol.ImpactIndependent
-	for _, pt := range granted {
-		impact = impact.Heavier(needsImpact(hv.h, pt.needs))
-	}
-
-	out := make([]part, 0, len(waiting))
-
-	for _, pt := range waiting {
-		if impact.Heavier(needsImpact(hv.h, pt.needs)) == impact && !pt.r.IgnoreBudget {
-			out = append(out, pt)
-		}
-	}
-
-	return out
 }
 
 // lease creates the lease for one host and books it. excepted: the grant
@@ -605,7 +603,15 @@ func (g *granter) lease(hv *hostView, parts []part, excepted bool) {
 		}
 	}
 
-	g.budget.take(l.Charged, impact)
+	// A charged host counts as node work already, and a lease does not
+	// change that; only its place in the independent limit is new.
+	switch {
+	case !hv.charged():
+		g.budget.take(l.Charged, impact)
+	case impact == protocol.ImpactIndependent:
+		g.budget.independent++
+	default:
+	}
 
 	hv.lease = l
 	p.leases = append(p.leases, l)
@@ -777,6 +783,9 @@ func (p *pass) grant() *Plan {
 			hp.Slot = SlotStale
 		case failed[name]:
 			hp.Slot = SlotFailed
+		case hv.charged():
+			// Not proven back after a failed lease: down like a leased host.
+			hp.Slot = SlotLeased
 		case queued:
 			hp.Slot = SlotQueued
 		}

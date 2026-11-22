@@ -87,8 +87,11 @@ type Outcome struct {
 	// Broken are the broken marks of the hosts on which a lease failed or
 	// was released in this pass, as they are from now on.
 	Broken []store.HostBroken
-	Audit  []fleet.AuditEntry
-	Plan   *Plan
+	// Unproven are the hosts whose fleet.Host.Unproven this pass set or
+	// cleared, as it is from now on.
+	Unproven []store.HostUnproven
+	Audit    []fleet.AuditEntry
+	Plan     *Plan
 }
 
 // Changes returns the outcome as one store transaction.
@@ -98,17 +101,19 @@ func (o *Outcome) Changes() *store.Changes {
 		Leases:     o.Leases,
 		Directives: o.Directives,
 		Broken:     o.Broken,
+		Unproven:   o.Unproven,
 		Audit:      o.Audit,
 	}
 }
 
-// Reconcile applies every rule of docs/scheduler.md once. It is pure: no
+// Reconcile applies every scheduling rule once. It is pure: no
 // I/O, no clock, no randomness; the same World gives the same Outcome as
 // long as NewID does.
 func Reconcile(w *World) *Outcome {
 	p := newPass(w)
 
 	p.syncDirectives()
+	p.proveHosts()
 	p.advanceLeases()
 	p.syncRollouts()
 	p.syncWithdrawals()
@@ -120,8 +125,11 @@ func Reconcile(w *World) *Outcome {
 type hostView struct {
 	h      *fleet.Host
 	weight uint64
-	// live is how many of the host's validators attested in the newest
-	// stored liveness epoch; the full weight when there is no row.
+	// duty is how many of the host's validators had an attestation duty in
+	// the newest stored liveness epoch, live how many of those attested;
+	// both the full weight when there is no row. Validators without a duty
+	// (exited, pending, beyond the validator set) count for nothing.
+	duty      uint64
 	live      uint64
 	liveKnown bool
 	// held: a hold, or a known-offline mark (offline), keeps the host from
@@ -136,6 +144,8 @@ type hostView struct {
 	// broken are the host's broken marks as the pass leaves them
 	// (fleet.Host.Broken); never changed in place.
 	broken map[string]string
+	// unproven is fleet.Host.Unproven as the pass leaves it.
+	unproven *time.Time
 }
 
 func (hv *hostView) allows(verb protocol.Verb) bool {
@@ -174,10 +184,19 @@ func (hv *hostView) working() bool {
 	return hv.lease == nil && !hv.stale && op != nil && !op.Phase.Terminal()
 }
 
-// occupied reports whether the host takes a slot: it holds a lease or is
-// working without one.
+// charged reports whether the host counts as down because a lease of it
+// failed after it may have disrupted it, and nothing has proven it back since
+// (proveHosts). It counts like a host that works without a lease, with its
+// full weight, whatever lighter lease it holds. A stale host reports
+// nothing; what it said last is not counted.
+func (hv *hostView) charged() bool {
+	return hv.unproven != nil && !hv.stale
+}
+
+// occupied reports whether the host takes a slot: it holds a lease, is
+// working without one or is charged.
 func (hv *hostView) occupied() bool {
-	return hv.lease != nil || hv.working()
+	return hv.lease != nil || hv.working() || hv.charged()
 }
 
 // pass is the working state of one reconcile.
@@ -269,15 +288,16 @@ func newPass(w *World) *pass {
 
 	for _, h := range w.Hosts {
 		hv := &hostView{
-			h:       h,
-			weight:  h.Weight(),
-			broken:  h.Broken,
-			held:    h.Held() || h.KnownOffline(w.Now),
-			offline: h.KnownOffline(w.Now),
-			stale:   hostStale(h, w.Now, w.Since, w.Settings.HostStaleAfter.Std()),
+			h:        h,
+			weight:   h.Weight(),
+			broken:   h.Broken,
+			unproven: h.Unproven,
+			held:     h.Held() || h.KnownOffline(w.Now),
+			offline:  h.KnownOffline(w.Now),
+			stale:    hostStale(h, w.Now, w.Since, w.Settings.HostStaleAfter.Std()),
 		}
 
-		hv.live, hv.liveKnown = p.liveOf(h.Name, hv.weight)
+		hv.duty, hv.live, hv.liveKnown = p.liveOf(h.Name, hv.weight)
 
 		p.hosts[h.Name] = hv
 		p.names = append(p.names, h.Name)
@@ -370,19 +390,22 @@ func (p *pass) indexLiveness() {
 	}
 }
 
-// liveOf returns the host's attesting validators in the newest stored epoch.
-// A host without a row counts as fully live.
-func (p *pass) liveOf(host string, weight uint64) (live uint64, known bool) {
+// liveOf returns the host's validators with a duty and those of them that
+// attested in the newest stored epoch. A host without a row counts as fully
+// live.
+func (p *pass) liveOf(host string, weight uint64) (duty, live uint64, known bool) {
 	if !p.haveRows {
-		return weight, false
+		return weight, weight, false
 	}
 
 	row, ok := p.rows[host][p.newestEpoch]
 	if !ok {
-		return weight, false
+		return weight, weight, false
 	}
 
-	return min(row.Live, weight), true
+	duty = min(row.Total, weight)
+
+	return duty, min(row.Live, duty), true
 }
 
 // later returns the later of two times.
@@ -441,6 +464,10 @@ func (p *pass) outcome(plan *Plan) *Outcome {
 	for _, name := range p.names {
 		if p.marked[name] && !maps.Equal(p.hosts[name].broken, p.hosts[name].h.Broken) {
 			out.Broken = append(out.Broken, store.HostBroken{Host: name, Marks: p.hosts[name].broken})
+		}
+
+		if hv := p.hosts[name]; !sameTime(hv.unproven, hv.h.Unproven) {
+			out.Unproven = append(out.Unproven, store.HostUnproven{Host: name, At: hv.unproven})
 		}
 	}
 
@@ -517,6 +544,15 @@ func cloneOperation(op *protocol.Operation) *protocol.Operation {
 	c.Steps = slices.Clone(op.Steps)
 
 	return &c
+}
+
+// sameTime reports whether two optional times are both nil or equal.
+func sameTime(a, b *time.Time) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+
+	return a.Equal(*b)
 }
 
 func cloneTime(t *time.Time) *time.Time {

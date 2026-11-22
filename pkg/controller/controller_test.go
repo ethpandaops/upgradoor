@@ -119,3 +119,14 @@ func TestLoadAnswerSigner(t *testing.T) {
 		assert.NotContains(t, err.Error(), short)
 	}
 }
+
+// An open API is an explicit choice, and one or the other, not both.
+func TestCheckAuth(t *testing.T) {
+	require.NoError(t, checkAuth(&Config{AuthProviderURL: "https://auth.example"}))
+	require.NoError(t, checkAuth(&Config{AllowOpenAPI: true}))
+
+	require.ErrorContains(t, checkAuth(&Config{}), "--auth-provider-url is required")
+	require.ErrorContains(t, checkAuth(&Config{
+		AuthProviderURL: "https://auth.example", AllowOpenAPI: true,
+	}), "exclude each other")
+}

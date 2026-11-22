@@ -424,6 +424,73 @@ collect:
 	assert.Contains(t, patches[len(patches)-1], "reason 20")
 }
 
+// A sync that only moved the probe values rebuilds the tables while a stream
+// shows that host's details, and not otherwise.
+func TestEventStreamNotifyHost(t *testing.T) {
+	h := newHarness(t, nil)
+	fastStreams(h)
+	h.store.Hosts["lighthouse-geth-1"] = &fleet.Host{
+		Name: "lighthouse-geth-1", LastSeen: controllertest.Epoch,
+		Status: &protocol.SyncRequest{Node: protocol.NodeHealth{
+			CL: &protocol.CLHealth{Reachable: true, Peers: 30, HeadSlot: 3200},
+		}},
+	}
+	h.start()
+
+	st := h.stream(PathEvents+"?host=lighthouse-geth-1", "")
+	require.Equal(t, http.StatusOK, st.status)
+	st.event(eventSnapshot)
+
+	h.store.Lock()
+	h.store.Hosts["lighthouse-geth-1"].Status.Node.CL.HeadSlot = 3201
+	h.store.Unlock()
+
+	h.srv.NotifyHost("lighthouse-geth-2")
+	st.quiet(200 * time.Millisecond)
+
+	h.srv.NotifyHost("lighthouse-geth-1")
+
+	patch := st.event(eventPatch)
+	assert.Equal(t, []string{wireKeyDetails}, keysOf(patch))
+	assert.Contains(t, string(patch[wireKeyDetails]), "3201")
+}
+
+// The public streams, which need no login, have their own bound: they cannot
+// take the authenticated streams' slots.
+func TestEventStreamBounds(t *testing.T) {
+	h := newHarness(t, nil)
+	h.start()
+
+	hub := h.srv.events.Load()
+	require.NotNil(t, hub)
+
+	ctx := context.Background()
+	subs := make([]*subscriber, 0, maxPublicStreams+1)
+
+	t.Cleanup(func() {
+		for _, sub := range subs {
+			hub.unsubscribe(sub)
+		}
+	})
+
+	for range maxPublicStreams {
+		sub, err := hub.subscribe(ctx, false, nil)
+		require.NoError(t, err)
+
+		subs = append(subs, sub)
+	}
+
+	_, err := hub.subscribe(ctx, false, nil)
+	require.ErrorIs(t, err, errStreamsFull)
+
+	sub, err := hub.subscribe(ctx, true, nil)
+	require.NoError(t, err, "an operator's stream still opens")
+
+	subs = append(subs, sub)
+	assert.Equal(t, int32(1), hub.streams.Load())
+	assert.Equal(t, int32(maxPublicStreams), hub.publicStreams.Load())
+}
+
 // A host goes stale because time passes: no write announces it.
 func TestEventStreamHostGoesStale(t *testing.T) {
 	h := newHarness(t, nil)

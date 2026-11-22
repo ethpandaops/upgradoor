@@ -601,10 +601,74 @@ func TestInterval(t *testing.T) {
 		assert.Equal(t, tt.want, e.client.Interval(true), "the controller's pace wins")
 	}
 
-	// A failed sync forgets what the controller asked for.
+	// A failed sync forgets what the controller asked for; the retry waits
+	// at most the configured interval.
 	e.ctrl.set(func(f *fakeController) { f.status = http.StatusBadGateway })
 
 	_, err := e.sync(t)
 	require.Error(t, err)
-	assert.Equal(t, 5*time.Second, e.client.Interval(true))
+	assertBetween(t, e.client.Interval(true), time.Second, 5*time.Second)
+}
+
+// Failed syncs back off with full jitter up to maxSyncInterval; a refused
+// answer counts, one good answer resets it.
+func TestIntervalBacksOff(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, nil)
+
+	// ceilings are the bounds after 1, 2, ... failures of an idle agent.
+	ceilings := []time.Duration{
+		30 * time.Second, time.Minute, 2 * time.Minute, 4 * time.Minute, 8 * time.Minute,
+		10 * time.Minute, 10 * time.Minute,
+	}
+
+	signer := answerSigner(t, testControllerSeed)
+
+	for i, ceiling := range ceilings {
+		e.ctrl.set(func(f *fakeController) {
+			f.status, f.signer = http.StatusBadGateway, signer
+			if i == 2 {
+				// A refused answer is a failure too.
+				f.status, f.signer = http.StatusOK, nil
+			}
+		})
+
+		_, err := e.sync(t)
+		require.Error(t, err)
+
+		longest := time.Duration(0)
+
+		for range 200 {
+			got := e.client.Interval(false)
+			assertBetween(t, got, time.Second, ceiling)
+			longest = max(longest, got)
+		}
+
+		assert.Greater(t, longest, ceiling/2, "spread over the whole range")
+	}
+
+	// While busy: from leaseSyncInterval, up to the same bound.
+	longest := time.Duration(0)
+
+	for range 200 {
+		got := e.client.Interval(true)
+		assertBetween(t, got, time.Second, 10*time.Minute)
+		longest = max(longest, got)
+	}
+
+	assert.Greater(t, longest, time.Minute, "backs off past the lease interval")
+
+	e.ctrl.set(func(f *fakeController) { f.status, f.signer = http.StatusOK, signer })
+
+	_, err := e.sync(t)
+	require.NoError(t, err)
+	assert.Equal(t, 30*time.Second, e.client.Interval(false), "one answer resets it")
+}
+
+func assertBetween(t *testing.T, got, low, high time.Duration) {
+	t.Helper()
+
+	assert.GreaterOrEqual(t, got, low)
+	assert.LessOrEqual(t, got, high)
 }

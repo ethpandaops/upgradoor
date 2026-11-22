@@ -238,7 +238,7 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		TrustForwardedHeaders: opts.TrustForwardedHeaders,
 		Store:                 opts.Store, Scheduler: opts.Scheduler, Lookups: opts.Lookups,
 		Metrics: collector,
-		Notify:  s.Notify, Now: opts.Now,
+		Notify:  s.Notify, NotifyHost: s.streams.NotifyHost, Now: opts.Now,
 	})
 	s.users = userapi.New(s.log, userapi.Options{
 		Lookups: opts.Lookups,

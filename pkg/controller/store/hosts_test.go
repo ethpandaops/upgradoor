@@ -97,7 +97,7 @@ func TestRecordSync(t *testing.T) {
 	}
 }
 
-// A sync that restates the stored row writes only the time, the uptime and
+// A sync that restates the stored row writes only the time, the status and
 // the asked interval; any other difference goes the full way.
 func TestRecordSyncConfirms(t *testing.T) {
 	t.Parallel()
@@ -136,6 +136,31 @@ func TestRecordSyncConfirms(t *testing.T) {
 			assert.Equal(t, int64(30), res.Host.Status.UptimeSeconds)
 			assert.True(t, at(30).Equal(res.Host.Status.SentAt))
 			assert.Equal(t, 31*time.Second, res.Host.SyncInterval)
+
+			// The heads, the sync distance and the peer counts move on a
+			// healthy node: stored, but not a change.
+			moved := reporting(100, 200, imageNeed("a"))
+			moved.Node.EL.Head, moved.Node.EL.Peers = 101, 13
+			moved.Node.CL.HeadSlot, moved.Node.CL.SyncDistance, moved.Node.CL.Peers = 3201, 1, 29
+			res = sync(40, moved)
+			assert.False(t, res.Changed, "only the probes' heads and peer counts moved")
+			assert.Equal(t, moved.Node, res.Host.Status.Node)
+
+			stored, err := s.GetHost(ctx, "node-1")
+			require.NoError(t, err)
+			assert.Equal(t, moved.Node, stored.Status.Node)
+
+			for name, change := range map[string]func(n *protocol.NodeHealth){
+				"EL syncing":       func(n *protocol.NodeHealth) { n.EL.Syncing = true },
+				"CL not reachable": func(n *protocol.NodeHealth) { n.CL.Reachable = false },
+				"CL EL offline":    func(n *protocol.NodeHealth) { n.CL.ELOffline = true },
+				"EL without peers": func(n *protocol.NodeHealth) { n.EL.Peers = 0 },
+			} {
+				req := reporting(100, 200, imageNeed("a"))
+				change(&req.Node)
+				assert.True(t, sync(45, req).Changed, name)
+				assert.True(t, sync(50, reporting(100, 200, imageNeed("a"))).Changed, name+" ends")
+			}
 
 			res = sync(60, reporting(100, 200, imageNeed("a"), imageNeed("b")))
 			assert.True(t, res.Changed, "a new need")
@@ -600,6 +625,10 @@ func TestRecordSyncCountsOverlappingValidatorsOnce(t *testing.T) {
 
 	ctx := context.Background()
 	s := newFileStore(t)
+	impl, ok := s.(*sqliteStore)
+	require.True(t, ok)
+
+	impl.opened = base
 
 	sync := func(t *testing.T, host string, start, end uint64, sec int) *SyncResult {
 		t.Helper()
@@ -694,6 +723,45 @@ func TestRecordSyncCountsOverlappingValidatorsOnce(t *testing.T) {
 	assert.Equal(t, []string{"node-d"}, res.ValidatorOverlaps)
 }
 
+// A host's silence counts from the store's start at the earliest: after an
+// outage longer than ValidatorClaimTTL, nobody's validators are up for grabs
+// until the hosts had ValidatorClaimTTL to sync again.
+func TestRecordSyncClaimSurvivesAnOutage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := newFileStore(t)
+	impl, ok := s.(*sqliteStore)
+	require.True(t, ok)
+
+	ttl := int(ValidatorClaimTTL / time.Second)
+
+	sync := func(host string, start, end uint64, sec int) *SyncResult {
+		t.Helper()
+
+		res, err := s.RecordSync(ctx, &HostSync{
+			Cert: testCert(host), Request: reporting(start, end), At: at(sec),
+		})
+		require.NoError(t, err)
+
+		return res
+	}
+
+	impl.opened = base
+	sync("node-a", 0, 64, 0)
+
+	// The controller was down for twice the TTL and is back.
+	impl.opened = at(2 * ttl)
+
+	res := sync("node-b", 0, 32, 2*ttl+1)
+	assert.Equal(t, []string{"node-a"}, res.ValidatorOverlaps)
+	assert.Nil(t, res.Host.Validators, "node-a keeps its validators")
+
+	res = sync("node-b", 0, 32, 3*ttl+1)
+	assert.Equal(t, &identity.ValidatorRange{Start: 0, End: 32}, res.Host.Validators,
+		"node-a stayed silent for the TTL after the start")
+}
+
 // setHold sets the controller-side hold switch of one host, as staff does.
 func setHold(ctx context.Context, s Store, name string, wanted bool, reason string) error {
 	return s.Commit(ctx, &Changes{Holds: []HostHold{{Host: name, Wanted: wanted, Reason: reason}}})
@@ -741,6 +809,41 @@ func TestCommitBrokenMarks(t *testing.T) {
 	require.NoError(t, s.DeleteHost(ctx, "node-1"))
 	addHost(t, s, "node-1", nil)
 	assert.Nil(t, marks())
+}
+
+// The end of an unproven lease is the host's like its broken marks: a commit
+// sets and clears it, a sync leaves it.
+func TestCommitUnproven(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	s := newFileStore(t)
+
+	addHost(t, s, "node-1", nil)
+
+	unproven := func() *time.Time {
+		host, err := s.GetHost(ctx, "node-1")
+		require.NoError(t, err)
+
+		return host.Unproven
+	}
+
+	assert.Nil(t, unproven())
+
+	ended := at(5)
+	require.NoError(t, s.Commit(ctx, &Changes{Unproven: []HostUnproven{
+		{Host: "node-1", At: &ended},
+		{Host: "nope", At: &ended},
+	}}))
+	require.NotNil(t, unproven())
+	assert.True(t, ended.Equal(*unproven()))
+
+	_, err := s.RecordSync(ctx, &HostSync{Cert: testCert("node-1"), Request: testRequest(), At: at(10)})
+	require.NoError(t, err)
+	require.NotNil(t, unproven())
+
+	require.NoError(t, s.Commit(ctx, &Changes{Unproven: []HostUnproven{{Host: "node-1"}}}))
+	assert.Nil(t, unproven())
 }
 
 // TestHoldBy: a hold remembers that it was set through a team feature only

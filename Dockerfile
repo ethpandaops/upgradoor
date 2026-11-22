@@ -28,7 +28,7 @@ ENTRYPOINT ["upgradoor-controller"]
 CMD ["run"]
 
 # The release image (--target release): the reproducible controller binary of `make release`, the
-# one the release manifest names, not a build of its own (docs/release.md).
+# one the release manifest names, not a build of its own.
 FROM runtime AS release
 ARG TARGETARCH
 COPY dist/upgradoor-controller-linux-${TARGETARCH} /usr/local/bin/upgradoor-controller

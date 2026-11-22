@@ -84,6 +84,7 @@ func (p *pass) advanceGranted(l *fleet.Lease, hv *hostView, op *protocol.Operati
 		// Counted from the scheduler's start at the earliest: after a
 		// controller outage the agent gets leaseTtl to say what it did.
 		p.failLease(l, reasonAgentSilent)
+		p.chargeHost(l)
 	}
 }
 
@@ -93,12 +94,14 @@ func (p *pass) advanceRunning(l *fleet.Lease, hv *hostView, op *protocol.Operati
 		// Silence counts from the scheduler's start at the earliest: while the
 		// controller was down the agent could not report.
 		p.failLease(l, reasonAgentSilent)
+		p.chargeHost(l)
 	case op != nil:
 		p.applyOperation(l, hv, op)
 	case hv.h.Status != nil:
 		// The status is replaced on every sync, so one without the operation
 		// is newer than the one that reported it.
 		p.failLease(l, reasonLostOperation)
+		p.chargeHost(l)
 	}
 }
 
@@ -110,6 +113,10 @@ func (p *pass) applyOperation(l *fleet.Lease, hv *hostView, op *protocol.Operati
 	switch op.Phase {
 	case protocol.PhaseFailed:
 		p.failLease(l, cmpOr(op.Error, reasonAgentFailed))
+
+		if op.Disrupted {
+			p.chargeHost(l)
+		}
 	case protocol.PhaseDone:
 		doneAt := hv.h.LastSeen
 		if doneAt.After(p.now) || doneAt.IsZero() {
@@ -141,6 +148,7 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 		// when it was ended. The lease ends here: nobody waits for the
 		// readiness of a host that a person took out of the rollout.
 		p.failLease(l, reasonEndedByOperator)
+		p.chargeHost(l)
 
 		return
 	}
@@ -189,6 +197,7 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 	// before the beacon service has settled an epoch again.
 	if timeout := p.set.ReadinessTimeout.Std(); p.now.Sub(later(*l.AgentDoneAt, p.w.Since)) > timeout {
 		p.failLease(l, fmt.Sprintf("not ready after %s: %s", timeout, note))
+		p.chargeHost(l)
 	}
 }
 
@@ -243,8 +252,10 @@ func (p *pass) ready(l *fleet.Lease, hv *hostView) (ready bool, note string) {
 	}
 
 	// Validators that attest prove the node is back; the run of healthy syncs
-	// only has to span readyEpochs where there are no attestations to go by.
-	noAttestations := hv.weight == 0
+	// only has to span readyEpochs where there are no attestations to go by:
+	// the host has no validators, or none of them had a duty in the newest
+	// liveness epoch.
+	noAttestations := hv.weight == 0 || (hv.liveKnown && hv.duty == 0)
 
 	// Always evaluated: it keeps the run of healthy syncs.
 	nodeOK, nodeNote := p.nodeReady(l, hv, noAttestations)
@@ -287,14 +298,14 @@ func (p *pass) minPeers() int {
 }
 
 // validatorsReady: for readyEpochs consecutive complete epochs that started
-// after the agent's done time, enough of the host's validators attested.
+// after the agent's done time, enough of the host's validators that had a
+// duty in the epoch attested.
 func (p *pass) validatorsReady(l *fleet.Lease, hv *hostView) (ready bool, note string) {
 	epochs := p.set.ReadyEpochs
 	if epochs == 0 {
 		return true, noteAttesting
 	}
 
-	want := attestationBar(p.set.MinParticipationPercent, hv.weight)
 	run := uint64(0)
 
 	if p.haveRows {
@@ -307,7 +318,8 @@ func (p *pass) validatorsReady(l *fleet.Lease, hv *hostView) (ready bool, note s
 
 			row, ok := p.rows[l.Host][e]
 
-			if start.Before(*l.AgentDoneAt) || !ok || row.Live < want {
+			if start.Before(*l.AgentDoneAt) || !ok ||
+				row.Live < attestationBar(p.set.MinParticipationPercent, min(row.Total, hv.weight)) {
 				break
 			}
 
@@ -320,7 +332,8 @@ func (p *pass) validatorsReady(l *fleet.Lease, hv *hostView) (ready bool, note s
 	}
 
 	note = fmt.Sprintf("%s: %d of %d epochs with at least %d of %d",
-		noteAttesting, min(run, epochs), epochs, want, hv.weight)
+		noteAttesting, min(run, epochs), epochs,
+		attestationBar(p.set.MinParticipationPercent, hv.duty), hv.duty)
 
 	return run >= epochs, note
 }
@@ -558,6 +571,54 @@ func (p *pass) endLease(l *fleet.Lease, state fleet.LeaseState) {
 	}
 }
 
+// chargeHost charges the host of a node lease that failed after it may have
+// disrupted the host: the host counts as down (hostView.charged) until
+// proveHosts finds it back. A stale host is not charged.
+func (p *pass) chargeHost(l *fleet.Lease) {
+	hv := p.hosts[l.Host]
+	if hv == nil || hv.stale || leaseImpact(l) != protocol.ImpactNode {
+		return
+	}
+
+	ended := p.now
+	hv.unproven = &ended
+}
+
+// proveHosts takes the charge off every host that is back since the lease
+// that charged it ended, and off every host that is stale. A host with
+// validators is back once a liveness epoch that began after the end has
+// settled with a row for it: from then on what its validators do is counted.
+// A host without validators is back with a sync after the end whose node
+// passes the node part of the readiness check (one without probes on that
+// sync alone).
+func (p *pass) proveHosts() {
+	for _, name := range p.names {
+		hv := p.hosts[name]
+		if hv.unproven != nil && (hv.stale || p.provenBack(hv)) {
+			hv.unproven = nil
+		}
+	}
+}
+
+// provenBack reports whether the charged host is back (proveHosts).
+func (p *pass) provenBack(hv *hostView) bool {
+	ended := *hv.unproven
+
+	if hv.weight == 0 {
+		st := hv.h.Status
+
+		return st != nil && hv.h.LastSeen.After(ended) && st.Node.Synced(p.minPeers())
+	}
+
+	for epoch := range p.rows[hv.h.Name] {
+		if start, placed := p.w.Health.EpochStart(epoch); placed && start.After(ended) {
+			return true
+		}
+	}
+
+	return false
+}
+
 // leaseRollouts returns the open and the aborted rollouts a lease serves
 // with the host's member entry, in a stable order. Rollouts that closed
 // otherwise meanwhile are left out: such a rollout is not written again, and
@@ -628,6 +689,14 @@ func unserved(r *fleet.Rollout) fleet.HostState {
 func (p *pass) releaseLease(l *fleet.Lease) {
 	p.endLease(l, fleet.LeaseReleased)
 	p.repairHost(l)
+
+	// Node work released through the full readiness check proves the host
+	// back. A forced lease, and any lease while readyEpochs is 0, proves
+	// nothing: the host's charge, if it has one, stays.
+	if hv := p.hosts[l.Host]; hv != nil && leaseImpact(l) == protocol.ImpactNode &&
+		!l.Force && p.set.ReadyEpochs > 0 {
+		hv.unproven = nil
+	}
 
 	for _, r := range p.leaseRollouts(l) {
 		m := p.member(r, l.Host)

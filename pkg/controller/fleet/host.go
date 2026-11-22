@@ -42,8 +42,9 @@ type Host struct {
 
 	// Status is the last sync request, verbatim.
 	Status *protocol.SyncRequest `json:"status,omitempty"`
-	// StatusHash identifies Status without its clock fields (SentAt,
-	// UptimeSeconds); empty when the store keeps none.
+	// StatusHash identifies Status without what changes on every sync
+	// (SentAt, UptimeSeconds, the probes' heads and peer counts); empty when
+	// the store keeps none.
 	StatusHash string `json:"-"`
 	// InventoryHash is the hash of the inventory stored for this host.
 	InventoryHash string `json:"inventoryHash,omitempty"`
@@ -74,6 +75,15 @@ type Host struct {
 	// it where a lease is released with the group's steps done; it goes with
 	// the host when the host is forgotten.
 	Broken map[string]string `json:"broken,omitempty"`
+
+	// Unproven is when a lease of the host failed after it may have disrupted
+	// the host; nil when no such lease is waiting for proof that the host is
+	// back. While it is set the host counts as down for the budget, the host
+	// limit and the gate. The scheduler sets it where such a lease fails and
+	// clears it when the proof arrives (a liveness epoch, or for a host
+	// without validators a healthy sync, after it), when the host goes stale,
+	// or when a lease of it is released through the full readiness check.
+	Unproven *time.Time `json:"unproven,omitempty"`
 
 	// SyncInterval is the longest sync interval the controller asked of the
 	// host in its last answer. StaleAfter allows for it.

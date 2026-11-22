@@ -44,12 +44,13 @@ func leaseImpact(l *fleet.Lease) protocol.Impact {
 }
 
 // occupation is the class of what occupies the host: its lease, or node for
-// an operation without a lease; empty when nothing does.
+// an operation without a lease and for a charged host; empty when nothing
+// does.
 func (hv *hostView) occupation() protocol.Impact {
 	switch {
 	case hv.lease != nil:
 		return leaseImpact(hv.lease)
-	case hv.working():
+	case hv.working(), hv.charged():
 		return protocol.ImpactNode
 	default:
 		return ""

@@ -45,6 +45,11 @@ func Needs(policy *Policy, view *View, manual []protocol.Need) []protocol.Need {
 		for i := range view.Containers {
 			c := &view.Containers[i]
 
+			// A container the recreate refuses has no need of any kind.
+			if c.NotRolled != "" {
+				continue
+			}
+
 			// A container off its target moves there first; its tag is
 			// followed again once it is in sync.
 			if t, ok := view.Targets[c.Name]; ok && !t.InSync && c.Managed {

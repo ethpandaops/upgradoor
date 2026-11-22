@@ -40,7 +40,7 @@ func TestPublicEndpointsLeakNothing(t *testing.T) {
 		"ok", "reasons", "network",
 		"updatedAt", "error", "genesisTime", "secondsPerSlot", "slotsPerEpoch", "headSlot",
 		"currentEpoch", "finalizedEpoch", "finalityLagEpochs", "livenessKnown",
-		"livenessEpoch", "livenessError", "tracked", "live",
+		"livenessEpoch", "tracked", "live",
 		// The chain's slot phases: public chain data.
 		"phases", "epoch", "start", "slotMs",
 	}
@@ -259,10 +259,12 @@ func TestPublicNetworkScrubsReasons(t *testing.T) {
 	require.Contains(t, controllertest.SecretBeaconError, ": "+inner, "the fixture error wraps the inner one")
 
 	tests := []struct {
-		name    string
-		err     string
-		reasons []string
-		want    []string
+		name     string
+		err      string
+		liveness string
+		timing   string
+		reasons  []string
+		want     []string
 	}{
 		{
 			name:    "reason quotes the error",
@@ -298,6 +300,25 @@ func TestPublicNetworkScrubsReasons(t *testing.T) {
 			want:    []string{"participation 88% < 90%", "finality lag 5 epochs > 3"},
 		},
 		{
+			name:     "liveness error: the fact stays, the cause goes",
+			liveness: "count epoch 224: " + controllertest.SecretBeaconError,
+			reasons: []string{
+				"attestation data missing or stale: count epoch 224: " + controllertest.SecretBeaconError,
+			},
+			want: []string{"attestation data missing or stale"},
+		},
+		{
+			name:    "liveness reason without the error field",
+			reasons: []string{"attestation data missing or stale: " + inner},
+			want:    []string{"attestation data missing or stale"},
+		},
+		{
+			name:    "timing error",
+			timing:  "phase at epoch 9 from " + inner,
+			reasons: []string{"invalid chain timing: phase at epoch 9 from " + inner},
+			want:    []string{"invalid chain timing"},
+		},
+		{
 			name:    "no reasons",
 			err:     controllertest.SecretBeaconError,
 			reasons: []string{},
@@ -311,7 +332,9 @@ func TestPublicNetworkScrubsReasons(t *testing.T) {
 			h.sched.Set(func(f *controllertest.Scheduler) {
 				f.CurrentPlan = &scheduler.Plan{Gate: scheduler.Gate{
 					Reasons: tt.reasons,
-					Network: fleet.NetworkHealth{Error: tt.err, CurrentEpoch: 225},
+					Network: fleet.NetworkHealth{
+						Error: tt.err, LivenessError: tt.liveness, TimingError: tt.timing, CurrentEpoch: 225,
+					},
 				}}
 			})
 
@@ -326,6 +349,8 @@ func TestPublicNetworkScrubsReasons(t *testing.T) {
 
 			gate := controllertest.DecodeJSON[scheduler.Gate](t, rec)
 			assert.Equal(t, tt.want, gate.Reasons)
+			assert.Empty(t, gate.Network.LivenessError)
+			assert.Empty(t, gate.Network.TimingError)
 
 			// The plan the scheduler handed out is not modified, and users
 			// still see the real text.

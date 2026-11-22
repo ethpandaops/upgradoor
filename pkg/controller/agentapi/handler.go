@@ -62,6 +62,9 @@ type Options struct {
 	Metrics metrics.Metrics
 	// Notify says that a sync or an inventory changed what the views show.
 	Notify func()
+	// NotifyHost, when set, says that a sync stored new probe values of the
+	// host (its details) and nothing else.
+	NotifyHost func(host string)
 	// Now is the clock.
 	Now func() time.Time
 }

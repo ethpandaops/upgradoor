@@ -411,6 +411,12 @@ func (s *sqliteStore) Commit(ctx context.Context, changes *Changes) error {
 			}
 		}
 
+		for _, u := range changes.Unproven {
+			if err := setHostUnproven(ctx, tx, u.Host, u.At); err != nil {
+				return fmt.Errorf("unproven lease end of %s: %w", u.Host, err)
+			}
+		}
+
 		var err error
 
 		audit, err = insertAudit(ctx, tx, changes.Audit)

@@ -66,7 +66,10 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 	f.BoolVar(&cfg.TrustForwardedHeaders, "trust-forwarded-headers", false,
 		"take the client address from X-Forwarded-For (behind an ingress)")
 	f.StringVar(&cfg.AuthProviderURL, "auth-provider-url", "",
-		"authenticatoor URL, e.g. https://auth.<network>; empty leaves the API open")
+		"authenticatoor URL, e.g. https://auth.<network>; required unless --allow-open-api")
+	f.BoolVar(&cfg.AllowOpenAPI, "allow-open-api", false,
+		"run without --auth-provider-url: every API action is anonymous and allowed "+
+			"(closed test networks only)")
 	f.StringVar(&cfg.AuthService, "auth-service", api.DefaultAuthService,
 		"name of this service in the token's services claim; "+
 			"its features (roll, team_roll, ...) are what allows actions")

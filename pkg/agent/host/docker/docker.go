@@ -47,6 +47,11 @@ func (c *Config) ApplyDefaults() {
 // stopped, when the local image does not have the granted digest.
 var ErrDigestMismatch = errors.New("host: local image digest differs from the granted digest")
 
+// ErrImageMoved is returned by Runtime.Recreate when the tag moved to
+// another image between the digest check and the create, after the old
+// container was stopped; the rollback has run.
+var ErrImageMoved = errors.New("host: the image of the tag changed after the old container was stopped")
+
 // Runtime is the Docker daemon.
 type Runtime interface {
 	// Containers lists all containers with the raw Docker facts; policy
@@ -60,8 +65,9 @@ type Runtime interface {
 	// Recreate replaces container name by one with the same configuration
 	// and change applied, left stopped unless start. It fails with
 	// ErrDigestMismatch before stopping anything unless digest is a registry
-	// digest of the image, rolls back on failure and resolves a recreate an
-	// earlier run left half done.
+	// digest of the image, with ErrImageMoved when the tag moved after the
+	// stop, rolls back on failure and resolves a recreate an earlier run left
+	// half done.
 	Recreate(
 		ctx context.Context, name, digest string, stopTimeout time.Duration, start bool, change *Change,
 	) error

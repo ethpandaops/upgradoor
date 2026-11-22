@@ -276,8 +276,9 @@ export class LiveStore {
           onEvent: event => {
             if (this.generation !== generation) return;
             if (event.event === 'expired') seen.expired = true;
-            if (event.event === 'snap') attempt = 0;
             this.apply(event);
+            // Only a snapshot that was taken in makes the stream good again.
+            if (event.event === 'snap') attempt = 0;
           },
         });
         error = new ApiError(0, 'the controller closed the event stream');

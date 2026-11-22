@@ -194,7 +194,7 @@ func (w *world) start(ctx context.Context) error {
 
 	args := []string{"run", "--listen", ctlAddr, "--data-dir", filepath.Join(w.o.dir, "data"),
 		"--network", network, "--signer-public-key", identity.EncodePublicKey(identity.PublicKey(signer)),
-		"--controller-seed-file", seedFile, "--allow-insecure-agent-http",
+		"--controller-seed-file", seedFile, "--allow-insecure-agent-http", "--allow-open-api",
 		"--beacon-endpoint", "http://" + beaconAddr,
 		"--registry-plain-http", regAddr, "--registry-allow-private",
 		"--default-setting", "lookupInterval=30s",

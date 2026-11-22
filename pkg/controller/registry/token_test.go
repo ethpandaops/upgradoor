@@ -4,6 +4,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -357,4 +358,38 @@ func TestConnectionDroppedAfterToken(t *testing.T) {
 
 	require.NotErrorAs(t, err, &status)
 	require.Equal(t, 1, f.tokens())
+}
+
+// The token cache is bounded: expired tokens are swept, a full cache gives
+// up the token that expires first, and an oversized token is not kept.
+func TestTokenCacheBounds(t *testing.T) {
+	r := buildResolver(t, Config{}, nil)
+
+	now := time.Unix(1_800_000_000, 0)
+	r.now = func() time.Time { return now }
+
+	r.storeToken("big", token{value: strings.Repeat("a", maxCachedTokenBytes+1)})
+	require.Empty(t, r.tokens, "an oversized token is not cached")
+
+	r.storeToken("expiring", token{value: "e", expires: now.Add(time.Minute)})
+	r.storeToken("first", token{value: "f", expires: now.Add(2 * time.Minute)})
+
+	for i := range maxCachedTokens - 2 {
+		r.storeToken("repo-"+strconv.Itoa(i), token{value: "t", expires: now.Add(time.Hour)})
+	}
+
+	require.Len(t, r.tokens, maxCachedTokens)
+
+	// The expired token goes: room without evicting anything else.
+	now = now.Add(90 * time.Second)
+
+	r.storeToken("new", token{value: "n"})
+	require.Len(t, r.tokens, maxCachedTokens)
+	require.NotContains(t, r.tokens, "expiring")
+
+	// Full: the token that expires first makes room.
+	r.storeToken("newer", token{value: "n"})
+	require.Len(t, r.tokens, maxCachedTokens)
+	require.NotContains(t, r.tokens, "first")
+	require.Contains(t, r.tokens, "new", "a token without a lifetime goes last")
 }

@@ -1,7 +1,7 @@
 // Package scheduler plans rollouts and grants leases under the availability
 // budget, the network gate and the order inside a rollout (hosts the change
-// already broke first, then a canary, then the rest). docs/scheduler.md states
-// the rules; the simulation tests assert them after every step.
+// already broke first, then a canary, then the rest). The simulation tests
+// assert the rules after every step.
 package scheduler
 
 import (
@@ -313,18 +313,21 @@ type Gate struct {
 	Network fleet.NetworkHealth `json:"network"`
 }
 
-// Budget is the availability budget in validator weight.
+// Budget is the availability budget in validator weight. It counts the
+// validators that had an attestation duty in the newest liveness epoch (all
+// of a host's without a row for it).
 type Budget struct {
 	TotalWeight uint64 `json:"totalWeight"`
 	// AllowedWeight is maxUnavailable applied to TotalWeight.
 	AllowedWeight float64 `json:"allowedWeight"`
-	// UnavailableWeight is the full weight of every host that holds a lease
-	// or works on an operation without one, plus the validators not attesting
-	// on every other host.
+	// UnavailableWeight is the full weight of every host that holds a lease,
+	// works on an operation without one or is not proven back after a lease
+	// that failed after it may have disrupted the host, plus the validators
+	// not attesting on every other host.
 	UnavailableWeight uint64 `json:"unavailableWeight"`
 	// LeasedHosts and MaxLeasedHosts are the host-count dimension:
 	// max(1, floor(maxUnavailable * hosts)) hosts may hold a lease (or work
-	// on an operation without one) at once.
+	// on an operation without one, or be not proven back) at once.
 	LeasedHosts    int `json:"leasedHosts"`
 	MaxLeasedHosts int `json:"maxLeasedHosts"`
 	// IndependentHosts and MaxIndependent are the independent limit: hosts

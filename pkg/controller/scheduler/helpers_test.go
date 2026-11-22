@@ -194,6 +194,7 @@ func (s *fakeStore) recordSync(h *fleet.Host) (adopted bool) {
 		c.HoldBy = old.HoldBy
 		c.HoldActor = old.HoldActor
 		c.Broken = old.Broken
+		c.Unproven = old.Unproven
 	} else {
 		c.FirstSeen = h.LastSeen
 
@@ -506,6 +507,12 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 		}
 	}
 
+	for _, u := range ch.Unproven {
+		if h := s.hosts[u.Host]; h != nil {
+			h.Unproven = storedAtPtr(u.At)
+		}
+	}
+
 	for _, r := range ch.Rollouts {
 		if _, ok := s.rollouts[r.ID]; !ok {
 			s.rolloutSeq = append(s.rolloutSeq, r.ID)
@@ -760,6 +767,10 @@ func (s *fakeStore) dump() string {
 			raw, _ := json.Marshal(marks)
 			fmt.Fprintf(&b, "%s broken %s\n", name, raw)
 		}
+
+		if at := s.hosts[name].Unproven; at != nil {
+			fmt.Fprintf(&b, "%s unproven %s\n", name, at.Format(time.RFC3339Nano))
+		}
 	}
 
 	for _, e := range s.audit {
@@ -796,8 +807,11 @@ type worldBuilder struct {
 	// autoLive adds a fully live row in the newest complete epoch for every
 	// validator host that has none.
 	autoLive bool
-	// liveOverride is what autoLive writes for a host instead of its weight.
+	// liveOverride is what autoLive writes for a host instead of its weight;
+	// dutyOverride is the number of its validators with a duty that live
+	// writes instead of its weight.
 	liveOverride map[string]uint64
+	dutyOverride map[string]uint64
 	// healthMod changes the beacon view after every refresh.
 	healthMod func(n *fleet.NetworkHealth)
 	// ended are the leases that ended, in the order in which they did;
@@ -809,7 +823,7 @@ type worldBuilder struct {
 func newWorldBuilder(t *testing.T) *worldBuilder {
 	t.Helper()
 
-	b := &worldBuilder{t: t, autoLive: true, liveOverride: map[string]uint64{}}
+	b := &worldBuilder{t: t, autoLive: true, liveOverride: map[string]uint64{}, dutyOverride: map[string]uint64{}}
 	settings := fleet.DefaultSettings()
 	settings.PolicyReboot = fleet.PolicyAuto
 
@@ -882,12 +896,16 @@ func (b *worldBuilder) get(name string) *fleet.Host {
 
 // live sets the host's liveness row in an epoch.
 func (b *worldBuilder) live(epoch uint64, name string, live uint64) {
-	h := b.get(name)
+	total := b.get(name).Weight()
+	if duty, ok := b.dutyOverride[name]; ok {
+		total = duty
+	}
+
 	b.w.Liveness = slices.DeleteFunc(b.w.Liveness, func(r fleet.Liveness) bool {
 		return r.Host == name && r.Epoch == epoch
 	})
 	b.w.Liveness = append(b.w.Liveness, fleet.Liveness{
-		Host: name, Epoch: epoch, Live: live, Total: h.Weight(),
+		Host: name, Epoch: epoch, Live: live, Total: total,
 	})
 }
 
@@ -998,6 +1016,16 @@ func applyOutcome(w *World, out *Outcome) {
 			if h.Name == marks.Host {
 				c := *h
 				c.Broken = marks.Marks
+				w.Hosts[i] = &c
+			}
+		}
+	}
+
+	for _, u := range out.Unproven {
+		for i, h := range w.Hosts {
+			if h.Name == u.Host {
+				c := *h
+				c.Unproven = u.At
 				w.Hosts[i] = &c
 			}
 		}

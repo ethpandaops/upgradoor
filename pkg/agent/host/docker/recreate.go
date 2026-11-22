@@ -332,7 +332,7 @@ func (r *dockerRuntime) create(
 
 	if res.Container.Image != plan.imageID {
 		return created.ID, fmt.Errorf("%w: the new container is on image %s, verified was %s",
-			ErrDigestMismatch, res.Container.Image, plan.imageID)
+			ErrImageMoved, res.Container.Image, plan.imageID)
 	}
 
 	// Further networks are connected one by one: API versions before 1.44

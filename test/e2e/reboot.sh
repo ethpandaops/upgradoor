@@ -113,7 +113,7 @@ docker run -d --name "$id-controller" --network "$net" --label upgradoor.test=re
     debian:13-slim /upgradoor-controller run \
     --listen :8080 --data-dir /data --network "$network" --signer-public-key "$signer" \
     --controller-seed-file /controller.seed \
-    --allow-insecure-agent-http --beacon-endpoint "http://$id-beacon:5052" \
+    --allow-insecure-agent-http --allow-open-api --beacon-endpoint "http://$id-beacon:5052" \
     --default-setting policyReboot=auto --default-setting policyPackages=auto \
     --default-setting hostStaleAfter=45s --default-setting leaseTtl=5m \
     --default-setting paused=true >/dev/null

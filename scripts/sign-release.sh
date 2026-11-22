@@ -11,8 +11,9 @@
 # 3. checks the image the manifest names: exactly linux/amd64 and linux/arm64, each holding
 #    the manifest's upgradoor-controller as /usr/local/bin/upgradoor-controller
 #    (--no-image-check skips this: then CI alone vouches for the image);
-# 4. rebuilds the binaries in a fresh worktree of the tag (make release) and demands identical
-#    lines (--no-rebuild skips this: then CI alone vouches for the build);
+# 4. checks that the tag is on origin/master, rebuilds the binaries in a fresh worktree of the
+#    tag (make release) and demands identical lines (--no-rebuild skips the rebuild: then CI
+#    alone vouches for the build);
 # 5. prints the manifest and its hash, signs it with one touch of the key (ssh-keygen -Y sign,
 #    namespace upgradoor-release): the key shows only its application name, so what was printed
 #    here is what you approve;
@@ -25,7 +26,7 @@
 # For tests, without GitHub or the tag:
 # UPGRADOOR_RELEASE_DIR  a local directory stands in for the draft: assets are read from it and
 #                        the signature is written into it
-# UPGRADOOR_RELEASE_REF  what to rebuild (default refs/tags/vX.Y.Z)
+# UPGRADOOR_RELEASE_REF  what to rebuild (default refs/tags/vX.Y.Z); not checked against master
 # UPGRADOOR_IMAGE_PULL   the repository to pull the signed digest from (default
 #                        ghcr.io/ethpandaops/upgradoor; the Docker Hub mirror holds the same digest)
 set -euo pipefail
@@ -110,6 +111,16 @@ if [ -n "$IMAGE_CHECK" ]; then
   echo "the image holds the manifest's upgradoor-controller binaries"
 else
   echo "note: the image was not checked (--no-image-check): you sign the digest CI pushed" >&2
+fi
+
+# What CI built from must be reviewed history: a release can be dispatched from any branch.
+if [ -z "${UPGRADOOR_RELEASE_REF:-}" ]; then
+  git -C "$HERE" fetch --quiet origin "+refs/heads/master:refs/remotes/origin/master" \
+    "+refs/tags/$VERSION:refs/tags/$VERSION" || die "cannot fetch master and $VERSION from origin"
+  commit=$(git -C "$HERE" rev-parse --verify --quiet "$REF^{commit}") || die "$REF is no commit"
+  git -C "$HERE" merge-base --is-ancestor "$commit" refs/remotes/origin/master ||
+    die "$VERSION is $commit, which is not on origin/master: do not sign"
+  echo "$VERSION is $commit, on origin/master"
 fi
 
 if [ -n "$REBUILD" ]; then

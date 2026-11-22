@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # release-manifest.sh -- writes and checks upgradoor-manifest.txt, the one file a release's
-# signature covers (docs/release.md):
+# signature covers:
 #
 #   scripts/release-manifest.sh write vX.Y.Z DIR [IMAGE_DIGEST]
 #       DIR/upgradoor-<os>-<arch> and DIR/upgradoor-controller-<os>-<arch> ->

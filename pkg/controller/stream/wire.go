@@ -37,7 +37,6 @@ import (
 // The schemas are not written down twice. They are read off the Go types of
 // the views (wireTables), written to web/src/api/wire.schema.json by the
 // test that keeps that file current, and interpreted from there by the page.
-// docs/protocol.md has the tables and the events.
 
 // Wire field types. Every one is a single character in the schema.
 const (

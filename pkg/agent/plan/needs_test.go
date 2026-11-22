@@ -275,6 +275,19 @@ func TestNeedsOfTargets(t *testing.T) {
 		Container: "geth", Image: "ethpandaops/geth:fix", FromImage: "ethpandaops/geth:master",
 		FromDigest: "sha256:a", ToDigest: "sha256:f",
 	}, got[0].Override)
+
+	// A container the recreate refuses gets no need, its target or not.
+	for _, notRolled := range []func(c *protocol.Container){
+		func(c *protocol.Container) { c.Linked = true },
+		func(c *protocol.Container) { c.Image = "ethpandaops/geth@sha256:a" },
+	} {
+		facts := hostFacts()
+		notRolled(&facts.Containers[0])
+
+		v = Classify(p, facts, files, checks, testNow)
+		require.NotEmpty(t, v.Container("geth").NotRolled)
+		assert.Empty(t, Needs(p, &v, nil))
+	}
 }
 
 func TestReconcileManualNeeds(t *testing.T) {

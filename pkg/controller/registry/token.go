@@ -20,6 +20,13 @@ const (
 	// tokenExpirySlack is how long before its announced expiry a token is no
 	// longer used.
 	tokenExpirySlack = 10 * time.Second
+
+	// maxCachedTokens bounds the token cache: a devnet pulls from a few
+	// dozen repositories, and the hosts name them.
+	maxCachedTokens = 256
+	// maxCachedTokenBytes is the largest token that is cached; a bearer
+	// token is a few KiB. A larger one is used for its request only.
+	maxCachedTokenBytes = 16 << 10
 )
 
 // token is a cached bearer token.
@@ -49,10 +56,36 @@ func (r *resolver) cachedToken(key string) string {
 	return tok.value
 }
 
-// storeToken caches a bearer token for a repository.
+// storeToken caches a bearer token for a repository. Expired tokens are
+// swept first; a full cache gives up the token that expires first (one
+// without a lifetime last).
 func (r *resolver) storeToken(key string, tok token) {
+	if len(tok.value) > maxCachedTokenBytes {
+		return
+	}
+
 	r.mu.Lock()
 	defer r.mu.Unlock()
+
+	now := r.now()
+
+	for k, t := range r.tokens {
+		if !t.expires.IsZero() && !now.Before(t.expires) {
+			delete(r.tokens, k)
+		}
+	}
+
+	if _, ok := r.tokens[key]; !ok && len(r.tokens) >= maxCachedTokens {
+		victim, first := "", time.Time{}
+
+		for k, t := range r.tokens {
+			if victim == "" || (!t.expires.IsZero() && (first.IsZero() || t.expires.Before(first))) {
+				victim, first = k, t.expires
+			}
+		}
+
+		delete(r.tokens, victim)
+	}
 
 	r.tokens[key] = tok
 }

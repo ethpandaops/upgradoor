@@ -155,13 +155,12 @@ func TestGroupNeedsAllOrNone(t *testing.T) {
 	assert.Nil(t, b.lease("b"))
 }
 
-// Needs that wait only for their place in their rollout's order ride along
-// with a lease the host is granted anyway, if their work is not heavier.
+// Independent work of another rollout rides along with a node lease the host
+// is granted anyway.
 func TestReadyNeedsRideAlong(t *testing.T) {
 	b := newWorldBuilder(t)
 
-	// The lighter host is the canary of both rollouts; the third host makes
-	// sure the canary of the tools rollout is c, which has no node work.
+	// The lighter host is the canary of both rollouts.
 	b.host("a", 10)
 	b.host("b", 20)
 	b.wantsInGroup("a", "geth", "execution", "", imgGeth, digestA)

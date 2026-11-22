@@ -761,66 +761,141 @@ func TestCancelDuringAnOperation(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			t.Parallel()
-
-			sc := agenttest.BaseScenario()
-			sc.RebootRequired = tt.reboot
-
-			e := newEnv(t, sc)
-			byID := map[string]protocol.Need{
-				geth: gethNeed(agenttest.GethV2), teku: tekuNeed(),
-				pkgs: agenttest.PackagesNeed(), protocol.RebootNeedID: agenttest.RebootNeed(),
+		for _, hold := range []bool{false, true} {
+			name := tt.name + ", by a cancel"
+			if hold {
+				name = tt.name + ", by a local hold"
 			}
 
-			if tt.images {
-				e.pull(agenttest.GethImage, agenttest.GethV2)
+			t.Run(name, func(t *testing.T) {
+				t.Parallel()
 
-				if !tt.gethOnly {
-					e.pull(agenttest.TekuImage, agenttest.TekuV2)
+				sc := agenttest.BaseScenario()
+				sc.RebootRequired = tt.reboot
+
+				e := newEnv(t, sc)
+				byID := map[string]protocol.Need{
+					geth: gethNeed(agenttest.GethV2), teku: tekuNeed(),
+					pkgs: agenttest.PackagesNeed(), protocol.RebootNeedID: agenttest.RebootNeed(),
 				}
-			}
 
-			if tt.packages {
-				e.host.SetUpgradable(agenttest.DockerUpgrade())
-			}
+				if tt.images {
+					e.pull(agenttest.GethImage, agenttest.GethV2)
 
-			entered, release := e.block(tt.parkAt)
-
-			e.start(t.Context())
-
-			needs := make([]protocol.Need, 0, len(tt.needs))
-			for _, id := range tt.needs {
-				needs = append(needs, byID[id])
-			}
-
-			l := e.grant("lease-cancel", needs...)
-
-			agenttest.AwaitParked(t, entered, tt.parkAt)
-			e.cancel(l)
-			release()
-
-			op := e.awaitFinished("lease-cancel")
-			assert.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
-			assert.True(t, op.Disrupted, "the host was touched")
-
-			for i, id := range tt.needs {
-				step := stepOf(t, op, id)
-				assert.Equal(t, tt.want[i], step.Status, id)
-
-				if tt.want[i] == cancelled {
-					assert.Contains(t, step.Error, "cancelled", id)
+					if !tt.gethOnly {
+						e.pull(agenttest.TekuImage, agenttest.TekuV2)
+					}
 				}
-			}
 
-			tt.check(t, e.disruptive())
+				if tt.packages {
+					e.host.SetUpgradable(agenttest.DockerUpgrade())
+				}
 
-			e.assertAllRunning()
-			assert.Equal(t, tt.geth, e.host.Container("geth").Digest)
-			assert.Equal(t, agenttest.TekuV1, e.host.Container("teku").Digest)
-			assert.Equal(t, "boot", e.host.BootID(), "no reboot")
-		})
+				entered, release := e.block(tt.parkAt)
+
+				e.start(t.Context())
+
+				needs := make([]protocol.Need, 0, len(tt.needs))
+				for _, id := range tt.needs {
+					needs = append(needs, byID[id])
+				}
+
+				l := e.grant("lease-cancel", needs...)
+
+				agenttest.AwaitParked(t, entered, tt.parkAt)
+
+				if hold {
+					e.files.set(func(o *plan.Overrides) {
+						o.Holds = map[string]plan.Hold{plan.HoldLocal: {By: "alice", Reason: "maintenance"}}
+					})
+				} else {
+					e.cancel(l)
+				}
+
+				release()
+
+				op := e.awaitFinished("lease-cancel")
+				assert.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+				assert.True(t, op.Disrupted, "the host was touched")
+
+				for i, id := range tt.needs {
+					step := stepOf(t, op, id)
+					assert.Equal(t, tt.want[i], step.Status, id)
+
+					switch {
+					case tt.want[i] != cancelled:
+					case hold:
+						assert.Equal(t, "cancelled: host is on local hold: maintenance", step.Error, id)
+					default:
+						assert.Contains(t, step.Error, "cancelled", id)
+					}
+				}
+
+				tt.check(t, e.disruptive())
+
+				e.assertAllRunning()
+				assert.Equal(t, tt.geth, e.host.Container("geth").Digest)
+				assert.Equal(t, agenttest.TekuV1, e.host.Container("teku").Digest)
+				assert.Equal(t, "boot", e.host.BootID(), "no reboot")
+			})
+		}
 	}
+}
+
+// A local hold set while the images are pulled begins nothing.
+func TestLocalHoldDuringThePull(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.host.SetRegistry(agenttest.GethImage, agenttest.GethV2, "")
+
+	entered, release := e.block("pull ")
+
+	e.start(t.Context())
+
+	need := gethNeed(agenttest.GethV2)
+	e.grant("lease-hold", need)
+
+	agenttest.AwaitParked(t, entered, "pull")
+	e.files.set(func(o *plan.Overrides) {
+		o.Holds = map[string]plan.Hold{plan.HoldLocal: {By: "alice"}}
+	})
+	release()
+
+	op := e.awaitFinished("lease-hold")
+	assert.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.False(t, op.Disrupted)
+
+	step := stepOf(t, op, need.ID)
+	assert.Equal(t, protocol.StepCancelled, step.Status)
+	assert.Equal(t, "cancelled: host is on local hold", step.Error)
+	assert.Empty(t, e.disruptive())
+	assert.Equal(t, agenttest.GethV1, e.host.Container("geth").Digest)
+}
+
+// An overrides file that stops reading during a lease does not end it: only
+// an explicit local hold does.
+func TestUnreadableOverridesDuringALease(t *testing.T) {
+	t.Parallel()
+
+	e := newEnv(t, agenttest.BaseScenario())
+	e.host.SetRegistry(agenttest.GethImage, agenttest.GethV2, "")
+
+	entered, release := e.block("pull ")
+
+	e.start(t.Context())
+
+	need := gethNeed(agenttest.GethV2)
+	e.grant("lease-typo", need)
+
+	agenttest.AwaitParked(t, entered, "pull")
+	e.files.set(func(o *plan.Overrides) { o.Known, o.Err = false, "yaml: line 3: did not find expected key" })
+	release()
+
+	op := e.awaitFinished("lease-typo")
+	assert.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+	assert.Equal(t, protocol.StepDone, stepOf(t, op, need.ID).Status)
+	assert.Equal(t, agenttest.GethV2, e.host.Container("geth").Digest)
 }
 
 // After a failure a step not begun reads "not attempted", cancel and restart or not.
@@ -911,7 +986,9 @@ func raceProceedAndCancel(t *testing.T, st *store) bool {
 		return false
 	}
 
-	r := &runner{log: quietLog(), st: st, deps: &Deps{Now: time.Now, Notify: func() {}}}
+	r := &runner{log: quietLog(), st: st, deps: &Deps{
+		Now: time.Now, Notify: func() {}, Overrides: &testFiles{files: plan.Overrides{Known: true}},
+	}}
 	o := &operation{r: r, log: quietLog()}
 
 	var (

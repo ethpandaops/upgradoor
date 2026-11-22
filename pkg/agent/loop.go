@@ -38,6 +38,10 @@ func (a *agent) loop(ctx context.Context) {
 			wait = min(wait, a.cfg.Controller.LeaseSyncInterval, soonSync)
 		}
 
+		if until := a.untilFallback(); until > 0 {
+			wait = min(wait, until)
+		}
+
 		timer := time.NewTimer(wait)
 
 		select {
@@ -160,6 +164,18 @@ func (a *agent) fallback(view *plan.View, needs []protocol.Need) bool {
 	a.log.WithField("needs", ids).Warn("fallback: serving needs without the controller")
 
 	return true
+}
+
+// untilFallback is the time until the controller's silence reaches
+// fallback.after, while syncs fail and the fallback has not begun: the sync
+// backoff does not delay its start. Zero or less otherwise.
+func (a *agent) untilFallback() time.Duration {
+	fb := &a.cfg.Policy.Fallback
+	if !a.syncFailing || !fb.Enabled() || a.fallbackTried != nil {
+		return 0
+	}
+
+	return fb.After - a.now().Sub(a.lastAnswer)
 }
 
 // endFallback notes an answer of the controller, which ends the fallback.

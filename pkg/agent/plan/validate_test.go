@@ -343,6 +343,13 @@ func TestValidate(t *testing.T) {
 			verdicts: map[string]verdict{override.ID: {protocol.StepRefused, "container geth is not managed"}},
 		},
 		{
+			name: "a container that is never rolled", files: specFiles, needs: []protocol.Need{spec},
+			mutate: func(f *Facts, _ *Overrides) { f.Containers[0].Linked = true },
+			verdicts: map[string]verdict{
+				spec.ID: {protocol.StepRefused, "container geth is created with links"},
+			},
+		},
+		{
 			name:  "malformed target needs",
 			needs: []protocol.Need{{ID: "override/x", Kind: protocol.NeedOverride}, {ID: "spec/x", Kind: protocol.NeedSpec}},
 			verdicts: map[string]verdict{

@@ -15,9 +15,14 @@ import (
 // Nothing is copied wholesale from a host, so a new field on fleet.Host or
 // protocol.Container cannot reach an unauthenticated visitor by accident.
 
-// beaconErrorPublic replaces the beacon service's error text in the public
-// network view: the real text can name in-cluster URLs and addresses.
-const beaconErrorPublic = "beacon node unavailable"
+// The fixed texts that stand in the public network view for the error texts
+// of the beacon service: those are err.Error() of beacon calls and can name
+// the endpoint and in-cluster addresses.
+const (
+	beaconErrorPublic   = "beacon node unavailable"
+	livenessErrorPublic = "attestation data missing or stale"
+	timingErrorPublic   = "invalid chain timing"
+)
 
 // PublicGate is the network gate as everybody may see it.
 func (v *Views) PublicGate() scheduler.Gate {
@@ -28,23 +33,38 @@ func (v *Views) PublicGate() scheduler.Gate {
 	return gate
 }
 
-// scrubGate removes the beacon service's error text from a gate, both from
-// the network view and from every reason that quotes it.
+// scrubGate removes the beacon service's error texts from a gate: from the
+// network view (Error says that there is one in a fixed text, LivenessError
+// and TimingError go) and from every reason that quotes one, which becomes
+// the fixed text of that error. A reason that starts with a fixed text and a
+// colon (the scheduler's "attestation data missing or stale: <error>") is
+// cut back to the fixed text.
 func scrubGate(gate *scheduler.Gate) {
-	secret := gate.Network.Error
-	if secret == "" {
-		return
+	n := &gate.Network
+	secrets := []struct{ text, public string }{
+		{n.LivenessError, livenessErrorPublic},
+		{n.TimingError, timingErrorPublic},
+		{n.Error, beaconErrorPublic},
 	}
 
-	gate.Network.Error = beaconErrorPublic
+	if n.Error != "" {
+		n.Error = beaconErrorPublic
+	}
+
+	n.LivenessError, n.TimingError = "", ""
 
 	reasons := make([]string, 0, len(gate.Reasons))
 
 	for _, reason := range gate.Reasons {
-		if reasonQuotes(reason, secret) {
-			// Nothing of such a reason is kept: what surrounds the quote may
-			// be part of the same error chain.
-			reason = beaconErrorPublic
+		for _, secret := range secrets {
+			if strings.HasPrefix(reason, secret.public+": ") ||
+				(secret.text != "" && reasonQuotes(reason, secret.text)) {
+				// Nothing of such a reason is kept: what surrounds the quote
+				// may be part of the same error chain.
+				reason = secret.public
+
+				break
+			}
 		}
 
 		if !slices.Contains(reasons, reason) {

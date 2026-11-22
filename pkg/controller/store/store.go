@@ -1,5 +1,5 @@
 // Package store persists the controller's state in SQLite
-// (modernc.org/sqlite, WAL). The schema is schema.sql.
+// (modernc.org/sqlite, WAL). The schema is the steps in migrations/.
 package store
 
 import (
@@ -18,8 +18,8 @@ var ErrNotFound = errors.New("store: not found")
 // Store is the controller's persistence. Every method is safe for concurrent
 // use and atomic on its own.
 type Store interface {
-	// Start opens the database and creates the schema in an empty one. It
-	// fails with ErrSchemaVersion on a database of another schema.
+	// Start opens the database and brings its schema up to date. It fails
+	// with ErrSchemaVersion on a database it cannot upgrade.
 	Start(ctx context.Context) error
 	// Stop closes the database.
 	Stop() error
@@ -239,7 +239,8 @@ type AuditFilter struct {
 // Holds set the controller-side hold switch of hosts; a host that does not
 // exist fails the whole set with ErrNotFound; so do Offline marks. Broken
 // replaces the broken
-// marks of hosts; a host that does not exist is passed over.
+// marks of hosts, Unproven their fleet.Host.Unproven; a host that does not
+// exist is passed over.
 type Changes struct {
 	Rollouts   []*fleet.Rollout
 	Leases     []*fleet.Lease
@@ -247,7 +248,15 @@ type Changes struct {
 	Holds      []HostHold
 	Offline    []HostOffline
 	Broken     []HostBroken
+	Unproven   []HostUnproven
 	Audit      []fleet.AuditEntry
+}
+
+// HostUnproven is fleet.Host.Unproven of one host as it is from now on; a
+// nil At clears it.
+type HostUnproven struct {
+	Host string
+	At   *time.Time
 }
 
 // HostBroken is the broken marks of one host (fleet.Host.Broken) as they are
@@ -280,5 +289,5 @@ type HostHold struct {
 func (c *Changes) Empty() bool {
 	return len(c.Rollouts) == 0 && len(c.Leases) == 0 &&
 		len(c.Directives) == 0 && len(c.Holds) == 0 && len(c.Offline) == 0 &&
-		len(c.Broken) == 0 && len(c.Audit) == 0
+		len(c.Broken) == 0 && len(c.Unproven) == 0 && len(c.Audit) == 0
 }

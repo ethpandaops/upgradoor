@@ -117,6 +117,10 @@ func (o *operation) finish() {
 				// After a failure a pending step reads "not attempted", cancel or not.
 				s.Status = protocol.StepCancelled
 				s.Error = reasonStepCancelled
+
+				if o.holdReason != "" {
+					s.Error = "cancelled: " + o.holdReason
+				}
 			case phase == protocol.PhaseFailed && s.Error == "":
 				s.Error = "not attempted: " + cur.Operation.Error
 			}
@@ -151,6 +155,9 @@ func (o *operation) finish() {
 	switch {
 	case o.failed:
 		log.WithField("error", rec.Operation.Error).Error("operation failed")
+	case o.holdReason != "":
+		log.WithField("reason", o.holdReason).
+			Warn("operation ended: the host is on local hold, the remaining steps were not begun")
 	case o.cancelled:
 		log.Warn("operation ended: the lease was cancelled, the remaining steps were not begun")
 	default:

@@ -405,46 +405,6 @@ func TestRestartPersistence(t *testing.T) {
 	assert.Equal(t, settings, loaded)
 }
 
-func TestSchemaVersion(t *testing.T) {
-	ctx := context.Background()
-
-	for _, changed := range []int{0, schemaVersion + 1} {
-		t.Run(fmt.Sprintf("version %d", changed), func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "upgradoor.db")
-
-			s := New(quietLog(), path)
-			require.NoError(t, s.Start(ctx))
-			addHost(t, s, "node-1", nil)
-			require.NoError(t, s.Stop())
-
-			db, err := sql.Open(driverName, "file:"+escapeURIPath(path))
-			require.NoError(t, err)
-
-			defer func() { require.NoError(t, db.Close()) }()
-
-			_, err = db.Exec(fmt.Sprintf(`PRAGMA user_version = %d`, changed))
-			require.NoError(t, err)
-
-			other := New(quietLog(), path)
-			err = other.Start(ctx)
-			require.ErrorIs(t, err, ErrSchemaVersion)
-			require.ErrorContains(t, err, "delete the database file")
-			require.ErrorContains(t, err, path)
-
-			_, err = other.ListHosts(ctx)
-			require.ErrorIs(t, err, ErrClosed, "a refused database is not left open")
-
-			// The refused start changed nothing.
-			var version, hosts int
-
-			require.NoError(t, db.QueryRow(`PRAGMA user_version`).Scan(&version))
-			require.NoError(t, db.QueryRow(`SELECT COUNT(*) FROM hosts`).Scan(&hosts))
-			assert.Equal(t, changed, version)
-			assert.Equal(t, 1, hosts)
-		})
-	}
-}
-
 func TestEscapeLike(t *testing.T) {
 	t.Parallel()
 

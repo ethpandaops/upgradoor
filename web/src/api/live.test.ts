@@ -4,6 +4,7 @@ import { MOCK_LOGINS, MockController } from '../mock/mockController';
 import { ApiClient, type FetchFn, type TokenSource } from './client';
 import { LiveStore } from './live';
 import { list } from './types';
+import { WIRE_VERSION } from './wire';
 
 const staff: TokenSource = {
   required: () => true,
@@ -105,6 +106,28 @@ describe('LiveStore', () => {
       expect(store.getStatus().state).toBe('live');
     });
     expect(store.view('public-network')?.ok).toBe(false);
+  });
+
+  it('backs off while the controller encodes with another wire version', async () => {
+    let opened = 0;
+    const api = {
+      events: (opts: Parameters<ApiClient['events']>[0]) => {
+        opened++;
+        opts.onEvent({ event: 'snap', data: { v: `${WIRE_VERSION}-other`, i: 0 } });
+        return Promise.resolve();
+      },
+    } as unknown as ApiClient;
+    const store = started(new LiveStore(api, { backoffMinMs: 20, backoffMaxMs: 10_000 }));
+
+    await new Promise(resolve => setTimeout(resolve, 200));
+
+    // 10..20 ms, then 20..40, 40..80, 80..160: without the backoff about one stream every 15 ms.
+    expect(opened).toBeGreaterThan(1);
+    expect(opened).toBeLessThanOrEqual(5);
+    expect(store.getStatus()).toMatchObject({
+      state: 'reconnecting',
+      error: { message: expect.stringContaining('reload the page') as string },
+    });
   });
 
   it('keeps what it has and says why while the controller is away', async () => {

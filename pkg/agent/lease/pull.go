@@ -50,6 +50,10 @@ func (o *operation) pullImages(ctx context.Context) error {
 			return nil
 		}
 
+		if o.held() {
+			return nil
+		}
+
 		// A recreate that no longer applies is superseded in its turn.
 		rec, reason := plan.Recheck(task, view)
 		if reason != "" {

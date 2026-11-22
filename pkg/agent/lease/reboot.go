@@ -21,6 +21,10 @@ const (
 func (o *operation) reboot(ctx context.Context) bool {
 	ids := o.lp.Reboot
 
+	if o.held() {
+		return false
+	}
+
 	var (
 		err       error
 		cancelled bool

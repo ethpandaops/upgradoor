@@ -17,6 +17,10 @@ import (
 // when the local image does not have the granted digest.
 var ErrDigestMismatch = docker.ErrDigestMismatch
 
+// ErrImageMoved is returned by Host.Recreate when the tag moved after the old
+// container was stopped; the rollback has run.
+var ErrImageMoved = docker.ErrImageMoved
+
 // Host is the machine; the contracts are on docker.Runtime, system.System
 // and probe.Prober.
 type Host interface {

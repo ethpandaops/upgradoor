@@ -1243,9 +1243,17 @@ func TestStepDoneInAFailedLeaseIsNoSuccess(t *testing.T) {
 	assert.Equal(t, fleet.HostDone, r.Host("a").State)
 	assert.Empty(t, r.Host("a").LeaseID, "done, but not through a lease that was released")
 
+	// a is not proven back: it keeps the one place of the host limit until a
+	// liveness epoch that began after its failure has settled.
+	assert.Empty(t, b.leasedHosts())
+	assert.Equal(t, "host limit 1 of 1", queueReasons(out.Plan)["b"])
+
+	b.advance(2 * testEpoch)
+	out = b.step()
+
 	// No first success: one new canary goes alone.
 	assert.Equal(t, []string{"b"}, b.leasedHosts())
-	assert.Equal(t, "b", r.Canary)
+	assert.Equal(t, "b", b.mustRollout(key).Canary)
 	assert.Equal(t, map[string]string{"c": "after canary b"}, queueReasons(out.Plan))
 
 	b.serve("b")
@@ -2174,3 +2182,81 @@ const (
 	noteNodeWaiting = "node at head with peers, waiting for it to stay so for 6m24s"
 	noteReadyNode   = "ready: node at head with peers"
 )
+
+// A host whose lease failed after its agent disrupted it counts with its full
+// weight and its place in the host limit until a liveness epoch that began
+// after the failure has settled; from then on what its validators do counts.
+// It may be granted again itself.
+func TestFailedHostStaysChargedUntilProvenBack(t *testing.T) {
+	b := newWorldBuilder(t)
+
+	for _, name := range []string{"a", "b", "c", "d", "e", "f", "g", "h", "i", "j"} {
+		b.host(name, 10)
+	}
+
+	b.wants("a", packagesNeed("2.0"))
+	b.wants("b", rebootNeed())
+
+	b.step()
+	require.Equal(t, []string{"a"}, b.leasedHosts())
+
+	// a fails and stays down; nothing of it has settled since.
+	b.report("a", protocol.PhaseFailed, true)
+	b.liveOverride["a"] = 0
+
+	out := b.step()
+	assert.Empty(t, b.leasedHosts())
+	assert.Equal(t, "budget 10% of 10%", queueReasons(out.Plan)["b"])
+	assert.Equal(t, uint64(10), out.Plan.Budget.UnavailableWeight)
+	assert.Equal(t, 1, out.Plan.Budget.LeasedHosts)
+	assert.Equal(t, SlotFailed, out.Plan.Hosts["a"].Slot)
+	require.NotNil(t, b.get("a").Unproven)
+
+	// The charge does not keep a's own repair away.
+	packages := b.mustRollout(packagesKey("2.0"))
+	packages.State, packages.Reason = fleet.RolloutActive, ""
+	packages.Host("a").State = fleet.HostPending
+
+	out = b.step()
+	assert.Equal(t, []string{"a"}, b.leasedHosts())
+	assert.Equal(t, "budget 10% of 10%", queueReasons(out.Plan)["b"])
+
+	b.report("a", protocol.PhaseFailed, true)
+	b.step()
+	require.Empty(t, b.leasedHosts())
+
+	// An epoch after the failure settles: a's validators are counted as they
+	// are, and they are down.
+	b.advance(2 * testEpoch)
+
+	out = b.step()
+	assert.Nil(t, b.get("a").Unproven)
+	assert.Zero(t, out.Plan.Budget.LeasedHosts)
+	assert.Equal(t, "budget 10% of 10%", queueReasons(out.Plan)["b"])
+
+	// They attest again.
+	b.liveOverride["a"] = 10
+	b.advance(testEpoch)
+	b.step()
+	assert.Equal(t, []string{"b"}, b.leasedHosts())
+}
+
+// A forced lease is released when the agent is done and charges nothing: the
+// next host goes at once.
+func TestForcedReleaseDoesNotCharge(t *testing.T) {
+	b := newWorldBuilder(t)
+
+	for _, name := range []string{"t1", "t2", "t3"} {
+		b.host(name, 0)
+	}
+
+	b.manualRollout("m1", true, false, "t1", "t2", "t3")
+	b.step()
+	require.Equal(t, []string{"t1"}, b.leasedHosts())
+
+	b.finish("t1")
+	b.step()
+	require.Equal(t, fleet.LeaseReleased, b.lastLease("t1").State)
+	assert.Nil(t, b.get("t1").Unproven)
+	assert.Equal(t, []string{"t2"}, b.leasedHosts())
+}

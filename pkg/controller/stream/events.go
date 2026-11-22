@@ -65,8 +65,10 @@ const (
 	maxStreamHosts = 16
 	// maxStreamHostName bounds one name in the host parameter.
 	maxStreamHostName = 253
-	// maxStreams bounds the open streams: the public one needs no login.
-	maxStreams = 256
+	// maxStreams bounds the open authenticated streams, maxPublicStreams the
+	// public ones, which need no login and so cannot take the operators'.
+	maxStreams       = 256
+	maxPublicStreams = 256
 	// maxStreamStrings bounds a string table. One that grows past it is
 	// started again, with every stream of its audience.
 	maxStreamStrings = 20000
@@ -90,7 +92,8 @@ const (
 var (
 	// errStreamsClosed is returned while the server is not started.
 	errStreamsClosed = errors.New("the event stream is not available yet")
-	// errStreamsFull is returned while maxStreams streams are open.
+	// errStreamsFull is returned while the streams of the kind asked for are
+	// at their bound.
 	errStreamsFull = errors.New("too many open event streams")
 
 	heartbeatFrame = []byte(": ping\n\n")
@@ -112,6 +115,15 @@ func frame(event string, data []byte) []byte {
 func (s *Handler) Notify() {
 	if hub := s.events.Load(); hub != nil {
 		hub.notify()
+	}
+}
+
+// NotifyHost says that the details of host may have changed. It notifies
+// only while a stream asked for them, so a sync that changed nothing else
+// does not rebuild the tables.
+func (s *Handler) NotifyHost(host string) {
+	if hub := s.events.Load(); hub != nil {
+		hub.notifyHost(host)
 	}
 }
 
@@ -301,10 +313,17 @@ type eventHub struct {
 	interval time.Duration
 	debounce time.Duration
 
-	dirty   chan struct{}
-	join    chan *subscriber
-	leave   chan *subscriber
-	streams atomic.Int32
+	dirty chan struct{}
+	join  chan *subscriber
+	leave chan *subscriber
+	// streams and publicStreams count the open authenticated and public
+	// streams; each kind has its own bound.
+	streams       atomic.Int32
+	publicStreams atomic.Int32
+
+	// watched counts, per host, the open streams that asked for its details.
+	watchMu sync.Mutex
+	watched map[string]int
 
 	cancel  context.CancelFunc
 	stopped chan struct{}
@@ -366,6 +385,7 @@ func newEventHub(log logrus.FieldLogger, srv *Handler) *eventHub {
 		join:     make(chan *subscriber),
 		leave:    make(chan *subscriber),
 		stopped:  make(chan struct{}),
+		watched:  make(map[string]int, 8),
 		subs:     make(map[*subscriber]struct{}, 8),
 		state:    newEventState(),
 	}
@@ -394,8 +414,13 @@ func (h *eventHub) notify() {
 // subscribe registers a stream. The snapshot is the first batch on its
 // channel.
 func (h *eventHub) subscribe(ctx context.Context, private bool, hosts []string) (*subscriber, error) {
-	if h.streams.Add(1) > maxStreams {
-		h.streams.Add(-1)
+	open, bound := &h.publicStreams, int32(maxPublicStreams)
+	if private {
+		open, bound = &h.streams, maxStreams
+	}
+
+	if open.Add(1) > bound {
+		open.Add(-1)
 
 		return nil, errStreamsFull
 	}
@@ -404,13 +429,15 @@ func (h *eventHub) subscribe(ctx context.Context, private bool, hosts []string) 
 
 	select {
 	case h.join <- sub:
+		h.watch(sub.hosts, 1)
+
 		return sub, nil
 	case <-h.stopped:
-		h.streams.Add(-1)
+		open.Add(-1)
 
 		return nil, errStreamsClosed
 	case <-ctx.Done():
-		h.streams.Add(-1)
+		open.Add(-1)
 
 		return nil, ctx.Err()
 	}
@@ -422,7 +449,42 @@ func (h *eventHub) unsubscribe(sub *subscriber) {
 	case <-h.stopped:
 	}
 
-	h.streams.Add(-1)
+	h.watch(sub.hosts, -1)
+
+	if sub.private {
+		h.streams.Add(-1)
+	} else {
+		h.publicStreams.Add(-1)
+	}
+}
+
+// watch counts the streams that asked for the details of hosts.
+func (h *eventHub) watch(hosts []string, delta int) {
+	if len(hosts) == 0 {
+		return
+	}
+
+	h.watchMu.Lock()
+	defer h.watchMu.Unlock()
+
+	for _, name := range hosts {
+		if n := h.watched[name] + delta; n > 0 {
+			h.watched[name] = n
+		} else {
+			delete(h.watched, name)
+		}
+	}
+}
+
+// notifyHost notifies when a stream asked for the details of host.
+func (h *eventHub) notifyHost(host string) {
+	h.watchMu.Lock()
+	watched := h.watched[host] > 0
+	h.watchMu.Unlock()
+
+	if watched {
+		h.notify()
+	}
 }
 
 func (h *eventHub) run(ctx context.Context) {

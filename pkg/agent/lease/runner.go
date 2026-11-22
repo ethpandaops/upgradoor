@@ -389,6 +389,8 @@ type operation struct {
 	failed bool
 	// cancelled skips the remaining steps as after a failure.
 	cancelled bool
+	// holdReason is set when a local hold cancelled the operation.
+	holdReason string
 	// deferred: an image could not be pulled, so nothing is begun.
 	deferred bool
 	// view is the last classified view, for order and stop timeouts.
@@ -526,11 +528,39 @@ func (o *operation) noteCancel() {
 	}
 }
 
+// held reports whether a local hold was set; it cancels the operation. Only
+// an explicit hold counts: an overrides file that cannot be read refuses a
+// lease before its start, but does not end one that runs. The controller
+// hold does not stop a lease it granted.
+func (o *operation) held() bool {
+	if o.holdReason != "" {
+		return true
+	}
+
+	files := o.r.deps.Overrides.Load()
+	if !files.Known {
+		return false
+	}
+
+	hold := plan.HoldState(&files, o.now())
+	if !hold.Local {
+		return false
+	}
+
+	o.holdReason = plan.HoldReason(hold)
+	o.cancelled = true
+
+	o.log.WithField("reason", o.holdReason).
+		Warn("the host is on local hold: beginning no further step, bringing the host back")
+
+	return true
+}
+
 // proceed reports whether a disruptive call may be made. It marks the steps
 // ids running under the lock that reads the cancel mark, so a cancel either
-// prevents the call or finds the steps begun.
+// prevents the call or finds the steps begun. A local hold counts as a cancel.
 func (o *operation) proceed(ids []string) bool {
-	if o.cancelled {
+	if o.cancelled || o.held() {
 		return false
 	}
 

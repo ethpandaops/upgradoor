@@ -405,6 +405,27 @@ func TestBuildCreateSpec(t *testing.T) {
 	assert.Equal(t, inspected(), old)
 }
 
+// An anonymous volume given as a mount keeps its volume, read-only and options.
+func TestBuildCreateSpecNamesAnonymousMounts(t *testing.T) {
+	old := inspected()
+	options := &mount.VolumeOptions{Labels: map[string]string{"keep": "1"}}
+	old.HostConfig.Mounts = append(old.HostConfig.Mounts,
+		mount.Mount{Type: mount.TypeVolume, Target: "/mdata/", ReadOnly: true, VolumeOptions: options})
+	old.Mounts = append(old.Mounts,
+		container.MountPoint{Type: mount.TypeVolume, Name: "anonvolume3", Destination: "/mdata"})
+
+	spec, err := buildCreateSpec(old, testImage())
+	require.NoError(t, err)
+
+	assert.Equal(t, []mount.Mount{
+		{Type: mount.TypeVolume, Source: "viamount", Target: "/viamount"},
+		{Type: mount.TypeVolume, Source: "anonvolume3", Target: "/mdata/", ReadOnly: true, VolumeOptions: options},
+		{Type: mount.TypeVolume, Source: "anonvolume1", Target: "/anon"},
+		{Type: mount.TypeVolume, Source: "anonvolume2", Target: "/imgvol", ReadOnly: true},
+	}, spec.HostConfig.Mounts)
+	assert.Empty(t, old.HostConfig.Mounts[1].Source, "the inspect data is not modified")
+}
+
 func TestBuildCreateSpecNetworkModes(t *testing.T) {
 	tests := []struct {
 		name        string

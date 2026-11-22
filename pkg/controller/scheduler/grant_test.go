@@ -1130,3 +1130,86 @@ func TestLocalRolloutsGoFirst(t *testing.T) {
 	assert.Equal(t, []string{"b"}, b.leasedHosts())
 	assert.Equal(t, "budget 50% of 10%", queueReasons(out.Plan)["a"])
 }
+
+// A need that waits for its rollout's canary is not granted with a lease the
+// host is granted for another rollout: a new image does not reach the hosts
+// of a running reboot rollout before its canary has proved it.
+func TestOrderWaitsDoNotRideAlong(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.w.Settings.MaxUnavailablePercent = 40
+	b.w.Settings.MaxLeasedPercent = 40
+
+	hosts := []string{"a", "b", "c", "d", "e"}
+	for _, name := range hosts {
+		b.host(name, 10)
+		b.wants(name, rebootNeed())
+	}
+
+	b.step()
+	require.Equal(t, []string{"a"}, b.leasedHosts(), "the canary of the reboot rollout")
+	b.finish("a")
+	b.step()
+	b.advance(5 * time.Second)
+	b.step()
+	b.advance(2 * testEpoch)
+
+	// In the pass in which the reboot rollout has its first success, a geth
+	// digest appears.
+	for _, name := range hosts[1:] {
+		b.wantsImage(name, imgGeth, digestA)
+	}
+
+	out := b.step()
+	require.Nil(t, b.lease("a"))
+	geth := b.mustRollout(imageKey("", imgGeth, digestA))
+
+	require.Equal(t, "b", geth.Canary)
+	assert.Equal(t, []string{"b", "c"}, b.leasedHosts())
+	assert.Len(t, b.lease("b").Needs, 2, "the canary gets both")
+	require.Len(t, b.lease("c").Needs, 1)
+	assert.Equal(t, protocol.NeedReboot, b.lease("c").Needs[0].Kind)
+	assert.Equal(t, fleet.HostPending, geth.Host("c").State)
+	assert.Equal(t, "budget 40% of 40%", queueReasons(out.Plan)["d"])
+}
+
+// Validators without an attestation duty (exited, pending, beyond the
+// validator set) count for nothing: a host whose range is half exited is
+// fully available, keeps the gate open, and is ready when the validators
+// that have a duty attest.
+func TestValidatorsWithoutDutyCountForNothing(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.host("half", 20)
+	b.host("a", 10)
+	b.host("b", 10)
+	b.dutyOverride["half"] = 10
+	b.liveOverride["half"] = 10
+	b.wants("half", packagesNeed("2.0"))
+
+	out := b.step()
+	assert.True(t, out.Plan.Gate.OK, "participation is 30 of the 30 with a duty")
+	assert.Equal(t, uint64(30), out.Plan.Budget.TotalWeight)
+	require.Equal(t, []string{"half"}, b.leasedHosts())
+	assert.Equal(t, uint64(10), b.lease("half").Charged)
+
+	b.serve("half")
+	assert.Equal(t, fleet.LeaseReleased, b.lastLease("half").State, "9 of the 10 with a duty attest")
+
+	out = b.step()
+	assert.True(t, out.Plan.Gate.OK)
+	assert.Zero(t, out.Plan.Budget.UnavailableWeight)
+
+	t.Run("a host none of whose validators has a duty does not pass the closed gate", func(t *testing.T) {
+		b := newWorldBuilder(t)
+		b.healthMod = func(n *fleet.NetworkHealth) { n.FinalityLagEpochs = 5 }
+		b.refreshHealth()
+		b.host("exited", 10)
+		b.host("a", 10)
+		b.dutyOverride["exited"] = 0
+		b.liveOverride["exited"] = 0
+		b.wants("exited", packagesNeed("2.0"))
+
+		out := b.step()
+		assert.Empty(t, b.leasedHosts())
+		assert.Equal(t, "network gate: finality lag 5 epochs > 3", queueReasons(out.Plan)["exited"])
+	})
+}

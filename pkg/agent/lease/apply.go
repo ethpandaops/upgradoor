@@ -183,6 +183,16 @@ func (o *operation) recreate(ctx context.Context, task *plan.Recreate) {
 		log.Info("the local image changed after the pull; image need superseded")
 		o.setSteps(task.IDs, protocol.StepSuperseded,
 			fmt.Sprintf("the local image of %s is not the granted digest %s any more", ref, task.Digest))
+	case errors.Is(err, host.ErrImageMoved):
+		// The container was stopped and rolled back: the disrupted mark stays,
+		// the starting phase brings it back if the rollback could not.
+		if slices.Contains(o.lp.WasRunning, name) {
+			o.touch([]string{name})
+		}
+
+		log.WithError(err).Warn("the local image changed after the stop; image need superseded")
+		o.setSteps(task.IDs, protocol.StepSuperseded,
+			fmt.Sprintf("the local image of %s changed from the granted digest %s during the recreate", ref, task.Digest))
 	default:
 		msg := fmt.Sprintf("recreate container %s: %v", name, err)
 

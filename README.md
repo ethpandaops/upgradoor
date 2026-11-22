@@ -276,7 +276,7 @@ bin/upgradoor-controller run \
     --listen 127.0.0.1:8080 --data-dir .tmp/dev/data \
     --network dev --signer-public-key "$(cat .tmp/dev/signer.pub)" \
     --controller-seed-file .tmp/dev/controller.seed \
-    --allow-insecure-agent-http \
+    --allow-insecure-agent-http --allow-open-api \
     --registry-plain-http 127.0.0.1:5050 --registry-allow-private \
     --default-setting lookupInterval=30s \
     --beacon-endpoint http://127.0.0.1:5052
@@ -305,7 +305,7 @@ controller seed) logs
 `--allow-unsigned-agent-answers` and `controller.allowUnsignedAnswers` exist
 for development without keys; the quick start does not need them.)
 
-Open <http://127.0.0.1:8080>. Without `--auth-provider-url` the API is open, so
+Open <http://127.0.0.1:8080>. With `--allow-open-api` (no `--auth-provider-url`) the API is open, so
 every tab is visible and every action allowed without a login. To try the
 permissions, run the auth stub and start the controller with
 `--auth-provider-url http://127.0.0.1:18099`; `--services` and `--teams` of

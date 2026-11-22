@@ -64,8 +64,12 @@ type Config struct {
 	AllowInsecureAgentHTTP bool
 	// TrustForwardedHeaders takes the client address from X-Forwarded-For.
 	TrustForwardedHeaders bool
-	// AuthProviderURL is the authenticatoor base URL; empty runs the API open.
+	// AuthProviderURL is the authenticatoor base URL; empty runs the API
+	// open, which needs AllowOpenAPI.
 	AuthProviderURL string
+	// AllowOpenAPI runs the user API without an auth provider: every action
+	// is anonymous and allowed (closed test networks only).
+	AllowOpenAPI bool
 	// AuthService is the name of this service in the token's "services"
 	// claim; empty means api.DefaultAuthService.
 	AuthService string
@@ -124,6 +128,10 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 	answers, err := loadAnswerSigner(cfg)
 	if err != nil {
 		return nil, err
+	}
+
+	if authErr := checkAuth(cfg); authErr != nil {
+		return nil, authErr
 	}
 
 	if len(cfg.BeaconEndpoints) == 0 {
@@ -205,7 +213,28 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 				"from the controller seed")
 	}
 
+	if cfg.AllowOpenAPI {
+		c.log.Warn("INSECURE: --allow-open-api is set and there is no --auth-provider-url. " +
+			"The API is open to everyone who can reach it: every action is anonymous " +
+			"and allowed. Closed test networks only.")
+	}
+
 	return c, nil
+}
+
+// checkAuth accepts a configuration with an auth provider, or without one
+// with the explicit opt-out, not both.
+func checkAuth(cfg *Config) error {
+	switch {
+	case cfg.AuthProviderURL == "" && !cfg.AllowOpenAPI:
+		return errors.New("controller: --auth-provider-url is required: without it every " +
+			"action is anonymous and allowed (--allow-open-api runs without, " +
+			"for closed test networks)")
+	case cfg.AuthProviderURL != "" && cfg.AllowOpenAPI:
+		return errors.New("controller: --auth-provider-url and --allow-open-api exclude each other")
+	}
+
+	return nil
 }
 
 // loadAnswerSigner reads the controller seed and derives the controller key
@@ -300,10 +329,6 @@ func (c *controller) Start(ctx context.Context) error {
 		"network": c.cfg.Network,
 		"auth":    c.cfg.AuthProviderURL != "",
 	}).Info("controller started")
-
-	if c.cfg.AuthProviderURL == "" {
-		c.log.Warn("no --auth-provider-url: the API is open to everyone who can reach it")
-	}
 
 	return nil
 }
