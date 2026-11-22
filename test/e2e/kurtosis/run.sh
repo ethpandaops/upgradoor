@@ -265,10 +265,9 @@ for i in $(seq 1 $nodes); do
     # Kurtosis created them: give them the labels Ansible would set.
     "$work/relabel" "$el=el/geth" "$cl=cl/lighthouse" "$vc=vc/lighthouse" || die "relabel node $i"
 
-    "$work/upgradoor-controller" keygen host-key --network "$network" --hostname "node-$i" \
-        >"$dir/host.key"
+    "$work/upgradoor" key --path "$dir/host.key" >"$dir/host.pub"
     "$work/upgradoor-controller" keygen host-cert --network "$network" --hostname "node-$i" \
-        --role ethereum_node >"$dir/host.crt"
+        --public-key "$(cat "$dir/host.pub")" >"$dir/host.crt"
 
     cat >"$dir/agent.yaml" <<EOF
 controller:
@@ -281,6 +280,7 @@ controller:
 keyFile: /etc/upgradoor/host.key
 certFile: /etc/upgradoor/host.crt
 stateDir: /var/lib/upgradoor
+roles: [ethereum_node]
 # Only image rolls: this "host" shares the real machine's kernel.
 verbs: [roll]
 # The containers carry the kind and team labels (relabel above).

@@ -135,10 +135,9 @@ for h in "${hosts[@]}"; do
         --label io.ethpandaops.upgradoor.kind=app --stop-timeout 5 --restart unless-stopped \
         busybox:stable sleep 1000000 >/dev/null
 
-    "$work/upgradoor-controller" keygen host-key --network "$network" --hostname "$h" \
-        >"$dir/host.key"
+    "$work/upgradoor" key --path "$dir/host.key" >"$dir/host.pub"
     "$work/upgradoor-controller" keygen host-cert --network "$network" --hostname "$h" \
-        >"$dir/host.crt"
+        --public-key "$(cat "$dir/host.pub")" >"$dir/host.crt"
 
     cat >"$dir/agent.yaml" <<EOF
 controller:

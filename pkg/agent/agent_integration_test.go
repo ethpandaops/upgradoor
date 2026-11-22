@@ -339,7 +339,9 @@ func (e *dockerEnv) recreate(
 	rec, reason := plan.Recheck(task, &view)
 	require.Empty(t, reason)
 
-	change := host.Change(rec)
+	change := host.Change{
+		Image: rec.Image, Command: rec.Command, SetCommand: rec.SetCommand, Base: rec.Base, SetBase: rec.SetBase,
+	}
 	err := e.host.Recreate(t.Context(), task.Container, task.Digest, itStopTimeout, true, &change)
 	require.NoError(t, err)
 }
