@@ -484,6 +484,31 @@ func TestLayout(t *testing.T) {
 // The default lines follow the default; active fields and every other
 // comment stay. A container no longer overridable loses its default lines,
 // a new one gets an entry.
+// A change written between the agent's read and its rename is not lost: the
+// write is dropped and Layout tries again on its next call.
+func TestWriteKeepsAChangeMadeMeanwhile(t *testing.T) {
+	tf := newTestFiles(t)
+	tf.write(t, "overrides:\n")
+
+	f, ok := tf.Files.(*files)
+	require.True(t, ok)
+
+	cur, err := f.read()
+	require.NoError(t, err)
+
+	mine := "overrides:\n  execution:\n    image: ethpandaops/geth:fix\n"
+	tf.write(t, mine)
+
+	cur.text = newText([]byte("overrides:\n  beacon:\n"))
+	require.ErrorIs(t, f.write(cur), errChangedMeanwhile)
+	assert.Equal(t, mine, tf.read(t))
+
+	changed, err := tf.Layout(map[string]plan.Deployed{"execution": gethDefault}, nil)
+	require.NoError(t, err)
+	assert.True(t, changed)
+	assert.Contains(t, tf.read(t), "image: ethpandaops/geth:fix")
+}
+
 func TestLayoutRefreshesDefaults(t *testing.T) {
 	tf := newTestFiles(t)
 	tf.write(t, `# upgradoor overrides: edit below, the agent applies changes within a minute.

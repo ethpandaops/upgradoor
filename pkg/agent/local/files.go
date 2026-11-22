@@ -446,6 +446,10 @@ func (f *files) layout(keep map[string]plan.Deployed, drop []string) (bool, erro
 	}
 
 	if err := f.write(cur); err != nil {
+		if errors.Is(err, errChangedMeanwhile) {
+			return false, nil
+		}
+
 		return false, err
 	}
 
@@ -455,6 +459,7 @@ func (f *files) layout(keep map[string]plan.Deployed, drop []string) (bool, erro
 // current is the file as read, with the owner and mode a rewrite keeps.
 type current struct {
 	text     *text
+	read     []byte // the file's bytes when it was read: a write checks them
 	exists   bool
 	mode     os.FileMode
 	uid, gid int
@@ -513,7 +518,7 @@ func (f *files) read() (*current, error) {
 	}
 
 	return &current{
-		text: newText(raw), exists: true, mode: info.Mode().Perm(),
+		text: newText(raw), read: raw, exists: true, mode: info.Mode().Perm(),
 		uid: int(st.Uid), gid: int(st.Gid), owner: true,
 	}, nil
 }
@@ -531,6 +536,26 @@ func (f *files) readParsed() (*current, plan.Overrides, error) {
 	}
 
 	return cur, set, nil
+}
+
+// errChangedMeanwhile: the file changed between the read and the write; the
+// write is dropped so that the other change is not lost.
+var errChangedMeanwhile = errors.New("the overrides file changed meanwhile, try again")
+
+// unchangedSince reports errChangedMeanwhile when the file is not what cur
+// read. A writer that does not take the lock (an editor) can still slip in
+// after this check; the window is the rename alone.
+func (f *files) unchangedSince(cur *current) error {
+	now, err := f.read()
+	if err != nil {
+		return err
+	}
+
+	if now.exists != cur.exists || !bytes.Equal(now.read, cur.read) {
+		return errChangedMeanwhile
+	}
+
+	return nil
 }
 
 // write replaces the file by an exclusively created temp file and a rename,
@@ -558,6 +583,10 @@ func (f *files) write(cur *current) error {
 	err = writeTemp(tmp, cur.text.bytes(), mode, uid, gid, owner)
 	if closeErr := tmp.Close(); err == nil {
 		err = closeErr
+	}
+
+	if err == nil {
+		err = f.unchangedSince(cur)
 	}
 
 	if err == nil {
