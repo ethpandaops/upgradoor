@@ -29,7 +29,7 @@ func TestNewValidatesOptions(t *testing.T) {
 	log := logrus.New()
 	log.SetOutput(io.Discard)
 
-	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed), controllertest.Network)
+	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed))
 	require.NoError(t, err)
 
 	valid := func() Options {

@@ -2,7 +2,6 @@ package identity
 
 import (
 	"bytes"
-	"crypto/mldsa"
 	"encoding/base64"
 	"encoding/json"
 	"flag"
@@ -119,8 +118,8 @@ type vector struct {
 	ProofBody   string      `json:"proofBody"`
 	Proof       string      `json:"proof"`
 
-	// ControllerKey and ControllerPublicKey are the controller key pair of
-	// Network, derived from ControllerSeed.
+	// ControllerKey and ControllerPublicKey are the controller key pair,
+	// derived from ControllerSeed.
 	ControllerKey       string `json:"controllerKey"`
 	ControllerPublicKey string `json:"controllerPublicKey"`
 
@@ -136,7 +135,7 @@ type vector struct {
 func (v *vector) compute() error {
 	seed := []byte(v.Seed)
 
-	signer, err := DeriveSignerKey(seed, v.Network)
+	signer, err := DeriveSignerKey(seed)
 	if err != nil {
 		return err
 	}
@@ -154,7 +153,7 @@ func (v *vector) compute() error {
 		return err
 	}
 
-	ctrl, err := DeriveControllerKey([]byte(v.ControllerSeed), v.Network)
+	ctrl, err := DeriveControllerKey([]byte(v.ControllerSeed))
 	if err != nil {
 		return err
 	}
@@ -256,32 +255,29 @@ func vectorInputs() []vector {
 func TestDerivationIsolation(t *testing.T) {
 	seed := []byte(testSeed)
 
-	signer, err := DeriveSignerKey(seed, "net")
+	signer, err := DeriveSignerKey(seed)
 	require.NoError(t, err)
 
-	ctrl, err := DeriveControllerKey(seed, "net")
+	ctrl, err := DeriveControllerKey(seed)
 	require.NoError(t, err)
-	ctrlOther, err := DeriveControllerKey(seed, "net2")
-	require.NoError(t, err)
-	signerOther, err := DeriveSignerKey(seed, "net2")
-	require.NoError(t, err)
+	assert.False(t, signer.Equal(ctrl))
 
-	keys := []*mldsa.PrivateKey{signer, signerOther, ctrl, ctrlOther}
-	for i := range keys {
-		for j := i + 1; j < len(keys); j++ {
-			assert.False(t, keys[i].Equal(keys[j]))
-		}
-	}
+	again, err := DeriveSignerKey(seed)
+	require.NoError(t, err)
+	assert.True(t, signer.Equal(again))
 
-	_, err = DeriveSignerKey([]byte("short"), "net")
+	_, err = DeriveSignerKey([]byte("short"))
 	require.ErrorIs(t, err, ErrSeedTooShort)
+	_, err = DeriveControllerKey([]byte("short"))
+	require.ErrorIs(t, err, ErrSeedTooShort)
+}
 
+func TestValidateName(t *testing.T) {
 	for _, bad := range []string{"", "a/b", "-a", "a b", `a"b`, "ü", strings.Repeat("a", 254)} {
-		_, err = DeriveSignerKey(seed, bad)
-		require.ErrorIs(t, err, ErrInvalidName, bad)
-		_, err = DeriveControllerKey(seed, bad)
-		require.ErrorIs(t, err, ErrInvalidName, bad)
+		require.ErrorIs(t, ValidateName(bad), ErrInvalidName, bad)
 	}
+
+	require.NoError(t, ValidateName("Host_With-Mixed.Case01"))
 }
 
 func TestKeyEncoding(t *testing.T) {

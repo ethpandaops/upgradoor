@@ -113,6 +113,9 @@ Without the URL no host has validators and the budget is only the host limit.
 - The controller signs its answers with a key derived from the controller
   seed (`--controller-seed-file`); agents pin its public key
   (`controller.publicKey`) and act on nothing else.
+- Both seeds are shared by all devnets and neither public key depends on the
+  network: the controller refuses certificates and agents refuse answers of
+  another network.
 - The agent runs as user `upgradoor` with two sudo rules (package upgrade,
   reboot) and does only the verbs its `agent.yaml` allows.
 - Hosts install only signed releases (below).
@@ -156,8 +159,8 @@ Local quick start with a fake beacon, a fake registry and one fake host
 make build && mkdir -p .tmp/dev/data && cd .tmp/dev
 export UPGRADOOR_SEED=$(openssl rand -hex 32)
 openssl rand -hex 32 > controller.seed
-../../bin/upgradoor-controller keygen signer-pubkey --network dev > signer.pub
-cpub=$(../../bin/upgradoor-controller keygen controller-pubkey --network dev --controller-seed-file controller.seed)
+../../bin/upgradoor-controller keygen signer-pubkey > signer.pub
+cpub=$(../../bin/upgradoor-controller keygen controller-pubkey --controller-seed-file controller.seed)
 pub=$(../../bin/upgradoor key --path host.key)
 ../../bin/upgradoor-controller keygen host-cert --network dev --hostname node-1 --public-key "$pub" > host.crt
 cat > agent.yaml <<EOF

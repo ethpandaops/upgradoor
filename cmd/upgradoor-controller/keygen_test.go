@@ -46,7 +46,7 @@ func TestHostCertCertifiesThePublicKey(t *testing.T) {
 		"--hostname", "lighthouse-geth-1", "--public-key", pub)
 	require.NoError(t, err)
 
-	signer, err := runKeygen(t, "", "signer-pubkey", "--network", "devnet-1")
+	signer, err := runKeygen(t, "", "signer-pubkey")
 	require.NoError(t, err)
 
 	out, err := runKeygen(t, cert, "verify-cert", "--network", "devnet-1",
@@ -74,16 +74,18 @@ func TestHostCertRejectsInput(t *testing.T) {
 		name string
 		args []string
 	}{
-		{"no public key", []string{"--hostname", "a"}},
-		{"private key", []string{"--hostname", "a", "--public-key", identity.EncodePrivateKey(key)}},
-		{"bad hostname", []string{"--hostname", "a/b", "--public-key", pub}},
-		{"seed argument", []string{"--hostname", "a", "--public-key", pub, testSeed}},
+		{"no network", []string{"--hostname", "a", "--public-key", pub}},
+		{"no public key", []string{"--network", "n", "--hostname", "a"}},
+		{"private key", []string{"--network", "n", "--hostname", "a",
+			"--public-key", identity.EncodePrivateKey(key)}},
+		{"bad hostname", []string{"--network", "n", "--hostname", "a/b", "--public-key", pub}},
+		{"seed argument", []string{"--network", "n", "--hostname", "a", "--public-key", pub,
+			testSeed}},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			out, err := runKeygen(t, "", append([]string{"host-cert", "--network", "devnet-1"},
-				tt.args...)...)
+			out, err := runKeygen(t, "", append([]string{"host-cert"}, tt.args...)...)
 			require.Error(t, err)
 			require.Empty(t, out)
 		})
@@ -111,32 +113,38 @@ func TestSeedFromStdin(t *testing.T) {
 	t.Setenv(seedEnv, testSeed)
 	t.Setenv(controllerSeedEnv, ctrlSeed)
 
-	fromEnv, err := run("", "signer-pubkey", "--network", "devnet-1")
+	fromEnv, err := run("", "signer-pubkey")
 	require.NoError(t, err)
 
-	ctrlFromEnv, err := run("", "controller-pubkey", "--network", "devnet-1")
+	ctrlFromEnv, err := run("", "controller-pubkey")
 	require.NoError(t, err)
+
+	// The public keys do not depend on the network.
+	_, err = run("", "signer-pubkey", "--network", "devnet-1")
+	require.ErrorContains(t, err, "unknown flag")
+	_, err = run("", "controller-pubkey", "--network", "devnet-1")
+	require.ErrorContains(t, err, "unknown flag")
 
 	t.Setenv(seedEnv, "")
 	t.Setenv(controllerSeedEnv, "")
 
-	out, err := run(testSeed+"\n", "signer-pubkey", "--network", "devnet-1", "--seed-file", "-")
+	out, err := run(testSeed+"\n", "signer-pubkey", "--seed-file", "-")
 	require.NoError(t, err)
 	assert.Equal(t, fromEnv, out)
 
-	out, err = run(ctrlSeed, "controller-pubkey", "--network", "devnet-1",
+	out, err = run(ctrlSeed, "controller-pubkey",
 		"--controller-seed-file", "-")
 	require.NoError(t, err)
 	assert.Equal(t, ctrlFromEnv, out)
 
-	_, err = run(ctrlSeed, "controller-pubkey", "--network", "devnet-1", "--seed-file", "-")
+	_, err = run(ctrlSeed, "controller-pubkey", "--seed-file", "-")
 	require.ErrorContains(t, err, "is the devnet seed")
 
-	_, err = run("short", "signer-pubkey", "--network", "devnet-1", "--seed-file", "-")
+	_, err = run("short", "signer-pubkey", "--seed-file", "-")
 	require.ErrorIs(t, err, identity.ErrSeedTooShort)
 
 	t.Setenv(controllerSeedEnv, testSeed)
 
-	_, err = run(testSeed, "signer-pubkey", "--network", "devnet-1", "--seed-file", "-")
+	_, err = run(testSeed, "signer-pubkey", "--seed-file", "-")
 	require.ErrorIs(t, err, errSameSeed)
 }

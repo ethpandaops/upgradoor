@@ -81,7 +81,7 @@ type Controller struct {
 func NewController(t *testing.T, now func() time.Time) *Controller {
 	t.Helper()
 
-	signer, err := identity.DeriveSignerKey([]byte(Seed), Network)
+	signer, err := identity.DeriveSignerKey([]byte(Seed))
 	require.NoError(t, err)
 
 	c := &Controller{
@@ -417,7 +417,7 @@ func Credentials(t *testing.T) *identity.Credentials {
 func ControllerPublicKey(t *testing.T) string {
 	t.Helper()
 
-	key, err := identity.DeriveControllerKey([]byte(ControllerSeed), Network)
+	key, err := identity.DeriveControllerKey([]byte(ControllerSeed))
 	require.NoError(t, err)
 
 	return identity.EncodePublicKey(identity.PublicKey(key))
@@ -427,7 +427,7 @@ func ControllerPublicKey(t *testing.T) string {
 func AnswerSigner(t *testing.T, controllerSeed string) *identity.AnswerSigner {
 	t.Helper()
 
-	key, err := identity.DeriveControllerKey([]byte(controllerSeed), Network)
+	key, err := identity.DeriveControllerKey([]byte(controllerSeed))
 	require.NoError(t, err)
 
 	signer, err := identity.NewAnswerSigner(key, Network)

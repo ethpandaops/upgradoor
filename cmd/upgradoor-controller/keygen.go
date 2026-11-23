@@ -13,9 +13,8 @@ import (
 )
 
 // The two seeds and where each is read from. They are different secrets and
-// are never read from the same place: the devnet seed yields the signer key
-// of one devnet, the controller seed (one per group of devnets) the
-// controller key of each devnet of the group.
+// are never read from the same place: the devnet seed yields the signer key,
+// the controller seed the controller key. Each is shared by all devnets.
 const (
 	seedEnv            = "UPGRADOOR_SEED"
 	seedFlag           = "seed-file"
@@ -39,32 +38,29 @@ func newKeygenCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use: "keygen",
 		Short: "Derive the signer key and issue host certificates from the devnet seed, " +
-			"and controller keys from the controller seed",
+			"and the controller key from the controller seed",
 		Long: "Derive keys and issue host certificates. There are two seeds, and they are\n" +
 			"different secrets:\n\n" +
-			"  the devnet seed      one per devnet: signer-pubkey, host-cert\n" +
+			"  the devnet seed      host certificates: signer-pubkey, host-cert\n" +
 			"                       --" + seedFlag + " or " + seedEnv + "\n" +
-			"  the controller seed  one per devnet group: controller-pubkey\n" +
+			"  the controller seed  controller answers: controller-pubkey\n" +
 			"                       --" + controllerSeedFlag + " or " + controllerSeedEnv + "\n\n" +
+			"Each seed is shared by all devnets, and the public keys do not depend on the\n" +
+			"network: the network is a claim of each host certificate and each answer.\n\n" +
 			"A command reads only its own seed and refuses the other one's flag. Neither\n" +
 			"seed is ever taken from an argument. Both are used as raw bytes, exactly as\n" +
 			"stored in sops (a single trailing newline of a seed file is dropped), and\n" +
 			"must be at least 32 bytes long. A seed file of - is standard input:\n\n" +
 			"  sops -d --extract '[\"secret_upgradoor_seed\"]' all.sops.yaml |\n" +
 			"    docker run --rm -i ghcr.io/ethpandaops/upgradoor keygen signer-pubkey \\\n" +
-			"    --network <network> --" + seedFlag + " -",
+			"    --" + seedFlag + " -",
 	}
 
 	cmd.PersistentFlags().StringVar(&seedFile, seedFlag, "",
 		"file holding the devnet seed (signer-pubkey, host-cert); - reads standard input")
-	cmd.PersistentFlags().StringVar(&network, "network", "", "network name (required)")
 
 	// seed reads the devnet seed.
 	seed := func(stdin io.Reader) ([]byte, error) {
-		if network == "" {
-			return nil, errors.New("--network is required")
-		}
-
 		s, err := readSeed(stdin, seedFile, seedEnv, seedFlag, "devnet seed")
 		if err != nil {
 			return nil, err
@@ -81,10 +77,6 @@ func newKeygenCmd() *cobra.Command {
 
 	// controllerSeed reads the controller seed, and never the devnet seed.
 	controllerSeed := func(stdin io.Reader) ([]byte, error) {
-		if network == "" {
-			return nil, errors.New("--network is required")
-		}
-
 		if seedFile != "" {
 			return nil, errors.New("--" + seedFlag + " is the devnet seed: the controller key " +
 				"is derived from the controller seed (--" + controllerSeedFlag + " or " +
@@ -113,7 +105,7 @@ func newKeygenCmd() *cobra.Command {
 				return err
 			}
 
-			key, err := identity.DeriveSignerKey(s, network)
+			key, err := identity.DeriveSignerKey(s)
 			if err != nil {
 				return err
 			}
@@ -127,15 +119,15 @@ func newKeygenCmd() *cobra.Command {
 	controllerPub := &cobra.Command{
 		Use:   "controller-pubkey",
 		Short: "Print the controller public key (the agents' controller.publicKey)",
-		Long: "Print the controller public key of a network, derived from the controller\n" +
-			"seed: the agents' controller.publicKey.",
+		Long: "Print the controller public key, derived from the controller seed: the\n" +
+			"agents' controller.publicKey.",
 		RunE: func(c *cobra.Command, _ []string) error {
 			s, err := controllerSeed(c.InOrStdin())
 			if err != nil {
 				return err
 			}
 
-			key, err := identity.DeriveControllerKey(s, network)
+			key, err := identity.DeriveControllerKey(s)
 			if err != nil {
 				return err
 			}
@@ -158,6 +150,10 @@ func newKeygenCmd() *cobra.Command {
 			"by this name.",
 		Args: cobra.NoArgs,
 		RunE: func(c *cobra.Command, _ []string) error {
+			if network == "" {
+				return errors.New("--network is required")
+			}
+
 			s, err := seed(c.InOrStdin())
 			if err != nil {
 				return err
@@ -180,6 +176,7 @@ func newKeygenCmd() *cobra.Command {
 			return err
 		},
 	}
+	hostCert.Flags().StringVar(&network, "network", "", "network name (required)")
 	hostCert.Flags().StringVar(&hostname, "hostname", "", "inventory hostname (required)")
 	hostCert.Flags().StringVar(&publicKey, "public-key", "", "the host's public key (required)")
 
@@ -200,6 +197,7 @@ func newKeygenCmd() *cobra.Command {
 			return json.NewEncoder(c.OutOrStdout()).Encode(info)
 		},
 	}
+	verify.Flags().StringVar(&network, "network", "", "network name (required)")
 	verify.Flags().StringVar(&signerKey, "signer-public-key", "", "signer public key (required)")
 
 	cmd.AddCommand(signer, controllerPub, hostCert, verify)

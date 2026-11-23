@@ -180,12 +180,12 @@ func (w *world) start(ctx context.Context) error {
 		return err
 	}
 
-	signer, err := identity.DeriveSignerKey(w.seed, network)
+	signer, err := identity.DeriveSignerKey(w.seed)
 	if err != nil {
 		return err
 	}
 
-	ctlKey, err := identity.DeriveControllerKey([]byte(controllerSeed), network)
+	ctlKey, err := identity.DeriveControllerKey([]byte(controllerSeed))
 	if err != nil {
 		return err
 	}

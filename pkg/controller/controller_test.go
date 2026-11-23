@@ -63,8 +63,8 @@ func TestLoadAnswerSigner(t *testing.T) {
 		return path
 	}
 
-	publicKey := func(seed string, net string) string {
-		key, err := identity.DeriveControllerKey([]byte(seed), net)
+	publicKey := func(seed string) string {
+		key, err := identity.DeriveControllerKey([]byte(seed))
 		require.NoError(t, err)
 
 		return identity.EncodePublicKey(identity.PublicKey(key))
@@ -80,18 +80,16 @@ func TestLoadAnswerSigner(t *testing.T) {
 		return identity.EncodePublicKey(signer.PublicKey())
 	}
 
-	// The controller derives the key of its own network, the
-	// one 'keygen controller-pubkey' gives the agents. A trailing newline of
-	// the file is not part of the seed.
+	// The controller derives the key 'keygen controller-pubkey' gives the
+	// agents. A trailing newline of the file is not part of the seed.
 	good := write("controller.seed", controllerSeed+"\n")
 
-	assert.Equal(t, publicKey(controllerSeed, network),
+	assert.Equal(t, publicKey(controllerSeed),
 		signerKey(t, &Config{Network: network, ControllerSeedFile: good}))
 
-	// Every devnet of a group has a key of its own from the one seed.
+	// The key is the same for every devnet.
 	other := signerKey(t, &Config{Network: "testnet-devnet-1", ControllerSeedFile: good})
-	assert.Equal(t, publicKey(controllerSeed, "testnet-devnet-1"), other)
-	assert.NotEqual(t, publicKey(controllerSeed, network), other)
+	assert.Equal(t, publicKey(controllerSeed), other)
 
 	// The opt-out is the only way to run without a seed.
 	signer, err := loadAnswerSigner(&Config{Network: network, AllowUnsignedAgentAnswers: true})

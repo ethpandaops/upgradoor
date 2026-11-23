@@ -96,7 +96,7 @@ type CertificateSpec struct {
 // certificate of hostKey as a compact JWT. The output is deterministic: the
 // same inputs always yield the same bytes.
 func IssueCertificate(seed []byte, hostKey *mldsa.PublicKey, spec CertificateSpec) (string, error) {
-	signer, err := DeriveSignerKey(seed, spec.Network)
+	signer, err := DeriveSignerKey(seed)
 	if err != nil {
 		return "", err
 	}

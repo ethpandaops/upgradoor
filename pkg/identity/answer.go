@@ -11,7 +11,7 @@ import (
 )
 
 const (
-	infoControllerPrefix = "upgradoor/controller/"
+	infoController = "upgradoor/controller"
 
 	// answerHeader is the fixed JOSE header of an answer signature.
 	answerHeader = `{"alg":"` + Algorithm + `","typ":"upgradoor-answer+jwt"}`
@@ -22,22 +22,14 @@ const (
 // is checked against. An agent acts on nothing of such an answer.
 var ErrBadAnswer = errors.New("identity: controller answer refused")
 
-// DeriveControllerKey derives the controller key of one network, with which
-// that network's controller signs its answers to agents.
+// DeriveControllerKey derives the controller key, with which every
+// controller signs its answers to agents.
 //
-// controllerSeed is the controller seed: the secret of one group of devnets
-// from which the controller of each of its networks derives its own key at
-// start, and from which whoever issues the agents' configuration derives the
-// public half. It is not the devnet seed the signer and host keys come from.
-// The network name in the derivation gives every devnet of the group its
-// own key. Like the devnet seed it is used as raw bytes and must be at least
-// MinSeedLength long.
-func DeriveControllerKey(controllerSeed []byte, network string) (*mldsa.PrivateKey, error) {
-	if err := ValidateName(network); err != nil {
-		return nil, err
-	}
-
-	return derive(controllerSeed, infoControllerPrefix+network)
+// controllerSeed is the controller seed, shared by all devnets. It is not the
+// devnet seed the signer key comes from. Like the devnet seed it is used as
+// raw bytes and must be at least MinSeedLength long.
+func DeriveControllerKey(controllerSeed []byte) (*mldsa.PrivateKey, error) {
+	return derive(controllerSeed, infoController)
 }
 
 // KeyFingerprint is the lower-case hex SHA-256 of a public key's bytes. It

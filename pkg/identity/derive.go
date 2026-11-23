@@ -3,11 +3,12 @@
 // with which a host authenticates to the controller, and the answer
 // signature with which the controller authenticates to the host.
 //
-// There are two seeds, and they are different secrets. The devnet seed, one
-// per devnet, yields the signer key of that devnet. The controller seed, one
-// per group of devnets (one devnet repository), yields the controller key of
-// each devnet of the group. A function takes the one or the other, never
-// both. A host key is generated on its host (GenerateHostKey).
+// There are two seeds, and they are different secrets, each shared by all
+// devnets. The devnet seed yields the signer key of the host certificates,
+// the controller seed the controller key that signs answers. Neither key
+// depends on the network: the network is a claim of the certificate and of
+// each answer. A function takes the one seed or the other, never both. A host
+// key is generated on its host (GenerateHostKey).
 //
 // Keys and signatures are ML-DSA-44 (FIPS 204), a post-quantum scheme.
 // Signatures are deterministic: the same input gives the same certificate.
@@ -35,7 +36,7 @@ const (
 	// MinSeedLength is the minimum accepted seed length in bytes.
 	MinSeedLength = 32
 
-	infoSignerPrefix = "upgradoor/signer/"
+	infoSigner = "upgradoor/signer"
 )
 
 var (
@@ -51,8 +52,8 @@ var (
 )
 
 // nameRe is the character set allowed for network names, hostnames and roles.
-// It excludes '/' (the HKDF info separator) and everything that would need
-// JSON escaping, which keeps the certificate encoding trivially canonical.
+// It excludes everything that would need JSON escaping, which keeps the
+// certificate encoding trivially canonical.
 var nameRe = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,252}$`)
 
 // ValidateName reports whether s is usable as a network, host or role name.
@@ -106,16 +107,12 @@ func ReadSeed(r io.Reader) ([]byte, error) {
 	return []byte(seed), nil
 }
 
-// DeriveSignerKey derives the per-network certificate signer key.
+// DeriveSignerKey derives the certificate signer key from the devnet seed.
 //
 // The seed is used as HKDF input keying material exactly as given: the raw
 // bytes of the sops value, no decoding and no trimming.
-func DeriveSignerKey(seed []byte, network string) (*mldsa.PrivateKey, error) {
-	if err := ValidateName(network); err != nil {
-		return nil, err
-	}
-
-	return derive(seed, infoSignerPrefix+network)
+func DeriveSignerKey(seed []byte) (*mldsa.PrivateKey, error) {
+	return derive(seed, infoSigner)
 }
 
 // GenerateHostKey returns a new random host key.

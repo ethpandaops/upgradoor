@@ -90,16 +90,16 @@ func TestAgentAuthentication(t *testing.T) {
 		identity.CertificateSpec{Network: controllertest.Network, Hostname: "lighthouse-geth-1"})
 	require.NoError(t, err)
 
-	// A certificate for another network, signed by this network's signer:
-	// the signature is good, the network claim is not.
-	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed), controllertest.Network)
+	// A certificate for another network: the signer is the same for every
+	// network, so the signature is good, the network claim is not.
+	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed))
 	require.NoError(t, err)
 
 	wrongNetCert, err := identity.SignCertificate(signer, identity.PublicKey(hostKey),
 		identity.CertificateSpec{Network: "other-devnet-1", Hostname: "lighthouse-geth-1"})
 	require.NoError(t, err)
 
-	// The same host name, issued under another network's seed-derived signer.
+	// The same host name, an agent of another network.
 	foreign := controllertest.NewAgent(t, identity.CertificateSpec{
 		Network: "other-devnet-1", Hostname: "lighthouse-geth-1",
 	})
@@ -150,7 +150,7 @@ func TestAgentAuthentication(t *testing.T) {
 		{
 			name:     "identity of another network",
 			agent:    foreign,
-			contains: "bad certificate",
+			contains: "another network",
 		},
 		{
 			name: "proof signed by another host",
@@ -1105,7 +1105,7 @@ func signedCall(
 }
 
 func TestAgentAnswersAreSigned(t *testing.T) {
-	key, err := identity.DeriveControllerKey([]byte("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"), controllertest.Network)
+	key, err := identity.DeriveControllerKey([]byte("fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"))
 	require.NoError(t, err)
 
 	signer, err := identity.NewAnswerSigner(key, controllertest.Network)

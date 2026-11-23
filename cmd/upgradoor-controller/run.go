@@ -56,7 +56,7 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 		"signer public key (output of 'keygen signer-pubkey')")
 	f.StringVar(&cfg.ControllerSeedFile, "controller-seed-file", "",
 		"file holding the controller seed (never the devnet seed): "+
-			"the key that signs answers to agents is derived from it for --network")
+			"the key that signs answers to agents is derived from it")
 	f.BoolVar(&cfg.AllowUnsignedAgentAnswers, "allow-unsigned-agent-answers", false,
 		"run without a controller seed: answers to agents are not signed (development only)")
 	f.StringArrayVar(&cfg.PublicURLs, "public-url", nil,

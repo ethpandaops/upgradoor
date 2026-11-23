@@ -96,13 +96,13 @@ docker run -d --name "$id-beacon" --network "$net" --label upgradoor.test=reboot
 
 seed=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 export UPGRADOOR_SEED=$seed
-signer=$("$work/upgradoor-controller" keygen signer-pubkey --network "$network")
+signer=$("$work/upgradoor-controller" keygen signer-pubkey)
 # The controller signs its answers with a key it derives from the controller
 # seed, a secret of its own; the agents accept only that key. The file is
 # read by another user inside the container, and this is a test seed.
 head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$work/controller.seed"
 chmod 0444 "$work/controller.seed"
-controller_pub=$("$work/upgradoor-controller" keygen controller-pubkey --network "$network" \
+controller_pub=$("$work/upgradoor-controller" keygen controller-pubkey \
     --controller-seed-file "$work/controller.seed")
 
 # Open API (no auth provider): this is a closed test network.

@@ -55,7 +55,7 @@ type fakeController struct {
 func newFakeController(t *testing.T, clk *clock) *fakeController {
 	t.Helper()
 
-	signerKey, err := identity.DeriveSignerKey([]byte(testSeed), testNetwork)
+	signerKey, err := identity.DeriveSignerKey([]byte(testSeed))
 	require.NoError(t, err)
 
 	f := &fakeController{
@@ -140,7 +140,7 @@ func (f *fakeController) serve(w http.ResponseWriter, r *http.Request) {
 func answerSigner(t *testing.T, controllerSeed string) *identity.AnswerSigner {
 	t.Helper()
 
-	key, err := identity.DeriveControllerKey([]byte(controllerSeed), testNetwork)
+	key, err := identity.DeriveControllerKey([]byte(controllerSeed))
 	require.NoError(t, err)
 
 	signer, err := identity.NewAnswerSigner(key, testNetwork)
@@ -301,6 +301,24 @@ func TestAnswersNotOfTheControllerAreNotActedOn(t *testing.T) {
 				}
 			},
 			reason: "it is for another host",
+		},
+		{
+			name: "answer of another network's controller",
+			forge: func(t *testing.T) forgeFunc {
+				t.Helper()
+
+				// The same controller key signs for every network.
+				key, err := identity.DeriveControllerKey([]byte(testControllerSeed))
+				require.NoError(t, err)
+
+				signer, err := identity.NewAnswerSigner(key, "other-devnet-1")
+				require.NoError(t, err)
+
+				return func(answer []byte, host, proofID string) []byte {
+					return sign(t, signer, host, proofID, answer)
+				}
+			},
+			reason: "it is for another network",
 		},
 		{
 			name: "body altered in transit",

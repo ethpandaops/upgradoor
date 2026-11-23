@@ -26,7 +26,7 @@ func newFixture(t *testing.T) *fixture {
 	seed := []byte(testSeed)
 	f := &fixture{now: time.Unix(1800000000, 0)}
 
-	signer, err := DeriveSignerKey(seed, "net")
+	signer, err := DeriveSignerKey(seed)
 	require.NoError(t, err)
 
 	f.signer = PublicKey(signer)
@@ -170,17 +170,8 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 		proof, _, err := creds.Proof("POST", fixtureURL, nil, f.now)
 		require.NoError(t, err)
 
-		// Signed by net2's signer: fails the signature check under net's key.
+		// The signer is the same for every network: the claim decides.
 		_, _, err = f.verifier.Verify(cert, proof, f.request(""))
-		require.ErrorIs(t, err, ErrBadCertificate)
-
-		// Signed by net's signer but claiming net2.
-		signer, err := DeriveSignerKey(seed, "net")
-		require.NoError(t, err)
-		cross, err := SignCertificate(signer, PublicKey(key),
-			CertificateSpec{Network: "net2", Hostname: "host-1"})
-		require.NoError(t, err)
-		_, _, err = f.verifier.Verify(cross, proof, f.request(""))
 		require.ErrorIs(t, err, ErrWrongNetwork)
 	})
 

@@ -14,17 +14,17 @@ import (
 // testControllerSeed is a controller seed: another secret than testSeed.
 const testControllerSeed = "fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"
 
-func controllerKey(t *testing.T, network string) *mldsa.PrivateKey {
+func controllerKey(t *testing.T) *mldsa.PrivateKey {
 	t.Helper()
 
-	key, err := DeriveControllerKey([]byte(testControllerSeed), network)
+	key, err := DeriveControllerKey([]byte(testControllerSeed))
 	require.NoError(t, err)
 
 	return key
 }
 
 func TestAnswerEncoding(t *testing.T) {
-	key := controllerKey(t, "net")
+	key := controllerKey(t)
 
 	signer, err := NewAnswerSigner(key, "net")
 	require.NoError(t, err)
@@ -65,7 +65,7 @@ func TestAnswerVerify(t *testing.T) {
 		body    = `{"lease":{"id":"l1"}}`
 	)
 
-	key := controllerKey(t, "net")
+	key := controllerKey(t)
 	pub := PublicKey(key)
 
 	signer, err := NewAnswerSigner(key, "net")
@@ -82,7 +82,7 @@ func TestAnswerVerify(t *testing.T) {
 
 	good := signedBy(t, signer, host, request, body)
 
-	otherSeed, err := DeriveControllerKey([]byte(testSeed), "net")
+	otherSeed, err := DeriveControllerKey([]byte(testSeed))
 	require.NoError(t, err)
 	otherKey, err := NewAnswerSigner(otherSeed, "net")
 	require.NoError(t, err)
@@ -131,7 +131,7 @@ func TestAnswerVerify(t *testing.T) {
 			reason: "for another host",
 		},
 		{
-			name: "answer of another network's controller", request: request,
+			name: "answer of another network's controller (same key)", request: request,
 			answer: signedBy(t, otherNet, host, request, body),
 			reason: "for another network",
 		},

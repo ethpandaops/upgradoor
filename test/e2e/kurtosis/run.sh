@@ -200,11 +200,11 @@ done
 say "controller and agents"
 seed=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n')
 export UPGRADOOR_SEED=$seed
-signer=$("$work/upgradoor-controller" keygen signer-pubkey --network "$network")
+signer=$("$work/upgradoor-controller" keygen signer-pubkey)
 # The controller signs its answers with a key it derives from the controller
 # seed, a secret of its own; the agents accept only that key.
 (umask 077 && head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n' >"$work/controller.seed")
-controller_pub=$("$work/upgradoor-controller" keygen controller-pubkey --network "$network" \
+controller_pub=$("$work/upgradoor-controller" keygen controller-pubkey \
     --controller-seed-file "$work/controller.seed")
 
 "$work/authstub" --listen "127.0.0.1:$auth_port" >"$work/authstub.log" 2>&1 &

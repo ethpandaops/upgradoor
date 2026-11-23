@@ -53,7 +53,7 @@ func newHarness(t *testing.T, mod func(*Options)) *harness {
 		reg:     prometheus.NewRegistry(),
 	}
 
-	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed), controllertest.Network)
+	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed))
 	require.NoError(t, err)
 
 	log := logrus.New()
