@@ -2,29 +2,24 @@
 
 previous_tag="${1}"
 
-# Get merge commits only
 if [ "$previous_tag" ]; then
     merge_commits=$(git log --oneline --merges --first-parent --no-decorate $previous_tag..HEAD)
 else 
     merge_commits=$(git log --oneline --merges --first-parent --no-decorate)
 fi
 
-# Extract PR numbers from merge commits
 pr_numbers=$(echo "$merge_commits" | grep -oP '(?<=Merge pull request #)\d+' | sort -u)
 
-# Convert PR numbers to array
 pr_array=($pr_numbers)
 
 # Fetch PR details from GitHub API using GraphQL for batching
 pr_details=""
 if [ ${#pr_array[@]} -gt 0 ]; then
-    # Split repository into owner and name
     IFS='/' read -r repo_owner repo_name <<< "$GITHUB_REPOSITORY"
     
     # Process PRs in batches of 50 (GraphQL limit)
     batch_size=50
     for ((i=0; i<${#pr_array[@]}; i+=batch_size)); do
-        # Build GraphQL query for batch
         graphql_query="query {"
         batch_end=$((i + batch_size))
         if [ $batch_end -gt ${#pr_array[@]} ]; then
@@ -37,14 +32,12 @@ if [ ${#pr_array[@]} -gt 0 ]; then
         done
         graphql_query="${graphql_query} }"
         
-        # Execute GraphQL query
         graphql_response=$(curl -s -X POST \
             -H "Authorization: bearer $GITHUB_TOKEN" \
             -H "Content-Type: application/json" \
             -d "{\"query\": \"$(echo $graphql_query | sed 's/"/\\"/g')\"}" \
             "https://api.github.com/graphql")
         
-        # Parse response
         if [ -f ./pr-details.txt ]; then
             rm ./pr-details.txt
         fi
@@ -60,7 +53,6 @@ if [ ${#pr_array[@]} -gt 0 ]; then
                 if [ -n "$pr_title" ]; then
                     echo "PR #${pr_num}: ${pr_title} (by @${pr_user})" >> ./pr-details.txt
                     if [ -n "$pr_body" ] && [ "$pr_body" != "null" ]; then
-                        # Remove HTML tags and limit to 512 characters
                         pr_body_clean=$(echo "$pr_body" | sed -e 's/<[^>]*>//g' -e 's/&nbsp;/ /g' -e 's/&quot;/"/g' -e 's/&amp;/\&/g' -e 's/&lt;/</g' -e 's/&gt;/>/g' | tr '\n' ' ' | sed 's/  */ /g' | cut -c1-512)
                         if [ -n "$pr_body_clean" ]; then
                             echo "  ${pr_body_clean}..." >> ./pr-details.txt
@@ -79,7 +71,6 @@ if [ ${#pr_array[@]} -eq 0 ]; then
     git log --no-merges --format='Commit %h: %s%n%b' ${previous_tag:+$previous_tag..HEAD} | head -c 16000 > ./pr-details.txt
 fi
 
-# Create a minified changelog combining merge commits and PR details
 minified_changelog=$(cat <<EOF
 Merged Pull Requests:
 ${merge_commits}
@@ -93,8 +84,6 @@ rm ./pr-details.txt
 # Sanitize the changelog by escaping backticks to prevent command execution
 changelog_safe="${minified_changelog//\`/\\\`}"
 
-# Fetch previous release notes in a more readable format, removing everything after <details>
-# Only include non-prerelease and non-draft versions, limit to 5 releases
 previous_releases=""
 release_count=0
 while IFS= read -r release; do
@@ -141,9 +130,6 @@ Previous release notes for context:
 $previous_release_notes
 EOF
 )
-
-#echo "$conv"
-#exit 0
 
 conv_json=$(echo "$conv" | jq -R -s '{"model": "'"$OPENROUTER_MODEL"'", "messages": [{"role": "user", "content": .}]}')
 conv_response=$(curl -X POST -H "Authorization: Bearer $OPENROUTER_TOKEN" -H "Content-Type: application/json" -d "$conv_json" https://openrouter.ai/api/v1/chat/completions)
