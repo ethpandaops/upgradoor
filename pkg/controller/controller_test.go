@@ -23,6 +23,7 @@ func TestParseDefaultSettings(t *testing.T) {
 		"readyAttestations=3", "readyStableFor=5m", "minPeers=5", "paused=true", `policyImage="manual"`,
 		"readyPeerShare=0.25", "pauseAfterCanaryImage=true",
 		`policyClients={"lighthouse":"auto"}`, `actionPolicies={"security-upgrades":"auto"}`,
+		`policyKinds={"el":"manual","snooper-el":"auto","other":"manual"}`,
 	})
 	require.NoError(t, err)
 	assert.InDelta(t, 25.0, s.MaxUnavailablePercent, 0)
@@ -38,11 +39,15 @@ func TestParseDefaultSettings(t *testing.T) {
 	assert.False(t, s.PauseAfterCanaryReboot)
 	assert.Equal(t, fleet.ClientPolicies{"lighthouse": fleet.PolicyAuto}, s.PolicyClients)
 	assert.Equal(t, fleet.ActionPolicies{"security-upgrades": fleet.PolicyAuto}, s.ActionPolicies)
+	assert.Equal(t, fleet.KindPolicies{
+		"el": fleet.PolicyManual, "snooper-el": fleet.PolicyAuto, fleet.KindOther: fleet.PolicyManual,
+	}, s.PolicyKinds)
 
 	for _, bad := range []string{
 		"nokey", "=1", "unknown=1", "leaseTtl=30", "maxUnavailablePercent=200",
 		"policyImage=sometimes", "readyAttestations=many", "readyAttestations=0", "readyStableFor=1h", "minPeers=0",
 		"readyPeerShare=2", "readyPeerShare=half", "pauseAfterCanaryImage=sometimes",
+		`policyKinds={"none":"manual"}`, `policyKinds={"cl":"sometimes"}`, `policyKinds=["cl"]`,
 	} {
 		_, err := ParseDefaultSettings([]string{bad})
 		require.Error(t, err, bad)

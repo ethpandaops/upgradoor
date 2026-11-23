@@ -157,6 +157,8 @@ func hostActionRefusal(
 		return reasonOffline
 	case h.Held():
 		return h.HeldReason()
+	case h.Incompatible() != "":
+		return h.Incompatible()
 	case hostStale(h, now, since, settings.HostStaleAfter.Std()):
 		return reasonAgentSilent
 	default:

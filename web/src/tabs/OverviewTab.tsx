@@ -495,7 +495,11 @@ function LeaseItem({ lease, rollouts }: { lease: Lease; rollouts: readonly Rollo
         </span>
       </div>
       <LeaseProgress lease={lease} />
-      {title && <p className="truncate text-xs/5 text-muted">{title}</p>}
+      {title && (
+        <p title={title} className="truncate text-xs/5 text-muted">
+          {title}
+        </p>
+      )}
       <p
         title={note}
         className={cx('truncate text-xs/5', lease.error || lease.operation?.error ? 'text-danger' : 'text-muted')}
@@ -594,6 +598,7 @@ function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (inte
       );
       break;
     case 'gate':
+    case 'incompatible':
     case 'silent':
     case 'verb':
       break;
@@ -606,7 +611,7 @@ function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (inte
         className={cx('mt-1.5 size-2 shrink-0 rounded-full', item.tone === 'danger' ? 'bg-danger-solid' : 'bg-warning')}
       />
       <div className="flex min-w-0 grow flex-col gap-1">
-        <p className="text-sm/6 font-medium">{item.title}</p>
+        <p className="text-sm/6 font-medium wrap-anywhere">{item.title}</p>
         <p className="text-xs/5 text-muted">{item.detail}</p>
         {item.hosts.length > 0 && item.kind !== 'held' && item.hosts.length <= 6 && (
           <p className="text-xs/5 text-faint">{item.hosts.join(', ')}</p>

@@ -104,14 +104,23 @@ func TestSettingsCanaryPauseAndPeerShare(t *testing.T) {
 
 func TestSettingsClientPolicies(t *testing.T) {
 	s := DefaultSettings()
-	assert.Equal(t, PolicyAuto, s.ImagePolicy("geth"), "a client nobody set follows policyImage")
+	p, src := s.ImagePolicy("geth", protocol.KindEL)
+	assert.Equal(t, PolicyAuto, p, "a client nobody set follows policyImage")
+	assert.Equal(t, PolicySourceDefault, src)
 
 	s.PolicyImage = PolicyManual
 	s.PolicyClients = ClientPolicies{"geth": PolicyAuto}
 	require.NoError(t, s.Validate())
-	assert.Equal(t, PolicyAuto, s.ImagePolicy("geth"))
-	assert.Equal(t, PolicyManual, s.ImagePolicy("lighthouse"))
-	assert.Equal(t, PolicyManual, s.ImagePolicy(""), "a container without a client")
+
+	p, src = s.ImagePolicy("geth", protocol.KindEL)
+	assert.Equal(t, PolicyAuto, p)
+	assert.Equal(t, PolicySourceClient, src)
+
+	p, _ = s.ImagePolicy("lighthouse", protocol.KindCL)
+	assert.Equal(t, PolicyManual, p)
+
+	p, _ = s.ImagePolicy("", "")
+	assert.Equal(t, PolicyManual, p, "a container without a client")
 
 	raw, err := json.Marshal(DefaultSettings())
 	require.NoError(t, err)
@@ -131,6 +140,64 @@ func TestSettingsClientPolicies(t *testing.T) {
 
 	s.PolicyClients = ClientPolicies{"geth": "sometimes"}
 	require.ErrorContains(t, s.Validate(), "invalid policy")
+}
+
+func TestSettingsKindPolicies(t *testing.T) {
+	s := DefaultSettings()
+	assert.Nil(t, s.PolicyKinds, "none by default")
+
+	s.PolicyClients = ClientPolicies{"geth": PolicyAuto}
+	s.PolicyKinds = KindPolicies{"el": PolicyManual, "cl": PolicyManual, "snooper-el": PolicyManual, KindOther: PolicyManual}
+	require.NoError(t, s.Validate())
+
+	for _, tt := range []struct {
+		name   string
+		team   string
+		kind   protocol.ContainerKind
+		policy Policy
+		source PolicySource
+	}{
+		{"the client's policy before the kind's", "geth", protocol.KindEL, PolicyAuto, PolicySourceClient},
+		{"a client without one: the kind's", "besu", protocol.KindEL, PolicyManual, PolicySourceKind},
+		{"no team: the kind's", "", "snooper-el", PolicyManual, PolicySourceKind},
+		{"unlabelled: other", "", "", PolicyManual, PolicySourceKind},
+		{"a kind not listed: policyImage", "lighthouse", protocol.KindVC, PolicyAuto, PolicySourceDefault},
+		{"an unknown kind: policyImage", "", "custom", PolicyAuto, PolicySourceDefault},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			p, src := s.ImagePolicy(tt.team, tt.kind)
+			assert.Equal(t, tt.policy, p)
+			assert.Equal(t, tt.source, src)
+		})
+	}
+
+	group := &Rollout{Kind: RolloutGroup, ContainerKind: protocol.KindCL, Team: "lighthouse"}
+	assert.Equal(t, PolicyManual, s.RolloutPolicy(group))
+
+	pkgs := &Rollout{Kind: RolloutPackages}
+	assert.Equal(t, PolicyAuto, s.RolloutPolicy(pkgs), "packages ignore the kind policies")
+
+	raw, err := json.Marshal(DefaultSettings())
+	require.NoError(t, err)
+	assert.Contains(t, string(raw), `"policyKinds":{}`, "none is an object, never null")
+
+	var back Settings
+	require.NoError(t, json.Unmarshal([]byte(`{"policyKinds":{}}`), &back))
+	assert.Nil(t, back.PolicyKinds)
+
+	empty, same := DefaultSettings(), DefaultSettings()
+	empty.PolicyKinds = KindPolicies{}
+	assert.True(t, empty.Equal(&same))
+	assert.False(t, s.Equal(&same))
+
+	for msg, kinds := range map[string]KindPolicies{
+		"is not a kind name": {"EL": PolicyAuto},
+		"\"none\" is not":    {"none": PolicyAuto},
+		"invalid policy":     {"cl": "sometimes"},
+	} {
+		s.PolicyKinds = kinds
+		require.ErrorContains(t, s.Validate(), msg)
+	}
 }
 
 func TestSettingsActionPolicies(t *testing.T) {

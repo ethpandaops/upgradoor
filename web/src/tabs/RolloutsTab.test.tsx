@@ -4,7 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import type { Rollout } from '../api/types';
 import { createHarness, PRIMARY, renderWithApp } from '../test/harness';
-import { RolloutTargets, RolloutsTab, waitsForApproval } from './RolloutsTab';
+import { RecentRollouts, RolloutTargets, RolloutsTab, policyText, waitsForApproval } from './RolloutsTab';
 
 const digest = (c: string) => `sha256:${c.repeat(64)}`;
 
@@ -70,6 +70,33 @@ describe('RolloutsTab, a held member', () => {
     expect(within(card).getByRole('img', { name: /^\d+ hosts: / })).toHaveAccessibleName(
       expect.stringMatching(/ waiting, 1 held/) as string
     );
+  });
+});
+
+describe('RolloutsTab, a member whose host is leased for other work', () => {
+  it('names the rollout of that lease instead of a missing queue place', async () => {
+    const h = await createHarness({ mode: 'open' });
+    await h.api.action({
+      action: 'reboot',
+      body: {
+        hosts: ['lighthouse-geth-2'],
+        all: false,
+        staggered: true,
+        force: false,
+        ignoreBudget: false,
+        reason: '',
+      },
+    });
+    renderWithApp(<RolloutsTab />, h);
+
+    const card = await screen.findByRole('article', { name: 'Manual reboot of lighthouse-geth-2' });
+    const row = within(within(card).getByRole('table', { name: /^Hosts of / }))
+      .getByText('lighthouse-geth-2')
+      .closest('tr') as HTMLElement;
+    expect(row).toHaveTextContent(
+      /host is leased for lighthouse cl: .+ \(lease verifying\); waits for that lease to end/
+    );
+    expect(row).not.toHaveTextContent('not in the queue');
   });
 });
 
@@ -197,10 +224,39 @@ describe('RolloutTargets', () => {
   });
 });
 
+describe('RecentRollouts', () => {
+  it('wraps a long title anywhere instead of keeping it on one line', () => {
+    const title = 'unlabelled: ghcr.io/ethpandaops/some-long-image-name/with-path:master-latest to 1ca62ee4ba52';
+    render(<RecentRollouts rollouts={[rollout({ title, state: 'completed' })]} leases={new Map()} />);
+
+    const cell = screen.getByRole('cell', { name: title });
+    expect(cell).toHaveClass('whitespace-normal', 'wrap-anywhere');
+    expect(cell).not.toHaveClass('whitespace-nowrap');
+  });
+});
+
 describe('waitsForApproval', () => {
   it('holds a rollout on the manual policy until it is approved', () => {
     expect(waitsForApproval(rollout({ policy: 'manual' }))).toBe(true);
     expect(waitsForApproval(rollout({ policy: 'manual', approved: true }))).toBe(false);
     expect(waitsForApproval(rollout({ policy: 'auto' }))).toBe(false);
+  });
+});
+
+describe('policyText', () => {
+  it('names the setting the policy of an image rollout comes from', () => {
+    expect(policyText(rollout({ policy: 'manual', policySource: 'kind', containerKind: 'cl' }))).toBe(
+      'policy manual (kind cl)'
+    );
+    expect(policyText(rollout({ policy: 'manual', policySource: 'kind', containerKind: undefined }))).toBe(
+      'policy manual (kind other)'
+    );
+    expect(policyText(rollout({ policy: 'manual', policySource: 'client', team: 'prysm' }))).toBe(
+      'policy manual (client prysm)'
+    );
+    expect(policyText(rollout({ policy: 'manual', policySource: 'default' }))).toBe(
+      'policy manual (default for images)'
+    );
+    expect(policyText(rollout({ kind: 'reboot', policy: 'manual' }))).toBe('policy manual');
   });
 });

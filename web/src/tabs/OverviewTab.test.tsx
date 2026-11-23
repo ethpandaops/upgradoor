@@ -104,7 +104,7 @@ describe('OverviewTab, logged in', () => {
     expect(screen.getByRole('region', { name: 'Outage budget' })).toHaveTextContent(
       /[\d.]+% of 10% validators offline/
     );
-    expect(screen.getByRole('region', { name: 'Scheduler' })).toHaveTextContent('1 in progress · 3 up next · 7 stuck');
+    expect(screen.getByRole('region', { name: 'Scheduler' })).toHaveTextContent('1 in progress · 3 up next · 8 stuck');
 
     // Up next holds only what waits and starts by itself, in queue order.
     const next = screen.getByRole('region', { name: 'Up next' });

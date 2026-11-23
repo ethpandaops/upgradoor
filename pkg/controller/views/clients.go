@@ -94,11 +94,13 @@ type ClientImage struct {
 type ClientView struct {
 	Name  string      `json:"name"`
 	Layer ClientLayer `json:"layer"`
-	// Policy is the image policy the client's rollouts answer to; PolicySet
-	// is false when that is the default, DefaultPolicy (policyImage).
-	Policy        fleet.Policy `json:"policy"`
-	PolicySet     bool         `json:"policySet"`
-	DefaultPolicy fleet.Policy `json:"defaultPolicy"`
+	// Policy is the client's own image policy (policyClients); PolicySet is
+	// false and Policy empty when it has none. DefaultPolicies is what the
+	// image rollouts of each kind of the client answer to without one
+	// (fleet.Settings.KindPolicy).
+	Policy          fleet.Policy                            `json:"policy"`
+	PolicySet       bool                                    `json:"policySet"`
+	DefaultPolicies map[protocol.ContainerKind]fleet.Policy `json:"defaultPolicies"`
 	// Images are the configured image references of the client's
 	// containers, by kind and reference.
 	Images []ClientImage `json:"images"`
@@ -198,16 +200,21 @@ func NewClientIndex(hosts []HostSummary, settings *fleet.Settings) *ClientIndex 
 		slices.SortFunc(rows, func(a, b ClientHost) int { return cmp.Compare(a.Host, b.Host) })
 
 		view := ClientView{
-			Name:          name,
-			Layer:         cmp.Or(layers[name], LayerExecution),
-			Policy:        settings.ImagePolicy(name),
-			DefaultPolicy: settings.PolicyImage,
-			Hosts:         len(rows),
+			Name:  name,
+			Layer: cmp.Or(layers[name], LayerExecution),
+			Hosts: len(rows),
 		}
-		_, view.PolicySet = settings.PolicyClients[name]
+		view.Policy, view.PolicySet = settings.PolicyClients[name]
 
 		view.count(rows)
 		view.Images = clientImages(rows)
+		view.DefaultPolicies = make(map[protocol.ContainerKind]fleet.Policy, len(view.Images))
+
+		for i := range view.Images {
+			kind := view.Images[i].Kind
+			view.DefaultPolicies[kind], _ = settings.KindPolicy(kind)
+		}
+
 		view.Version = clientVersion(rows)
 
 		idx.Views = append(idx.Views, view)
@@ -541,6 +548,39 @@ func commonCommand(counts map[string]int) (command []string, hosts int) {
 
 func kindOrder(k protocol.ContainerKind) int {
 	return slices.Index([]protocol.ContainerKind{protocol.KindEL, protocol.KindCL, protocol.KindVC}, k)
+}
+
+// FleetKinds are the kinds of the managed containers the hosts report: el,
+// cl and vc first, then by name. Unlabelled containers add none.
+func FleetKinds(hosts []*fleet.Host) []protocol.ContainerKind {
+	kinds := make([]protocol.ContainerKind, 0, 8)
+
+	for _, host := range hosts {
+		if host.Status == nil {
+			continue
+		}
+
+		for i := range host.Status.Containers {
+			c := &host.Status.Containers[i]
+			if c.Managed && c.Kind != "" && !slices.Contains(kinds, c.Kind) {
+				kinds = append(kinds, c.Kind)
+			}
+		}
+	}
+
+	rank := func(k protocol.ContainerKind) int {
+		if i := kindOrder(k); i >= 0 {
+			return i
+		}
+
+		return 3
+	}
+
+	slices.SortFunc(kinds, func(a, b protocol.ContainerKind) int {
+		return cmp.Or(cmp.Compare(rank(a), rank(b)), cmp.Compare(a, b))
+	})
+
+	return kinds
 }
 
 // clientVersion is a digest of a client's host list: it differs whenever a

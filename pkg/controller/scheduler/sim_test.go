@@ -3727,7 +3727,7 @@ func (o *oracle) checkRollout(f *simFacts, r *fleet.Rollout, l *fleet.Lease, gat
 
 	switch r.Kind {
 	case fleet.RolloutGroup:
-		policy = f.settings.ImagePolicy(r.Team)
+		policy, _ = f.settings.ImagePolicy(r.Team, r.ContainerKind)
 	case fleet.RolloutPackages:
 		policy = f.settings.PolicyPackages
 	case fleet.RolloutReboot:

@@ -1,11 +1,14 @@
 package fleet
 
 import (
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 // TestEpochTimes: epochs are placed by the chain's slot phases, exactly, also
@@ -221,5 +224,21 @@ func TestHostStaleAfter(t *testing.T) {
 			h := &Host{LastSeen: now.Add(-tc.silent), SyncInterval: tc.interval}
 			assert.Equal(t, tc.want, h.Stale(now, 2*time.Minute))
 		})
+	}
+}
+
+func TestHostIncompatible(t *testing.T) {
+	h := &Host{}
+	assert.Empty(t, h.Incompatible(), "no sync yet")
+	assert.Zero(t, h.AgentProtocol())
+
+	h.Status = &protocol.SyncRequest{ProtocolVersion: protocol.Version}
+	assert.Empty(t, h.Incompatible())
+	assert.Equal(t, protocol.Version, h.AgentProtocol())
+
+	for _, v := range []int{protocol.MinVersion - 1, protocol.Version + 1} {
+		h.Status.ProtocolVersion = v
+		assert.Equal(t, fmt.Sprintf("agent protocol %d not supported (controller supports %d..%d)",
+			v, protocol.MinVersion, protocol.Version), h.Incompatible())
 	}
 }

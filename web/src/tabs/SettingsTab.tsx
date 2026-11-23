@@ -23,12 +23,16 @@ import { ActionPolicies } from './ActionPolicies';
 import {
   GROUPS,
   POLICIES,
+  POLICY_LABEL,
   POLICY_MEANING,
   changedSettings,
   dirtyKeys,
   displayValue,
   errorField,
   fieldSpec,
+  kindRows,
+  parsePolicies,
+  policiesText,
   sameValue,
   shortValue,
   toForm,
@@ -150,7 +154,7 @@ function SettingsEditor({
       */}
       <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
         {GROUPS.map(group => (
-          <GroupCard key={group.id} group={group} field={field} formId={formId} />
+          <GroupCard key={group.id} group={group} field={field} formId={formId} kinds={list(body.kinds)} />
         ))}
       </div>
 
@@ -218,10 +222,13 @@ function GroupCard({
   group,
   field,
   formId,
+  kinds,
 }: {
   group: GroupSpec;
   field: (key: SettingKey) => FieldState;
   formId: string;
+  /** kinds are the kinds of the fleet's managed containers. */
+  kinds: readonly string[];
 }) {
   if (group.wide) {
     return (
@@ -244,6 +251,9 @@ function GroupCard({
             />
           ))}
           {group.actionPolicies && <ActionPolicies state={field('actionPolicies')} />}
+          {group.kindPolicies && (
+            <KindPolicies state={field('policyKinds')} imagePolicy={field('policyImage').value} kinds={kinds} />
+          )}
         </div>
         {group.kinds && <ClientPolicies />}
       </Card>
@@ -284,6 +294,69 @@ function ClientPolicies() {
       </a>
       .
     </p>
+  );
+}
+
+/** KindChoice is a kind's own image policy, or inherit: it follows policyImage. */
+type KindChoice = Policy | 'inherit';
+
+/**
+ * KindPolicies edits the image policy of each container kind (policyKinds):
+ * inherit (policyImage, named), automatic or manual per kind.
+ */
+function KindPolicies({
+  state,
+  imagePolicy,
+  kinds,
+}: {
+  state: FieldState;
+  imagePolicy: string;
+  kinds: readonly string[];
+}) {
+  const spec = fieldSpec('policyKinds');
+  const policies = parsePolicies(state.value) ?? {};
+  const rows = kindRows(kinds, parsePolicies(state.stored) ?? {}, policies);
+  const inherit = POLICIES.includes(imagePolicy as Policy)
+    ? POLICY_LABEL[imagePolicy as Policy].toLowerCase()
+    : imagePolicy;
+
+  const set = (kind: string, choice: KindChoice) => {
+    const next = { ...policies };
+    if (choice === 'inherit') Reflect.deleteProperty(next, kind);
+    else next[kind] = choice;
+    state.set(policiesText(next));
+  };
+
+  return (
+    <div role="group" aria-label={spec.label} className={cx(CELL, 'sm:col-span-2 xl:col-span-4')}>
+      <div className="flex min-h-6 flex-wrap items-center gap-x-2 gap-y-1">
+        <span className="text-sm/6 font-medium whitespace-nowrap">{spec.label}</span>
+        <InfoTip label={spec.label}>
+          <InfoText spec={spec} fallback={state.fallback} />
+        </InfoTip>
+      </div>
+      <ul className="flex flex-wrap gap-x-6 gap-y-2">
+        {rows.map(kind => (
+          <li key={kind} className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs/5">
+            <span className="font-mono">{kind === 'other' ? 'other (unlabelled)' : kind}</span>
+            <Segmented<KindChoice>
+              label={`Image policy of the kind ${kind}`}
+              value={policies[kind] ?? 'inherit'}
+              disabled={state.disabled}
+              onChange={choice => {
+                set(kind, choice);
+              }}
+              options={[
+                { value: 'inherit', label: `Inherit (${inherit})`, title: 'Follow Policy: images' },
+                ...POLICIES.map(p => ({ value: p, label: POLICY_LABEL[p], title: POLICY_MEANING[p] })),
+              ]}
+            />
+          </li>
+        ))}
+      </ul>
+      <Mark spec={spec} state={state} what={spec.label} />
+      <Problem state={state} />
+    </div>
   );
 }
 
@@ -478,7 +551,8 @@ function Control({ id, hintId, spec, state }: { id: string; hintId: string; spec
 
   switch (spec.kind) {
     case 'actions':
-      // The policies per host action have an editor of their own: ActionPolicies.
+    case 'kinds':
+      // The policies per host action and per kind have editors of their own.
       return null;
     case 'switch':
       return (

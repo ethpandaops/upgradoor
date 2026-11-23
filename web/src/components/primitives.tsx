@@ -132,7 +132,9 @@ export function Td({ className, tight = false, ...rest }: TdHTMLAttributes<HTMLT
   return (
     <td
       className={cx(
-        'border-b border-border py-1.5 align-top whitespace-nowrap',
+        'border-b border-border py-1.5 align-top',
+        // nowrap unless the cell sets its own white-space: in the stylesheet nowrap would win.
+        !className?.includes('whitespace-') && 'whitespace-nowrap',
         tight ? 'px-0.5' : 'px-2.5',
         className
       )}

@@ -275,6 +275,7 @@ func TestContentSecurityPolicy(t *testing.T) {
 	tests := []struct {
 		name    string
 		authURL string
+		extra   []string
 		want    []string
 		not     []string
 		wantErr bool
@@ -294,6 +295,26 @@ func TestContentSecurityPolicy(t *testing.T) {
 			},
 			not: []string{"/some/path"},
 		},
+		{
+			name:    "extra origins for scripts and requests only",
+			authURL: "https://auth.example.org",
+			extra: []string{
+				"https://menu.example.org/", "http://b.example.org:8080",
+				"https://auth.example.org", "https://menu.example.org",
+			},
+			want: []string{
+				"script-src 'self' https://auth.example.org " +
+					"http://b.example.org:8080 https://menu.example.org;",
+				"connect-src 'self' https://auth.example.org " +
+					"http://b.example.org:8080 https://menu.example.org;",
+				"frame-src 'self' https://auth.example.org;",
+				"form-action 'self' https://auth.example.org;",
+				"img-src 'self' data:;",
+			},
+		},
+		{name: "extra origin with path", extra: []string{"https://menu.example.org/x"}, wantErr: true},
+		{name: "extra origin with query", extra: []string{"https://menu.example.org/?a=1"}, wantErr: true},
+		{name: "extra origin without scheme", extra: []string{"menu.example.org"}, wantErr: true},
 		{name: "not a URL", authURL: "://nope", wantErr: true},
 		{name: "wrong scheme", authURL: "javascript:alert(1)", wantErr: true},
 		{name: "no host", authURL: "https://", wantErr: true},
@@ -304,7 +325,7 @@ func TestContentSecurityPolicy(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h, err := New(log, testFS(), Options{AuthProviderURL: tt.authURL})
+			h, err := New(log, testFS(), Options{AuthProviderURL: tt.authURL, ExtraOrigins: tt.extra})
 			if tt.wantErr {
 				require.Error(t, err)
 

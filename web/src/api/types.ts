@@ -569,7 +569,12 @@ export interface Rollout {
   hosts: List<RolloutHost>;
   /** views.RolloutView: the policy the rollout answers to (fleet.Settings.RolloutPolicy); manual waits for approval. */
   policy: Policy;
+  /** The setting that decided the policy of an image rollout; absent for every other rollout. */
+  policySource?: PolicySource;
 }
+
+/** fleet.PolicySource: policyClients, policyKinds or policyImage. */
+export type PolicySource = 'client' | 'kind' | 'default';
 
 /** fleet.LeaseState */
 export type LeaseState = 'granted' | 'running' | 'verifying' | 'released' | 'failed' | 'expired' | 'cancelled';
@@ -683,9 +688,12 @@ export interface Settings {
   /**
    * The image policy per client ("geth": "manual"); always an object. The
    * image rollouts of a client that is listed answer to its entry, the
-   * others to policyImage. It is changed with the client-policy action.
+   * others to policyKinds, then policyImage. It is changed with the
+   * client-policy action.
    */
   policyClients: Record<string, Policy>;
+  /** The image policy per container kind ("cl": "manual", "other" for unlabelled containers); always an object. A kind that is not listed follows policyImage. */
+  policyKinds: Record<string, Policy>;
   /** The policy per host action; always an object. An action that is not listed is manual. */
   actionPolicies: Record<string, Policy>;
   /** Pause a rollout of the kind when its first host is ready, until a person resumes it. */
@@ -1115,6 +1123,10 @@ export interface HostListing {
   lastSeen: string;
   stale: boolean;
   agentVersion: string;
+  /** The protocol version of the agent's last sync; 0 before the first. */
+  agentProtocol: number;
+  /** Why the controller serves the host nothing: its agent speaks a protocol version it does not support. Absent when served. */
+  incompatible?: string;
   containers: List<ContainerListing>;
   os: OSSummary;
   pending: Pending;
@@ -1213,10 +1225,11 @@ export interface ClientImage {
 export interface ClientView {
   name: string;
   layer: ClientLayer;
-  /** The image policy the client's rollouts answer to; policySet is false when that is defaultPolicy (policyImage). */
-  policy: Policy;
+  /** The client's own image policy; policySet is false and policy empty when it has none. */
+  policy: Policy | '';
   policySet: boolean;
-  defaultPolicy: Policy;
+  /** What the image rollouts of each kind of the client answer to without a policy of its own: policyKinds, else policyImage. */
+  defaultPolicies: Record<ContainerKind, Policy>;
   images: List<ClientImage>;
   /** The hosts that run the client; the counts below are those hosts by their state and add up to it. */
   hosts: number;
@@ -1409,6 +1422,8 @@ export interface Rollouts {
 export interface SettingsBody {
   settings: Settings;
   defaults: Settings;
+  /** The kinds of the fleet's managed containers: el, cl, vc first, then by name. */
+  kinds: List<ContainerKind>;
 }
 
 /** api.Audit */

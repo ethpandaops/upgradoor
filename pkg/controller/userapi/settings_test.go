@@ -18,6 +18,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/controller/views"
+	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
 // TestSettingsKeysAreExact: a key is a setting's name byte for byte, once.
@@ -68,6 +69,37 @@ func TestSettingsKeysAreExact(t *testing.T) {
 	assert.False(t, underflows(`true`))
 	assert.True(t, underflows(`1E-400`))
 	assert.True(t, underflows(`0.00001e-400`))
+}
+
+// TestSettingsKindPolicies: policyKinds goes in and comes back as a whole,
+// and the body lists the kinds of the fleet.
+func TestSettingsKindPolicies(t *testing.T) {
+	h, _ := realScheduler(t)
+
+	rec := h.sendJSON(http.MethodPut, "/api/v1/settings", `{"policyKinds":{"cl":"manual","other":"auto"}}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	want := fleet.KindPolicies{"cl": fleet.PolicyManual, fleet.KindOther: fleet.PolicyAuto}
+	assert.Equal(t, want, controllertest.DecodeJSON[views.SettingsBody](t, rec).Settings.PolicyKinds)
+	assert.Equal(t, want, controllertest.DecodeJSON[views.SettingsBody](t, h.get("/api/v1/settings")).Settings.PolicyKinds)
+
+	rec = h.sendJSON(http.MethodPut, "/api/v1/settings", `{"policyKinds":{"none":"manual"}}`)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	assert.Contains(t, controllertest.DecodeJSON[httpjson.ErrorBody](t, rec).Error, `"none" is not a kind name`)
+
+	rec = h.sendJSON(http.MethodPut, "/api/v1/settings", `{"policyKinds":{}}`)
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Nil(t, controllertest.DecodeJSON[views.SettingsBody](t, h.get("/api/v1/settings")).Settings.PolicyKinds)
+
+	fake := newHarness(t, nil)
+	fake.store.Hosts["a"] = &fleet.Host{Name: "a", Status: &protocol.SyncRequest{Containers: []protocol.Container{
+		{Name: "snooper", Managed: true, Kind: "snooper-el"},
+		{Name: "beacon", Managed: true, Kind: protocol.KindCL},
+		{Name: "tools", Managed: true},
+	}}}
+
+	body := controllertest.DecodeJSON[views.SettingsBody](t, fake.get("/api/v1/settings"))
+	assert.Equal(t, []protocol.ContainerKind{protocol.KindCL, "snooper-el"}, body.Kinds)
 }
 
 // realScheduler is a Server over the real store and scheduler, open.

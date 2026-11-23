@@ -284,6 +284,24 @@ describe('ClientsTab', () => {
     });
   });
 
+  it('names the default of each kind that inherit follows when they differ', async () => {
+    window.location.hash = '#clients/lighthouse';
+    const h = await createHarness({ mode: 'auth', loggedIn: true, profile: 'staff' });
+    await h.api.putSettings({ policyKinds: { cl: 'manual' } });
+    renderWithApp(<ClientsTab onOpenTab={vi.fn()} />, h);
+    await screen.findByRole('table', { name: 'Hosts of lighthouse' });
+
+    const policy = screen.getByRole('group', { name: 'Roll policy' });
+    expect(within(policy).getByRole('button', { name: 'Inherit (cl manual, vc auto)' })).toHaveAttribute(
+      'aria-pressed',
+      'true'
+    );
+    expect(policy).toHaveTextContent('each kind follows its own default');
+
+    await h.api.putSettings({ policyKinds: { cl: 'manual', vc: 'manual' } });
+    expect(await within(policy).findByRole('button', { name: 'Inherit (manual)' })).toBeInTheDocument();
+  });
+
   it('disables the policy switch, with the reason, for a login that may not set it', async () => {
     await open('reader', '#clients/geth');
     await screen.findByRole('table', { name: 'Hosts of geth' });
@@ -330,6 +348,9 @@ describe('ClientsTab', () => {
     expect(window.location.hash).toBe('#clients/lighthouse/rollouts');
     // The open rollout as on the Rollouts tab; the finished ones of the client below it.
     expect(screen.getByRole('article', { name: /sigp\/lighthouse/ })).toHaveTextContent('waiting for approval');
+    expect(screen.getByRole('article', { name: /sigp\/lighthouse/ })).toHaveTextContent(
+      'policy manual (client lighthouse)'
+    );
     expect(screen.getByRole('table', { name: 'Finished rollouts of lighthouse' })).toHaveTextContent('superseded');
 
     await user.click(within(callout).getByRole('button', { name: 'Approve…' }));

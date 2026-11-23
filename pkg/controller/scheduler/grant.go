@@ -504,6 +504,8 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 		return verdict{rank: rankHeld, reason: reasonOffline}, ""
 	case hv.held:
 		return verdict{rank: rankHeld, reason: hv.heldReason()}, ""
+	case hv.incompatible != "":
+		return verdict{rank: rankSilent, reason: hv.incompatible}, ""
 	case hv.stale:
 		return verdict{rank: rankSilent, reason: reasonAgentSilent}, ""
 	case hv.working():

@@ -1,6 +1,7 @@
 package userapi
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -12,6 +13,7 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
+	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/controller/views"
@@ -312,10 +314,28 @@ func (s *Handler) handleGetSettings(w http.ResponseWriter, r *http.Request, u *a
 		return
 	}
 
-	httpjson.Write(s.log, w, http.StatusOK, views.SettingsBody{
-		Settings: settings,
+	body, err := s.settingsBody(ctx, &settings)
+	if err != nil {
+		httpjson.InternalError(s.log, w, r, err)
+
+		return
+	}
+
+	httpjson.Write(s.log, w, http.StatusOK, body)
+}
+
+// settingsBody is the body of GET and PUT /api/v1/settings for settings.
+func (s *Handler) settingsBody(ctx context.Context, settings *fleet.Settings) (*views.SettingsBody, error) {
+	hosts, err := s.opts.Store.ListHosts(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	return &views.SettingsBody{
+		Settings: *settings,
 		Defaults: s.opts.DefaultSettings,
-	})
+		Kinds:    views.FleetKinds(hosts),
+	}, nil
 }
 
 // handleAudit serves GET /api/v1/audit, newest first, paged by "before".

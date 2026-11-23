@@ -9,9 +9,11 @@
 // All bodies are JSON, optionally gzip-encoded (Content-Encoding: gzip). The
 // request proof (pkg/identity) covers the body bytes as sent on the wire.
 //
-// The agents and the controller of a devnet are always the same build.
-// Nothing here provides for a peer of another one: a field is what this build
-// writes and reads, and a peer that speaks another Version is refused.
+// The controller serves agents that speak MinVersion to Version; one outside
+// that range is recorded and served nothing. A change in the meaning of a
+// field bumps Version. A newer controller never sends an agent something it
+// must honour but cannot know: agents reject unknown directive kinds and
+// refuse unknown need kinds.
 package protocol
 
 import (
@@ -23,6 +25,8 @@ import (
 const (
 	// Version is the protocol version spoken by this build.
 	Version = 1
+	// MinVersion is the oldest agent protocol version the controller serves.
+	MinVersion = 1
 
 	// PathSync is the sync endpoint (POST).
 	PathSync = "/api/agent/v1/sync"
@@ -34,6 +38,12 @@ const (
 	MaxSyncBody      = 1 << 20
 	MaxInventoryBody = 8 << 20
 )
+
+// Supported reports whether the controller serves an agent that speaks
+// protocol version v.
+func Supported(v int) bool {
+	return v >= MinVersion && v <= Version
+}
 
 // Verb is one of the things an agent can be allowed to do. The set is closed.
 type Verb string

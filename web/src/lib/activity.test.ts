@@ -54,6 +54,22 @@ describe('attentionItems', () => {
     expect(items[1]?.rollout?.id).toBe('r2');
   });
 
+  it('names the hosts with an unsupported agent apart from the silent ones', () => {
+    const reason = 'agent protocol 0 not supported (controller supports 1..1)';
+    const items = attentionItems({
+      gate: gate(true),
+      paused: false,
+      queue: [entry('old', 1, 'silent'), entry('quiet', 2, 'silent')],
+      rollouts: [],
+      hosts: [{ name: 'old', stale: false, incompatible: reason } as HostSummary],
+    });
+
+    expect(items.map(i => [i.kind, i.title, i.hosts])).toEqual([
+      ['incompatible', 'old runs an unsupported agent', ['old']],
+      ['silent', 'quiet is silent', ['quiet']],
+    ]);
+  });
+
   it('acts on the rollout the plan names, not on the first one of the host', () => {
     // h is in a rollout somebody paused (A) and in one that waits for
     // approval (B). Approving must not resume A.

@@ -19,8 +19,10 @@ upgradoor only recreates them on a newer digest of their tag (or an override).
   - canary first, then the rest; a slot is released once the host is ready
     (at head, peers, validators attesting).
 - Policies `auto` or `manual` per verb (`policyImage`, `policyPackages`,
-  `policyReboot`) and per client (`policyClients`). Settings are edited in the
-  UI; `--default-setting key=value` sets their defaults.
+  `policyReboot`), per client (`policyClients`) and per container kind
+  (`policyKinds`, `other` for unlabelled containers); an image rollout answers
+  to its client's, then its kind's, then `policyImage`. Settings are edited in
+  the UI; `--default-setting key=value` sets their defaults.
 - Web UI and API with logins from the devnet's authenticatoor. Every login
   reads a reduced view; more needs a feature of the service `upgradoor`:
 

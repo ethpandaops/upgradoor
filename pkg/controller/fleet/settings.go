@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"cmp"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -99,9 +100,13 @@ type Settings struct {
 	PolicyReboot   Policy `json:"policyReboot"`
 	// PolicyClients is the image policy per client, which is the team of
 	// the containers ("geth": "manual"). The image rollouts of a team that is
-	// listed answer to its entry; those of every other team, and of
-	// containers without a team, to PolicyImage.
+	// listed answer to its entry; the others to PolicyKinds, then PolicyImage.
 	PolicyClients ClientPolicies `json:"policyClients"`
+	// PolicyKinds is the image policy per container kind ("cl": "manual"),
+	// KindOther for unlabelled containers. It applies to the image rollouts
+	// of a kind whose team has no entry in PolicyClients; a kind that is not
+	// listed answers to PolicyImage.
+	PolicyKinds KindPolicies `json:"policyKinds"`
 	// ActionPolicies is the policy per host action name: auto opens a
 	// rollout from the hosts' reports that the action is due, manual (the
 	// default for an action that is not listed) waits for approval.
@@ -189,6 +194,55 @@ func (c *ClientPolicies) UnmarshalJSON(b []byte) error {
 // MaxPolicyClients bounds PolicyClients.
 const MaxPolicyClients = 64
 
+// KindPolicies is an image policy per container kind. In JSON it is always
+// an object: none is {}, never null.
+type KindPolicies map[string]Policy
+
+// MarshalJSON implements json.Marshaler.
+func (k KindPolicies) MarshalJSON() ([]byte, error) {
+	if k == nil {
+		return []byte("{}"), nil
+	}
+
+	return json.Marshal(map[string]Policy(k))
+}
+
+// UnmarshalJSON implements json.Unmarshaler: the object replaces what was
+// there, and an empty one is no policies at all (nil).
+func (k *KindPolicies) UnmarshalJSON(b []byte) error {
+	var m map[string]Policy
+	if err := json.Unmarshal(b, &m); err != nil {
+		return fmt.Errorf("policyKinds must be an object of kind to policy: %w", err)
+	}
+
+	if len(m) == 0 {
+		m = nil
+	}
+
+	*k = m
+
+	return nil
+}
+
+// KindOther is the PolicyKinds key of unlabelled containers.
+const KindOther = "other"
+
+// MaxPolicyKinds bounds PolicyKinds.
+const MaxPolicyKinds = 64
+
+// PolicySource says which setting decided the policy of an image rollout.
+type PolicySource string
+
+// Policy sources.
+const (
+	// PolicySourceClient: the team's entry in PolicyClients.
+	PolicySourceClient PolicySource = "client"
+	// PolicySourceKind: the kind's entry in PolicyKinds.
+	PolicySourceKind PolicySource = "kind"
+	// PolicySourceDefault: PolicyImage.
+	PolicySourceDefault PolicySource = "default"
+)
+
 // ActionPolicies is a policy per host action. In JSON it is always an
 // object: none is {}, never null.
 type ActionPolicies map[string]Policy
@@ -232,24 +286,39 @@ func (s *Settings) ActionPolicy(name string) Policy {
 	return PolicyManual
 }
 
-// ImagePolicy is the policy the image rollouts of a client answer to: the
-// client's own when one is set, PolicyImage otherwise.
-func (s *Settings) ImagePolicy(client string) Policy {
-	if p, ok := s.PolicyClients[client]; ok && client != "" {
-		return p
+// ImagePolicy is the policy the image rollouts of a team's containers of a
+// kind answer to (empty kind: unlabelled containers), and the setting it
+// comes from: the team's entry in PolicyClients, else the kind's in
+// PolicyKinds, else PolicyImage.
+func (s *Settings) ImagePolicy(team string, kind protocol.ContainerKind) (Policy, PolicySource) {
+	if p, ok := s.PolicyClients[team]; ok && team != "" {
+		return p, PolicySourceClient
 	}
 
-	return s.PolicyImage
+	return s.KindPolicy(kind)
+}
+
+// KindPolicy is the image policy of a kind without a client policy: the
+// kind's entry in PolicyKinds (KindOther for the empty kind), else
+// PolicyImage.
+func (s *Settings) KindPolicy(kind protocol.ContainerKind) (Policy, PolicySource) {
+	key := cmp.Or(string(kind), KindOther)
+	if p, ok := s.PolicyKinds[key]; ok {
+		return p, PolicySourceKind
+	}
+
+	return s.PolicyImage, PolicySourceDefault
 }
 
 // RolloutPolicy is the policy that governs a rollout: that of its kind, and
-// for an image rollout that of its team where one is set (PolicyImage for a
-// rollout without a team). A rollout a person or a host asked for answers to
-// no policy: auto.
+// for an image rollout ImagePolicy of its team and container kind. A rollout
+// a person or a host asked for answers to no policy: auto.
 func (s *Settings) RolloutPolicy(r *Rollout) Policy {
 	switch r.Kind {
 	case RolloutGroup:
-		return s.ImagePolicy(r.Team)
+		p, _ := s.ImagePolicy(r.Team, r.ContainerKind)
+
+		return p
 	case RolloutPackages:
 		return s.PolicyPackages
 	case RolloutReboot:
@@ -265,15 +334,16 @@ func (s *Settings) RolloutPolicy(r *Rollout) Policy {
 	}
 }
 
-// Equal reports whether two settings are the same; no client or action
-// policies and an empty set of them are.
+// Equal reports whether two settings are the same; no client, kind or
+// action policies and an empty set of them are.
 func (s *Settings) Equal(o *Settings) bool {
 	a, b := *s, *o
 	a.PolicyClients, b.PolicyClients = nil, nil
+	a.PolicyKinds, b.PolicyKinds = nil, nil
 	a.ActionPolicies, b.ActionPolicies = nil, nil
 
 	return reflect.DeepEqual(a, b) && maps.Equal(s.PolicyClients, o.PolicyClients) &&
-		maps.Equal(s.ActionPolicies, o.ActionPolicies)
+		maps.Equal(s.PolicyKinds, o.PolicyKinds) && maps.Equal(s.ActionPolicies, o.ActionPolicies)
 }
 
 // PauseAfterCanaryFor reports whether a rollout that serves needs of the kind
@@ -367,8 +437,8 @@ func (s *Settings) Validate() error {
 	return s.validatePolicies()
 }
 
-// validatePolicies checks the policies: the kinds', the clients' and the
-// actions'.
+// validatePolicies checks the policies: the need kinds', the clients', the
+// container kinds' and the actions'.
 func (s *Settings) validatePolicies() error {
 	for _, p := range []Policy{s.PolicyImage, s.PolicyPackages, s.PolicyReboot} {
 		if p != PolicyAuto && p != PolicyManual {
@@ -387,6 +457,20 @@ func (s *Settings) validatePolicies() error {
 
 		if p != PolicyAuto && p != PolicyManual {
 			return fmt.Errorf("policyClients: invalid policy %q for %s", p, client)
+		}
+	}
+
+	if len(s.PolicyKinds) > MaxPolicyKinds {
+		return fmt.Errorf("policyKinds lists more than %d kinds", MaxPolicyKinds)
+	}
+
+	for kind, p := range s.PolicyKinds {
+		if !protocol.ValidKind(protocol.ContainerKind(kind)) || kind == string(protocol.KindNone) {
+			return fmt.Errorf("policyKinds: %q is not a kind name", kind)
+		}
+
+		if p != PolicyAuto && p != PolicyManual {
+			return fmt.Errorf("policyKinds: invalid policy %q for %s", p, kind)
 		}
 	}
 

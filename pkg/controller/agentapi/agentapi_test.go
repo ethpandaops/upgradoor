@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -436,16 +437,6 @@ func TestAgentRequestErrors(t *testing.T) {
 			status: http.StatusBadRequest, contains: "invalid sync request",
 		},
 		{
-			name: "sync: protocol version mismatch", path: protocol.PathSync,
-			body:   `{"protocolVersion":2,"agentVersion":"x"}`,
-			status: http.StatusBadRequest, contains: "protocol version 2 is not supported",
-		},
-		{
-			name: "sync: missing protocol version", path: protocol.PathSync,
-			body:   `{"agentVersion":"x"}`,
-			status: http.StatusBadRequest, contains: "protocol version 0 is not supported",
-		},
-		{
 			name: "sync: unsupported content encoding", path: protocol.PathSync, body: "{}",
 			call: controllertest.CallOpts{Mutate: func(r *http.Request) {
 				r.Header.Set("Content-Encoding", "br")
@@ -472,6 +463,59 @@ func TestAgentRequestErrors(t *testing.T) {
 			requireAgentError(t, rec, tt.status, tt.contains)
 			assert.Nil(t, h.store.Host(agent.Name))
 			assert.Zero(t, h.sched.NudgeCount())
+		})
+	}
+}
+
+// An agent outside MinVersion..Version is recorded, so the host shows with
+// its versions, and is answered an error instead of an assignment.
+func TestSyncProtocolRange(t *testing.T) {
+	tests := []struct {
+		name    string
+		version int
+		served  bool
+	}{
+		{name: "oldest", version: protocol.MinVersion, served: true},
+		{name: "newest", version: protocol.Version, served: true},
+		{name: "older", version: protocol.MinVersion - 1},
+		{name: "newer", version: protocol.Version + 1},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			h := newHarness(t, nil)
+			agent := validatorAgent(t)
+
+			h.sched.Set(func(f *controllertest.Scheduler) {
+				f.Assignments[agent.Name] = &scheduler.Assignment{
+					Directives: []protocol.Directive{{ID: "d-1", Kind: protocol.DirectiveReboot}},
+				}
+			})
+
+			req := controllertest.SyncRequest()
+			req.ProtocolVersion = tt.version
+			req.AgentVersion = "v9"
+
+			rec := h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{})
+
+			detail := h.detail(agent.Name)
+			assert.Equal(t, "v9", detail.AgentVersion)
+			assert.Equal(t, tt.version, detail.AgentProtocol)
+			assert.Equal(t, controllertest.Epoch, detail.LastSeen)
+			assert.Equal(t, 1, h.sched.NudgeCount())
+
+			if tt.served {
+				require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+				assert.Len(t, controllertest.DecodeJSON[protocol.SyncResponse](t, rec).Directives, 1)
+				assert.Empty(t, detail.Incompatible)
+
+				return
+			}
+
+			want := fmt.Sprintf("agent protocol %d not supported (controller supports %d..%d)",
+				tt.version, protocol.MinVersion, protocol.Version)
+			requireAgentError(t, rec, http.StatusBadRequest, want)
+			assert.Equal(t, want, detail.Incompatible)
 		})
 	}
 }
@@ -1164,7 +1208,7 @@ func TestAgentAnswersAreSigned(t *testing.T) {
 		req.ProtocolVersion = protocol.Version + 1
 
 		rec, id := signedCall(t, h, agent, protocol.PathSync, req)
-		requireAgentError(t, rec, http.StatusBadRequest, "protocol version")
+		requireAgentError(t, rec, http.StatusBadRequest, "not supported")
 
 		_, err := answers.Verify(id, rec.Body.Bytes())
 		require.ErrorIs(t, err, identity.ErrBadAnswer)

@@ -90,6 +90,8 @@ export function hostState(row: HostRow): { tone: Tone; label: string; title?: st
     case 'offline':
       return { tone: 'warning', label: 'offline', detail: s.offline?.reason };
     case 'stale':
+      // The plan serves an unsupported agent nothing, as a silent one.
+      if (s.incompatible) return { tone: 'danger', label: 'incompatible', detail: s.incompatible };
       return { tone: 'warning', label: 'silent', detail: 'the agent stopped syncing' };
     case 'queued':
       return {

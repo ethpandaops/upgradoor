@@ -51,6 +51,20 @@ export function unitLabel(r: Rollout): string {
   return r.team ? `${r.team} ${r.containerKind}` : r.containerKind;
 }
 
+/** policyText names the policy of a rollout and, for an image rollout, the setting it comes from: "policy manual (kind cl)". */
+export function policyText(rollout: Rollout): string {
+  switch (rollout.policySource) {
+    case 'client':
+      return `policy ${rollout.policy} (client ${rollout.team ?? ''})`;
+    case 'kind':
+      return `policy ${rollout.policy} (kind ${rollout.containerKind || 'other'})`;
+    case 'default':
+      return `policy ${rollout.policy} (default for images)`;
+    default:
+      return `policy ${rollout.policy}`;
+  }
+}
+
 /** waitsForApproval says whether a rollout waits for a person to approve it: its policy is manual. */
 export function waitsForApproval(rollout: Rollout): boolean {
   return rollout.policy === 'manual' && !rollout.approved;
@@ -271,11 +285,35 @@ export function heldMembers(
   return out;
 }
 
-function hostProgress(h: RolloutHost, queue: ReadonlyMap<string, QueueEntry>, leases: ReadonlyMap<string, Lease>) {
+/** openLeaseOf is the host's lease that has not ended. */
+function openLeaseOf(host: string, leases: ReadonlyMap<string, Lease>): Lease | undefined {
+  for (const l of leases.values()) {
+    if (l.host === host && !LEASE_ENDED.has(l.state)) return l;
+  }
+  return undefined;
+}
+
+function hostProgress(
+  h: RolloutHost,
+  queue: ReadonlyMap<string, QueueEntry>,
+  leases: ReadonlyMap<string, Lease>,
+  titles: ReadonlyMap<string, string>
+) {
   switch (h.state) {
     case 'pending': {
       const q = queue.get(h.host);
-      if (!q) return <span className="text-muted">not in the queue</span>;
+      if (!q) {
+        // A leased host is not in the queue: the member waits for that lease to end.
+        const busy = openLeaseOf(h.host, leases);
+        if (!busy) return <span className="text-muted">not in the queue</span>;
+        const other = [...new Set(Object.values(busy.rollouts ?? {}))].map(id => titles.get(id) ?? id);
+        return (
+          <span className="text-muted">
+            host is leased for {other.length > 0 ? other.join(', ') : 'other work'} (lease {busy.state}); waits for that
+            lease to end
+          </span>
+        );
+      }
       if (q.wait === 'held') {
         return (
           <span>
@@ -351,6 +389,8 @@ export function RolloutCard({
   const held = useMemo(() => heldMembers(hosts, queue), [hosts, queue]);
   const waiting = waitsForApproval(r);
   const gate = useLive('plan').data?.gate;
+  const all = useLive('rollouts').data;
+  const titles = useMemo(() => new Map([...list(all?.open), ...list(all?.recent)].map(x => [x.id, x.title])), [all]);
   // A member waits at the closed gate for this rollout: a person may let it pass.
   const atGate =
     !r.ignoreGate &&
@@ -368,10 +408,11 @@ export function RolloutCard({
     >
       <div className="flex flex-wrap items-center gap-x-2 gap-y-1 text-xs/5">
         <RolloutKindBadge kind={r.kind} />
-        <h3 className="text-sm/6 font-semibold">{r.title}</h3>
+        <h3 className="min-w-0 text-sm/6 font-semibold wrap-anywhere">{r.title}</h3>
         <RolloutStateBadge state={r.state} />
         {r.paused && <Badge tone="warning">{pauseLabel(r.pauseReason)}</Badge>}
         {waiting && <Badge tone="warning">waiting for approval</Badge>}
+        {waiting && <span className="text-muted">{policyText(r)}</span>}
         {r.force && <Badge tone="warning">force</Badge>}
         {r.ignoreBudget && <Badge tone="danger">ignores budget</Badge>}
         {r.ignoreGate && !r.ignoreBudget && (
@@ -526,9 +567,9 @@ export function RolloutCard({
                     <HostStateBadge state={h.state} />
                   )}
                 </Td>
-                <Td className="whitespace-normal">
+                <Td className="min-w-48 whitespace-normal">
                   {/* A done member of an action rollout is its run; any other says what it waits for, then its run. */}
-                  {!(run && h.state === 'done') && hostProgress(h, queue, leases)}
+                  {!(run && h.state === 'done') && hostProgress(h, queue, leases, titles)}
                   {run && <ActionRunView run={run} label={`${r.action ?? 'the action'} on ${h.host}`} />}
                 </Td>
                 <Td>
@@ -597,7 +638,7 @@ export function RolloutTargets({ targets, label }: { targets: readonly RolloutTa
               </span>
             </>
           )}
-          <span className="font-mono">{t.image}</span>
+          <span className="min-w-0 font-mono wrap-anywhere">{t.image}</span>
           <span className="text-muted">@</span>
           <Digest value={t.digest} />
           {t.revision && (
@@ -642,7 +683,8 @@ export function RecentRollouts({
           const failed = hosts.filter(h => h.state === 'failed').length;
           return (
             <tr key={r.id} className="hover:bg-surface-hover">
-              <Td className="font-medium">{r.title}</Td>
+              {/* Image references have no spaces: they break anywhere, within a width the other columns leave. */}
+              <Td className="min-w-48 font-medium whitespace-normal wrap-anywhere xl:min-w-64">{r.title}</Td>
               <Td>
                 {r.kind === 'local'
                   ? 'host request'
@@ -662,7 +704,7 @@ export function RecentRollouts({
                 <span className="text-muted">({percentOf(done, hosts.length)})</span>
                 {failed > 0 && <span className="text-danger"> {failed} failed</span>}
               </Td>
-              <Td className="whitespace-normal text-muted">{r.reason || <Dash />}</Td>
+              <Td className="min-w-36 whitespace-normal text-muted wrap-anywhere">{r.reason || <Dash />}</Td>
               <Td>{r.createdBy}</Td>
               <Td>
                 <RelTime fixed value={r.createdAt} />

@@ -179,6 +179,38 @@ func (h *Host) Held() bool {
 	return h.Status != nil && h.Status.Hold.Active()
 }
 
+// AgentProtocol is the protocol version of the host's last sync; zero before
+// the first.
+func (h *Host) AgentProtocol() int {
+	if h.Status == nil {
+		return 0
+	}
+
+	return h.Status.ProtocolVersion
+}
+
+// Incompatible says why the controller serves the host nothing: its agent
+// speaks a protocol version outside protocol.MinVersion..protocol.Version.
+// Empty for a host it serves and one without a sync.
+func (h *Host) Incompatible() string {
+	if h.Status == nil {
+		return ""
+	}
+
+	return Unsupported(h.Status.ProtocolVersion)
+}
+
+// Unsupported says why the controller serves no agent that speaks protocol
+// version v; empty when it serves it.
+func Unsupported(v int) string {
+	if protocol.Supported(v) {
+		return ""
+	}
+
+	return fmt.Sprintf("agent protocol %d not supported (controller supports %d..%d)",
+		v, protocol.MinVersion, protocol.Version)
+}
+
 // Liveness is the attestation liveness of one host's validators in one epoch.
 type Liveness struct {
 	Host  string `json:"host"`

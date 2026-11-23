@@ -91,7 +91,7 @@ func (h *harness) refreshHealth() {
 func (h *harness) addHost(name string, weight uint64, needs ...protocol.Need) *fleet.Host {
 	host := &fleet.Host{
 		Name: name, FirstSeen: h.now.Add(-30 * 24 * time.Hour), LastSeen: h.now,
-		Status: &protocol.SyncRequest{Verbs: slices.Clone(allVerbs), Needs: needs},
+		Status: &protocol.SyncRequest{ProtocolVersion: protocol.Version, Verbs: slices.Clone(allVerbs), Needs: needs},
 	}
 
 	if weight > 0 {
@@ -421,7 +421,7 @@ func TestServiceStartStop(t *testing.T) {
 	h := newHarness(t)
 	h.store.putHost(&fleet.Host{
 		Name: "a", LastSeen: time.Now(),
-		Status: &protocol.SyncRequest{Verbs: allVerbs, Needs: []protocol.Need{packagesNeed("2.0")}},
+		Status: &protocol.SyncRequest{ProtocolVersion: protocol.Version, Verbs: allVerbs, Needs: []protocol.Need{packagesNeed("2.0")}},
 	})
 
 	svc := New(quietLog(), Options{
@@ -449,7 +449,7 @@ func TestServiceStartStop(t *testing.T) {
 
 	h.store.putHost(&fleet.Host{
 		Name: "b", LastSeen: time.Now(),
-		Status: &protocol.SyncRequest{Verbs: allVerbs, Needs: []protocol.Need{rebootNeed()}},
+		Status: &protocol.SyncRequest{ProtocolVersion: protocol.Version, Verbs: allVerbs, Needs: []protocol.Need{rebootNeed()}},
 	})
 	svc.Nudge()
 	svc.Nudge()
@@ -480,7 +480,7 @@ func TestServiceStartStop(t *testing.T) {
 		st := newFakeStore()
 		st.putHost(&fleet.Host{
 			Name: "a", LastSeen: time.Now(),
-			Status: &protocol.SyncRequest{Verbs: allVerbs, Needs: []protocol.Need{packagesNeed("2.0")}},
+			Status: &protocol.SyncRequest{ProtocolVersion: protocol.Version, Verbs: allVerbs, Needs: []protocol.Need{packagesNeed("2.0")}},
 		})
 		st.failNext = 3
 

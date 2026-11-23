@@ -1616,7 +1616,7 @@ func TestClientPolicyAction(t *testing.T) {
 
 	res, err = h.svc.SetClientPolicy(h.ctx, "alice", ClientPolicyRequest{Client: "geth"})
 	require.NoError(t, err)
-	assert.Equal(t, "image policy of geth: auto (the default)", res.Message)
+	assert.Equal(t, "image policy of geth: the default of each kind", res.Message)
 
 	got, err := h.svc.Settings(h.ctx)
 	require.NoError(t, err)

@@ -69,7 +69,7 @@ type wireField struct {
 // always count as repeating.
 var wireRefFields = []string{
 	"image", "configuredImage", "imageId", "digest", "revision", "version", "reason",
-	"state", "holdReason", "pauseReason", "readiness", "error", "agentVersion", "runningKernel",
+	"state", "holdReason", "pauseReason", "readiness", "error", "agentVersion", "incompatible", "runningKernel",
 	"newestKernel", "prettyName", "versionId", "arch", "grantedBy", "createdBy", "actor",
 	"action", "origin", "layer", "by", "after", "rollout", "target", "localReason",
 	"timingError", "health", "from", "to", "candidate", "current", "host", "description", "feature",

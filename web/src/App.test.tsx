@@ -84,7 +84,7 @@ describe('App in public mode (auth configured, logged out)', () => {
     expect(userCalls().every(c => c.authorization === 'Bearer mock-token')).toBe(true);
 
     await user.click(screen.getByRole('tab', { name: 'Rollouts' }));
-    expect(await screen.findByRole('heading', { name: /Open rollouts \(4\)/ })).toBeInTheDocument();
+    expect(await screen.findByRole('heading', { name: /Open rollouts \(5\)/ })).toBeInTheDocument();
 
     // The login ends while a private tab is shown: the overview, and no error.
     await user.click(screen.getByRole('button', { name: 'Logout' }));

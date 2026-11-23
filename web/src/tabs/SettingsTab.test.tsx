@@ -3,6 +3,7 @@ import userEvent from '@testing-library/user-event';
 import { describe, expect, it, vi } from 'vitest';
 
 import { ApiError } from '../api/client';
+import { list } from '../api/types';
 import { hasUnsavedWork } from '../hooks/useUnsavedWork';
 import { createHarness, renderWithApp } from '../test/harness';
 import { SettingsTab } from './SettingsTab';
@@ -63,6 +64,51 @@ describe('SettingsTab', () => {
     expect(within(form).getByRole('status')).toHaveTextContent('No unsaved changes.');
     expect(screen.queryByRole('list', { name: 'Changes to save' })).not.toBeInTheDocument();
     expect(h.calls.filter(c => c.method === 'PUT')).toEqual([]);
+  });
+
+  it('offers a policy per kind of the fleet and other, and saves the whole map', async () => {
+    const { form, h, user } = await openSettings();
+
+    const kinds = within(form).getByRole('group', { name: 'Policy per kind' });
+    const rows = within(kinds)
+      .getAllByRole('listitem')
+      .map(li => li.firstChild?.textContent);
+    expect(rows).toEqual([...list((await h.api.settings()).kinds), 'other (unlabelled)']);
+    expect(rows).toContain('snooper-el');
+    expect(within(group('Images')).getByRole('group', { name: 'Image policy of the kind cl' })).toHaveTextContent(
+      'Inherit (automatic)'
+    );
+    expect(policy(form, 'Image policy of the kind cl')).toHaveTextContent('Inherit (automatic)');
+
+    await user.click(
+      within(within(kinds).getByRole('group', { name: 'Image policy of the kind cl' })).getByRole('button', {
+        name: 'Manual',
+      })
+    );
+    await user.click(
+      within(within(kinds).getByRole('group', { name: 'Image policy of the kind other' })).getByRole('button', {
+        name: 'Automatic',
+      })
+    );
+    expect(kinds).toHaveTextContent('changed');
+    expect(kinds).toHaveTextContent('default every kind inherits');
+
+    await user.click(screen.getByRole('button', { name: 'Save' }));
+    await waitFor(() => {
+      expect(h.calls.filter(c => c.method === 'PUT')).toHaveLength(1);
+    });
+    expect(h.calls.find(c => c.method === 'PUT')?.body).toStrictEqual({
+      policyKinds: { cl: 'manual', other: 'auto' },
+    });
+    // The answer of the save is the new stored state: nothing is changed any more.
+    await waitFor(() => {
+      expect(within(screen.getByRole('form', { name: 'Settings' })).getByRole('status')).toHaveTextContent(
+        'No unsaved changes.'
+      );
+    });
+    expect(policy(screen.getByRole('form', { name: 'Settings' }), 'Image policy of the kind cl')).toHaveTextContent(
+      'Manual'
+    );
   });
 
   it('keeps the long description behind the info icon', async () => {

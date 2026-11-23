@@ -15,6 +15,8 @@ import {
   type ContainerKind,
   type HostSummary,
   type Need,
+  type Policy,
+  type PolicySource,
   type Settings,
 } from '../api/types';
 import { isHeld } from '../lib/format';
@@ -46,9 +48,20 @@ export class ClientQueryError extends Error {
 
 const compare = (a: string, b: string): number => (a < b ? -1 : a > b ? 1 : 0);
 
-/** imagePolicy is the policy the image rollouts of a client answer to (fleet.Settings.ImagePolicy). */
-export function imagePolicy(settings: Settings, client: string | undefined): Settings['policyImage'] {
-  return (client ? settings.policyClients[client] : undefined) ?? settings.policyImage;
+/** kindPolicy is the image policy of a kind without a client policy (fleet.Settings.KindPolicy): policyKinds, other for no kind, else policyImage. */
+export function kindPolicy(settings: Settings, kind: string | undefined): [Policy, PolicySource] {
+  const own = settings.policyKinds[kind || 'other'];
+  return own ? [own, 'kind'] : [settings.policyImage, 'default'];
+}
+
+/** imagePolicy is the policy the image rollouts of a team's containers of a kind answer to (fleet.Settings.ImagePolicy). */
+export function imagePolicy(
+  settings: Settings,
+  team: string | undefined,
+  kind: string | undefined
+): [Policy, PolicySource] {
+  const own = team ? settings.policyClients[team] : undefined;
+  return own ? [own, 'client'] : kindPolicy(settings, kind);
 }
 
 /** shouldRun mirrors protocol.Container.ShouldRun: a container that is down and was not stopped by a person. */
@@ -255,14 +268,15 @@ export function clientIndex(hosts: readonly HostSummary[], settings: Settings): 
 
     const count = (state: ClientHostState) => rows.filter(r => r.state === state).length;
     const consensus = rows.some(r => list(r.containers).some(c => c.kind === 'cl' || c.kind === 'vc'));
+    const clientImages = images(rows);
 
     views.push({
       name,
       layer: consensus ? 'consensus' : 'execution',
-      policy: imagePolicy(settings, name),
+      policy: settings.policyClients[name] ?? '',
       policySet: name in settings.policyClients,
-      defaultPolicy: settings.policyImage,
-      images: images(rows),
+      defaultPolicies: Object.fromEntries(clientImages.map(i => [i.kind, kindPolicy(settings, i.kind)[0]])),
+      images: clientImages,
       hosts: rows.length,
       current: count('current'),
       pending: count('pending'),

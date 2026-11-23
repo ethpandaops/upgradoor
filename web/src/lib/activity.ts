@@ -4,7 +4,16 @@
 import { list, type Gate, type HostListing, type QueueEntry, type Rollout, type WaitKind } from '../api/types';
 import { pauseLabel } from './format';
 
-type AttentionKind = 'gate' | 'paused' | 'halted' | 'approval' | 'rollout-paused' | 'held' | 'silent' | 'verb';
+type AttentionKind =
+  | 'gate'
+  | 'paused'
+  | 'halted'
+  | 'approval'
+  | 'rollout-paused'
+  | 'held'
+  | 'incompatible'
+  | 'silent'
+  | 'verb';
 
 export interface AttentionItem {
   /** Stable key for the list. */
@@ -116,8 +125,28 @@ export function attentionItems(input: {
     });
   }
 
+  // The controller serves these agents nothing: they wait like silent ones, for another reason.
+  const incompatible = input.hosts.filter(h => h.incompatible).map(h => h.name);
+  if (incompatible.length > 0) {
+    items.push({
+      id: 'incompatible',
+      kind: 'incompatible',
+      tone: 'danger',
+      title:
+        incompatible.length === 1
+          ? `${incompatible[0] as string} runs an unsupported agent`
+          : `${incompatible.length} hosts run an unsupported agent`,
+      detail:
+        "The controller does not support the agent's protocol version; the host gets no work until one of them is updated.",
+      hosts: incompatible,
+    });
+  }
+
   // Every silent host counts, queued or not: nobody knows what it needs.
-  const silent = [...new Set([...hostsWaiting('silent'), ...input.hosts.filter(h => h.stale).map(h => h.name)])];
+  const unsupported = new Set(incompatible);
+  const silent = [...new Set([...hostsWaiting('silent'), ...input.hosts.filter(h => h.stale).map(h => h.name)])].filter(
+    h => !unsupported.has(h)
+  );
   if (silent.length > 0) {
     items.push({
       id: 'silent',

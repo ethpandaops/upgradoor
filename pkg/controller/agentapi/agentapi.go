@@ -409,12 +409,6 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 		return nil, agentErrorf(http.StatusBadRequest, "invalid sync request: %s", err.Error())
 	}
 
-	if req.ProtocolVersion != protocol.Version {
-		return nil, agentErrorf(http.StatusBadRequest,
-			"protocol version %d is not supported, the controller speaks %d",
-			req.ProtocolVersion, protocol.Version)
-	}
-
 	req.Containers = cleanContainers(req.Containers)
 	req.Roles = cleanRoles(req.Roles)
 	req.Actions = cleanActions(req.Actions)
@@ -437,6 +431,14 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 	}
 
 	s.auditIdentity(ctx, s.identityAudit(cert, result, remote))
+
+	// An agent outside the supported range is recorded, so the host shows
+	// with its versions, and gets nothing: no lease, no directive.
+	if reason := fleet.Unsupported(req.ProtocolVersion); reason != "" {
+		s.recorded(cert.Subject, result, now)
+
+		return nil, agentErrorf(http.StatusBadRequest, "%s", reason)
+	}
 
 	assignment, err := s.opts.Scheduler.Assignment(ctx, cert.Subject)
 	if err != nil {
@@ -479,24 +481,28 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 		(assignment.Queue != nil && assignment.Queue.Position <= queueBusy)))
 	resp.NextSyncMillis = s.pacer.ask(cert.Subject, now, busy, pc).Milliseconds()
 
-	// A sync that only confirmed the row changes nothing the scheduler
-	// decides on, unless the host may have been stale before it: silent for
-	// longer than the shortest stale bound the settings allow. Such a sync
-	// waits for the scheduler's next tick; nudging it on every sync kept the
-	// scheduler reconciling back to back. Its fresh probe values show in the
-	// host's details only.
+	s.recorded(cert.Subject, result, now)
+	s.pacer.observe(time.Since(started))
+
+	return resp, nil
+}
+
+// recorded tells the scheduler and the views about a recorded sync. A sync
+// that only confirmed the row changes nothing the scheduler decides on,
+// unless the host may have been stale before it: silent for longer than the
+// shortest stale bound the settings allow. Such a sync waits for the
+// scheduler's next tick; nudging it on every sync kept the scheduler
+// reconciling back to back. Its fresh probe values show in the host's
+// details only.
+func (s *Handler) recorded(host string, result *store.SyncResult, now time.Time) {
 	switch {
 	case result == nil || result.Host == nil || result.Changed ||
 		now.Sub(result.PreviousSeen) > result.Host.StaleAfter(fleet.MinHostStaleAfter):
 		s.opts.Scheduler.Nudge()
 		s.opts.Notify()
 	case s.opts.NotifyHost != nil:
-		s.opts.NotifyHost(cert.Subject)
+		s.opts.NotifyHost(host)
 	}
-
-	s.pacer.observe(time.Since(started))
-
-	return resp, nil
 }
 
 // cleanRoles keeps the valid role names a host reports, sorted, without

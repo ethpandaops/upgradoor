@@ -199,7 +199,7 @@ const RESUME = '; resume to continue';
 /** waitKind classifies a waiting reason the way the scheduler does. */
 function waitKind(reason: string): WaitKind {
   if (reason === 'held' || reason.startsWith('held by ')) return 'held';
-  if (reason === 'agent silent') return 'silent';
+  if (reason === 'agent silent' || reason.startsWith('agent protocol ')) return 'silent';
   if (reason === 'paused') return 'paused';
   if (reason === 'rollout paused' || reason.endsWith(RESUME)) return 'rollout-paused';
   if (reason.startsWith('waiting for approval')) return 'approval';
@@ -909,9 +909,8 @@ export class MockController {
     const s = this.data.settings;
     switch (r.kind) {
       case 'group':
-        // A group rollout answers to the image policy of its team where one
-        // is set, else to policyImage.
-        return imagePolicy(s, r.team);
+        // A group rollout answers to the image policy of its team, else of its kind, else to policyImage.
+        return imagePolicy(s, r.team, r.containerKind)[0];
       case 'packages':
         return s.policyPackages;
       case 'reboot':
@@ -1017,6 +1016,7 @@ export class MockController {
    */
   private waitingReason(host: HostDetail, memberOf: MockRollout[], gate: Gate, budget: Budget): string | undefined {
     if (isHeld(host)) return heldBy(host) ?? 'held';
+    if (host.incompatible) return host.incompatible;
     if (this.isStale(host.name)) return 'agent silent';
     if (this.data.settings.paused) return 'paused';
 
@@ -1133,7 +1133,7 @@ export class MockController {
         plan.slot = 'offline';
       } else if (held) {
         plan.slot = 'held';
-      } else if (this.isStale(host.name)) {
+      } else if (host.incompatible || this.isStale(host.name)) {
         plan.slot = 'stale';
       } else if (failed) {
         plan.slot = 'failed';
@@ -1235,6 +1235,8 @@ export class MockController {
       lastSeen: this.iso(this.now() - this.seenAgo(host.name) * 1000),
       stale: this.isStale(host.name),
       agentVersion: host.agentVersion,
+      agentProtocol: host.agentProtocol,
+      ...(host.incompatible ? { incompatible: host.incompatible } : {}),
       containers: whole
         ? host.containers
         : list(host.containers).map(c => without(c, 'command', 'override', 'overridable')),
@@ -1424,7 +1426,11 @@ export class MockController {
       (b.createdAt ?? b.grantedAt ?? '').localeCompare(a.createdAt ?? a.grantedAt ?? '');
 
     // A rollout is served with the policy it answers to (views.RolloutView).
-    const view = (r: MockRollout): Rollout => ({ ...r, policy: this.policy(r) });
+    const view = (r: MockRollout): Rollout => ({
+      ...r,
+      policy: this.policy(r),
+      ...(r.kind === 'group' ? { policySource: imagePolicy(this.data.settings, r.team, r.containerKind)[1] } : {}),
+    });
 
     return {
       open: this.openRollouts().map(view),
@@ -1442,7 +1448,20 @@ export class MockController {
   }
 
   private settingsBody(): SettingsBody {
-    return { settings: { ...this.data.settings }, defaults: { ...this.data.defaults } };
+    return { settings: { ...this.data.settings }, defaults: { ...this.data.defaults }, kinds: this.kinds() };
+  }
+
+  /** kinds are the kinds of the managed containers of the fleet (views.FleetKinds). */
+  private kinds(): string[] {
+    const kinds = new Set<string>();
+    for (const host of this.data.hosts.values()) {
+      for (const c of list(host.containers)) if (c.managed && c.kind) kinds.add(c.kind);
+    }
+    const rank = (k: string) => {
+      const i = ['el', 'cl', 'vc'].indexOf(k);
+      return i < 0 ? 3 : i;
+    };
+    return [...kinds].sort((a, b) => rank(a) - rank(b) || a.localeCompare(b));
   }
 
   /**
@@ -1467,6 +1486,18 @@ export class MockController {
           !Array.isArray(value) &&
           Object.entries(value).every(([client, p]) => CLIENT_NAME.test(client) && (p === 'auto' || p === 'manual'));
         if (!ok) throw new HttpError(400, 'policyClients must be an object of client to policy');
+        continue;
+      }
+      // The image policies per container kind, replaced as a whole.
+      if (key === 'policyKinds') {
+        const ok =
+          typeof value === 'object' &&
+          value !== null &&
+          !Array.isArray(value) &&
+          Object.entries(value).every(
+            ([kind, p]) => CLIENT_NAME.test(kind) && kind !== 'none' && (p === 'auto' || p === 'manual')
+          );
+        if (!ok) throw new HttpError(400, 'policyKinds must be an object of kind to policy');
         continue;
       }
       // The policies per host action, replaced as a whole.
@@ -1615,7 +1646,9 @@ export class MockController {
 
     const next = { ...before, policyClients };
     const message =
-      `image policy of ${req.client}: ${imagePolicy(next, req.client)}` + (req.policy === '' ? ' (the default)' : '');
+      req.policy === ''
+        ? `image policy of ${req.client}: the default of each kind`
+        : `image policy of ${req.client}: ${req.policy}`;
 
     // A request that changes nothing is no change and no entry in the audit log.
     if (JSON.stringify(before.policyClients) === JSON.stringify(policyClients)) return { message };
@@ -2513,6 +2546,8 @@ function hostListing(s: HostSummary): HostListing {
     lastSeen: s.lastSeen,
     stale: s.stale,
     agentVersion: s.agentVersion,
+    agentProtocol: s.agentProtocol,
+    ...(s.incompatible ? { incompatible: s.incompatible } : {}),
     containers: list(s.containers).map(c => ({
       name: c.name,
       image: c.image,

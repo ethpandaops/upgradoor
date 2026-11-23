@@ -910,6 +910,25 @@ func TestStaleHostIsNotGranted(t *testing.T) {
 	assert.Equal(t, []string{"a"}, b.leasedHosts())
 }
 
+// An agent the controller does not serve waits like a silent one, with the
+// protocol as its reason.
+func TestIncompatibleHostIsNotGranted(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.host("a", 0)
+	b.wants("a", packagesNeed("2.0"))
+	b.get("a").Status.ProtocolVersion = protocol.Version + 1
+
+	out := b.step()
+
+	assert.Empty(t, b.leasedHosts())
+	assert.Equal(t, SlotStale, out.Plan.Hosts["a"].Slot)
+	assert.Equal(t, fleet.Unsupported(protocol.Version+1), out.Plan.Hosts["a"].Reason)
+
+	b.get("a").Status.ProtocolVersion = protocol.Version
+	b.step()
+	assert.Equal(t, []string{"a"}, b.leasedHosts())
+}
+
 func TestUnknownLivenessKeepsTheGateClosed(t *testing.T) {
 	synced := protocol.NodeHealth{CL: &protocol.CLHealth{Reachable: true, Peers: 5}}
 
@@ -1275,4 +1294,39 @@ func TestValidatorsWithoutDutyCountForNothing(t *testing.T) {
 		assert.Empty(t, b.leasedHosts())
 		assert.Equal(t, "network gate: finality lag 5 epochs > 3", queueReasons(out.Plan)["exited"])
 	})
+}
+
+// An image rollout waits for approval by the policy of its team, else of its
+// kind (other for unlabelled containers), else policyImage.
+func TestApprovalByKindPolicy(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.w.Settings.MaxUnavailablePercent = 100
+	b.w.Settings.MaxLeasedPercent = 100
+	b.w.Settings.MaxIndependentPercent = 100
+	b.w.Settings.PolicyClients = fleet.ClientPolicies{"geth": fleet.PolicyAuto}
+	b.w.Settings.PolicyKinds = fleet.KindPolicies{
+		"el": fleet.PolicyManual, "snooper-el": fleet.PolicyManual, fleet.KindOther: fleet.PolicyManual,
+	}
+
+	for _, name := range []string{"a", "b", "c", "d", "e"} {
+		b.host(name, 0)
+	}
+
+	b.wantsInGroup("a", "geth", protocol.KindEL, "geth", imgGeth, digestA)
+	b.wantsInGroup("b", "besu", protocol.KindEL, "besu", "hyperledger/besu:develop", digestA)
+	b.wantsInGroup("c", "snooper", "snooper-el", "", "ethpandaops/snooper:latest", digestA)
+	b.wantsInGroup("d", "tools", "", "", imgVC, digestA)
+	b.get("d").Status.Containers[0].Impact = protocol.ImpactIndependent
+	b.wantsInGroup("e", "lighthouse", protocol.KindCL, "lighthouse", imgLighthouse, digestA)
+
+	out := b.step()
+	reasons := queueReasons(out.Plan)
+
+	assert.NotNil(t, b.lease("a"), "the client's auto before the kind's manual")
+	assert.NotNil(t, b.lease("e"), "a kind not listed follows policyImage")
+
+	for _, host := range []string{"b", "c", "d"} {
+		assert.Nil(t, b.lease(host), host)
+		assert.Equal(t, reasonApproval, reasons[host], host)
+	}
 }

@@ -242,7 +242,7 @@ export function describeCall(call: ActionCall): string[] {
       const { client, policy } = call.body;
       if (policy === '') {
         return [
-          `Remove the image policy of ${client}: its image rollouts answer to the global image policy again.`,
+          `Remove the image policy of ${client}: its image rollouts answer to the policy of their kind, else the policy for images, again.`,
           'An open rollout that was approved stays approved.',
         ];
       }

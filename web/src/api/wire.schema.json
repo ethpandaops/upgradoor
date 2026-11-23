@@ -1,5 +1,5 @@
 {
- "version": "e835fe10b14d",
+ "version": "19414286776d",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -289,8 +289,8 @@
     "t": "b"
    },
    {
-    "n": "defaultPolicy",
-    "t": "r"
+    "n": "defaultPolicies",
+    "t": "j"
    },
    {
     "n": "images",
@@ -1553,6 +1553,11 @@
    {
     "n": "policy",
     "t": "r"
+   },
+   {
+    "n": "policySource",
+    "t": "r",
+    "omit": true
    }
   ],
   "SlotParticipation": [
@@ -1718,6 +1723,15 @@
     "t": "r"
    },
    {
+    "n": "agentProtocol",
+    "t": "n"
+   },
+   {
+    "n": "incompatible",
+    "t": "r",
+    "omit": true
+   },
+   {
     "n": "containers",
     "t": "a",
     "of": "Container"
@@ -1848,6 +1862,15 @@
    {
     "n": "agentVersion",
     "t": "r"
+   },
+   {
+    "n": "agentProtocol",
+    "t": "n"
+   },
+   {
+    "n": "incompatible",
+    "t": "r",
+    "omit": true
    },
    {
     "n": "containers",

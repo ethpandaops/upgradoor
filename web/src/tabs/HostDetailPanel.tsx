@@ -416,6 +416,9 @@ function OverviewPane({ host: h, onAction }: { host: HostDetail; onAction: (inte
               )}
               <Fact label="agent">
                 <span className="font-mono">{h.agentVersion || '?'}</span>{' '}
+                <span className={h.incompatible ? 'text-danger' : 'text-muted'} title={h.incompatible}>
+                  protocol {h.agentProtocol}
+                </span>{' '}
                 <span className="text-muted">allows {verbs.join(', ') || 'nothing'}</span>
               </Fact>
               <Fact label="certificate">

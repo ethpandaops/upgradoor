@@ -118,6 +118,8 @@ interface HostSpec {
   behind?: string[];
   reboot?: boolean;
   stale?: boolean;
+  /** agentProtocol is the protocol version the agent speaks; 1 when absent. */
+  agentProtocol?: number;
   localHold?: string;
   customEL?: string;
   failedEL?: boolean;
@@ -175,6 +177,7 @@ function specs(): HostSpec[] {
   patch('lodestar-reth-1', { reboot: true });
   patch('lodestar-reth-3', { localHold: 'debugging reth OOM, do not touch (pk)', oldDocker: true });
   patch('prysm-geth-3', { stale: true, oldDocker: true });
+  patch('grandine-erigon-1', { agentProtocol: 0 });
   patch('grandine-erigon-2', { customEL: 'erigontech/erigon:pr-17012-debug', behind: [GRANDINE_IMAGE] });
   patch('teku-reth-1', { security: true });
   patch('prysm-erigon-1', { security: true });
@@ -350,6 +353,7 @@ export function defaultSettings(): Settings {
     policyPackages: 'auto',
     policyReboot: 'manual',
     policyClients: {},
+    policyKinds: {},
     actionPolicies: {},
     pauseAfterCanaryImage: false,
     pauseAfterCanaryPackages: false,
@@ -658,7 +662,11 @@ function buildHost(spec: HostSpec, index: number, at: (s: number) => string): Ho
     validators: spec.validators ? VALIDATORS_PER_HOST : 0,
     lastSeen: at(0),
     stale: spec.stale === true,
-    agentVersion: index % 9 === 4 ? '0.3.1' : '0.3.2',
+    agentVersion: spec.agentProtocol === 0 ? '0.2.9' : index % 9 === 4 ? '0.3.1' : '0.3.2',
+    agentProtocol: spec.agentProtocol ?? 1,
+    ...(spec.agentProtocol === undefined || spec.agentProtocol === 1
+      ? {}
+      : { incompatible: `agent protocol ${spec.agentProtocol} not supported (controller supports 1..1)` }),
     containers,
     node: {
       el: el
@@ -785,7 +793,7 @@ function containerStats(host: string, c: Container, busy: number): ContainerStat
   }
 }
 
-/** A group rollout's key and title, as the scheduler writes them (groupKey, groupTitle). */
+/** A group rollout's key and title, as the scheduler writes them (groupKey, groupTitle); kind '' is unlabelled. */
 function groupRollout(
   kind: ContainerKind,
   team: string,
@@ -796,12 +804,14 @@ function groupRollout(
     if (!t.spec) return part;
     return `${t.container ?? ''} to ${part}${t.flags ? ', command line changed' : ''}`;
   });
+  const unit = !kind ? `unit:/${targets[0]?.image ?? ''}` : team ? `unit:${kind}#${team}` : `unit:${kind}`;
+  const name = !kind ? 'unlabelled' : team ? `${team} ${kind}` : kind;
   return {
     kind: 'group',
-    key: `unit:${kind}#${team}@${hex(JSON.stringify(targets), 16)}`,
-    title: `${team} ${kind}: ${parts.join('; ')}`,
-    containerKind: kind,
-    team,
+    key: `${unit}@${hex(JSON.stringify(targets), 16)}`,
+    title: `${name}: ${parts.join('; ')}`,
+    ...(kind ? { containerKind: kind } : {}),
+    ...(team ? { team } : {}),
     targets,
   };
 }
@@ -898,6 +908,12 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
   const dockerRollout = `ro-${hex('rollout/docker', 16)}`;
   const oldLighthouseRollout = `ro-${hex('rollout/lighthouse-old', 16)}`;
   const abortedRollout = `ro-${hex('rollout/aborted', 16)}`;
+  // Unlabelled tooling images: long references without a space to break at.
+  const toolingRollout = `ro-${hex('rollout/tooling', 16)}`;
+  const exporterRollout = `ro-${hex('rollout/exporter', 16)}`;
+  const exporterOldRollout = `ro-${hex('rollout/exporter-old', 16)}`;
+  const TOOLING_IMAGE = 'ghcr.io/ethpandaops/devnet-tooling-assertoor-test-runner/with-path:master-latest';
+  const EXPORTER_IMAGE = 'ghcr.io/ethpandaops/ethereum-metrics-exporter-for-devnets/with-path:master-latest';
 
   const leaseVerifying = `ls-${hex('lease/lighthouse-geth-2', 16)}`;
   const leaseCanary = `ls-${hex('lease/lighthouse-geth-1', 16)}`;
@@ -986,6 +1002,20 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       ],
     },
     {
+      id: toolingRollout,
+      ...groupRollout('', '', [imageTarget(TOOLING_IMAGE, digest('tooling/next'))]),
+      state: 'active',
+      paused: true,
+      approved: false,
+      force: false,
+      ignoreBudget: false,
+      ignoreGate: false,
+      createdBy: 'scheduler',
+      createdAt: at(6 * 3600),
+      updatedAt: at(5 * 3600),
+      hosts: [member('tooling-1', 'pending', 3, at(6 * 3600))],
+    },
+    {
       id: rebootRollout,
       kind: 'reboot',
       key: 'reboot',
@@ -1033,6 +1063,42 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
           ...member(h, 'done', h === 'grandine-erigon-1' ? 2 : 3, at(2 * 86400 + 3 * 3600)),
           leaseId: `ls-${hex(`lease/docker/${h}`, 16)}`,
         })),
+    },
+    {
+      id: exporterRollout,
+      ...groupRollout('', '', [imageTarget(EXPORTER_IMAGE, digest('exporter/current'))]),
+      state: 'completed',
+      paused: false,
+      approved: false,
+      force: false,
+      ignoreBudget: false,
+      ignoreGate: false,
+      createdBy: 'scheduler',
+      createdAt: at(2 * 86400 + 40 * 60),
+      updatedAt: at(2 * 86400),
+      endedAt: at(2 * 86400),
+      hosts: [
+        {
+          ...member('tooling-1', 'done', 3, at(2 * 86400)),
+          leaseId: `ls-${hex('lease/exporter/tooling-1', 16)}`,
+        },
+      ],
+    },
+    {
+      id: exporterOldRollout,
+      ...groupRollout('', '', [imageTarget(EXPORTER_IMAGE, digest('exporter/older'))]),
+      state: 'superseded',
+      reason: `the target changed: unlabelled: ${EXPORTER_IMAGE} to ${digest('exporter/current').slice(7, 19)}`,
+      paused: false,
+      approved: false,
+      force: false,
+      ignoreBudget: false,
+      ignoreGate: false,
+      createdBy: 'scheduler',
+      createdAt: at(2 * 86400 + 3 * 3600),
+      updatedAt: at(2 * 86400 + 40 * 60),
+      endedAt: at(2 * 86400 + 40 * 60),
+      hosts: [member('tooling-1', 'pending', 3, at(2 * 86400 + 3 * 3600))],
     },
     {
       id: oldLighthouseRollout,

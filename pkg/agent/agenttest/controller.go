@@ -177,11 +177,11 @@ func (c *Controller) serve(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 
-		// As the real controller: another version is refused.
-		if req.ProtocolVersion != protocol.Version {
+		// As the real controller: a version outside the range is refused.
+		if !protocol.Supported(req.ProtocolVersion) {
 			c.fail(w, http.StatusBadRequest, fmt.Sprintf(
-				"protocol version %d is not supported, the controller speaks %d",
-				req.ProtocolVersion, protocol.Version))
+				"agent protocol %d not supported (controller supports %d..%d)",
+				req.ProtocolVersion, protocol.MinVersion, protocol.Version))
 
 			return
 		}

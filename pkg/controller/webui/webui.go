@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"net/url"
 	"path"
+	"slices"
 	"strings"
 	"time"
 
@@ -146,6 +147,9 @@ type Options struct {
 	// in the Content-Security-Policy so the UI can load its login client and
 	// talk to it. Empty when the API runs open.
 	AuthProviderURL string
+	// ExtraOrigins are origins (scheme://host) the UI may load scripts from
+	// and connect to, e.g. for a site menu an ingress injects.
+	ExtraOrigins []string
 }
 
 // Handler serves the web UI.
@@ -160,7 +164,7 @@ var _ http.Handler = (*Handler)(nil)
 // New returns a handler over fsys. A nil fsys, or one without index.html,
 // yields the placeholder page.
 func New(log logrus.FieldLogger, fsys fs.FS, opts Options) (*Handler, error) {
-	csp, err := contentSecurityPolicy(opts.AuthProviderURL)
+	csp, err := contentSecurityPolicy(opts.AuthProviderURL, opts.ExtraOrigins)
 	if err != nil {
 		return nil, err
 	}
@@ -174,8 +178,8 @@ func New(log logrus.FieldLogger, fsys fs.FS, opts Options) (*Handler, error) {
 
 // contentSecurityPolicy builds the policy for UI pages: everything from the
 // own origin, plus the authenticatoor origin for its client script, its
-// requests and its login frame.
-func contentSecurityPolicy(authProviderURL string) (string, error) {
+// requests and its login frame, plus extra origins for scripts and requests.
+func contentSecurityPolicy(authProviderURL string, extraOrigins []string) (string, error) {
 	authOrigin := ""
 
 	if authProviderURL != "" {
@@ -192,19 +196,63 @@ func contentSecurityPolicy(authProviderURL string) (string, error) {
 		authOrigin = " " + u.Scheme + "://" + u.Host
 	}
 
+	extra, err := normalizeOrigins(extraOrigins, strings.TrimSpace(authOrigin))
+	if err != nil {
+		return "", err
+	}
+
 	return strings.Join([]string{
 		"default-src 'self'",
-		"script-src 'self'" + authOrigin,
+		"script-src 'self'" + authOrigin + extra,
 		"style-src 'self' 'unsafe-inline'",
 		"img-src 'self' data:",
 		"font-src 'self' data:",
-		"connect-src 'self'" + authOrigin,
+		"connect-src 'self'" + authOrigin + extra,
 		"frame-src 'self'" + authOrigin,
 		"object-src 'none'",
 		"base-uri 'self'",
 		"form-action 'self'" + authOrigin,
 		"frame-ancestors 'none'",
 	}, "; "), nil
+}
+
+// normalizeOrigins reduces each origin to scheme://host, sorted and without
+// duplicates or the auth origin, as a space-prefixed source list.
+func normalizeOrigins(raw []string, authOrigin string) (string, error) {
+	seen := make(map[string]struct{}, len(raw)+1)
+	seen[strings.ToLower(authOrigin)] = struct{}{}
+
+	origins := make([]string, 0, len(raw))
+
+	for _, r := range raw {
+		u, err := url.Parse(r)
+		if err != nil {
+			return "", fmt.Errorf("webui: UI origin %q: %w", r, err)
+		}
+
+		if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil ||
+			(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" ||
+			u.ForceQuery {
+			return "", fmt.Errorf("webui: UI origin %q is not an http(s) origin "+
+				"(scheme://host[:port])", r)
+		}
+
+		origin := strings.ToLower(u.Scheme + "://" + u.Host)
+		if _, ok := seen[origin]; ok {
+			continue
+		}
+
+		seen[origin] = struct{}{}
+		origins = append(origins, origin)
+	}
+
+	if len(origins) == 0 {
+		return "", nil
+	}
+
+	slices.Sort(origins)
+
+	return " " + strings.Join(origins, " "), nil
 }
 
 // ServeHTTP implements http.Handler.

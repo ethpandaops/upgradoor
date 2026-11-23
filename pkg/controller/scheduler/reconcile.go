@@ -149,8 +149,12 @@ type hostView struct {
 	holdRequested bool
 	offline       bool
 	// stale: no sync for hostStaleAfter, measured from World.Since at the
-	// earliest.
+	// earliest, or an agent the controller does not serve (incompatible):
+	// either way nothing it reports is acted on.
 	stale bool
+	// incompatible says why the host's agent is not served
+	// (fleet.Host.Incompatible); empty when it is.
+	incompatible string
 	// lease is the host's non-terminal lease.
 	lease *fleet.Lease
 	// broken are the host's broken marks as the pass leaves them
@@ -319,6 +323,10 @@ func newPass(w *World) *pass {
 			held:     h.Held() || h.KnownOffline(w.Now),
 			offline:  h.KnownOffline(w.Now),
 			stale:    hostStale(h, w.Now, w.Since, w.Settings.HostStaleAfter.Std()),
+		}
+
+		if hv.incompatible = h.Incompatible(); hv.incompatible != "" {
+			hv.stale = true
 		}
 
 		hv.duty, hv.live, hv.liveKnown = p.liveOf(h.Name, hv.weight)

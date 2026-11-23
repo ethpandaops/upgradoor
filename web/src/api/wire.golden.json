@@ -10,6 +10,7 @@
    "lastSeen": "2026-11-14T12:00:00Z",
    "stale": false,
    "agentVersion": "agent-zz-0.4.2",
+   "agentProtocol": 1,
    "containers": [
     {
      "name": "geth",
@@ -328,6 +329,7 @@
      "lastSeen": "2026-11-14T12:00:00Z",
      "stale": false,
      "agentVersion": "",
+     "agentProtocol": 0,
      "containers": [],
      "os": {
       "id": "",
@@ -367,6 +369,7 @@
      "lastSeen": "2026-11-14T12:00:00Z",
      "stale": false,
      "agentVersion": "agent-zz-0.4.2",
+     "agentProtocol": 1,
      "containers": [
       {
        "name": "geth",
@@ -483,6 +486,7 @@
      "lastSeen": "2026-11-14T12:00:00Z",
      "stale": false,
      "agentVersion": "agent-zz-0.4.2",
+     "agentProtocol": 1,
      "containers": [
       {
        "name": "geth",
@@ -861,6 +865,7 @@
     "policyPackages": "auto",
     "policyReboot": "manual",
     "policyClients": {},
+    "policyKinds": {},
     "actionPolicies": {},
     "pauseAfterCanaryImage": false,
     "pauseAfterCanaryPackages": false,
@@ -885,6 +890,7 @@
     "policyPackages": "auto",
     "policyReboot": "manual",
     "policyClients": {},
+    "policyKinds": {},
     "actionPolicies": {},
     "pauseAfterCanaryImage": false,
     "pauseAfterCanaryPackages": false,
@@ -892,7 +898,12 @@
     "readyPeerShare": 0,
     "lookupInterval": "5m0s",
     "paused": false
-   }
+   },
+   "kinds": [
+    "el",
+    "cl",
+    "vc"
+   ]
   }
  },
  "public": {
@@ -1006,7 +1017,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "e835fe10b14d"
+  "v": "19414286776d"
  },
  "user": {
   "a": {
@@ -1021,9 +1032,13 @@
     [
      "qq-stealth-cl-team",
      57,
-     58,
      0,
-     58,
+     0,
+     [
+      {
+       "cl": "auto"
+      }
+     ],
      [
       [
        16,
@@ -1045,14 +1060,18 @@
      0,
      0,
      0,
-     59
+     58
     ],
     [
      "qq-stealth-el-team",
-     60,
-     58,
+     59,
      0,
-     58,
+     0,
+     [
+      {
+       "el": "auto"
+      }
+     ],
      [
       [
        11,
@@ -1062,13 +1081,13 @@
        2,
        0,
        [
-        61,
-        62
+        60,
+        61
        ],
        2,
        [
-        61,
-        62
+        60,
+        61
        ]
       ]
      ],
@@ -1081,7 +1100,7 @@
      0,
      0,
      0,
-     63
+     62
     ]
    ]
   },
@@ -1244,6 +1263,8 @@
        1794657600,
        0,
        "agent-zz-0.4.2",
+       1,
+       0,
        [
         [
          "geth",
@@ -1489,6 +1510,8 @@
      0,
      0,
      0,
+     0,
+     0,
      [],
      [],
      [],
@@ -1515,6 +1538,8 @@
      0,
      0,
      5,
+     1,
+     0,
      [
       [
        6,
@@ -1642,6 +1667,8 @@
      0,
      0,
      5,
+     1,
+     0,
      [
       [
        6,
@@ -2034,7 +2061,6 @@
    "zzEL",
    "zz container exited 137",
    "consensus",
-   "auto",
    "def2b291bd9b76fc",
    "execution",
    "--http",
@@ -2059,7 +2085,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "e835fe10b14d"
+  "v": "19414286776d"
  },
  "patch": {
   "c": {
@@ -2067,12 +2093,12 @@
     [
      "qq-stealth-cl-team",
      15,
-     67
+     66
     ],
     [
      "qq-stealth-el-team",
      15,
-     68
+     67
     ]
    ]
   },
@@ -2080,26 +2106,26 @@
    "u": [
     [
      "lighthouse-geth-2",
-     11,
+     13,
      [
       0,
       0,
       [
        [
         "staff",
+        63,
         64,
-        65,
         1794657600
        ],
        [
         "geth",
-        66,
+        65,
         0,
         1794657600
        ]
       ]
      ],
-     12,
+     14,
      [
       34,
       6
@@ -2149,6 +2175,7 @@
     "lastSeen": "2026-11-14T12:00:00Z",
     "stale": false,
     "agentVersion": "",
+    "agentProtocol": 0,
     "containers": [],
     "os": {
      "id": "",
@@ -2188,6 +2215,7 @@
     "lastSeen": "2026-11-14T12:00:00Z",
     "stale": false,
     "agentVersion": "agent-zz-0.4.2",
+    "agentProtocol": 1,
     "containers": [
      {
       "name": "geth",
@@ -2304,6 +2332,7 @@
     "lastSeen": "2026-11-14T12:00:00Z",
     "stale": false,
     "agentVersion": "agent-zz-0.4.2",
+    "agentProtocol": 1,
     "containers": [
      {
       "name": "geth",

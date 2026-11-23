@@ -447,7 +447,7 @@ func TestSettings(t *testing.T) {
 
 	rec := h.get("/api/v1/settings")
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Equal(t, views.SettingsBody{Settings: fleet.DefaultSettings(), Defaults: defaults},
+	assert.Equal(t, views.SettingsBody{Settings: fleet.DefaultSettings(), Defaults: defaults, Kinds: []protocol.ContainerKind{}},
 		controllertest.DecodeJSON[views.SettingsBody](t, rec))
 
 	changed := fleet.DefaultSettings()
@@ -470,7 +470,7 @@ func TestSettings(t *testing.T) {
 
 	rec = h.sendJSON(http.MethodPut, "/api/v1/settings", string(body))
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Equal(t, views.SettingsBody{Settings: changed, Defaults: defaults},
+	assert.Equal(t, views.SettingsBody{Settings: changed, Defaults: defaults, Kinds: []protocol.ContainerKind{}},
 		controllertest.DecodeJSON[views.SettingsBody](t, rec))
 
 	calls := h.sched.Recorded()
@@ -973,5 +973,9 @@ func TestAdminFeature(t *testing.T) {
 
 	clients := controllertest.DecodeJSON[views.Clients](t, get("/api/v1/clients", provider.Grant(t, "+upgradoor")))
 	require.NotEmpty(t, clients.Clients)
-	assert.Equal(t, fleet.DefaultSettings().PolicyImage, clients.Clients[0].DefaultPolicy)
+	require.NotEmpty(t, clients.Clients[0].DefaultPolicies)
+
+	for kind, p := range clients.Clients[0].DefaultPolicies {
+		assert.Equal(t, fleet.DefaultSettings().PolicyImage, p, kind)
+	}
 }

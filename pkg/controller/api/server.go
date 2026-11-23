@@ -122,6 +122,9 @@ type Options struct {
 	// claim: the token must have basic access to it, and the features that
 	// allow actions are features of it. Empty means DefaultAuthService.
 	AuthService string
+	// UIOrigins are extra origins the web UI may load scripts from and
+	// connect to.
+	UIOrigins []string
 
 	Store     Store
 	Scheduler scheduler.Service
@@ -256,7 +259,10 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		DefaultSettings: opts.DefaultSettings, Notify: s.Notify, Now: opts.Now,
 	})
 
-	ui, err := webui.New(log, opts.WebFS, webui.Options{AuthProviderURL: opts.AuthProviderURL})
+	ui, err := webui.New(log, opts.WebFS, webui.Options{
+		AuthProviderURL: opts.AuthProviderURL,
+		ExtraOrigins:    opts.UIOrigins,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("api: web UI: %w", err)
 	}

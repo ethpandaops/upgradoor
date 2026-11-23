@@ -95,6 +95,8 @@ func Summarize(
 
 	if status := host.Status; status != nil {
 		sum.AgentVersion = status.AgentVersion
+		sum.AgentProtocol = status.ProtocolVersion
+		sum.Incompatible = host.Incompatible()
 		sum.Containers = NonNil(status.Containers)
 		sum.Node = status.Node
 		sum.OS = status.OS
@@ -123,6 +125,7 @@ func Listing(sum *HostSummary) HostListing {
 	out := HostListing{
 		Name: sum.Name, Roles: sum.Roles, Validators: sum.Validators, LastSeen: sum.LastSeen,
 		Stale: sum.Stale, AgentVersion: sum.AgentVersion,
+		AgentProtocol: sum.AgentProtocol, Incompatible: sum.Incompatible,
 		Containers: make([]ContainerListing, 0, len(sum.Containers)),
 		OS:         sum.OS, Pending: sum.Pending, UptimeSeconds: sum.UptimeSeconds,
 		Usage: NewHostUsage(sum.Resources), Hold: sum.Hold,
@@ -226,7 +229,12 @@ func (v *Views) Rollouts(ctx context.Context, limit int) (*Rollouts, error) {
 	}
 
 	view := func(r *fleet.Rollout) *RolloutView {
-		return &RolloutView{Rollout: *r, Policy: settings.RolloutPolicy(r)}
+		out := &RolloutView{Rollout: *r, Policy: settings.RolloutPolicy(r)}
+		if r.Kind == fleet.RolloutGroup {
+			_, out.PolicySource = settings.ImagePolicy(r.Team, r.ContainerKind)
+		}
+
+		return out
 	}
 
 	out := &Rollouts{

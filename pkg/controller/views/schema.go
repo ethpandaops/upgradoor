@@ -131,6 +131,13 @@ type HostSummary struct {
 	LastSeen     time.Time `json:"lastSeen"`
 	Stale        bool      `json:"stale"`
 	AgentVersion string    `json:"agentVersion"`
+	// AgentProtocol is the protocol version of the agent's last sync; zero
+	// before the first.
+	AgentProtocol int `json:"agentProtocol"`
+	// Incompatible says why the controller serves the host nothing: its agent
+	// speaks a protocol version the controller does not support. Absent when
+	// it is served.
+	Incompatible string `json:"incompatible,omitempty"`
 
 	Containers    []protocol.Container `json:"containers"`
 	Node          protocol.NodeHealth  `json:"node"`
@@ -175,6 +182,8 @@ type HostListing struct {
 	LastSeen      time.Time          `json:"lastSeen"`
 	Stale         bool               `json:"stale"`
 	AgentVersion  string             `json:"agentVersion"`
+	AgentProtocol int                `json:"agentProtocol"`
+	Incompatible  string             `json:"incompatible,omitempty"`
 	Containers    []ContainerListing `json:"containers"`
 	OS            protocol.OSSummary `json:"os"`
 	Pending       protocol.Pending   `json:"pending"`
@@ -274,6 +283,9 @@ type RolloutView struct {
 	// Policy is the policy the rollout answers to
 	// (fleet.Settings.RolloutPolicy): manual waits for a person's approval.
 	Policy fleet.Policy `json:"policy"`
+	// PolicySource is the setting that decided Policy of an image rollout
+	// (fleet.Settings.ImagePolicy); empty for every other rollout.
+	PolicySource fleet.PolicySource `json:"policySource,omitempty"`
 }
 
 // Rollouts is the body of GET /api/v1/rollouts.
@@ -290,6 +302,8 @@ type Rollouts struct {
 type SettingsBody struct {
 	Settings fleet.Settings `json:"settings"`
 	Defaults fleet.Settings `json:"defaults"`
+	// Kinds are the kinds of the managed containers of the fleet (FleetKinds).
+	Kinds []protocol.ContainerKind `json:"kinds"`
 }
 
 // Audit is the body of GET /api/v1/audit.

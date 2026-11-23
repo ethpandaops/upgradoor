@@ -875,7 +875,7 @@ func (b *worldBuilder) host(name string, weight uint64, roles ...string) *fleet.
 		Roles:     roles,
 		FirstSeen: b.w.Now.Add(-30 * 24 * time.Hour),
 		LastSeen:  b.w.Now,
-		Status:    &protocol.SyncRequest{Verbs: slices.Clone(allVerbs)},
+		Status:    &protocol.SyncRequest{ProtocolVersion: protocol.Version, Verbs: slices.Clone(allVerbs)},
 	}
 
 	if weight > 0 {

@@ -215,6 +215,8 @@ func manualTargets(
 		return nil, reasonOffline
 	case h.Held():
 		return nil, h.HeldReason()
+	case h.Incompatible() != "":
+		return nil, h.Incompatible()
 	case hostStale(h, now, since, settings.HostStaleAfter.Std()):
 		return nil, reasonAgentSilent
 	case !slices.Contains(h.Status.Verbs, req.verb):
@@ -962,6 +964,8 @@ func overrideRefusal(
 	switch {
 	case h.Status == nil:
 		return "host " + h.Name + ": no sync yet"
+	case h.Incompatible() != "":
+		return "host " + h.Name + ": " + h.Incompatible()
 	case hostStale(h, now, since, settings.HostStaleAfter.Std()):
 		return "host " + h.Name + ": " + reasonAgentSilent
 	case !slices.Contains(h.Status.Verbs, protocol.VerbRoll):
@@ -1026,11 +1030,9 @@ func (s *service) SetClientPolicy(
 		return nil, fmt.Errorf("%w: %w", ErrInvalidAction, err)
 	}
 
-	res := &ActionResult{
-		Message: fmt.Sprintf("image policy of %s: %s", req.Client, next.ImagePolicy(req.Client)),
-	}
+	res := &ActionResult{Message: fmt.Sprintf("image policy of %s: %s", req.Client, req.Policy)}
 	if req.Policy == "" {
-		res.Message += " (the default)"
+		res.Message = fmt.Sprintf("image policy of %s: the default of each kind", req.Client)
 	}
 
 	if next.Equal(&settings) {

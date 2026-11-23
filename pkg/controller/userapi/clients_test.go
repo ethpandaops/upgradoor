@@ -109,7 +109,7 @@ func TestClients(t *testing.T) {
 
 	assert.Equal(t, "lighthouse", lighthouse.Name, "consensus clients come first")
 	assert.Equal(t, views.LayerConsensus, lighthouse.Layer)
-	assert.Equal(t, fleet.PolicyAuto, lighthouse.Policy)
+	assert.Empty(t, lighthouse.Policy, "none of its own")
 	assert.False(t, lighthouse.PolicySet)
 	assert.Equal(t, []views.ClientImage{
 		{

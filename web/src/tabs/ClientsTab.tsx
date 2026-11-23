@@ -47,7 +47,7 @@ import { setKept, useKept } from '../hooks/useKept';
 import { commandDiff } from '../lib/flags';
 import { absoluteTime, displayImage, plural, shortRevision } from '../lib/format';
 import { approveIntent, clientPolicyIntent, holdIntent } from '../lib/intents';
-import { POLICIES, POLICY_MEANING } from '../lib/settingsForm';
+import { POLICIES, POLICY_LABEL, POLICY_MEANING } from '../lib/settingsForm';
 import { RecentRollouts, RolloutCard, useRolloutData, waitsForApproval } from './RolloutsTab';
 
 /** The number of hosts on a page of a client's list. It is fixed, so the pages have one height. */
@@ -997,8 +997,6 @@ function DeviationChip({
   );
 }
 
-const POLICY_LABEL: Record<Policy, string> = { auto: 'Automatic', manual: 'Manual' };
-
 /** PolicyChoice is the client's own image policy, or inherit: it follows the default. */
 type PolicyChoice = Policy | 'inherit';
 
@@ -1009,16 +1007,16 @@ type PolicyChoice = Policy | 'inherit';
  */
 function PolicySetting({ client, onAction }: { client: ClientView; onAction: (intent: ActionIntent) => void }) {
   const permissions = usePermissions();
-  const fallback = client.defaultPolicy;
-  const value: PolicyChoice = client.policySet ? client.policy : 'inherit';
+  const defaults = inheritedPolicies(client);
+  const value: PolicyChoice = client.policy === '' ? 'inherit' : client.policy;
 
   const verdict = permissions.canIntent(clientPolicyIntent(client.name, client.policy));
   const options: { value: PolicyChoice; label: string; title: string }[] = [
     {
       value: 'inherit',
-      label: `Inherit (${POLICY_LABEL[fallback].toLowerCase()})`,
+      label: `Inherit (${inheritText(defaults)})`,
       title: verdict.allowed
-        ? `Follow the default for images, now ${POLICY_LABEL[fallback].toLowerCase()}`
+        ? `Follow the default of each kind for images, now ${inheritText(defaults)}`
         : verdict.reason,
     },
     ...POLICIES.map(p => ({
@@ -1042,10 +1040,30 @@ function PolicySetting({ client, onAction }: { client: ClientView; onAction: (in
           if (choice !== value) onAction(clientPolicyIntent(client.name, choice === 'inherit' ? '' : choice));
         }}
       />
-      <span className="text-muted">{POLICY_MEANING[client.policy]}</span>
+      <span className="text-muted">{policyMeaning(value, defaults)}</span>
       {!verdict.allowed && <span className="text-muted">Read only: {verdict.reason}.</span>}
     </div>
   );
+}
+
+/** inheritedPolicies are the image policies the client's kinds follow without one of its own, in the page's order of kinds. */
+function inheritedPolicies(client: ClientView): [string, Policy][] {
+  const defaults = client.defaultPolicies;
+  return clientKinds(client).flatMap(kind => (defaults[kind] ? [[kind, defaults[kind]] as [string, Policy]] : []));
+}
+
+/** inheritText names what inherit means: one policy when the kinds agree, else the policy of each kind. */
+function inheritText(defaults: readonly [string, Policy][]): string {
+  const policies = new Set(defaults.map(([, p]) => p));
+  if (policies.size <= 1) return POLICY_LABEL[[...policies][0] ?? 'auto'].toLowerCase();
+  return defaults.map(([kind, p]) => `${kind} ${p}`).join(', ');
+}
+
+/** policyMeaning says what the chosen policy does. */
+function policyMeaning(value: PolicyChoice, defaults: readonly [string, Policy][]): string {
+  if (value !== 'inherit') return POLICY_MEANING[value];
+  const policies = new Set(defaults.map(([, p]) => p));
+  return policies.size === 1 ? POLICY_MEANING[[...policies][0] as Policy] : 'each kind follows its own default';
 }
 
 // -------------------------------------------------------------------- rows

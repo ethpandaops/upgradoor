@@ -2,14 +2,7 @@ import { list, type Policy } from '../api/types';
 import { useLive } from '../components/Live';
 import { Badge, InfoTip, Segmented } from '../components/primitives';
 import { actionPolicyNames } from '../lib/hostActions';
-import {
-  POLICIES,
-  POLICY_MEANING,
-  fieldSpec,
-  parseActionPolicies,
-  actionPoliciesText,
-  valueText,
-} from '../lib/settingsForm';
+import { POLICIES, POLICY_MEANING, fieldSpec, parsePolicies, policiesText, valueText } from '../lib/settingsForm';
 
 /** The part of a setting's form state the editor reads. */
 interface PoliciesState {
@@ -29,11 +22,11 @@ interface PoliciesState {
 export function ActionPolicies({ state }: { state: PoliciesState }) {
   const spec = fieldSpec('actionPolicies');
   const hosts = list(useLive('hosts').data?.hosts);
-  const policies = parseActionPolicies(state.value) ?? {};
-  const names = actionPolicyNames(hosts, { ...(parseActionPolicies(state.stored) ?? {}), ...policies });
+  const policies = parsePolicies(state.value) ?? {};
+  const names = actionPolicyNames(hosts, { ...(parsePolicies(state.stored) ?? {}), ...policies });
 
   const set = (name: string, policy: Policy) => {
-    state.set(actionPoliciesText({ ...policies, [name]: policy }));
+    state.set(policiesText({ ...policies, [name]: policy }));
   };
 
   return (

@@ -13,9 +13,11 @@ import {
   fieldSpec,
   fromForm,
   groupKeys,
+  kindRows,
   sameValue,
   toForm,
   validateField,
+  valueText,
   type FieldSpec,
 } from './settingsForm';
 
@@ -99,5 +101,36 @@ describe('the groups of the settings page', () => {
     const form = { ...toForm(stored), minPeers: '5', leaseTtl: '1800s' };
 
     expect(changedSettings(form, stored)).toEqual({ minPeers: 5 });
+  });
+});
+
+describe('the policy per kind', () => {
+  const kinds = fieldSpec('policyKinds');
+
+  it('offers the kinds of the fleet, those with a policy, and other last', () => {
+    expect(kindRows(['el', 'cl', 'snooper'], { blobber: 'manual', other: 'auto' }, { cl: 'manual' })).toEqual([
+      'el',
+      'cl',
+      'snooper',
+      'blobber',
+      'other',
+    ]);
+    expect(kindRows([])).toEqual(['other']);
+  });
+
+  it('sends the whole map when it changed, and sees another order as the same', () => {
+    const stored = { ...defaultSettings(), policyKinds: { cl: 'manual' as const, other: 'auto' as const } };
+    const form = { ...toForm(stored), policyKinds: '{"other":"auto","cl":"manual","vc":"manual"}' };
+
+    expect(changedSettings(form, stored)).toEqual({ policyKinds: { cl: 'manual', other: 'auto', vc: 'manual' } });
+    expect(sameValue(kinds, '{"other":"auto","cl":"manual"}', toForm(stored).policyKinds)).toBe(true);
+  });
+
+  it('says what is set, and refuses what is no kind to policy', () => {
+    expect(valueText(kinds, '{}')).toBe('every kind inherits');
+    expect(valueText(kinds, '{"cl":"manual","other":"auto"}')).toBe('cl manual, other auto');
+    expect(validateField(kinds, '{"none":"manual"}')).toBe('none is not a kind');
+    expect(validateField(kinds, '{"cl":"sometimes"}')).toBe('must be an object of kind to auto or manual');
+    expect(validateField(kinds, '{"cl":"manual"}')).toBeNull();
   });
 });

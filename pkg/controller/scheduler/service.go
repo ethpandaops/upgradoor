@@ -592,6 +592,7 @@ func (s *service) PatchSettings(
 
 	next := current
 	next.PolicyClients = maps.Clone(current.PolicyClients)
+	next.PolicyKinds = maps.Clone(current.PolicyKinds)
 	next.ActionPolicies = maps.Clone(current.ActionPolicies)
 
 	if err := apply(&next); err != nil {
@@ -605,6 +606,10 @@ func (s *service) PatchSettings(
 	// Nothing named, or what is named is what is there: no write, no entry.
 	if len(next.PolicyClients) == 0 {
 		next.PolicyClients = nil
+	}
+
+	if len(next.PolicyKinds) == 0 {
+		next.PolicyKinds = nil
 	}
 
 	if len(next.ActionPolicies) == 0 {

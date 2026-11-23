@@ -13,7 +13,6 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/httpjson"
-	"github.com/ethpandaops/upgradoor/pkg/controller/views"
 )
 
 // settingsPatch is the body of PUT /api/v1/settings: the settings it names,
@@ -202,10 +201,15 @@ func (s *Handler) handlePutSettings(w http.ResponseWriter, r *http.Request, u *a
 	}
 
 	s.opts.Notify()
-	httpjson.Write(s.log, w, http.StatusOK, views.SettingsBody{
-		Settings: stored,
-		Defaults: s.opts.DefaultSettings,
-	})
+
+	body, err := s.settingsBody(ctx, &stored)
+	if err != nil {
+		httpjson.InternalError(s.log, w, r, err)
+
+		return
+	}
+
+	httpjson.Write(s.log, w, http.StatusOK, body)
 }
 
 // A patch is what decodeBody decodes the body into.
