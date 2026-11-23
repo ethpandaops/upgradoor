@@ -87,7 +87,7 @@ func TestLoadAnswerSigner(t *testing.T) {
 	assert.Equal(t, publicKey(controllerSeed),
 		signerKey(t, &Config{Network: network, ControllerSeedFile: good}))
 
-	// The key is the same for every devnet.
+	// The key does not depend on the network.
 	other := signerKey(t, &Config{Network: "testnet-devnet-1", ControllerSeedFile: good})
 	assert.Equal(t, publicKey(controllerSeed), other)
 

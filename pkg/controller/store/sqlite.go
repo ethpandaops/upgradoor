@@ -153,8 +153,10 @@ func (s *sqliteStore) Stop() error {
 // prepareDSN returns the connection string shared by the writer and the
 // readers and makes sure a database file can be created.
 func (s *sqliteStore) prepareDSN() (string, error) {
+	// temp_store(2): statement journals and sorts stay in memory, so no
+	// temporary directory is needed (read-only root filesystems).
 	pragmas := fmt.Sprintf(
-		"_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)", busyTimeout.Milliseconds())
+		"_pragma=busy_timeout(%d)&_pragma=foreign_keys(1)&_pragma=temp_store(2)", busyTimeout.Milliseconds())
 
 	if s.path == MemoryPath {
 		// SQLite's memdb VFS shares one in-memory database between all

@@ -3,11 +3,10 @@
 // with which a host authenticates to the controller, and the answer
 // signature with which the controller authenticates to the host.
 //
-// There are two seeds, and they are different secrets, each shared by all
-// devnets. The devnet seed yields the signer key of the host certificates,
-// the controller seed the controller key that signs answers. Neither key
-// depends on the network: the network is a claim of the certificate and of
-// each answer. A function takes the one seed or the other, never both. A host
+// There are two seeds, and they are different secrets. The devnet seed
+// yields the signer key of the host certificates, the controller seed the
+// controller key that signs answers. Neither key depends on the network: the
+// network is a claim of the certificate and of each answer. A function takes the one seed or the other, never both. A host
 // key is generated on its host (GenerateHostKey).
 //
 // Keys and signatures are ML-DSA-44 (FIPS 204), a post-quantum scheme.

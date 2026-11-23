@@ -22,11 +22,11 @@ const (
 // is checked against. An agent acts on nothing of such an answer.
 var ErrBadAnswer = errors.New("identity: controller answer refused")
 
-// DeriveControllerKey derives the controller key, with which every
-// controller signs its answers to agents.
+// DeriveControllerKey derives the controller key, with which the controller
+// signs its answers to agents.
 //
-// controllerSeed is the controller seed, shared by all devnets. It is not the
-// devnet seed the signer key comes from. Like the devnet seed it is used as
+// controllerSeed is the controller seed, not the devnet seed the signer key
+// comes from. Like the devnet seed it is used as
 // raw bytes and must be at least MinSeedLength long.
 func DeriveControllerKey(controllerSeed []byte) (*mldsa.PrivateKey, error) {
 	return derive(controllerSeed, infoController)

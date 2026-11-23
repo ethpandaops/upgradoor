@@ -21,7 +21,7 @@ import { ActionIcon, ActionMenu } from '../components/icons';
 import { useLive } from '../components/Live';
 import { useQuery } from '../hooks/useQuery';
 import { OverrideButtons, overrideState } from '../components/Overrides';
-import { ActionButton, usePermissions } from '../components/Permissions';
+import { usePermissions } from '../components/Permissions';
 import { RelTime } from '../components/RelTime';
 import {
   Badge,
@@ -999,46 +999,50 @@ function DeviationChip({
 
 const POLICY_LABEL: Record<Policy, string> = { auto: 'Automatic', manual: 'Manual' };
 
+/** PolicyChoice is the client's own image policy, or inherit: it follows the default. */
+type PolicyChoice = Policy | 'inherit';
+
 /**
  * PolicySetting is the image policy of the client, a setting of its header:
- * automatic or manual, whether that is the client's own or the default, and
- * the way back to the default. It is disabled, and says why, for a login
- * that may not set it.
+ * inherit (the default, named), automatic or manual. It is disabled, and says
+ * why, for a login that may not set it.
  */
 function PolicySetting({ client, onAction }: { client: ClientView; onAction: (intent: ActionIntent) => void }) {
   const permissions = usePermissions();
   const fallback = client.defaultPolicy;
+  const value: PolicyChoice = client.policySet ? client.policy : 'inherit';
 
   const verdict = permissions.canIntent(clientPolicyIntent(client.name, client.policy));
+  const options: { value: PolicyChoice; label: string; title: string }[] = [
+    {
+      value: 'inherit',
+      label: `Inherit (${POLICY_LABEL[fallback].toLowerCase()})`,
+      title: verdict.allowed
+        ? `Follow the default for images, now ${POLICY_LABEL[fallback].toLowerCase()}`
+        : verdict.reason,
+    },
+    ...POLICIES.map(p => ({
+      value: p,
+      label: POLICY_LABEL[p],
+      title: verdict.allowed ? `${POLICY_LABEL[p]}: ${POLICY_MEANING[p]}` : verdict.reason,
+    })),
+  ];
 
   return (
     <div role="group" aria-label="Roll policy" className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs/5">
       <span className="text-sm/6 font-medium" title={POLICIES.map(p => `${p}: ${POLICY_MEANING[p]}`).join('\n')}>
         Roll policy
       </span>
-      <Segmented<Policy>
+      <Segmented<PolicyChoice>
         label={`Roll policy of ${client.name}`}
-        value={client.policy}
+        value={value}
         disabled={!verdict.allowed}
-        options={POLICIES.map(p => ({
-          value: p,
-          label: POLICY_LABEL[p],
-          title: verdict.allowed ? `${POLICY_LABEL[p]}: ${POLICY_MEANING[p]}` : verdict.reason,
-        }))}
-        onChange={policy => {
-          if (policy !== client.policy) onAction(clientPolicyIntent(client.name, policy));
+        options={options}
+        onChange={choice => {
+          if (choice !== value) onAction(clientPolicyIntent(client.name, choice === 'inherit' ? '' : choice));
         }}
       />
-      <span className="text-muted">
-        {client.policySet ? 'set for this client' : `the default for images (${POLICY_LABEL[fallback].toLowerCase()})`}
-        {' · '}
-        {POLICY_MEANING[client.policy]}
-      </span>
-      {client.policySet && (
-        <ActionButton dense variant="ghost" onAction={onAction} intent={clientPolicyIntent(client.name, '')}>
-          Use the default ({POLICY_LABEL[fallback].toLowerCase()})…
-        </ActionButton>
-      )}
+      <span className="text-muted">{POLICY_MEANING[client.policy]}</span>
       {!verdict.allowed && <span className="text-muted">Read only: {verdict.reason}.</span>}
     </div>
   );

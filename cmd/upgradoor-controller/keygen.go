@@ -14,7 +14,7 @@ import (
 
 // The two seeds and where each is read from. They are different secrets and
 // are never read from the same place: the devnet seed yields the signer key,
-// the controller seed the controller key. Each is shared by all devnets.
+// the controller seed the controller key.
 const (
 	seedEnv            = "UPGRADOOR_SEED"
 	seedFlag           = "seed-file"
@@ -45,8 +45,8 @@ func newKeygenCmd() *cobra.Command {
 			"                       --" + seedFlag + " or " + seedEnv + "\n" +
 			"  the controller seed  controller answers: controller-pubkey\n" +
 			"                       --" + controllerSeedFlag + " or " + controllerSeedEnv + "\n\n" +
-			"Each seed is shared by all devnets, and the public keys do not depend on the\n" +
-			"network: the network is a claim of each host certificate and each answer.\n\n" +
+			"The public keys do not depend on the network: the network is a claim of\n" +
+			"each host certificate and each answer.\n\n" +
 			"A command reads only its own seed and refuses the other one's flag. Neither\n" +
 			"seed is ever taken from an argument. Both are used as raw bytes, exactly as\n" +
 			"stored in sops (a single trailing newline of a seed file is dropped), and\n" +

@@ -307,7 +307,7 @@ func TestAnswersNotOfTheControllerAreNotActedOn(t *testing.T) {
 			forge: func(t *testing.T) forgeFunc {
 				t.Helper()
 
-				// The same controller key signs for every network.
+				// The controller key does not depend on the network.
 				key, err := identity.DeriveControllerKey([]byte(testControllerSeed))
 				require.NoError(t, err)
 

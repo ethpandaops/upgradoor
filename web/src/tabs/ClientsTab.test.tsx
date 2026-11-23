@@ -246,15 +246,14 @@ describe('ClientsTab', () => {
     });
   });
 
-  it('sets the image policy of a client through the dialog, and offers the way back to the default', async () => {
+  it('sets the image policy of a client through the dialog, and inherits the default again', async () => {
     const user = userEvent.setup();
     const h = await open('staff', '#clients/geth');
     await screen.findByRole('table', { name: 'Hosts of geth' });
 
     const policy = screen.getByRole('group', { name: 'Roll policy' });
-    expect(within(policy).getByRole('button', { name: 'Automatic' })).toHaveAttribute('aria-pressed', 'true');
-    expect(policy).toHaveTextContent('the default for images (automatic)');
-    expect(within(policy).queryByRole('button', { name: /Use the default/ })).not.toBeInTheDocument();
+    expect(within(policy).getByRole('button', { name: 'Inherit (automatic)' })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(policy).getByRole('button', { name: 'Automatic' })).toHaveAttribute('aria-pressed', 'false');
 
     await user.click(within(policy).getByRole('button', { name: 'Manual' }));
     const dialog = await screen.findByRole('dialog', { name: 'Image policy of geth: manual' });
@@ -269,7 +268,20 @@ describe('ClientsTab', () => {
       policy: 'manual',
       reason: 'release week',
     });
-    expect(within(policy).getByRole('button', { name: 'Use the default (automatic)…' })).toBeEnabled();
+
+    await user.click(within(policy).getByRole('button', { name: 'Inherit (automatic)' }));
+    const back = await screen.findByRole('dialog', { name: 'Image policy of geth: back to the default' });
+    await user.click(within(back).getByRole('button', PRIMARY));
+    await waitFor(() => {
+      expect(within(policy).getByRole('button', { name: 'Inherit (automatic)' })).toHaveAttribute(
+        'aria-pressed',
+        'true'
+      );
+    });
+    expect(h.calls.filter(c => c.path === '/api/v1/actions/client-policy').at(-1)?.body).toMatchObject({
+      client: 'geth',
+      policy: '',
+    });
   });
 
   it('disables the policy switch, with the reason, for a login that may not set it', async () => {
@@ -279,7 +291,7 @@ describe('ClientsTab', () => {
     const policy = screen.getByRole('group', { name: 'Roll policy' });
     const reason =
       'Needs upgradoor:manage or upgradoor:team_manage for a team that owns every container of this client';
-    for (const name of ['Automatic', 'Manual']) {
+    for (const name of ['Inherit (automatic)', 'Automatic', 'Manual']) {
       expect(within(policy).getByRole('button', { name })).toBeDisabled();
       expect(within(policy).getByRole('button', { name })).toHaveAttribute('title', reason);
     }

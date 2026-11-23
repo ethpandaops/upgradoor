@@ -170,7 +170,7 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 		proof, _, err := creds.Proof("POST", fixtureURL, nil, f.now)
 		require.NoError(t, err)
 
-		// The signer is the same for every network: the claim decides.
+		// The signer key does not depend on the network: the claim decides.
 		_, _, err = f.verifier.Verify(cert, proof, f.request(""))
 		require.ErrorIs(t, err, ErrWrongNetwork)
 	})

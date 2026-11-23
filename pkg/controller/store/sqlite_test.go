@@ -308,17 +308,20 @@ func TestLifecycle(t *testing.T) {
 				synchronous int
 				foreignKeys int
 				busy        int
+				tempStore   int
 			)
 
 			require.NoError(t, db.QueryRow(`PRAGMA journal_mode`).Scan(&journal))
 			require.NoError(t, db.QueryRow(`PRAGMA synchronous`).Scan(&synchronous))
 			require.NoError(t, db.QueryRow(`PRAGMA foreign_keys`).Scan(&foreignKeys))
 			require.NoError(t, db.QueryRow(`PRAGMA busy_timeout`).Scan(&busy))
+			require.NoError(t, db.QueryRow(`PRAGMA temp_store`).Scan(&tempStore))
 
 			assert.Equal(t, "wal", journal)
 			assert.Equal(t, 2, synchronous, "FULL")
 			assert.Equal(t, 1, foreignKeys)
 			assert.Equal(t, int(busyTimeout.Milliseconds()), busy)
+			assert.Equal(t, 2, tempStore, "MEMORY: no temporary directory needed")
 		}
 
 		_, err := impl.reader.Exec(`DELETE FROM hosts`)

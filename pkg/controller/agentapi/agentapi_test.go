@@ -90,8 +90,8 @@ func TestAgentAuthentication(t *testing.T) {
 		identity.CertificateSpec{Network: controllertest.Network, Hostname: "lighthouse-geth-1"})
 	require.NoError(t, err)
 
-	// A certificate for another network: the signer is the same for every
-	// network, so the signature is good, the network claim is not.
+	// A certificate for another network: the signature is good, the network
+	// claim is not.
 	signer, err := identity.DeriveSignerKey([]byte(controllertest.Seed))
 	require.NoError(t, err)
 

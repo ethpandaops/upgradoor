@@ -47,9 +47,9 @@ type Config struct {
 	Network string
 	// SignerPublicKey is the unpadded base64url ML-DSA-44 signer public key.
 	SignerPublicKey string
-	// ControllerSeedFile is the file holding the controller seed, shared by
-	// all devnets, from which the controller derives the controller key at
-	// start. It is not the devnet seed.
+	// ControllerSeedFile is the file holding the controller seed, from which
+	// the controller derives the controller key at start. It is not the
+	// devnet seed.
 	// The seed is only ever read from a file: a flag or an environment
 	// variable would show it in the process listing or the pod
 	// specification.

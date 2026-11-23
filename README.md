@@ -113,9 +113,8 @@ Without the URL no host has validators and the budget is only the host limit.
 - The controller signs its answers with a key derived from the controller
   seed (`--controller-seed-file`); agents pin its public key
   (`controller.publicKey`) and act on nothing else.
-- Both seeds are shared by all devnets and neither public key depends on the
-  network: the controller refuses certificates and agents refuse answers of
-  another network.
+- Neither public key depends on the network: the controller refuses
+  certificates and agents refuse answers of another network.
 - The agent runs as user `upgradoor` with two sudo rules (package upgrade,
   reboot) and does only the verbs its `agent.yaml` allows.
 - Hosts install only signed releases (below).
