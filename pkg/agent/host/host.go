@@ -83,7 +83,7 @@ func New(log logrus.FieldLogger, cfg *Config, blocked []string, login Login) (Ho
 		return nil, errors.New("host: logger is required")
 	}
 
-	runtime, err := docker.New(log, cfg.Docker.Host, login)
+	runtime, err := docker.New(log, cfg.Docker.Host, cfg.Docker.Labels, login)
 	if err != nil {
 		return nil, err
 	}

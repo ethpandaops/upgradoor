@@ -21,6 +21,10 @@ func (c *Config) ApplyDefaults() {
 
 // Validate checks the probes and the commands.
 func (c *Config) Validate() error {
+	if err := c.Docker.Validate(); err != nil {
+		return err
+	}
+
 	if err := c.Probes.Validate(); err != nil {
 		return err
 	}

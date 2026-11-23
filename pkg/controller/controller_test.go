@@ -22,6 +22,7 @@ func TestParseDefaultSettings(t *testing.T) {
 		"maxUnavailablePercent=25", "leaseTtl=10m", "policyReboot=auto",
 		"readyAttestations=3", "readyStableFor=5m", "minPeers=5", "paused=true", `policyImage="manual"`,
 		"readyPeerShare=0.25", "pauseAfterCanaryImage=true",
+		`policyClients={"lighthouse":"auto"}`, `actionPolicies={"security-upgrades":"auto"}`,
 	})
 	require.NoError(t, err)
 	assert.InDelta(t, 25.0, s.MaxUnavailablePercent, 0)
@@ -35,6 +36,8 @@ func TestParseDefaultSettings(t *testing.T) {
 	assert.InDelta(t, 0.25, s.ReadyPeerShare, 0)
 	assert.True(t, s.PauseAfterCanaryImage)
 	assert.False(t, s.PauseAfterCanaryReboot)
+	assert.Equal(t, fleet.ClientPolicies{"lighthouse": fleet.PolicyAuto}, s.PolicyClients)
+	assert.Equal(t, fleet.ActionPolicies{"security-upgrades": fleet.PolicyAuto}, s.ActionPolicies)
 
 	for _, bad := range []string{
 		"nokey", "=1", "unknown=1", "leaseTtl=30", "maxUnavailablePercent=200",

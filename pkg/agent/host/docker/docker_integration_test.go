@@ -511,7 +511,7 @@ func (e *itEnv) newRuntime(t *testing.T) *dockerRuntime {
 	log.SetOutput(testLogWriter{t})
 	log.SetLevel(logrus.DebugLevel)
 
-	r, err := newDockerRuntime(log, e.host, nil)
+	r, err := newDockerRuntime(log, e.host, nil, nil)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, r.Close()) })
 

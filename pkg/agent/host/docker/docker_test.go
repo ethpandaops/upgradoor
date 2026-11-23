@@ -41,6 +41,7 @@ type fakeEngine struct {
 	// onCreate runs before a container is created.
 	onCreate func()
 	created  []client.ContainerCreateOptions
+	listed   []client.ContainerListOptions
 	pulls    []client.ImagePullOptions
 	pullMsgs []jsonstream.Message
 	nextID   int
@@ -129,8 +130,10 @@ func notFound(what string) error {
 }
 
 func (f *fakeEngine) ContainerList(
-	context.Context, client.ContainerListOptions,
+	_ context.Context, opts client.ContainerListOptions,
 ) (client.ContainerListResult, error) {
+	f.listed = append(f.listed, opts)
+
 	var res client.ContainerListResult
 	for id := range f.containers {
 		res.Items = append(res.Items, container.Summary{ID: id})
@@ -391,6 +394,25 @@ func TestContainers(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, got, 2)
 	assert.Equal(t, "other"+retiredSuffix, got[1].Name)
+}
+
+func TestContainersOnlyWithTheConfiguredLabels(t *testing.T) {
+	f := newFakeEngine()
+	r := newTestRuntime(t, f)
+	r.only = labelFilter(map[string]string{"e2e.node": "1"})
+
+	_, err := r.Containers(context.Background())
+	require.NoError(t, err)
+	require.Len(t, f.listed, 1)
+	assert.True(t, f.listed[0].All)
+	assert.Equal(t, client.Filters{"label": {"e2e.node=1": true}}, f.listed[0].Filters)
+
+	assert.Nil(t, labelFilter(nil), "no labels: every container")
+}
+
+func TestConfigValidate(t *testing.T) {
+	require.NoError(t, (&Config{Labels: map[string]string{"e2e.node": ""}}).Validate())
+	require.Error(t, (&Config{Labels: map[string]string{" ": "1"}}).Validate())
 }
 
 func TestContainersLabels(t *testing.T) {

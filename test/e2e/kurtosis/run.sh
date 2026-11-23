@@ -136,15 +136,13 @@ publish() {
         tr -d '\r' | awk 'tolower($1) == "docker-content-digest:" {print $2}'
 }
 
-# rollout_of DIGEST: the id of the image rollout for a digest.
-rollout_of() {
-    api /api/v1/rollouts |
-        jq -r --arg d "$1" '[.open[], .recent[]] | map(select(.digest == $d)) | .[0].id // empty'
+# rollout_of DIGEST: the id of the beacon node rollout for a digest.
+rollout_for() {
+    jq --arg d "$1" '[.open[], .recent[]] |
+        map(select(.containerKind == "cl" and any(.targets[]?; .digest == $d))) | .[0]'
 }
-rollout_state() {
-    api /api/v1/rollouts |
-        jq -r --arg d "$1" '[.open[], .recent[]] | map(select(.digest == $d)) | .[0].state // "none"'
-}
+rollout_of() { api /api/v1/rollouts | rollout_for "$1" | jq -r '.id // empty'; }
+rollout_state() { api /api/v1/rollouts | rollout_for "$1" | jq -r '.state // "none"'; }
 rollout_is() { [ "$(rollout_state "$1")" = "$2" ]; }
 rollout_exists() { [ -n "$(rollout_of "$1")" ]; }
 
@@ -241,6 +239,7 @@ mkdir -p "$work/data"
     --default-setting leaseTtl=5m \
     --default-setting readinessTimeout=6m \
     --default-setting hostStaleAfter=1m \
+    --default-setting lookupInterval=30s \
     >"$work/controller.log" 2>&1 &
 echo $! >"$work/controller.pid"
 wait_until "controller up" 30 curl -fsS "$ctl/healthz"
@@ -263,7 +262,8 @@ for i in $(seq 1 $nodes); do
     vc=$(container "vc-$i-geth-lighthouse")
     [ -n "$el" ] && [ -n "$cl" ] && [ -n "$vc" ] || die "containers of node $i not found"
     # Kurtosis created them: give them the labels Ansible would set.
-    "$work/relabel" "$el=el/geth" "$cl=cl/lighthouse" "$vc=vc/lighthouse" || die "relabel node $i"
+    # All nodes share one Docker daemon: each agent only sees its node's containers.
+    "$work/relabel" "+e2e.node=$i" "$el=el/geth" "$cl=cl/lighthouse" "$vc=vc/lighthouse" || die "relabel node $i"
 
     "$work/upgradoor" key --path "$dir/host.key" >"$dir/host.pub"
     "$work/upgradoor-controller" keygen host-cert --network "$network" --hostname "node-$i" \
@@ -284,6 +284,9 @@ roles: [ethereum_node]
 # Only image rolls: this "host" shares the real machine's kernel.
 verbs: [roll]
 # The containers carry the kind and team labels (relabel above).
+docker:
+  labels:
+    e2e.node: "$i"
 probes:
   el: http://$(ip_of "$el"):8545
   cl: http://$(ip_of "$cl"):4000
@@ -399,7 +402,7 @@ pass "refusals: 403, nothing changed, nothing audited"
 
 # One owned container is enough for a host-level action.
 expect_status 200 "$team_token" /api/v1/actions/hold '{"hosts":["node-3"],"reason":"e2e: team hold"}'
-wait_until "node-3 reports the team hold" 60 jq_true /api/v1/hosts/node-3 '.holders == ["lighthouse"]'
+wait_until "node-3 reports the team hold" 60 jq_true /api/v1/hosts/node-3 '[.hold.holds[]?.holder] == ["lighthouse"]'
 jq_true "/api/v1/audit?action=action.hold&limit=1" '.entries[0] |
         .actor == "lh@example.com" and .target == "node-3" and
         .detail.authorizedBy == "team_manage" and .detail.teams == ["lighthouse"]' ||
@@ -502,14 +505,14 @@ wait_until "manual roll of node-2 completed" 600 \
 
 post /api/v1/actions/hold '{"hosts":["node-4"],"reason":"e2e: hold"}' >/dev/null
 wait_until "node-4 reports staff's hold" 60 \
-    jq_true /api/v1/hosts/node-4 '.holders == ["staff"]'
+    jq_true /api/v1/hosts/node-4 '[.hold.holds[]?.holder] == ["staff"]'
 
 # A hold of staff is not a team's to lift, also on a host of the team.
-jq_true /api/v1/hosts/node-4 '.holders == ["staff"]' || die "the staff hold is not shown as staff's"
+jq_true /api/v1/hosts/node-4 '[.hold.holds[]?.holder] == ["staff"]' || die "the staff hold is not shown as staff's"
 expect_status 403 "$team_token" /api/v1/actions/unhold '{"hosts":["node-4"],"holders":["staff"]}'
 jq -e '.error == "forbidden: upgradoor:team_manage does not lift the hold of staff on host node-4"' \
     "$work/answer.json" >/dev/null || die "the refusal does not say whose hold it is: $(cat "$work/answer.json")"
-jq_true /api/v1/hosts/node-4 '.holders == ["staff"] and (.plan.holdRequests // []) == []' ||
+jq_true /api/v1/hosts/node-4 '[.hold.holds[]?.holder] == ["staff"] and (.plan.holdRequests // []) == []' ||
     die "a team member lifted a staff hold"
 
 post /api/v1/actions/roll '{"all":true,"staggered":true,"reason":"e2e: staggered roll"}' \
@@ -519,7 +522,7 @@ jq -e '.rejected["node-4"] != null or (.hosts | index("node-4") | not)' "$work/a
     >/dev/null || die "the held host was accepted for the staggered roll"
 
 post /api/v1/actions/pause '{"reason":"e2e: pause"}' >/dev/null
-jq_true /api/v1/plan '.paused == true' || die "global pause not in effect"
+wait_until "global pause in effect" 30 jq_true /api/v1/plan '.paused == true'
 post /api/v1/actions/resume '{"reason":"e2e: resume"}' >/dev/null
 
 wait_until "staggered manual roll completed" 1500 \

@@ -4,7 +4,7 @@
 // configuration and image plus the labels, as Ansible's recreate would, so
 // the agent finds it.
 //
-//	relabel <container>=<kind>[/<team>] ...
+//	relabel [+<label>=<value> ...] <container>=<kind>[/<team>] ...
 package main
 
 import (
@@ -30,7 +30,28 @@ func main() {
 
 func run(args []string) error {
 	if len(args) == 0 {
-		return errors.New("usage: relabel <container>=<kind>[/<team>] [<container>=<kind>[/<team>]]")
+		return errors.New("usage: relabel [+<label>=<value> ...] <container>=<kind>[/<team>] [more]")
+	}
+
+	// +<label>=<value> goes on every container, e.g. the label an agent is
+	// limited to (docker.labels).
+	extra := make(map[string]string, 1)
+	specs := make([]string, 0, len(args))
+
+	for _, arg := range args {
+		label, ok := strings.CutPrefix(arg, "+")
+		if !ok {
+			specs = append(specs, arg)
+
+			continue
+		}
+
+		k, v, ok := strings.Cut(label, "=")
+		if !ok || k == "" {
+			return fmt.Errorf("%q is not +<label>=<value>", arg)
+		}
+
+		extra[k] = v
 	}
 
 	log := logrus.New()
@@ -55,7 +76,7 @@ func run(args []string) error {
 		return err
 	}
 
-	for _, arg := range args {
+	for _, arg := range specs {
 		name, spec, ok := strings.Cut(arg, "=")
 		kind, team, _ := strings.Cut(spec, "/")
 
@@ -63,7 +84,12 @@ func run(args []string) error {
 			return fmt.Errorf("%q is not <container>=<kind>[/<team>]", arg)
 		}
 
-		labels := map[string]string{protocol.LabelKind: kind}
+		labels := make(map[string]string, 2+len(extra))
+		for k, v := range extra {
+			labels[k] = v
+		}
+
+		labels[protocol.LabelKind] = kind
 		if team != "" {
 			labels[protocol.LabelTeam] = team
 		}

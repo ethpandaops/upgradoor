@@ -40,6 +40,9 @@ type Config struct {
 	// AuthFile is a Docker config.json with the credentials for pulls; a
 	// missing file means anonymous.
 	AuthFile string `yaml:"authFile"`
+	// Labels limits the agent to the containers that carry all of them, for
+	// several agents on one daemon; empty means every container.
+	Labels map[string]string `yaml:"labels"`
 }
 
 // ApplyDefaults fills unset fields.
@@ -51,6 +54,17 @@ func (c *Config) ApplyDefaults() {
 	if c.AuthFile == "" {
 		c.AuthFile = defaultAuthFile
 	}
+}
+
+// Validate checks the label filter: every label has a name.
+func (c *Config) Validate() error {
+	for k := range c.Labels {
+		if strings.TrimSpace(k) == "" {
+			return errors.New("docker.labels: a label without a name")
+		}
+	}
+
+	return nil
 }
 
 // ErrDigestMismatch is returned by Runtime.Recreate, before anything is
@@ -112,8 +126,8 @@ type Change struct {
 type Login func(registryHost string) (username, password string, ok bool)
 
 // New returns the runtime for the daemon at host without connecting.
-func New(log logrus.FieldLogger, host string, login Login) (Runtime, error) {
-	r, err := newDockerRuntime(log, host, login)
+func New(log logrus.FieldLogger, host string, labels map[string]string, login Login) (Runtime, error) {
+	r, err := newDockerRuntime(log, host, labels, login)
 	if err != nil {
 		return nil, err
 	}
@@ -169,6 +183,8 @@ type dockerRuntime struct {
 	log    logrus.FieldLogger
 	engine engine
 	login  Login
+	// only filters the container list (Config.Labels); nil lists every container.
+	only client.Filters
 
 	// recreateMu serialises Recreate and the recovery of interrupted ones.
 	recreateMu sync.Mutex
@@ -179,9 +195,25 @@ type dockerRuntime struct {
 	pulled   map[string]string
 }
 
+// labelFilter is the list filter of Config.Labels; nil without labels.
+func labelFilter(labels map[string]string) client.Filters {
+	if len(labels) == 0 {
+		return nil
+	}
+
+	f := make(client.Filters, 1)
+	for k, v := range labels {
+		f.Add("label", k+"="+v)
+	}
+
+	return f
+}
+
 // newDockerRuntime returns the runtime without connecting; the API version
 // is negotiated on the first request.
-func newDockerRuntime(log logrus.FieldLogger, host string, login Login) (*dockerRuntime, error) {
+func newDockerRuntime(
+	log logrus.FieldLogger, host string, labels map[string]string, login Login,
+) (*dockerRuntime, error) {
 	if host == "" {
 		return nil, errors.New("docker: daemon host is required")
 	}
@@ -196,6 +228,7 @@ func newDockerRuntime(log logrus.FieldLogger, host string, login Login) (*docker
 		engine: cli,
 		login:  login,
 		pulled: make(map[string]string, 8),
+		only:   labelFilter(labels),
 	}
 
 	return r, nil
@@ -212,7 +245,7 @@ func (r *dockerRuntime) Close() error {
 
 // Containers implements Runtime.
 func (r *dockerRuntime) Containers(ctx context.Context) ([]protocol.Container, error) {
-	list, err := r.engine.ContainerList(ctx, client.ContainerListOptions{All: true})
+	list, err := r.engine.ContainerList(ctx, client.ContainerListOptions{All: true, Filters: r.only})
 	if err != nil {
 		return nil, fmt.Errorf("list containers: %w", err)
 	}
