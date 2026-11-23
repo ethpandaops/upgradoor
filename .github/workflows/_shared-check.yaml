@@ -127,7 +127,7 @@ jobs:
       run: make test-docker
 
   test_system:
-    name: Test packages and reboot (systemd container)
+    name: Test packages (systemd container)
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -139,6 +139,3 @@ jobs:
 
     - name: Run system tests
       run: make test-system
-
-    - name: Run reboot tests
-      run: make test-reboot

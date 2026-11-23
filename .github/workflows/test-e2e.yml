@@ -49,6 +49,21 @@ jobs:
     - name: Run docker tests
       run: make test-docker
 
+  test_reboot:
+    name: "Test reboot (systemd container)"
+    if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e') }}
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+    - name: Set up go
+      uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+      with:
+        go-version-file: go.mod
+
+    - name: Run reboot tests
+      run: make test-reboot
+
   test_e2e:
     name: "End to end (Kurtosis)"
     if: ${{ github.event_name != 'pull_request' || contains(github.event.pull_request.labels.*.name, 'e2e') }}
