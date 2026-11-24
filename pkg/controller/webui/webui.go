@@ -20,6 +20,8 @@ package webui
 import (
 	"bytes"
 	"crypto/sha256"
+	"crypto/sha512"
+	"encoding/base64"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -51,6 +53,9 @@ const (
 	contentTypeJSON = "application/json; charset=utf-8"
 
 	notFoundJSON = `{"error":"not found"}` + "\n"
+
+	schemeHTTP  = "http"
+	schemeHTTPS = "https"
 )
 
 // errDirectory is returned by readFile for directories, which are never
@@ -147,9 +152,15 @@ type Options struct {
 	// in the Content-Security-Policy so the UI can load its login client and
 	// talk to it. Empty when the API runs open.
 	AuthProviderURL string
-	// ExtraOrigins are origins (scheme://host) the UI may load scripts from
-	// and connect to, e.g. for a site menu an ingress injects.
-	ExtraOrigins []string
+	// ConnectOrigins are origins (scheme://host) the UI may connect to, e.g.
+	// for data the site script fetches.
+	ConnectOrigins []string
+	// ScriptURL is a script the UI includes, e.g. a site menu; its origin is
+	// allowed in script-src. Empty allows none.
+	ScriptURL string
+	// ScriptIntegrity is the subresource integrity of ScriptURL
+	// ("sha256-", "sha384-" or "sha512-" and the base64 digest).
+	ScriptIntegrity string
 }
 
 // Handler serves the web UI.
@@ -164,7 +175,12 @@ var _ http.Handler = (*Handler)(nil)
 // New returns a handler over fsys. A nil fsys, or one without index.html,
 // yields the placeholder page.
 func New(log logrus.FieldLogger, fsys fs.FS, opts Options) (*Handler, error) {
-	csp, err := contentSecurityPolicy(opts.AuthProviderURL, opts.ExtraOrigins)
+	scriptOrigin, err := scriptOrigin(opts.ScriptURL, opts.ScriptIntegrity)
+	if err != nil {
+		return nil, err
+	}
+
+	csp, err := contentSecurityPolicy(opts.AuthProviderURL, scriptOrigin, opts.ConnectOrigins)
 	if err != nil {
 		return nil, err
 	}
@@ -176,10 +192,59 @@ func New(log logrus.FieldLogger, fsys fs.FS, opts Options) (*Handler, error) {
 	}, nil
 }
 
+// scriptOrigin validates the site script and returns its origin, or "" when
+// there is none. The script must be https (http only on loopback) and carry
+// a single sha256, sha384 or sha512 integrity hash.
+func scriptOrigin(scriptURL, integrity string) (string, error) {
+	if scriptURL == "" {
+		if integrity != "" {
+			return "", errors.New("webui: script integrity given without a script URL")
+		}
+
+		return "", nil
+	}
+
+	u, err := url.Parse(scriptURL)
+	if err != nil {
+		return "", fmt.Errorf("webui: script URL: %w", err)
+	}
+
+	loopback := u.Hostname() == "localhost" || u.Hostname() == "127.0.0.1" ||
+		u.Hostname() == "::1"
+
+	if (u.Scheme != schemeHTTPS && (u.Scheme != schemeHTTP || !loopback)) || u.Host == "" ||
+		u.User != nil {
+		return "", fmt.Errorf("webui: script URL %q is not an https URL", scriptURL)
+	}
+
+	if integrity == "" {
+		return "", errors.New("webui: script URL needs a script integrity hash")
+	}
+
+	algo, digest, _ := strings.Cut(integrity, "-")
+	sizes := map[string]int{"sha256": sha256.Size, "sha384": sha512.Size384, "sha512": sha512.Size}
+
+	size, ok := sizes[algo]
+	if !ok {
+		return "", fmt.Errorf("webui: script integrity %q is not sha256-, sha384- or sha512-",
+			integrity)
+	}
+
+	if raw, err := base64.StdEncoding.DecodeString(digest); err != nil || len(raw) != size {
+		return "", fmt.Errorf("webui: script integrity %q is not a base64 %s digest",
+			integrity, algo)
+	}
+
+	return strings.ToLower(u.Scheme + "://" + u.Host), nil
+}
+
 // contentSecurityPolicy builds the policy for UI pages: everything from the
 // own origin, plus the authenticatoor origin for its client script, its
-// requests and its login frame, plus extra origins for scripts and requests.
-func contentSecurityPolicy(authProviderURL string, extraOrigins []string) (string, error) {
+// requests and its login frame, plus the site script origin for scripts and
+// the connect origins for requests.
+func contentSecurityPolicy(authProviderURL, scriptOrigin string, connectOrigins []string) (
+	string, error,
+) {
 	authOrigin := ""
 
 	if authProviderURL != "" {
@@ -188,7 +253,7 @@ func contentSecurityPolicy(authProviderURL string, extraOrigins []string) (strin
 			return "", fmt.Errorf("webui: auth provider URL: %w", err)
 		}
 
-		if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
+		if (u.Scheme != schemeHTTPS && u.Scheme != schemeHTTP) || u.Host == "" {
 			return "", fmt.Errorf("webui: auth provider URL %q is not an http(s) URL",
 				authProviderURL)
 		}
@@ -196,18 +261,23 @@ func contentSecurityPolicy(authProviderURL string, extraOrigins []string) (strin
 		authOrigin = " " + u.Scheme + "://" + u.Host
 	}
 
-	extra, err := normalizeOrigins(extraOrigins, strings.TrimSpace(authOrigin))
+	connect, err := normalizeOrigins(connectOrigins, strings.TrimSpace(authOrigin))
 	if err != nil {
 		return "", err
 	}
 
+	script := authOrigin
+	if scriptOrigin != "" && !strings.EqualFold(" "+scriptOrigin, authOrigin) {
+		script += " " + scriptOrigin
+	}
+
 	return strings.Join([]string{
 		"default-src 'self'",
-		"script-src 'self'" + authOrigin + extra,
+		"script-src 'self'" + script,
 		"style-src 'self' 'unsafe-inline'",
 		"img-src 'self' data:",
 		"font-src 'self' data:",
-		"connect-src 'self'" + authOrigin + extra,
+		"connect-src 'self'" + authOrigin + connect,
 		"frame-src 'self'" + authOrigin,
 		"object-src 'none'",
 		"base-uri 'self'",
@@ -230,7 +300,7 @@ func normalizeOrigins(raw []string, authOrigin string) (string, error) {
 			return "", fmt.Errorf("webui: UI origin %q: %w", r, err)
 		}
 
-		if (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" || u.User != nil ||
+		if (u.Scheme != schemeHTTPS && u.Scheme != schemeHTTP) || u.Host == "" || u.User != nil ||
 			(u.Path != "" && u.Path != "/") || u.RawQuery != "" || u.Fragment != "" ||
 			u.ForceQuery {
 			return "", fmt.Errorf("webui: UI origin %q is not an http(s) origin "+

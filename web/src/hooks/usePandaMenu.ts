@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react';
 
-// The ethpandaops panda menu (global-panda-menu) is a script injected into
-// the page by the ingress. It mounts itself as #panda-menu-root and, in its
+// The ethpandaops panda menu (global-panda-menu) is a script the UI includes
+// when the config names it (uiScript). It mounts itself as #panda-menu-root and, in its
 // default mode, floats a 44px button 16px from the top-left corner.
 const ROOT_ID = 'panda-menu-root';
 

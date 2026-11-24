@@ -74,9 +74,12 @@ type Config struct {
 	// AuthService is the name of this service in the token's "services"
 	// claim; empty means api.DefaultAuthService.
 	AuthService string
-	// UIOrigins are extra origins the web UI may load scripts from and
-	// connect to.
+	// UIOrigins are extra origins the web UI may connect to.
 	UIOrigins []string
+	// UIScript is a script added to the web UI, e.g. a site menu, and
+	// UIScriptIntegrity its subresource integrity hash.
+	UIScript          string
+	UIScriptIntegrity string
 	// BeaconEndpoints are beacon API base URLs, tried in order.
 	BeaconEndpoints []string
 	// ValidatorRangesURL is the devnet's validator ranges inventory, from
@@ -204,6 +207,8 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		AuthProviderURL:        cfg.AuthProviderURL,
 		AuthService:            cfg.AuthService,
 		UIOrigins:              cfg.UIOrigins,
+		UIScript:               cfg.UIScript,
+		UIScriptIntegrity:      cfg.UIScriptIntegrity,
 		Store:                  c.store,
 		Scheduler:              c.scheduler,
 		Beacon:                 c.beacon,

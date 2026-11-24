@@ -12,6 +12,7 @@ import { Button, Loading, cx } from './components/primitives';
 import { useHashTab } from './hooks/useHashTab';
 import { useTheme } from './hooks/useTheme';
 import { FEATURE } from './lib/permissions';
+import { includeSiteScript } from './lib/siteScript';
 import { AuditTab } from './tabs/AuditTab';
 import { ClientsTab } from './tabs/ClientsTab';
 import { HostsTab } from './tabs/HostsTab';
@@ -92,6 +93,7 @@ export function App({ api, auth, mock }: { api: ApiClient; auth: AuthStore; mock
     api
       .config()
       .then(async config => {
+        includeSiteScript(config);
         await auth.start(config.authProviderUrl);
         if (!cancelled) setBoot({ phase: 'ready', config });
       })

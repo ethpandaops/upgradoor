@@ -71,8 +71,11 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 		"run without --auth-provider-url: every API action is anonymous and allowed "+
 			"(closed test networks only)")
 	f.StringArrayVar(&cfg.UIOrigins, "ui-origin", nil,
-		"origin the web UI may load scripts from and connect to, "+
-			"e.g. for an injected site menu (repeatable)")
+		"origin the web UI may connect to, e.g. for data an included script fetches (repeatable)")
+	f.StringVar(&cfg.UIScript, "ui-script", "",
+		"https URL of a script the web UI includes, e.g. a site menu; needs --ui-script-integrity")
+	f.StringVar(&cfg.UIScriptIntegrity, "ui-script-integrity", "",
+		"subresource integrity of --ui-script, e.g. sha384-<base64 digest>")
 	f.StringVar(&cfg.AuthService, "auth-service", api.DefaultAuthService,
 		"name of this service in the token's services claim; "+
 			"its features (manage, team_manage, ...) are what allows actions")

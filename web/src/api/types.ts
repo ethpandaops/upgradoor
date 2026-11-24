@@ -985,6 +985,9 @@ export interface Config {
   authProviderUrl: string;
   /** authService is the controller's name in a token's "services" claim. */
   authService: string;
+  /** uiScript is a script the UI includes (e.g. a site menu), with its integrity hash. */
+  uiScript?: string;
+  uiScriptIntegrity?: string;
 }
 
 /** api.PublicImageRef */

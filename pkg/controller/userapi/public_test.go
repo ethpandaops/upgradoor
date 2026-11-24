@@ -72,7 +72,12 @@ func TestPublicEndpointsLeakNothing(t *testing.T) {
 				"recorded", "missed", "assigned", "included", "worstAssigned", "worstIncluded",
 			},
 		},
-		{path: "/api/v1/config", allowed: []string{"network", "version", "authProviderUrl", "authService"}},
+		{
+			path: "/api/v1/config",
+			allowed: []string{
+				"network", "version", "authProviderUrl", "authService", "uiScript", "uiScriptIntegrity",
+			},
+		},
 	}
 
 	for _, withPlan := range []bool{true, false} {
@@ -378,6 +383,16 @@ func TestConfig(t *testing.T) {
 	assert.Equal(t, views.Config{
 		Network: controllertest.Network, Version: "v1.2.3-test",
 		AuthProviderURL: "https://auth.testnet.example", AuthService: "upgradoor",
+	}, controllertest.DecodeJSON[views.Config](t, h.get("/api/v1/config")))
+
+	h = newHarness(t, func(o *Options) {
+		o.UIScript = "https://menu.example.org/menu.js"
+		o.UIScriptIntegrity = "sha384-abc"
+	})
+
+	assert.Equal(t, views.Config{
+		Network: controllertest.Network, Version: "v1.2.3-test", AuthService: "upgradoor",
+		UIScript: "https://menu.example.org/menu.js", UIScriptIntegrity: "sha384-abc",
 	}, controllertest.DecodeJSON[views.Config](t, h.get("/api/v1/config")))
 }
 

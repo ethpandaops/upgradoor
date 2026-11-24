@@ -15,6 +15,9 @@ import (
 
 const indexHTML = "<!doctype html><title>upgradoor ui</title><div id=root></div>"
 
+// testIntegrity is a well-formed sha384 integrity value.
+const testIntegrity = "sha384-icGX6g6CzB0tqlhDc6Su4c6IPVbcbUvfM3xjbbFYsYBwuZR79WkmOxDhGEPfmyn2"
+
 func testFS() fs.FS {
 	return fstest.MapFS{
 		"index.html":               {Data: []byte(indexHTML)},
@@ -273,12 +276,14 @@ func TestPlaceholder(t *testing.T) {
 
 func TestContentSecurityPolicy(t *testing.T) {
 	tests := []struct {
-		name    string
-		authURL string
-		extra   []string
-		want    []string
-		not     []string
-		wantErr bool
+		name      string
+		authURL   string
+		connect   []string
+		script    string
+		integrity string
+		want      []string
+		not       []string
+		wantErr   bool
 	}{
 		{
 			name: "open mode allows only self",
@@ -296,25 +301,63 @@ func TestContentSecurityPolicy(t *testing.T) {
 			not: []string{"/some/path"},
 		},
 		{
-			name:    "extra origins for scripts and requests only",
+			name:    "connect origins for requests only",
 			authURL: "https://auth.example.org",
-			extra: []string{
-				"https://menu.example.org/", "http://b.example.org:8080",
-				"https://auth.example.org", "https://menu.example.org",
+			connect: []string{
+				"https://data.example.org/", "http://b.example.org:8080",
+				"https://auth.example.org", "https://data.example.org",
 			},
 			want: []string{
-				"script-src 'self' https://auth.example.org " +
-					"http://b.example.org:8080 https://menu.example.org;",
+				"script-src 'self' https://auth.example.org;",
 				"connect-src 'self' https://auth.example.org " +
-					"http://b.example.org:8080 https://menu.example.org;",
+					"http://b.example.org:8080 https://data.example.org;",
 				"frame-src 'self' https://auth.example.org;",
 				"form-action 'self' https://auth.example.org;",
 				"img-src 'self' data:;",
 			},
 		},
-		{name: "extra origin with path", extra: []string{"https://menu.example.org/x"}, wantErr: true},
-		{name: "extra origin with query", extra: []string{"https://menu.example.org/?a=1"}, wantErr: true},
-		{name: "extra origin without scheme", extra: []string{"menu.example.org"}, wantErr: true},
+		{
+			name:      "script origin for scripts only",
+			authURL:   "https://auth.example.org",
+			script:    "https://Menu.example.org/menu-1.0.js",
+			integrity: testIntegrity,
+			connect:   []string{"https://data.example.org"},
+			want: []string{
+				"script-src 'self' https://auth.example.org https://menu.example.org;",
+				"connect-src 'self' https://auth.example.org https://data.example.org;",
+			},
+		},
+		{
+			name:      "loopback script over http",
+			script:    "http://127.0.0.1:8081/menu.js",
+			integrity: testIntegrity,
+			want:      []string{"script-src 'self' http://127.0.0.1:8081;"},
+		},
+		{name: "script without integrity", script: "https://menu.example.org/m.js", wantErr: true},
+		{name: "integrity without script", integrity: testIntegrity, wantErr: true},
+		{
+			name: "script over http", script: "http://menu.example.org/m.js",
+			integrity: testIntegrity, wantErr: true,
+		},
+		{name: "script without host", script: "https:///m.js", integrity: testIntegrity, wantErr: true},
+		{
+			name: "integrity with unknown algorithm", script: "https://menu.example.org/m.js",
+			integrity: "md5-" + testIntegrity[len("sha384-"):], wantErr: true,
+		},
+		{
+			name: "integrity digest of wrong size", script: "https://menu.example.org/m.js",
+			integrity: "sha256-" + testIntegrity[len("sha384-"):], wantErr: true,
+		},
+		{
+			name: "integrity not base64", script: "https://menu.example.org/m.js",
+			integrity: "sha384-not base64!", wantErr: true,
+		},
+		{name: "connect origin with path", connect: []string{"https://data.example.org/x"}, wantErr: true},
+		{
+			name: "connect origin with query", connect: []string{"https://data.example.org/?a=1"},
+			wantErr: true,
+		},
+		{name: "connect origin without scheme", connect: []string{"data.example.org"}, wantErr: true},
 		{name: "not a URL", authURL: "://nope", wantErr: true},
 		{name: "wrong scheme", authURL: "javascript:alert(1)", wantErr: true},
 		{name: "no host", authURL: "https://", wantErr: true},
@@ -325,7 +368,10 @@ func TestContentSecurityPolicy(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			h, err := New(log, testFS(), Options{AuthProviderURL: tt.authURL, ExtraOrigins: tt.extra})
+			h, err := New(log, testFS(), Options{
+				AuthProviderURL: tt.authURL, ConnectOrigins: tt.connect,
+				ScriptURL: tt.script, ScriptIntegrity: tt.integrity,
+			})
 			if tt.wantErr {
 				require.Error(t, err)
 

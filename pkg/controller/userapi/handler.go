@@ -47,6 +47,9 @@ type Options struct {
 	// AuthService is the name of this service in the token's "services"
 	// claim.
 	AuthService string
+	// UIScript is a script the web UI includes, with its integrity hash.
+	UIScript          string
+	UIScriptIntegrity string
 
 	Store     Store
 	Scheduler scheduler.Service

@@ -505,7 +505,7 @@ wait_until "manual roll of node-2 completed" 600 \
 
 post /api/v1/actions/hold '{"hosts":["node-4"],"reason":"e2e: hold"}' >/dev/null
 wait_until "node-4 reports staff's hold" 60 \
-    jq_true /api/v1/hosts/node-4 '[.hold.holds[]?.holder] == ["staff"]'
+    jq_true /api/v1/hosts/node-4 '[.hold.holds[]?.holder] == ["staff"] and (.plan.holdRequests // []) == []'
 
 # A hold of staff is not a team's to lift, also on a host of the team.
 jq_true /api/v1/hosts/node-4 '[.hold.holds[]?.holder] == ["staff"]' || die "the staff hold is not shown as staff's"

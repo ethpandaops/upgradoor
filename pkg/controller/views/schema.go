@@ -79,6 +79,10 @@ type Config struct {
 	// The UI asks the auth client for the features of this service to know
 	// which buttons to offer.
 	AuthService string `json:"authService"`
+	// UIScript is a script the UI includes, e.g. a site menu, with its
+	// subresource integrity hash; absent when there is none.
+	UIScript          string `json:"uiScript,omitempty"`
+	UIScriptIntegrity string `json:"uiScriptIntegrity,omitempty"`
 }
 
 // PublicImageRef is the public description of one running image.

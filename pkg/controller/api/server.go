@@ -122,9 +122,12 @@ type Options struct {
 	// claim: the token must have basic access to it, and the features that
 	// allow actions are features of it. Empty means DefaultAuthService.
 	AuthService string
-	// UIOrigins are extra origins the web UI may load scripts from and
-	// connect to.
+	// UIOrigins are extra origins the web UI may connect to.
 	UIOrigins []string
+	// UIScript is a script added to the web UI, e.g. a site menu, and
+	// UIScriptIntegrity its subresource integrity hash.
+	UIScript          string
+	UIScriptIntegrity string
 
 	Store     Store
 	Scheduler scheduler.Service
@@ -254,6 +257,7 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		Lookups: opts.Lookups,
 		Network: opts.Network, Version: opts.Version,
 		AuthProviderURL: opts.AuthProviderURL, AuthService: opts.AuthService,
+		UIScript: opts.UIScript, UIScriptIntegrity: opts.UIScriptIntegrity,
 		Store: opts.Store, Scheduler: opts.Scheduler, Beacon: opts.Beacon, Views: s.views,
 		Endpoints: opts.Endpoints, Validators: opts.Validators,
 		DefaultSettings: opts.DefaultSettings, Notify: s.Notify, Now: opts.Now,
@@ -261,7 +265,9 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 
 	ui, err := webui.New(log, opts.WebFS, webui.Options{
 		AuthProviderURL: opts.AuthProviderURL,
-		ExtraOrigins:    opts.UIOrigins,
+		ConnectOrigins:  opts.UIOrigins,
+		ScriptURL:       opts.UIScript,
+		ScriptIntegrity: opts.UIScriptIntegrity,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("api: web UI: %w", err)
