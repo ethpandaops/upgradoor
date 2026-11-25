@@ -30,6 +30,8 @@ func TestEntryValidate(t *testing.T) {
 	require.NoError(t, (&Entry{Image: "ethpandaops/geth:fix"}).Validate())
 	require.NoError(t, (&Entry{Command: []string{"--a"}, HasCommand: true, By: strings.Repeat("x", maxEntryText)}).Validate())
 	require.NoError(t, (&Entry{Command: []string{}, HasCommand: true}).Validate(), "an empty command line")
+	require.NoError(t, (&Entry{Command: []string{strings.Repeat("x", maxArgLen)}, HasCommand: true}).Validate(),
+		"a bootnode list of several KiB")
 
 	for name, tt := range map[string]struct {
 		entry *Entry
@@ -40,7 +42,7 @@ func TestEntryValidate(t *testing.T) {
 		"no reference":    {&Entry{Image: "UPPER/case:x"}, "invalid"},
 		"a digest":        {&Entry{Image: "ethpandaops/geth@sha256:" + strings.Repeat("a", 64)}, "pinned to a digest"},
 		"a bad argument":  {&Entry{Command: []string{"--a\nb"}, HasCommand: true}, "control character"},
-		"a long argument": {&Entry{Command: []string{strings.Repeat("x", maxFlagLen+1)}, HasCommand: true}, "too long"},
+		"a long argument": {&Entry{Command: []string{strings.Repeat("x", maxArgLen+1)}, HasCommand: true}, "longer than"},
 		"too many":        {&Entry{Command: make([]string, maxArgs+1), HasCommand: true}, "more than"},
 		"a long by":       {&Entry{Image: "a/b:c", By: strings.Repeat("x", maxEntryText+1)}, "too long"},
 		"a long reason:":  {&Entry{Image: "a/b:c", Reason: strings.Repeat("x", maxEntryText+1)}, "too long"},

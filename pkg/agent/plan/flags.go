@@ -12,6 +12,8 @@ const (
 	maxFlags   = 64
 	maxFlagLen = 2048
 	maxArgs    = 512
+	// Bootnode lists run to several KiB; the kernel allows 128 KiB per argument.
+	maxArgLen = 32 << 10
 )
 
 // applyFlags returns a copy of command with remove, then add applied; it is
@@ -116,8 +118,8 @@ func validateCommand(command []string) error {
 
 	for _, arg := range command {
 		switch {
-		case len(arg) > maxFlagLen:
-			return errors.New("a command argument is too long")
+		case len(arg) > maxArgLen:
+			return fmt.Errorf("a command argument is longer than %d bytes", maxArgLen)
 		case strings.ContainsAny(arg, "\x00\r\n"):
 			return fmt.Errorf("command argument %q has a control character", arg)
 		}
