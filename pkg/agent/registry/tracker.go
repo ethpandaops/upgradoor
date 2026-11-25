@@ -17,8 +17,6 @@ import (
 )
 
 const (
-	// pullTimeout bounds one fallback pull.
-	pullTimeout = 10 * time.Minute
 	// pullRetry is the pause after a failed pull of a tag.
 	pullRetry = 5 * time.Minute
 	// maxIdle bounds how long the goroutine sleeps without looking again.
@@ -30,8 +28,9 @@ type Images interface {
 	// LocalImage returns the local image's registry digest ("" when absent)
 	// and revision label.
 	LocalImage(ctx context.Context, ref string) (digest, revision string, err error)
-	// Pull pulls ref by its tag and returns what LocalImage then would.
-	Pull(ctx context.Context, ref string) (digest, revision string, err error)
+	// Pull pulls ref by its tag and returns what LocalImage then would,
+	// ending a pull without progress itself; progress may be nil.
+	Pull(ctx context.Context, ref string, progress func(*protocol.PullProgress)) (digest, revision string, err error)
 }
 
 // Tracker keeps what the controller says the followed tags point at and
@@ -443,7 +442,7 @@ func (t *tracker) checkTag(ctx context.Context, key string) {
 // pullOwn pulls a fallback tag and takes what it pulled as where the tag
 // points. The result counts only while the entry is still in the fallback.
 func (t *tracker) pullOwn(ctx context.Context, log logrus.FieldLogger, key, ref string, tag *trackedTag) {
-	pctx, cancel := context.WithTimeout(ctx, pullTimeout)
+	pctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 
 	t.mu.Lock()
@@ -457,7 +456,7 @@ func (t *tracker) pullOwn(ctx context.Context, log logrus.FieldLogger, key, ref 
 	t.pulling = &activePull{key: key, ref: ref, cancel: cancel}
 	t.mu.Unlock()
 
-	got, revision, err := t.images.Pull(pctx, ref)
+	got, revision, err := t.images.Pull(pctx, ref, nil)
 	if err == nil && got == "" {
 		err = errors.New("the pulled image has no registry digest")
 	}

@@ -17,10 +17,11 @@ import { Digest, ShortId } from '../components/Digest';
 import { Drawer } from '../components/Drawer';
 import { HostActionsMenu, SecurityUpdates } from '../components/HostActions';
 import { Disclosure } from '../components/icons';
-import { LeaseTable } from '../components/LeaseTable';
+import { BaselineState, LeaseTable } from '../components/LeaseTable';
 import { useLiveHost } from '../components/Live';
 import { OverrideButtons, OverrideSummary, overrideState } from '../components/Overrides';
 import { usePermissions } from '../components/Permissions';
+import { PullNote } from '../components/PullNote';
 import { Readiness } from '../components/Readiness';
 import { RelTime } from '../components/RelTime';
 import { IntentAction } from '../components/SelectionBar';
@@ -264,12 +265,23 @@ function OverviewPane({ host: h, onAction }: { host: HostDetail; onAction: (inte
                 <ShortId value={lease.id} label="lease ID" />
                 <LeaseStateBadge state={lease.state} />
                 {lease.operation && <span className="text-muted">{lease.operation.phase}</span>}
+                <PullNote operation={lease.operation} />
               </span>
             </Fact>
           )}
           {lease?.readiness && (
             <Fact label="readiness">
               <Readiness lease={lease} />
+            </Fact>
+          )}
+          {lease?.baseline && (
+            <Fact label="before lease">
+              <BaselineState baseline={lease.baseline} />
+            </Fact>
+          )}
+          {!lease && h.plan.notReady && (
+            <Fact label="not ready">
+              <span className="text-warning">{h.plan.notReady}</span>
             </Fact>
           )}
           <Fact label="hold">

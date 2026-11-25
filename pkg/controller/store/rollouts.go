@@ -13,7 +13,7 @@ import (
 
 // rolloutHostsQuery reads the members of one rollout.
 const rolloutHostsQuery = `
-	SELECT host, state, stage, need_id, lease_id, error, skipped_by, served, updated_at
+	SELECT host, state, stage, need_id, lease_id, error, skipped_by, served, no_worse, updated_at
 	FROM rollout_hosts WHERE rollout_id = ? ORDER BY host`
 
 // The queries below are read on every reconcile tick (the open rollouts, the
@@ -232,7 +232,7 @@ func loadRolloutHosts(ctx context.Context, tx *sql.Tx, rollouts []*fleet.Rollout
 			)
 
 			err := rows.Scan(&host.Host, &state, &stage, &host.NeedID, &host.LeaseID,
-				&host.Error, &host.SkippedBy, &host.Served, &updatedAt)
+				&host.Error, &host.SkippedBy, &host.Served, &host.NoWorse, &updatedAt)
 			if err != nil {
 				return errors.Join(err, rows.Close())
 			}
@@ -484,14 +484,15 @@ func upsertRollout(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) erro
 type rolloutHostRow struct {
 	state, needID, leaseID, err, skippedBy string
 	stage                                  int
-	served                                 bool
+	served, noWorse                        bool
 	updatedAt                              int64
 }
 
 func newRolloutHostRow(h *fleet.RolloutHost) rolloutHostRow {
 	return rolloutHostRow{
 		state: string(h.State), needID: h.NeedID, leaseID: h.LeaseID, err: h.Error,
-		skippedBy: h.SkippedBy, stage: int(h.Stage), served: h.Served, updatedAt: millis(h.UpdatedAt),
+		skippedBy: h.SkippedBy, stage: int(h.Stage), served: h.Served, noWorse: h.NoWorse,
+		updatedAt: millis(h.UpdatedAt),
 	}
 }
 
@@ -502,7 +503,7 @@ func writeRolloutHosts(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) 
 	stored := make(map[string]rolloutHostRow, len(rollout.Hosts))
 
 	err := queryRows(ctx, tx, `
-		SELECT host, state, stage, need_id, lease_id, error, skipped_by, served, updated_at
+		SELECT host, state, stage, need_id, lease_id, error, skipped_by, served, no_worse, updated_at
 		FROM rollout_hosts WHERE rollout_id = ?`, []any{rollout.ID},
 		func(row rowScanner) error {
 			var (
@@ -511,7 +512,7 @@ func writeRolloutHosts(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) 
 			)
 
 			if err := row.Scan(&host, &r.state, &r.stage, &r.needID, &r.leaseID, &r.err,
-				&r.skippedBy, &r.served, &r.updatedAt); err != nil {
+				&r.skippedBy, &r.served, &r.noWorse, &r.updatedAt); err != nil {
 				return err
 			}
 
@@ -558,14 +559,14 @@ func writeRolloutHosts(ctx context.Context, tx *sql.Tx, rollout *fleet.Rollout) 
 
 	return insertBatched(ctx, tx, `
 		INSERT INTO rollout_hosts
-			(rollout_id, host, state, stage, need_id, lease_id, error, skipped_by, served, updated_at)
+			(rollout_id, host, state, stage, need_id, lease_id, error, skipped_by, served, no_worse, updated_at)
 		VALUES `,
-		10, len(changed),
+		11, len(changed),
 		func(args []any, i int) []any {
 			h := &rollout.Hosts[changed[i]]
 
 			return append(args, rollout.ID, h.Host, string(h.State), int(h.Stage), h.NeedID,
-				h.LeaseID, h.Error, h.SkippedBy, h.Served, millis(h.UpdatedAt))
+				h.LeaseID, h.Error, h.SkippedBy, h.Served, h.NoWorse, millis(h.UpdatedAt))
 		})
 }
 
@@ -586,7 +587,15 @@ func upsertLease(ctx context.Context, tx *sql.Tx, lease *fleet.Lease) error {
 	stored.SyncedSince = storedTimePtr(stored.SyncedSince)
 	stored.SyncedUntil = storedTimePtr(stored.SyncedUntil)
 	stored.ReadyAt = storedTimePtr(stored.ReadyAt)
+	stored.NoWorseSince = storedTimePtr(stored.NoWorseSince)
+	stored.NoWorseUntil = storedTimePtr(stored.NoWorseUntil)
 	stored.EndedAt = storedTimePtr(stored.EndedAt)
+
+	if lease.Baseline != nil {
+		baseline := *lease.Baseline
+		baseline.At = storedTime(baseline.At)
+		stored.Baseline = &baseline
+	}
 
 	if lease.Cancelled != nil {
 		cancelled := *lease.Cancelled
@@ -604,6 +613,14 @@ func upsertLease(ctx context.Context, tx *sql.Tx, lease *fleet.Lease) error {
 		operation := *lease.Operation
 		operation.StartedAt = storedTime(operation.StartedAt)
 		operation.UpdatedAt = storedTime(operation.UpdatedAt)
+
+		if operation.Pull != nil {
+			pull := *operation.Pull
+			pull.StartedAt = storedTime(pull.StartedAt)
+			pull.LastProgressAt = storedTime(pull.LastProgressAt)
+			operation.Pull = &pull
+		}
+
 		stored.Operation = &operation
 	}
 

@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { Gate, HostSummary, QueueEntry, Rollout } from '../api/types';
+import type { Gate, HostSummary, QueueEntry, Rollout, RolloutHost } from '../api/types';
 import { attentionItems } from './activity';
 
 function entry(
@@ -83,6 +83,38 @@ describe('attentionItems', () => {
 
     expect(item?.title).toBe('Rollout B waits for approval');
     expect(item?.rollout?.id).toBe('B');
+  });
+
+  it('asks for the approval of an auto rollout that waits at the closed gate', () => {
+    const member = (host: string) => ({ host }) as RolloutHost;
+    const items = attentionItems({
+      gate: gate(false, ['finality lag 5 epochs > 3']),
+      paused: false,
+      queue: [
+        entry('g1', 1, 'gate', ['A'], 'A'),
+        entry('g2', 2, 'gate', ['A'], 'A'),
+        entry('m', 3, 'approval', ['M'], 'M'),
+        entry('p', 4, 'gate', ['P'], 'P'),
+        entry('i', 5, 'gate', ['I'], 'I'),
+      ],
+      rollouts: [
+        rollout('A', { policy: 'auto', hosts: [member('g1'), member('g2')] }),
+        rollout('M', { policy: 'manual', hosts: [member('m')] }),
+        rollout('P', { policy: 'auto', approved: true, hosts: [member('p')] }),
+        rollout('I', { policy: 'auto', ignoreGate: true, hosts: [member('i')] }),
+      ],
+      hosts: [],
+    });
+
+    expect(items.map(i => [i.kind, i.title, i.hosts])).toEqual([
+      ['gate', 'The network gate is closed', ['g1', 'g2', 'p', 'i']],
+      ['approval', 'Rollout M waits for approval', ['m']],
+      ['gate-approval', 'Rollout A waits at the closed gate', ['g1', 'g2']],
+    ]);
+    expect(items[2]?.detail).toBe(
+      'Auto rollouts never roll through a closed network gate; approved, it rolls one host at a time. 2 hosts wait.'
+    );
+    expect(items[2]?.rollout?.id).toBe('A');
   });
 
   it('says why a rollout is paused: after its canary, by an abort, or by a person', () => {

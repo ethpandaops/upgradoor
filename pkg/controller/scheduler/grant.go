@@ -43,6 +43,10 @@ const (
 	ReasonGatePrefix  = "network gate: "
 	reasonAfter       = "after "
 	reasonAfterCanary = "after canary "
+	// reasonAfterHealthy starts the reason of a host that is not ready for
+	// something else than the rollout is about and waits for capacity that
+	// ready hosts of the rollout took first.
+	reasonAfterHealthy = "after healthy hosts: not ready ("
 )
 
 // Gate reasons.
@@ -74,6 +78,7 @@ const (
 	rankOrder
 	rankBudget
 	rankHostLimit
+	rankPulls
 )
 
 // waitKinds maps a verdict's rank to the wait kind served in the plan.
@@ -91,6 +96,7 @@ var waitKinds = map[int]WaitKind{
 	rankOrder:         WaitOrder,
 	rankBudget:        WaitBudget,
 	rankHostLimit:     WaitHostLimit,
+	rankPulls:         WaitPulls,
 }
 
 // verdict is why one host waits (rankGrantable: it does not).
@@ -109,6 +115,9 @@ type budgetState struct {
 	leased      int
 	maxLeased   int
 	percent     float64
+	// weighted counts the hosts of leased that have validators with a duty:
+	// while it is zero, one lease goes whatever the budget (fits).
+	weighted int
 	// independent counts the hosts whose lease is about independent
 	// containers alone; maxIndependent is their limit.
 	independent    int
@@ -153,6 +162,10 @@ func (p *pass) budget() *budgetState {
 			b.unavailable += hv.duty
 			b.leased++
 
+			if hv.duty > 0 {
+				b.weighted++
+			}
+
 			continue
 		}
 
@@ -189,11 +202,19 @@ func (b *budgetState) admitIndependent() verdict {
 }
 
 // fits checks the three grant conditions for a host that costs cost: it
-// costs nothing, it stays inside the budget, or it goes alone.
+// costs nothing, it stays inside the budget, or it is the floor lease. The
+// floor is one lease while no host with validators is down for work,
+// whatever the validators that miss duties on their own: on an unstable
+// network a fix must be able to roll. A limit of 0% has no floor.
 func (b *budgetState) fits(cost uint64) bool {
 	return cost == 0 ||
 		float64(b.unavailable+cost) <= b.allowed+budgetEpsilon ||
-		(b.unavailable == 0 && b.allowed > 0 && b.leased == 0)
+		b.floor()
+}
+
+// floor reports whether the floor lease is free (fits).
+func (b *budgetState) floor() bool {
+	return b.weighted == 0 && b.percent > 0
 }
 
 // admit checks the three grant conditions and the host-count limit for a
@@ -218,8 +239,9 @@ func (b *budgetState) admit(cost uint64) verdict {
 	return verdict{}
 }
 
-// take books a granted host by the class of its lease.
-func (b *budgetState) take(cost uint64, impact protocol.Impact) {
+// take books a granted host by the class of its lease. duty is the host's
+// validators with a duty.
+func (b *budgetState) take(cost, duty uint64, impact protocol.Impact) {
 	b.unavailable += cost
 
 	if impact == protocol.ImpactIndependent {
@@ -229,6 +251,10 @@ func (b *budgetState) take(cost uint64, impact protocol.Impact) {
 	}
 
 	b.leased++
+
+	if duty > 0 {
+		b.weighted++
+	}
 }
 
 // percent formats a percentage with at most one decimal, rounded down.
@@ -371,6 +397,8 @@ type granter struct {
 	budget      *budgetState
 	// order holds the order of each rollout a host was considered in.
 	order map[string]*rolloutOrder
+	// pulls counts the leases with image work that are granted or pulling.
+	pulls int
 }
 
 // rolloutOrder is what the order inside one rollout rests on while grants are
@@ -439,13 +467,15 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 
 	// Independent containers touch neither the node nor the network: the
 	// gate does not hold them back. Nor does it hold back a rollout a person
-	// let pass it.
+	// let pass it. A rollout a person approved passes it with one host at a
+	// time; nothing passes it by itself but through passesClosedGate.
 	if !r.PassesGate() && !g.gate.OK && needsImpact(hv.h, needs) != protocol.ImpactIndependent {
-		if !g.passesClosedGate(hv) {
+		switch {
+		case g.passesClosedGate(hv):
+			excepted = true
+		case !r.Approved || g.admitting(hv).leased > 0:
 			return verdict{rank: rankGate, reason: ReasonGatePrefix + g.gate.Reasons[0]}, nil, false
 		}
-
-		excepted = true
 	}
 
 	// A forced rollout has no order, and a host that passes the closed gate
@@ -465,7 +495,8 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 	return verdict{}, needs, false
 }
 
-// passesClosedGate is the one exception of the network gate. While the gate
+// passesClosedGate is the one exception of the network gate that needs no
+// person (an approved rollout is the other, evaluate). While the gate
 // is closed for what the network does (finality, participation; not for
 // missing or stale data), a host with validators of which none attested in
 // the newest liveness epoch may be granted when nothing at all is leased:
@@ -491,13 +522,18 @@ func (g *granter) admitting(hv *hostView) *budgetState {
 	b.unavailable -= hv.live
 	b.leased--
 
+	if hv.duty > 0 {
+		b.weighted--
+	}
+
 	return &b
 }
 
 // consider grants the host a lease for everything grantable, or says what
 // it waits for. When the wait is about one rollout (its pause, approval,
-// halt, order, gate or verb), that rollout's ID is returned too; a hold, the
-// global pause and the budget are about none.
+// halt, order, gate, verb, or the budget or host limit its node work waits
+// for), that rollout's ID is returned too; a hold, the global pause and the
+// independent limit are about none.
 func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, about string) {
 	switch {
 	case hv.offline:
@@ -542,7 +578,7 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 
 	if len(normal) > 0 {
 		if bv := g.admitting(hv).admit(nodeCost(hv, impact)); bv.rank != rankGrantable {
-			best, about, normal, excepted = bv, "", nil, false
+			best, about, normal, excepted = bv, normal[0].r.ID, nil, false
 		}
 	}
 
@@ -561,6 +597,15 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 	parts := slices.Concat(exempt, normal, indep)
 	if len(parts) == 0 {
 		return best, about
+	}
+
+	if limit := g.p.set.MaxConcurrentPulls; limit > 0 && g.pulls >= limit {
+		for _, pt := range parts {
+			if pullsImages(pt.needs) {
+				return verdict{rank: rankPulls, reason: fmt.Sprintf("image pulls at once: %d of %d",
+					g.pulls, limit)}, pt.r.ID
+			}
+		}
 	}
 
 	g.lease(hv, parts, excepted)
@@ -597,6 +642,10 @@ func (g *granter) lease(hv *hostView, parts []part, excepted bool) {
 	l.Impact = impact
 	l.Charged = nodeCost(hv, impact)
 
+	if impact == protocol.ImpactNode {
+		l.Baseline = p.baseline(hv)
+	}
+
 	for _, pt := range parts {
 		r := pt.r
 		m := p.member(r, host)
@@ -624,7 +673,7 @@ func (g *granter) lease(hv *hostView, parts []part, excepted bool) {
 	// change that; only its place in the independent limit is new.
 	switch {
 	case !hv.charged():
-		g.budget.take(l.Charged, impact)
+		g.budget.take(l.Charged, hv.duty, impact)
 	case impact == protocol.ImpactIndependent:
 		g.budget.independent++
 	default:
@@ -633,30 +682,37 @@ func (g *granter) lease(hv *hostView, parts []part, excepted bool) {
 	hv.lease = l
 	p.leases = append(p.leases, l)
 
+	if pullsImages(l.Needs) {
+		g.pulls++
+	}
+
 	p.record("lease.granted", host, map[string]any{
-		keyLease:       l.ID,
-		keyRollouts:    ids,
-		"cost":         l.Charged,
-		"impact":       l.Impact,
-		"unavailable":  g.budget.unavailable,
-		"allowed":      g.budget.allowed,
-		keyForce:       l.Force,
-		"ignoreBudget": ignoreBudget,
-		"ignoredGate":  ignoredGate,
-		"closedGate":   excepted,
+		keyLease:        l.ID,
+		keyRollouts:     ids,
+		"cost":          l.Charged,
+		"impact":        l.Impact,
+		"unavailable":   g.budget.unavailable,
+		"allowed":       g.budget.allowed,
+		keyForce:        l.Force,
+		keyIgnoreBudget: ignoreBudget,
+		"ignoredGate":   ignoredGate,
+		"closedGate":    excepted,
 	})
 }
 
-// waiting is one host that waits in an open rollout.
+// waiting is one host that waits in an open rollout, with its servingRank
+// in each of them.
 type waiting struct {
 	hv       *hostView
 	rollouts []*fleet.Rollout
+	ranks    []int
 }
 
 // servingOrder lists the hosts that wait in an open rollout and hold no
 // lease: what hosts ask for themselves (local rollouts) first, then the
-// oldest rollout first, inside a rollout by stage (broken hosts, the canary,
-// the rest), then ascending weight and name.
+// oldest rollout first, inside a rollout by servingRank, ascending live
+// validators, stage (broken hosts, the canary, the rest), ascending weight
+// and name.
 func (p *pass) servingOrder() []*waiting {
 	var (
 		order  []*waiting
@@ -670,43 +726,73 @@ func (p *pass) servingOrder() []*waiting {
 		return cmp.Compare(localFirst(a), localFirst(b))
 	})
 
+	type member struct {
+		m    *fleet.RolloutHost
+		hv   *hostView
+		rank int
+	}
+
 	for _, r := range rollouts {
 		if r.State.Terminal() {
 			continue
 		}
 
-		members := make([]*fleet.RolloutHost, 0, len(r.Hosts))
+		members := make([]member, 0, len(r.Hosts))
 
 		for i := range r.Hosts {
 			m := &r.Hosts[i]
 			if hv := p.hosts[m.Host]; m.State == fleet.HostPending && hv != nil && hv.lease == nil {
-				members = append(members, m)
+				members = append(members, member{m: m, hv: hv, rank: p.servingRank(r, hv)})
 			}
 		}
 
-		slices.SortFunc(members, func(a, b *fleet.RolloutHost) int {
-			ha, hb := p.hosts[a.Host], p.hosts[b.Host]
-
+		slices.SortFunc(members, func(a, b member) int {
 			return cmp.Or(
-				cmp.Compare(a.Stage, b.Stage),
-				cmp.Compare(ha.weight, hb.weight),
-				cmp.Compare(a.Host, b.Host),
+				cmp.Compare(a.rank, b.rank),
+				cmp.Compare(a.hv.live, b.hv.live),
+				cmp.Compare(a.m.Stage, b.m.Stage),
+				cmp.Compare(a.hv.weight, b.hv.weight),
+				cmp.Compare(a.m.Host, b.m.Host),
 			)
 		})
 
 		for _, m := range members {
-			w := byHost[m.Host]
+			w := byHost[m.m.Host]
 			if w == nil {
-				w = &waiting{hv: p.hosts[m.Host]}
-				byHost[m.Host] = w
+				w = &waiting{hv: m.hv}
+				byHost[m.m.Host] = w
 				order = append(order, w)
 			}
 
 			w.rollouts = append(w.rollouts, r)
+			w.ranks = append(w.ranks, m.rank)
 		}
 	}
 
 	return order
+}
+
+// pullsImages reports whether serving the needs recreates a container, which
+// the agent starts by pulling its image.
+func pullsImages(needs []protocol.Need) bool {
+	return slices.ContainsFunc(needs, func(n protocol.Need) bool { return n.Container() != "" })
+}
+
+// pulling counts the open leases with image work that the agent has not
+// started or that pull.
+func (p *pass) pulling() int {
+	n := 0
+
+	for _, l := range p.leases {
+		switch {
+		case !pullsImages(l.Needs) || l.Recheck:
+		case l.State == fleet.LeaseGranted,
+			l.State == fleet.LeaseRunning && l.Operation != nil && l.Operation.Phase == protocol.PhasePulling:
+			n++
+		}
+	}
+
+	return n
 }
 
 // localFirst ranks the local rollouts before the others.
@@ -720,7 +806,9 @@ func localFirst(r *fleet.Rollout) int {
 
 // grant makes the grants of this pass and builds the plan.
 func (p *pass) grant() *Plan {
-	g := &granter{p: p, budget: p.budget(), order: make(map[string]*rolloutOrder, len(p.rollouts))}
+	g := &granter{
+		p: p, budget: p.budget(), order: make(map[string]*rolloutOrder, len(p.rollouts)), pulls: p.pulling(),
+	}
 	g.gate, g.gateTrusted = p.gate()
 
 	plan := &Plan{
@@ -732,9 +820,23 @@ func (p *pass) grant() *Plan {
 	}
 
 	reasons := make(map[string]string, len(p.hosts))
+	// ready names the rollouts with a member before this host that is ready
+	// or not ready for what the rollout is about.
+	ready := make(map[string]bool, len(p.rollouts))
 
 	for _, w := range p.servingOrder() {
 		v, about := g.consider(w.hv, w.rollouts)
+
+		// Capacity that ready hosts took first is what such a host waits for.
+		for i, r := range w.rollouts {
+			switch {
+			case w.ranks[i] != rankDownUnrelated:
+				ready[r.ID] = true
+			case r.ID == about && ready[about] && v.rank >= rankBudget:
+				v.reason = reasonAfterHealthy + w.hv.unready + ")"
+			}
+		}
+
 		if v.rank == rankGrantable {
 			continue
 		}
@@ -810,6 +912,7 @@ func (p *pass) grant() *Plan {
 
 		if hv.lease == nil {
 			hp.Reason = reason
+			hp.NotReady = hv.unready
 		}
 
 		hp.HoldRequests = p.holdRequests(name)

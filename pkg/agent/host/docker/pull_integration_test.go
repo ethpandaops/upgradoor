@@ -27,7 +27,7 @@ func TestIntegrationDigests(t *testing.T) {
 	require.NoError(t, err)
 	assert.Empty(t, local, "nothing pulled yet")
 
-	pulled, revision, err := r.Pull(ctx, ref)
+	pulled, revision, err := r.Pull(ctx, ref, nil)
 	require.NoError(t, err)
 	assert.Equal(t, digest1, pulled)
 	assert.Equal(t, "rev1", revision, "the revision label of the pulled image")
@@ -70,7 +70,7 @@ func TestIntegrationDigests(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, digest1, local, "the registry moved, the local tag did not")
 
-	pulled, revision, err = r.Pull(ctx, ref)
+	pulled, revision, err = r.Pull(ctx, ref, nil)
 	require.NoError(t, err)
 	assert.Equal(t, digest2, pulled)
 	assert.Equal(t, "rev2", revision, "known before any container runs the image")
@@ -89,12 +89,12 @@ func TestIntegrationDigests(t *testing.T) {
 	assert.Equal(t, "rev1", after.Revision)
 
 	// Pulling again changes nothing.
-	pulled, _, err = r.Pull(ctx, ref)
+	pulled, _, err = r.Pull(ctx, ref, nil)
 	require.NoError(t, err)
 	assert.Equal(t, digest2, pulled)
 
 	// Errors of the pull are reported.
-	_, _, err = r.Pull(ctx, env.repoRef("digests-absent"))
+	_, _, err = r.Pull(ctx, env.repoRef("digests-absent"), nil)
 	require.Error(t, err)
 
 	local, _, err = r.LocalImage(ctx, env.repoRef("digests-absent"))

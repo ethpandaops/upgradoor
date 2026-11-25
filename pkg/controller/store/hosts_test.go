@@ -158,6 +158,25 @@ func TestRecordSyncConfirms(t *testing.T) {
 				assert.True(t, sync(50, testRequest(imageNeed("a"))).Changed, name+" ends")
 			}
 
+			// A pull's progress: stored, but not a change; a phase is.
+			pulling := func(phase protocol.Phase, done int64) *protocol.SyncRequest {
+				req := testRequest(imageNeed("a"))
+				req.Operation = &protocol.Operation{
+					LeaseID: "l-1", Phase: phase, StartedAt: at(0), UpdatedAt: at(int(done)),
+					Pull: &protocol.PullProgress{Image: "a", Attempt: 1, BytesDone: done, LastProgressAt: at(int(done))},
+				}
+
+				return req
+			}
+
+			assert.True(t, sync(52, pulling(protocol.PhasePulling, 1)).Changed, "an operation")
+
+			res = sync(54, pulling(protocol.PhasePulling, 2))
+			assert.False(t, res.Changed, "only the pull progressed")
+			assert.Equal(t, int64(2), res.Host.Status.Operation.Pull.BytesDone)
+
+			assert.True(t, sync(56, pulling(protocol.PhaseApplying, 2)).Changed, "a new phase")
+
 			res = sync(60, testRequest(imageNeed("a"), imageNeed("b")))
 			assert.True(t, res.Changed, "a new need")
 		})

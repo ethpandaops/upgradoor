@@ -423,6 +423,7 @@ func actionSamples(t *testing.T) []actionSample {
 		{action: "pause", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},
 		{action: "resume", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},
 		{action: "ignore-gate", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},
+		{action: "ignore-budget", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},
 		{
 			action: "approve-lease", body: fmt.Sprintf(`{"rollout":"r-lighthouse","host":%q}`, controllertest.HostMixed),
 			feature: authz.FeatureManage, twin: true,

@@ -169,6 +169,12 @@ const SAMPLES: Sample[] = [
     twin: true,
   },
   {
+    name: 'ignore-budget',
+    call: { action: 'ignore-budget', body: { rollout: 'r-lighthouse', reason: '' } },
+    feature: FEATURE.manage,
+    twin: true,
+  },
+  {
     name: 'approve-lease',
     call: { action: 'approve-lease', body: { rollout: 'r-lighthouse', host: MIXED, reason: '' } },
     feature: FEATURE.manage,
@@ -637,6 +643,9 @@ describe('can, what the review of the first version found', () => {
     });
     expect(
       can(team, { action: 'ignore-gate', body: { rollout: 'r-action', reason: '' } }, ownership([MIXED, TEKU])).by
+    ).toBe('team');
+    expect(
+      can(team, { action: 'ignore-budget', body: { rollout: 'r-action', reason: '' } }, ownership([MIXED, TEKU])).by
     ).toBe('team');
 
     // One member the team may not run the action on, or one that does not report it, keeps manage.

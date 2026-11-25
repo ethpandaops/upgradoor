@@ -30,11 +30,15 @@ const (
 	keyRollouts = "rollouts"
 	// keyIgnoreGate is Rollout.IgnoreGate.
 	keyIgnoreGate = "ignoreGate"
+	// keyIgnoreBudget is Rollout.IgnoreBudget.
+	keyIgnoreBudget = "ignoreBudget"
 	// keyHolder names whose hold an entry of hold or unhold is about.
 	keyHolder    = "holder"
 	keyDirective = "directive"
 	keyBy        = "by"
 	keyHeld      = "held"
+	keyReadiness = "readiness"
+	keyOutcome   = "outcome"
 )
 
 // manualRequest is a roll or reboot request in one shape.
@@ -158,7 +162,7 @@ func (s *service) manual(ctx context.Context, actor string, req *manualRequest) 
 
 	changes.Audit = []fleet.AuditEntry{s.entry(actor, "action."+string(req.verb), r.ID, map[string]any{
 		keyHosts: res.Hosts, "rejected": res.Rejected, "containers": req.containers,
-		"staggered": req.staggered, keyForce: r.Force, "ignoreBudget": r.IgnoreBudget,
+		"staggered": req.staggered, keyForce: r.Force, keyIgnoreBudget: r.IgnoreBudget,
 		keyIgnoreGate: r.IgnoreGate, keyReason: req.reason,
 	})}
 
@@ -620,7 +624,9 @@ func (s *service) Pause(ctx context.Context, actor string, req ScopeRequest) (*A
 }
 
 // Resume lifts the global pause or the pause of one rollout, and approves a
-// rollout that waits on a manual policy.
+// rollout that waits on a manual policy. While the network gate is closed it
+// approves a rollout that is not paused whatever its policy: approved, it
+// passes the closed gate one host at a time.
 func (s *service) Resume(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -641,7 +647,10 @@ func (s *service) Resume(ctx context.Context, actor string, req ScopeRequest) (*
 
 	before := map[string]any{keyPaused: r.Paused, "approved": r.Approved}
 	res := &ActionResult{Rollout: r.ID, Message: "rollout resumed"}
-	approve := !r.Approved && settings.RolloutPolicy(r) == fleet.PolicyManual
+	plan := s.Plan()
+	gateClosed := plan != nil && !plan.Gate.OK
+	approve := !r.Approved &&
+		(settings.RolloutPolicy(r) == fleet.PolicyManual || (gateClosed && !r.Paused))
 
 	if !r.Paused && !approve {
 		res.Message = "rollout is not paused and needs no approval"
@@ -684,6 +693,31 @@ func (s *service) IgnoreGate(ctx context.Context, actor string, req ScopeRequest
 	return res, s.commitRollout(ctx, actor, "action.ignore-gate", r, map[string]any{
 		keyBefore: map[string]any{keyIgnoreGate: false},
 		keyAfter:  map[string]any{keyIgnoreGate: true},
+		keyReason: req.Reason,
+	})
+}
+
+// IgnoreBudget lets the leases of an open rollout pass the budget and a
+// closed network gate.
+func (s *service) IgnoreBudget(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	r, err := s.openRollout(ctx, req.Rollout)
+	if err != nil {
+		return nil, err
+	}
+
+	res := &ActionResult{Rollout: r.ID, Message: "rollout ignores the budget"}
+	if r.IgnoreBudget {
+		return res, nil
+	}
+
+	r.IgnoreBudget = true
+
+	return res, s.commitRollout(ctx, actor, "action.ignore-budget", r, map[string]any{
+		keyBefore: map[string]any{keyIgnoreBudget: false},
+		keyAfter:  map[string]any{keyIgnoreBudget: true},
 		keyReason: req.Reason,
 	})
 }
@@ -739,7 +773,7 @@ func (s *service) ApproveLease(
 		Leases: []*fleet.Lease{l},
 		Audit: []fleet.AuditEntry{s.entry(actor, "action.approve-lease", l.Host, map[string]any{
 			keyLease: l.ID, keyRollouts: slices.Compact(slices.Sorted(maps.Values(l.Rollouts))),
-			"readiness": l.Readiness, keyReason: req.Reason,
+			keyReadiness: l.Readiness, keyReason: req.Reason,
 		})},
 	})
 }
@@ -1356,7 +1390,7 @@ func (s *service) recheck(
 		Rollouts: make(map[string]string, 2), Weight: failed.Weight, Charged: failed.Charged,
 		GrantedBy: actorName(actor), GrantedAt: now,
 		ExpiresAt: now.Add(failed.ExpiresAt.Sub(failed.GrantedAt)), AgentDoneAt: &now,
-		Operation: cloneOperation(failed.Operation), Recheck: true,
+		Operation: cloneOperation(failed.Operation), Recheck: true, Baseline: failed.Baseline,
 	}
 
 	for i := range failed.Needs {

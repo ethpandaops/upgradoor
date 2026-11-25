@@ -360,6 +360,25 @@ describe('ClientsTab', () => {
     });
     expect(h.calls.some(c => c.path === '/api/v1/actions/resume')).toBe(true);
   });
+  it('calls for the approval of an auto rollout that waits at the closed gate', async () => {
+    const user = userEvent.setup();
+    const h = await open('staff', '#clients/lighthouse');
+    h.controller.setGateFailing(true);
+
+    const callout = await screen.findByRole('region', { name: 'Rollouts of lighthouse waiting for approval' });
+    expect(callout).toHaveTextContent('never roll through a closed network gate');
+    expect(callout).not.toHaveTextContent('manual policy');
+    expect(within(callout).getByText('waiting at closed gate')).toBeInTheDocument();
+
+    await user.click(within(callout).getByRole('button', { name: 'Approve…' }));
+    const dialog = await screen.findByRole('dialog');
+    expect(within(dialog).getByRole('list', { name: 'Current state' })).toHaveTextContent(/Network gate closed: /);
+    await user.click(within(dialog).getByRole('button', PRIMARY));
+    await waitFor(() => {
+      expect(screen.queryByRole('region', { name: /waiting for approval/ })).not.toBeInTheDocument();
+    });
+    expect(h.calls.some(c => c.path === '/api/v1/actions/resume')).toBe(true);
+  });
 });
 
 describe("ClientsTab: a client's team", () => {

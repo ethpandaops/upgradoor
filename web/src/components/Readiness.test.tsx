@@ -6,6 +6,17 @@ import { NowProvider } from './RelTime';
 
 const waiting = 'node at head with peers, waiting for it to stay so for 5m0s';
 
+describe('readinessNote', () => {
+  it('counts down in place and keeps what follows about the state before the lease', () => {
+    const now = Date.parse('2026-01-01T00:00:00Z');
+    const note = `${waiting}; not ready before the lease (EL is not reachable): no worse, released as such from 00:15:00 if it stays so`;
+
+    expect(readinessNote({ readiness: note, readyAt: '2026-01-01T00:01:00Z' }, now)).toBe(
+      'node at head with peers, ready in 1m; not ready before the lease (EL is not reachable): no worse, released as such from 00:15:00 if it stays so'
+    );
+  });
+});
+
 describe('Readiness', () => {
   it('counts down to readyAt every second, then says the check is pending', () => {
     vi.useFakeTimers();

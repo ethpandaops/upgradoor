@@ -98,6 +98,13 @@ describe('HostsTab, logged in', () => {
 
     const failed = rowOf(table, 'nimbus-nethermind-1');
     expect(failed).toHaveTextContent('0%0/128');
+    // Its EL is down: the plan says so for a host without a lease.
+    expect(within(failed).getByText('not ready')).toHaveAttribute(
+      'title',
+      'Not ready by its last sync: EL is not reachable'
+    );
+    expect(failed).toHaveTextContent('EL is not reachable');
+    expect(within(rowOf(table, 'lighthouse-geth-1')).queryByText('not ready')).toBeNull();
     expect(rowOf(table, 'prysm-erigon-1')).toHaveTextContent('3 security');
     expect(within(failed).getByText('failed')).toBeInTheDocument();
 

@@ -5,6 +5,7 @@ import {
   type ClientHostState,
   type HostState,
   type Impact,
+  type LeaseOutcome,
   type LeaseState,
   type Need,
   type OfflineMark,
@@ -78,7 +79,22 @@ const HOST_STATE_TONE: Record<HostState, Tone> = {
   aborted: 'neutral',
 };
 
-export function HostStateBadge({ state }: { state: HostState }) {
+/** memberStateLabel names a rollout member's state; a member done through a lease released as no worse says so. */
+export function memberStateLabel(state: HostState, noWorse?: boolean): string {
+  return state === 'done' && noWorse ? 'done (no worse)' : state;
+}
+
+const NO_WORSE_TITLE =
+  'Released as no worse than before its lease: the host was not ready before it and did not pass the full readiness check. Not a success of the rollout.';
+
+export function HostStateBadge({ state, noWorse }: { state: HostState; noWorse?: boolean }) {
+  if (state === 'done' && noWorse) {
+    return (
+      <Badge tone="warning" title={NO_WORSE_TITLE}>
+        {memberStateLabel(state, noWorse)}
+      </Badge>
+    );
+  }
   return <Badge tone={HOST_STATE_TONE[state]}>{state}</Badge>;
 }
 
@@ -132,6 +148,31 @@ const LEASE_TONE: Record<LeaseState, Tone> = {
 
 export function LeaseStateBadge({ state }: { state: LeaseState }) {
   return <Badge tone={LEASE_TONE[state]}>{state}</Badge>;
+}
+
+const OUTCOME: Record<LeaseOutcome, { tone: Tone; label: string; title: string }> = {
+  recovered: {
+    tone: 'success',
+    label: 'recovered',
+    title: 'The host was not ready before the lease and passed the full readiness check after it.',
+  },
+  'no-worse': { tone: 'warning', label: 'no worse', title: NO_WORSE_TITLE },
+  worse: {
+    tone: 'danger',
+    label: 'worse',
+    title: 'The host was not ready before the lease and failed with a signal worse than before it.',
+  },
+};
+
+/** LeaseOutcomeBadge says how the lease of a host that was not ready before it ended. */
+export function LeaseOutcomeBadge({ outcome }: { outcome: LeaseOutcome | undefined }) {
+  if (!outcome) return null;
+  const o = OUTCOME[outcome];
+  return (
+    <Badge tone={o.tone} title={o.title}>
+      {o.label}
+    </Badge>
+  );
 }
 
 const STEP_TONE: Record<StepStatus, Tone> = {

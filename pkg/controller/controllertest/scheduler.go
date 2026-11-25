@@ -256,6 +256,12 @@ func (f *Scheduler) IgnoreGate(ctx context.Context, actor string, req scheduler.
 	return f.record(ctx, "ignore-gate", actor, req)
 }
 
+func (f *Scheduler) IgnoreBudget(ctx context.Context, actor string, req scheduler.ScopeRequest) (
+	*scheduler.ActionResult, error,
+) {
+	return f.record(ctx, "ignore-budget", actor, req)
+}
+
 func (f *Scheduler) ApproveLease(ctx context.Context, actor string, req scheduler.ApproveLeaseRequest) (
 	*scheduler.ActionResult, error,
 ) {

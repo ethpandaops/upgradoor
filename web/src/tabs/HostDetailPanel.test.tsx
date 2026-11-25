@@ -50,12 +50,19 @@ describe('HostDrawer overview', () => {
 
     const now = within(drawer).getByRole('region', { name: 'Now' });
     expect(now).toHaveTextContent('verifying');
+    expect(now).toHaveTextContent('before leaseready');
     expect(within(drawer).getByRole('region', { name: 'Node' })).toHaveTextContent('128 assigned, 128 active');
 
     const resources = within(drawer).getByRole('region', { name: 'System resources' });
     expect(resources).toHaveTextContent(/\d+ cores · load [\d.]+ \/ [\d.]+ \/ [\d.]+/);
     expect(resources).toHaveTextContent(/GiB of \d+ GiB/);
     expect(within(resources).getByRole('meter', { name: 'CPU busy' })).toBeInTheDocument();
+  });
+
+  it('says what a host without a lease is not ready for', async () => {
+    const { drawer } = await openDrawer('nimbus-nethermind-1');
+
+    expect(within(drawer).getByRole('region', { name: 'Now' })).toHaveTextContent('not readyEL is not reachable');
   });
 
   it('says which image of a host could not be pulled, and why', async () => {

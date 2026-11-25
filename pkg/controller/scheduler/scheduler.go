@@ -102,6 +102,9 @@ type Service interface {
 	Abort(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
 	// IgnoreGate lets one rollout's leases pass a closed network gate.
 	IgnoreGate(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
+	// IgnoreBudget lets one rollout's leases pass the budget and a closed
+	// network gate.
+	IgnoreBudget(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
 	// ApproveLease releases a member's verifying lease as ready without
 	// waiting for the readiness check.
 	ApproveLease(ctx context.Context, actor string, req ApproveLeaseRequest) (*ActionResult, error)
@@ -272,8 +275,9 @@ type ClientPolicyRequest struct {
 	Reason string       `json:"reason"`
 }
 
-// ScopeRequest is the body of pause, resume, abort and ignore-gate. An empty
-// Rollout means the global scope (pause and resume only).
+// ScopeRequest is the body of pause, resume, abort, ignore-gate and
+// ignore-budget. An empty Rollout means the global scope (pause and resume
+// only).
 type ScopeRequest struct {
 	Rollout string `json:"rollout"`
 	Reason  string `json:"reason"`
@@ -387,8 +391,10 @@ type QueueEntry struct {
 	// expected to report its need.
 	After string `json:"after,omitempty"`
 	// Rollout is the ID of the rollout the reason is about: the one that is
-	// paused, halted, unapproved or whose order the host waits in. Empty when
-	// the reason is about the host or the fleet (hold, global pause, budget).
+	// paused, halted, unapproved, waits at the gate, whose order the host
+	// waits in, or whose node work waits for the budget or the host limit.
+	// Empty when the reason is about the host or the fleet (hold, global
+	// pause, independent limit).
 	Rollout string `json:"rollout,omitempty"`
 	// Rollouts are the IDs of the rollouts the host is a pending member of.
 	Rollouts []string `json:"rollouts"`
@@ -397,15 +403,18 @@ type QueueEntry struct {
 // WaitKind is the class of a queued host's waiting reason.
 type WaitKind string
 
-// Wait kinds. Budget, host limit and order clear by themselves as the
+// Wait kinds. Budget, host limit, pulls and order clear by themselves as the
 // rollout proceeds; pull clears when the agent lets a failed pull be tried
 // again; working clears when the operation the host works on without a lease
 // is over; gate clears when the network recovers; the others need somebody
 // to act.
 const (
-	WaitBudget        WaitKind = "budget"
-	WaitPull          WaitKind = "pull"
-	WaitHostLimit     WaitKind = "host-limit"
+	WaitBudget    WaitKind = "budget"
+	WaitPull      WaitKind = "pull"
+	WaitHostLimit WaitKind = "host-limit"
+	// WaitPulls: maxConcurrentPulls leases with image work are granted or
+	// pulling.
+	WaitPulls         WaitKind = "pulls"
 	WaitOrder         WaitKind = "order"
 	WaitGate          WaitKind = "gate"
 	WaitVerb          WaitKind = "verb"
@@ -447,6 +456,9 @@ type HostPlan struct {
 	LeaseID string `json:"leaseId,omitempty"`
 	// Reason is the waiting reason when queued.
 	Reason string `json:"reason,omitempty"`
+	// NotReady says what a host without a lease is not ready for by its last
+	// sync: the node, a probe, or validators that did not attest.
+	NotReady string `json:"notReady,omitempty"`
 	// HoldRequests are the hold and release-hold directives the host has not
 	// answered yet, oldest first.
 	HoldRequests []PendingHold `json:"holdRequests,omitempty"`

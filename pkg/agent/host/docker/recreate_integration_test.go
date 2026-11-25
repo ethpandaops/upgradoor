@@ -57,7 +57,7 @@ func TestIntegrationRecreate(t *testing.T) {
 	markers := []string{"/anon/marker", "/imgvol/marker", "/named/marker", "/bind/marker"}
 
 	digest1 := env.publish(t, ref, variantOne)
-	_, _, err := r.Pull(ctx, ref)
+	_, _, err := r.Pull(ctx, ref, nil)
 	require.NoError(t, err)
 
 	subnet := env.createNetwork(t, netA)
@@ -173,7 +173,7 @@ func TestIntegrationRecreate(t *testing.T) {
 	require.ErrorIs(t, err, ErrDigestMismatch)
 	assertUntouched("refused: the lease digest is not pulled")
 
-	pulled, _, err := r.Pull(ctx, ref)
+	pulled, _, err := r.Pull(ctx, ref, nil)
 	require.NoError(t, err)
 	require.Equal(t, digest2, pulled)
 	assertUntouched("pull")
@@ -338,7 +338,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		name := env.prefix + "rollback-start"
 
 		env.publish(t, ref, variantOne)
-		_, _, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref, nil)
 		require.NoError(t, err)
 
 		_, err = env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -352,7 +352,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 
 		// The new image's command does not exist: created, cannot start.
 		broken := env.publish(t, ref, variantBroken)
-		pulled, _, err := r.Pull(ctx, ref)
+		pulled, _, err := r.Pull(ctx, ref, nil)
 		require.NoError(t, err)
 		require.Equal(t, broken, pulled)
 
@@ -394,7 +394,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		netName := name + "-net"
 
 		env.publish(t, ref, variantOne)
-		_, _, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref, nil)
 		require.NoError(t, err)
 
 		_, err = env.cli.NetworkCreate(ctx, netName, client.NetworkCreateOptions{Driver: "bridge"})
@@ -416,7 +416,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		require.NoError(t, err)
 
 		digest2 := env.publish(t, ref, variantTwo)
-		_, _, err = r.Pull(ctx, ref)
+		_, _, err = r.Pull(ctx, ref, nil)
 		require.NoError(t, err)
 
 		err = r.Recreate(ctx, name, digest2, 5*time.Second, true, nil)
@@ -439,7 +439,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		name := env.prefix + "rollback-create"
 
 		env.publish(t, ref, variantOne)
-		_, _, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref, nil)
 		require.NoError(t, err)
 
 		_, err = env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -453,7 +453,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 
 		// The new image has no command: the daemon refuses the create.
 		digest := env.publish(t, ref, variantNoCommand)
-		_, _, err = r.Pull(ctx, ref)
+		_, _, err = r.Pull(ctx, ref, nil)
 		require.NoError(t, err)
 
 		err = r.Recreate(ctx, name, digest, 5*time.Second, true, nil)
@@ -476,7 +476,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		name := env.prefix + "interrupted"
 
 		digest1 := env.publish(t, ref, variantOne)
-		_, _, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref, nil)
 		require.NoError(t, err)
 
 		created, err := env.cli.ContainerCreate(ctx, client.ContainerCreateOptions{
@@ -529,7 +529,7 @@ func TestIntegrationRecreateRollback(t *testing.T) {
 		name := env.prefix + "leftover"
 
 		digest1 := env.publish(t, ref, variantOne)
-		_, _, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref, nil)
 		require.NoError(t, err)
 
 		create := func(containerName, marker string) string {
@@ -617,7 +617,7 @@ func TestIntegrationRecreateExplicitEntrypoint(t *testing.T) {
 	ref := env.repoRef("explicit-ep")
 
 	env.publish(t, ref, variantEntryOne)
-	_, _, err := r.Pull(ctx, ref)
+	_, _, err := r.Pull(ctx, ref, nil)
 	require.NoError(t, err)
 
 	explicit := env.prefix + "explicit-ep-given"
@@ -643,7 +643,7 @@ func TestIntegrationRecreateExplicitEntrypoint(t *testing.T) {
 	require.Empty(t, before.Config.Cmd, "the daemon does not inherit the command next to an entrypoint")
 
 	digest2 := env.publish(t, ref, variantEntryTwo)
-	_, _, err = r.Pull(ctx, ref)
+	_, _, err = r.Pull(ctx, ref, nil)
 	require.NoError(t, err)
 
 	require.NoError(t, r.Recreate(ctx, explicit, digest2, 5*time.Second, true, nil))
@@ -670,7 +670,7 @@ func TestIntegrationRecreateEntrypoint(t *testing.T) {
 	ref := env.repoRef("entrypoint")
 
 	env.publish(t, ref, variantOne)
-	_, _, err := r.Pull(ctx, ref)
+	_, _, err := r.Pull(ctx, ref, nil)
 	require.NoError(t, err)
 
 	tests := []struct {
@@ -708,7 +708,7 @@ func TestIntegrationRecreateEntrypoint(t *testing.T) {
 	}
 
 	digest2 := env.publish(t, ref, variantTwo)
-	_, _, err = r.Pull(ctx, ref)
+	_, _, err = r.Pull(ctx, ref, nil)
 	require.NoError(t, err)
 
 	for _, tt := range tests {
@@ -738,7 +738,7 @@ func TestIntegrationRecreateWithChange(t *testing.T) {
 	fixDigest := env.publish(t, fix, variantEntryTwo)
 
 	for _, ref := range []string{base, fix} {
-		_, _, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref, nil)
 		require.NoError(t, err)
 	}
 
@@ -841,7 +841,7 @@ func TestIntegrationSoftDeployViaTheBlock(t *testing.T) {
 	v2Digest := env.publish(t, v2, variantEntryTwo)
 
 	for _, ref := range []string{v1, v2} {
-		_, _, err := r.Pull(ctx, ref)
+		_, _, err := r.Pull(ctx, ref, nil)
 		require.NoError(t, err)
 	}
 

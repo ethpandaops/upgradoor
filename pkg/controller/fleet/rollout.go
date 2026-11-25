@@ -1,6 +1,7 @@
 package fleet
 
 import (
+	"slices"
 	"strings"
 	"time"
 
@@ -165,6 +166,14 @@ func (r *Rollout) Directed() bool {
 	return strings.HasPrefix(r.Key, KeyManualPrefix)
 }
 
+// Deployed reports whether every target of the rollout is an Ansible
+// deploy (RolloutTarget.Spec); a rollout without targets is not.
+func (r *Rollout) Deployed() bool {
+	return len(r.Targets) > 0 && !slices.ContainsFunc(r.Targets, func(t RolloutTarget) bool {
+		return t.Spec == ""
+	})
+}
+
 // Host returns the member entry for a host name, or nil.
 func (r *Rollout) Host(name string) *RolloutHost {
 	for i := range r.Hosts {
@@ -248,7 +257,10 @@ type RolloutHost struct {
 	// skip keeps the rollout open while the host still has the need.
 	SkippedBy string `json:"skippedBy,omitempty"`
 	// Served: a lease of the rollout was granted for the member.
-	Served    bool      `json:"-"`
+	Served bool `json:"-"`
+	// NoWorse marks a member done through a lease released as no worse than
+	// before it (OutcomeNoWorse): no success of the rollout.
+	NoWorse   bool      `json:"noWorse,omitempty"`
 	UpdatedAt time.Time `json:"updatedAt"`
 }
 
@@ -326,6 +338,50 @@ type PeerCheck struct {
 	Needs  int `json:"needs"`
 }
 
+// LeaseOutcome says how the readiness check of a lease whose host was not
+// ready before it ended.
+type LeaseOutcome string
+
+// Lease outcomes.
+const (
+	// OutcomeRecovered: the host passed the full readiness check.
+	OutcomeRecovered LeaseOutcome = "recovered"
+	// OutcomeNoWorse: released after BaselineGrace without passing it, no
+	// signal worse than in the baseline.
+	OutcomeNoWorse LeaseOutcome = "no-worse"
+	// OutcomeWorse: failed with a signal worse than in the baseline.
+	OutcomeWorse LeaseOutcome = "worse"
+)
+
+// LeaseBaseline is the host's state at grant time, from its last sync.
+type LeaseBaseline struct {
+	// At is the time of that sync.
+	At   time.Time           `json:"at"`
+	Node protocol.NodeHealth `json:"node"`
+	// Duty, Live and LiveKnown are the host's validators with a duty and
+	// those that attested in the newest liveness epoch.
+	Duty      uint64 `json:"duty"`
+	Live      uint64 `json:"live"`
+	LiveKnown bool   `json:"liveKnown"`
+	// Containers are the managed containers.
+	Containers []BaselineContainer `json:"containers,omitempty"`
+	// BelowFleet says which client had fewer peers than the fleet allows.
+	BelowFleet string `json:"belowFleet,omitempty"`
+	// Unready says why the host was not ready; empty when it was.
+	Unready string `json:"unready,omitempty"`
+	// Root is the component the unreadiness starts at: el, cl, a probed
+	// kind or vc; empty when none.
+	Root protocol.ContainerKind `json:"root,omitempty"`
+}
+
+// BaselineContainer is one managed container in a LeaseBaseline.
+type BaselineContainer struct {
+	Name         string                 `json:"name"`
+	Kind         protocol.ContainerKind `json:"kind,omitempty"`
+	State        string                 `json:"state"`
+	RestartCount int                    `json:"restartCount"`
+}
+
 // Lease is a slot granted to one host.
 type Lease struct {
 	ID    string     `json:"id"`
@@ -363,7 +419,18 @@ type Lease struct {
 	// SyncedUntil is the newest sync of that run. A sync that comes more than
 	// hostStaleAfter after it starts a new run.
 	SyncedUntil *time.Time `json:"syncedUntil,omitempty"`
-	EndedAt     *time.Time `json:"endedAt,omitempty"`
+	// Baseline is the host's state at grant time; nil when its last sync was
+	// too old. A host that was not ready then is held to no worse than that
+	// once BaselineGrace has passed.
+	Baseline *LeaseBaseline `json:"baseline,omitempty"`
+	// NoWorseSince and NoWorseUntil are the run of syncs, after the done
+	// report, in which no signal was worse than in the baseline; same run
+	// rules as SyncedSince.
+	NoWorseSince *time.Time `json:"noWorseSince,omitempty"`
+	NoWorseUntil *time.Time `json:"noWorseUntil,omitempty"`
+	// Outcome is set at the end of a lease whose host was not ready before it.
+	Outcome LeaseOutcome `json:"outcome,omitempty"`
+	EndedAt *time.Time   `json:"endedAt,omitempty"`
 
 	// Operation is the agent's last report for this lease.
 	Operation *protocol.Operation `json:"operation,omitempty"`

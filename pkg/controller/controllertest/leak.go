@@ -224,6 +224,15 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 		// What the last readiness check compared with the fleet.
 		Readiness:  SecretReadiness,
 		PeerChecks: []fleet.PeerCheck{{Layer: SecretPeerLayer, Peers: 4, Median: 31, Needs: 16}},
+		// The host's state when the lease was granted.
+		Baseline: &fleet.LeaseBaseline{
+			At: Epoch, Unready: "EL is not reachable", Root: protocol.KindEL, Duty: 2, Live: 2, LiveKnown: true,
+			Node: protocol.NodeHealth{EL: &protocol.ELHealth{Error: SecretProbeError}},
+			Containers: []fleet.BaselineContainer{
+				{Name: "geth", Kind: protocol.KindEL, State: "restarting", RestartCount: 7},
+			},
+		},
+		Outcome: fleet.OutcomeWorse,
 		Operation: &protocol.Operation{
 			LeaseID: "lease-zz", Phase: protocol.PhaseFailed, StartedAt: Epoch,
 			Steps: []protocol.Step{{

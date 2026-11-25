@@ -381,6 +381,26 @@ interface Operation {
   error?: string;
   steps: List<Step>;
   disrupted: boolean;
+  /** The image pull in flight while the phase is pulling; older agents omit it. */
+  pull?: PullProgress;
+}
+
+/**
+ * protocol.PullProgress: how far one image pull got. The totals are those of
+ * the layers the daemon has seen so far.
+ */
+export interface PullProgress {
+  image?: string;
+  /** Counts from 1; a stalled or transiently failed pull is tried again within the lease. */
+  attempt?: number;
+  bytesDone?: number;
+  bytesTotal?: number;
+  layersDone?: number;
+  layersTotal?: number;
+  /** The start of the first attempt. */
+  startedAt?: string;
+  /** When the daemon last reported progress. */
+  lastProgressAt?: string;
 }
 
 /** protocol.OSInfo */
@@ -512,6 +532,8 @@ export interface RolloutHost {
   skippedBy?: string;
   /** The failure reason, or the reason given with a skip. */
   error?: string;
+  /** noWorse marks a member done through a lease released as no worse than before it: no success of the rollout. */
+  noWorse?: boolean;
   updatedAt: string;
 }
 
@@ -556,8 +578,10 @@ export interface Rollout {
    * ("aborted: <reason>; resume to continue"). Empty once it is resumed.
    */
   pauseReason?: string;
+  /** approved: a person approved the rollout (manual policy, or an auto one at a closed gate). */
   approved: boolean;
   force: boolean;
+  /** ignoreBudget: the rollout skips the budget and the network gate; host limit and order still apply. */
   ignoreBudget: boolean;
   /** ignoreGate: a person let the rollout pass a closed network gate; budget, host limit and order still apply. */
   ignoreGate: boolean;
@@ -569,12 +593,12 @@ export interface Rollout {
   hosts: List<RolloutHost>;
   /** views.RolloutView: the policy the rollout answers to (fleet.Settings.RolloutPolicy); manual waits for approval. */
   policy: Policy;
-  /** The setting that decided the policy of an image rollout; absent for every other rollout. */
+  /** What decided the policy of an image rollout; absent for every other rollout. */
   policySource?: PolicySource;
 }
 
-/** fleet.PolicySource: policyClients, policyKinds or policyImage. */
-export type PolicySource = 'client' | 'kind' | 'default';
+/** fleet.PolicySource: policyClients, policyKinds, policyImage, or deploy: every target is an Ansible deploy (always auto). */
+export type PolicySource = 'client' | 'kind' | 'default' | 'deploy';
 
 /** fleet.LeaseState */
 export type LeaseState = 'granted' | 'running' | 'verifying' | 'released' | 'failed' | 'expired' | 'cancelled';
@@ -615,6 +639,41 @@ export interface PeerCheck {
   needs: number;
 }
 
+/**
+ * fleet.LeaseOutcome: how the readiness check of a lease whose host was not
+ * ready before it ended. recovered: the host passed the full readiness check;
+ * no-worse: released after baselineGrace without passing it, no signal worse
+ * than in the baseline; worse: failed with a signal worse than in the baseline.
+ */
+export type LeaseOutcome = 'recovered' | 'no-worse' | 'worse';
+
+/** fleet.BaselineContainer: one managed container in a LeaseBaseline. */
+interface BaselineContainer {
+  name: string;
+  kind?: ContainerKind;
+  state: string;
+  restartCount: number;
+}
+
+/** fleet.LeaseBaseline: the host's state at grant time, from its last sync. */
+export interface LeaseBaseline {
+  /** The time of that sync. */
+  at: string;
+  node: NodeHealth;
+  /** The host's validators with a duty and those that attested in the newest liveness epoch. */
+  duty: number;
+  live: number;
+  liveKnown: boolean;
+  /** The managed containers. */
+  containers?: BaselineContainer[];
+  /** Which client had fewer peers than the fleet allows. */
+  belowFleet?: string;
+  /** Why the host was not ready; empty when it was. */
+  unready?: string;
+  /** The component the unreadiness starts at: el, cl, a probed kind or vc; empty when none. */
+  root?: ContainerKind;
+}
+
 /** fleet.Lease */
 export interface Lease {
   id: string;
@@ -652,6 +711,17 @@ export interface Lease {
    * lease whose steps the agent did, after a retry; the agent is not offered it.
    */
   recheck?: boolean;
+  /**
+   * The host's state at grant time; absent when its last sync was too old. A
+   * host that was not ready then is held to no worse than that once
+   * baselineGrace has passed.
+   */
+  baseline?: LeaseBaseline;
+  /** The run of syncs after the done report in which no signal was worse than in the baseline. */
+  noWorseSince?: string;
+  noWorseUntil?: string;
+  /** Set when a lease whose host was not ready before it ends. */
+  outcome?: LeaseOutcome;
 }
 
 /** fleet.AuditEntry */
@@ -682,6 +752,14 @@ export interface Settings {
   leaseTtl: string;
   hostStaleAfter: string;
   readinessTimeout: string;
+  /**
+   * How long after its operation a host that was not ready before its lease
+   * waits for the full readiness check before it is released as no worse than
+   * before (Go duration). Between readyStableFor and readinessTimeout.
+   */
+  baselineGrace: string;
+  /** The leases with image work that are granted or pulling at once; 0 is no bound. */
+  maxConcurrentPulls: number;
   policyImage: Policy;
   policyPackages: Policy;
   policyReboot: Policy;
@@ -817,7 +895,7 @@ export interface ClientOverrideRequest {
   reason: string;
 }
 
-/** scheduler.ScopeRequest: the body of pause, resume, abort and ignore-gate. */
+/** scheduler.ScopeRequest: the body of pause, resume, abort, ignore-gate and ignore-budget. */
 export interface ScopeRequest {
   rollout: string;
   reason: string;
@@ -884,13 +962,16 @@ export interface Budget {
 
 /**
  * scheduler.WaitKind: the class of a waiting reason. budget, host-limit,
- * order and pull (the host waits to pull an image again after a failed pull) clear by themselves; working clears when the operation the host
- * works on without a lease is over; gate clears when the network recovers;
- * the rest needs somebody to act.
+ * pulls (maxConcurrentPulls leases with image work are granted or pulling),
+ * order and pull (the host waits to pull an image again after a failed pull)
+ * clear by themselves; working clears when the operation the host works on
+ * without a lease is over; gate clears when the network recovers; the rest
+ * needs somebody to act.
  */
 export type WaitKind =
   | 'budget'
   | 'host-limit'
+  | 'pulls'
   | 'order'
   | 'gate'
   | 'verb'
@@ -915,9 +996,9 @@ export interface QueueEntry {
    */
   after?: string;
   /**
-   * The rollout the reason is about (the paused, halted or unapproved one, or
-   * the one whose order the host waits in); absent when the reason is about
-   * the host or the fleet.
+   * The rollout the reason is about (the paused, halted or unapproved one, the
+   * one whose order the host waits in, or whose node work waits at the gate or
+   * for the budget); absent when the reason is about the host or the fleet.
    */
   rollout?: string;
   rollouts: List<string>;
@@ -934,6 +1015,8 @@ export interface HostPlan {
   liveKnown: boolean;
   leaseId?: string;
   reason?: string;
+  /** What a host without a lease is not ready for by its last sync ("EL is not reachable"). */
+  notReady?: string;
   /** holdRequests are the hold and release-hold directives the host has not answered yet, oldest first. */
   holdRequests?: List<PendingHold>;
 }

@@ -1,5 +1,5 @@
 {
- "version": "19414286776d",
+ "version": "ce78e4a7a75f",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -128,6 +128,25 @@
   "AuditHead": [
    {
     "n": "latestId",
+    "t": "n"
+   }
+  ],
+  "BaselineContainer": [
+   {
+    "n": "name",
+    "t": "s"
+   },
+   {
+    "n": "kind",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "state",
+    "t": "r"
+   },
+   {
+    "n": "restartCount",
     "t": "n"
    }
   ],
@@ -643,6 +662,11 @@
     "omit": true
    },
    {
+    "n": "notReady",
+    "t": "s",
+    "omit": true
+   },
+   {
     "n": "holdRequests",
     "t": "a",
     "of": "PendingHold",
@@ -835,6 +859,27 @@
     "omit": true
    },
    {
+    "n": "baseline",
+    "t": "o",
+    "of": "LeaseBaseline",
+    "omit": true
+   },
+   {
+    "n": "noWorseSince",
+    "t": "t",
+    "omit": true
+   },
+   {
+    "n": "noWorseUntil",
+    "t": "t",
+    "omit": true
+   },
+   {
+    "n": "outcome",
+    "t": "r",
+    "omit": true
+   },
+   {
     "n": "endedAt",
     "t": "t",
     "omit": true
@@ -895,6 +940,50 @@
    },
    {
     "n": "reason",
+    "t": "r",
+    "omit": true
+   }
+  ],
+  "LeaseBaseline": [
+   {
+    "n": "at",
+    "t": "t"
+   },
+   {
+    "n": "node",
+    "t": "o",
+    "of": "NodeHealth"
+   },
+   {
+    "n": "duty",
+    "t": "n"
+   },
+   {
+    "n": "live",
+    "t": "n"
+   },
+   {
+    "n": "liveKnown",
+    "t": "b"
+   },
+   {
+    "n": "containers",
+    "t": "a",
+    "of": "BaselineContainer",
+    "omit": true
+   },
+   {
+    "n": "belowFleet",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "unready",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "root",
     "t": "r",
     "omit": true
    }
@@ -1121,6 +1210,12 @@
    {
     "n": "disrupted",
     "t": "b"
+   },
+   {
+    "n": "pull",
+    "t": "o",
+    "of": "PullProgress",
+    "omit": true
    }
   ],
   "OverrideNeed": [
@@ -1292,6 +1387,46 @@
     "omit": true
    }
   ],
+  "PullProgress": [
+   {
+    "n": "image",
+    "t": "r",
+    "omit": true
+   },
+   {
+    "n": "attempt",
+    "t": "n",
+    "omit": true
+   },
+   {
+    "n": "bytesDone",
+    "t": "n",
+    "omit": true
+   },
+   {
+    "n": "bytesTotal",
+    "t": "n",
+    "omit": true
+   },
+   {
+    "n": "layersDone",
+    "t": "n",
+    "omit": true
+   },
+   {
+    "n": "layersTotal",
+    "t": "n",
+    "omit": true
+   },
+   {
+    "n": "startedAt",
+    "t": "t"
+   },
+   {
+    "n": "lastProgressAt",
+    "t": "t"
+   }
+  ],
   "QueueEntry": [
    {
     "n": "host",
@@ -1403,6 +1538,11 @@
    {
     "n": "skippedBy",
     "t": "s",
+    "omit": true
+   },
+   {
+    "n": "noWorse",
+    "t": "b",
     "omit": true
    },
    {
@@ -2000,6 +2140,11 @@
    {
     "n": "skippedBy",
     "t": "s",
+    "omit": true
+   },
+   {
+    "n": "noWorse",
+    "t": "b",
     "omit": true
    },
    {

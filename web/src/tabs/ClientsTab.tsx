@@ -10,7 +10,9 @@ import {
   type Container,
   type ContainerKind,
   type HostListing,
+  type Gate,
   type Policy,
+  type QueueEntry,
   type Rollout,
 } from '../api/types';
 import { useApp, useAuthState, usePrivateAccess } from '../appContext';
@@ -44,11 +46,12 @@ import { useClientHosts } from '../hooks/useClientHosts';
 import { useDebounced } from '../hooks/useDebounced';
 import { useHashSub } from '../hooks/useHashTab';
 import { setKept, useKept } from '../hooks/useKept';
+import { GATE_APPROVAL_HINT, approvableAtGate, gateApprovalNotes, waitsForApproval } from '../lib/approvals';
 import { commandDiff } from '../lib/flags';
 import { absoluteTime, displayImage, plural, shortRevision } from '../lib/format';
 import { approveIntent, clientPolicyIntent, holdIntent } from '../lib/intents';
 import { POLICIES, POLICY_LABEL, POLICY_MEANING } from '../lib/settingsForm';
-import { RecentRollouts, RolloutCard, useRolloutData, waitsForApproval } from './RolloutsTab';
+import { RecentRollouts, RolloutCard, useRolloutData } from './RolloutsTab';
 
 /** The number of hosts on a page of a client's list. It is fixed, so the pages have one height. */
 export const CLIENT_PAGE_SIZE = 50;
@@ -259,7 +262,7 @@ function ClientPage({
   const rollouts = useRolloutData();
   const open = list(rollouts.rollouts.data?.open).filter(r => r.team === client.name);
   const recent = list(rollouts.rollouts.data?.recent).filter(r => r.team === client.name);
-  const approvals = open.filter(waitsForApproval);
+  const approvals = open.filter(r => waitsForApproval(r) || approvableAtGate(r, rollouts.queue));
 
   // Kept while another tab is shown, per client.
   const [place, setPlace] = useKept<Place>(`clients/${client.name}`, START);
@@ -363,6 +366,8 @@ function ClientPage({
         <ApprovalCallout
           client={client}
           rollouts={approvals}
+          queue={rollouts.queue}
+          gate={rollouts.plan.data?.gate}
           onShow={
             view === 'rollouts'
               ? undefined
@@ -642,19 +647,26 @@ function ClientPage({
 /**
  * ApprovalCallout names the rollouts of the client that wait for a person to
  * approve them, with the approval: a client on the manual policy rolls
- * nothing until then.
+ * nothing until then, an auto rollout does not pass the closed gate.
  */
 function ApprovalCallout({
   client,
   rollouts,
+  queue,
+  gate,
   onShow,
   onAction,
 }: {
   client: ClientView;
   rollouts: readonly Rollout[];
+  queue: ReadonlyMap<string, QueueEntry>;
+  gate: Gate | undefined;
   onShow: (() => void) | undefined;
   onAction: (intent: ActionIntent) => void;
 }) {
+  const atGate = new Set(rollouts.filter(r => approvableAtGate(r, queue)).map(r => r.id));
+  const manual = rollouts.some(r => !atGate.has(r.id));
+
   return (
     <section
       aria-label={`Rollouts of ${client.name} waiting for approval`}
@@ -664,9 +676,12 @@ function ApprovalCallout({
         <h3 className="text-sm/6 font-semibold text-warning">
           {rollouts.length === 1 ? 'A rollout waits' : `${rollouts.length} rollouts wait`} for approval
         </h3>
-        <span className="text-xs/5 text-muted">
-          {client.name} rolls out on the manual policy: nothing is rolled until a person approves.
-        </span>
+        {manual && (
+          <span className="text-xs/5 text-muted">
+            {client.name} rolls out on the manual policy: nothing is rolled until a person approves.
+          </span>
+        )}
+        {atGate.size > 0 && <span className="text-xs/5 text-muted">{GATE_APPROVAL_HINT}.</span>}
         {onShow && (
           <button type="button" onClick={onShow} className="ml-auto text-xs/5 font-medium text-accent hover:underline">
             Show the rollouts
@@ -674,22 +689,36 @@ function ApprovalCallout({
         )}
       </div>
       <ul className="flex flex-col gap-1.5">
-        {rollouts.map(r => (
-          <li key={r.id} className="flex flex-wrap items-center gap-x-3 gap-y-1">
-            <span className="min-w-0 font-mono text-sm/6 wrap-anywhere">{r.title}</span>
-            <span className="text-xs/5 text-muted">
-              {plural(list(r.hosts).length, 'host')} · opened <RelTime fixed value={r.createdAt} />
-            </span>
-            <span className="ml-auto">
-              <IntentAction
-                icon={r.paused ? 'resume' : 'check'}
-                label={r.paused ? 'Resume and approve…' : 'Approve…'}
-                onAction={onAction}
-                intent={approveIntent(`Approve rollout: ${r.title}`, r.id, r.team)}
-              />
-            </span>
-          </li>
-        ))}
+        {rollouts.map(r => {
+          const gated = atGate.has(r.id);
+          return (
+            <li key={r.id} className="flex flex-wrap items-center gap-x-3 gap-y-1">
+              <span className="min-w-0 font-mono text-sm/6 wrap-anywhere">{r.title}</span>
+              {gated && (
+                <Badge tone="warning" title={GATE_APPROVAL_HINT}>
+                  waiting at closed gate
+                </Badge>
+              )}
+              <span className="text-xs/5 text-muted">
+                {plural(list(r.hosts).length, 'host')} · opened <RelTime fixed value={r.createdAt} />
+              </span>
+              <span className="ml-auto">
+                <IntentAction
+                  icon={r.paused ? 'resume' : 'check'}
+                  label={r.paused ? 'Resume and approve…' : 'Approve…'}
+                  onAction={onAction}
+                  intent={approveIntent(
+                    `Approve rollout: ${r.title}`,
+                    r.id,
+                    r.team,
+                    undefined,
+                    gated ? gateApprovalNotes(gate) : undefined
+                  )}
+                />
+              </span>
+            </li>
+          );
+        })}
       </ul>
     </section>
   );

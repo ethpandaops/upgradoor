@@ -62,7 +62,7 @@ import { validateImageRef } from '../lib/imageRef';
 import { parseGoDuration } from '../lib/goDuration';
 import { rolloutActionOf } from '../lib/hostActions';
 import { FEATURE, TEAM_PREFIX, TWINNED, can, type Login, type PermissionCall } from '../lib/permissions';
-import { FIELDS, toForm, validateField } from '../lib/settingsForm';
+import { FIELDS, toForm, validateForm } from '../lib/settingsForm';
 import {
   EPOCH_MS,
   SECONDS_PER_SLOT,
@@ -75,7 +75,7 @@ import {
   type MockFleet,
   type MockRollout,
 } from './fixture';
-import { ClientQueryError, clientHostsPage, clientIndex, imagePolicy, type ClientIndex } from './clients';
+import { ClientQueryError, clientHostsPage, clientIndex, groupPolicy, type ClientIndex } from './clients';
 import { MockHostActionError, seedHostActions, startHostAction } from './hostActions';
 import { OFF_SLOTS, capOutages, outageSpans, type Deviation } from './outages';
 import { MockSources } from './sources';
@@ -145,6 +145,7 @@ const ACTIONS: readonly string[] = [
   'forget',
   'end-lease',
   'ignore-gate',
+  'ignore-budget',
   'approve-lease',
   'pause',
   'resume',
@@ -207,9 +208,21 @@ function waitKind(reason: string): WaitKind {
   if (reason.startsWith('network gate')) return 'gate';
   if (reason.startsWith('verb not allowed')) return 'verb';
   if (reason === REASON_PULL) return 'pull';
+  if (reason.startsWith('image pulls at once: ')) return 'pulls';
   if (reason.startsWith('after ')) return 'order';
   if (reason.startsWith('validators down: ')) return 'budget';
   return 'host-limit';
+}
+
+/** nodeMissing is what the node lacks to be ready, as protocol.NodeHealth.Missing says it; empty when nothing. */
+function nodeMissing({ el, cl }: HostDetail['node'], minPeers: number): string {
+  if (el && !el.reachable) return 'EL is not reachable';
+  if (cl && !cl.reachable) return 'CL is not reachable';
+  if (el?.syncing || cl?.syncing) return 'node is syncing';
+  if (cl?.elOffline) return 'CL reports its EL offline';
+  if (el && el.peers < minPeers) return `waiting for peers: EL has ${el.peers} of ${minPeers}`;
+  if (cl && cl.peers < minPeers) return `waiting for peers: CL has ${cl.peers} of ${minPeers}`;
+  return '';
 }
 
 /** The waiting reason of a host whose last lease could not pull an image (reasonPull). */
@@ -226,17 +239,21 @@ const RECONCILE_MS = 5_000;
 
 const isOpen = (l: Lease) => !['released', 'failed', 'expired'].includes(l.state);
 
-/** succeeded: the rollout has served a member successfully (one is done through a lease). */
+/** succeeded: the rollout has served a member successfully (one is done through a lease, not as no worse). */
 function succeeded(r: MockRollout): boolean {
-  return list(r.hosts).some(m => m.state === 'done' && Boolean(m.leaseId));
+  return list(r.hosts).some(m => m.state === 'done' && Boolean(m.leaseId) && !m.noWorse);
 }
 
-/** fits: the three grant conditions of the availability budget for a host that costs cost. */
-function fits(cost: number, budget: Budget): boolean {
+/**
+ * fits: the grant conditions of the availability budget for a host that costs
+ * cost: it costs nothing, stays inside the budget, or is the floor lease (no
+ * lease of a host with validators is open). weighted counts those leases.
+ */
+function fits(cost: number, budget: Budget, weighted: number): boolean {
   return (
     cost === 0 ||
     budget.unavailableWeight + cost <= budget.allowedWeight + 1e-9 ||
-    (budget.unavailableWeight === 0 && budget.allowedWeight > 0 && budget.leasedHosts === 0)
+    (weighted === 0 && budget.allowedWeight > 0)
   );
 }
 
@@ -909,8 +926,8 @@ export class MockController {
     const s = this.data.settings;
     switch (r.kind) {
       case 'group':
-        // A group rollout answers to the image policy of its team, else of its kind, else to policyImage.
-        return imagePolicy(s, r.team, r.containerKind)[0];
+        // An Ansible deploy is auto; else the image policy of its team, else of its kind, else policyImage.
+        return groupPolicy(s, r)[0];
       case 'packages':
         return s.policyPackages;
       case 'reboot':
@@ -951,6 +968,15 @@ export class MockController {
       independentHosts: 0,
       maxIndependent: Math.max(1, Math.floor((this.data.settings.maxIndependentPercent / 100) * this.data.hosts.size)),
     };
+  }
+
+  /** weightedLeases counts the open leases of hosts with validators: they rule out the floor lease. */
+  private weightedLeases(): number {
+    let n = 0;
+    for (const host of this.data.hosts.values()) {
+      if (host.validators > 0 && this.openLease(host.name)) n += 1;
+    }
+    return n;
   }
 
   /** live is the number of the host's validators that attested in the newest epoch. */
@@ -1038,15 +1064,16 @@ export class MockController {
     if (able.length === 0) return REASON_PULL;
 
     const ignoresBudget = able.some(r => r.ignoreBudget);
-    const throughGate = !gate.ok && !able.some(r => r.ignoreBudget || r.ignoreGate);
-    if (throughGate) return `network gate: ${list(gate.reasons)[0] ?? 'failing'}`;
+    // A closed gate holds back what nobody let pass; an approved rollout passes it one lease at a time.
+    const passes = able.some(r => r.ignoreBudget || r.ignoreGate || (r.approved && budget.leasedHosts === 0));
+    if (!gate.ok && !passes) return `network gate: ${list(gate.reasons)[0] ?? 'failing'}`;
 
     const waits = able.map(r => this.orderWait(r, host.name));
     if (waits[0] !== undefined && waits.every(w => w !== undefined)) return waits[0].reason;
 
     if (!ignoresBudget) {
       const cost = this.live(host.name);
-      if (!fits(cost, budget)) {
+      if (!fits(cost, budget, this.weightedLeases())) {
         const pct = (w: number) => (budget.totalWeight > 0 ? (w / budget.totalWeight) * 100 : 0);
         const now = formatPercent(pct(budget.unavailableWeight));
         const withHost = formatPercent(pct(budget.unavailableWeight + cost));
@@ -1057,7 +1084,20 @@ export class MockController {
       }
     }
 
+    const limit = this.data.settings.maxConcurrentPulls;
+    const pulling = this.pulling();
+    if (limit > 0 && pulling >= limit) return `image pulls at once: ${pulling} of ${limit}`;
+
     return undefined;
+  }
+
+  /** pulling counts the open leases with image work that the agent has not started or that pull. */
+  private pulling(): number {
+    return this.data.leases.filter(
+      l =>
+        list(l.needs).some(n => n.image ?? n.override ?? n.spec) &&
+        (l.state === 'granted' || (l.state === 'running' && l.operation?.phase === 'pulling'))
+    ).length;
   }
 
   /** orderAfter names the host that a host waiting for its place in the order waits for. */
@@ -1086,6 +1126,8 @@ export class MockController {
       case 'gate':
       case 'verb':
         return active[0]?.id;
+      case 'budget':
+        return active.find(r => !r.paused && !r.ignoreBudget)?.id;
       default:
         return undefined;
     }
@@ -1144,6 +1186,9 @@ export class MockController {
       if (!lease && memberOf.length > 0) {
         plan.reason = this.waitingReason(host, memberOf, gate, budget);
       }
+
+      const notReady = !lease && !this.isStale(host.name) ? nodeMissing(host.node, this.data.settings.minPeers) : '';
+      if (notReady) plan.notReady = notReady;
 
       hosts[host.name] = plan;
     }
@@ -1429,7 +1474,7 @@ export class MockController {
     const view = (r: MockRollout): Rollout => ({
       ...r,
       policy: this.policy(r),
-      ...(r.kind === 'group' ? { policySource: imagePolicy(this.data.settings, r.team, r.containerKind)[1] } : {}),
+      ...(r.kind === 'group' ? { policySource: groupPolicy(this.data.settings, r)[1] } : {}),
     });
 
     return {
@@ -1525,11 +1570,9 @@ export class MockController {
     }
 
     const next = { ...this.data.settings, ...(body as Partial<Settings>) };
-    const form = toForm(next);
-    for (const spec of FIELDS) {
-      const problem = validateField(spec, form[spec.key]);
-      if (problem) throw new HttpError(400, `${spec.key} ${problem}`);
-    }
+    const problems = Object.entries(validateForm(toForm(next)));
+    const [key, problem] = problems[0] ?? [];
+    if (key) throw new HttpError(400, `${key} ${problem}`);
 
     // A body that changes nothing is no change and no entry in the audit log.
     const before = { ...this.data.settings };
@@ -1602,6 +1645,8 @@ export class MockController {
         return this.endLease(body as EndLeaseRequest);
       case 'ignore-gate':
         return this.ignoreGate(body as ScopeRequest);
+      case 'ignore-budget':
+        return this.ignoreBudget(body as ScopeRequest);
       case 'approve-lease':
         return this.approveLease(body as ApproveLeaseRequest);
       case 'pause':
@@ -1960,6 +2005,17 @@ export class MockController {
             updatedAt: this.iso(now),
             steps: [{ needId: need.id, status: 'pending' }],
             disrupted: false,
+            pull: {
+              image:
+                need.override?.image ?? list(host.containers).find(c => c.name === need.override?.container)?.image,
+              attempt: 1,
+              bytesDone: 412 * 1024 * 1024,
+              bytesTotal: 933 * 1024 * 1024,
+              layersDone: 3,
+              layersTotal: 7,
+              startedAt: this.iso(now),
+              lastProgressAt: this.iso(now),
+            },
           },
           needs: [need],
           rollouts: { [need.id]: r.id },
@@ -2275,6 +2331,22 @@ export class MockController {
     return { message: 'rollout passes the network gate', rollout: r.id };
   }
 
+  /** ignoreBudget lets one open rollout skip the budget and the network gate. */
+  private ignoreBudget(req: ScopeRequest): ActionResult {
+    if (req.rollout === '') throw new HttpError(400, 'rollout must not be empty');
+    const r = this.openRollout(req.rollout);
+    if (!r.ignoreBudget) {
+      r.ignoreBudget = true;
+      r.updatedAt = this.iso(this.now());
+      this.log('action.ignore-budget', r.id, {
+        before: { ignoreBudget: false },
+        after: { ignoreBudget: true },
+        reason: req.reason,
+      });
+    }
+    return { message: 'rollout ignores the budget', rollout: r.id };
+  }
+
   /** approveLease releases the verifying lease of one member at once, as the next reconcile would. */
   private approveLease(req: ApproveLeaseRequest): ActionResult {
     const r = this.rollout(req.rollout);
@@ -2347,9 +2419,10 @@ export class MockController {
     const r = this.openRollout(req.rollout);
 
     r.paused = action === 'pause';
-    // A resume lifts every pause, whoever set it, and takes its reason along.
+    // A resume lifts every pause, whoever set it, and takes its reason along. It approves a rollout of a
+    // manual policy, and any rollout while the gate is closed.
     if (action === 'resume') {
-      r.approved = true;
+      r.approved = r.approved || this.policy(r) === 'manual' || !this.gate().ok;
       r.pauseReason = undefined;
     }
     r.updatedAt = this.iso(this.now());

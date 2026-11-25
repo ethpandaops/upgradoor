@@ -44,7 +44,11 @@ type fakeEngine struct {
 	listed   []client.ContainerListOptions
 	pulls    []client.ImagePullOptions
 	pullMsgs []jsonstream.Message
-	nextID   int
+	// pullPause separates the pull messages; pullHang keeps the stream
+	// open after them until the pull's context ends.
+	pullPause time.Duration
+	pullHang  bool
+	nextID    int
 }
 
 func newFakeEngine() *fakeEngine {
@@ -305,7 +309,7 @@ func (f *fakeEngine) ImagePull(
 
 	f.pulls = append(f.pulls, options)
 
-	return fakePullStream{msgs: f.pullMsgs}, nil
+	return fakePullStream{msgs: f.pullMsgs, pause: f.pullPause, hang: f.pullHang}, nil
 }
 
 func (f *fakeEngine) NetworkConnect(
@@ -316,21 +320,39 @@ func (f *fakeEngine) NetworkConnect(
 
 func (f *fakeEngine) Close() error { return f.record("close") }
 
-// fakePullStream replays pull progress messages.
+// fakePullStream replays pull progress messages, pause apart; with hang it
+// then waits for the end of the pull's context.
 type fakePullStream struct {
-	msgs []jsonstream.Message
+	msgs  []jsonstream.Message
+	pause time.Duration
+	hang  bool
 }
 
 func (s fakePullStream) Read([]byte) (int, error) { return 0, io.EOF }
 
 func (s fakePullStream) Close() error { return nil }
 
-func (s fakePullStream) JSONMessages(context.Context) iter.Seq2[jsonstream.Message, error] {
+func (s fakePullStream) JSONMessages(ctx context.Context) iter.Seq2[jsonstream.Message, error] {
 	return func(yield func(jsonstream.Message, error) bool) {
 		for _, msg := range s.msgs {
+			if s.pause > 0 {
+				select {
+				case <-ctx.Done():
+					yield(jsonstream.Message{}, ctx.Err())
+
+					return
+				case <-time.After(s.pause):
+				}
+			}
+
 			if !yield(msg, nil) {
 				return
 			}
+		}
+
+		if s.hang {
+			<-ctx.Done()
+			yield(jsonstream.Message{}, ctx.Err())
 		}
 	}
 }
@@ -347,6 +369,7 @@ func newTestRuntime(t *testing.T, f *fakeEngine) *dockerRuntime {
 		log:    log,
 		engine: f,
 		pulled: make(map[string]string, 1),
+		stall:  pullStall,
 	}
 }
 

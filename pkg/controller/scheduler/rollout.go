@@ -718,14 +718,27 @@ func (p *pass) pickCanary(r *fleet.Rollout) {
 			continue
 		}
 
-		if best == nil || p.canaryBefore(m, best) {
+		if best == nil || p.canaryBefore(r, m, best) {
 			best = m
 		}
 	}
 
-	if best != nil && members > 1 {
-		r.Canary = best.Host
+	// Once a host went as no worse than before, hosts that are not ready for
+	// something else go without a canary: none of them can prove the change.
+	if best == nil || members < 2 ||
+		(p.servingRank(r, p.hosts[best.Host]) == rankDownUnrelated && noWorseDone(r)) {
+		return
 	}
+
+	r.Canary = best.Host
+}
+
+// noWorseDone reports whether a member is done through a lease released as
+// no worse than before.
+func noWorseDone(r *fleet.Rollout) bool {
+	return slices.ContainsFunc(r.Hosts, func(m fleet.RolloutHost) bool {
+		return m.State == fleet.HostDone && m.NoWorse
+	})
 }
 
 // keepsCanary reports whether the canary was served: it holds a lease, is
@@ -745,9 +758,11 @@ func (p *pass) keepsCanary(r *fleet.Rollout, c *fleet.RolloutHost) bool {
 }
 
 // doneByRelease reports whether the member is done through a lease that was
-// released: only such a member keeps the ID of its lease.
+// released after the full readiness check: only a member done through a
+// released lease keeps the ID of its lease, and one released as no worse
+// than before is marked.
 func doneByRelease(m *fleet.RolloutHost) bool {
-	return m.State == fleet.HostDone && m.LeaseID != ""
+	return m.State == fleet.HostDone && m.LeaseID != "" && !m.NoWorse
 }
 
 // succeeded reports whether the rollout has had its first success: a member
@@ -796,18 +811,19 @@ func (p *pass) awaited(r *fleet.Rollout, m *fleet.RolloutHost) bool {
 
 // canaryBefore orders the members that can be the canary: a member that
 // holds a lease first, then hosts that fit the budget as it is before this
-// pass grants anything, hosts with live validators (only they prove that
-// attesting still works after the change; a host whose validators are all
-// offline proves as little as a host without any), hosts that report the
-// need before hosts that are only expected to, ascending weight and name.
-func (p *pass) canaryBefore(a, b *fleet.RolloutHost) bool {
+// pass grants anything, by servingRank (a host that is not ready for
+// something else last: it proves little), hosts without validators with a
+// duty or without liveness data last (they do not prove that attesting works
+// after the change), ascending live validators, hosts that report the need
+// before hosts that are only expected to, ascending weight and name.
+func (p *pass) canaryBefore(r *fleet.Rollout, a, b *fleet.RolloutHost) bool {
 	type rank struct {
-		waiting, overBudget, notLive, expected int
-		weight                                 uint64
+		waiting, overBudget, serving, unattested, expected int
+		live, weight                                       uint64
 	}
 
 	of := func(m *fleet.RolloutHost) rank {
-		k := rank{notLive: 1}
+		k := rank{serving: rankDownUnrelated + 1, unattested: 1}
 
 		if m.State != fleet.HostLeased {
 			k.waiting = 1
@@ -826,10 +842,12 @@ func (p *pass) canaryBefore(a, b *fleet.RolloutHost) bool {
 			k.overBudget = 1
 		}
 
+		k.serving = p.servingRank(r, hv)
 		k.weight = hv.weight
+		k.live = hv.live
 
-		if hv.live > 0 {
-			k.notLive = 0
+		if hv.duty > 0 && hv.liveKnown {
+			k.unattested = 0
 		}
 
 		return k
@@ -840,7 +858,9 @@ func (p *pass) canaryBefore(a, b *fleet.RolloutHost) bool {
 	return cmp.Or(
 		cmp.Compare(ka.waiting, kb.waiting),
 		cmp.Compare(ka.overBudget, kb.overBudget),
-		cmp.Compare(ka.notLive, kb.notLive),
+		cmp.Compare(ka.serving, kb.serving),
+		cmp.Compare(ka.unattested, kb.unattested),
+		cmp.Compare(ka.live, kb.live),
 		cmp.Compare(ka.expected, kb.expected),
 		cmp.Compare(ka.weight, kb.weight),
 		cmp.Compare(a.Host, b.Host),

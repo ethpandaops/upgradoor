@@ -162,6 +162,10 @@ type hostView struct {
 	broken map[string]string
 	// unproven is fleet.Host.Unproven as the pass leaves it.
 	unproven *time.Time
+	// root and unready are what the host is not ready for by its last sync,
+	// as the pass begins (pass.readiness); empty when it is ready.
+	root    protocol.ContainerKind
+	unready string
 }
 
 // heldReason says what holds the host: its holds, else the hold it was
@@ -338,6 +342,10 @@ func newPass(w *World) *pass {
 
 	slices.Sort(p.names)
 
+	for _, hv := range p.hosts {
+		hv.root, hv.unready = p.readiness(hv)
+	}
+
 	for _, r := range w.Rollouts {
 		c := cloneRollout(r)
 		p.rollouts = append(p.rollouts, c)
@@ -488,6 +496,7 @@ func (p *pass) setMember(m *fleet.RolloutHost, state fleet.HostState) {
 	m.State = state
 	m.UpdatedAt = p.now
 	m.SkippedBy = ""
+	m.NoWorse = false
 
 	if state == fleet.HostDone || state == fleet.HostExpected {
 		m.Error = ""
@@ -558,6 +567,8 @@ func cloneLease(l *fleet.Lease) *fleet.Lease {
 	c.SyncedSince = cloneTime(l.SyncedSince)
 	c.SyncedUntil = cloneTime(l.SyncedUntil)
 	c.ReadyAt = cloneTime(l.ReadyAt)
+	c.NoWorseSince = cloneTime(l.NoWorseSince)
+	c.NoWorseUntil = cloneTime(l.NoWorseUntil)
 	c.EndedAt = cloneTime(l.EndedAt)
 	c.Operation = cloneOperation(l.Operation)
 	c.PeerChecks = slices.Clone(l.PeerChecks)
@@ -584,6 +595,11 @@ func cloneOperation(op *protocol.Operation) *protocol.Operation {
 
 	c := *op
 	c.Steps = slices.Clone(op.Steps)
+
+	if op.Pull != nil {
+		pull := *op.Pull
+		c.Pull = &pull
+	}
 
 	return &c
 }

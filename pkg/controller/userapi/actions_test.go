@@ -1970,6 +1970,8 @@ func TestPermissionMatrix(t *testing.T) {
 		{"abort", teamless, rollout("r-reboot"), false, false},
 		{"ignore-gate", own, rollout("r-lighthouse"), true, false},
 		{"ignore-gate", other, rollout("r-geth"), false, false},
+		{"ignore-budget", own, rollout("r-lighthouse"), true, false},
+		{"ignore-budget", other, rollout("r-geth"), false, false},
 		{"approve-lease", own, approve("r-lighthouse"), true, false},
 		{"approve-lease", other, approve("r-geth"), false, false},
 		{"retry", own, rollout("r-lighthouse"), true, false},

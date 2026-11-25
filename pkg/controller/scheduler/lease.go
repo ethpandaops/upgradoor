@@ -185,31 +185,83 @@ func (p *pass) verify(l *fleet.Lease, hv *hostView) {
 	// fleet's, as both stand now. Falling short keeps the lease, not more: the
 	// run of healthy syncs stays, so the lease is released in the first pass
 	// in which the host does not fall short.
+	peers := p.fleetPeers(l, hv)
 	if ready {
-		if below := p.belowFleet(l, hv.h.Status.Node); below != "" {
+		if below := peers(); below != "" {
 			ready, note = false, below
 		}
 	}
 
-	l.Readiness = note
+	lenient := lenientCheck(l)
 
 	if ready {
 		if id := p.stillReported(l, hv); id != "" {
+			l.Readiness = note
 			p.failLease(l, "need "+id+" is still reported after the operation")
 
 			return
 		}
 
+		if lenient {
+			l.Outcome = fleet.OutcomeRecovered
+			note = "recovered: was not ready before the lease (" + l.Baseline.Unready + ")"
+		}
+
+		l.Readiness = note
 		p.releaseLease(l)
 
 		return
 	}
 
+	worse := ""
+
+	if lenient {
+		var release bool
+
+		release, worse, note = p.noWorse(l, hv, note, peers)
+		if release {
+			if id := p.stillReported(l, hv); id != "" {
+				l.Readiness = note
+				p.failLease(l, "need "+id+" is still reported after the operation")
+
+				return
+			}
+
+			l.Readiness = "not ready before the lease: " + l.Baseline.Unready + "; no worse after"
+			p.releaseNoWorse(l)
+
+			return
+		}
+	}
+
+	l.Readiness = note
+
 	// Counted from the scheduler's start at the earliest: while the controller
 	// was down nobody looked, and the attestations seen before are gone.
 	if timeout := p.set.ReadinessTimeout.Std(); p.now.Sub(later(*l.AgentDoneAt, p.w.Since)) > timeout {
+		if worse != "" {
+			l.Outcome = fleet.OutcomeWorse
+		}
+
 		p.failLease(l, fmt.Sprintf("not ready after %s: %s", timeout, note))
 		p.chargeHost(l)
+	}
+}
+
+// fleetPeers returns belowFleet of the host's node as a function that
+// compares once per pass, however often it is asked.
+func (p *pass) fleetPeers(l *fleet.Lease, hv *hostView) func() string {
+	var (
+		done  bool
+		below string
+	)
+
+	return func() string {
+		if !done {
+			done, below = true, p.belowFleet(l, hv.h.Status.Node)
+		}
+
+		return below
 	}
 }
 
@@ -507,15 +559,23 @@ func (p *pass) references() []*hostView {
 }
 
 // belowFleet compares the peer count of each client of a node with the
+// median of the same client on the reference hosts (comparePeers) and keeps
+// what was compared on the lease for people. It is asked once per pass, of a
+// host that is ready otherwise (verify).
+func (p *pass) belowFleet(l *fleet.Lease, node protocol.NodeHealth) string {
+	checks, below := p.comparePeers(node)
+	l.PeerChecks = append(l.PeerChecks, checks...)
+
+	return below
+}
+
+// comparePeers compares the peer count of each client of a node with the
 // median of the same client on the reference hosts (the lower of the two
 // middle values of an even number of them) and names the first that has fewer
 // than readyPeerShare of it; "" when none has. A client that the node does
 // not probe, or that fewer than minReferences reference hosts probe, is not
-// compared. What was compared is kept on the lease for people. It is asked
-// once per pass, of a host that is ready otherwise (verify).
-func (p *pass) belowFleet(l *fleet.Lease, node protocol.NodeHealth) string {
-	below := ""
-
+// compared.
+func (p *pass) comparePeers(node protocol.NodeHealth) (checks []fleet.PeerCheck, below string) {
 	for _, layer := range peerLayers {
 		peers, probed := layer.peers(node)
 		if !probed {
@@ -529,14 +589,14 @@ func (p *pass) belowFleet(l *fleet.Lease, node protocol.NodeHealth) string {
 
 		needs := int(math.Ceil(p.set.ReadyPeerShare*float64(median) - budgetEpsilon))
 
-		l.PeerChecks = append(l.PeerChecks, fleet.PeerCheck{Layer: layer.name, Peers: peers, Median: median, Needs: needs})
+		checks = append(checks, fleet.PeerCheck{Layer: layer.name, Peers: peers, Median: median, Needs: needs})
 
 		if peers < needs && below == "" {
 			below = fmt.Sprintf("%s peers %d, the fleet's median is %d (needs %d)", layer.name, peers, median, needs)
 		}
 	}
 
-	return below
+	return checks, below
 }
 
 // fleetMedian is the median peer count of one client on the reference hosts
@@ -740,14 +800,45 @@ func (p *pass) releaseLease(l *fleet.Lease) {
 	detail := map[string]any{
 		keyLease: l.ID, keyForce: l.Force,
 		// What the controller saw before it gave the slot back.
-		"readiness": l.Readiness,
+		keyReadiness: l.Readiness,
 	}
 
 	if l.Approved != nil {
 		detail["approvedBy"] = l.Approved.By
 	}
 
+	if l.Outcome != "" {
+		detail[keyOutcome] = l.Outcome
+	}
+
 	p.record("lease.released", l.Host, detail)
+}
+
+// releaseNoWorse ends a lease whose host was not ready before it and is no
+// worse after it. Its members are done, but it proves nothing: no success of
+// a rollout (no canary, no pause after one), the host's broken marks and
+// charge stay.
+func (p *pass) releaseNoWorse(l *fleet.Lease) {
+	p.endLease(l, fleet.LeaseReleased)
+	l.Outcome = fleet.OutcomeNoWorse
+
+	for _, r := range p.leaseRollouts(l) {
+		m := p.member(r, l.Host)
+
+		if stepsDone(l, r.ID) || l.Recheck {
+			p.setMember(m, fleet.HostDone)
+			m.NoWorse = true
+
+			continue
+		}
+
+		m.LeaseID = ""
+		p.setMember(m, unserved(r))
+	}
+
+	p.record("lease.released", l.Host, map[string]any{
+		keyLease: l.ID, keyForce: l.Force, keyReadiness: l.Readiness, keyOutcome: l.Outcome,
+	})
 }
 
 // failLease ends a lease as failed, marks its host broken for what the lease

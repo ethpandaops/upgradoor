@@ -17,6 +17,7 @@ import {
   type Need,
   type Policy,
   type PolicySource,
+  type Rollout,
   type Settings,
 } from '../api/types';
 import { isHeld } from '../lib/format';
@@ -62,6 +63,16 @@ export function imagePolicy(
 ): [Policy, PolicySource] {
   const own = team ? settings.policyClients[team] : undefined;
   return own ? [own, 'client'] : kindPolicy(settings, kind);
+}
+
+/** groupPolicy is the policy of a group rollout (fleet.Settings.GroupPolicy): auto when every target is an Ansible deploy, else imagePolicy. */
+export function groupPolicy(
+  settings: Settings,
+  r: Pick<Rollout, 'team' | 'containerKind' | 'targets'>
+): [Policy, PolicySource] {
+  const targets = list(r.targets);
+  if (targets.length > 0 && targets.every(t => t.spec)) return ['auto', 'deploy'];
+  return imagePolicy(settings, r.team, r.containerKind);
 }
 
 /** shouldRun mirrors protocol.Container.ShouldRun: a container that is down and was not stopped by a person. */

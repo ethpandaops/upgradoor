@@ -628,11 +628,13 @@ func TestCommit(t *testing.T) {
 
 			served := testRollout("r1", fleet.RolloutActive, 0, "node-1")
 			served.Hosts[0].Served = true
+			served.Hosts[0].NoWorse = true
 			require.NoError(t, s.Commit(ctx, &Changes{Rollouts: []*fleet.Rollout{served}}))
 
 			got, err := s.GetRollout(ctx, "r1")
 			require.NoError(t, err)
 			assert.True(t, got.Hosts[0].Served)
+			assert.True(t, got.Hosts[0].NoWorse)
 
 			require.NoError(t, s.Commit(ctx, &Changes{Dropped: []string{"r1"}}))
 

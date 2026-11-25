@@ -74,19 +74,22 @@ export function scopeIntent(
 }
 
 /**
- * approveIntent approves one rollout that waits on a manual policy: a resume
- * of a rollout that is not paused, labelled for what it does.
+ * approveIntent approves one rollout that waits on a manual policy or at the
+ * closed network gate: a resume of a rollout that is not paused, labelled for
+ * what it does. notes are shown in the dialog.
  */
 export function approveIntent(
   title: string,
   rollout: string,
   client: string | undefined,
-  hostAction?: RolloutAction
+  hostAction?: RolloutAction,
+  notes?: readonly string[]
 ): ActionIntent {
   return {
     kind: 'call',
     title,
     verb: 'Approve',
+    notes,
     rolloutClient: client ?? '',
     rolloutAction: hostAction,
     make: reason => ({ action: 'resume', body: buildScopeRequest(rollout, reason) }),
@@ -113,6 +116,30 @@ export function ignoreGateIntent(
     rolloutClient: client ?? '',
     rolloutAction: hostAction,
     make: reason => ({ action: 'ignore-gate', body: buildScopeRequest(rollout, reason) }),
+  };
+}
+
+/**
+ * ignoreBudgetIntent lets one rollout skip the availability budget (and the
+ * network gate). reasons are the budget waits of its members, shown in the
+ * dialog.
+ */
+export function ignoreBudgetIntent(
+  title: string,
+  rollout: string,
+  client: string | undefined,
+  hostAction: RolloutAction | undefined,
+  reasons: readonly string[]
+): ActionIntent {
+  return {
+    kind: 'call',
+    title,
+    verb: 'Roll despite network state',
+    danger: true,
+    notes: reasons.map(r => `Validator budget: ${r}`),
+    rolloutClient: client ?? '',
+    rolloutAction: hostAction,
+    make: reason => ({ action: 'ignore-budget', body: buildScopeRequest(rollout, reason) }),
   };
 }
 

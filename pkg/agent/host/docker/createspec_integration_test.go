@@ -244,7 +244,7 @@ func TestIntegrationAnsibleSeesNoChange(t *testing.T) {
 			vars["c_image"] = ref
 
 			digest1 := env.publish(t, ref, variantOne)
-			pulled, _, err := r.Pull(ctx, ref)
+			pulled, _, err := r.Pull(ctx, ref, nil)
 			require.NoError(t, err)
 			require.Equal(t, digest1, pulled)
 
@@ -263,7 +263,7 @@ func TestIntegrationAnsibleSeesNoChange(t *testing.T) {
 
 			// A new image is pushed under the same tag and rolled out.
 			digest2 := env.publish(t, ref, variantTwo)
-			pulled, _, err = r.Pull(ctx, ref)
+			pulled, _, err = r.Pull(ctx, ref, nil)
 			require.NoError(t, err)
 			require.Equal(t, digest2, pulled)
 
@@ -288,7 +288,7 @@ func TestIntegrationAnsibleSeesNoChange(t *testing.T) {
 
 			// A replacement of a replacement is no different.
 			env.publish(t, ref, variantOne)
-			pulled, _, err = r.Pull(ctx, ref)
+			pulled, _, err = r.Pull(ctx, ref, nil)
 			require.NoError(t, err)
 			require.NoError(t, r.Recreate(ctx, name, pulled, 10*time.Second, true, nil))
 

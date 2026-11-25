@@ -170,6 +170,29 @@ describe('OverviewTab, logged in', () => {
     });
   });
 
+  it('approves an auto rollout that waits at the closed gate from the attention list', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    h.controller.setGateFailing(true);
+    renderWithApp(<OverviewTab onOpenTab={noTab} />, h);
+
+    const attention = await screen.findByRole('region', { name: 'Needs attention' });
+    const row = (await within(attention).findAllByText(/ waits at the closed gate$/))[0]?.closest('li');
+    if (!row) throw new Error('no rollout waits at the closed gate');
+    expect(row).toHaveTextContent('approved, it rolls one host at a time');
+    await user.click(within(row).getByRole('button', { name: 'Approve…' }));
+
+    const dialog = screen.getByRole('dialog');
+    const notes = within(dialog).getByRole('list', { name: 'Current state' });
+    expect(notes).toHaveTextContent(/Network gate closed: /);
+    expect(notes).toHaveTextContent('one host at a time');
+    await user.click(within(dialog).getByRole('button', PRIMARY));
+
+    await vi.waitFor(() => {
+      expect(h.calls.find(c => c.method === 'POST')?.path).toBe('/api/v1/actions/resume');
+    });
+  });
+
   it('lists a paused scheduler and a closed gate first', async () => {
     const h = await createHarness({ mode: 'open' });
     h.controller.setGateFailing(true);

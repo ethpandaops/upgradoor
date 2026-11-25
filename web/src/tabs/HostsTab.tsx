@@ -548,14 +548,19 @@ function PrivateCells({
             <span className="text-faint">up to date</span>
           )}
           <OfflineBadge mark={s.offline} />
+          {s.plan.notReady && (
+            <Badge tone="warning" title={`Not ready by its last sync: ${s.plan.notReady}`}>
+              not ready
+            </Badge>
+          )}
           {s.hold.local && (
             <Badge tone="warning" title={`Local hold file${s.hold.localReason ? `: ${s.hold.localReason}` : ''}`}>
               local hold
             </Badge>
           )}
-          {state?.detail && (
-            <span className="min-w-0 truncate text-muted" title={state.detail}>
-              {state.detail}
+          {(state?.detail ?? s.plan.notReady) && (
+            <span className="min-w-0 truncate text-muted" title={state?.detail ?? s.plan.notReady}>
+              {state?.detail ?? s.plan.notReady}
             </span>
           )}
         </span>

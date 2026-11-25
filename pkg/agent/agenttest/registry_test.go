@@ -51,7 +51,7 @@ func TestHostPullFrom(t *testing.T) {
 
 	h.PullFrom(func(context.Context, string) (string, error) { return GethV3, nil })
 
-	digest, _, err := h.Pull(t.Context(), GethImage)
+	digest, _, err := h.Pull(t.Context(), GethImage, nil)
 	require.NoError(t, err)
 	assert.Equal(t, GethV3, digest)
 
@@ -61,6 +61,6 @@ func TestHostPullFrom(t *testing.T) {
 
 	h.PullFrom(func(context.Context, string) (string, error) { return "", assert.AnError })
 
-	_, _, err = h.Pull(t.Context(), GethImage)
+	_, _, err = h.Pull(t.Context(), GethImage, nil)
 	require.ErrorIs(t, err, assert.AnError)
 }

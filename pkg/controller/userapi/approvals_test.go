@@ -18,9 +18,9 @@ func approver(services string, teams ...string) *authz.User {
 	return &authz.User{Actor: controllertest.UserEmail, Services: services, Teams: teams}
 }
 
-// Whoever may approve a rollout lets it pass the gate: manage, its team's
-// twin, or the action on every member of an action rollout. Admin is not
-// needed.
+// Whoever may approve a rollout lets it pass the gate or the budget: manage,
+// its team's twin, or the action on every member of an action rollout. Admin
+// is not needed.
 func TestIgnoreGatePermissions(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -51,25 +51,27 @@ func TestIgnoreGatePermissions(t *testing.T) {
 		},
 	}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			h := newHarness(t, nil)
-			actionFixture(h)
+	for _, action := range []string{"ignore-gate", "ignore-budget"} {
+		for _, tt := range tests {
+			t.Run(action+"/"+tt.name, func(t *testing.T) {
+				h := newHarness(t, nil)
+				actionFixture(h)
 
-			rec := postAction(h, tt.user, "ignore-gate", tt.body)
-			require.Equal(t, tt.status, rec.Code, rec.Body.String())
+				rec := postAction(h, tt.user, action, tt.body)
+				require.Equal(t, tt.status, rec.Code, rec.Body.String())
 
-			calls := h.sched.Recorded()
-			if tt.status != http.StatusOK {
-				assert.Empty(t, calls)
+				calls := h.sched.Recorded()
+				if tt.status != http.StatusOK {
+					assert.Empty(t, calls)
 
-				return
-			}
+					return
+				}
 
-			require.Len(t, calls, 1)
-			assert.Equal(t, "ignore-gate", calls[0].Name)
-			assert.Equal(t, tt.by, calls[0].Auth.By)
-		})
+				require.Len(t, calls, 1)
+				assert.Equal(t, action, calls[0].Name)
+				assert.Equal(t, tt.by, calls[0].Auth.By)
+			})
+		}
 	}
 }
 

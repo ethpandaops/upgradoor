@@ -22,6 +22,10 @@ var ErrDigestMismatch = docker.ErrDigestMismatch
 // container was stopped; the rollback has run.
 var ErrImageMoved = docker.ErrImageMoved
 
+// ErrPullStalled is returned by Host.Pull when the pull made no progress for
+// a while.
+var ErrPullStalled = docker.ErrPullStalled
+
 // Host is the machine; the contracts are on docker.Runtime, system.System
 // and probe.Prober.
 type Host interface {
@@ -29,8 +33,8 @@ type Host interface {
 	Containers(ctx context.Context) ([]protocol.Container, error)
 	// LocalImage returns the digest and revision of a local image.
 	LocalImage(ctx context.Context, ref string) (digest, revision string, err error)
-	// Pull pulls an image by its tag.
-	Pull(ctx context.Context, ref string) (digest, revision string, err error)
+	// Pull pulls an image by its tag; progress may be nil.
+	Pull(ctx context.Context, ref string, progress func(*protocol.PullProgress)) (digest, revision string, err error)
 	// Recreate replaces a container, with change applied.
 	Recreate(
 		ctx context.Context, name, digest string, stopTimeout time.Duration, start bool, change *Change,

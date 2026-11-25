@@ -248,7 +248,7 @@ func (e *dockerEnv) buildImage(ctx context.Context) {
 		require.NoError(e.t, pushed.Wait(ctx), "push %s", ref)
 		require.NoError(e.t, pushed.Close())
 
-		digest, _, err := e.host.Pull(ctx, ref)
+		digest, _, err := e.host.Pull(ctx, ref, nil)
 		require.NoError(e.t, err)
 
 		if e.digest == "" {

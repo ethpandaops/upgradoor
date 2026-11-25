@@ -60,7 +60,7 @@ const (
 	FeatureDetails = "details"
 	// FeatureManage covers roll, reboot, hold, unhold, mark-offline,
 	// unmark-offline, skip, retry, end-lease, client-policy, pause, resume,
-	// ignore-gate, approve-lease and abort of one rollout, POST
+	// ignore-gate, ignore-budget, approve-lease and abort of one rollout, POST
 	// /api/v1/images/refresh, the flags force and ignoreBudget, the selector
 	// all and a roll that is not staggered. It is the feature of a host action
 	// that names none. A host has one hold per holder: the plain feature sets

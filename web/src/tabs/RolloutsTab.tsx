@@ -12,11 +12,12 @@ import {
 import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { ActionRunView, leaseRun } from '../components/ActionRun';
 import { Digest, ShortId } from '../components/Digest';
-import { LeaseTable, PeerChecks } from '../components/LeaseTable';
+import { BeforeLease, LeaseTable, PeerChecks } from '../components/LeaseTable';
 import { useLive } from '../components/Live';
 import { ActionIcon } from '../components/icons';
 import { Readiness } from '../components/Readiness';
 import { IntentAction } from '../components/SelectionBar';
+import { PullNote } from '../components/PullNote';
 import { RelTime } from '../components/RelTime';
 import {
   Badge,
@@ -31,14 +32,28 @@ import {
   Th,
   cx,
 } from '../components/primitives';
-import { HostStateBadge, RolloutKindBadge, RolloutStateBadge, stageLabel } from '../components/status';
+import {
+  HostStateBadge,
+  memberStateLabel,
+  RolloutKindBadge,
+  RolloutStateBadge,
+  stageLabel,
+} from '../components/status';
 import { pauseLabel, percentOf, plural, QUEUE_PLACE_TITLE, queuePlace, shortRevision } from '../lib/format';
+import {
+  GATE_APPROVAL_HINT,
+  approvableAtGate,
+  gateApprovalNotes,
+  waitReasons,
+  waitsForApproval,
+} from '../lib/approvals';
 import { rolloutActionOf } from '../lib/hostActions';
 import {
   approveIntent,
   approveLeaseIntent,
   endLeaseIntent,
   hostsIntent,
+  ignoreBudgetIntent,
   ignoreGateIntent,
   scopeIntent,
 } from '../lib/intents';
@@ -60,14 +75,11 @@ export function policyText(rollout: Rollout): string {
       return `policy ${rollout.policy} (kind ${rollout.containerKind || 'other'})`;
     case 'default':
       return `policy ${rollout.policy} (default for images)`;
+    case 'deploy':
+      return `policy ${rollout.policy} (Ansible deploy)`;
     default:
       return `policy ${rollout.policy}`;
   }
-}
-
-/** waitsForApproval says whether a rollout waits for a person to approve it: its policy is manual. */
-export function waitsForApproval(rollout: Rollout): boolean {
-  return rollout.policy === 'manual' && !rollout.approved;
 }
 
 /**
@@ -262,7 +274,7 @@ const LEASE_ENDED: ReadonlySet<Lease['state']> = new Set(['released', 'failed', 
  * lease ended, when the page knows the lease.
  */
 function memberState(h: RolloutHost, leases: ReadonlyMap<string, Lease>): string {
-  if (h.state !== 'leased') return h.state;
+  if (h.state !== 'leased') return memberStateLabel(h.state, h.noWorse);
 
   const lease = h.leaseId ? leases.get(h.leaseId) : undefined;
   if (!lease) return 'leased when the rollout closed';
@@ -340,6 +352,12 @@ function hostProgress(
           {lease.operation && (
             <>
               , agent phase <span className="font-mono">{lease.operation.phase}</span>
+              {lease.operation.phase === 'pulling' && (
+                <>
+                  {' '}
+                  — <PullNote operation={lease.operation} />
+                </>
+              )}
             </>
           )}
           {lease.readiness && (
@@ -350,6 +368,7 @@ function hostProgress(
           )}
           {lease.approved && <span className="text-muted"> — approved by {lease.approved.by}</span>}
           <PeerChecks checks={lease.peerChecks} />
+          <BeforeLease lease={lease} />
         </span>
       );
     }
@@ -391,11 +410,10 @@ export function RolloutCard({
   const gate = useLive('plan').data?.gate;
   const all = useLive('rollouts').data;
   const titles = useMemo(() => new Map([...list(all?.open), ...list(all?.recent)].map(x => [x.id, x.title])), [all]);
-  // A member waits at the closed gate for this rollout: a person may let it pass.
-  const atGate =
-    !r.ignoreGate &&
-    !r.ignoreBudget &&
-    hosts.some(h => queue.get(h.host)?.wait === 'gate' && queue.get(h.host)?.rollout === r.id);
+  // A member waits at the closed gate, or for the budget, for this rollout: a person may let it pass.
+  const atGate = !r.ignoreGate && !r.ignoreBudget && waitReasons(r, queue, 'gate').length > 0;
+  const budgetReasons = r.ignoreBudget || atGate ? [] : waitReasons(r, queue, 'budget');
+  const gateApproval = approvableAtGate(r, queue);
   const hostAction = rolloutActionOf(r);
 
   return (
@@ -413,6 +431,11 @@ export function RolloutCard({
         {r.paused && <Badge tone="warning">{pauseLabel(r.pauseReason)}</Badge>}
         {waiting && <Badge tone="warning">waiting for approval</Badge>}
         {waiting && <span className="text-muted">{policyText(r)}</span>}
+        {gateApproval && (
+          <Badge tone="warning" title={GATE_APPROVAL_HINT}>
+            waiting at closed gate
+          </Badge>
+        )}
         {r.force && <Badge tone="warning">force</Badge>}
         {r.ignoreBudget && <Badge tone="danger">ignores budget</Badge>}
         {r.ignoreGate && !r.ignoreBudget && (
@@ -431,6 +454,14 @@ export function RolloutCard({
               intent={approveIntent(`Approve rollout: ${r.title}`, r.id, r.team, hostAction)}
             />
           )}
+          {gateApproval && (
+            <IntentAction
+              icon="check"
+              label="Approve…"
+              onAction={onAction}
+              intent={approveIntent(`Approve rollout: ${r.title}`, r.id, r.team, hostAction, gateApprovalNotes(gate))}
+            />
+          )}
           {atGate && (
             <IntentAction
               icon="action"
@@ -442,6 +473,20 @@ export function RolloutCard({
                 r.team,
                 hostAction,
                 list(gate?.reasons)
+              )}
+            />
+          )}
+          {budgetReasons.length > 0 && (
+            <IntentAction
+              icon="action"
+              label="Roll despite network state…"
+              onAction={onAction}
+              intent={ignoreBudgetIntent(
+                `Roll despite network state: ${r.title}`,
+                r.id,
+                r.team,
+                hostAction,
+                budgetReasons
               )}
             />
           )}
@@ -564,7 +609,7 @@ export function RolloutCard({
                       {held.get(h.host)}
                     </Badge>
                   ) : (
-                    <HostStateBadge state={h.state} />
+                    <HostStateBadge state={h.state} noWorse={h.noWorse} />
                   )}
                 </Td>
                 <Td className="min-w-48 whitespace-normal">

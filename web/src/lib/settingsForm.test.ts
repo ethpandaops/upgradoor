@@ -17,6 +17,7 @@ import {
   sameValue,
   toForm,
   validateField,
+  validateForm,
   valueText,
   type FieldSpec,
 } from './settingsForm';
@@ -62,6 +63,42 @@ describe('the readiness fields', () => {
   it('send 0 as a Go duration', () => {
     const form = { ...toForm(defaultSettings()), readyStableFor: '0' };
     expect(fromForm(form).readyStableFor).toBe('0s');
+  });
+});
+
+describe('the baseline grace and the pull limit', () => {
+  it('take a grace between ready stable for and the readiness timeout', () => {
+    const form = toForm(defaultSettings());
+    expect(form.baselineGrace).toBe('15m');
+    expect(validateForm(form).baselineGrace).toBeUndefined();
+
+    expect(validateForm({ ...form, baselineGrace: '45m' }).baselineGrace).toBe(
+      'must be between Ready stable for and Readiness timeout'
+    );
+    expect(validateForm({ ...form, baselineGrace: '30s' }).baselineGrace).toBe(
+      'must be between Ready stable for and Readiness timeout'
+    );
+    expect(validateForm({ ...form, baselineGrace: 'soon' }).baselineGrace).toBe(
+      'must be a duration like 30m, 90s or 1h30m'
+    );
+    expect(fromForm({ ...form, baselineGrace: '20m' }).baselineGrace).toBe('20m');
+  });
+
+  it('take 0 to 10000 pulls at once, 0 for no bound', () => {
+    const pulls = fieldSpec('maxConcurrentPulls');
+    for (const text of ['0', '10', '10000']) expect(validateField(pulls, text), text).toBeNull();
+    for (const text of ['-1', '10001', '2.5', '']) expect(validateField(pulls, text), text).not.toBeNull();
+    expect(fromForm({ ...toForm(defaultSettings()), maxConcurrentPulls: '0' }).maxConcurrentPulls).toBe(0);
+  });
+
+  it('sit next to the readiness timeout and the host limit', () => {
+    const keys = (id: string) => GROUPS.find(g => g.id === id)?.keys ?? [];
+    expect(keys('timeouts').slice(-2)).toEqual(['readinessTimeout', 'baselineGrace']);
+    expect(keys('limits')).toContain('maxConcurrentPulls');
+  });
+
+  it('find the setting a message names first', () => {
+    expect(errorField('baselineGrace must be between readyStableFor and readinessTimeout')).toBe('baselineGrace');
   });
 });
 

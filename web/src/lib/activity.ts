@@ -2,6 +2,7 @@
 // be served by themselves, and what is stuck until somebody acts.
 
 import { list, type Gate, type HostListing, type QueueEntry, type Rollout, type WaitKind } from '../api/types';
+import { GATE_APPROVAL_HINT, approvableAtGate } from './approvals';
 import { pauseLabel } from './format';
 
 type AttentionKind =
@@ -9,6 +10,7 @@ type AttentionKind =
   | 'paused'
   | 'halted'
   | 'approval'
+  | 'gate-approval'
   | 'rollout-paused'
   | 'held'
   | 'incompatible'
@@ -24,7 +26,7 @@ export interface AttentionItem {
   detail: string;
   /** The hosts that wait because of it. */
   hosts: string[];
-  /** The rollout to act on (halted, approval, rollout-paused). */
+  /** The rollout to act on (halted, approval, gate-approval, rollout-paused). */
   rollout?: Rollout;
 }
 
@@ -111,6 +113,22 @@ export function attentionItems(input: {
   for (const item of groups.values()) {
     const waits = `${waitingHosts(item.hosts.length)}.`;
     item.detail = item.detail ? `${item.detail}. ${waits}` : waits;
+  }
+
+  // An auto rollout at the closed gate rolls through it only once a person approves it.
+  const byHost = new Map(queue.map(q => [q.host, q]));
+  for (const rollout of input.rollouts) {
+    if (!approvableAtGate(rollout, byHost)) continue;
+    const hosts = queue.filter(q => q.wait === 'gate' && q.rollout === rollout.id).map(q => q.host);
+    items.push({
+      id: `gate-approval/${rollout.id}`,
+      kind: 'gate-approval',
+      tone: 'warning',
+      title: `${rollout.title} waits at the closed gate`,
+      detail: `${GATE_APPROVAL_HINT}. ${waitingHosts(hosts.length)}.`,
+      hosts,
+      rollout,
+    });
   }
 
   const held = hostsWaiting('held');

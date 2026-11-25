@@ -20,6 +20,7 @@ import { useLive } from '../components/Live';
 import { LeaseProgress } from '../components/LeaseProgress';
 import { useReadinessNote } from '../components/Readiness';
 import { IntentAction } from '../components/SelectionBar';
+import { pullNote } from '../components/PullNote';
 import { RelTime, useSharedNow } from '../components/RelTime';
 import { Timeline, TimelineLegend } from '../components/Timeline';
 import { Badge, Button, Card, ErrorBanner, Loading, Meter, Segmented, cx } from '../components/primitives';
@@ -27,6 +28,7 @@ import { WorkTag } from '../components/status';
 import { setKept } from '../hooks/useKept';
 import { useSlotHistory } from '../hooks/useSlotHistory';
 import { attentionItems, type AttentionItem } from '../lib/activity';
+import { gateApprovalNotes } from '../lib/approvals';
 import { formatPercent, percentOf, plural } from '../lib/format';
 import { rolloutActionOf } from '../lib/hostActions';
 import { approveIntent, holdIntent, hostsIntent, scopeIntent } from '../lib/intents';
@@ -229,7 +231,12 @@ export function OverviewTab({ onOpenTab }: { onOpenTab: (tab: 'hosts' | 'rollout
             ) : (
               <ul className="flex flex-col gap-3">
                 {attention.map(item => (
-                  <AttentionRow key={item.id} item={item} onAction={actions.request} />
+                  <AttentionRow
+                    key={item.id}
+                    item={item}
+                    gate={plan.data?.gate ?? gate.data}
+                    onAction={actions.request}
+                  />
                 ))}
               </ul>
             )}
@@ -476,10 +483,12 @@ function rolloutTitles(ids: readonly string[], rollouts: readonly Rollout[]): st
 function LeaseItem({ lease, rollouts }: { lease: Lease; rollouts: readonly Rollout[] }) {
   const title = rolloutTitles(Object.values(dict(lease.rollouts)), rollouts);
   const readiness = useReadinessNote(lease);
+  const pull = pullNote(lease.operation, useSharedNow());
   const note =
     lease.error ??
     lease.operation?.error ??
     readiness ??
+    (pull && [pull.text, pull.quiet].filter(Boolean).join(' · ')) ??
     (lease.operation ? undefined : 'Waiting for the agent to pick up the lease.');
 
   return (
@@ -548,7 +557,15 @@ function NextList({ entries, kindsOf }: { entries: readonly QueueEntry[]; kindsO
   );
 }
 
-function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (intent: ActionIntent) => void }) {
+function AttentionRow({
+  item,
+  gate,
+  onAction,
+}: {
+  item: AttentionItem;
+  gate: Gate | undefined;
+  onAction: (intent: ActionIntent) => void;
+}) {
   const r = item.rollout;
   let buttons: ReactNode = null;
 
@@ -560,6 +577,22 @@ function AttentionRow({ item, onAction }: { item: AttentionItem; onAction: (inte
           label="Approve…"
           onAction={onAction}
           intent={approveIntent(`Approve rollout: ${r.title}`, r.id, r.team, rolloutActionOf(r))}
+        />
+      );
+      break;
+    case 'gate-approval':
+      buttons = r && (
+        <IntentAction
+          icon="check"
+          label="Approve…"
+          onAction={onAction}
+          intent={approveIntent(
+            `Approve rollout: ${r.title}`,
+            r.id,
+            r.team,
+            rolloutActionOf(r),
+            gateApprovalNotes(gate)
+          )}
         />
       );
       break;

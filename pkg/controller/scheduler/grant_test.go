@@ -121,6 +121,39 @@ func TestClosedGatePassesOneHostWithoutLiveValidators(t *testing.T) {
 	}
 }
 
+// Nothing rolls through a closed gate by itself. A rollout a person approved
+// passes it one host at a time, in its order, whatever the budget would allow.
+func TestClosedGatePassesAnApprovedRolloutOneHostAtATime(t *testing.T) {
+	const closed = "network gate: finality lag 5 epochs > 3"
+
+	b := newWorldBuilder(t)
+	b.w.Settings.MaxUnavailablePercent = 100
+	b.w.Settings.MaxLeasedPercent = 100
+
+	for _, h := range []string{"a", "b", "c"} {
+		b.host(h, 10)
+		b.wants(h, packagesNeed("2.0"))
+	}
+
+	b.healthMod = func(n *fleet.NetworkHealth) { n.FinalityLagEpochs = 5 }
+	b.refreshHealth()
+
+	out := b.step()
+	assert.Empty(t, b.leasedHosts(), "an auto rollout that nobody approved waits")
+	assert.Equal(t, map[string]string{"a": closed, "b": closed, "c": closed}, queueReasons(out.Plan))
+	assert.Equal(t, WaitGate, out.Plan.Queue[0].Wait)
+
+	r := b.mustRollout(packagesKey("2.0"))
+	r.Approved = true
+
+	out = b.step()
+	assert.Equal(t, []string{"a"}, b.leasedHosts(), "the canary")
+	assert.Equal(t, map[string]string{"b": closed, "c": closed}, queueReasons(out.Plan))
+
+	b.serve("a")
+	assert.Len(t, b.leasedHosts(), 1, "one host at a time after the canary too")
+}
+
 func TestBudgetAdmit(t *testing.T) {
 	tests := []struct {
 		name   string
@@ -135,26 +168,36 @@ func TestBudgetAdmit(t *testing.T) {
 		},
 		{
 			name:   "one validator too many",
-			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 5, leased: 1, maxLeased: 3},
+			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 5, leased: 1, weighted: 1, maxLeased: 3},
 			cost:   6,
 			want:   "validators down: 5% now, 11% with this host, limit 10%",
 		},
 		{
-			name:   "heavy host goes alone when nothing is unavailable",
+			name:   "floor: heavy host goes when nothing is unavailable",
 			budget: budgetState{total: 100, percent: 10, allowed: 10, maxLeased: 1},
 			cost:   40,
 		},
 		{
-			name:   "heavy host waits while a host without validators holds a lease",
+			name:   "floor: heavy host goes while a host without validators holds a lease",
 			budget: budgetState{total: 100, percent: 10, allowed: 10, leased: 1, maxLeased: 3},
 			cost:   40,
-			want:   "validators down: 0% now, 40% with this host, limit 10%",
 		},
 		{
-			name:   "heavy host waits while one validator is down elsewhere",
-			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 1, maxLeased: 3},
+			name:   "floor: heavy host goes while validators elsewhere miss their duties",
+			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 33, maxLeased: 3},
+			cost:   40,
+		},
+		{
+			name:   "no floor while a host with validators holds a lease",
+			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 1, leased: 1, weighted: 1, maxLeased: 3},
 			cost:   40,
 			want:   "validators down: 1% now, 41% with this host, limit 10%",
+		},
+		{
+			name:   "the floor does not lift the host limit",
+			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 33, leased: 1, maxLeased: 1},
+			cost:   40,
+			want:   "hosts at once: 1 of 1 busy",
 		},
 		{
 			name:   "already-down host is free",
@@ -180,7 +223,7 @@ func TestBudgetAdmit(t *testing.T) {
 		},
 		{
 			name:   "budget is named before the host limit",
-			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 10, leased: 2, maxLeased: 2},
+			budget: budgetState{total: 100, percent: 10, allowed: 10, unavailable: 10, leased: 2, weighted: 2, maxLeased: 2},
 			cost:   1,
 			want:   "validators down: 10% now, 11% with this host, limit 10%",
 		},
@@ -191,7 +234,7 @@ func TestBudgetAdmit(t *testing.T) {
 		},
 		{
 			name:   "percent is rounded down in the reason",
-			budget: budgetState{total: 3, percent: 12.5, allowed: 0.375, unavailable: 1, maxLeased: 1},
+			budget: budgetState{total: 3, percent: 12.5, allowed: 0.375, unavailable: 1, leased: 1, weighted: 1, maxLeased: 2},
 			cost:   1,
 			want:   "validators down: 33.3% now, 66.7% with this host, limit 12.5%",
 		},
@@ -234,7 +277,9 @@ func TestBudgetFromWorld(t *testing.T) {
 		MaxIndependent:    1,
 	}, plan.Budget)
 	assert.Equal(t, HostPlan{Slot: SlotIdle, Weight: 7, Live: 7}, plan.Hosts["norow"])
-	assert.Equal(t, HostPlan{Slot: SlotIdle, Weight: 10, Live: 4, LiveKnown: true}, plan.Hosts["partial"])
+	assert.Equal(t, HostPlan{
+		Slot: SlotIdle, Weight: 10, Live: 4, LiveKnown: true, NotReady: "validators: 4 of 10 attesting",
+	}, plan.Hosts["partial"])
 	assert.Equal(t, SlotVerifying, plan.Hosts["leased"].Slot)
 }
 
@@ -272,13 +317,14 @@ func TestBudgetAlreadyDownHostIsFree(t *testing.T) {
 	b.host("up", 20)
 	b.host("idle", 60)
 	b.liveOverride["down"] = 0
-	b.wants("down", packagesNeed("2.0"))
-	b.wants("up", packagesNeed("2.0"))
+	b.wantsKind("down", protocol.KindVC, imgLighthouse, digestA)
+	b.wantsKind("up", protocol.KindVC, imgLighthouse, digestA)
 
 	out := b.step()
 
 	// 20 of 100 are down already, twice the 10 allowed. Rolling the host
-	// that is down costs nothing more.
+	// that is down costs nothing more; its validator client is what it is
+	// not ready for.
 	assert.Equal(t, []string{"down"}, b.leasedHosts())
 	assert.Equal(t, uint64(0), b.lease("down").Charged)
 	assert.Equal(t, uint64(20), b.lease("down").Weight)
@@ -324,8 +370,9 @@ func TestBudgetZeroMaxUnavailable(t *testing.T) {
 	assert.Equal(t, map[string]string{"val": "validators down: 0% now, 100% with this host, limit 0%"}, queueReasons(out.Plan))
 }
 
-// TestHostsThatCostNothingPassAFullBudget: in the rest, a host without
-// validators is served while a host with validators waits for the budget.
+// TestHostsThatCostNothingPassAFullBudget: in the rest, hosts without
+// validators are served first; the host with validators would have the floor
+// lease, but the host limit is full.
 func TestHostsThatCostNothingPassAFullBudget(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 50
@@ -346,7 +393,7 @@ func TestHostsThatCostNothingPassAFullBudget(t *testing.T) {
 
 	out := b.step()
 	assert.Equal(t, []string{"tool1", "tool2"}, b.leasedHosts())
-	assert.Equal(t, map[string]string{"heavy": "validators down: 20% now, 65% with this host, limit 50%"}, queueReasons(out.Plan))
+	assert.Equal(t, map[string]string{"heavy": "hosts at once: 2 of 2 busy"}, queueReasons(out.Plan))
 }
 
 func TestHostLimitBoundsHostsWithoutValidators(t *testing.T) {
@@ -674,11 +721,13 @@ func TestWaitingReasons(t *testing.T) {
 		{
 			name: "budget",
 			setup: func(b *worldBuilder) {
-				b.host("sick", 90)
-				b.live(b.w.Health.LivenessEpoch, "sick", 82) // 8 of 100 down
+				b.host("sick", 80)
+				b.live(b.w.Health.LivenessEpoch, "sick", 72) // 8 of 100 down
+				b.host("busy", 10)
+				b.held("busy") // no floor lease while it works
 				b.w.Settings.MinParticipationPercent = 50
 			},
-			want: "validators down: 8% now, 18% with this host, limit 10%",
+			want: "validators down: 18% now, 28% with this host, limit 10%",
 		},
 		{
 			name: "held wins over everything else",
@@ -791,19 +840,23 @@ func TestWaitingReasons(t *testing.T) {
 func TestWaitingReasonShowsTheNeedClosestToAGrant(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.PolicyReboot = fleet.PolicyManual
-	b.host("other", 90)
+	b.host("other", 80)
+	b.host("busy", 10)
 	b.host("h", 10)
-	b.live(b.w.Health.LivenessEpoch, "other", 82)
+	b.live(b.w.Health.LivenessEpoch, "other", 72)
+	b.held("busy")
 	b.w.Settings.MinParticipationPercent = 50
 	b.wants("h", rebootNeed(), packagesNeed("2.0"))
 
 	out := b.step()
 
 	// The reboot waits for approval, the packages for the budget: the host
-	// is told about the budget.
-	assert.Equal(t, "validators down: 8% now, 18% with this host, limit 10%", queueReasons(out.Plan)["h"])
+	// is told about the budget, and about the rollout that waits for it.
+	assert.Equal(t, "validators down: 18% now, 28% with this host, limit 10%", queueReasons(out.Plan)["h"])
+	require.Len(t, out.Plan.Queue, 1)
 	assert.Len(t, out.Plan.Queue[0].Rollouts, 2)
-	assert.Empty(t, out.Plan.Queue[0].Rollout, "the budget is about no rollout")
+	assert.Equal(t, WaitBudget, out.Plan.Queue[0].Wait)
+	assert.Equal(t, b.mustRollout(packagesKey("2.0")).ID, out.Plan.Queue[0].Rollout)
 }
 
 // A host in two rollouts waits for one thing; the plan names the rollout
@@ -1294,6 +1347,39 @@ func TestValidatorsWithoutDutyCountForNothing(t *testing.T) {
 		assert.Empty(t, b.leasedHosts())
 		assert.Equal(t, "network gate: finality lag 5 epochs > 3", queueReasons(out.Plan)["exited"])
 	})
+}
+
+// An Ansible deploy rolls without approval whatever the image policies say,
+// but not through a closed gate: there it waits for a person like any auto
+// rollout.
+func TestDeployIsAutoButWaitsAtAClosedGate(t *testing.T) {
+	const closed = "network gate: finality lag 5 epochs > 3"
+
+	b := newWorldBuilder(t)
+	b.w.Settings.MaxUnavailablePercent = 100
+	b.w.Settings.MaxLeasedPercent = 100
+	b.w.Settings.PolicyImage = fleet.PolicyManual
+	b.w.Settings.PolicyClients = fleet.ClientPolicies{"geth": fleet.PolicyManual, "besu": fleet.PolicyManual}
+	b.host("a", 10)
+	b.host("b", 10)
+	b.deploysInGroup("a", "geth", protocol.KindEL, "geth", imgGeth, digestA)
+
+	b.step()
+	assert.NotNil(t, b.lease("a"), "no approval under the manual image policy")
+	assert.False(t, b.openGroup(protocol.KindEL, "geth").Approved)
+
+	b.healthMod = func(n *fleet.NetworkHealth) { n.FinalityLagEpochs = 5 }
+	b.refreshHealth()
+	b.deploysInGroup("b", "besu", protocol.KindEL, "besu", "hyperledger/besu:develop", digestA)
+
+	out := b.step()
+	assert.Nil(t, b.lease("b"))
+	assert.Equal(t, closed, queueReasons(out.Plan)["b"])
+
+	b.serve("a")
+	b.openGroup(protocol.KindEL, "besu").Approved = true
+	b.step()
+	assert.NotNil(t, b.lease("b"), "approved, it passes the closed gate")
 }
 
 // An image rollout waits for approval by the policy of its team, else of its

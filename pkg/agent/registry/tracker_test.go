@@ -54,7 +54,9 @@ func (h *fakeImages) LocalImage(_ context.Context, ref string) (digest, revision
 	return h.local[ref], revisionOf(h.local[ref]), nil
 }
 
-func (h *fakeImages) Pull(ctx context.Context, ref string) (digest, revision string, err error) {
+func (h *fakeImages) Pull(
+	ctx context.Context, ref string, _ func(*protocol.PullProgress),
+) (digest, revision string, err error) {
 	h.mu.Lock()
 	h.pulls++
 	block := h.pullBlock

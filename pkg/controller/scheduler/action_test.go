@@ -189,6 +189,79 @@ func TestIgnoreGateAction(t *testing.T) {
 	require.ErrorIs(t, err, ErrUnknownRollout)
 }
 
+// A person lets a rollout that waits for the budget pass it: the flag is
+// stored and audited, and the host that waited is granted.
+func TestIgnoreBudgetAction(t *testing.T) {
+	h := newHarness(t)
+	h.addHost("idle", 80)
+	h.addHost("a", 10, packagesNeed("2.0"))
+	h.addHost("b", 10, packagesNeed("3.0"))
+	h.advance(time.Second)
+	h.tick()
+
+	// One host has the floor lease; the other waits for the budget.
+	plan := h.svc.Plan()
+	require.Len(t, plan.Queue, 1)
+
+	wait := plan.Queue[0]
+	require.Equal(t, WaitBudget, wait.Wait)
+	require.NotEmpty(t, wait.Rollout)
+
+	res, err := h.svc.IgnoreBudget(h.ctx, "alice", ScopeRequest{Rollout: wait.Rollout, Reason: "fix for the outage"})
+	require.NoError(t, err)
+	assert.Equal(t, wait.Rollout, res.Rollout)
+	assert.True(t, h.rollout(wait.Rollout).IgnoreBudget)
+
+	entry := h.store.lastAuditOf("action.ignore-budget")
+	assert.Equal(t, "alice", entry.Actor)
+	assert.Equal(t, map[string]any{
+		keyBefore: map[string]any{keyIgnoreBudget: false},
+		keyAfter:  map[string]any{keyIgnoreBudget: true},
+		keyReason: "fix for the outage",
+	}, entry.Detail)
+
+	_, err = h.svc.IgnoreBudget(h.ctx, "bob", ScopeRequest{Rollout: wait.Rollout})
+	require.NoError(t, err)
+	assert.Equal(t, 1, h.audited("action.ignore-budget"))
+
+	h.tick()
+	assert.NotNil(t, h.assignment(wait.Host).Lease)
+
+	_, err = h.svc.IgnoreBudget(h.ctx, "alice", ScopeRequest{Rollout: "nope"})
+	require.ErrorIs(t, err, ErrUnknownRollout)
+}
+
+// While the gate is closed, resume approves a rollout whatever its policy
+// (unless it only lifts a pause); approved, it passes the gate one host at a
+// time.
+func TestResumeApprovesAtAClosedGate(t *testing.T) {
+	h := newHarness(t)
+	h.addHost("a", 0, packagesNeed("2.0"))
+	h.addHost("b", 0, packagesNeed("2.0"))
+	h.health.FinalityLagEpochs = 5
+	h.tick()
+
+	id := h.openRollouts()[0].ID
+	assert.Equal(t, WaitGate, h.svc.Plan().Queue[0].Wait)
+	assert.Equal(t, id, h.svc.Plan().Queue[0].Rollout)
+
+	_, err := h.svc.Pause(h.ctx, "alice", ScopeRequest{Rollout: id})
+	require.NoError(t, err)
+
+	res, err := h.svc.Resume(h.ctx, "alice", ScopeRequest{Rollout: id})
+	require.NoError(t, err)
+	assert.Equal(t, "rollout resumed", res.Message)
+	assert.False(t, h.rollout(id).Approved, "lifting a pause approves nothing")
+
+	res, err = h.svc.Resume(h.ctx, "alice", ScopeRequest{Rollout: id})
+	require.NoError(t, err)
+	assert.Equal(t, "rollout approved", res.Message)
+	assert.True(t, h.rollout(id).Approved)
+
+	h.tick()
+	assert.Len(t, h.leased(), 1, "one host at a time")
+}
+
 // A person approves a verifying lease: it is released in the next reconcile
 // without waiting for readiness, and its host counts as the canary's success.
 // Only a verifying lease of a member can be approved.
@@ -260,6 +333,8 @@ func TestRetryAfterAnEndedLeaseRechecksReadiness(t *testing.T) {
 	assert.True(t, recheck.Recheck)
 	assert.Equal(t, fleet.LeaseVerifying, recheck.State)
 	assert.Equal(t, h.lease(lease).Needs, recheck.Needs)
+	require.NotNil(t, h.lease(lease).Baseline)
+	assert.Equal(t, h.lease(lease).Baseline, recheck.Baseline, "judged against the host as it was before")
 	assert.Nil(t, h.assignment("a").Lease, "the agent is not offered a recheck")
 	assert.Equal(t, true, h.store.lastAuditOf("lease.granted").Detail["recheck"])
 

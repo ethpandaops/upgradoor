@@ -160,10 +160,12 @@ func encodeSync(in *HostSync) (roles string, status sql.NullString, hash string,
 		return roles, status, "", nil
 	}
 
-	// The hash leaves out the fields that change on every sync.
+	// The hash leaves out the fields that change on every sync, and the
+	// progress of a pull, which the scheduler's next tick takes over.
 	steady := *in.Request
 	steady.SentAt, steady.UptimeSeconds = time.Time{}, 0
 	steady.Node = steadyNode(in.Request.Node)
+	steady.Operation = steadyOperation(in.Request.Operation)
 
 	raw, err = json.Marshal(&steady)
 	if err != nil {
@@ -203,6 +205,19 @@ func steadyNode(n protocol.NodeHealth) protocol.NodeHealth {
 	}
 
 	return out
+}
+
+// steadyOperation is the operation without its update time and pull
+// progress: a pull reports progress every half minute for as long as it runs.
+func steadyOperation(op *protocol.Operation) *protocol.Operation {
+	if op == nil {
+		return nil
+	}
+
+	out := *op
+	out.UpdatedAt, out.Pull = time.Time{}, nil
+
+	return &out
 }
 
 // GetHost returns one host or ErrNotFound.

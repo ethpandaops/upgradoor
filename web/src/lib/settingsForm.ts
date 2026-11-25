@@ -174,6 +174,24 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: 'How long to wait for readiness after the agent reports done before the slot has failed.',
   },
   {
+    key: 'baselineGrace',
+    label: 'Baseline grace',
+    kind: 'duration',
+    min: 0,
+    range: 'a duration like 15m, from Ready stable for to Readiness timeout',
+    hint: 'How long a host that was not ready before its lease waits for the full readiness check before it is released as no worse than before.',
+  },
+  {
+    key: 'maxConcurrentPulls',
+    label: 'Max image pulls',
+    kind: 'count',
+    unit: 'leases',
+    min: 0,
+    max: 10_000,
+    range: '0 to 10000; 0 is no bound',
+    hint: 'Leases with image work granted or pulling at once; 0 is no bound.',
+  },
+  {
     key: 'leaseTtl',
     label: 'Lease TTL',
     kind: 'duration',
@@ -295,7 +313,13 @@ export const GROUPS: readonly GroupSpec[] = [
     id: 'limits',
     title: 'Budget and network gate',
     about: 'How much of the fleet may be down at once, and when the network is healthy enough to take a host down.',
-    keys: ['maxUnavailablePercent', 'maxLeasedPercent', 'minParticipationPercent', 'maxFinalityLagEpochs'],
+    keys: [
+      'maxUnavailablePercent',
+      'maxLeasedPercent',
+      'maxConcurrentPulls',
+      'minParticipationPercent',
+      'maxFinalityLagEpochs',
+    ],
   },
   {
     id: 'readiness',
@@ -307,7 +331,7 @@ export const GROUPS: readonly GroupSpec[] = [
     id: 'timeouts',
     title: 'Timeouts',
     about: 'How long the scheduler waits for an agent, and for a host to become ready.',
-    keys: ['leaseTtl', 'hostStaleAfter', 'readinessTimeout'],
+    keys: ['leaseTtl', 'hostStaleAfter', 'readinessTimeout', 'baselineGrace'],
   },
 ];
 
@@ -377,13 +401,17 @@ export function parsePolicies(text: string): Record<string, Policy> | undefined 
 
 /**
  * errorField finds the setting a validation error of the controller is about:
- * its messages start with the setting's name ("minPeers must be at least 1").
+ * its messages start with the setting's name ("minPeers must be at least 1"),
+ * other settings may follow.
  */
 export function errorField(message: string): SettingKey | undefined {
   const text = message.toLowerCase();
-  return [...FIELDS]
-    .sort((a, b) => b.key.length - a.key.length)
-    .find(f => new RegExp(`(^|[^a-z])${f.key.toLowerCase()}([^a-z]|$)`).test(text))?.key;
+  let best: { key: SettingKey; at: number } | undefined;
+  for (const f of FIELDS) {
+    const at = text.search(new RegExp(`(^|[^a-z])${f.key.toLowerCase()}([^a-z]|$)`));
+    if (at >= 0 && (!best || at < best.at)) best = { key: f.key, at };
+  }
+  return best?.key;
 }
 
 /** SettingsForm holds every field as the text (or switch state) shown in its input. */
@@ -452,13 +480,22 @@ export function validateField(spec: FieldSpec, raw: string): string | null {
 
 type FormErrors = Partial<Record<SettingKey, string>>;
 
-/** validateForm returns the problems of every field, keyed by setting. */
+/** validateForm returns the problems of every field, keyed by setting; baselineGrace also against its neighbours. */
 export function validateForm(form: SettingsForm): FormErrors {
   const errors: FormErrors = {};
   for (const f of FIELDS) {
     const err = validateField(f, form[f.key]);
     if (err) errors[f.key] = err;
   }
+
+  const grace = parseGoDuration(form.baselineGrace);
+  const stable = parseGoDuration(form.readyStableFor);
+  const timeout = parseGoDuration(form.readinessTimeout);
+  if (!errors.baselineGrace && grace !== null && stable !== null && timeout !== null) {
+    if (grace < stable || grace > timeout)
+      errors.baselineGrace = 'must be between Ready stable for and Readiness timeout';
+  }
+
   return errors;
 }
 
@@ -478,6 +515,8 @@ export function fromForm(form: SettingsForm): FormSettings {
     leaseTtl: duration('leaseTtl'),
     hostStaleAfter: duration('hostStaleAfter'),
     readinessTimeout: duration('readinessTimeout'),
+    baselineGrace: duration('baselineGrace'),
+    maxConcurrentPulls: Number(form.maxConcurrentPulls),
     policyImage: form.policyImage as Policy,
     policyPackages: form.policyPackages as Policy,
     policyReboot: form.policyReboot as Policy,

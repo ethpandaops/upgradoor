@@ -1,4 +1,4 @@
-import { list, type Lease, type Need, type PeerCheck } from '../api/types';
+import { list, type Lease, type LeaseBaseline, type Need, type PeerCheck } from '../api/types';
 import { formatDuration, secondsBetween } from '../lib/format';
 import { endLeaseIntent } from '../lib/intents';
 import { RunExit, RunOutput } from './ActionRun';
@@ -7,7 +7,8 @@ import { ActionIcon } from './icons';
 import { Readiness } from './Readiness';
 import { RelTime } from './RelTime';
 import { Badge, Dash, Table, Td, Th } from './primitives';
-import { LeaseStateBadge, StepBadge, needSummary } from './status';
+import { PullNote } from './PullNote';
+import { LeaseOutcomeBadge, LeaseStateBadge, StepBadge, needSummary } from './status';
 
 function stepLabel(needs: readonly Need[], needId: string): string {
   const need = needs.find(n => n.id === needId);
@@ -35,6 +36,63 @@ export function PeerChecks({ checks }: { checks: readonly PeerCheck[] | undefine
           {c.layer} {c.peers} peers, fleet median {c.median}, needs {c.needs}
         </span>
       ))}
+    </span>
+  );
+}
+
+/**
+ * baselineFacts sums up the node of a lease's baseline in short parts: each
+ * client (reachable, syncing, head and peers), the unhealthy probes, the
+ * validators that attested, the containers that were not running or had
+ * restarted, and a client below the fleet's peer count.
+ */
+export function baselineFacts(b: LeaseBaseline): string[] {
+  const out: string[] = [];
+  const { el, cl } = b.node;
+
+  if (el) {
+    if (!el.reachable) out.push('EL not reachable');
+    else out.push(`EL ${el.syncing ? 'syncing, ' : ''}head ${el.head}, ${el.peers} peers`);
+  }
+  if (cl) {
+    if (!cl.reachable) out.push('CL not reachable');
+    else if (cl.elOffline) out.push('CL reports its EL offline');
+    else out.push(`CL ${cl.syncing ? 'syncing, ' : ''}slot ${cl.headSlot}, ${cl.peers} peers`);
+  }
+  for (const p of list(b.node.probes)) {
+    if (!p.healthy) out.push(`${p.kind} not healthy`);
+  }
+  if (b.duty > 0 && b.liveKnown) out.push(`validators ${b.live} of ${b.duty} attesting`);
+  for (const c of list(b.containers)) {
+    if (c.state === 'running' && c.restartCount === 0) continue;
+    out.push(`${c.name} ${c.state}${c.restartCount > 0 ? `, ${c.restartCount} restarts` : ''}`);
+  }
+  if (b.belowFleet) out.push(b.belowFleet);
+
+  return out;
+}
+
+/** BaselineState says whether the host was ready before its lease; for one that was not, why and how its node was. */
+export function BaselineState({ baseline: b }: { baseline: LeaseBaseline }) {
+  if (!b.unready) return <span>ready</span>;
+
+  const facts = baselineFacts(b);
+  return (
+    <span>
+      <span className="text-warning">not ready — {b.unready}</span>
+      {b.root && <span className="text-muted"> (root {b.root})</span>}
+      {facts.length > 0 && <span className="text-muted"> · {facts.join(' · ')}</span>}
+    </span>
+  );
+}
+
+/** BeforeLease is the line under a lease's readiness that says how the host was when the lease was granted. */
+export function BeforeLease({ lease }: { lease: Pick<Lease, 'baseline'> }) {
+  if (!lease.baseline) return null;
+
+  return (
+    <span className="block text-muted" aria-label="Before the lease">
+      Before the lease: <BaselineState baseline={lease.baseline} />
     </span>
   );
 }
@@ -96,6 +154,7 @@ export function LeaseTable({
               <Td className="min-w-28">
                 <span className="inline-flex items-center gap-1">
                   <LeaseStateBadge state={l.state} />
+                  <LeaseOutcomeBadge outcome={l.outcome} />
                   {l.force && <Badge tone="warning">force</Badge>}
                   {ending && <span className="text-muted">ending (cancelled by {l.cancelled?.by})</span>}
                 </span>
@@ -141,10 +200,13 @@ export function LeaseTable({
                   <span className="text-danger">{l.operation.error}</span>
                 ) : l.readiness ? (
                   <Readiness lease={l} />
+                ) : l.operation?.phase === 'pulling' ? (
+                  <PullNote operation={l.operation} />
                 ) : (
                   <Dash />
                 )}
                 <PeerChecks checks={l.peerChecks} />
+                <BeforeLease lease={l} />
               </Td>
               <Td className="font-mono" title={`weight ${l.weight}, charged ${l.charged}`}>
                 {l.charged}/{l.weight}

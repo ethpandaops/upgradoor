@@ -848,6 +848,7 @@ type planKey struct {
 	liveKnown    bool
 	leaseID      string
 	reason       string
+	notReady     string
 }
 
 // holdRequestsKey is the hold requests of a host's plan in a row key.
@@ -885,7 +886,7 @@ func addHosts(
 			stale: sum.Stale, boot: wireBoot(sum, boots),
 			plan: planKey{
 				slot: sum.Plan.Slot, weight: sum.Plan.Weight, live: sum.Plan.Live, liveKnown: sum.Plan.LiveKnown,
-				leaseID: sum.Plan.LeaseID, reason: sum.Plan.Reason,
+				leaseID: sum.Plan.LeaseID, reason: sum.Plan.Reason, notReady: sum.Plan.NotReady,
 			},
 			holdRequests: holdRequestsKey(sum.Plan.HoldRequests), unplanned: !planned(sum.Name),
 		}

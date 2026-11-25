@@ -133,6 +133,7 @@ export function matchesFilter(row: HostRow, filter: string): boolean {
     ...(row.summary ? hostOwners(row.summary) : []),
     row.summary ? (hostState(row)?.label ?? 'up to date') : undefined,
     row.summary?.plan.reason,
+    row.summary?.plan.notReady ? `not ready ${row.summary.plan.notReady}` : undefined,
     row.summary?.hold.local ? 'local hold' : undefined,
     row.updatePending ? 'pending' : undefined,
   ]

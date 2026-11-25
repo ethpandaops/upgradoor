@@ -135,7 +135,15 @@ func storedLease(l *fleet.Lease) *fleet.Lease {
 	bare.AgentDoneAt = storedAtPtr(bare.AgentDoneAt)
 	bare.SyncedSince = storedAtPtr(bare.SyncedSince)
 	bare.SyncedUntil = storedAtPtr(bare.SyncedUntil)
+	bare.NoWorseSince = storedAtPtr(bare.NoWorseSince)
+	bare.NoWorseUntil = storedAtPtr(bare.NoWorseUntil)
 	bare.EndedAt = storedAtPtr(bare.EndedAt)
+
+	if l.Baseline != nil {
+		b := *l.Baseline
+		b.At = storedAt(b.At)
+		bare.Baseline = &b
+	}
 
 	if l.Cancelled != nil {
 		c := *l.Cancelled
@@ -1314,6 +1322,23 @@ func (b *worldBuilder) wantsImage(host, image, to string) {
 	name := "c-" + image
 	h.Status.Containers = append(h.Status.Containers, container(name, image, digestOld, to, b.w.Now))
 	h.Status.Needs = append(h.Status.Needs, imageNeed(name, image, to))
+}
+
+// wantsKind is wantsImage for a container of a real kind (el, cl, vc).
+func (b *worldBuilder) wantsKind(host string, kind protocol.ContainerKind, image, to string) {
+	h := b.get(host)
+	name := "c-" + string(kind)
+	c := container(name, image, digestOld, to, b.w.Now)
+	c.Kind = kind
+	n := imageNeed(name, image, to)
+	n.Image.Kind = kind
+	h.Status.Containers = append(h.Status.Containers, c)
+	h.Status.Needs = append(h.Status.Needs, n)
+}
+
+// kindKey is the key of the group rollout of wantsKind.
+func kindKey(kind protocol.ContainerKind, image, digest string) string {
+	return groupKey(kind, "", []fleet.RolloutTarget{{Image: image, Digest: digest}})
 }
 
 func (b *worldBuilder) wants(host string, needs ...protocol.Need) {

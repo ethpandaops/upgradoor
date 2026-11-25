@@ -95,13 +95,13 @@ func TestRuntime(t *testing.T) {
 	assert.Equal(t, "sha256:aaa", h.Container("geth").Digest)
 
 	// Pulling moves the local tag only.
-	pulled, revision, err := h.Pull(ctx, "ethpandaops/geth:master")
+	pulled, revision, err := h.Pull(ctx, "ethpandaops/geth:master", nil)
 	require.NoError(t, err)
 	assert.Equal(t, "sha256:ddd", pulled)
 	assert.Equal(t, "r2", revision, "the revision comes with the pulled image")
 	assert.Equal(t, "sha256:aaa", h.Container("geth").Digest)
 
-	_, _, err = h.Pull(ctx, "nobody/nothing")
+	_, _, err = h.Pull(ctx, "nobody/nothing", nil)
 	require.Error(t, err)
 
 	before := h.Container("geth")
@@ -124,7 +124,7 @@ func TestRuntime(t *testing.T) {
 	assert.Nil(t, h.Container("nimbus"))
 
 	// A recreate onto an override writes image, command and override labels.
-	_, _, err = h.Pull(ctx, "ethpandaops/geth:fix")
+	_, _, err = h.Pull(ctx, "ethpandaops/geth:fix", nil)
 	require.NoError(t, err)
 	require.NoError(t, h.Recreate(ctx, "geth", "sha256:fff", time.Second, true, &host.Change{
 		Image: "ethpandaops/geth:fix", Command: []string{"--http", "--v"}, SetCommand: true,

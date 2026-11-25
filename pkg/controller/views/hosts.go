@@ -231,7 +231,7 @@ func (v *Views) Rollouts(ctx context.Context, limit int) (*Rollouts, error) {
 	view := func(r *fleet.Rollout) *RolloutView {
 		out := &RolloutView{Rollout: *r, Policy: settings.RolloutPolicy(r)}
 		if r.Kind == fleet.RolloutGroup {
-			_, out.PolicySource = settings.ImagePolicy(r.Team, r.ContainerKind)
+			_, out.PolicySource = settings.GroupPolicy(r)
 		}
 
 		return out

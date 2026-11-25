@@ -58,7 +58,28 @@ func TestSettingsDefaultsAndValidation(t *testing.T) {
 	}
 
 	s.ReadyStableFor = Duration(MaxReadyStableFor)
+	require.EqualError(t, s.Validate(), "baselineGrace must be between readyStableFor and readinessTimeout",
+		"the grace is shorter than the run of healthy syncs")
+
+	s.BaselineGrace = s.ReadyStableFor
 	require.NoError(t, s.Validate())
+
+	s.BaselineGrace = s.ReadinessTimeout + 1
+	require.EqualError(t, s.Validate(), "baselineGrace must be between readyStableFor and readinessTimeout")
+
+	s.BaselineGrace = s.ReadinessTimeout
+	require.NoError(t, s.Validate())
+
+	assert.Equal(t, 15*time.Minute, DefaultSettings().BaselineGrace.Std())
+	assert.Equal(t, 10, DefaultSettings().MaxConcurrentPulls)
+
+	for _, v := range []int{-1, MaxConcurrentPulls + 1} {
+		s.MaxConcurrentPulls = v
+		require.EqualError(t, s.Validate(), "maxConcurrentPulls must be between 0 and 10000", "%d", v)
+	}
+
+	s.MaxConcurrentPulls = 0
+	require.NoError(t, s.Validate(), "0: no bound")
 
 	s.MinPeers = 0
 	require.EqualError(t, s.Validate(), "minPeers must be at least 1")
@@ -140,6 +161,36 @@ func TestSettingsClientPolicies(t *testing.T) {
 
 	s.PolicyClients = ClientPolicies{"geth": "sometimes"}
 	require.ErrorContains(t, s.Validate(), "invalid policy")
+}
+
+// An image rollout of Ansible deploys only is auto whatever the image
+// policies say; one with a tag that moved answers to them.
+func TestSettingsGroupPolicy(t *testing.T) {
+	s := DefaultSettings()
+	s.PolicyClients = ClientPolicies{"geth": PolicyManual}
+
+	deploy := RolloutTarget{Image: "geth:v1", Digest: "sha256:a", Spec: "k1"}
+	moved := RolloutTarget{Image: "geth:v1", Digest: "sha256:b"}
+
+	for _, tt := range []struct {
+		name    string
+		targets []RolloutTarget
+		policy  Policy
+		source  PolicySource
+	}{
+		{"all deploys: auto", []RolloutTarget{deploy, deploy}, PolicyAuto, PolicySourceDeploy},
+		{"a deploy and a moved tag: the image policy", []RolloutTarget{deploy, moved}, PolicyManual, PolicySourceClient},
+		{"moved tags only: the image policy", []RolloutTarget{moved}, PolicyManual, PolicySourceClient},
+		{"no targets: the image policy", nil, PolicyManual, PolicySourceClient},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &Rollout{Kind: RolloutGroup, ContainerKind: protocol.KindEL, Team: "geth", Targets: tt.targets}
+			p, src := s.GroupPolicy(r)
+			assert.Equal(t, tt.policy, p)
+			assert.Equal(t, tt.source, src)
+			assert.Equal(t, tt.policy, s.RolloutPolicy(r))
+		})
+	}
 }
 
 func TestSettingsKindPolicies(t *testing.T) {

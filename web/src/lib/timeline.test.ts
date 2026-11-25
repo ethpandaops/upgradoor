@@ -11,6 +11,7 @@ describe('wait kinds', () => {
   it('tells the waits that clear by themselves from the others', () => {
     expect(clearsByItself('budget')).toBe(true);
     expect(clearsByItself('order')).toBe(true);
+    expect(clearsByItself('pulls')).toBe(true);
     // The agent lets a failed pull be tried again by itself.
     expect(clearsByItself('pull')).toBe(true);
     expect(clearsByItself('gate')).toBe(false);

@@ -18,7 +18,7 @@ export const FEATURE = {
   details: 'details',
   /**
    * manage: roll, reboot, hold, unhold, mark-offline, unmark-offline, skip, retry, end-lease, client-policy, the
-   * decisions on one rollout (pause, resume, ignore-gate, approve-lease, abort), the image refresh, the flags force
+   * decisions on one rollout (pause, resume, ignore-gate, ignore-budget, approve-lease, abort), the image refresh, the flags force
    * and ignoreBudget, the selector all, a roll now, and a host action that names no feature. Twin team_manage: the
    * same on what a team of the login owns (its containers, rollouts, leases and members that only roll them, its
    * client, its own hold); never reboot, mark-offline, unmark-offline or the image refresh.
@@ -194,6 +194,7 @@ function requirement(call: Exclude<PermissionCall, { action: 'host-action' }>): 
     case 'pause':
     case 'resume':
     case 'ignore-gate':
+    case 'ignore-budget':
     case 'approve-lease':
       // Without a rollout it is the global switch.
       return call.body.rollout === ''
@@ -453,12 +454,15 @@ export function can(login: Login, call: PermissionCall, ownership: Ownership): V
   return featureVerdict(login, call, ownership);
 }
 
-/** ApprovalCall is a person's decision on one rollout: resume (which approves), ignore-gate, approve-lease. */
-type ApprovalCall = Extract<PermissionCall, { action: 'resume' | 'ignore-gate' | 'approve-lease' }>;
+/** ApprovalCall is a person's decision on one rollout: resume (which approves), ignore-gate, ignore-budget, approve-lease. */
+type ApprovalCall = Extract<PermissionCall, { action: 'resume' | 'ignore-gate' | 'ignore-budget' | 'approve-lease' }>;
 
 function isApproval(call: PermissionCall): call is ApprovalCall {
   return (
-    (call.action === 'resume' || call.action === 'ignore-gate' || call.action === 'approve-lease') &&
+    (call.action === 'resume' ||
+      call.action === 'ignore-gate' ||
+      call.action === 'ignore-budget' ||
+      call.action === 'approve-lease') &&
     call.body.rollout !== ''
   );
 }

@@ -14,7 +14,7 @@ import (
 
 const (
 	// insertBatchRows is how many rows one multi-row INSERT carries. With at
-	// most 8 columns that stays far below SQLite's bound-parameter limit.
+	// most 11 columns that stays far below SQLite's bound-parameter limit.
 	insertBatchRows = 250
 
 	// DefaultPackageSearchLimit is the number of package names

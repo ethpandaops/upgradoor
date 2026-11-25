@@ -663,7 +663,7 @@ func TestIntegrationLabels(t *testing.T) {
 	ref := env.repoRef("labels")
 	env.publish(t, ref, variantEntryOne)
 
-	_, _, err := r.Pull(ctx, ref)
+	_, _, err := r.Pull(ctx, ref, nil)
 	require.NoError(t, err)
 
 	timeout := 42

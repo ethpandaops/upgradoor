@@ -493,6 +493,12 @@ func (r *Record) clone() *Record {
 	out := *r
 	out.Lease.Needs = plan.CloneNeeds(r.Lease.Needs)
 	out.Operation.Steps = slices.Clone(r.Operation.Steps)
+
+	if r.Operation.Pull != nil {
+		pull := *r.Operation.Pull
+		out.Operation.Pull = &pull
+	}
+
 	out.WasRunning = slices.Clone(r.WasRunning)
 	out.Touched = slices.Clone(r.Touched)
 

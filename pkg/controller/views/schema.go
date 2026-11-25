@@ -40,6 +40,7 @@
 //	POST /api/v1/actions/forget        user     scheduler.HoldRequest         -> scheduler.ActionResult
 //	POST /api/v1/actions/end-lease     user     scheduler.EndLeaseRequest     -> scheduler.ActionResult
 //	POST /api/v1/actions/ignore-gate   user     scheduler.ScopeRequest        -> scheduler.ActionResult
+//	POST /api/v1/actions/ignore-budget user     scheduler.ScopeRequest        -> scheduler.ActionResult
 //	POST /api/v1/actions/approve-lease user     scheduler.ApproveLeaseRequest -> scheduler.ActionResult
 //
 //	GET  /metrics                      Prometheus
@@ -287,8 +288,8 @@ type RolloutView struct {
 	// Policy is the policy the rollout answers to
 	// (fleet.Settings.RolloutPolicy): manual waits for a person's approval.
 	Policy fleet.Policy `json:"policy"`
-	// PolicySource is the setting that decided Policy of an image rollout
-	// (fleet.Settings.ImagePolicy); empty for every other rollout.
+	// PolicySource is what decided Policy of an image rollout
+	// (fleet.Settings.GroupPolicy); empty for every other rollout.
 	PolicySource fleet.PolicySource `json:"policySource,omitempty"`
 }
 

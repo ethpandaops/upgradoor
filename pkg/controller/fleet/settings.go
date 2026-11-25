@@ -94,6 +94,14 @@ type Settings struct {
 	// ReadinessTimeout is how long the controller waits for readiness after
 	// the agent reports done before it declares the slot failed.
 	ReadinessTimeout Duration `json:"readinessTimeout"`
+	// BaselineGrace is how long after its operation a host that was not ready
+	// before its lease waits for the full readiness check before it is
+	// released as no worse than before. Between ReadyStableFor and
+	// ReadinessTimeout.
+	BaselineGrace Duration `json:"baselineGrace"`
+	// MaxConcurrentPulls bounds the leases with image work that are granted
+	// or pulling at once; 0 is no bound.
+	MaxConcurrentPulls int `json:"maxConcurrentPulls"`
 
 	PolicyImage    Policy `json:"policyImage"`
 	PolicyPackages Policy `json:"policyPackages"`
@@ -148,6 +156,8 @@ func DefaultSettings() Settings {
 		LeaseTTL:                Duration(30 * time.Minute),
 		HostStaleAfter:          Duration(2 * time.Minute),
 		ReadinessTimeout:        Duration(30 * time.Minute),
+		BaselineGrace:           Duration(15 * time.Minute),
+		MaxConcurrentPulls:      10,
 		PolicyImage:             PolicyAuto,
 		PolicyPackages:          PolicyAuto,
 		PolicyReboot:            PolicyManual,
@@ -230,7 +240,7 @@ const KindOther = "other"
 // MaxPolicyKinds bounds PolicyKinds.
 const MaxPolicyKinds = 64
 
-// PolicySource says which setting decided the policy of an image rollout.
+// PolicySource says what decided the policy of an image rollout.
 type PolicySource string
 
 // Policy sources.
@@ -241,6 +251,8 @@ const (
 	PolicySourceKind PolicySource = "kind"
 	// PolicySourceDefault: PolicyImage.
 	PolicySourceDefault PolicySource = "default"
+	// PolicySourceDeploy: every target is an Ansible deploy, always auto.
+	PolicySourceDeploy PolicySource = "deploy"
 )
 
 // ActionPolicies is a policy per host action. In JSON it is always an
@@ -310,13 +322,24 @@ func (s *Settings) KindPolicy(kind protocol.ContainerKind) (Policy, PolicySource
 	return s.PolicyImage, PolicySourceDefault
 }
 
+// GroupPolicy is the policy of a group rollout and what decided it: auto
+// when every target is an Ansible deploy (Rollout.Deployed), else
+// ImagePolicy of its team and container kind.
+func (s *Settings) GroupPolicy(r *Rollout) (Policy, PolicySource) {
+	if r.Deployed() {
+		return PolicyAuto, PolicySourceDeploy
+	}
+
+	return s.ImagePolicy(r.Team, r.ContainerKind)
+}
+
 // RolloutPolicy is the policy that governs a rollout: that of its kind, and
-// for an image rollout ImagePolicy of its team and container kind. A rollout
-// a person or a host asked for answers to no policy: auto.
+// for an image rollout GroupPolicy. A rollout a person or a host asked for
+// answers to no policy: auto.
 func (s *Settings) RolloutPolicy(r *Rollout) Policy {
 	switch r.Kind {
 	case RolloutGroup:
-		p, _ := s.ImagePolicy(r.Team, r.ContainerKind)
+		p, _ := s.GroupPolicy(r)
 
 		return p
 	case RolloutPackages:
@@ -377,6 +400,8 @@ func (s *Settings) EffectiveMinPeers(nodes int) int {
 const (
 	MaxReadyAttestations = 32
 	MaxReadyStableFor    = 30 * time.Minute
+	// MaxConcurrentPulls bounds Settings.MaxConcurrentPulls.
+	MaxConcurrentPulls = 10000
 )
 
 // Validate checks value ranges.
@@ -428,6 +453,14 @@ func (s *Settings) Validate() error {
 
 	if s.ReadinessTimeout.Std() < time.Minute {
 		return errors.New("readinessTimeout must be at least 1m")
+	}
+
+	if s.BaselineGrace < s.ReadyStableFor || s.BaselineGrace > s.ReadinessTimeout {
+		return errors.New("baselineGrace must be between readyStableFor and readinessTimeout")
+	}
+
+	if s.MaxConcurrentPulls < 0 || s.MaxConcurrentPulls > MaxConcurrentPulls {
+		return fmt.Errorf("maxConcurrentPulls must be between 0 and %d", MaxConcurrentPulls)
 	}
 
 	if s.LookupInterval.Std() < MinLookupInterval || s.LookupInterval.Std() > MaxLookupInterval {

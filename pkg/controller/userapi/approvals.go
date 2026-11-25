@@ -13,7 +13,7 @@ import (
 )
 
 // allowApproval authorizes a person's decision on one rollout (resume, which
-// approves, ignore-gate, approve-lease): the host action on every member of
+// approves, ignore-gate, ignore-budget, approve-lease): the host action on every member of
 // an action rollout (allowActionApproval), or what needScope says.
 func (s *Handler) allowApproval(
 	w http.ResponseWriter, r *http.Request, u *authz.User, rollout string,
@@ -30,6 +30,21 @@ func (s *Handler) allowApproval(
 // handleIgnoreGate serves POST /api/v1/actions/ignore-gate: the leases of one
 // rollout pass a closed network gate from now on.
 func (s *Handler) handleIgnoreGate(w http.ResponseWriter, r *http.Request, u *authz.User) {
+	s.handleRolloutDecision(w, r, u, s.opts.Scheduler.IgnoreGate)
+}
+
+// handleIgnoreBudget serves POST /api/v1/actions/ignore-budget: the leases of
+// one rollout pass the budget and a closed network gate from now on.
+func (s *Handler) handleIgnoreBudget(w http.ResponseWriter, r *http.Request, u *authz.User) {
+	s.handleRolloutDecision(w, r, u, s.opts.Scheduler.IgnoreBudget)
+}
+
+// handleRolloutDecision serves a person's decision on one rollout that takes
+// a ScopeRequest.
+func (s *Handler) handleRolloutDecision(
+	w http.ResponseWriter, r *http.Request, u *authz.User,
+	decide func(context.Context, string, scheduler.ScopeRequest) (*scheduler.ActionResult, error),
+) {
 	var req scheduler.ScopeRequest
 	if err := decodeBody(w, r, &req); err != nil {
 		s.writeBodyError(w, err)
@@ -48,7 +63,7 @@ func (s *Handler) handleIgnoreGate(w http.ResponseWriter, r *http.Request, u *au
 		return
 	}
 
-	s.answer(w, r, u)(s.opts.Scheduler.IgnoreGate(ctx, u.Actor, req))
+	s.answer(w, r, u)(decide(ctx, u.Actor, req))
 }
 
 // handleApproveLease serves POST /api/v1/actions/approve-lease: the

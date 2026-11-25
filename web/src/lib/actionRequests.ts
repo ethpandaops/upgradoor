@@ -316,7 +316,8 @@ export function describeCall(call: ActionCall): string[] {
       return call.body.rollout === ''
         ? ['Lift the global pause: the scheduler grants leases again.']
         : [
-            `Resume rollout ${call.body.rollout}: lift its pause and approve it if it waits on a manual policy. ` +
+            `Resume rollout ${call.body.rollout}: lift its pause and approve it if it waits on a manual policy ` +
+              'or at the closed network gate (then one host at a time while the gate stays closed). ' +
               'Hosts are then granted under the normal rules.',
           ];
     case 'ignore-gate':
@@ -324,6 +325,12 @@ export function describeCall(call: ActionCall): string[] {
         `Let rollout ${call.body.rollout} pass the network gate while it is closed, whatever its reason: ` +
           'missing or stale data included.',
         'The availability budget, the host limit and the canary still apply. Other rollouts keep waiting at the gate. ' +
+          'This is recorded in the audit log.',
+      ];
+    case 'ignore-budget':
+      return [
+        `Let rollout ${call.body.rollout} ignore the availability budget and the network gate from now on.`,
+        'The host limit and the canary still apply. Other rollouts keep waiting for the budget. ' +
           'This is recorded in the audit log.',
       ];
     case 'approve-lease':

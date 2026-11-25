@@ -65,7 +65,7 @@ var simReasons = regexp.MustCompile(`^(held( by .+)?|hold requested, waiting for
 	`waiting for approval \(policy manual\)|rollout halted: .+|` +
 	`verb not allowed by the agent|waiting to pull its image again after a failed pull|network gate: .+|after .+|` +
 	`validators down: [0-9.]+% now, [0-9.]+% with this host, limit [0-9.]+%|` +
-	`hosts at once: \d+ of \d+ busy|independent hosts at once: \d+ of \d+ busy)$`)
+	`hosts at once: \d+ of \d+ busy|independent hosts at once: \d+ of \d+ busy|image pulls at once: \d+ of \d+)$`)
 
 // sim is one simulation run.
 type sim struct {
@@ -159,6 +159,10 @@ func (s *sim) count() {
 			s.stats["forced grants"]++
 		}
 
+		if l.Outcome != "" {
+			s.stats["outcome "+string(l.Outcome)]++
+		}
+
 		if exempt {
 			s.stats["budget-exempt grants"]++
 		}
@@ -248,6 +252,11 @@ func newSim(seed uint64) (*sim, error) {
 	case 2:
 		s.defaults.ReadyPeerShare = 0.75
 	}
+
+	// From the seed too: the grace before a host that was not ready before
+	// its lease goes as no worse, and the bound on image pulls at once.
+	s.defaults.BaselineGrace = fleet.Duration(time.Duration([]int{60, 90, 120}[(seed/13)%3]) * time.Second)
+	s.defaults.MaxConcurrentPulls = []int{0, 1, 3, 10}[(seed/17)%4]
 
 	if err := s.defaults.Validate(); err != nil {
 		return nil, fmt.Errorf("sim settings: %w", err)
@@ -369,9 +378,10 @@ func (s *sim) checkStarts() error {
 			case errors.Is(err, store.ErrNotFound):
 			case err != nil:
 				return err
-			case (a.overrun || len(a.late) > 0) && l.State == fleet.LeaseExpired && l.Host == a.name:
+			case (a.overrun || len(a.late) > 0) && l.Host == a.name && (l.State == fleet.LeaseExpired ||
+				l.State == fleet.LeaseFailed && l.Error == reasonAgentSilent):
 				// Its clock is slow: it starts a lease the controller has
-				// expired.
+				// expired, or failed because the agent was silent past it.
 			case l.State.Terminal() || l.Host != a.name:
 				return fmt.Errorf("%s began the operation of lease %s with step %s, and the lease is %s (host %s)",
 					a.name, l.ID, b.need, l.State, l.Host)
@@ -611,7 +621,7 @@ func (s *sim) checkPlan() error {
 	}
 
 	leased := make(map[string]bool, len(open))
-	independent := 0
+	independent, pulls := 0, 0
 	byLease := make(map[string]protocol.Impact, len(open))
 
 	for _, l := range open {
@@ -621,6 +631,17 @@ func (s *sim) checkPlan() error {
 		if l.Impact == protocol.ImpactIndependent {
 			independent++
 		}
+
+		if slices.ContainsFunc(l.Needs, func(n protocol.Need) bool { return n.Container() != "" }) &&
+			(l.State == fleet.LeaseGranted || l.State == fleet.LeaseRunning && l.Operation != nil &&
+				l.Operation.Phase == protocol.PhasePulling) {
+			pulls++
+		}
+	}
+
+	// No grant starts more image pulls than maxConcurrentPulls allows.
+	if limit := s.defaults.MaxConcurrentPulls; limit > 0 && pulls > limit {
+		return fmt.Errorf("%d leases with image work are granted or pulling, at most %d may", pulls, limit)
 	}
 
 	// A host that works without a lease takes a slot like one that holds one,
@@ -1700,6 +1721,7 @@ func TestSimulation(t *testing.T) {
 			"slot-duration forks", "leases ended by a person: granted", "leases ended by a person: running",
 			"leases ended by a person: verifying", "waits: verb", "waits: validators", "waits: hosts",
 			"waits: network", "waits: after", "completed unlabelled rollouts",
+			"waits: image", "outcome recovered", "outcome no-worse",
 		} {
 			if total[what] == 0 {
 				t.Errorf("the simulation never produced any %s", what)
@@ -3431,6 +3453,13 @@ func (o *oracle) checkEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) error 
 		if !l.Recheck && (report == nil || report.Phase != protocol.PhaseDone) {
 			return errors.New("released, and its agent never reported the operation done")
 		}
+
+		// Only a host that was not ready before its lease goes as no worse,
+		// and only after baselineGrace.
+		if l.Outcome == fleet.OutcomeNoWorse && (l.Baseline == nil || l.Baseline.Unready == "" ||
+			l.AgentDoneAt == nil || l.EndedAt.Sub(*l.AgentDoneAt) < f.settings.BaselineGrace.Std()) {
+			return errors.New("released as no worse, and its host was ready before it or the grace did not pass")
+		}
 	case fleet.LeaseFailed:
 		for _, id := range o.serves[l.ID] {
 			r := snap.rollout(id)
@@ -3522,8 +3551,9 @@ func oracleGate(f *simFacts, leased map[string]protocol.Impact) []string {
 }
 
 // oracleBudget checks the three grant conditions (the host costs nothing, it
-// stays inside the budget, or it goes alone) and the host limit for one host,
-// against the world's own count of unavailable weight.
+// stays inside the budget, or it is the floor lease: no other host with
+// validators is at work) and the host limit for one host, against the
+// world's own count of unavailable weight.
 func oracleBudget(f *simFacts, leased map[string]protocol.Impact, host string, impact protocol.Impact) error {
 	if impact == protocol.ImpactIndependent {
 		limit := max(1, int(math.Floor(f.settings.MaxIndependentPercent*float64(len(f.hosts))/100+budgetEpsilon)))
@@ -3558,6 +3588,13 @@ func oracleBudget(f *simFacts, leased map[string]protocol.Impact, host string, i
 	percent := f.settings.MaxUnavailablePercent
 	allowed := percent * float64(total) / 100
 	others := oracleCount(leased, protocol.ImpactNode) + f.chargedOthers(leased, host)
+	weighted := 0
+
+	for name, h := range f.hosts {
+		if name != host && h.weight > 0 && (leased[name] == protocol.ImpactNode || f.charged(h)) {
+			weighted++
+		}
+	}
 
 	cost := f.hosts[host].live
 	if impact != protocol.ImpactNode {
@@ -3566,10 +3603,10 @@ func oracleBudget(f *simFacts, leased map[string]protocol.Impact, host string, i
 
 	fits := cost == 0 ||
 		float64(unavailable+cost) <= allowed+budgetEpsilon ||
-		(unavailable == 0 && allowed > 0 && others == 0)
+		(weighted == 0 && percent > 0)
 	if !fits {
-		return fmt.Errorf("over budget: cost %d with %d of %d already unavailable, %v allowed and %d other leases",
-			cost, unavailable, total, allowed, others)
+		return fmt.Errorf("over budget: cost %d with %d of %d already unavailable, %v allowed and %d other "+
+			"hosts with validators at work", cost, unavailable, total, allowed, weighted)
 	}
 
 	limit := max(1, int(math.Floor(f.settings.MaxLeasedPercent*float64(len(f.hosts))/100+budgetEpsilon)))
@@ -3616,8 +3653,11 @@ func (o *oracle) checkGrant(
 	}
 
 	// bound is the class of the needs whose rollouts do not ignore the
-	// budget: they alone answer to the gate and the limits.
+	// budget: they alone answer to the gate and the limits. passing: every
+	// such need that the gate holds back is of a rollout that ignores it;
+	// approved: or that a person approved.
 	exempt, anyExempt := true, false
+	passing, approved := true, true
 	bound := protocol.ImpactIndependent
 
 	for i := range l.Needs {
@@ -3634,7 +3674,13 @@ func (o *oracle) checkGrant(
 
 		if !r.IgnoreBudget {
 			exempt = false
-			bound = bound.Heavier(oracleNeedImpact(host, &l.Needs[i]))
+			needImpact := oracleNeedImpact(host, &l.Needs[i])
+			bound = bound.Heavier(needImpact)
+
+			if needImpact != protocol.ImpactIndependent {
+				passing = passing && r.IgnoreGate
+				approved = approved && (r.IgnoreGate || r.Approved)
+			}
 		}
 	}
 
@@ -3644,34 +3690,52 @@ func (o *oracle) checkGrant(
 		return nil
 	}
 
-	if len(gate) > 0 && bound != protocol.ImpactIndependent {
-		// The one exception: the gate is closed for what the network does, not
-		// for want of data, none of the host's validators attests, and nothing
-		// at all is leased.
-		if slices.Contains(gate, gateBeacon) || slices.Contains(gate, gateLiveness) {
-			return fmt.Errorf("the network gate is closed for want of data: %v", gate)
+	if len(gate) > 0 && bound != protocol.ImpactIndependent && !passing {
+		busy := oracleCount(leased, protocol.ImpactNode) + f.chargedOthers(leased, l.Host)
+		if err := o.checkClosedGate(host, gate, busy, approved); err != nil {
+			return err
 		}
-
-		if host.weight == 0 || host.live != 0 {
-			return fmt.Errorf("the network gate is closed (%v) and %d of the host's %d validators attest",
-				gate, host.live, host.weight)
-		}
-
-		if n := oracleCount(leased, protocol.ImpactNode) + f.chargedOthers(leased, l.Host); n > 0 {
-			return fmt.Errorf("the network gate is closed (%v) and %d hosts are leased already", gate, n)
-		}
-
-		o.exceptions++
 	}
 
 	return oracleBudget(f, leased, l.Host, bound)
 }
 
+// checkClosedGate checks a grant of node work past the closed gate. busy are
+// the other hosts at work; approved: a person approved every rollout the
+// gate holds back, which then passes it one host at a time.
+func (o *oracle) checkClosedGate(host *simHostFact, gate []string, busy int, approved bool) error {
+	if approved && busy == 0 {
+		o.exceptions++
+
+		return nil
+	}
+
+	// The one exception without a person: the gate is closed for what the
+	// network does, not for want of data, none of the host's validators
+	// attests, and nothing at all is leased.
+	if slices.Contains(gate, gateBeacon) || slices.Contains(gate, gateLiveness) {
+		return fmt.Errorf("the network gate is closed for want of data: %v", gate)
+	}
+
+	if host.weight == 0 || host.live != 0 {
+		return fmt.Errorf("the network gate is closed (%v) and %d of the host's %d validators attest",
+			gate, host.live, host.weight)
+	}
+
+	if busy > 0 {
+		return fmt.Errorf("the network gate is closed (%v) and %d hosts are leased already", gate, busy)
+	}
+
+	o.exceptions++
+
+	return nil
+}
+
 // oracleSucceeded reports whether a member of the rollout is done through a
-// lease that was released.
+// lease that was released after the full readiness check.
 func oracleSucceeded(r *fleet.Rollout) bool {
 	return slices.ContainsFunc(r.Hosts, func(m fleet.RolloutHost) bool {
-		return m.State == fleet.HostDone && m.LeaseID != ""
+		return m.State == fleet.HostDone && m.LeaseID != "" && !m.NoWorse
 	})
 }
 

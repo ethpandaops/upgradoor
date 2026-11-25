@@ -100,6 +100,26 @@ type Operation struct {
 	// that ends without it (every step superseded or refused, or the lease
 	// expired before the start) cost no availability.
 	Disrupted bool `json:"disrupted"`
+	// Pull is the image pull in flight while the phase is pulling. Older
+	// agents omit it.
+	Pull *PullProgress `json:"pull,omitempty"`
+}
+
+// PullProgress is how far one image pull got. The byte and layer counts
+// grow as the daemon learns the layers: the totals are those seen so far.
+type PullProgress struct {
+	Image string `json:"image,omitempty"`
+	// Attempt counts from 1; a stalled or transiently failed pull is tried
+	// again within the lease.
+	Attempt     int   `json:"attempt,omitempty"`
+	BytesDone   int64 `json:"bytesDone,omitempty"`
+	BytesTotal  int64 `json:"bytesTotal,omitempty"`
+	LayersDone  int   `json:"layersDone,omitempty"`
+	LayersTotal int   `json:"layersTotal,omitempty"`
+	// StartedAt is the start of the first attempt.
+	StartedAt time.Time `json:"startedAt,omitzero"`
+	// LastProgressAt is when the daemon last reported progress.
+	LastProgressAt time.Time `json:"lastProgressAt,omitzero"`
 }
 
 // DirectiveKind is the kind of a controller directive.

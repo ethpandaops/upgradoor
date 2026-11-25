@@ -2,9 +2,9 @@ import { render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { describe, expect, it } from 'vitest';
 
-import type { Rollout } from '../api/types';
+import { list, type Rollout } from '../api/types';
 import { createHarness, PRIMARY, renderWithApp } from '../test/harness';
-import { RecentRollouts, RolloutTargets, RolloutsTab, policyText, waitsForApproval } from './RolloutsTab';
+import { RecentRollouts, RolloutTargets, RolloutsTab, policyText } from './RolloutsTab';
 
 const digest = (c: string) => `sha256:${c.repeat(64)}`;
 
@@ -51,6 +51,23 @@ describe('RolloutsTab', () => {
     expect(within(hosts).getByText('lighthouse-geth-4').closest('tr')).toHaveTextContent(
       'waiting to pull its image again after a failed pull'
     );
+  });
+});
+
+describe('RolloutsTab, a member released as no worse', () => {
+  it('calls it done (no worse), and a plain done member done', async () => {
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<RolloutsTab />, h);
+
+    const card = await screen.findByRole('article', { name: /^lighthouse cl: / });
+    const hosts = within(card).getByRole('table', { name: /^Hosts of / });
+    const row = (host: string) => within(hosts).getByText(host).closest('tr') as HTMLElement;
+
+    expect(within(row('rpc-1')).getByText('done (no worse)')).toHaveAttribute(
+      'title',
+      expect.stringMatching(/Not a success of the rollout\.$/) as string
+    );
+    expect(within(row('lighthouse-geth-1')).getByText('done')).toBeInTheDocument();
   });
 });
 
@@ -164,8 +181,69 @@ describe('RolloutsTab, decisions of a person', () => {
     await waitFor(() => {
       expect(within(card).getByText('ignores gate')).toBeInTheDocument();
     });
-    expect(within(card).queryByRole('button', { name: 'Roll despite network state…' })).not.toBeInTheDocument();
+    // Past the gate a member may still wait for the budget: what is left to lift is the budget.
+    const next = within(card).queryByRole('button', { name: 'Roll despite network state…' });
+    if (next) {
+      await user.click(next);
+      expect(within(screen.getByRole('dialog')).getByRole('list', { name: 'Current state' })).toHaveTextContent(
+        /^Validator budget: /
+      );
+    }
     expect(h.calls.some(c => c.path === '/api/v1/actions/ignore-gate')).toBe(true);
+  });
+});
+
+describe('RolloutsTab, waits a person may lift', () => {
+  it('lets a rollout whose member waits for the budget ignore it, and badges it', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<RolloutsTab />, h);
+
+    const button = (await screen.findAllByRole('button', { name: 'Roll despite network state…' }))[0];
+    if (!button) throw new Error('no rollout waits for the budget');
+    const card = button.closest('article') as HTMLElement;
+    await user.click(button);
+
+    const dialog = screen.getByRole('dialog');
+    expect(within(dialog).getByRole('list', { name: 'Current state' })).toHaveTextContent(
+      /Validator budget: validators down: /
+    );
+    await user.click(within(dialog).getByRole('button', PRIMARY));
+
+    await waitFor(() => {
+      expect(within(card).getByText('ignores budget')).toBeInTheDocument();
+    });
+    expect(within(card).queryByRole('button', { name: 'Roll despite network state…' })).not.toBeInTheDocument();
+    const body = h.calls.find(c => c.path === '/api/v1/actions/ignore-budget')?.body as { rollout: string };
+    const audit = await h.api.audit({ action: 'action.ignore-budget' });
+    expect(list(audit.entries)[0]).toMatchObject({
+      target: body.rollout,
+      detail: { before: { ignoreBudget: false }, after: { ignoreBudget: true } },
+    });
+  });
+
+  it('offers to approve an auto rollout that waits at the closed gate', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    h.controller.setGateFailing(true);
+    renderWithApp(<RolloutsTab />, h);
+
+    const badge = (await screen.findAllByText('waiting at closed gate'))[0];
+    if (!badge) throw new Error('no auto rollout waits at the gate');
+    expect(badge).toHaveAttribute('title', expect.stringMatching(/never roll through a closed network gate/) as string);
+    const card = badge.closest('article') as HTMLElement;
+    await user.click(within(card).getByRole('button', { name: 'Approve…' }));
+
+    const dialog = screen.getByRole('dialog');
+    const notes = within(dialog).getByRole('list', { name: 'Current state' });
+    expect(notes).toHaveTextContent(/Network gate closed: /);
+    expect(notes).toHaveTextContent('one host at a time');
+    await user.click(within(dialog).getByRole('button', { name: 'Approve' }));
+
+    await waitFor(() => {
+      expect(within(card).queryByText('waiting at closed gate')).not.toBeInTheDocument();
+    });
+    expect(h.calls.some(c => c.path === '/api/v1/actions/resume')).toBe(true);
   });
 });
 
@@ -235,14 +313,6 @@ describe('RecentRollouts', () => {
   });
 });
 
-describe('waitsForApproval', () => {
-  it('holds a rollout on the manual policy until it is approved', () => {
-    expect(waitsForApproval(rollout({ policy: 'manual' }))).toBe(true);
-    expect(waitsForApproval(rollout({ policy: 'manual', approved: true }))).toBe(false);
-    expect(waitsForApproval(rollout({ policy: 'auto' }))).toBe(false);
-  });
-});
-
 describe('policyText', () => {
   it('names the setting the policy of an image rollout comes from', () => {
     expect(policyText(rollout({ policy: 'manual', policySource: 'kind', containerKind: 'cl' }))).toBe(
@@ -257,6 +327,7 @@ describe('policyText', () => {
     expect(policyText(rollout({ policy: 'manual', policySource: 'default' }))).toBe(
       'policy manual (default for images)'
     );
+    expect(policyText(rollout({ policy: 'auto', policySource: 'deploy' }))).toBe('policy auto (Ansible deploy)');
     expect(policyText(rollout({ kind: 'reboot', policy: 'manual' }))).toBe('policy manual');
   });
 });

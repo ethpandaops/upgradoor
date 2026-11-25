@@ -290,7 +290,7 @@ func (e *env) pull(ref, digest string) {
 	e.t.Helper()
 
 	e.host.SetRegistry(ref, digest, "")
-	_, _, err := e.host.Pull(e.t.Context(), ref)
+	_, _, err := e.host.Pull(e.t.Context(), ref, nil)
 	require.NoError(e.t, err)
 }
 

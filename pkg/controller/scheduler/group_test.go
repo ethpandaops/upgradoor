@@ -26,6 +26,24 @@ func (b *worldBuilder) wantsInGroup(host, name string, kind protocol.ContainerKi
 	h.Status.Needs = append(h.Status.Needs, n)
 }
 
+// deploysInGroup makes the host run a container of the kind and team that
+// Ansible deployed anew: a spec need for image at digest to.
+func (b *worldBuilder) deploysInGroup(host, name string, kind protocol.ContainerKind, team, image, to string) {
+	h := b.get(host)
+	c := container(name, image, digestOld, digestOld, b.w.Now)
+	c.Kind, c.Team = kind, team
+	h.Status.Containers = append(h.Status.Containers, c)
+
+	key := image + "@" + to
+	h.Status.Needs = append(h.Status.Needs, protocol.Need{
+		ID:   protocol.SpecNeedID(name, key),
+		Kind: protocol.NeedSpec,
+		Spec: &protocol.SpecNeed{
+			Container: name, Kind: kind, Team: team, Key: key, Image: image, FromDigest: digestOld, ToDigest: to,
+		},
+	})
+}
+
 // openGroup returns the one open rollout of a kind and team.
 func (b *worldBuilder) openGroup(kind protocol.ContainerKind, team string) *fleet.Rollout {
 	b.t.Helper()
@@ -205,4 +223,28 @@ func TestReadyNeedsRideAlong(t *testing.T) {
 	l := b.lease("a")
 	require.NotNil(t, l, "a is a canary")
 	assert.Len(t, l.Needs, 2, "the exporter rides along with the node lease")
+}
+
+// A tag that moves while an Ansible deploy of the unit is open supersedes it
+// with a rollout that answers to the image policy again.
+func TestDeployWithAMovedTagAnswersToTheImagePolicy(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.w.Settings.PolicyImage = fleet.PolicyManual
+	b.host("a", 10)
+	b.host("b", 10)
+	b.deploysInGroup("a", "geth", protocol.KindEL, "geth", imgGeth, digestA)
+	b.deploysInGroup("b", "geth", protocol.KindEL, "geth", imgGeth, digestA)
+	b.step()
+
+	first := b.openGroup(protocol.KindEL, "geth")
+	assert.Equal(t, fleet.PolicyAuto, b.w.Settings.RolloutPolicy(first))
+
+	b.wantsInGroup("b", "exporter", protocol.KindEL, "geth", "org/exporter:latest", digestB)
+	b.advance(time.Second)
+	b.step()
+
+	next := b.openGroup(protocol.KindEL, "geth")
+	assert.NotEqual(t, first.ID, next.ID)
+	assert.Len(t, next.Targets, 2)
+	assert.Equal(t, fleet.PolicyManual, b.w.Settings.RolloutPolicy(next))
 }

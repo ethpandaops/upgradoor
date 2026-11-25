@@ -237,6 +237,12 @@ func (a *Access) Lease(l *fleet.Lease) *fleet.Lease {
 	out := *l
 	out.Needs = a.needs(l.Needs)
 
+	if l.Baseline != nil {
+		baseline := *l.Baseline
+		baseline.Node = nodeWithoutErrors(l.Baseline.Node)
+		out.Baseline = &baseline
+	}
+
 	if l.Operation != nil {
 		op := *l.Operation
 		op.Steps = make([]protocol.Step, 0, len(l.Operation.Steps))
@@ -259,6 +265,31 @@ func (a *Access) Lease(l *fleet.Lease) *fleet.Lease {
 	}
 
 	return &out
+}
+
+// nodeWithoutErrors is the node's state without the probes' error texts,
+// which name the host's internals.
+func nodeWithoutErrors(n protocol.NodeHealth) protocol.NodeHealth {
+	out := protocol.NodeHealth{Probes: make([]protocol.KindHealth, 0, len(n.Probes))}
+
+	if n.EL != nil {
+		el := *n.EL
+		el.Error = ""
+		out.EL = &el
+	}
+
+	if n.CL != nil {
+		cl := *n.CL
+		cl.Error = ""
+		out.CL = &cl
+	}
+
+	for _, p := range n.Probes {
+		p.Error = ""
+		out.Probes = append(out.Probes, p)
+	}
+
+	return out
 }
 
 // ownsNeed reports whether a team of the login owns the container the need

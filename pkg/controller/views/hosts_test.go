@@ -62,8 +62,8 @@ func TestNewHostUsage(t *testing.T) {
 		"no busy share before the agent's second reading")
 }
 
-// An image rollout names the setting its policy comes from; other rollouts
-// name none.
+// An image rollout names what its policy comes from; other rollouts name
+// none.
 func TestRolloutsPolicySource(t *testing.T) {
 	st, sched := controllertest.NewStore(), controllertest.NewScheduler()
 	sched.CurrentSettings.PolicyClients = fleet.ClientPolicies{"geth": fleet.PolicyManual}
@@ -73,6 +73,10 @@ func TestRolloutsPolicySource(t *testing.T) {
 		{ID: "geth", Kind: fleet.RolloutGroup, ContainerKind: protocol.KindEL, Team: "geth", State: fleet.RolloutActive},
 		{ID: "teku", Kind: fleet.RolloutGroup, ContainerKind: protocol.KindCL, Team: "teku", State: fleet.RolloutActive},
 		{ID: "tools", Kind: fleet.RolloutGroup, State: fleet.RolloutActive},
+		{
+			ID: "deploy", Kind: fleet.RolloutGroup, ContainerKind: protocol.KindEL, Team: "geth",
+			State: fleet.RolloutActive, Targets: []fleet.RolloutTarget{{Image: "geth:v1", Spec: "k1"}},
+		},
 		{ID: "reboot", Kind: fleet.RolloutReboot, State: fleet.RolloutActive},
 	}
 
@@ -88,6 +92,6 @@ func TestRolloutsPolicySource(t *testing.T) {
 
 	assert.Equal(t, map[string]fleet.PolicySource{
 		"geth": fleet.PolicySourceClient, "teku": fleet.PolicySourceKind,
-		"tools": fleet.PolicySourceDefault, "reboot": "",
+		"tools": fleet.PolicySourceDefault, "deploy": fleet.PolicySourceDeploy, "reboot": "",
 	}, got)
 }

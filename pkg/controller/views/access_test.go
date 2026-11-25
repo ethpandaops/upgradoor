@@ -121,6 +121,7 @@ func TestAccessRollout(t *testing.T) {
 }
 
 // A step error is the internals of the need's container: shown to its team.
+// The pull in flight names an image like the needs do: shown to all.
 func TestAccessLease(t *testing.T) {
 	l := &fleet.Lease{
 		Needs: []protocol.Need{
@@ -131,6 +132,10 @@ func TestAccessLease(t *testing.T) {
 		Operation: &protocol.Operation{Error: "failed", Steps: []protocol.Step{
 			{NeedID: "i", Status: protocol.StepDone, Error: "pull e"},
 			{NeedID: "p", Status: protocol.StepFailed, Error: "dpkg e"},
+		}, Pull: &protocol.PullProgress{Image: "ethpandaops/geth:master", Attempt: 2, BytesDone: 5}},
+		Baseline: &fleet.LeaseBaseline{Unready: "EL is not reachable", Node: protocol.NodeHealth{
+			EL:     &protocol.ELHealth{Error: "dial 10.0.0.1"},
+			Probes: []protocol.KindHealth{{Kind: "mev", Error: "dial 10.0.0.2"}},
 		}},
 	}
 
@@ -139,7 +144,12 @@ func TestAccessLease(t *testing.T) {
 	assert.Empty(t, got.Operation.Steps[1].Error)
 	assert.Equal(t, "step p failed", got.Error)
 	assert.Equal(t, "failed", got.Operation.Error)
+	assert.Equal(t, l.Operation.Pull, got.Operation.Pull)
 	assert.Equal(t, "dpkg e", l.Operation.Steps[1].Error, "the lease is not changed")
+	assert.Equal(t, "EL is not reachable", got.Baseline.Unready)
+	assert.Empty(t, got.Baseline.Node.EL.Error, "the probes' errors are the host's internals")
+	assert.Empty(t, got.Baseline.Node.Probes[0].Error)
+	assert.Equal(t, "dial 10.0.0.1", l.Baseline.Node.EL.Error, "the lease is not changed")
 
 	assert.Same(t, l, (&Access{Full: true}).Lease(l))
 }

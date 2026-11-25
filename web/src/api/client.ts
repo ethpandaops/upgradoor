@@ -161,6 +161,7 @@ interface ActionBodies {
   'client-override': ClientOverrideRequest;
   'host-action': HostActionRequest;
   'ignore-gate': ScopeRequest;
+  'ignore-budget': ScopeRequest;
   'approve-lease': ApproveLeaseRequest;
 }
 

@@ -237,7 +237,10 @@ func (h *Host) LocalImage(ctx context.Context, ref string) (digest, revision str
 }
 
 // Pull implements host.Host: the tag's local image becomes the registry's.
-func (h *Host) Pull(ctx context.Context, ref string) (digest, revision string, err error) {
+// It reports no progress.
+func (h *Host) Pull(
+	ctx context.Context, ref string, _ func(*protocol.PullProgress),
+) (digest, revision string, err error) {
 	if err := h.begin(ctx, "pull:"+ref, "pull "+ref); err != nil {
 		return "", "", fmt.Errorf("agenttest: pull %s: %w", ref, err)
 	}

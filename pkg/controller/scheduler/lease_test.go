@@ -388,6 +388,30 @@ func TestOperationThatDisruptedNothing(t *testing.T) {
 	})
 }
 
+// The lease shows the progress of the agent's pull as of its last sync, as a
+// copy.
+func TestLeaseFollowsThePullProgress(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.host("a", 10)
+	b.wantsImage("a", imgLighthouse, digestA)
+	b.step()
+
+	b.report("a", protocol.PhasePulling, false)
+	pull := &protocol.PullProgress{Image: imgLighthouse, Attempt: 1, BytesDone: 10, BytesTotal: 100}
+	b.get("a").Status.Operation.Pull = pull
+
+	out := b.step()
+	require.Len(t, out.Leases, 1)
+	assert.Equal(t, pull, b.lease("a").Operation.Pull)
+
+	pull.BytesDone = 40
+	assert.Equal(t, int64(10), b.lease("a").Operation.Pull.BytesDone, "a copy")
+
+	out = b.step()
+	require.Len(t, out.Leases, 1, "written again with the new progress")
+	assert.Equal(t, int64(40), b.lease("a").Operation.Pull.BytesDone)
+}
+
 func TestStepOutcomes(t *testing.T) {
 	imgKey := imageKey("", imgLighthouse, digestA)
 	pkgKey := packagesKey("2.0")
@@ -2042,8 +2066,8 @@ const (
 
 // A host whose lease failed after its agent disrupted it counts with its full
 // weight and its place in the host limit until a liveness epoch that began
-// after the failure has settled; from then on what its validators do counts.
-// It may be granted again itself.
+// after the failure has settled; from then on what its validators do counts,
+// and it no longer takes the floor lease. It may be granted again itself.
 func TestFailedHostStaysChargedUntilProvenBack(t *testing.T) {
 	b := newWorldBuilder(t)
 
@@ -2083,19 +2107,13 @@ func TestFailedHostStaysChargedUntilProvenBack(t *testing.T) {
 	require.Empty(t, b.leasedHosts())
 
 	// An epoch after the failure settles: a's validators are counted as they
-	// are, and they are down.
+	// are. They are down, but no host is at work: b has the floor lease.
 	b.advance(2 * testEpoch)
 
 	out = b.step()
 	assert.Nil(t, b.get("a").Unproven)
-	assert.Zero(t, out.Plan.Budget.LeasedHosts)
-	assert.Equal(t, "validators down: 10% now, 20% with this host, limit 10%", queueReasons(out.Plan)["b"])
-
-	// They attest again.
-	b.liveOverride["a"] = 10
-	b.advance(testEpoch)
-	b.step()
 	assert.Equal(t, []string{"b"}, b.leasedHosts())
+	assert.Equal(t, uint64(20), out.Plan.Budget.UnavailableWeight)
 }
 
 // A forced lease is released when the agent is done and charges nothing: the

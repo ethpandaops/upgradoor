@@ -349,6 +349,8 @@ export function defaultSettings(): Settings {
     leaseTtl: '30m0s',
     hostStaleAfter: '2m0s',
     readinessTimeout: '30m0s',
+    baselineGrace: '15m0s',
+    maxConcurrentPulls: 10,
     policyImage: 'auto',
     policyPackages: 'auto',
     policyReboot: 'manual',
@@ -946,7 +948,11 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       updatedAt: at(4 * 60),
       hosts: [
         withLease(member('lighthouse-geth-1', 'done', 2, at(38 * 60)), leaseCanary, 'image/lighthouse/' + lhDigest),
-        withLease(member('rpc-1', 'done', 3, at(21 * 60)), leaseRpc, 'image/lighthouse/' + lhDigest),
+        // Syncing before its lease and after it: released as no worse, no success of the rollout.
+        {
+          ...withLease(member('rpc-1', 'done', 3, at(21 * 60)), leaseRpc, 'image/lighthouse/' + lhDigest),
+          noWorse: true,
+        },
         withLease(member('lighthouse-geth-2', 'leased', 3, at(9 * 60)), leaseVerifying, 'image/lighthouse/' + lhDigest),
         pending('lighthouse-geth-3', 3, 'image/lighthouse/', 46 * 60),
         pending('lighthouse-geth-4', 3, 'image/lighthouse/', 46 * 60),
@@ -1182,6 +1188,24 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       },
       readiness: 'node at head with peers, waiting for it to stay so for 1m0s',
       readyAt: at(-30),
+      baseline: {
+        at: at(9 * 60 + 10),
+        node: {
+          el: { reachable: true, syncing: false, peers: 27, head: 9_140_200 },
+          cl: {
+            reachable: true,
+            syncing: false,
+            optimistic: false,
+            elOffline: false,
+            peers: 48,
+            headSlot: 181_950,
+            syncDistance: 0,
+          },
+        },
+        duty: VALIDATORS_PER_HOST,
+        live: VALIDATORS_PER_HOST,
+        liveKnown: true,
+      },
     },
     {
       id: leaseGrandine,
@@ -1271,7 +1295,35 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
         steps: [{ needId: lhNeed('lighthouse').id, status: 'done' }],
         disrupted: true,
       },
-      readiness: 'ready: node at head with peers',
+      readiness: 'not ready before the lease: node is syncing; no worse after',
+      // The EL was still catching up when the lease was granted, and was after the grace.
+      baseline: {
+        at: at(36 * 60 + 20),
+        node: {
+          el: { reachable: true, syncing: true, peers: 22, head: 9_102_377 },
+          cl: {
+            reachable: true,
+            syncing: false,
+            optimistic: true,
+            elOffline: false,
+            peers: 51,
+            headSlot: 181_700,
+            syncDistance: 0,
+          },
+        },
+        duty: 0,
+        live: 0,
+        liveKnown: false,
+        containers: [
+          { name: 'geth', kind: 'el', state: 'running', restartCount: 2 },
+          { name: 'lighthouse', kind: 'cl', state: 'running', restartCount: 0 },
+        ],
+        unready: 'node is syncing',
+        root: 'el',
+      },
+      noWorseSince: at(31 * 60),
+      noWorseUntil: at(21 * 60),
+      outcome: 'no-worse',
     },
     {
       id: leaseFailed,
@@ -1402,7 +1454,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
   log(36 * 60, 'scheduler', 'lease.granted', 'rpc-1', { lease: leaseRpc, rollout: lighthouseRollout });
   log(21 * 60, 'scheduler', 'lease.released', 'rpc-1', {
     lease: leaseRpc,
-    readiness: 'ready: node at head with peers',
+    readiness: 'not ready before the lease: node is syncing; no worse after',
   });
   log(9 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-2', { lease: leaseVerifying, rollout: lighthouseRollout });
 
@@ -1421,6 +1473,8 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     // One client has an image policy of its own; no rollout of it is open.
     settings: {
       ...defaults,
+      // The large fleets take more hosts at once than they may pull images for.
+      ...(fleet === 'large' || fleet === 'huge' ? { maxLeasedPercent: 15 } : {}),
       pauseAfterCanaryImage: true,
       readyPeerShare: 0.25,
       policyClients: { besu: 'manual' },
@@ -1501,10 +1555,12 @@ function largeFleet(
       const failed = !running && hash(`fail/${host}`) % 60 === 0;
       const id = `ls-${hex(`lease/${host}`, 16)}`;
 
+      // The last ten of the running wave were granted and wait for the agent: as many as may pull at once.
+      const waiting = running && i >= WAVE - 10;
       leases.push({
         id,
         host,
-        state: running ? 'running' : failed ? 'failed' : 'released',
+        state: waiting ? 'granted' : running ? 'running' : failed ? 'failed' : 'released',
         needs: [need],
         rollouts: { [need.id]: rollout },
         weight: VALIDATORS_PER_HOST,

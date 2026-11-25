@@ -76,6 +76,10 @@ var ErrDigestMismatch = errors.New("host: local image digest differs from the gr
 // container was stopped; the rollback has run.
 var ErrImageMoved = errors.New("host: the image of the tag changed after the old container was stopped")
 
+// ErrPullStalled is returned by Runtime.Pull when the daemon reported no
+// progress for a while; the layers it finished stay, so a retry resumes.
+var ErrPullStalled = errors.New("host: the pull made no progress")
+
 // Runtime is the Docker daemon.
 type Runtime interface {
 	// Containers lists all containers with the raw Docker facts; policy
@@ -84,8 +88,11 @@ type Runtime interface {
 	// LocalImage returns the registry digest ("" if none) and revision label
 	// of the local image ref names.
 	LocalImage(ctx context.Context, ref string) (digest, revision string, err error)
-	// Pull pulls ref by its tag and returns what LocalImage then would.
-	Pull(ctx context.Context, ref string) (digest, revision string, err error)
+	// Pull pulls ref by its tag and returns what LocalImage then would. It
+	// fails with ErrPullStalled when the daemon reports no progress for a
+	// while. progress, when not nil, hears the byte and layer counts
+	// whenever they change, on the calling goroutine.
+	Pull(ctx context.Context, ref string, progress func(*protocol.PullProgress)) (digest, revision string, err error)
 	// Recreate replaces container name by one with the same configuration
 	// and change applied, left stopped unless start. It fails with
 	// ErrDigestMismatch before stopping anything unless digest is a registry
@@ -189,6 +196,9 @@ type dockerRuntime struct {
 	// recreateMu serialises Recreate and the recovery of interrupted ones.
 	recreateMu sync.Mutex
 
+	// stall is how long a pull may go without progress.
+	stall time.Duration
+
 	// pulled is the digest the last Pull saw per repository and image ID;
 	// it breaks ties between several digests of one image.
 	pulledMu sync.Mutex
@@ -229,6 +239,7 @@ func newDockerRuntime(
 		login:  login,
 		pulled: make(map[string]string, 8),
 		only:   labelFilter(labels),
+		stall:  pullStall,
 	}
 
 	return r, nil

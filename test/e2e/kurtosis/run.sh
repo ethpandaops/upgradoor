@@ -238,6 +238,7 @@ mkdir -p "$work/data"
     --default-setting readyAttestations=2 \
     --default-setting leaseTtl=5m \
     --default-setting readinessTimeout=6m \
+    --default-setting baselineGrace=3m \
     --default-setting hostStaleAfter=1m \
     --default-setting lookupInterval=30s \
     >"$work/controller.log" 2>&1 &
@@ -445,8 +446,11 @@ jq -e --arg c "$(jq -r .canary "$work/rollout-b.json")" '
 [ "$(cat "$work/max-open-leases" 2>/dev/null || echo 0)" -le 1 ] || die "more than one lease was open at once"
 pass "B rolled host by host: canary first, never more than one lease, each released before the next"
 
+# A host that missed an attestation just before its lease was not ready
+# before it; passing the full check then reads "recovered".
 jq -e '[.[] | select(.action == "lease.released") | .detail.readiness
-        | startswith("ready: node at head with peers, validators attesting: ")] | length == 4 and all' \
+        | startswith("ready: node at head with peers, validators attesting: ") or startswith("recovered: ")]
+        | length == 4 and all' \
     "$work/audit-leases.json" >/dev/null ||
     die "a lease was released without the node and attestation readiness check: $(jq -c '[.[] | select(.action == "lease.released") | .detail]' "$work/audit-leases.json")"
 pass "every slot was released with the node at head with peers and the validators attesting"
@@ -490,6 +494,12 @@ rd=$(rollout_of "$digest_d")
 first=$(api "/api/v1/audit?action=lease.granted&limit=500" |
     jq -r --arg id "$rd" '[.entries[] | select(.detail | tostring | contains($id))] | last | .target')
 [ "$first" = "$broken" ] || die "D went to $first first, expected the broken host $broken"
+# Its CL was down before the lease: back after it, it recovered through the
+# full check.
+api "/api/v1/audit?action=lease.released&limit=500" |
+    jq -e --arg h "$broken" '[.entries[] | select(.target == $h)] | first
+        | .detail.outcome == "recovered" and (.detail.readiness | startswith("recovered: was not ready before the lease"))' \
+    >/dev/null || die "the repair of $broken was not released as recovered"
 wait_until "gate open again" 300 jq_true /api/v1/plan '.gate.ok'
 pass "D superseded C, repaired $broken first, then rolled everyone"
 

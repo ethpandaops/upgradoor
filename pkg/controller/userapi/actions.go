@@ -62,6 +62,7 @@ func (s *Handler) actions() map[string]UserHandler {
 		"retry":  action(s, needRetry, validateRolloutHosts(false), sched.Retry),
 		// Whoever may approve the rollout: see allowApproval.
 		"ignore-gate":   s.handleIgnoreGate,
+		"ignore-budget": s.handleIgnoreBudget,
 		"approve-lease": s.handleApproveLease,
 	}
 }

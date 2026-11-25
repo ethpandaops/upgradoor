@@ -163,7 +163,7 @@ func TestSettingsFieldsCoverEveryField(t *testing.T) {
 	// `json:"-"` or omitempty would silently never be stored.
 	assert.ElementsMatch(t, []string{
 		"maxUnavailablePercent", "maxLeasedPercent", "maxIndependentPercent", "minParticipationPercent", "maxFinalityLagEpochs", "readyAttestations", "readyStableFor", "minPeers",
-		"leaseTtl", "hostStaleAfter", "readinessTimeout",
+		"leaseTtl", "hostStaleAfter", "readinessTimeout", "baselineGrace", "maxConcurrentPulls",
 		"policyImage", "policyPackages", "policyReboot", "paused",
 		"pauseAfterCanaryImage", "pauseAfterCanaryPackages", "pauseAfterCanaryReboot", "readyPeerShare",
 		"lookupInterval",

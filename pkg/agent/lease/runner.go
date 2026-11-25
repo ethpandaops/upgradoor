@@ -113,6 +113,8 @@ type runner struct {
 	deps *Deps
 	// poll is the pause between looks while an operation waits.
 	poll time.Duration
+	// pullBackoff are the pauses before the retries of a pull.
+	pullBackoff []time.Duration
 	// wakeup holds at most one pending wake of the goroutine.
 	wakeup chan struct{}
 	// ignored is the lease last logged as not taken; guarded by st.mu.
@@ -128,12 +130,13 @@ var _ Runner = (*runner)(nil)
 // New returns the runner on the state file state was opened on.
 func New(log logrus.FieldLogger, cfg *Config, state State, deps *Deps) Runner {
 	return &runner{
-		log:    log.WithField("package", "lease"),
-		cfg:    cfg,
-		st:     state.file(),
-		deps:   deps,
-		poll:   min(max(cfg.Window/pollPerWindow, minPoll), maxPoll),
-		wakeup: make(chan struct{}, 1),
+		log:         log.WithField("package", "lease"),
+		cfg:         cfg,
+		st:          state.file(),
+		deps:        deps,
+		poll:        min(max(cfg.Window/pollPerWindow, minPoll), maxPoll),
+		pullBackoff: defaultPullBackoff,
+		wakeup:      make(chan struct{}, 1),
 	}
 }
 
@@ -397,6 +400,9 @@ type operation struct {
 	holdReason string
 	// deferred: an image could not be pulled, so nothing is begun.
 	deferred bool
+	// pulling is the pull in flight, pullShownAt when it was last written.
+	pulling     *protocol.PullProgress
+	pullShownAt time.Time
 	// view is the last classified view, for order and stop timeouts.
 	view *plan.View
 }
