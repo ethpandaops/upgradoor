@@ -105,14 +105,16 @@ jobs:
         password: ${{ github.token }}
 
     # The image holds exactly the manifest's upgradoor-controller. Pushed by digest only: no tag
-    # points at it until the signed release is published.
+    # points at it until the signed release is published. Reproducible: timestamps are the commit
+    # time (SOURCE_DATE_EPOCH, rewrite-timestamp), no buildx attestations.
     - name: Build multiarch docker image, by digest
       run: |
         set -eu
         mkdir -p .cache
+        export SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)
         docker buildx build . --file Dockerfile --target release \
           --platform linux/amd64,linux/arm64 --provenance=false --sbom=false \
-          --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true" \
+          --output "type=image,name=$IMAGE,push-by-digest=true,name-canonical=true,push=true,rewrite-timestamp=true" \
           --metadata-file .cache/image.json
         digest=$(jq -r '."containerimage.digest"' .cache/image.json)
         [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::no image digest: $digest"; exit 1; }

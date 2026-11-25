@@ -17,9 +17,11 @@ RUN CGO_ENABLED=0 go build -tags=webui -trimpath \
     -o /upgradoor-controller ./cmd/upgradoor-controller
 
 # The base is pinned by digest: a release image's digest is signed with its binaries.
+# adduser stamps the build day into /etc/shadow; it is cleared to keep the layer reproducible.
 FROM alpine:3.22@sha256:49340b346798875b5592e5d420241f2f9cfba5f47e62ebb1446a1b34734e898f AS runtime
 RUN apk add --no-cache ca-certificates tzdata && \
     adduser -D -u 10001 upgradoor && \
+    sed -i 's/^\(upgradoor:[^:]*\):[0-9]*:/\1::/' /etc/shadow && \
     mkdir -p /data && chown upgradoor /data
 USER upgradoor
 EXPOSE 8080
