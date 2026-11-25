@@ -283,8 +283,8 @@ kill $watch 2>/dev/null || true
 [ "$(sysbox_boot_count "$id-host-1")" -gt "$b1" ] || die "host-1 did not reboot in the fleet reboot"
 [ "$(sysbox_boot_count "$id-host-2")" -gt "$b2" ] || die "host-2 did not reboot in the fleet reboot"
 [ ! -e "$work/overlap" ] || die "two leases were open at once during the fleet reboot"
-# A lease ends released, expired (a lease that disrupted nothing, such as
-# host-2's package upgrade) or failed. Entries come newest first.
+# A lease ends released, expired (a lease in which no step ran) or failed.
+# Entries come newest first.
 api "/api/v1/audit?limit=500" >"$work/audit.json"
 jq -e '
     [.entries[] | select(.action | IN("lease.granted", "lease.released", "lease.expired", "lease.failed"))]

@@ -11,6 +11,7 @@ import {
 } from '../api/types';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { ActionRunView, leaseRun } from '../components/ActionRun';
+import { CommandChange } from '../components/CommandChange';
 import { Digest, ShortId } from '../components/Digest';
 import { BeforeLease, LeaseTable, PeerChecks } from '../components/LeaseTable';
 import { useLive } from '../components/Live';
@@ -663,7 +664,7 @@ export function RolloutCard({
 /**
  * RolloutTargets lists what a group rollout moves its group to: each tag at
  * the digest it moves to, and for a soft deploy the container it was reported
- * for and whether its command line changes.
+ * for, the image it ran and how its command line changes.
  */
 export function RolloutTargets({ targets, label }: { targets: readonly RolloutTarget[]; label: string }) {
   return (
@@ -691,7 +692,14 @@ export function RolloutTargets({ targets, label }: { targets: readonly RolloutTa
               revision <span className="font-mono">{shortRevision(t.revision)}</span>
             </span>
           )}
-          {t.flags && <span className="text-warning">command line changed</span>}
+          {t.spec && (
+            <CommandChange
+              fromImage={t.fromImage}
+              flags={t.flags}
+              command={t.command}
+              label={`Command line change of ${t.container ?? t.spec}`}
+            />
+          )}
         </li>
       ))}
     </ul>

@@ -183,6 +183,24 @@
        "kernel"
       ]
      }
+    },
+    {
+     "id": "spec/geth/k1",
+     "kind": "spec",
+     "spec": {
+      "container": "geth",
+      "kind": "el",
+      "team": "qq-stealth-el-team",
+      "key": "k1",
+      "image": "ethereum/client-go:stable",
+      "toDigest": "sha256:e1e1",
+      "flags": true,
+      "command": {
+       "added": [
+        "--zz-secret-flag=7"
+       ]
+      }
+     }
     }
    ],
    "actions": [
@@ -486,6 +504,9 @@
       },
       {
        "kind": "reboot"
+      },
+      {
+       "kind": "spec"
       }
      ],
      "plan": {
@@ -804,6 +825,47 @@
       }
      ],
      "policy": "manual"
+    },
+    {
+     "id": "rollout-geth",
+     "kind": "group",
+     "key": "unit:el#qq-stealth-el-team@k1",
+     "title": "geth",
+     "containerKind": "el",
+     "team": "qq-stealth-el-team",
+     "targets": [
+      {
+       "image": "ethereum/client-go:stable",
+       "digest": "sha256:e1e1",
+       "spec": "k1",
+       "container": "geth",
+       "flags": true,
+       "command": {
+        "added": [
+         "--zz-secret-flag=7"
+        ]
+       }
+      }
+     ],
+     "state": "active",
+     "paused": false,
+     "approved": false,
+     "force": false,
+     "ignoreBudget": false,
+     "ignoreGate": false,
+     "createdBy": "",
+     "createdAt": "0001-01-01T00:00:00Z",
+     "updatedAt": "0001-01-01T00:00:00Z",
+     "hosts": [
+      {
+       "host": "lighthouse-geth-1",
+       "state": "pending",
+       "stage": 0,
+       "updatedAt": "0001-01-01T00:00:00Z"
+      }
+     ],
+     "policy": "auto",
+     "policySource": "deploy"
     }
    ],
    "recent": [],
@@ -1073,7 +1135,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "ce78e4a7a75f"
+  "v": "3eabe5076196"
  },
  "user": {
   "a": {
@@ -1087,7 +1149,7 @@
    "r": [
     [
      "qq-stealth-cl-team",
-     60,
+     65,
      0,
      0,
      [
@@ -1099,7 +1161,7 @@
       [
        16,
        13,
-       40,
+       41,
        0,
        2,
        1,
@@ -1116,11 +1178,11 @@
      0,
      0,
      0,
-     61
+     66
     ],
     [
      "qq-stealth-el-team",
-     62,
+     67,
      0,
      0,
      [
@@ -1137,13 +1199,13 @@
        2,
        0,
        [
-        63,
-        64
+        68,
+        52
        ],
        2,
        [
-        63,
-        64
+        68,
+        52
        ]
       ]
      ],
@@ -1156,7 +1218,7 @@
      0,
      0,
      0,
-     65
+     69
     ]
    ]
   },
@@ -1556,6 +1618,32 @@
            "kernel"
           ]
          ]
+        ],
+        [
+         "spec/geth/k1",
+         "spec",
+         0,
+         0,
+         0,
+         0,
+         0,
+         [
+          "geth",
+          "el",
+          "qq-stealth-el-team",
+          "k1",
+          "ethereum/client-go:stable",
+          0,
+          0,
+          "sha256:e1e1",
+          0,
+          1,
+          [
+           [
+            "--zz-secret-flag=7"
+           ]
+          ]
+         ]
         ]
        ],
        [
@@ -1724,10 +1812,13 @@
       ],
       [
        37
+      ],
+      [
+       38
       ]
      ],
      [
-      38,
+      39,
       100,
       90,
       1,
@@ -1738,7 +1829,7 @@
       [
        "zz-flush-caches",
        0,
-       39
+       40
       ]
      ],
      1794571200
@@ -1769,8 +1860,8 @@
       [
        12,
        13,
-       40,
        41,
+       42,
        10,
        1,
        16,
@@ -1849,18 +1940,18 @@
      ],
      [],
      [
-      42,
+      43,
       100,
       100,
       1,
       0,
-      43
+      44
      ],
      [
       [
        "zz-flush-caches",
        0,
-       39
+       40
       ]
      ],
      1794571200
@@ -1877,8 +1968,8 @@
     ],
     [
      "cl sigp/lighthouse:unstable",
-     40,
-     41
+     41,
+     42
     ]
    ]
   },
@@ -1886,8 +1977,8 @@
    "r": [
     [
      "lease-zz",
-     45,
-     50,
+     46,
+     55,
      [
       [
        "packages/03cc7f406059e2fc",
@@ -1902,8 +1993,8 @@
         [
          [
           "zzdocker-ce",
-          51,
-          52
+          56,
+          57
          ]
         ]
        ]
@@ -1920,7 +2011,7 @@
        0,
        [
         [
-         53
+         58
         ]
        ]
       ]
@@ -1944,7 +2035,7 @@
         0,
         0,
         0,
-        54
+        59
        ]
       ],
       2,
@@ -1954,7 +2045,7 @@
        [
         "geth",
         11,
-        55,
+        60,
         7
        ]
       ],
@@ -1964,18 +2055,18 @@
      ],
      0,
      0,
-     56,
+     61,
      0,
      [
       "lease-zz",
-      50,
+      55,
       1794657600,
       0,
       0,
       [
        [
         "action/1",
-        50,
+        55,
         0,
         [
          1,
@@ -1984,17 +2075,17 @@
        ]
       ]
      ],
-     57,
+     62,
      0,
      [
       [
-       58,
+       63,
        4,
        31,
        16
       ]
      ],
-     59
+     64
     ]
    ],
    "o": [
@@ -2010,8 +2101,15 @@
      "rollout-zz/lighthouse-geth-1",
      "rollout-zz",
      0,
-     45,
-     49
+     46,
+     50
+    ],
+    [
+     "rollout-geth/lighthouse-geth-1",
+     "rollout-geth",
+     0,
+     46,
+     50
     ]
    ]
   },
@@ -2068,14 +2166,14 @@
   "q": {
    "r": [
     [
-     45,
+     46,
      1,
      30
     ],
     [
-     44,
+     45,
      2,
-     43
+     44
     ]
    ]
   },
@@ -2092,9 +2190,48 @@
      0,
      0,
      0,
-     46,
+     47,
      0,
      1,
+     48,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     0,
+     49
+    ],
+    [
+     "rollout-geth",
+     51,
+     "unit:el#qq-stealth-el-team@k1",
+     "geth",
+     11,
+     "qq-stealth-el-team",
+     [
+      [
+       7,
+       8,
+       0,
+       "k1",
+       "geth",
+       0,
+       1,
+       [
+        [
+         52
+        ]
+       ]
+      ]
+     ],
+     0,
+     0,
+     0,
      47,
      0,
      0,
@@ -2106,12 +2243,17 @@
      0,
      0,
      0,
-     48
+     0,
+     0,
+     0,
+     53,
+     54
     ]
    ],
    "o": [
     [
-     "rollout-zz"
+     "rollout-zz",
+     "rollout-geth"
     ],
     []
    ]
@@ -2155,6 +2297,7 @@
    "roll",
    "packages",
    "reboot",
+   "spec",
    "held",
    "node",
    "sha256:c2c2",
@@ -2167,6 +2310,10 @@
    "zz paused after the canary; resume to continue",
    "manual",
    "pending",
+   "group",
+   "--zz-secret-flag=7",
+   "auto",
+   "deploy",
    "failed",
    "5:28.0.0-zz1",
    "5:28.3.3-zz1",
@@ -2181,7 +2328,6 @@
    "def2b291bd9b76fc",
    "execution",
    "--http",
-   "--zz-secret-flag=7",
    "09915cf85f4760b6"
   ],
   "sl": {
@@ -2193,7 +2339,7 @@
      3,
      [
       [
-       44,
+       45,
        2,
        1
       ]
@@ -2202,7 +2348,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "ce78e4a7a75f"
+  "v": "3eabe5076196"
  },
  "patch": {
   "c": {
@@ -2210,12 +2356,12 @@
     [
      "qq-stealth-cl-team",
      15,
-     69
+     73
     ],
     [
      "qq-stealth-el-team",
      15,
-     70
+     74
     ]
    ]
   },
@@ -2230,13 +2376,13 @@
       [
        [
         "staff",
-        66,
-        67,
+        70,
+        71,
         1794657600
        ],
        [
         "geth",
-        68,
+        72,
         0,
         1794657600
        ]
@@ -2423,6 +2569,9 @@
      },
      {
       "kind": "reboot"
+     },
+     {
+      "kind": "spec"
      }
     ],
     "plan": {

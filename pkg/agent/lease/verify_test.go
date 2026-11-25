@@ -63,7 +63,8 @@ func TestVerifyingCatchesARestartingContainer(t *testing.T) {
 
 	op := e.awaitFinished("lease-crashloop")
 	assert.Equal(t, protocol.PhaseFailed, op.Phase)
-	assert.Contains(t, op.Error, "container geth is restarting: ")
+	assert.Contains(t, op.Error, "container geth kept restarting: ")
+	assert.Contains(t, op.Error, ", never up 80ms")
 	// The recreate itself worked; what failed is the operation.
 	assert.Equal(t, protocol.StepDone, stepOf(t, op, need.ID).Status)
 
@@ -100,14 +101,16 @@ type tickingHost struct {
 	// state is geth's state; empty is running.
 	state    string
 	exitCode int
-	flapping bool
-	restarts int
+	// geth restarts on every listing while flapping, or before flapUntil.
+	flapping  bool
+	flapUntil time.Time
+	restarts  int
 }
 
 func (h *tickingHost) Containers(context.Context) ([]protocol.Container, error) {
 	h.clock.Advance(time.Second)
 
-	if h.flapping {
+	if h.flapping || h.clock.Now().Before(h.flapUntil) {
 		h.restarts++
 	}
 
@@ -127,8 +130,11 @@ func (h *tickingHost) Start(context.Context, string) error {
 	return nil
 }
 
+// verifyCfg is the verify section bringBack uses unless told otherwise.
+var verifyCfg = Config{Window: 10 * time.Second, Timeout: 100 * time.Second}
+
 // bringBack runs the starting and verifying of a disrupted geth and returns the record.
-func bringBack(t *testing.T, h *tickingHost) *Record {
+func bringBack(t *testing.T, h *tickingHost, cfg Config) *Record {
 	t.Helper()
 
 	st, err := openStore(quietLog(), t.TempDir())
@@ -146,8 +152,7 @@ func bringBack(t *testing.T, h *tickingHost) *Record {
 		}
 	}))
 
-	cfg := &Config{Window: 10 * time.Second, Timeout: 100 * time.Second}
-	r, ok := New(quietLog(), cfg, st, &Deps{
+	r, ok := New(quietLog(), &cfg, st, &Deps{
 		Host: h, Policy: &plan.Policy{}, Overrides: &testFiles{files: plan.Overrides{Known: true}},
 		Audit: &testAudit{}, Notify: func() {}, Now: h.clock.Now,
 	}).(*runner)
@@ -172,37 +177,57 @@ func TestStartingAndVerifyingShareOneTimeout(t *testing.T) {
 	// Starting takes 60 of the 100 seconds; geth then never comes up.
 	rec := bringBack(t, &tickingHost{
 		clock: clock, startsAt: began.Add(60 * time.Second), state: protocol.StateRestarting,
-	})
+	}, verifyCfg)
 
 	assert.Equal(t, protocol.PhaseFailed, rec.Operation.Phase)
-	assert.Equal(t, "containers did not stay up for 10s within 1m40s: container geth is restarting",
-		rec.Operation.Error)
+	assert.Equal(t, "container geth is restarting", rec.Operation.Error)
 
 	took := clock.Now().Sub(began)
 	assert.GreaterOrEqual(t, took, 100*time.Second)
 	assert.LessOrEqual(t, took, 102*time.Second, "starting and verifying took %s of 100s", took)
 }
 
-// A crash loop or a container that exited for good fails verifying at once.
-func TestVerifyingFailsEarly(t *testing.T) {
+// Verifying asks each container to be up for stableUp (here the 10s window)
+// at the end of the window, and waits past it for one that restarted late,
+// up to maxVerify or the timeout.
+func TestVerifyingOutcomes(t *testing.T) {
 	t.Parallel()
+
+	long := Config{Window: 10 * time.Second, Timeout: 10 * time.Minute}
 
 	tests := []struct {
 		name string
 		host tickingHost
-		err  string
+		// flapFor is how long geth restarts on every listing.
+		flapFor time.Duration
+		cfg     Config
+		// err matches the error; empty for a pass.
+		err string
+		// took bounds how long starting and verifying took.
+		tookMin, tookMax time.Duration
 	}{
 		{
-			name: "crash loop", host: tickingHost{state: protocol.StateRestarting, flapping: true},
-			err: "container geth is restarting: 3 restarts",
+			name: "restarts early, then stays up", flapFor: 5 * time.Second,
+			cfg: verifyCfg, tookMin: 14 * time.Second, tookMax: 16 * time.Second,
 		},
 		{
-			name: "running between restarts", host: tickingHost{flapping: true},
-			err: "container geth is restarting: 3 restarts",
+			name: "restarts at the end of the window: waited for", flapFor: 30 * time.Second,
+			cfg: verifyCfg, tookMin: 39 * time.Second, tookMax: 41 * time.Second,
 		},
 		{
-			name: "exited", host: tickingHost{state: protocol.StateExited, exitCode: 1},
-			err: "container geth is exited (exit code 1)",
+			name: "crash loop until the timeout", host: tickingHost{state: protocol.StateRestarting, flapping: true},
+			cfg: verifyCfg, err: `^container geth kept restarting: \d+ restarts, never up 10s$`,
+			tookMin: 100 * time.Second, tookMax: 102 * time.Second,
+		},
+		{
+			name: "running between restarts until maxVerify", host: tickingHost{flapping: true},
+			cfg: long, err: `^container geth kept restarting: \d+ restarts, never up 10s$`,
+			tookMin: maxVerify, tookMax: maxVerify + 3*time.Second,
+		},
+		{
+			name: "exited at the end of the window", host: tickingHost{state: protocol.StateExited, exitCode: 1},
+			cfg: long, err: `^container geth is exited \(exit code 1\)$`,
+			tookMin: 10 * time.Second, tookMax: 13 * time.Second,
 		},
 	}
 
@@ -214,13 +239,20 @@ func TestVerifyingFailsEarly(t *testing.T) {
 			began := clock.Now()
 
 			h := tt.host
-			h.clock, h.startsAt = clock, began
+			h.clock, h.startsAt, h.flapUntil = clock, began, began.Add(tt.flapFor)
 
-			rec := bringBack(t, &h)
+			rec := bringBack(t, &h, tt.cfg)
 
-			assert.Equal(t, protocol.PhaseFailed, rec.Operation.Phase)
-			assert.Equal(t, tt.err, rec.Operation.Error)
-			assert.Less(t, clock.Now().Sub(began), 10*time.Second, "failed before the window")
+			if tt.err == "" {
+				assert.Equal(t, protocol.PhaseDone, rec.Operation.Phase, rec.Operation.Error)
+			} else {
+				assert.Equal(t, protocol.PhaseFailed, rec.Operation.Phase)
+				assert.Regexp(t, tt.err, rec.Operation.Error)
+			}
+
+			took := clock.Now().Sub(began)
+			assert.GreaterOrEqual(t, took, tt.tookMin)
+			assert.LessOrEqual(t, took, tt.tookMax)
 		})
 	}
 }
@@ -232,7 +264,7 @@ func TestVerifyWindowFollowsTheInjectedClock(t *testing.T) {
 	clock := &steppedClock{now: time.Date(2026, 11, 14, 12, 0, 0, 0, time.UTC)}
 	began := clock.Now()
 
-	rec := bringBack(t, &tickingHost{clock: clock, startsAt: began})
+	rec := bringBack(t, &tickingHost{clock: clock, startsAt: began}, verifyCfg)
 	assert.Equal(t, protocol.PhaseDone, rec.Operation.Phase, rec.Operation.Error)
 
 	took := clock.Now().Sub(began)

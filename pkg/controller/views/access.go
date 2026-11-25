@@ -205,6 +205,12 @@ func (a *Access) needs(in []protocol.Need) []protocol.Need {
 
 		if !a.ownsTeam(needTeam(&n)) {
 			n.Packages, n.Action, n.PullError = nil, nil, ""
+
+			if n.Spec != nil && n.Spec.Command != nil {
+				spec := *n.Spec
+				spec.Command = nil
+				n.Spec = &spec
+			}
 		}
 
 		out = append(out, n)
@@ -305,17 +311,32 @@ func (a *Access) ownsNeed(needs []protocol.Need, id string) bool {
 }
 
 // Rollout is a rollout as a login without the full view sees it: a packages
-// rollout without its packages.
+// rollout without its packages, a group rollout of a team the login does not
+// own without the command line changes of its targets.
 func (a *Access) Rollout(r *RolloutView) *RolloutView {
-	if a.Full || r.Kind != fleet.RolloutPackages {
+	switch {
+	case a.Full:
 		return r
+	case r.Kind == fleet.RolloutPackages:
+		out := *r
+		out.Packages = nil
+		out.Title = reducedPackagesTitle
+
+		return &out
+	case a.ownsTeam(r.Team) || !slices.ContainsFunc(r.Targets, func(t fleet.RolloutTarget) bool {
+		return t.Command != nil
+	}):
+		return r
+	default:
+		out := *r
+		out.Targets = slices.Clone(r.Targets)
+
+		for i := range out.Targets {
+			out.Targets[i].Command = nil
+		}
+
+		return &out
 	}
-
-	out := *r
-	out.Packages = nil
-	out.Title = reducedPackagesTitle
-
-	return &out
 }
 
 // Rollouts is the rollout view as the login sees it.

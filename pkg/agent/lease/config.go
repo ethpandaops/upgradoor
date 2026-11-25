@@ -10,7 +10,9 @@ const (
 
 // Config is the verify section of agent.yaml.
 type Config struct {
-	// Window is how long touched containers must run without a restart (default 45s).
+	// Window is how long verifying watches the touched containers; each must
+	// then have run stableUp (at most the window) without a restart, and one
+	// that restarted late extends it up to maxVerify (default 45s).
 	Window time.Duration `yaml:"window"`
 	// Timeout bounds the starting and verifying phases together (default 10m).
 	Timeout time.Duration `yaml:"timeout"`

@@ -248,3 +248,29 @@ func TestDeployWithAMovedTagAnswersToTheImagePolicy(t *testing.T) {
 	assert.Len(t, next.Targets, 2)
 	assert.Equal(t, fleet.PolicyManual, b.w.Settings.RolloutPolicy(next))
 }
+
+// A soft deploy's target carries how the command line changes, as the agent
+// reports it; from an older agent it has none.
+func TestDeployTargetCarriesTheCommandDelta(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.host("a", 10)
+	b.host("b", 10)
+	b.deploysInGroup("a", "geth", protocol.KindEL, "geth", imgGeth, digestA)
+	b.deploysInGroup("b", "beacon", protocol.KindCL, "lighthouse", imgLighthouse, digestA)
+
+	delta := &protocol.CommandDelta{Added: []string{"--new"}, Removed: []string{"--old"}}
+	s := b.get("a").Status.Needs[0].Spec
+	s.FromImage, s.Flags, s.Command = "ethpandaops/geth:v1", true, delta
+	b.step()
+
+	got := b.openGroup(protocol.KindEL, "geth").Targets
+	require.Len(t, got, 1)
+	assert.Equal(t, "ethpandaops/geth:v1", got[0].FromImage)
+	assert.True(t, got[0].Flags)
+	assert.Equal(t, delta, got[0].Command)
+	assert.NotSame(t, delta, got[0].Command)
+
+	old := b.openGroup(protocol.KindCL, "lighthouse").Targets
+	require.Len(t, old, 1)
+	assert.Nil(t, old[0].Command)
+}

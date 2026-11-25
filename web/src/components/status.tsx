@@ -16,6 +16,7 @@ import {
   type StepStatus,
 } from '../api/types';
 import { displayImage, shortDigest, shortRevision } from '../lib/format';
+import { CommandChange } from './CommandChange';
 import { CopyValue, Digest } from './Digest';
 import { Badge, Dash, type Tone } from './primitives';
 
@@ -318,7 +319,12 @@ export function NeedLine({ need }: { need: Need }) {
           <span className="text-muted">onto agent.yaml's</span>
           <span className="font-mono text-muted">{need.spec.image}</span>
           <Digest value={need.spec.toDigest} />
-          {need.spec.flags && <span className="text-muted">command line changes</span>}
+          <CommandChange
+            fromImage={need.spec.fromImage}
+            flags={need.spec.flags}
+            command={need.spec.command}
+            label={`Command line change of ${need.spec.container}`}
+          />
         </>
       )}
       {need.kind === 'packages' &&

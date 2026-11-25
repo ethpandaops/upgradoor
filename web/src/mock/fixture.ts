@@ -478,7 +478,10 @@ function imageNeed(c: Container, pullFailed = false): Need {
   };
 }
 
-/** specNeed moves a container that runs another image than agent.yaml names back onto it. */
+/** enr is a made-up bootnode record of about the length of a real one. */
+const enr = (seed: string) => `enr:-${hex(`enr/${seed}`, 64).repeat(5)}`;
+
+/** specNeed moves a container that runs another image than agent.yaml names back onto it; Ansible changed its bootnodes too. */
 function specNeed(c: Container): Need {
   const image = c.configuredImage ?? c.image;
   const to = currentDigest(image);
@@ -495,6 +498,11 @@ function specNeed(c: Container): Need {
       fromImage: c.image,
       toDigest: to,
       toRevision: revision(to),
+      flags: true,
+      command: {
+        added: [`--bootnodes=${['a', 'b', 'd'].map(enr).join(',')}`, '--maxpeers=80'],
+        removed: [`--bootnodes=${['a', 'b', 'c'].map(enr).join(',')}`, '--maxpeers=50', '--nat=any'],
+      },
     },
   };
 }

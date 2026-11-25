@@ -300,6 +300,32 @@ describe('RolloutTargets', () => {
       'specprysm-validator→gcr.io/offchainlabs/prysm/validator:latest@bbbbbbbbbbbbcommand line changed',
     ]);
   });
+
+  it('shows what a soft deploy changes, folded away', () => {
+    render(
+      <RolloutTargets
+        label="Targets"
+        targets={[
+          {
+            image: 'ethpandaops/geth:v2',
+            digest: digest('a'),
+            spec: 'k1',
+            container: 'geth',
+            fromImage: 'ethpandaops/geth:v1',
+            flags: true,
+            command: { added: ['--syncmode=full'], removed: ['--syncmode=snap'] },
+          },
+        ]}
+      />
+    );
+
+    const target = screen.getByRole('list', { name: 'Targets' });
+    expect(target).toHaveTextContent('from ethpandaops/geth:v1');
+    expect(target).toHaveTextContent('command line changed +1 \u22121');
+    const change = screen.getByRole('list', { name: 'Command line change of geth' });
+    expect(change.closest('details')).not.toHaveAttribute('open');
+    expect(change).toHaveTextContent('--syncmodesnap→full');
+  });
 });
 
 describe('RecentRollouts', () => {

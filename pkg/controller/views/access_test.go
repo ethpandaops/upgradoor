@@ -28,6 +28,9 @@ func accessHost() *HostSummary {
 		Needs: []protocol.Need{
 			{ID: "p", Kind: protocol.NeedPackages, Packages: &protocol.PackagesNeed{}},
 			{ID: "i", Kind: protocol.NeedImage, PullError: "e", Image: &protocol.ImageNeed{Team: "geth"}},
+			{ID: "s", Kind: protocol.NeedSpec, Spec: &protocol.SpecNeed{
+				Team: "teku", Flags: true, Command: &protocol.CommandDelta{Added: []string{"--z"}},
+			}},
 		},
 	}
 }
@@ -56,6 +59,9 @@ func TestAccessSummary(t *testing.T) {
 		got.Containers[1])
 	assert.Nil(t, got.Needs[0].Packages)
 	assert.Equal(t, "e", got.Needs[1].PullError, "the need of the team's container")
+	assert.Nil(t, got.Needs[2].Spec.Command, "another team's command line")
+	assert.True(t, got.Needs[2].Spec.Flags)
+	assert.NotNil(t, sum.Needs[2].Spec.Command)
 
 	assert.Equal(t, "c1", sum.Containers[0].ID, "the summary is not changed")
 	assert.NotNil(t, sum.Resources)
@@ -113,6 +119,17 @@ func TestAccessRollout(t *testing.T) {
 	assert.Nil(t, got.Packages)
 	assert.Equal(t, fleet.PolicyManual, got.Policy)
 	assert.Same(t, r, (&Access{Full: true}).Rollout(r))
+
+	group := &RolloutView{Rollout: fleet.Rollout{
+		Kind: fleet.RolloutGroup, Team: "geth",
+		Targets: []fleet.RolloutTarget{{Spec: "k", Flags: true, Command: &protocol.CommandDelta{Added: []string{"--x"}}}},
+	}}
+	assert.Same(t, group, (&Access{Teams: []string{"geth"}}).Rollout(group), "the team's own")
+
+	other := (&Access{Teams: []string{"teku"}}).Rollout(group)
+	assert.Nil(t, other.Targets[0].Command, "another team's command line")
+	assert.True(t, other.Targets[0].Flags)
+	assert.NotNil(t, group.Targets[0].Command)
 
 	entries := (&Access{}).Audit([]fleet.AuditEntry{{
 		Action: "rollout.created", Detail: map[string]any{"title": "packages: openssl 3"},

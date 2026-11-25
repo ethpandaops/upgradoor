@@ -254,7 +254,7 @@ func TestNeedsOfTargets(t *testing.T) {
 	assert.Equal(t, &protocol.SpecNeed{
 		Container: "geth", Kind: protocol.KindEL, Team: "geth", Key: n.Spec.Key,
 		Image: "ethpandaops/geth:v2", FromImage: "ethpandaops/geth:master", FromDigest: "sha256:a",
-		ToDigest: "sha256:v2", Flags: true,
+		ToDigest: "sha256:v2", Flags: true, Command: &protocol.CommandDelta{Added: []string{"--new"}},
 	}, n.Spec)
 
 	// An override.

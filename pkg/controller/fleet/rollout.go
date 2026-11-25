@@ -49,10 +49,14 @@ type RolloutTarget struct {
 	Revision string `json:"revision,omitempty"`
 	// Spec is the key of a soft deploy (protocol.SpecNeed.Key); empty for a
 	// tag that moved. Container names the container it was first reported
-	// for, Flags that its command line changes.
-	Spec      string `json:"spec,omitempty"`
-	Container string `json:"container,omitempty"`
-	Flags     bool   `json:"flags,omitempty"`
+	// for, FromImage the image it ran there when that was another one, Flags
+	// that its command line changes and Command how (the key covers it, so
+	// it holds for every host of the target); absent from older agents.
+	Spec      string                 `json:"spec,omitempty"`
+	Container string                 `json:"container,omitempty"`
+	FromImage string                 `json:"fromImage,omitempty"`
+	Flags     bool                   `json:"flags,omitempty"`
+	Command   *protocol.CommandDelta `json:"command,omitempty"`
 }
 
 // RolloutState is the lifecycle state of a rollout.
@@ -284,7 +288,8 @@ const (
 	// or readiness did not arrive in time.
 	LeaseFailed LeaseState = "failed"
 	// LeaseExpired: the agent never started and the lease ran out, or it
-	// finished without disrupting anything. Not a failure.
+	// finished without running a step (every one superseded, refused or
+	// deferred). Not a failure.
 	LeaseExpired LeaseState = "expired"
 	// LeaseCancelled: a person ended the lease (Lease.Cancelled) and it is
 	// over. Not a failure.

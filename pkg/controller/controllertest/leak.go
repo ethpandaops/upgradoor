@@ -1,6 +1,7 @@
 package controllertest
 
 import (
+	"slices"
 	"testing"
 	"time"
 
@@ -178,12 +179,22 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 		},
 	}
 
+	// Ansible changed geth's command line: the change is the team's.
+	deploy := &protocol.CommandDelta{Added: []string{SecretFlag}}
+	spec := protocol.Need{
+		ID: protocol.SpecNeedID("geth", "k1"), Kind: protocol.NeedSpec,
+		Spec: &protocol.SpecNeed{
+			Container: "geth", Kind: protocol.KindEL, Team: SecretOwnerEL, Key: "k1",
+			Image: "ethereum/client-go:stable", ToDigest: "sha256:e1e1", Flags: true, Command: deploy,
+		},
+	}
+
 	st.Hosts["lighthouse-geth-1"] = &fleet.Host{
 		Name: "lighthouse-geth-1", CertHash: SecretCertHash,
 		Validators: []identity.ValidatorRange{{Start: 0, End: 100}},
 		Roles:      []string{"ethereum_node"},
 		FirstSeen:  Epoch.Add(-48 * time.Hour), LastSeen: Epoch,
-		RemoteAddr: SecretAddr, Status: status("sha256:c1c1", needs),
+		RemoteAddr: SecretAddr, Status: status("sha256:c1c1", append(slices.Clone(needs), spec)),
 		InventoryHash: "inv-hash",
 	}
 	st.Hosts["lighthouse-geth-2"] = &fleet.Host{
@@ -245,6 +256,14 @@ func LeakFixture(t *testing.T, st *Store, sched *Scheduler, beacon *Beacon) {
 	st.Rollouts = []*fleet.Rollout{{
 		ID: "rollout-zz", Kind: fleet.RolloutReboot, Key: "reboot", Title: "reboot",
 		State: fleet.RolloutActive, Paused: true, PauseReason: SecretPauseReason,
+		Hosts: []fleet.RolloutHost{{Host: "lighthouse-geth-1", State: fleet.HostPending}},
+	}, {
+		ID: "rollout-geth", Kind: fleet.RolloutGroup, Key: "unit:el#" + SecretOwnerEL + "@k1",
+		Title: "geth", ContainerKind: protocol.KindEL, Team: SecretOwnerEL, State: fleet.RolloutActive,
+		Targets: []fleet.RolloutTarget{{
+			Image: "ethereum/client-go:stable", Digest: "sha256:e1e1", Spec: "k1", Container: "geth",
+			Flags: true, Command: deploy,
+		}},
 		Hosts: []fleet.RolloutHost{{Host: "lighthouse-geth-1", State: fleet.HostPending}},
 	}}
 	// Per-host slot participation: public is the sum only, too.

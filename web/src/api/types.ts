@@ -282,7 +282,23 @@ interface SpecNeed {
   toRevision?: string;
   /** The command line changes. */
   flags?: boolean;
+  /** How the command line changes; absent from older agents. */
+  command?: CommandDelta;
 }
+
+/**
+ * protocol.CommandDelta: the arguments a command line gains and loses, each
+ * sorted and bounded. truncated: arguments were left out or cut; a cut one
+ * ends in COMMAND_DELTA_CUT.
+ */
+export interface CommandDelta {
+  added?: List<string>;
+  removed?: List<string>;
+  truncated?: boolean;
+}
+
+/** protocol.CommandDeltaCut */
+export const COMMAND_DELTA_CUT = '\u2026';
 
 /** protocol.PackageChange */
 interface PackageChange {
@@ -545,10 +561,12 @@ export interface RolloutTarget {
   revision?: string;
   /** The key of a soft deploy (SpecNeed.key); absent for a tag that moved. */
   spec?: string;
-  /** The container a soft deploy was first reported for. */
+  /** The container a soft deploy was first reported for, and the image it ran there when that was another one. */
   container?: string;
-  /** The soft deploy changes the command line. */
+  fromImage?: string;
+  /** The soft deploy changes the command line, and how (the same on every host of the target; absent from older agents). */
   flags?: boolean;
+  command?: CommandDelta;
 }
 
 /** views.RolloutView: a fleet.Rollout with its policy. */

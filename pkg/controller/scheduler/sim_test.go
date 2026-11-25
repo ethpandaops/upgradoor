@@ -1823,11 +1823,14 @@ type simAgent struct {
 	startAt  time.Time
 	// op is the operation on lease; it ends at opEnd with opFail deciding
 	// the outcome. down is true while the operation has things stopped.
+	// quiet: the operation is a package upgrade that restarts no container,
+	// done without a disruption.
 	op     *protocol.Operation
 	opEnd  time.Time
 	opFail bool
 	reboot bool
 	down   bool
+	quiet  bool
 	// upAt is when the last operation ended: the node finds its peers again
 	// from then on.
 	upAt time.Time
@@ -2628,6 +2631,7 @@ func (w *simWorld) startOperation(a *simAgent) {
 	}
 
 	a.reboot = false
+	a.quiet = false
 	a.stepFail = -1
 	a.beginAt = make([]time.Time, len(a.lease.Needs))
 
@@ -2660,8 +2664,14 @@ func (w *simWorld) startOperation(a *simAgent) {
 		op.Phase = protocol.PhaseDraining
 	}
 
+	// Now and then a package upgrade restarts nothing: the agent reports it
+	// done without a disruption.
+	a.quiet = !slices.ContainsFunc(runs, func(i int) bool {
+		return a.lease.Needs[i].Kind != protocol.NeedPackages
+	}) && w.rng.IntN(3) == 0
+
 	// Work on slot and independent containers leaves the node up.
-	a.down = simLeaseImpact(a, a.lease.Needs) == protocol.ImpactNode
+	a.down = !a.quiet && simLeaseImpact(a, a.lease.Needs) == protocol.ImpactNode
 
 	if a.overrun {
 		a.late[op.LeaseID] = true
@@ -2831,6 +2841,10 @@ func (w *simWorld) finishOperation(a *simAgent) {
 	// what the package upgrade of the same operation asked for.
 	if rebooted {
 		a.rebootRequired = a.rebootSticks
+	}
+
+	if a.quiet && op.Phase == protocol.PhaseDone {
+		op.Disrupted = false
 	}
 }
 
@@ -3459,6 +3473,13 @@ func (o *oracle) checkEnd(f *simFacts, snap *simSnapshot, l *fleet.Lease) error 
 		if l.Outcome == fleet.OutcomeNoWorse && (l.Baseline == nil || l.Baseline.Unready == "" ||
 			l.AgentDoneAt == nil || l.EndedAt.Sub(*l.AgentDoneAt) < f.settings.BaselineGrace.Std()) {
 			return errors.New("released as no worse, and its host was ready before it or the grace did not pass")
+		}
+	case fleet.LeaseExpired:
+		// A lease in which a step ran is verified, disrupted or not.
+		if report != nil && slices.ContainsFunc(report.Steps, func(s protocol.Step) bool {
+			return s.Status == protocol.StepDone
+		}) {
+			return errors.New("expired, and its agent reported a step done")
 		}
 	case fleet.LeaseFailed:
 		for _, id := range o.serves[l.ID] {

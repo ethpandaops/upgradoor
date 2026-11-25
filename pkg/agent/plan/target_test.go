@@ -1,10 +1,13 @@
 package plan
 
 import (
+	"fmt"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -202,4 +205,42 @@ func TestSpecKeyIsShared(t *testing.T) {
 	added, removed := argDelta([]string{"--a", "--b", "--b"}, []string{"--b", "--c", "--c"})
 	assert.Equal(t, []string{"--c"}, added)
 	assert.Equal(t, []string{"--a"}, removed)
+}
+
+func TestSpecCommand(t *testing.T) {
+	assert.Nil(t, specCommand([]string{"--a", "--b"}, []string{"--b", "--a"}), "only the order")
+
+	assert.Equal(t, &protocol.CommandDelta{
+		Added: []string{"--bootnodes=enr:a,enr:c", "--new"}, Removed: []string{"--bootnodes=enr:a,enr:b"},
+	}, specCommand(
+		[]string{"--http", "--bootnodes=enr:a,enr:b"},
+		[]string{"--http", "--new", "--bootnodes=enr:a,enr:c"},
+	))
+
+	// A long argument is cut on a rune boundary.
+	long := "--bootnodes=" + strings.Repeat("é", maxDeltaArgLen)
+	got := specCommand(nil, []string{long})
+	require.Len(t, got.Added, 1)
+	assert.True(t, got.Truncated)
+	assert.LessOrEqual(t, len(got.Added[0]), maxDeltaArgLen)
+	assert.True(t, strings.HasSuffix(got.Added[0], protocol.CommandDeltaCut))
+	assert.True(t, utf8.ValidString(got.Added[0]))
+	assert.True(t, strings.HasPrefix(long, strings.TrimSuffix(got.Added[0], protocol.CommandDeltaCut)))
+
+	// The count and the bytes of one side are bounded; the other side keeps its own.
+	many := make([]string, 0, maxDeltaArgs+4)
+	for i := range maxDeltaArgs + 4 {
+		many = append(many, fmt.Sprintf("--f%02d", i))
+	}
+
+	got = specCommand([]string{"--old"}, many)
+	assert.True(t, got.Truncated)
+	assert.Equal(t, many[:maxDeltaArgs], got.Added)
+	assert.Equal(t, []string{"--old"}, got.Removed)
+
+	big := []string{"--a=" + strings.Repeat("x", 3<<10), "--b=" + strings.Repeat("x", 3<<10), "--c=" + strings.Repeat("x", 3<<10)}
+	got = specCommand(big, nil)
+	assert.True(t, got.Truncated)
+	assert.Equal(t, big[:2], got.Removed)
+	assert.Nil(t, got.Added)
 }

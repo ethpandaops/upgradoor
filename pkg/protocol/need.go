@@ -145,6 +145,33 @@ type SpecNeed struct {
 	ToRevision string `json:"toRevision,omitempty"`
 	// Flags is true when the command line changes.
 	Flags bool `json:"flags,omitempty"`
+	// Command is how the command line changes, bounded; absent when it does
+	// not, and from agents that do not report it.
+	Command *CommandDelta `json:"command,omitempty"`
+}
+
+// CommandDelta is how a command line changes: the arguments it gains and the
+// ones it loses, each sorted and unique. The lists are bounded; Truncated
+// says that arguments were left out or cut, a cut one ending in
+// CommandDeltaCut.
+type CommandDelta struct {
+	Added     []string `json:"added,omitempty"`
+	Removed   []string `json:"removed,omitempty"`
+	Truncated bool     `json:"truncated,omitempty"`
+}
+
+// CommandDeltaCut ends an argument of a CommandDelta that was cut short.
+const CommandDeltaCut = "\u2026"
+
+// Clone returns a deep copy; nil stays nil.
+func (d *CommandDelta) Clone() *CommandDelta {
+	if d == nil {
+		return nil
+	}
+
+	return &CommandDelta{
+		Added: slices.Clone(d.Added), Removed: slices.Clone(d.Removed), Truncated: d.Truncated,
+	}
 }
 
 // PackagesNeed asks to upgrade blocked packages.

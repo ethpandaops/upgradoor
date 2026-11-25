@@ -89,7 +89,8 @@ func targetOf(n *protocol.Need) fleet.RolloutTarget {
 	if s := n.Spec; s != nil {
 		return fleet.RolloutTarget{
 			Image: s.Image, Digest: s.ToDigest, Revision: s.ToRevision,
-			Spec: s.Key, Container: s.Container, Flags: s.Flags,
+			Spec: s.Key, Container: s.Container, FromImage: s.FromImage, Flags: s.Flags,
+			Command: s.Command.Clone(),
 		}
 	}
 

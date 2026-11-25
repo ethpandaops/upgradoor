@@ -129,6 +129,7 @@ func targetNeed(
 				Container: c.Name, Kind: c.Kind, Team: c.Team, Key: key,
 				Image: t.Image, FromImage: fromImage, FromDigest: c.Digest,
 				ToDigest: rc.Digest, ToRevision: rc.Revision, Flags: t.Flags,
+				Command: specCommand(c.Command, t.Command),
 			},
 		}, true
 	}
@@ -250,6 +251,7 @@ func cloneNeed(n *protocol.Need) protocol.Need {
 
 	if n.Spec != nil {
 		s := *n.Spec
+		s.Command = n.Spec.Command.Clone()
 		out.Spec = &s
 	}
 

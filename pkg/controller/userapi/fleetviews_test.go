@@ -57,7 +57,7 @@ func TestHosts(t *testing.T) {
 	assert.Equal(t, []string{protocol.HolderHost, fleet.HolderStaff}, one.Holders)
 	assert.Empty(t, boot.Holders)
 	assert.Equal(t, []protocol.Verb{protocol.VerbRoll, protocol.VerbPackages}, one.Verbs)
-	assert.Len(t, one.Needs, 2)
+	assert.Len(t, one.Needs, 3)
 	assert.Equal(t, scheduler.SlotHeld, one.Plan.Slot)
 	assert.Equal(t, uint64(90), one.Plan.Live)
 
@@ -875,6 +875,8 @@ func TestHostDetailsFeature(t *testing.T) {
 		assert.NotContains(t, raw, controllertest.SecretCertHash)
 		assert.Contains(t, read("/api/v1/clients/"+controllertest.SecretOwnerEL+"/hosts", member),
 			controllertest.SecretFlag)
+		assert.Contains(t, read("/api/v1/rollouts", member), controllertest.SecretFlag,
+			"the command line change of the team's deploy")
 	})
 
 	t.Run("owned hosts", func(t *testing.T) {
@@ -968,8 +970,13 @@ func TestAdminFeature(t *testing.T) {
 
 	// The policies that the views need come with the rows.
 	rollouts := controllertest.DecodeJSON[views.Rollouts](t, get("/api/v1/rollouts", provider.Grant(t, "+upgradoor")))
-	require.Len(t, rollouts.Open, 1)
-	assert.Equal(t, fleet.DefaultSettings().PolicyReboot, rollouts.Open[0].Policy)
+	require.Len(t, rollouts.Open, 2)
+
+	for _, r := range rollouts.Open {
+		if r.Kind == fleet.RolloutReboot {
+			assert.Equal(t, fleet.DefaultSettings().PolicyReboot, r.Policy)
+		}
+	}
 
 	clients := controllertest.DecodeJSON[views.Clients](t, get("/api/v1/clients", provider.Grant(t, "+upgradoor")))
 	require.NotEmpty(t, clients.Clients)

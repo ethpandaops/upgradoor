@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"fmt"
+	"slices"
 	"testing"
 	"time"
 
@@ -332,6 +333,7 @@ func TestOperationThatDisruptedNothing(t *testing.T) {
 		out := b.step()
 		assert.Equal(t, fleet.LeaseExpired, out.Leases[0].State)
 		assert.Equal(t, []string{"lease.expired", "rollout.completed"}, auditActions(out))
+		assert.Equal(t, reasonNotDisrupted, out.Audit[0].Detail[keyReason])
 		assert.Equal(t, fleet.HostDone, b.closed(packagesKey("2.0")).Host("a").State)
 		assert.Equal(t, uint64(0), out.Plan.Budget.UnavailableWeight)
 	})
@@ -372,6 +374,7 @@ func TestOperationThatDisruptedNothing(t *testing.T) {
 
 		out := b.step()
 		assert.Equal(t, fleet.LeaseExpired, out.Leases[0].State)
+		assert.Equal(t, reasonNotDisrupted, out.Audit[0].Detail[keyReason])
 		assert.Nil(t, b.lease("a"))
 		assert.Empty(t, b.get("a").Broken)
 		assert.Equal(t, reasonPull, queueReasons(out.Plan)["a"])
@@ -386,6 +389,56 @@ func TestOperationThatDisruptedNothing(t *testing.T) {
 		b.step()
 		assert.NotNil(t, b.lease("a"))
 	})
+}
+
+// A step that ran without restarting anything (a package upgrade that touched
+// no container) is verified and released: its member keeps the lease ID, is
+// the rollout's success, and the rest of the fleet goes in parallel.
+func TestOperationThatRanWithoutDisruption(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.w.Settings.MaxLeasedPercent = 100
+	hosts := []string{"a", "b", "c"}
+
+	for _, name := range hosts {
+		b.host(name, 0)
+		b.wants(name, packagesNeed("2.0"))
+	}
+
+	key := packagesKey("2.0")
+
+	b.step()
+	require.Len(t, b.leasedHosts(), 1, "the canary alone")
+
+	canary := b.leasedHosts()[0]
+	assert.Equal(t, canary, b.mustRollout(key).Canary)
+
+	id := b.lease(canary).ID
+	b.report(canary, protocol.PhaseDone, false)
+	b.get(canary).Status.Needs = nil
+
+	out := b.step()
+	require.NotNil(t, b.lease(canary))
+	assert.Equal(t, fleet.LeaseVerifying, b.lease(canary).State)
+	assert.NotContains(t, auditActions(out), "lease.expired")
+
+	b.advance(5 * time.Second)
+	b.step()
+	b.advance(2 * testEpoch)
+	b.step()
+
+	l := b.lastLease(canary)
+	require.NotNil(t, l)
+	assert.Equal(t, id, l.ID)
+	assert.Equal(t, fleet.LeaseReleased, l.State)
+
+	r := b.mustRollout(key)
+	assert.Equal(t, fleet.HostDone, r.Host(canary).State)
+	assert.Equal(t, id, r.Host(canary).LeaseID)
+	assert.True(t, doneByRelease(r.Host(canary)))
+	assert.Equal(t, canary, r.Canary)
+
+	rest := slices.DeleteFunc(slices.Clone(hosts), func(h string) bool { return h == canary })
+	assert.Equal(t, rest, b.leasedHosts(), "served together after the canary")
 }
 
 // The lease shows the progress of the agent's pull as of its last sync, as a

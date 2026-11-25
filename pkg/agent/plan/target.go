@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"slices"
+	"unicode/utf8"
 
 	"github.com/ethpandaops/upgradoor/pkg/imageref"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -192,6 +193,71 @@ func argDelta(from, to []string) (added, removed []string) {
 	}
 
 	return missing(to, from), missing(from, to)
+}
+
+// Bounds of a spec need's command delta, per side: the arguments it names,
+// the bytes of one argument and of all of them.
+const (
+	maxDeltaArgs   = 16
+	maxDeltaArgLen = 4 << 10
+	maxDeltaBytes  = 8 << 10
+)
+
+// specCommand is how a spec need changes the command line: argDelta, which
+// the spec key covers, so every host of a key reports the same delta. An
+// argument longer than maxDeltaArgLen is cut; one that does not fit the
+// side's bytes is left out with every one after it. Nil when nothing changes.
+func specCommand(from, to []string) *protocol.CommandDelta {
+	added, removed := argDelta(from, to)
+	if len(added)+len(removed) == 0 {
+		return nil
+	}
+
+	d := &protocol.CommandDelta{}
+	d.Added = boundArgs(added, &d.Truncated)
+	d.Removed = boundArgs(removed, &d.Truncated)
+
+	return d
+}
+
+// boundArgs keeps args within the bounds of one side of a delta, setting
+// truncated when it cuts or leaves out any.
+func boundArgs(args []string, truncated *bool) []string {
+	out := make([]string, 0, min(len(args), maxDeltaArgs))
+	size := 0
+
+	for i, arg := range args {
+		if len(arg) > maxDeltaArgLen {
+			arg = cutArg(arg, maxDeltaArgLen)
+			*truncated = true
+		}
+
+		if i == maxDeltaArgs || size+len(arg) > maxDeltaBytes {
+			*truncated = true
+
+			break
+		}
+
+		size += len(arg)
+		out = append(out, arg)
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
+}
+
+// cutArg shortens arg to at most limit bytes on a rune boundary, ending in
+// protocol.CommandDeltaCut.
+func cutArg(arg string, limit int) string {
+	n := limit - len(protocol.CommandDeltaCut)
+	for n > 0 && !utf8.RuneStart(arg[n]) {
+		n--
+	}
+
+	return arg[:n] + protocol.CommandDeltaCut
 }
 
 func (t *Target) needID(c *protocol.Container, digest string) string {

@@ -97,8 +97,9 @@ type Operation struct {
 	Error string `json:"error,omitempty"`
 	Steps []Step `json:"steps"`
 	// Disrupted is true once the agent has stopped anything. An operation
-	// that ends without it (every step superseded or refused, or the lease
-	// expired before the start) cost no availability.
+	// that ends without it (every step superseded or refused, the lease
+	// expired before the start, or a package upgrade that restarted no
+	// container) cost no availability.
 	Disrupted bool `json:"disrupted"`
 	// Pull is the image pull in flight while the phase is pulling. Older
 	// agents omit it.

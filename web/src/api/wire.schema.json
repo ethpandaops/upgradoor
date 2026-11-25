@@ -1,5 +1,5 @@
 {
- "version": "ce78e4a7a75f",
+ "version": "3eabe5076196",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -355,6 +355,23 @@
    {
     "n": "version",
     "t": "r"
+   }
+  ],
+  "CommandDelta": [
+   {
+    "n": "added",
+    "t": "l",
+    "omit": true
+   },
+   {
+    "n": "removed",
+    "t": "l",
+    "omit": true
+   },
+   {
+    "n": "truncated",
+    "t": "b",
+    "omit": true
    }
   ],
   "Container": [
@@ -1575,8 +1592,19 @@
     "omit": true
    },
    {
+    "n": "fromImage",
+    "t": "s",
+    "omit": true
+   },
+   {
     "n": "flags",
     "t": "b",
+    "omit": true
+   },
+   {
+    "n": "command",
+    "t": "o",
+    "of": "CommandDelta",
     "omit": true
    }
   ],
@@ -1783,6 +1811,12 @@
    {
     "n": "flags",
     "t": "b",
+    "omit": true
+   },
+   {
+    "n": "command",
+    "t": "o",
+    "of": "CommandDelta",
     "omit": true
    }
   ],

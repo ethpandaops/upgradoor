@@ -136,7 +136,11 @@ func (p *pass) applyOperation(l *fleet.Lease, hv *hostView, op *protocol.Operati
 
 		l.AgentDoneAt = &doneAt
 
-		if !op.Disrupted {
+		// A step that ran without a restart (a package upgrade that touched
+		// no container) is verified like any other.
+		if !op.Disrupted && !slices.ContainsFunc(op.Steps, func(s protocol.Step) bool {
+			return s.Status == protocol.StepDone
+		}) {
 			p.expireLease(l, reasonNotDisrupted)
 
 			return
