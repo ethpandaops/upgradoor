@@ -41,6 +41,8 @@ type Store interface {
 	Commit(ctx context.Context, changes *store.Changes) error
 	LoadSettings(ctx context.Context, defaults fleet.Settings) (fleet.Settings, error)
 	SaveSettings(ctx context.Context, defaults, settings fleet.Settings) error
+	DeployWindow(ctx context.Context) (fleet.DeployWindowState, error)
+	ArmDeployWindow(ctx context.Context, at time.Time, entry *fleet.AuditEntry) (bool, error)
 	AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error
 }
 
@@ -301,6 +303,10 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 		Settings: settings,
 		Health:   s.opts.Health(),
 		NewID:    s.opts.NewID,
+	}
+
+	if w.DeployWindow, err = st.DeployWindow(ctx); err != nil {
+		return nil, fmt.Errorf("scheduler: load deploy window: %w", err)
 	}
 
 	if w.Hosts, err = st.ListHosts(ctx); err != nil {

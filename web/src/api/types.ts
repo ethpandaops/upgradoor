@@ -801,6 +801,8 @@ export interface Settings {
   /** How often the controller looks a tag up at its registry (Go duration). */
   lookupInterval: string;
   paused: boolean;
+  /** Length of the initial deployment window from the controller's first start (Go duration); "0s" is none. */
+  deployWindow: string;
 }
 
 // --------------------------------------------------------------- scheduler
@@ -919,6 +921,11 @@ export interface ScopeRequest {
   reason: string;
 }
 
+/** scheduler.ArmRequest: the body of arm-deploy-window. */
+export interface ArmRequest {
+  reason: string;
+}
+
 /** scheduler.ApproveLeaseRequest: the body of approve-lease, the verifying lease of one member of a rollout. */
 export interface ApproveLeaseRequest {
   rollout: string;
@@ -998,6 +1005,7 @@ export type WaitKind =
   | 'approval'
   | 'rollout-paused'
   | 'paused'
+  | 'deploy-window'
   | 'silent'
   | 'working'
   | 'held';
@@ -1048,10 +1056,20 @@ export interface PendingHold {
   at: string;
 }
 
+/** scheduler.DeployWindow: while it is open no lease is granted but for Ansible deploys. */
+export interface DeployWindow {
+  open: boolean;
+  /** When the window closes by time; absent when the setting is 0 or there is no window. */
+  until?: string;
+  /** When the window was armed; absent while not armed. */
+  armedAt?: string;
+}
+
 /** scheduler.Plan */
 export interface Plan {
   computedAt: string;
   paused: boolean;
+  deployWindow: DeployWindow;
   gate: Gate;
   budget: Budget;
   queue: List<QueueEntry>;

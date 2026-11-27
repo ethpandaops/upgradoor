@@ -1288,6 +1288,39 @@ func TestHoldAndUnholdActions(t *testing.T) {
 	assert.NotNil(t, h.assignment("a").Lease)
 }
 
+func TestArmDeployWindow(t *testing.T) {
+	h := newHarness(t)
+	h.addHost("a", 0, rebootNeed())
+	h.store.window = fleet.DeployWindowState{StartedAt: h.now}
+
+	h.tick()
+	assert.True(t, h.svc.Plan().DeployWindow.Open)
+	assert.Contains(t, h.assignment("a").Queue.Reason, "initial deployment window until ")
+
+	res, err := h.svc.ArmDeployWindow(h.ctx, "alice", ArmRequest{Reason: "deployed"})
+	require.NoError(t, err)
+	assert.Equal(t, "armed: the deployment window is over", res.Message)
+
+	entry := h.store.lastAudit()
+	assert.Equal(t, "action.arm-deploy-window", entry.Action)
+	assert.Equal(t, "alice", entry.Actor)
+	assert.Equal(t, "deployed", entry.Detail["reason"])
+
+	audits := len(h.store.auditActions())
+	res, err = h.svc.ArmDeployWindow(h.ctx, "alice", ArmRequest{})
+	require.NoError(t, err)
+	assert.Equal(t, "the deployment window is not open", res.Message)
+	assert.Len(t, h.store.auditActions(), audits, "arming twice changes and audits nothing")
+
+	h.tick()
+
+	plan := h.svc.Plan()
+	assert.False(t, plan.DeployWindow.Open)
+	require.NotNil(t, plan.DeployWindow.ArmedAt)
+	assert.True(t, plan.DeployWindow.ArmedAt.Equal(h.now))
+	assert.Equal(t, []string{"a"}, h.leased(), "granted on the next pass")
+}
+
 func TestPauseAndResumeActions(t *testing.T) {
 	h := newHarness(t)
 	h.addHost("a", 0, rebootNeed())

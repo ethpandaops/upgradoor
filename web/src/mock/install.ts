@@ -11,7 +11,9 @@
 //   &fleet=large                   three hundred hosts in the middle of a
 //                                  rolling update, some of them offline
 //   &fleet=huge                    the same with twelve hundred hosts
-//   &fleet=quiet                   the small fleet with nothing going on
+//   &fleet=quiet                   the small fleet with nothing going on, in
+//                                  its initial deployment window
+//   &window=open                   start in the initial deployment window
 //   ?mock=auth&as=team             who the fake client is logged in as:
 //                                  staff (every feature), team (the team
 //                                  features, member of lighthouse) or reader
@@ -159,6 +161,7 @@ export function installMock(mode: MockMode, search: string): MockHandle {
   let client: FakeAuthenticatoor | undefined;
 
   if (params.get('gate') === 'fail') controller.setGateFailing(true);
+  if (params.get('window') === 'open') controller.openDeployWindow();
 
   if (mode === 'auth') {
     const as = params.get('as');

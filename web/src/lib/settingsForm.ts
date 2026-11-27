@@ -66,6 +66,15 @@ export const FIELDS: readonly FieldSpec[] = [
     hint: 'Nothing new is granted while this is on. Open leases finish. Use it before planned work on the devnet.',
   },
   {
+    key: 'deployWindow',
+    label: 'Deployment window',
+    kind: 'duration',
+    min: 0,
+    max: 720 * 3_600_000,
+    range: 'a duration like 24h, 0 to 720h',
+    hint: 'How long after the controller first started on a fresh store nothing is granted but Ansible deploys, while the devnet is bootstrapped and deployed. Changing it moves the end of an open window; 0 turns it off. Arm it to end it early.',
+  },
+  {
     key: 'maxUnavailablePercent',
     label: 'Max unavailable',
     kind: 'percent',
@@ -295,9 +304,9 @@ export const GROUPS: readonly GroupSpec[] = [
     id: 'scheduler',
     title: 'Scheduler',
     about:
-      'The switch for everything, how many hosts may update independent containers at once, and what happens to a new rollout of each kind.',
+      'The switch for everything, the initial deployment window, how many hosts may update independent containers at once, and what happens to a new rollout of each kind.',
     wide: true,
-    keys: ['paused', 'maxIndependentPercent'],
+    keys: ['paused', 'deployWindow', 'maxIndependentPercent'],
     kinds: ROLLOUT_KINDS,
     actionPolicies: true,
   },
@@ -526,6 +535,7 @@ export function fromForm(form: SettingsForm): FormSettings {
     readyPeerShare: Number(form.readyPeerShare),
     lookupInterval: duration('lookupInterval'),
     paused: form.paused === 'true',
+    deployWindow: duration('deployWindow'),
     actionPolicies: parsePolicies(form.actionPolicies) ?? {},
     policyKinds: parsePolicies(form.policyKinds) ?? {},
   };

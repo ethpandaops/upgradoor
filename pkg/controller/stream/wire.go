@@ -257,8 +257,9 @@ type wireImage struct {
 // wirePlan is a scheduler.Plan without the gate (tableNetwork), the queue
 // (tableQueue), the hosts (in the host rows) and the time it was computed at.
 type wirePlan struct {
-	Paused bool             `json:"paused"`
-	Budget scheduler.Budget `json:"budget"`
+	Paused       bool                   `json:"paused"`
+	Budget       scheduler.Budget       `json:"budget"`
+	DeployWindow scheduler.DeployWindow `json:"deployWindow"`
 }
 
 // wireMember is one host of a rollout.

@@ -48,6 +48,7 @@ type fakeStore struct {
 	directives map[string]*fleet.Directive
 	dirSeq     []string
 	settings   *fleet.Settings
+	window     fleet.DeployWindowState
 	audit      []fleet.AuditEntry
 
 	// failWrites makes every write fail; failNext fails that many writes,
@@ -595,6 +596,32 @@ func (s *fakeStore) AppendAudit(_ context.Context, entries ...fleet.AuditEntry) 
 	s.appendAudit(entries)
 
 	return nil
+}
+
+func (s *fakeStore) DeployWindow(context.Context) (fleet.DeployWindowState, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	return s.window, nil
+}
+
+func (s *fakeStore) ArmDeployWindow(_ context.Context, at time.Time, entry *fleet.AuditEntry) (bool, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if err := s.writable(); err != nil {
+		return false, err
+	}
+
+	if s.window.StartedAt.IsZero() || s.window.ArmedAt != nil {
+		return false, nil
+	}
+
+	armed := storedAt(at)
+	s.window.ArmedAt = &armed
+	s.appendAudit([]fleet.AuditEntry{*entry})
+
+	return true, nil
 }
 
 // auditActions lists the actions of the audit trail, oldest first.

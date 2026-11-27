@@ -638,6 +638,10 @@
   "plan": {
    "computedAt": "2026-11-14T12:00:00Z",
    "paused": false,
+   "deployWindow": {
+    "open": true,
+    "until": "2026-11-15T00:00:00Z"
+   },
    "gate": {
     "ok": false,
     "reasons": [
@@ -988,7 +992,8 @@
     "pauseAfterCanaryReboot": false,
     "readyPeerShare": 0,
     "lookupInterval": "5m0s",
-    "paused": false
+    "paused": false,
+    "deployWindow": "24h0m0s"
    },
    "defaults": {
     "maxUnavailablePercent": 10,
@@ -1015,7 +1020,8 @@
     "pauseAfterCanaryReboot": false,
     "readyPeerShare": 0,
     "lookupInterval": "5m0s",
-    "paused": false
+    "paused": false,
+    "deployWindow": "24h0m0s"
    },
    "kinds": [
     "el",
@@ -1135,7 +1141,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "3eabe5076196"
+  "v": "a8ca38cc7907"
  },
  "user": {
   "a": {
@@ -2159,6 +2165,10 @@
       200,
       20,
       10
+     ],
+     [
+      1,
+      1794700800
      ]
     ]
    ]
@@ -2348,7 +2358,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "3eabe5076196"
+  "v": "a8ca38cc7907"
  },
  "patch": {
   "c": {

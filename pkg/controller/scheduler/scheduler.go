@@ -89,6 +89,8 @@ type Service interface {
 	// pause and approves a rollout that waits on a manual policy.
 	Pause(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
 	Resume(ctx context.Context, actor string, req ScopeRequest) (*ActionResult, error)
+	// ArmDeployWindow ends an open initial deployment window now.
+	ArmDeployWindow(ctx context.Context, actor string, req ArmRequest) (*ActionResult, error)
 	// Skip marks hosts as skipped in a rollout. In a rollout of an observed
 	// cause the rollout stays open while a skipped host still has the need.
 	Skip(ctx context.Context, actor string, req RolloutHostsRequest) (*ActionResult, error)
@@ -283,6 +285,11 @@ type ScopeRequest struct {
 	Reason  string `json:"reason"`
 }
 
+// ArmRequest is the body of POST /api/v1/actions/arm-deploy-window.
+type ArmRequest struct {
+	Reason string `json:"reason"`
+}
+
 // RolloutHostsRequest is the body of skip and retry.
 type RolloutHostsRequest struct {
 	Rollout string   `json:"rollout"`
@@ -321,14 +328,28 @@ type ActionResult struct {
 type Plan struct {
 	ComputedAt time.Time `json:"computedAt"`
 	// Paused is the global pause.
-	Paused bool   `json:"paused"`
-	Gate   Gate   `json:"gate"`
-	Budget Budget `json:"budget"`
+	Paused bool `json:"paused"`
+	// DeployWindow is the initial deployment window.
+	DeployWindow DeployWindow `json:"deployWindow"`
+	Gate         Gate         `json:"gate"`
+	Budget       Budget       `json:"budget"`
 	// Queue lists every host with an open need that holds no lease, in the
 	// order the scheduler would serve them.
 	Queue []QueueEntry `json:"queue"`
 	// Hosts is the per-host availability view, keyed by host name.
 	Hosts map[string]HostPlan `json:"hosts"`
+}
+
+// DeployWindow is the state of the initial deployment window. While it is
+// open no lease is granted but for rollouts of Ansible deploys
+// (fleet.Rollout.Deployed).
+type DeployWindow struct {
+	Open bool `json:"open"`
+	// Until is when the window closes by time; nil when the setting is 0 or
+	// the store holds no window.
+	Until *time.Time `json:"until,omitempty"`
+	// ArmedAt is when the window was armed; nil while not armed.
+	ArmedAt *time.Time `json:"armedAt,omitempty"`
 }
 
 // Gate is the network gate. No new lease is granted while it fails, except
@@ -406,8 +427,8 @@ type WaitKind string
 // Wait kinds. Budget, host limit, pulls and order clear by themselves as the
 // rollout proceeds; pull clears when the agent lets a failed pull be tried
 // again; working clears when the operation the host works on without a lease
-// is over; gate clears when the network recovers; the others need somebody
-// to act.
+// is over; gate clears when the network recovers; deploy-window clears when
+// the window ends; the others need somebody to act.
 const (
 	WaitBudget    WaitKind = "budget"
 	WaitPull      WaitKind = "pull"
@@ -422,9 +443,11 @@ const (
 	WaitApproval      WaitKind = "approval"
 	WaitRolloutPaused WaitKind = "rollout-paused"
 	WaitPaused        WaitKind = "paused"
-	WaitSilent        WaitKind = "silent"
-	WaitWorking       WaitKind = "working"
-	WaitHeld          WaitKind = "held"
+	// WaitDeployWindow: the initial deployment window is open.
+	WaitDeployWindow WaitKind = "deploy-window"
+	WaitSilent       WaitKind = "silent"
+	WaitWorking      WaitKind = "working"
+	WaitHeld         WaitKind = "held"
 )
 
 // SlotState is a host's state in the availability view.

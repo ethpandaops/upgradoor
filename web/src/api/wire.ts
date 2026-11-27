@@ -370,7 +370,11 @@ export function buildViews(doc: WireDoc, strings: readonly string[], priv: boole
 
     if (priv) {
       const hostRows = doc.rows<WireHost>('h', strings);
-      const plan = doc.one<{ paused: boolean; budget: LiveViews['plan']['budget'] }>('pl', strings);
+      const plan = doc.one<{
+        paused: boolean;
+        budget: LiveViews['plan']['budget'];
+        deployWindow?: LiveViews['plan']['deployWindow'];
+      }>('pl', strings);
 
       if (plan) {
         const hosts: Record<string, HostPlan> = {};
@@ -379,6 +383,7 @@ export function buildViews(doc: WireDoc, strings: readonly string[], priv: boole
         out.plan = {
           computedAt: new Date(ms).toISOString(),
           paused: plan.paused,
+          deployWindow: plan.deployWindow ?? { open: false },
           gate: full,
           budget: plan.budget,
           queue: [...doc.rows<QueueEntry>('q', strings)].sort((a, b) => a.position - b.position),

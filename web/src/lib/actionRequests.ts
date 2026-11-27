@@ -4,6 +4,7 @@
 import type { ActionCall } from '../api/client';
 import type {
   ApproveLeaseRequest,
+  ArmRequest,
   ClientPolicyRequest,
   EndLeaseRequest,
   HoldRequest,
@@ -100,6 +101,11 @@ export function buildClientPolicyRequest(
 /** buildScopeRequest builds the body of pause, resume and abort; an empty rollout is the global scope. */
 export function buildScopeRequest(rollout: string, reason: string): ScopeRequest {
   return { rollout, reason: reason.trim() };
+}
+
+/** buildArmRequest builds the body of arm-deploy-window. */
+export function buildArmRequest(reason: string): ArmRequest {
+  return { reason: reason.trim() };
 }
 
 /** buildApproveLeaseRequest builds the body of approve-lease: the verifying lease of one member of a rollout. */
@@ -320,6 +326,11 @@ export function describeCall(call: ActionCall): string[] {
               'or at the closed network gate (then one host at a time while the gate stays closed). ' +
               'Hosts are then granted under the normal rules.',
           ];
+    case 'arm-deploy-window':
+      return [
+        'Arm upgradoor now: end the initial deployment window. From the next pass on leases are granted under the ' +
+          'usual rules: rollouts, host actions and manual actions start. This is recorded in the audit log.',
+      ];
     case 'ignore-gate':
       return [
         `Let rollout ${call.body.rollout} pass the network gate while it is closed, whatever its reason: ` +

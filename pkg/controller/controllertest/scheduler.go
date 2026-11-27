@@ -226,6 +226,12 @@ func (f *Scheduler) Resume(ctx context.Context, actor string, req scheduler.Scop
 	return f.record(ctx, "resume", actor, req)
 }
 
+func (f *Scheduler) ArmDeployWindow(ctx context.Context, actor string, req scheduler.ArmRequest) (
+	*scheduler.ActionResult, error,
+) {
+	return f.record(ctx, "arm-deploy-window", actor, req)
+}
+
 func (f *Scheduler) Skip(ctx context.Context, actor string, req scheduler.RolloutHostsRequest) (
 	*scheduler.ActionResult, error,
 ) {

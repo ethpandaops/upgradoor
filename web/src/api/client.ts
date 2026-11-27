@@ -24,6 +24,7 @@ import type {
   RollRequest,
   RolloutHostsRequest,
   ScopeRequest,
+  ArmRequest,
   Settings,
   SettingsBody,
   ValidatorRangesRefresh,
@@ -152,6 +153,7 @@ interface ActionBodies {
   'end-lease': EndLeaseRequest;
   pause: ScopeRequest;
   resume: ScopeRequest;
+  'arm-deploy-window': ArmRequest;
   abort: ScopeRequest;
   skip: RolloutHostsRequest;
   retry: RolloutHostsRequest;

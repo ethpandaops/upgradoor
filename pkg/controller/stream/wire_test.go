@@ -415,7 +415,11 @@ func TestWireFiles(t *testing.T) {
 	// A chain the clock explains, with the head a few slots behind.
 	h.beacon.Network.Error = ""
 	h.beacon.Network.HeadSlot = 7195
-	h.sched.Set(func(f *controllertest.Scheduler) { f.CurrentPlan.Gate.Network = h.beacon.Network })
+	until := controllertest.Epoch.Add(12 * time.Hour)
+	h.sched.Set(func(f *controllertest.Scheduler) {
+		f.CurrentPlan.Gate.Network = h.beacon.Network
+		f.CurrentPlan.DeployWindow = scheduler.DeployWindow{Open: true, Until: &until}
+	})
 	h.start()
 
 	golden := wireGolden{Now: controllertest.Epoch.Unix(), REST: make(map[string]json.RawMessage, 12)}

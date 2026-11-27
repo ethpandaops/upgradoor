@@ -352,3 +352,65 @@ func TestMigrateServedMembers(t *testing.T) {
 		"released": true, "leased": true, "failed": true, "cancelled": true, "waiting": false, "gone": false,
 	}, served)
 }
+
+// Step 5 arms the deployment window of a store that serves a running fleet
+// and opens none on a fresh one.
+func TestMigrateDeployWindow(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	steps, err := loadMigrations()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(steps), 5)
+
+	for _, tt := range []struct {
+		name  string
+		rows  string
+		armed bool
+	}{
+		{name: "fresh"},
+		{name: "hosts", rows: `INSERT INTO hosts (name, cert_hash, first_seen, last_seen) VALUES ('a', 'h', 1, 1)`, armed: true},
+		{name: "rollouts", rows: `INSERT INTO rollouts (id, kind, key, state, created_at, updated_at, data)
+			VALUES ('r', 'packages', 'packages:x', 'completed', 1, 2, '{"id":"r"}')`, armed: true},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := filepath.Join(t.TempDir(), "upgradoor.db")
+			s, ok := New(quietLog(), path).(*sqliteStore)
+			require.True(t, ok)
+
+			db := fileDB(t, path)
+			require.NoError(t, s.migrate(ctx, db, steps[:4]))
+
+			if tt.rows != "" {
+				_, err := db.Exec(tt.rows)
+				require.NoError(t, err)
+			}
+
+			before := time.Now().Add(-time.Second)
+
+			require.NoError(t, s.migrate(ctx, db, steps))
+			require.NoError(t, s.Start(ctx))
+			t.Cleanup(func() { _ = s.Stop() })
+
+			w, err := s.DeployWindow(ctx)
+			require.NoError(t, err)
+
+			if !tt.armed {
+				assert.Equal(t, fleet.DeployWindowState{}, w, "the controller opens the window")
+
+				return
+			}
+
+			require.NotNil(t, w.ArmedAt)
+			assert.WithinRange(t, *w.ArmedAt, before, time.Now().Add(time.Second))
+			assert.Equal(t, *w.ArmedAt, w.StartedAt)
+
+			w, err = s.StartDeployWindow(ctx, time.Now())
+			require.NoError(t, err)
+			assert.NotNil(t, w.ArmedAt, "the armed window stays armed")
+		})
+	}
+}

@@ -96,6 +96,46 @@ func TestSettingsDefaultsAndValidation(t *testing.T) {
 
 	s.MaxLeasedPercent = 100
 	require.NoError(t, s.Validate())
+
+	assert.Equal(t, 24*time.Hour, s.DeployWindow.Std())
+
+	for _, v := range []time.Duration{-time.Second, MaxDeployWindow + time.Second} {
+		s.DeployWindow = Duration(v)
+		require.EqualError(t, s.Validate(), "deployWindow must be between 0 and 720h", "%s", v)
+	}
+
+	s.DeployWindow = 0
+	require.NoError(t, s.Validate(), "0: no window")
+}
+
+func TestDeployWindowState(t *testing.T) {
+	start := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+	armed := start.Add(time.Hour)
+
+	for _, tt := range []struct {
+		name   string
+		w      DeployWindowState
+		length time.Duration
+		now    time.Time
+		open   bool
+	}{
+		{name: "no window stored", length: 24 * time.Hour, now: start},
+		{name: "open", w: DeployWindowState{StartedAt: start}, length: 24 * time.Hour,
+			now: start.Add(23 * time.Hour), open: true},
+		{name: "ended by time", w: DeployWindowState{StartedAt: start}, length: 24 * time.Hour,
+			now: start.Add(24 * time.Hour)},
+		{name: "longer setting moves the end", w: DeployWindowState{StartedAt: start}, length: 48 * time.Hour,
+			now: start.Add(24 * time.Hour), open: true},
+		{name: "disabled", w: DeployWindowState{StartedAt: start}, now: start},
+		{name: "armed", w: DeployWindowState{StartedAt: start, ArmedAt: &armed}, length: 24 * time.Hour,
+			now: start.Add(2 * time.Hour)},
+	} {
+		assert.Equal(t, tt.open, tt.w.Open(tt.now, tt.length), tt.name)
+	}
+
+	w := DeployWindowState{StartedAt: start}
+	assert.Equal(t, start.Add(time.Hour), w.End(time.Hour))
+	assert.True(t, w.End(0).IsZero())
 }
 
 func TestSettingsCanaryPauseAndPeerShare(t *testing.T) {

@@ -432,6 +432,7 @@ func actionSamples(t *testing.T) []actionSample {
 		{action: "retry", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},
 		{action: "pause", body: `{}`, feature: authz.FeatureAdmin},
 		{action: "resume", body: `{"reason":"over"}`, feature: authz.FeatureAdmin},
+		{action: "arm-deploy-window", body: `{}`, feature: authz.FeatureAdmin},
 		{action: "forget", body: hosts, feature: authz.FeatureAdmin},
 		{action: actionSettings, body: settingsBody(t), feature: authz.FeatureAdmin},
 	}

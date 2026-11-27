@@ -58,7 +58,10 @@ type World struct {
 	// measures from the last sync alone.
 	Since    time.Time
 	Settings fleet.Settings
-	Health   fleet.NetworkHealth
+	// DeployWindow is the stored initial deployment window; the zero value
+	// is none.
+	DeployWindow fleet.DeployWindowState
+	Health       fleet.NetworkHealth
 	// Liveness holds the rows of the newest stored epochs.
 	Liveness []fleet.Liveness
 	// Attested holds per host the newest slots, ascending, for which a

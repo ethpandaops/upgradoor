@@ -245,6 +245,27 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 	return c, nil
 }
 
+// startDeployWindow opens the initial deployment window on the first start
+// on a fresh store and logs its state.
+func (c *controller) startDeployWindow(ctx context.Context) error {
+	w, err := c.store.StartDeployWindow(ctx, time.Now())
+	if err != nil {
+		return fmt.Errorf("deploy window: %w", err)
+	}
+
+	log := c.log.WithField("started_at", w.StartedAt)
+	if w.ArmedAt != nil {
+		log.WithField("armed_at", *w.ArmedAt).Info("Initial deployment window is armed")
+
+		return nil
+	}
+
+	log.Info("Initial deployment window not armed: only Ansible deploys are leased " +
+		"until it ends (setting deployWindow) or is armed")
+
+	return nil
+}
+
 // checkAuth accepts a configuration with an auth provider, or without one
 // with the explicit opt-out, not both.
 func checkAuth(cfg *Config) error {
@@ -299,6 +320,10 @@ func loadAnswerSigner(cfg *Config) (*identity.AnswerSigner, error) {
 func (c *controller) Start(ctx context.Context) error {
 	if err := c.store.Start(ctx); err != nil {
 		return fmt.Errorf("store: %w", err)
+	}
+
+	if err := c.startDeployWindow(ctx); err != nil {
+		return errors.Join(err, c.store.Stop())
 	}
 
 	if err := c.validators.Start(ctx); err != nil {

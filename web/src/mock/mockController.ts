@@ -50,6 +50,8 @@ import {
   type RolloutHostsRequest,
   type Rollouts,
   type ScopeRequest,
+  type ArmRequest,
+  type DeployWindow,
   type Settings,
   type SettingsBody,
   type WaitKind,
@@ -197,11 +199,15 @@ function mix(a: number, b: number): number {
  */
 const RESUME = '; resume to continue';
 
+/** DEPLOY_WINDOW_REASON starts the reason of a host that waits for the initial deployment window; its end follows. */
+const DEPLOY_WINDOW_REASON = 'initial deployment window until ';
+
 /** waitKind classifies a waiting reason the way the scheduler does. */
 function waitKind(reason: string): WaitKind {
   if (reason === 'held' || reason.startsWith('held by ')) return 'held';
   if (reason === 'agent silent' || reason.startsWith('agent protocol ')) return 'silent';
   if (reason === 'paused') return 'paused';
+  if (reason.startsWith(DEPLOY_WINDOW_REASON)) return 'deploy-window';
   if (reason === 'rollout paused' || reason.endsWith(RESUME)) return 'rollout-paused';
   if (reason.startsWith('waiting for approval')) return 'approval';
   if (reason.startsWith('rollout halted')) return 'halted';
@@ -328,6 +334,24 @@ export class MockController {
   /** gateFailing reports whether the network gate is forced to fail. */
   get gateFailing(): boolean {
     return this.data.gateFailing;
+  }
+
+  /** openDeployWindow opens the initial deployment window from now on. */
+  openDeployWindow(): void {
+    this.data.deployWindow = { startedAt: this.now() };
+    this.publish();
+  }
+
+  /** deployWindow is the window as the plan states it (scheduler.DeployWindow). */
+  private deployWindow(): DeployWindow {
+    const w = this.data.deployWindow;
+    const length = parseGoDuration(this.data.settings.deployWindow) ?? 0;
+    const until = length > 0 ? w.startedAt + length : undefined;
+    return {
+      open: w.armedAt === undefined && until !== undefined && this.now() < until,
+      ...(until !== undefined ? { until: this.iso(until) } : {}),
+      ...(w.armedAt !== undefined ? { armedAt: this.iso(w.armedAt) } : {}),
+    };
   }
 
   /** setGateFailing toggles a failing network gate (low participation, finality lag). */
@@ -529,6 +553,7 @@ export class MockController {
         this.authorizeAdmin(login);
         return this.sources.view();
       }
+      if (route === 'plan') return this.plan();
       if (route === 'slots') return this.slots(q.get('window'), true);
       if (route === 'audit') {
         return this.auditPage(
@@ -1046,6 +1071,12 @@ export class MockController {
     if (this.isStale(host.name)) return 'agent silent';
     if (this.data.settings.paused) return 'paused';
 
+    // Only Ansible deploys go through the initial deployment window.
+    const deploy = this.deployWindow();
+    if (deploy.open && !memberOf.some(r => r.kind === 'group' && groupPolicy(this.data.settings, r)[1] === 'deploy')) {
+      return `${DEPLOY_WINDOW_REASON}${(deploy.until as string).slice(0, 19)}Z`;
+    }
+
     const active = memberOf.filter(r => r.state === 'active');
     const usable = active.filter(r => !r.paused);
     if (active.length > 0 && usable.length === 0) return active[0]?.pauseReason ?? 'rollout paused';
@@ -1210,7 +1241,15 @@ export class MockController {
       });
     }
 
-    return { computedAt: this.iso(this.now() - 1000), paused: this.data.settings.paused, gate, budget, queue, hosts };
+    return {
+      computedAt: this.iso(this.now() - 1000),
+      paused: this.data.settings.paused,
+      deployWindow: this.deployWindow(),
+      gate,
+      budget,
+      queue,
+      hosts,
+    };
   }
 
   // -------------------------------------------------------------- views
@@ -1652,6 +1691,8 @@ export class MockController {
       case 'pause':
       case 'resume':
         return this.pause(name, body as ScopeRequest);
+      case 'arm-deploy-window':
+        return this.arm(body as ArmRequest);
       case 'abort':
         return this.abort(body as ScopeRequest);
       case 'skip':
@@ -2406,6 +2447,18 @@ export class MockController {
     }
 
     this.log('lease.cancelled', l.host, { lease: l.id, by, rollouts: paused }, 'scheduler');
+  }
+
+  private arm(req: ArmRequest): ActionResult {
+    if (!this.deployWindow().open) return { message: 'the deployment window is not open' };
+    const now = this.now();
+    this.data.deployWindow = { ...this.data.deployWindow, armedAt: now };
+    this.log('action.arm-deploy-window', 'settings', {
+      before: { armedAt: null },
+      after: { armedAt: this.iso(now) },
+      reason: req.reason,
+    });
+    return { message: 'armed: the deployment window is over' };
   }
 
   private pause(action: 'pause' | 'resume', req: ScopeRequest): ActionResult {

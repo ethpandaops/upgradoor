@@ -170,6 +170,32 @@ describe('OverviewTab, logged in', () => {
     });
   });
 
+  it('says until when the deployment window holds the hosts, and arms it from the attention list', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'auth', loggedIn: true });
+    h.controller.openDeployWindow();
+    renderWithApp(<OverviewTab onOpenTab={noTab} />, h);
+
+    const attention = await screen.findByRole('region', { name: 'Needs attention' });
+    const row = (await within(attention).findByText(/^Initial deployment window until /)).closest('li');
+    if (!row) throw new Error('no deployment window in the attention list');
+    expect(row).toHaveTextContent('Nothing but Ansible deploys is granted');
+    await user.click(within(row).getByRole('button', { name: 'Arm now…' }));
+
+    const dialog = screen.getByRole('dialog');
+    expect(dialog).toHaveTextContent('end the initial deployment window');
+    await user.click(within(dialog).getByRole('button', PRIMARY));
+
+    await vi.waitFor(() => {
+      expect(h.calls.find(c => c.method === 'POST')?.path).toBe('/api/v1/actions/arm-deploy-window');
+    });
+    await vi.waitFor(() => {
+      expect(screen.getByRole('region', { name: 'Needs attention' })).not.toHaveTextContent(
+        'Initial deployment window'
+      );
+    });
+  });
+
   it('approves an auto rollout that waits at the closed gate from the attention list', async () => {
     const user = userEvent.setup();
     const h = await createHarness({ mode: 'open' });

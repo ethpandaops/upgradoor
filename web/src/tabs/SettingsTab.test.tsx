@@ -5,7 +5,7 @@ import { describe, expect, it, vi } from 'vitest';
 import { ApiError } from '../api/client';
 import { list } from '../api/types';
 import { hasUnsavedWork } from '../hooks/useUnsavedWork';
-import { createHarness, renderWithApp } from '../test/harness';
+import { createHarness, renderWithApp, PRIMARY } from '../test/harness';
 import { SettingsTab } from './SettingsTab';
 
 async function openSettings() {
@@ -64,6 +64,28 @@ describe('SettingsTab', () => {
     expect(within(form).getByRole('status')).toHaveTextContent('No unsaved changes.');
     expect(screen.queryByRole('list', { name: 'Changes to save' })).not.toBeInTheDocument();
     expect(h.calls.filter(c => c.method === 'PUT')).toEqual([]);
+  });
+
+  it('states the deployment window, edits its length and arms it while it is open', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: true, fleet: 'quiet' });
+    renderWithApp(<SettingsTab />, h);
+    const user = userEvent.setup();
+
+    const card = await screen.findByRole('region', { name: 'Initial deployment window' });
+    const state = within(card).getByLabelText('Deployment window state');
+    expect(state).toHaveTextContent(/^Open until /);
+    const form = await screen.findByRole('form', { name: 'Settings' });
+    expect(within(form).getByLabelText('Deployment window')).toHaveValue('24h');
+
+    await user.click(within(card).getByRole('button', { name: 'Arm now…' }));
+    const dialog = screen.getByRole('dialog');
+    await user.click(within(dialog).getByRole('button', PRIMARY));
+
+    await waitFor(() => {
+      expect(state).toHaveTextContent(/^Armed /);
+    });
+    expect(within(card).queryByRole('button', { name: 'Arm now…' })).not.toBeInTheDocument();
+    expect(h.calls.filter(c => c.method === 'POST').map(c => c.path)).toEqual(['/api/v1/actions/arm-deploy-window']);
   });
 
   it('offers a policy per kind of the fleet and other, and saves the whole map', async () => {

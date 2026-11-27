@@ -4,6 +4,7 @@ import type { ActionIntent } from '../components/ActionDialog';
 import { list, type Lease, type Policy, type RolloutKind } from '../api/types';
 import {
   buildApproveLeaseRequest,
+  buildArmRequest,
   buildClientPolicyRequest,
   buildEndLeaseRequest,
   buildHoldRequest,
@@ -70,6 +71,16 @@ export function scopeIntent(
     rolloutClient: rollout === '' ? undefined : (client ?? ''),
     rolloutAction: rollout === '' ? undefined : hostAction,
     make: reason => ({ action, body: buildScopeRequest(rollout, reason) }),
+  };
+}
+
+/** armIntent ends the initial deployment window now. */
+export function armIntent(): ActionIntent {
+  return {
+    kind: 'call',
+    title: 'Arm upgradoor: end the deployment window',
+    verb: 'Arm now',
+    make: reason => ({ action: 'arm-deploy-window', body: buildArmRequest(reason) }),
   };
 }
 

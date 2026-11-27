@@ -57,9 +57,11 @@ func (s *Handler) actions() map[string]UserHandler {
 		"pause":     action(s, needScope, validateScope(false), sched.Pause),
 		// needScope, or the action's own permission: see handleResume.
 		"resume": s.handleResume,
-		"abort":  action(s, needAbort, validateScope(true), sched.Abort),
-		"skip":   action(s, needRecoverHosts, validateRolloutHosts(true), sched.Skip),
-		"retry":  action(s, needRetry, validateRolloutHosts(false), sched.Retry),
+		// Ends the initial deployment window now, like the global pause.
+		"arm-deploy-window": action(s, needAdmin[scheduler.ArmRequest], validateArm, sched.ArmDeployWindow),
+		"abort":             action(s, needAbort, validateScope(true), sched.Abort),
+		"skip":              action(s, needRecoverHosts, validateRolloutHosts(true), sched.Skip),
+		"retry":             action(s, needRetry, validateRolloutHosts(false), sched.Retry),
 		// Whoever may approve the rollout: see allowApproval.
 		"ignore-gate":   s.handleIgnoreGate,
 		"ignore-budget": s.handleIgnoreBudget,
@@ -454,6 +456,11 @@ func validateScope(rolloutRequired bool) func(*scheduler.ScopeRequest) error {
 
 		return validateReason(req.Reason)
 	}
+}
+
+// validateArm checks arm-deploy-window.
+func validateArm(req *scheduler.ArmRequest) error {
+	return validateReason(req.Reason)
 }
 
 // validateRolloutHosts checks skip (hosts required) and retry (no hosts

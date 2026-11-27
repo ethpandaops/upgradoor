@@ -329,6 +329,8 @@ export interface MockData {
   settings: Settings;
   defaults: Settings;
   gateFailing: boolean;
+  /** deployWindow is the initial deployment window (fleet.DeployWindowState), in ms. */
+  deployWindow: { startedAt: number; armedAt?: number };
   /** quiet: every host attests, whatever its containers say. */
   quiet: boolean;
   /** offline are the times a host's validators do not attest without upgradoor having touched it, by host. */
@@ -363,6 +365,7 @@ export function defaultSettings(): Settings {
     readyPeerShare: 0,
     lookupInterval: '5m0s',
     paused: false,
+    deployWindow: '24h0m0s',
   };
 }
 
@@ -1489,6 +1492,11 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     },
     defaults,
     gateFailing: false,
+    // The quiet fleet is a fresh devnet in its initial deployment window; the others were armed long ago.
+    deployWindow:
+      fleet === 'quiet'
+        ? { startedAt: now - 5 * 3600_000 }
+        : { startedAt: now - 30 * 86400_000, armedAt: now - 29 * 86400_000 },
     offline:
       fleet === 'large' || fleet === 'huge'
         ? largeFleet(now, hosts, seenAgo, leases, fleet === 'huge' ? HUGE_FLEET_HOSTS : LARGE_FLEET_HOSTS)

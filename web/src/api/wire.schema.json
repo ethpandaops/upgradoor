@@ -1,5 +1,5 @@
 {
- "version": "3eabe5076196",
+ "version": "a8ca38cc7907",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -588,6 +588,22 @@
    {
     "n": "memoryLimit",
     "t": "n",
+    "omit": true
+   }
+  ],
+  "DeployWindow": [
+   {
+    "n": "open",
+    "t": "b"
+   },
+   {
+    "n": "until",
+    "t": "t",
+    "omit": true
+   },
+   {
+    "n": "armedAt",
+    "t": "t",
     "omit": true
    }
   ],
@@ -2286,6 +2302,11 @@
     "n": "budget",
     "t": "o",
     "of": "Budget"
+   },
+   {
+    "n": "deployWindow",
+    "t": "o",
+    "of": "DeployWindow"
    }
   ]
  }

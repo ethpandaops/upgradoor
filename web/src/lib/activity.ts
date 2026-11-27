@@ -1,13 +1,22 @@
 // What the Overview says about the scheduler's state: which queued hosts will
 // be served by themselves, and what is stuck until somebody acts.
 
-import { list, type Gate, type HostListing, type QueueEntry, type Rollout, type WaitKind } from '../api/types';
+import {
+  list,
+  type DeployWindow,
+  type Gate,
+  type HostListing,
+  type QueueEntry,
+  type Rollout,
+  type WaitKind,
+} from '../api/types';
 import { GATE_APPROVAL_HINT, approvableAtGate } from './approvals';
-import { pauseLabel } from './format';
+import { absoluteTime, pauseLabel } from './format';
 
 type AttentionKind =
   | 'gate'
   | 'paused'
+  | 'deploy-window'
   | 'halted'
   | 'approval'
   | 'gate-approval'
@@ -44,6 +53,7 @@ function waitingHosts(n: number): string {
 export function attentionItems(input: {
   gate: Gate | undefined;
   paused: boolean;
+  deployWindow?: DeployWindow;
   queue: readonly QueueEntry[];
   rollouts: readonly Rollout[];
   hosts: readonly HostListing[];
@@ -74,6 +84,20 @@ export function attentionItems(input: {
       title: 'The scheduler is paused',
       detail: 'No lease is granted until it is resumed.',
       hosts: hostsWaiting('paused'),
+    });
+  }
+
+  if (input.deployWindow?.open) {
+    const waiting = hostsWaiting('deploy-window');
+    items.push({
+      id: 'deploy-window',
+      kind: 'deploy-window',
+      tone: 'warning',
+      title: `Initial deployment window until ${absoluteTime(input.deployWindow.until)}`,
+      detail:
+        'Nothing but Ansible deploys is granted until it ends or upgradoor is armed' +
+        (waiting.length > 0 ? `. ${waitingHosts(waiting.length)}.` : '.'),
+      hosts: waiting,
     });
   }
 

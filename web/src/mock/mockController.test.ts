@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 
-import type { ActionResult } from '../api/types';
+import { list, type ActionResult, type Plan } from '../api/types';
 import { MockController } from './mockController';
 
 async function call<T>(mock: MockController, path: string, body?: unknown, method = 'POST'): Promise<T> {
@@ -98,5 +98,39 @@ describe('MockController event streams', () => {
     expect(mock.openStreams).toBe(1);
     abort.abort();
     expect(mock.openStreams).toBe(0);
+  });
+});
+
+describe('MockController deployment window', () => {
+  it('holds the quiet fleet in its window until it is armed', async () => {
+    const mock = new MockController({ fleet: 'quiet' });
+
+    const before = await call<Plan>(mock, 'plan', undefined, 'GET');
+    expect(before.deployWindow.open).toBe(true);
+    expect(before.deployWindow.armedAt).toBeUndefined();
+
+    const res = await call<ActionResult>(mock, 'actions/arm-deploy-window', { reason: 'deployed' });
+    expect(res.message).toBe('armed: the deployment window is over');
+
+    const after = await call<Plan>(mock, 'plan', undefined, 'GET');
+    expect(after.deployWindow.open).toBe(false);
+    expect(after.deployWindow.armedAt).toBeDefined();
+
+    const again = await call<ActionResult>(mock, 'actions/arm-deploy-window', {});
+    expect(again.message).toBe('the deployment window is not open');
+  });
+
+  it('makes the hosts of a rollout that is no Ansible deploy wait while it is open', async () => {
+    const mock = new MockController();
+    const open = await call<Plan>(mock, 'plan', undefined, 'GET');
+    expect(open.deployWindow.open).toBe(false);
+    expect(list(open.queue).some(q => q.wait === 'deploy-window')).toBe(false);
+
+    mock.openDeployWindow();
+
+    const plan = await call<Plan>(mock, 'plan', undefined, 'GET');
+    const waiting = list(plan.queue).filter(q => q.wait === 'deploy-window');
+    expect(waiting.length).toBeGreaterThan(0);
+    expect(waiting[0]?.reason).toMatch(/^initial deployment window until \d{4}-\d\d-\d\dT\d\d:\d\d:\d\dZ$/);
   });
 });

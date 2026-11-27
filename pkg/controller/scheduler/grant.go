@@ -23,9 +23,12 @@ const (
 	reasonHoldRequested = "hold requested, waiting for the host"
 	// reasonWorking is why a host that works on an operation without a lease
 	// is granted nothing.
-	reasonWorking       = "working on an operation without a lease"
-	reasonPaused        = "paused"
-	reasonRolloutPaused = "rollout paused"
+	reasonWorking = "working on an operation without a lease"
+	reasonPaused  = "paused"
+	// reasonDeployWindowPrefix starts the waiting reason of a host that
+	// waits for the end of the initial deployment window; its end follows.
+	reasonDeployWindowPrefix = "initial deployment window until "
+	reasonRolloutPaused      = "rollout paused"
 	// reasonResume ends the pause reasons that say why a rollout is paused.
 	reasonResume = "; resume to continue"
 	// reasonAborted starts the pause reason of a reboot or local rollout
@@ -69,6 +72,7 @@ const (
 	rankSilent
 	rankWorking
 	rankPaused
+	rankDeployWindow
 	rankRolloutPaused
 	rankApproval
 	rankHalted
@@ -87,6 +91,7 @@ var waitKinds = map[int]WaitKind{
 	rankSilent:        WaitSilent,
 	rankWorking:       WaitWorking,
 	rankPaused:        WaitPaused,
+	rankDeployWindow:  WaitDeployWindow,
 	rankRolloutPaused: WaitRolloutPaused,
 	rankApproval:      WaitApproval,
 	rankHalted:        WaitHalted,
@@ -395,6 +400,7 @@ type granter struct {
 	// gateTrusted: the gate judges by data it has (pass.gate).
 	gateTrusted bool
 	budget      *budgetState
+	window      DeployWindow
 	// order holds the order of each rollout a host was considered in.
 	order map[string]*rolloutOrder
 	// pulls counts the leases with image work that are granted or pulling.
@@ -441,6 +447,12 @@ func (g *granter) orderVerdict(r *fleet.Rollout, hv *hostView) verdict {
 // now, the budget aside. excepted says that they are only because the closed
 // gate lets this host pass.
 func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted []protocol.Need, excepted bool) {
+	// Ansible deploys are what the initial deployment window is for.
+	if g.window.Open && !r.Deployed() {
+		return verdict{rank: rankDeployWindow, reason: reasonDeployWindowPrefix +
+			g.window.Until.UTC().Format(time.RFC3339)}, nil, false
+	}
+
 	if v = g.p.policyVerdict(r); v.rank != rankGrantable {
 		return v, nil, false
 	}
@@ -532,8 +544,8 @@ func (g *granter) admitting(hv *hostView) *budgetState {
 // consider grants the host a lease for everything grantable, or says what
 // it waits for. When the wait is about one rollout (its pause, approval,
 // halt, order, gate, verb, or the budget or host limit its node work waits
-// for), that rollout's ID is returned too; a hold, the global pause and the
-// independent limit are about none.
+// for), that rollout's ID is returned too; a hold, the global pause, the
+// deployment window and the independent limit are about none.
 func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, about string) {
 	switch {
 	case hv.offline:
@@ -565,6 +577,10 @@ func (g *granter) consider(hv *hostView, rollouts []*fleet.Rollout) (v verdict, 
 		case rv.rank != rankGrantable:
 			if rv.rank > best.rank {
 				best, about = rv, r.ID
+
+				if rv.rank == rankDeployWindow {
+					about = ""
+				}
 			}
 		case r.IgnoreBudget:
 			exempt = append(exempt, part{r, needs})
@@ -795,6 +811,18 @@ func (p *pass) pulling() int {
 	return n
 }
 
+// deployWindow is the state of the initial deployment window at the pass.
+func (p *pass) deployWindow() DeployWindow {
+	w := &p.w.DeployWindow
+	d := DeployWindow{Open: w.Open(p.now, p.set.DeployWindow.Std()), ArmedAt: w.ArmedAt}
+
+	if end := w.End(p.set.DeployWindow.Std()); !end.IsZero() {
+		d.Until = &end
+	}
+
+	return d
+}
+
 // localFirst ranks the local rollouts before the others.
 func localFirst(r *fleet.Rollout) int {
 	if r.Kind == fleet.RolloutLocal {
@@ -810,13 +838,15 @@ func (p *pass) grant() *Plan {
 		p: p, budget: p.budget(), order: make(map[string]*rolloutOrder, len(p.rollouts)), pulls: p.pulling(),
 	}
 	g.gate, g.gateTrusted = p.gate()
+	g.window = p.deployWindow()
 
 	plan := &Plan{
-		ComputedAt: p.now,
-		Paused:     p.set.Paused,
-		Gate:       g.gate,
-		Queue:      []QueueEntry{},
-		Hosts:      make(map[string]HostPlan, len(p.hosts)),
+		ComputedAt:   p.now,
+		Paused:       p.set.Paused,
+		DeployWindow: g.window,
+		Gate:         g.gate,
+		Queue:        []QueueEntry{},
+		Hosts:        make(map[string]HostPlan, len(p.hosts)),
 	}
 
 	reasons := make(map[string]string, len(p.hosts))

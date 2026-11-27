@@ -31,7 +31,7 @@ import { attentionItems, type AttentionItem } from '../lib/activity';
 import { gateApprovalNotes } from '../lib/approvals';
 import { formatPercent, percentOf, plural } from '../lib/format';
 import { rolloutActionOf } from '../lib/hostActions';
-import { approveIntent, holdIntent, hostsIntent, scopeIntent } from '../lib/intents';
+import { approveIntent, armIntent, holdIntent, hostsIntent, scopeIntent } from '../lib/intents';
 import { splitQueue, workKind, type StageOf } from '../lib/timeline';
 
 const RANGES = [
@@ -94,6 +94,7 @@ export function OverviewTab({ onOpenTab }: { onOpenTab: (tab: 'hosts' | 'rollout
       attentionItems({
         gate: plan.data?.gate ?? gate.data,
         paused: plan.data?.paused ?? false,
+        deployWindow: plan.data?.deployWindow,
         queue: list(plan.data?.queue),
         rollouts: list(rollouts.data?.open),
         hosts: list(hosts.data?.hosts),
@@ -624,6 +625,9 @@ function AttentionRow({
           />
         </>
       );
+      break;
+    case 'deploy-window':
+      buttons = <IntentAction icon="check" label="Arm now…" onAction={onAction} intent={armIntent()} />;
       break;
     case 'held':
       buttons = (

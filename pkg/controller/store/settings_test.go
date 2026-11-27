@@ -166,9 +166,60 @@ func TestSettingsFieldsCoverEveryField(t *testing.T) {
 		"leaseTtl", "hostStaleAfter", "readinessTimeout", "baselineGrace", "maxConcurrentPulls",
 		"policyImage", "policyPackages", "policyReboot", "paused",
 		"pauseAfterCanaryImage", "pauseAfterCanaryPackages", "pauseAfterCanaryReboot", "readyPeerShare",
-		"lookupInterval",
+		"lookupInterval", "deployWindow",
 		"policyClients", "policyKinds", "actionPolicies",
 	}, keysOf(fields))
+}
+
+func TestDeployWindow(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	start := time.Date(2026, 11, 1, 0, 0, 0, 0, time.UTC)
+
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := backend.open(t)
+
+			w, err := s.DeployWindow(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, fleet.DeployWindowState{}, w, "a fresh store holds no window")
+
+			entry := fleet.AuditEntry{Time: start, Actor: "alice", Action: "action.arm-deploy-window", Target: "settings"}
+
+			armed, err := s.ArmDeployWindow(ctx, start, &entry)
+			require.NoError(t, err)
+			assert.False(t, armed, "no window to arm")
+
+			w, err = s.StartDeployWindow(ctx, start)
+			require.NoError(t, err)
+			assert.Equal(t, fleet.DeployWindowState{StartedAt: start}, w)
+
+			w, err = s.StartDeployWindow(ctx, start.Add(time.Hour))
+			require.NoError(t, err)
+			assert.Equal(t, start, w.StartedAt, "a later start keeps the first")
+
+			at := start.Add(2 * time.Hour)
+
+			armed, err = s.ArmDeployWindow(ctx, at, &entry)
+			require.NoError(t, err)
+			assert.True(t, armed)
+
+			armed, err = s.ArmDeployWindow(ctx, at.Add(time.Hour), &entry)
+			require.NoError(t, err)
+			assert.False(t, armed, "armed once")
+
+			w, err = s.DeployWindow(ctx)
+			require.NoError(t, err)
+			assert.Equal(t, fleet.DeployWindowState{StartedAt: start, ArmedAt: &at}, w)
+
+			entries, err := s.ListAudit(ctx, AuditFilter{ActionPrefix: "action.arm-deploy-window"})
+			require.NoError(t, err)
+			assert.Len(t, entries, 1, "one entry, with the arm")
+		})
+	}
 }
 
 func keysOf[V any](m map[string]V) []string {

@@ -94,6 +94,10 @@ func TestActions(t *testing.T) {
 			want: scheduler.ScopeRequest{Rollout: "r-1", Reason: "approved"},
 		},
 		{
+			action: "arm-deploy-window", body: `{"reason":"deployed"}`,
+			want: scheduler.ArmRequest{Reason: "deployed"},
+		},
+		{
 			action: "abort", body: `{"rollout":"r-1","reason":"bad image"}`,
 			want: scheduler.ScopeRequest{Rollout: "r-1", Reason: "bad image"},
 		},
@@ -259,7 +263,7 @@ func TestActionErrorMapping(t *testing.T) {
 	bodies := map[string]string{
 		"roll": `{"all":true}`, "reboot": `{"all":true}`, "hold": `{"hosts":["a"]}`,
 		"unhold": `{"hosts":["a"]}`, "forget": `{"hosts":["a"]}`, "pause": `{}`, "resume": `{}`,
-		"abort": `{"rollout":"r"}`, "skip": `{"rollout":"r","hosts":["a"]}`,
+		"arm-deploy-window": `{}`, "abort": `{"rollout":"r"}`, "skip": `{"rollout":"r","hosts":["a"]}`,
 		"retry": `{"rollout":"r"}`, "end-lease": `{"lease":"l"}`,
 	}
 
@@ -1689,6 +1693,11 @@ func TestAuthorizeTargets(t *testing.T) {
 			refusal:  "forbidden: this login lacks the feature upgradoor:admin",
 		},
 		{
+			name: "arm the deployment window with manage only", action: "arm-deploy-window", body: `{}`,
+			services: "+upgradoor:manage",
+			refusal:  "forbidden: this login lacks the feature upgradoor:admin",
+		},
+		{
 			name: "abort a rollout for no team with a team twin", action: "abort", body: `{"rollout":"r-1"}`,
 			services: "+upgradoor:team_*", teams: both,
 			refusal: "forbidden: upgradoor:team_manage does not cover rollout r-1: it is for no team",
@@ -1962,6 +1971,7 @@ func TestPermissionMatrix(t *testing.T) {
 		{"pause", other, rollout("r-geth"), false, false},
 		{"pause", teamless, rollout("r-1"), false, false},
 		{"pause", "everything", `{}`, false, true},
+		{"arm-deploy-window", "everything", `{}`, false, true},
 		{"resume", own, rollout("r-lighthouse"), true, false},
 		{"resume", other, rollout("r-geth"), false, false},
 		{"resume", "everything", `{}`, false, true},

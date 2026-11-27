@@ -185,6 +185,12 @@ const SAMPLES: Sample[] = [
   { name: 'pause all', call: scope('pause', ''), feature: FEATURE.admin, twin: false },
   { name: 'resume all', call: scope('resume', ''), feature: FEATURE.admin, twin: false },
   { name: 'forget', call: hold('forget', [MIXED]), feature: FEATURE.admin, twin: false },
+  {
+    name: 'arm the deployment window',
+    call: { action: 'arm-deploy-window', body: { reason: '' } },
+    feature: FEATURE.admin,
+    twin: false,
+  },
   { name: 'settings', call: { action: 'settings' }, feature: FEATURE.admin, twin: false },
 ];
 

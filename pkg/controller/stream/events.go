@@ -1091,7 +1091,9 @@ func (v *streamViews) loginDoc(
 
 	addImages(b, &v.images)
 	addSlots(b, v.slots, v.slotHosts)
-	b.one(tablePlan, wirePlan{Paused: v.plan.Paused, Budget: v.plan.Budget})
+	b.one(tablePlan, wirePlan{
+		Paused: v.plan.Paused, Budget: v.plan.Budget, DeployWindow: v.plan.DeployWindow,
+	})
 
 	for i := range v.plan.Queue {
 		b.add(tableQueue, v.plan.Queue[i])

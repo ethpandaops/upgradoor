@@ -140,6 +140,11 @@ type Settings struct {
 
 	// Paused is the global pause: nothing new is granted.
 	Paused bool `json:"paused"`
+
+	// DeployWindow is the length of the initial deployment window from the
+	// controller's first start on a fresh store (DeployWindowState). 0 is no
+	// window.
+	DeployWindow Duration `json:"deployWindow"`
 }
 
 // DefaultSettings returns the built-in defaults.
@@ -162,7 +167,38 @@ func DefaultSettings() Settings {
 		PolicyPackages:          PolicyAuto,
 		PolicyReboot:            PolicyManual,
 		LookupInterval:          Duration(5 * time.Minute),
+		DeployWindow:            Duration(24 * time.Hour),
 	}
+}
+
+// MaxDeployWindow bounds Settings.DeployWindow.
+const MaxDeployWindow = 30 * 24 * time.Hour
+
+// DeployWindowState is the stored state of the initial deployment window.
+// While it is open only leases of Ansible deploys are granted.
+type DeployWindowState struct {
+	// StartedAt is the controller's first start on a fresh store; zero when
+	// the store has no window.
+	StartedAt time.Time `json:"startedAt"`
+	// ArmedAt is when the window was ended early, or when a store that held
+	// a running fleet was upgraded to one with windows; nil while not armed.
+	ArmedAt *time.Time `json:"armedAt,omitempty"`
+}
+
+// End is when the window closes by time; zero when there is no window.
+func (w *DeployWindowState) End(length time.Duration) time.Time {
+	if w.StartedAt.IsZero() || length <= 0 {
+		return time.Time{}
+	}
+
+	return w.StartedAt.Add(length)
+}
+
+// Open reports whether the window is open at now.
+func (w *DeployWindowState) Open(now time.Time, length time.Duration) bool {
+	end := w.End(length)
+
+	return w.ArmedAt == nil && !end.IsZero() && now.Before(end)
 }
 
 // MinLookupInterval and MaxLookupInterval bound Settings.LookupInterval.
@@ -465,6 +501,10 @@ func (s *Settings) Validate() error {
 
 	if s.LookupInterval.Std() < MinLookupInterval || s.LookupInterval.Std() > MaxLookupInterval {
 		return errors.New("lookupInterval must be between 30s and 24h")
+	}
+
+	if s.DeployWindow < 0 || s.DeployWindow.Std() > MaxDeployWindow {
+		return errors.New("deployWindow must be between 0 and 720h")
 	}
 
 	return s.validatePolicies()

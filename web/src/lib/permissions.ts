@@ -28,7 +28,7 @@ export const FEATURE = {
   manage_image: 'manage_image',
   /** manage_flags: flag-override, client-override of the flags. Twin team_manage_flags: a container a team of the login owns. */
   manage_flags: 'manage_flags',
-  /** admin: forget, the global pause, the settings, the data sources. Includes every other feature. No twin. */
+  /** admin: forget, the global pause, arming the deployment window, the settings, the data sources. Includes every other feature. No twin. */
   admin: 'admin',
 } as const;
 
@@ -188,6 +188,7 @@ function requirement(call: Exclude<PermissionCall, { action: 'host-action' }>): 
         team: { rule: 'host', hosts: call.body.hosts, all: false, holders: call.body.holders ?? [] },
       };
     case 'forget':
+    case 'arm-deploy-window':
       return { feature: FEATURE.admin };
     case 'end-lease':
       return { feature: FEATURE.manage, team: { rule: 'lease', lease: call.body.lease } };

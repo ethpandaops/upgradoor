@@ -5,8 +5,10 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"sort"
+	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 )
@@ -117,4 +119,104 @@ func settingsFields(settings *fleet.Settings) (map[string]json.RawMessage, error
 	}
 
 	return fields, nil
+}
+
+// DeployWindow returns the stored deployment window; the zero value when the
+// store holds none.
+func (s *sqliteStore) DeployWindow(ctx context.Context) (fleet.DeployWindowState, error) {
+	var w fleet.DeployWindowState
+
+	err := s.read(ctx, func(tx *sql.Tx) error {
+		var err error
+
+		w, err = readDeployWindow(ctx, tx)
+
+		return err
+	})
+	if err != nil {
+		return w, fmt.Errorf("store: deploy window: %w", err)
+	}
+
+	return w, nil
+}
+
+// StartDeployWindow opens the deployment window at at unless the store holds
+// one, and returns the stored window.
+func (s *sqliteStore) StartDeployWindow(ctx context.Context, at time.Time) (fleet.DeployWindowState, error) {
+	var w fleet.DeployWindowState
+
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		_, err := tx.ExecContext(ctx,
+			`INSERT INTO deploy_window (id, started_at) VALUES (1, ?) ON CONFLICT (id) DO NOTHING`, millis(at))
+		if err != nil {
+			return err
+		}
+
+		w, err = readDeployWindow(ctx, tx)
+
+		return err
+	})
+	if err != nil {
+		return w, fmt.Errorf("store: start deploy window: %w", err)
+	}
+
+	return w, nil
+}
+
+// ArmDeployWindow arms a stored window that is not armed at at and appends
+// entry, in one transaction. armed is false when there was nothing to arm;
+// then nothing is written.
+func (s *sqliteStore) ArmDeployWindow(
+	ctx context.Context, at time.Time, entry *fleet.AuditEntry,
+) (armed bool, err error) {
+	err = s.write(ctx, func(tx *sql.Tx) error {
+		res, txErr := tx.ExecContext(ctx,
+			`UPDATE deploy_window SET armed_at = ? WHERE id = 1 AND armed_at IS NULL`, millis(at))
+		if txErr != nil {
+			return txErr
+		}
+
+		n, txErr := res.RowsAffected()
+		if txErr != nil || n == 0 {
+			return txErr
+		}
+
+		armed = true
+
+		_, txErr = insertAudit(ctx, tx, []fleet.AuditEntry{*entry})
+
+		return txErr
+	})
+	if err != nil {
+		return false, fmt.Errorf("store: arm deploy window: %w", err)
+	}
+
+	return armed, nil
+}
+
+func readDeployWindow(ctx context.Context, tx *sql.Tx) (fleet.DeployWindowState, error) {
+	var (
+		w       fleet.DeployWindowState
+		started int64
+		armed   sql.NullInt64
+	)
+
+	err := tx.QueryRowContext(ctx, `SELECT started_at, armed_at FROM deploy_window WHERE id = 1`).
+		Scan(&started, &armed)
+
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+		return w, nil
+	case err != nil:
+		return w, err
+	}
+
+	w.StartedAt = fromMillis(started)
+
+	if armed.Valid {
+		t := fromMillis(armed.Int64)
+		w.ArmedAt = &t
+	}
+
+	return w, nil
 }

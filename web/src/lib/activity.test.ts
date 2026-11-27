@@ -54,6 +54,36 @@ describe('attentionItems', () => {
     expect(items[1]?.rollout?.id).toBe('r2');
   });
 
+  it('says until when the deployment window holds the hosts, and nothing once it is over', () => {
+    const until = '2026-11-28T10:00:00Z';
+    const items = attentionItems({
+      gate: gate(true),
+      paused: false,
+      deployWindow: { open: true, until },
+      queue: [entry('a', 1, 'deploy-window'), entry('b', 2, 'deploy-window')],
+      rollouts: [],
+      hosts: [],
+    });
+
+    expect(items.map(i => [i.kind, i.hosts])).toEqual([['deploy-window', ['a', 'b']]]);
+    expect(items[0]?.title).toContain('Initial deployment window until ');
+    expect(items[0]?.title).toContain(until.replace('Z', '.000Z'));
+    expect(items[0]?.detail).toBe(
+      'Nothing but Ansible deploys is granted until it ends or upgradoor is armed. 2 hosts wait.'
+    );
+
+    expect(
+      attentionItems({
+        gate: gate(true),
+        paused: false,
+        deployWindow: { open: false, until, armedAt: until },
+        queue: [],
+        rollouts: [],
+        hosts: [],
+      })
+    ).toEqual([]);
+  });
+
   it('names the hosts with an unsupported agent apart from the silent ones', () => {
     const reason = 'agent protocol 0 not supported (controller supports 1..1)';
     const items = attentionItems({

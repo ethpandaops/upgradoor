@@ -3,7 +3,10 @@ import { useId, useMemo, useState, type SyntheticEvent } from 'react';
 import { errorText } from '../api/client';
 import { list, type Policy, type SettingsBody } from '../api/types';
 import { useApp } from '../appContext';
+import { useActions } from '../components/ActionDialog';
 import { useLive } from '../components/Live';
+import { RelTime } from '../components/RelTime';
+import { IntentAction } from '../components/SelectionBar';
 import { usePermissions } from '../components/Permissions';
 import {
   Badge,
@@ -19,6 +22,8 @@ import {
 } from '../components/primitives';
 import { useQuery } from '../hooks/useQuery';
 import { useUnsavedWork } from '../hooks/useUnsavedWork';
+import { absoluteTime } from '../lib/format';
+import { armIntent } from '../lib/intents';
 import { ActionPolicies } from './ActionPolicies';
 import {
   GROUPS,
@@ -60,6 +65,7 @@ export function SettingsTab() {
 
   return (
     <div className="mx-auto flex w-full max-w-screen-2xl flex-col gap-4">
+      <DeployWindowCard />
       {body ? (
         <SettingsEditor
           // A new stored state (after a save or a reload) resets the form.
@@ -77,6 +83,51 @@ export function SettingsTab() {
         <ErrorBanner error={loaded.error} what="the settings" onRetry={loaded.refresh} />
       )}
     </div>
+  );
+}
+
+/**
+ * DeployWindowCard states the initial deployment window as the scheduler
+ * last planned it, with the action that ends it early while it is open.
+ */
+function DeployWindowCard() {
+  const plan = useLive('plan').data;
+  const actions = useActions();
+  if (!plan) return null;
+
+  const w = plan.deployWindow;
+
+  return (
+    <>
+      {actions.notice}
+      <Card
+        title="Initial deployment window"
+        aside={w.open && <IntentAction icon="check" label="Arm now…" onAction={actions.request} intent={armIntent()} />}
+      >
+        <p aria-label="Deployment window state" className="text-sm/6">
+          {w.armedAt !== undefined ? (
+            <>
+              Armed <RelTime value={w.armedAt} />.
+            </>
+          ) : w.until === undefined ? (
+            'Disabled.'
+          ) : w.open ? (
+            <>
+              <Badge tone="warning">Open</Badge> until {absoluteTime(w.until)}, <RelTime value={w.until} />.
+            </>
+          ) : (
+            <>
+              Ended <RelTime value={w.until} />.
+            </>
+          )}
+        </p>
+        <p className="text-xs/5 text-muted">
+          While it is open after the controller first started on a fresh store, nothing is granted but Ansible deploys:
+          rollouts, host actions and manual actions wait. Syncs, probes and readiness go on.
+        </p>
+      </Card>
+      {actions.dialog}
+    </>
   );
 }
 

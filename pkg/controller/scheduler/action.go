@@ -39,6 +39,7 @@ const (
 	keyHeld      = "held"
 	keyReadiness = "readiness"
 	keyOutcome   = "outcome"
+	keyArmedAt   = "armedAt"
 )
 
 // manualRequest is a roll or reboot request in one shape.
@@ -1106,6 +1107,53 @@ func (s *service) setGlobalPause(
 	}
 
 	s.Nudge()
+
+	return res, nil
+}
+
+// ArmDeployWindow arms the initial deployment window while it is open: leases
+// are granted under the usual rules from the next reconcile on. A window
+// that is not open is left as it is.
+func (s *service) ArmDeployWindow(ctx context.Context, actor string, req ArmRequest) (*ActionResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	settings, err := s.Settings(ctx)
+	if err != nil {
+		return nil, err
+	}
+
+	w, err := s.opts.Store.DeployWindow(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: load deploy window: %w", err)
+	}
+
+	now := s.opts.Now()
+	res := &ActionResult{Message: "the deployment window is not open"}
+
+	if !w.Open(now, settings.DeployWindow.Std()) {
+		return res, nil
+	}
+
+	entry := s.entry(actor, "action.arm-deploy-window", "settings", map[string]any{
+		keyBefore: map[string]any{keyArmedAt: nil},
+		keyAfter:  map[string]any{keyArmedAt: now},
+		keyReason: req.Reason,
+	})
+	entries := []fleet.AuditEntry{entry}
+	stampAuthorization(ctx, entries)
+
+	armed, err := s.opts.Store.ArmDeployWindow(ctx, now, &entries[0])
+	if err != nil {
+		return nil, fmt.Errorf("scheduler: %w", err)
+	}
+
+	if armed {
+		res.Message = "armed: the deployment window is over"
+
+		s.changed()
+		s.Nudge()
+	}
 
 	return res, nil
 }

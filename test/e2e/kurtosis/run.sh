@@ -241,6 +241,7 @@ mkdir -p "$work/data"
     --default-setting baselineGrace=3m \
     --default-setting hostStaleAfter=1m \
     --default-setting lookupInterval=30s \
+    --default-setting deployWindow=0 \
     >"$work/controller.log" 2>&1 &
 echo $! >"$work/controller.pid"
 wait_until "controller up" 30 curl -fsS "$ctl/healthz"

@@ -101,6 +101,18 @@ type Store interface {
 	// and removes overrides for fields that equal them.
 	SaveSettings(ctx context.Context, defaults, settings fleet.Settings) error
 
+	// DeployWindow returns the initial deployment window; the zero value
+	// when the store holds none.
+	DeployWindow(ctx context.Context) (fleet.DeployWindowState, error)
+	// StartDeployWindow opens the window at at unless the store holds one
+	// (a fresh store holds none, an upgraded one with hosts or rollouts an
+	// armed one), and returns the stored window.
+	StartDeployWindow(ctx context.Context, at time.Time) (fleet.DeployWindowState, error)
+	// ArmDeployWindow arms a window that is not armed at at and appends
+	// entry in the same transaction; armed is false, and nothing is written,
+	// when there is nothing to arm.
+	ArmDeployWindow(ctx context.Context, at time.Time, entry *fleet.AuditEntry) (armed bool, err error)
+
 	// AppendAudit appends entries; ID is assigned, a zero Time is set to now.
 	AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error
 	// ListAudit returns entries, newest first.

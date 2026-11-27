@@ -273,7 +273,7 @@ export function privateTables(v: {
     h: { rows: list(v.hosts.hosts).map(h => wireHost(h, h.name in planned)) },
     c: { rows: list(v.clients.clients) },
     ...sharedTables(v.images, v.slots),
-    pl: { one: { paused: v.plan.paused, budget: v.plan.budget } },
+    pl: { one: { paused: v.plan.paused, budget: v.plan.budget, deployWindow: v.plan.deployWindow } },
     q: { rows: list(v.plan.queue) },
     ro: {
       rows: all.map(r => ({ ...r, hosts: null })),

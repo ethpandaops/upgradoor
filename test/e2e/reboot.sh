@@ -116,7 +116,7 @@ docker run -d --name "$id-controller" --network "$net" --label upgradoor.test=re
     --allow-insecure-agent-http --allow-open-api --beacon-endpoint "http://$id-beacon:5052" \
     --default-setting policyReboot=auto --default-setting policyPackages=auto \
     --default-setting hostStaleAfter=45s --default-setting leaseTtl=5m \
-    --default-setting paused=true >/dev/null
+    --default-setting paused=true --default-setting deployWindow=0 >/dev/null
 wait_until "controller up" 30 curl -fsS "$ctl/healthz"
 
 # --- hosts ---------------------------------------------------------------------

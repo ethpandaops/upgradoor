@@ -81,7 +81,7 @@ const (
 	// client-override. Twin: team_manage_flags.
 	FeatureManageFlags = "manage_flags"
 	// FeatureAdmin covers forget, pause and resume without a rollout (the
-	// global switch), GET and PUT /api/v1/settings, the data sources and
+	// global switch), arm-deploy-window, GET and PUT /api/v1/settings, the data sources and
 	// their refresh, and the audit log in full (views.Access). It includes
 	// every other feature. No twin.
 	FeatureAdmin = "admin"

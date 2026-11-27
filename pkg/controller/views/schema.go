@@ -34,6 +34,7 @@
 //	POST /api/v1/actions/unmark-offline user    scheduler.OfflineRequest      -> scheduler.ActionResult
 //	POST /api/v1/actions/pause         user     scheduler.ScopeRequest        -> scheduler.ActionResult
 //	POST /api/v1/actions/resume        user     scheduler.ScopeRequest        -> scheduler.ActionResult
+//	POST /api/v1/actions/arm-deploy-window admin scheduler.ArmRequest        -> scheduler.ActionResult
 //	POST /api/v1/actions/skip          user     scheduler.RolloutHostsRequest -> scheduler.ActionResult
 //	POST /api/v1/actions/retry         user     scheduler.RolloutHostsRequest -> scheduler.ActionResult
 //	POST /api/v1/actions/abort         user     scheduler.ScopeRequest        -> scheduler.ActionResult

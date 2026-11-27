@@ -1416,3 +1416,81 @@ func TestApprovalByKindPolicy(t *testing.T) {
 		assert.Equal(t, reasonApproval, reasons[host], host)
 	}
 }
+
+// While the initial deployment window is open nothing but Ansible deploys is
+// granted; the window ends by time with no action.
+func TestDeployWindowHoldsAllButDeploys(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.w.Settings.MaxLeasedPercent = 100
+	b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now.Add(-time.Hour)}
+	end := b.w.DeployWindow.StartedAt.Add(24 * time.Hour)
+
+	b.host("h", 10)
+	b.wants("h", packagesNeed("2.0"))
+	b.host("d", 10)
+	b.deploysInGroup("d", "geth", protocol.KindEL, "geth", imgGeth, digestA)
+
+	out := b.step()
+
+	assert.Equal(t, []string{"d"}, b.leasedHosts(), "the deploy goes through the window")
+	assert.Equal(t, DeployWindow{Open: true, Until: &end}, out.Plan.DeployWindow)
+	require.Len(t, out.Plan.Queue, 1)
+	assert.Equal(t, QueueEntry{
+		Host: "h", Position: 1, Reason: "initial deployment window until " + end.UTC().Format(time.RFC3339),
+		Wait: WaitDeployWindow, Rollouts: out.Plan.Queue[0].Rollouts,
+	}, out.Plan.Queue[0])
+
+	b.serve("d")
+	b.advance(end.Sub(b.w.Now) - time.Second)
+	b.step()
+	assert.Nil(t, b.lease("h"), "a second before the end")
+
+	b.advance(time.Second)
+	out = b.step()
+	assert.NotNil(t, b.lease("h"), "granted on the first pass after the end")
+	assert.False(t, out.Plan.DeployWindow.Open)
+}
+
+// The global pause holds deploys too, and says so before the window.
+func TestDeployWindowUnderPause(t *testing.T) {
+	b := newWorldBuilder(t)
+	b.w.Settings.Paused = true
+	b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now}
+
+	b.host("h", 10)
+	b.wants("h", packagesNeed("2.0"))
+	b.host("d", 10)
+	b.deploysInGroup("d", "geth", protocol.KindEL, "geth", imgGeth, digestA)
+
+	out := b.step()
+
+	assert.Empty(t, b.leasedHosts())
+	assert.Equal(t, map[string]string{"h": "paused", "d": "paused"}, queueReasons(out.Plan))
+}
+
+// An armed window, a disabled one and a store without one grant as usual.
+func TestDeployWindowClosed(t *testing.T) {
+	for name, mod := range map[string]func(b *worldBuilder){
+		"armed": func(b *worldBuilder) {
+			at := b.w.Now
+			b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now, ArmedAt: &at}
+		},
+		"disabled": func(b *worldBuilder) {
+			b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now}
+			b.w.Settings.DeployWindow = 0
+		},
+		"no window stored": func(*worldBuilder) {},
+	} {
+		t.Run(name, func(t *testing.T) {
+			b := newWorldBuilder(t)
+			mod(b)
+			b.host("h", 10)
+			b.wants("h", packagesNeed("2.0"))
+
+			out := b.step()
+
+			assert.NotNil(t, b.lease("h"))
+			assert.False(t, out.Plan.DeployWindow.Open)
+		})
+	}
+}
