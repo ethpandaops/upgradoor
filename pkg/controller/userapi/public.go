@@ -10,7 +10,6 @@ import (
 // handleConfig serves GET /api/v1/config.
 func (s *Handler) handleConfig(w http.ResponseWriter, _ *http.Request) {
 	httpjson.Write(s.log, w, http.StatusOK, views.Config{
-		BuildMinute:       s.opts.BuildMinute,
 		Network:           s.opts.Network,
 		Version:           s.opts.Version,
 		AuthProviderURL:   s.opts.AuthProviderURL,

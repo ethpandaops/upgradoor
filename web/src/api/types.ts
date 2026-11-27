@@ -1071,8 +1071,6 @@ export interface Config {
   /** uiScript is a script the UI includes (e.g. a site menu), with its integrity hash. */
   uiScript?: string;
   uiScriptIntegrity?: string;
-  /** The minute of the hour at which the image builder's scheduled run starts; absent when it has no such schedule. */
-  buildMinute?: number;
 }
 
 /** api.PublicImageRef */

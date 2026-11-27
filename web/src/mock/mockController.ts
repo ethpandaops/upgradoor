@@ -1254,7 +1254,6 @@ export class MockController {
       version: this.data.version,
       authProviderUrl: this.auth ? MOCK_AUTH_URL : '',
       authService: MOCK_AUTH_SERVICE,
-      buildMinute: 45,
     };
   }
 

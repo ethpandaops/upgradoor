@@ -57,10 +57,7 @@ type Options struct {
 	Lookups Lookups
 	// Upstream compares the images with their source branches; nil without.
 	Upstream Upstream
-	// BuildMinute is the minute of the hour of the image builder's
-	// scheduled run; nil when it has none.
-	BuildMinute *int
-	Beacon      views.Beacon
+	Beacon   views.Beacon
 	// Endpoints and Validators are the data sources of the settings page;
 	// nil shows none.
 	Endpoints  BeaconEndpoints

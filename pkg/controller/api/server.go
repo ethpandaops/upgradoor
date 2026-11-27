@@ -141,9 +141,6 @@ type Options struct {
 	Lookups discovery.Tracker
 	// Upstream compares the images with their source branches; nil without.
 	Upstream upstream.Tracker
-	// BuildMinute is the minute of the hour of the image builder's
-	// scheduled run; nil when it has none.
-	BuildMinute *int
 	// DefaultSettings are the settings from flags, shown next to the
 	// effective ones.
 	DefaultSettings fleet.Settings
@@ -271,8 +268,7 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 	})
 	s.users = userapi.New(s.log, userapi.Options{
 		Lookups: opts.Lookups, Upstream: refresh,
-		BuildMinute: opts.BuildMinute,
-		Network:     opts.Network, Version: opts.Version,
+		Network: opts.Network, Version: opts.Version,
 		AuthProviderURL: opts.AuthProviderURL, AuthService: opts.AuthService,
 		UIScript: opts.UIScript, UIScriptIntegrity: opts.UIScriptIntegrity,
 		Store: opts.Store, Scheduler: opts.Scheduler, Beacon: opts.Beacon, Views: s.views,

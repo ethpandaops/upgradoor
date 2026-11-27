@@ -96,9 +96,6 @@ type Config struct {
 	ImageSources []string
 	// SourceInterval is how often the source branches are read.
 	SourceInterval time.Duration
-	// BuildScheduleMinute is the minute of the hour at which the image
-	// builder's scheduled run starts; negative when it has none.
-	BuildScheduleMinute int
 	// DefaultSettings are "key=value" overrides of the built-in setting
 	// defaults; keys are the JSON names of fleet.Settings.
 	DefaultSettings []string
@@ -157,10 +154,6 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 
 	if len(cfg.BeaconEndpoints) == 0 {
 		return nil, errors.New("controller: at least one --beacon-endpoint is required")
-	}
-
-	if cfg.BuildScheduleMinute > 59 {
-		return nil, errors.New("controller: --build-schedule-minute is a minute of the hour (0-59), or -1 for none")
 	}
 
 	defaults, err := ParseDefaultSettings(cfg.DefaultSettings)
@@ -232,11 +225,6 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Now:      time.Now,
 	})
 
-	var buildMinute *int
-	if cfg.BuildScheduleMinute >= 0 {
-		buildMinute = &cfg.BuildScheduleMinute
-	}
-
 	c.api, err = api.New(log, api.Options{
 		Network:                cfg.Network,
 		Version:                cfg.Version,
@@ -257,7 +245,6 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Validators:             c.validators,
 		Lookups:                c.lookups,
 		Upstream:               c.upstream,
-		BuildMinute:            buildMinute,
 		DefaultSettings:        defaults,
 		WebFS:                  cfg.WebFS,
 		Registry:               prometheus.NewRegistry(),

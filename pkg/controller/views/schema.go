@@ -85,10 +85,6 @@ type Config struct {
 	// subresource integrity hash; absent when there is none.
 	UIScript          string `json:"uiScript,omitempty"`
 	UIScriptIntegrity string `json:"uiScriptIntegrity,omitempty"`
-	// BuildMinute is the minute of the hour at which the image builder's
-	// scheduled run starts, which builds the images whose branch moved;
-	// absent when it has no such schedule.
-	BuildMinute *int `json:"buildMinute,omitempty"`
 }
 
 // PublicImageRef is the public description of one running image.

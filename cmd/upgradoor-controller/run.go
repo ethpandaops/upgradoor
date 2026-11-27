@@ -102,9 +102,6 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 			"is compared with the image. Only for images whose labels do not name their source (repeatable)")
 	f.DurationVar(&cfg.SourceInterval, "source-interval", upstream.DefaultInterval,
 		"how often the source branches of the images are read")
-	f.IntVar(&cfg.BuildScheduleMinute, "build-schedule-minute", 45,
-		"minute of the hour at which the image builder's scheduled run starts "+
-			"(eth-client-docker-image-builder: 45); the UI says when a pending build is due. -1 for none")
 	f.StringArrayVar(&cfg.DefaultSettings, "default-setting", nil,
 		"default for a setting as key=value, e.g. maxUnavailablePercent=10 (repeatable)")
 	f.StringVar(&pprofListen, "pprof-listen", "",

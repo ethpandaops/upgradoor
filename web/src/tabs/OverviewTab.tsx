@@ -934,6 +934,9 @@ function RunningCommits({ image, hosts }: { image: PublicImage; hosts: readonly 
   );
 }
 
+/** BUILDER_MINUTE is the minute of the hour at which eth-client-docker-image-builder's scheduled run starts. */
+const BUILDER_MINUTE = 45;
+
 /** nextBuild is the next time the clock shows minute past the hour, as a local time of day. */
 function nextBuild(minute: number, now: number): string {
   const at = new Date(now);
@@ -950,7 +953,6 @@ function nextBuild(minute: number, now: number): string {
  * nothing when the branch's head is built and every host runs it.
  */
 function ImageStatus({ image, rollNote }: { image: PublicImage; rollNote: RollNote }) {
-  const { config } = useApp();
   const now = useSharedNow();
   const s = image.source;
   const behind = list(image.hostsBehind);
@@ -1005,11 +1007,9 @@ function ImageStatus({ image, rollNote }: { image: PublicImage; rollNote: RollNo
           >
             build pending
           </Badge>
-          {config.buildMinute !== undefined && (
-            <span className="text-muted" title="The image builder's scheduled run builds the branches that moved">
-              next builder run {nextBuild(config.buildMinute, now)}
-            </span>
-          )}
+          <span className="text-muted" title="The image builder's scheduled run builds the branches that moved">
+            next builder run {nextBuild(BUILDER_MINUTE, now)}
+          </span>
         </span>
       )}
       {behind.length > 0 && (
