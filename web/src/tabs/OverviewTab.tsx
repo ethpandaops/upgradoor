@@ -761,12 +761,12 @@ export function ImageSummary({ images }: { images: readonly PublicImage[] }) {
 const COMMIT_LINK = 'font-mono hover:underline';
 
 /**
- * sourceUnverified reports a check that has not succeeded (yet): the head
- * could not be read, or it is known but not that the image is built from it.
+ * sourceUnverified reports a check that has not succeeded (yet): the newest
+ * one failed, or the head is known but not that the image is built from it.
  */
 function sourceUnverified(s: ImageSource | undefined): boolean {
   if (s === undefined || s.pending === true) return false;
-  return s.head === undefined ? Boolean(s.error) : !sameCommit(s.commit, s.head);
+  return Boolean(s.error) || (s.head !== undefined && !sameCommit(s.commit, s.head));
 }
 
 /** sameCommit compares two commits of which either may be shortened. */

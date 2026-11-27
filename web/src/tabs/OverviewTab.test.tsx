@@ -378,4 +378,13 @@ describe('ImageSummary', () => {
     render(<ImageSummary images={[built, unread]} />);
     expect(screen.queryByText(/every image is on its branch head/)).not.toBeInTheDocument();
   });
+
+  it('claims nothing while the newest check of a head that was read before failed', () => {
+    const stale: PublicImage = {
+      ...built,
+      source: { repo: 'ethereum/go-ethereum', ref: 'master', commit: head, head, error: 'upstream: 503' },
+    };
+    render(<ImageSummary images={[stale]} />);
+    expect(screen.queryByText(/every image is on its branch head/)).not.toBeInTheDocument();
+  });
 });

@@ -58,6 +58,27 @@ export function outagesIn(outages: readonly Outage[], fromMs: number, toMs: numb
     .sort((a, b) => Number(!a.work) - Number(!b.work) || Date.parse(a.from) - Date.parse(b.from));
 }
 
+/** outageKey names a span across updates of the window, which replace its object. */
+function outageKey(o: Outage): string {
+  return `${o.lease ?? ''}/${o.from}/${list(o.names).join(',')}`;
+}
+
+/**
+ * outageCauses are the spans of the block that was asked about, then whatever
+ * else was off in its time, each once and as the window has it now.
+ */
+export function outageCauses(
+  block: readonly Outage[],
+  outages: readonly Outage[],
+  fromMs: number,
+  toMs: number,
+  now: number
+): Outage[] {
+  const causes = new Map<string, Outage>();
+  for (const o of [...block, ...outagesIn(outages, fromMs, toMs, now)]) causes.set(outageKey(o), o);
+  return [...causes.values()];
+}
+
 function slotsTitle(s: TimelineSelection): string {
   return s.slots === 1 ? `Slot ${s.slot}` : `Slots ${s.slot}–${s.slot + s.slots - 1}`;
 }
@@ -93,10 +114,7 @@ export function OutagePanel({
   const epoch = Math.floor(s.slot / Math.max(1, s.slotsPerEpoch));
   const lastEpoch = Math.floor((s.slot + Math.max(1, s.slots) - 1) / Math.max(1, s.slotsPerEpoch));
 
-  // The spans of the block that was asked about, and whatever else was off in its time.
-  const causes = outages
-    ? [...new Set([...(block?.outages ?? []), ...outagesIn(outages, s.fromMs, s.toMs, now)])]
-    : undefined;
+  const causes = outages ? outageCauses(block?.outages ?? [], outages, s.fromMs, s.toMs, now) : undefined;
   const misses = hostMisses(rows ?? [], s.slot, s.slots);
   const explained = new Set(list(causes).flatMap(o => list(o.names)));
 
@@ -202,13 +220,7 @@ export function OutagePanel({
               ) : (
                 <ul className="flex flex-col gap-3">
                   {causes.map(o => (
-                    <Cause
-                      key={`${o.lease ?? ''}/${o.from}/${list(o.names).join(',')}`}
-                      outage={o}
-                      rollouts={rollouts}
-                      now={now}
-                      onOpenHost={onOpenHost}
-                    />
+                    <Cause key={outageKey(o)} outage={o} rollouts={rollouts} now={now} onOpenHost={onOpenHost} />
                   ))}
                 </ul>
               )}

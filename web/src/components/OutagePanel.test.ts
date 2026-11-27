@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 
 import type { Outage, SlotRow } from '../api/types';
-import { hostMisses, outagesIn } from './OutagePanel';
+import { hostMisses, outageCauses, outagesIn } from './OutagePanel';
 
 const at = (s: number) => new Date(Date.parse('2026-01-01T00:00:00Z') + s * 1000).toISOString();
 const ms = (s: number) => Date.parse(at(s));
@@ -67,5 +67,15 @@ describe('outagesIn', () => {
     ];
 
     expect(outagesIn(outages, ms(20), ms(30), ms(60)).map(o => o.names?.[0])).toEqual(['rolled', 'off', 'open']);
+  });
+
+  it('lists a span of the block once after the window replaced its object, as the window has it now', () => {
+    const clicked = [span('rolled', 15, 25, { work: 'image', lease: 'l1', open: true })];
+    const refreshed = [span('off', 0, 50), span('rolled', 15, 25, { work: 'image', lease: 'l1', missed: 3 })];
+
+    const causes = outageCauses(clicked, refreshed, ms(20), ms(30), ms(60));
+
+    expect(causes.map(o => o.names?.[0])).toEqual(['rolled', 'off']);
+    expect(causes[0]).toBe(refreshed[1]);
   });
 });
