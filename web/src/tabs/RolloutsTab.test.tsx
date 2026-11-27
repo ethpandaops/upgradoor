@@ -304,7 +304,7 @@ describe('RolloutTargets', () => {
 
 describe('RecentRollouts', () => {
   it('wraps a long title anywhere instead of keeping it on one line', () => {
-    const title = 'unlabelled: ghcr.io/ethpandaops/some-long-image-name/with-path:master-latest to 1ca62ee4ba52';
+    const title = 'unlabelled: ghcr.io/ethpandaops/some-long-image-name/with-path:master-latest to 1ca62ee4bc52';
     render(<RecentRollouts rollouts={[rollout({ title, state: 'completed' })]} leases={new Map()} />);
 
     const cell = screen.getByRole('cell', { name: title });
