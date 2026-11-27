@@ -9,7 +9,6 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller"
 	"github.com/ethpandaops/upgradoor/pkg/controller/api"
 	"github.com/ethpandaops/upgradoor/pkg/controller/upstream"
-	"github.com/ethpandaops/upgradoor/pkg/controller/userapi"
 	"github.com/ethpandaops/upgradoor/web"
 )
 
@@ -106,10 +105,6 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 	f.IntVar(&cfg.BuildScheduleMinute, "build-schedule-minute", 45,
 		"minute of the hour at which the image builder's scheduled run starts "+
 			"(eth-client-docker-image-builder: 45); the UI says when a pending build is due. -1 for none")
-	f.StringVar(&cfg.HookSecretFile, "hook-secret-file", "",
-		"file holding the secret of POST "+userapi.PathBuildHook+", which an image builder calls "+
-			"when a build finished: the tags and source branches are then looked up at once. "+
-			"Sent as a bearer token or as the secret of a GitHub webhook (no hook when empty)")
 	f.StringArrayVar(&cfg.DefaultSettings, "default-setting", nil,
 		"default for a setting as key=value, e.g. maxUnavailablePercent=10 (repeatable)")
 	f.StringVar(&pprofListen, "pprof-listen", "",

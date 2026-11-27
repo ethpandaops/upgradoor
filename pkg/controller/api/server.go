@@ -141,8 +141,6 @@ type Options struct {
 	Lookups discovery.Tracker
 	// Upstream compares the images with their source branches; nil without.
 	Upstream upstream.Tracker
-	// HookSecret authenticates the build hook; empty serves none.
-	HookSecret []byte
 	// BuildMinute is the minute of the hour of the image builder's
 	// scheduled run; nil when it has none.
 	BuildMinute *int
@@ -272,7 +270,7 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		Notify:  s.Notify, NotifyHost: s.streams.NotifyHost, Now: opts.Now,
 	})
 	s.users = userapi.New(s.log, userapi.Options{
-		Lookups: opts.Lookups, Upstream: refresh, HookSecret: opts.HookSecret,
+		Lookups: opts.Lookups, Upstream: refresh,
 		BuildMinute: opts.BuildMinute,
 		Network:     opts.Network, Version: opts.Version,
 		AuthProviderURL: opts.AuthProviderURL, AuthService: opts.AuthService,

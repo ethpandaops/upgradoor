@@ -115,11 +115,7 @@ still have to roll.
   repository by name, and compared through the builder's `<tag>-<commit>`
   tag. Anything else is named with
   `--image-source <image>=<owner>/<name>[@<ref>]`.
-- `POST /api/v1/hooks/build` (with `--hook-secret-file`) looks every tag and
-  branch up at once. It takes the secret as a bearer token, or as the secret
-  of a GitHub webhook on the builder's repository (`workflow_run` events:
-  only a completed run counts). "Check registries now" does the same from the
-  UI.
+- "Check registries now" in the UI looks every tag and branch up at once.
 
 ## Validators
 

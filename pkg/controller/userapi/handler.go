@@ -57,8 +57,6 @@ type Options struct {
 	Lookups Lookups
 	// Upstream compares the images with their source branches; nil without.
 	Upstream Upstream
-	// HookSecret authenticates POST /api/v1/hooks/build; empty serves no hook.
-	HookSecret []byte
 	// BuildMinute is the minute of the hour of the image builder's
 	// scheduled run; nil when it has none.
 	BuildMinute *int
@@ -137,7 +135,6 @@ func (s *Handler) Routes() []Route {
 		{Method: http.MethodGet, Pattern: "/api/v1/public/images", Public: s.handlePublicImages},
 		{Method: http.MethodGet, Pattern: "/api/v1/public/network", Public: s.handlePublicNetwork},
 		{Method: http.MethodGet, Pattern: "/api/v1/public/slots", Public: s.handlePublicSlots},
-		{Method: http.MethodPost, Pattern: PathBuildHook, Public: s.handleBuildHook},
 
 		{Method: http.MethodGet, Pattern: "/api/v1/hosts", User: s.handleHosts},
 		{Method: http.MethodGet, Pattern: "/api/v1/hosts/{name}", User: s.handleHost},

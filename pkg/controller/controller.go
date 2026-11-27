@@ -3,7 +3,6 @@
 package controller
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -13,7 +12,6 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
-	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -101,8 +99,6 @@ type Config struct {
 	// BuildScheduleMinute is the minute of the hour at which the image
 	// builder's scheduled run starts; negative when it has none.
 	BuildScheduleMinute int
-	// HookSecretFile holds the secret of the build hook; empty serves none.
-	HookSecretFile string
 	// DefaultSettings are "key=value" overrides of the built-in setting
 	// defaults; keys are the JSON names of fleet.Settings.
 	DefaultSettings []string
@@ -241,13 +237,6 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		buildMinute = &cfg.BuildScheduleMinute
 	}
 
-	var hookSecret []byte
-	if cfg.HookSecretFile != "" {
-		if hookSecret, err = readHookSecret(cfg.HookSecretFile); err != nil {
-			return nil, fmt.Errorf("controller: --hook-secret-file: %w", err)
-		}
-	}
-
 	c.api, err = api.New(log, api.Options{
 		Network:                cfg.Network,
 		Version:                cfg.Version,
@@ -268,7 +257,6 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Validators:             c.validators,
 		Lookups:                c.lookups,
 		Upstream:               c.upstream,
-		HookSecret:             hookSecret,
 		BuildMinute:            buildMinute,
 		DefaultSettings:        defaults,
 		WebFS:                  cfg.WebFS,
@@ -440,25 +428,6 @@ func (c *controller) Stop() error {
 		c.validators.Stop(), c.store.Stop())
 
 	return errors.Join(errs...)
-}
-
-// minHookSecret is the shortest secret the build hook accepts.
-const minHookSecret = 16
-
-// readHookSecret reads the secret of the build hook: the file's content
-// without surrounding white space.
-func readHookSecret(path string) ([]byte, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, err
-	}
-
-	secret := bytes.TrimSpace(data)
-	if len(secret) < minHookSecret {
-		return nil, fmt.Errorf("the secret is shorter than %d bytes", minHookSecret)
-	}
-
-	return secret, nil
 }
 
 // health is the beacon service's view with the state of the validator ranges
