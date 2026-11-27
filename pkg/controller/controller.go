@@ -26,6 +26,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/registry"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
+	"github.com/ethpandaops/upgradoor/pkg/controller/upstream"
 	"github.com/ethpandaops/upgradoor/pkg/controller/validators"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/registryauth"
@@ -90,6 +91,11 @@ type Config struct {
 	RegistryAuthFile string
 	// Registry is how the registries are reached for the lookups.
 	Registry registry.Config
+	// ImageSources name the GitHub repository an image is built from, as
+	// "<image>=<owner>/<name>[@<ref>]", for images whose labels do not.
+	ImageSources []string
+	// SourceInterval is how often the source branches are read.
+	SourceInterval time.Duration
 	// DefaultSettings are "key=value" overrides of the built-in setting
 	// defaults; keys are the JSON names of fleet.Settings.
 	DefaultSettings []string
@@ -114,6 +120,7 @@ type controller struct {
 	validators validators.Service
 	scheduler  scheduler.Service
 	lookups    discovery.Tracker
+	upstream   upstream.Tracker
 	api        *api.Server
 	server     *http.Server
 	served     chan error
@@ -196,6 +203,28 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 
 	c.lookups = discovery.NewTracker(log, resolver, defaults.LookupInterval.Std(), time.Now)
 
+	sources := make(map[string]upstream.Source, len(cfg.ImageSources))
+
+	for _, value := range cfg.ImageSources {
+		image, source, serr := upstream.ParseSource(value)
+		if serr != nil {
+			return nil, fmt.Errorf("controller: --image-source: %w", serr)
+		}
+
+		sources[image] = source
+	}
+
+	c.upstream = upstream.New(log, upstream.Options{
+		Lookups:  c.lookups,
+		Registry: resolver,
+		NotFound: registry.IsNotFound,
+		Remote:   upstream.NewGitHub(cfg.Version),
+		Sources:  sources,
+		Interval: cfg.SourceInterval,
+		Changed:  func() { c.api.Notify() },
+		Now:      time.Now,
+	})
+
 	c.api, err = api.New(log, api.Options{
 		Network:                cfg.Network,
 		Version:                cfg.Version,
@@ -215,6 +244,7 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Endpoints:              c.beacon,
 		Validators:             c.validators,
 		Lookups:                c.lookups,
+		Upstream:               c.upstream,
 		DefaultSettings:        defaults,
 		WebFS:                  cfg.WebFS,
 		Registry:               prometheus.NewRegistry(),
@@ -319,8 +349,13 @@ func (c *controller) Start(ctx context.Context) error {
 			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
 	}
 
+	if err := c.upstream.Start(ctx); err != nil {
+		return errors.Join(fmt.Errorf("upstream: %w", err), c.lookups.Stop(),
+			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
+	}
+
 	if err := c.api.Start(ctx); err != nil {
-		return errors.Join(fmt.Errorf("api: %w", err),
+		return errors.Join(fmt.Errorf("api: %w", err), c.upstream.Stop(),
 			c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
 	}
 
@@ -328,7 +363,7 @@ func (c *controller) Start(ctx context.Context) error {
 
 	listener, err := lc.Listen(ctx, "tcp", c.cfg.Listen)
 	if err != nil {
-		return errors.Join(fmt.Errorf("listen: %w", err), c.api.Stop(), c.lookups.Stop(),
+		return errors.Join(fmt.Errorf("listen: %w", err), c.api.Stop(), c.upstream.Stop(), c.lookups.Stop(),
 			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
 	}
 
@@ -376,7 +411,7 @@ func (c *controller) Stop() error {
 		errs = append(errs, c.server.Shutdown(ctx), <-c.served)
 	}
 
-	errs = append(errs, c.api.Stop(), c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(),
+	errs = append(errs, c.api.Stop(), c.upstream.Stop(), c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(),
 		c.validators.Stop(), c.store.Stop())
 
 	return errors.Join(errs...)

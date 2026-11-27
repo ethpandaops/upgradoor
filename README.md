@@ -99,6 +99,24 @@ upgradoor key                   create the host key, print its public key
 upgradoor verify-cert           print what a host certificate certifies
 ```
 
+## Source branches
+
+The controller finds the GitHub repository and branch each followed image is
+built from and reads the branch's head every minute (`--source-interval`).
+The overview shows per image whether it is built from that head, or that a
+build is pending (the branch is ahead of the image), next to the hosts that
+still have to roll.
+
+- The source is read off the image's labels (`ethpandaops.io.repo`,
+  `ethpandaops.io.commitRef`, `commit` of eth-client-docker-image-builder, or
+  `org.opencontainers.image.source` / `.revision`); the branch is the one
+  named like the tag unless a label says otherwise.
+- An `ethpandaops/<client>` image without labels is matched to its upstream
+  repository by name, and compared through the builder's `<tag>-<commit>`
+  tag. Anything else is named with
+  `--image-source <image>=<owner>/<name>[@<ref>]`.
+- "Check registries now" in the UI looks every tag and branch up at once.
+
 ## Validators
 
 The controller reads the devnet's validator name inventory from

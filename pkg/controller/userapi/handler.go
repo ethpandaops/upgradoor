@@ -55,7 +55,9 @@ type Options struct {
 	Scheduler scheduler.Service
 	// Lookups looks the hosts' tags up at the registries; nil without them.
 	Lookups Lookups
-	Beacon  views.Beacon
+	// Upstream compares the images with their source branches; nil without.
+	Upstream Upstream
+	Beacon   views.Beacon
 	// Endpoints and Validators are the data sources of the settings page;
 	// nil shows none.
 	Endpoints  BeaconEndpoints
@@ -74,6 +76,11 @@ type Options struct {
 // Lookups is the part of discovery.Tracker the user routes use.
 type Lookups interface {
 	Refresh() discovery.Refreshed
+}
+
+// Upstream is the part of upstream.Tracker the user routes use.
+type Upstream interface {
+	Refresh() int
 }
 
 // Handler serves the user routes and the public REST views.

@@ -5,9 +5,11 @@ import {
   type Budget,
   list,
   type Gate,
+  type ImageSource,
   type Lease,
   type NeedKind,
   type Plan,
+  type PublicHost,
   type PublicImage,
   type QueueEntry,
   type Rollout,
@@ -15,16 +17,30 @@ import {
 import { beaconSeen, chainAt } from '../api/wire';
 import { useApp, useAuthState, usePrivateAccess } from '../appContext';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
-import { Digest } from '../components/Digest';
 import { useLive } from '../components/Live';
 import { LeaseProgress } from '../components/LeaseProgress';
+import { OutagePanel } from '../components/OutagePanel';
 import { useReadinessNote } from '../components/Readiness';
+import { RefreshImages } from '../components/RefreshImages';
 import { IntentAction } from '../components/SelectionBar';
 import { pullNote } from '../components/PullNote';
 import { RelTime, useSharedNow } from '../components/RelTime';
-import { Timeline, TimelineLegend } from '../components/Timeline';
-import { Badge, Button, Card, ErrorBanner, Loading, Meter, Segmented, cx } from '../components/primitives';
-import { WorkTag } from '../components/status';
+import { Timeline, TimelineLegend, type TimelineSelection } from '../components/Timeline';
+import {
+  Badge,
+  Button,
+  Card,
+  Dash,
+  ErrorBanner,
+  Loading,
+  Meter,
+  Segmented,
+  Table,
+  Td,
+  Th,
+  cx,
+} from '../components/primitives';
+import { ClientBadge, WorkTag } from '../components/status';
 import { setKept } from '../hooks/useKept';
 import { useSlotHistory } from '../hooks/useSlotHistory';
 import { attentionItems, type AttentionItem } from '../lib/activity';
@@ -32,7 +48,8 @@ import { gateApprovalNotes } from '../lib/approvals';
 import { formatPercent, percentOf, plural } from '../lib/format';
 import { rolloutActionOf } from '../lib/hostActions';
 import { approveIntent, holdIntent, hostsIntent, scopeIntent } from '../lib/intents';
-import { splitQueue, workKind, type StageOf } from '../lib/timeline';
+import { clearsByItself, splitQueue, workKind, type StageOf } from '../lib/timeline';
+import { clientOf } from './hostRows';
 
 const RANGES = [
   { value: '15m', label: '15m', ms: 900_000 },
@@ -63,6 +80,12 @@ export function OverviewTab({ onOpenTab }: { onOpenTab: (tab: 'hosts' | 'rollout
 
   const [range, setRange] = useState<RangeId>('3h');
   const rangeMs = (RANGES.find(r => r.value === range) ?? RANGES[2]).ms;
+  // The span of the graph somebody asked about: its panel says what happened there.
+  const [selection, setSelection] = useState<TimelineSelection | undefined>(undefined);
+  const openHost = (host: string) => {
+    setKept('hosts.filter', host);
+    onOpenTab('hosts');
+  };
 
   const gate = useLive('public-network');
   const history = useSlotHistory(rangeMs / 1000);
@@ -102,6 +125,15 @@ export function OverviewTab({ onOpenTab }: { onOpenTab: (tab: 'hosts' | 'rollout
   );
   const needKindsOf = (host: string) =>
     list(list(hosts.data?.hosts).find(h => h.name === host)?.needs).map(n => n.kind);
+
+  // What the roll of the hosts behind an image waits for: a lease that runs, or the first of them in the queue.
+  const rollNote = (behind: readonly string[]): string | undefined => {
+    const lease = openLeases.find(l => behind.includes(l.host));
+    if (lease) return `rolling ${lease.host} now`;
+    const waiting = queue.filter(q => behind.includes(q.host)).sort((a, b) => a.position - b.position)[0];
+    if (!waiting) return undefined;
+    return clearsByItself(waiting.wait) ? `starts by itself: ${waiting.reason}` : `waits: ${waiting.reason}`;
+  };
 
   const pendingHosts = list(publicHosts.data?.hosts).filter(h => h.updatePending).length;
   const totalHosts = list(publicHosts.data?.hosts).length;
@@ -153,10 +185,9 @@ export function OverviewTab({ onOpenTab }: { onOpenTab: (tab: 'hosts' | 'rollout
         <Timeline
           history={history.data}
           outages={history.outages}
-          onOpenHost={host => {
-            setKept('hosts.filter', host);
-            onOpenTab('hosts');
-          }}
+          onOpenHost={openHost}
+          onSelect={setSelection}
+          selected={selection}
           now={now}
           rangeMs={rangeMs}
           emptyNote={participationNote(plan.data?.gate ?? gate.data, history.loading)}
@@ -250,9 +281,37 @@ export function OverviewTab({ onOpenTab }: { onOpenTab: (tab: 'hosts' | 'rollout
         )
       )}
 
-      <Card title="Client images" count={list(images.data?.images).length}>
-        <ImageGrid images={list(images.data?.images)} />
+      <Card
+        title="Client images"
+        count={list(images.data?.images).length}
+        aside={
+          <>
+            <ImageSummary images={list(images.data?.images)} />
+            {priv && <RefreshImages />}
+          </>
+        }
+      >
+        <ImageGrid images={list(images.data?.images)} hosts={list(publicHosts.data?.hosts)} rollNote={rollNote} />
       </Card>
+
+      {selection && (
+        <OutagePanel
+          selection={selection}
+          outages={history.outages}
+          now={now}
+          onClose={() => {
+            setSelection(undefined);
+          }}
+          onOpenHost={priv ? openHost : undefined}
+          onOpenRollouts={
+            priv
+              ? () => {
+                  onOpenTab('rollouts');
+                }
+              : undefined
+          }
+        />
+      )}
 
       {actions.dialog}
     </div>
@@ -655,39 +714,416 @@ function AttentionRow({
   );
 }
 
-function ImageGrid({ images }: { images: readonly PublicImage[] }) {
+const GITHUB = 'https://github.com';
+
+/** shortCommit is a commit the way git shortens it. */
+function shortCommit(commit: string): string {
+  return commit.slice(0, 7);
+}
+
+/** ImageSummary says, above the list, how many images wait for a build and how many for a roll. */
+export function ImageSummary({ images }: { images: readonly PublicImage[] }) {
+  const followed = images.filter(img => img.source?.head);
+  const unverified = images.filter(img => sourceUnverified(img.source));
+  const build = images.filter(img => img.source?.pending).length;
+  const roll = images.filter(img => list(img.hostsBehind).length > 0).length;
+
+  if (build === 0 && roll === 0) {
+    return followed.length > 0 && unverified.length === 0 ? (
+      <span
+        className="text-xs/5 font-medium text-success"
+        title="Every image whose source branch is known is built from the head of that branch, and every host runs it. The branches are read every minute."
+      >
+        ✓ every image is on its branch head and rolled
+      </span>
+    ) : null;
+  }
+
+  return (
+    <span className="flex flex-wrap items-center gap-1.5">
+      {build > 0 && (
+        <Badge
+          tone="warning"
+          title="The source branch is ahead of the image: the image builder has not published its head yet."
+        >
+          {build} build pending
+        </Badge>
+      )}
+      {roll > 0 && (
+        <Badge tone="info" title="The tag points at a newer image than some hosts run.">
+          {roll} roll pending
+        </Badge>
+      )}
+    </span>
+  );
+}
+
+const COMMIT_LINK = 'font-mono hover:underline';
+
+/**
+ * sourceUnverified reports a check that has not succeeded (yet): the newest
+ * one failed, or the head is known but not that the image is built from it.
+ */
+function sourceUnverified(s: ImageSource | undefined): boolean {
+  if (s === undefined || s.pending === true) return false;
+  return Boolean(s.error) || (s.head !== undefined && !sameCommit(s.commit, s.head));
+}
+
+/** sameCommit compares two commits of which either may be shortened. */
+function sameCommit(a: string | undefined, b: string | undefined): boolean {
+  return a !== undefined && b !== undefined && a !== '' && b !== '' && (a.startsWith(b) || b.startsWith(a));
+}
+
+function CommitLink({
+  repo,
+  commit,
+  className,
+  title,
+}: {
+  repo: string;
+  commit: string;
+  className?: string;
+  title: string;
+}) {
+  return (
+    <a
+      className={cx(COMMIT_LINK, className)}
+      href={`${GITHUB}/${repo}/commit/${commit}`}
+      target="_blank"
+      rel="noreferrer"
+      title={title}
+    >
+      {shortCommit(commit)}
+    </a>
+  );
+}
+
+/** SourceBranch names the repository and branch an image is built from, linked to GitHub. */
+function SourceBranch({ image }: { image: PublicImage }) {
+  const s = image.source;
+  if (!s) return <Dash />;
+
+  return (
+    <a
+      className="text-muted hover:text-foreground hover:underline"
+      href={`${GITHUB}/${s.repo}/tree/${s.ref}`}
+      target="_blank"
+      rel="noreferrer"
+      title={s.error ? `Reading ${s.repo}@${s.ref} failed: ${s.error}` : `The image is built from ${s.repo}@${s.ref}`}
+    >
+      {s.repo}
+      <span className="text-faint">@{s.ref}</span>
+      {s.error && <span className="text-warning"> ⚠</span>}
+    </a>
+  );
+}
+
+/** BranchHead is the commit the image's branch is at. */
+function BranchHead({ image }: { image: PublicImage }) {
+  const s = image.source;
+  if (!s) return <Dash />;
+  if (!s.head) {
+    return (
+      <span className="text-faint" title={s.error ?? `${s.repo} has no branch or tag ${s.ref} to compare with`}>
+        ?
+      </span>
+    );
+  }
+
+  return (
+    <CommitLink repo={s.repo} commit={s.head} className="text-muted" title={`${s.repo}@${s.ref} is at ${s.head}`} />
+  );
+}
+
+/** BuiltCommit is the commit the image the tag points at was built from; it warns when the branch is ahead of it. */
+function BuiltCommit({ image }: { image: PublicImage }) {
+  const s = image.source;
+  const commit = s?.commit ?? dict(image.commits)[image.digest ?? ''];
+  if (!s) {
+    // The image names its commit, but nothing says which repository and branch to compare it with.
+    return commit ? (
+      <span className="font-mono text-muted" title={`The image the tag points at is built from ${commit}`}>
+        {shortCommit(commit)}
+      </span>
+    ) : (
+      <Dash />
+    );
+  }
+  if (!commit) {
+    return (
+      <span
+        className={s.pending ? 'text-warning' : 'text-faint'}
+        title="The image does not say which commit it was built from"
+      >
+        ?
+      </span>
+    );
+  }
+
+  return s.pending && s.head ? (
+    <a
+      className={cx(COMMIT_LINK, 'text-warning')}
+      href={`${GITHUB}/${s.repo}/compare/${commit}...${s.head}`}
+      target="_blank"
+      rel="noreferrer"
+      title={`The image is built from ${commit}; ${s.repo}@${s.ref} is ahead of it. Open what the image lacks.`}
+    >
+      {shortCommit(commit)}
+    </a>
+  ) : (
+    <CommitLink
+      repo={s.repo}
+      commit={commit}
+      className="text-muted"
+      title={`The image the tag points at is built from ${commit}`}
+    />
+  );
+}
+
+/**
+ * RunningCommits are the commits the hosts run, with how many hosts are on
+ * each when they differ. A digest whose commit is not known shows as the digest, cut to the length
+ * of a commit and underlined with dots.
+ */
+function RunningCommits({ image, hosts }: { image: PublicImage; hosts: readonly PublicHost[] }) {
+  const s = image.source;
+  const counts = new Map<string, number>();
+
+  for (const host of hosts) {
+    const ref = image.kind === 'el' ? host.el : host.cl;
+    if (ref?.image === image.image) counts.set(ref.digest ?? '', (counts.get(ref.digest ?? '') ?? 0) + 1);
+  }
+
+  if (counts.size === 0) return <Dash />;
+
+  // The digest the tag points at first, then the one most hosts run.
+  const digests = [...counts.keys()].sort(
+    (a, b) => Number(b === image.digest) - Number(a === image.digest) || (counts.get(b) ?? 0) - (counts.get(a) ?? 0)
+  );
+
+  return (
+    <span className="flex flex-wrap items-center gap-x-2">
+      {digests.map(digest => {
+        const commit = dict(image.commits)[digest] ?? (digest === image.digest ? s?.commit : undefined);
+        const current = digest === image.digest;
+        const tone = current ? (sameCommit(commit, s?.head) ? 'text-success' : 'text-muted') : 'text-warning';
+        const n = counts.get(digest) ?? 0;
+
+        return (
+          <span key={digest} className="inline-flex items-center gap-1">
+            {commit && s ? (
+              <CommitLink
+                repo={s.repo}
+                commit={commit}
+                className={tone}
+                title={`${plural(n, 'host')} ${n === 1 ? 'runs' : 'run'} the image built from ${commit} (${digest})`}
+              />
+            ) : (
+              <span
+                className={cx('font-mono', tone, !commit && 'underline decoration-dotted')}
+                title={`${plural(n, 'host')} ${n === 1 ? 'runs' : 'run'} ${digest || 'an image without a digest'}${commit ? `, built from ${commit}` : '; the commit it was built from is not known'}`}
+              >
+                {commit ? shortCommit(commit) : digest ? shortCommit(digest.replace(/^[a-z0-9]+:/, '')) : '?'}
+              </span>
+            )}
+            {digests.length > 1 && <span className="text-faint tabular-nums">×{n}</span>}
+          </span>
+        );
+      })}
+    </span>
+  );
+}
+
+/** BUILDER_MINUTE is the minute of the hour at which eth-client-docker-image-builder's scheduled run starts. */
+const BUILDER_MINUTE = 45;
+
+/** nextBuild is the next time the clock shows minute past the hour, as a local time of day. */
+function nextBuild(minute: number, now: number): string {
+  const at = new Date(now);
+  at.setUTCSeconds(0, 0);
+  if (at.getUTCMinutes() >= minute) at.setUTCHours(at.getUTCHours() + 1);
+  at.setUTCMinutes(minute);
+  return at.toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit', hourCycle: 'h23' });
+}
+
+/**
+ * ImageStatus says what an image waits for and when that is expected: a
+ * build when its branch is ahead of it (the builder's next scheduled run), a
+ * roll when hosts run an older image (what the scheduler waits for), and
+ * nothing when the branch's head is built and every host runs it.
+ */
+function ImageStatus({ image, rollNote }: { image: PublicImage; rollNote: RollNote }) {
+  const now = useSharedNow();
+  const s = image.source;
+  const behind = list(image.hostsBehind);
+  const build = s?.pending === true;
+
+  if (s !== undefined && sourceUnverified(s) && behind.length === 0) {
+    return (
+      <span
+        className="font-medium text-warning"
+        title={
+          s.error
+            ? `Whether the image is built from the head of ${s.repo}@${s.ref} could not be checked: ${s.error}`
+            : `Whether the image is built from the head of ${s.repo}@${s.ref} is not known yet`
+        }
+      >
+        ? not verified
+      </span>
+    );
+  }
+
+  if (!build && behind.length === 0) {
+    return s?.head ? (
+      <span
+        className="font-medium text-success"
+        title={`The head of ${s.repo}@${s.ref} is built and every host runs it`}
+      >
+        ✓ up to date
+      </span>
+    ) : (
+      <span
+        className="font-medium text-success"
+        title={
+          s
+            ? `Every host runs the image the tag points at. ${s.repo} has no branch or tag ${s.ref} to compare it with.`
+            : 'Every host runs the image the tag points at. Which branch it is built from is not known, so it is not compared with one.'
+        }
+      >
+        ✓ rolled <span className="font-normal text-faint">· no branch to compare</span>
+      </span>
+    );
+  }
+
+  const roll = behind.length > 0 ? rollNote(behind) : undefined;
+
+  return (
+    <span className="flex flex-col gap-0.5">
+      {build && (
+        <span className="flex items-center gap-1.5">
+          <Badge
+            tone="warning"
+            title={`${s.repo}@${s.ref} is ahead of the image: the image builder has not published its head yet`}
+          >
+            build pending
+          </Badge>
+          <span className="text-muted" title="The image builder's scheduled run builds the branches that moved">
+            next builder run {nextBuild(BUILDER_MINUTE, now)}
+          </span>
+        </span>
+      )}
+      {behind.length > 0 && (
+        <span className="flex items-center gap-1.5">
+          <Badge
+            tone="info"
+            title={`The tag points at a newer image than ${plural(behind.length, 'host')} run: ${behind.join(', ')}`}
+          >
+            roll pending
+          </Badge>
+          {roll && (
+            <span className="max-w-52 truncate text-muted" title={roll}>
+              {roll}
+            </span>
+          )}
+        </span>
+      )}
+    </span>
+  );
+}
+
+/** RollNote says, for the hosts behind an image, what their roll waits for; undefined when that is not known. */
+type RollNote = (behind: readonly string[]) => string | undefined;
+
+const IMAGE_GROUPS = [
+  { kind: 'el', title: 'Execution clients' },
+  { kind: 'cl', title: 'Consensus clients' },
+] as const;
+
+function ImageGrid({
+  images,
+  hosts,
+  rollNote,
+}: {
+  images: readonly PublicImage[];
+  hosts: readonly PublicHost[];
+  rollNote: RollNote;
+}) {
   if (images.length === 0) return <Quiet>No host has reported a client image yet.</Quiet>;
 
   return (
-    <ul className="grid grid-cols-1 gap-x-8 lg:grid-cols-2">
-      {images.map(img => {
-        const on = list(img.hostsOn).length;
-        const behind = list(img.hostsBehind);
-        const total = on + behind.length;
+    <Table label="Client images" roomy>
+      <thead>
+        <tr>
+          <Th>Image</Th>
+          <Th title="The repository and branch the image is built from">Branch</Th>
+          <Th title="The commit the branch is at, read every minute">Branch head</Th>
+          <Th title="The commit the image the tag points at was built from">Image built from</Th>
+          <Th title="The commit of the image the hosts run">Running</Th>
+          <Th>Status</Th>
+          <Th title="Hosts that run that digest">Hosts</Th>
+        </tr>
+      </thead>
+      {IMAGE_GROUPS.map(g => {
+        const rows = images.filter(img => img.kind === g.kind);
+        if (rows.length === 0) return null;
 
         return (
-          <li
-            key={`${img.kind}/${img.image}`}
-            className="flex items-center gap-3 border-b border-border py-1.5 text-xs/5"
-            title={behind.length > 0 ? `behind: ${behind.join(', ')}` : undefined}
-          >
-            <span className="w-6 shrink-0 font-medium text-faint uppercase">{img.kind}</span>
-            <span className="min-w-0 grow truncate font-mono text-sm/6" title={img.image}>
-              {img.image}
-            </span>
-            <Digest value={img.digest} />
-            <span className="flex w-40 shrink-0 items-center gap-2">
-              <span className="w-16">
-                <Meter progress value={on} max={total} label={`Hosts on the newest digest of ${img.image}`} />
-              </span>
-              <span className={cx('tabular-nums', behind.length > 0 ? 'font-medium text-warning' : 'text-muted')}>
-                {on}/{total}
-                {behind.length > 0 && ` · ${behind.length} behind`}
-              </span>
-            </span>
-          </li>
+          <tbody key={g.kind} aria-label={g.title}>
+            <tr>
+              <th
+                scope="colgroup"
+                colSpan={7}
+                className="border-b border-border px-2.5 pt-3 pb-1 font-medium text-faint"
+              >
+                {g.title} {rows.length}
+              </th>
+            </tr>
+            {rows.map(img => {
+              const on = list(img.hostsOn).length;
+              const behind = list(img.hostsBehind);
+              const total = on + behind.length;
+
+              return (
+                <tr key={img.image}>
+                  <Td>
+                    <span className="flex items-center gap-2">
+                      <ClientBadge name={clientOf({ image: img.image })} />
+                      <span className="font-mono text-sm/6">{img.image}</span>
+                    </span>
+                  </Td>
+                  <Td>
+                    <SourceBranch image={img} />
+                  </Td>
+                  <Td>
+                    <BranchHead image={img} />
+                  </Td>
+                  <Td>
+                    <BuiltCommit image={img} />
+                  </Td>
+                  <Td>
+                    <RunningCommits image={img} hosts={hosts} />
+                  </Td>
+                  <Td>
+                    <ImageStatus image={img} rollNote={rollNote} />
+                  </Td>
+                  <Td title={behind.length > 0 ? `behind: ${behind.join(', ')}` : undefined}>
+                    <span className="flex items-center gap-2">
+                      <span className="w-12">
+                        <Meter progress value={on} max={total} label={`Hosts on the newest digest of ${img.image}`} />
+                      </span>
+                      <span
+                        className={cx('tabular-nums', behind.length > 0 ? 'font-medium text-warning' : 'text-muted')}
+                      >
+                        {on}/{total}
+                      </span>
+                    </span>
+                  </Td>
+                </tr>
+              );
+            })}
+          </tbody>
         );
       })}
-    </ul>
+    </Table>
   );
 }

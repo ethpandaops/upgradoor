@@ -2,7 +2,7 @@ import { Fragment, useState } from 'react';
 
 import type { AuditEntry } from '../api/types';
 import { changeOf, diffValues, formatValue } from '../lib/auditDiff';
-import { RelTime } from './RelTime';
+import { Timestamp } from './RelTime';
 import { Dash, Table, Td, Th } from './primitives';
 
 /** AuditDetail renders an entry's detail: a before / after diff when it is a change, JSON otherwise. */
@@ -123,7 +123,7 @@ export function AuditTable({
                   )}
                 </Td>
                 <Td>
-                  <RelTime fixed value={e.time} />
+                  <Timestamp value={e.time} />
                 </Td>
                 <Td>{e.actor}</Td>
                 <Td className="font-mono">{e.action}</Td>

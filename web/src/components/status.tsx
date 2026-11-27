@@ -205,6 +205,59 @@ export function stageLabel(stage: Stage): string {
   return STAGE_LABEL[stage];
 }
 
+/** CLIENT_HUES are the hues of the clients that have one of their own; the others get one from their name. */
+const CLIENT_HUES: Record<string, number> = {
+  geth: 212,
+  nethermind: 188,
+  besu: 165,
+  erigon: 28,
+  reth: 8,
+  ethrex: 282,
+  lighthouse: 262,
+  prysm: 46,
+  teku: 22,
+  nimbus: 198,
+  lodestar: 305,
+  grandine: 138,
+  ethlambda: 332,
+};
+
+/** CLIENT_COLORS are the clients whose colour is not a hue: silver is silver. */
+const CLIENT_COLORS: Record<string, string> = {
+  silver: 'hsl(215 12% 72%)',
+};
+
+function clientHue(name: string): number {
+  const known = CLIENT_HUES[name.toLowerCase()];
+  if (known !== undefined) return known;
+  let hash = 0;
+  for (const ch of name) hash = (hash * 31 + ch.charCodeAt(0)) % 360;
+  return hash;
+}
+
+/**
+ * ClientBadge names a client in its own colour, the same wherever the client
+ * shows. The colour is mixed with the theme's text colour, so it reads on
+ * both themes.
+ */
+export function ClientBadge({ name }: { name: string | undefined }) {
+  if (!name) return null;
+  const base = CLIENT_COLORS[name.toLowerCase()] ?? `hsl(${clientHue(name)} 75% 52%)`;
+
+  return (
+    <span
+      className="inline-flex items-center rounded-sm border px-1.5 text-xs/5 font-medium whitespace-nowrap"
+      style={{
+        color: `color-mix(in oklab, ${base} 72%, var(--color-foreground))`,
+        backgroundColor: `color-mix(in oklab, ${base} 16%, transparent)`,
+        borderColor: `color-mix(in oklab, ${base} 40%, transparent)`,
+      }}
+    >
+      {name}
+    </span>
+  );
+}
+
 /**
  * ImageCell shows an image as tag + short digest + revision. stacked puts the
  * digest below the tag to keep wide tables narrow.
@@ -370,7 +423,7 @@ export function WorkTag({ kind }: { kind: keyof typeof WORK_LABEL }) {
 /** OfflineBadge says that a host is marked known offline, with why and until when. */
 export function OfflineBadge({ mark }: { mark: OfflineMark | undefined }) {
   if (!mark) return null;
-  const until = mark.until ? `, until ${new Date(mark.until).toLocaleString()}` : '';
+  const until = mark.until ? `, until ${new Date(mark.until).toLocaleString([], { hourCycle: 'h23' })}` : '';
   return (
     <Badge tone="neutral" title={`Known offline${until}: ${mark.reason}. Left out of the gate and the budget.`}>
       known offline

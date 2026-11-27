@@ -40,7 +40,7 @@ func (s *Handler) handlePublicImages(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	httpjson.Write(s.log, w, http.StatusOK, views.NewPublicImages(hosts))
+	httpjson.Write(s.log, w, http.StatusOK, s.views.PublicImages(hosts))
 }
 
 // handlePublicNetwork serves GET /api/v1/public/network.

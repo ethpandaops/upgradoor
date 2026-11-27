@@ -39,6 +39,7 @@ import {
   type SlotRow,
   type PublicHost,
   type PublicHosts,
+  type ImageSource,
   type PublicImage,
   type PublicImageRef,
   type PublicImages,
@@ -302,6 +303,38 @@ const STREAM_ROLLOUT_LIMIT = 50;
  * snapshot, then the rows and cells that changed, whenever publish() is called
  * (after every action, and by whoever lets time pass).
  */
+/** OLDER_COMMIT is what the hosts behind an image of SOURCES run. */
+const OLDER_COMMIT = '9f8e7d6c5b4a39281706f5e4d3c2b1a098765432';
+
+/** SOURCES are the images of the fixture whose source branch is known: one built from its head, one behind it, one whose check fails, one whose head cannot be read. */
+const SOURCES: Record<string, ImageSource> = {
+  'ethpandaops/geth:master': {
+    repo: 'ethereum/go-ethereum',
+    ref: 'master',
+    commit: '1df30b18d9ed35ee9d28ffd4648442c2204554ad',
+    head: '1df30b18d9ed35ee9d28ffd4648442c2204554ad',
+  },
+  'sigp/lighthouse:unstable': {
+    repo: 'sigp/lighthouse',
+    ref: 'unstable',
+    commit: 'd450b29',
+    head: '7c1f9be2a0e4d3b6c5a49788f6e5d4c3b2a19087',
+    pending: true,
+  },
+  'chainsafe/lodestar:next': {
+    repo: 'chainsafe/lodestar',
+    ref: 'unstable',
+    head: '83a0cb8fbee7beacfb013b3765f4e16a8050c7c2',
+    error:
+      'registry: HEAD https://registry-1.docker.io/v2/chainsafe/lodestar/manifests/next-83a0cb8: 429 Too Many Requests',
+  },
+  'consensys/teku:develop': {
+    repo: 'consensys/teku',
+    ref: 'develop',
+    error: 'upstream: github.com/consensys/teku: 401 Unauthorized',
+  },
+};
+
 export class MockController {
   readonly data: MockData;
   private readonly auth: boolean;
@@ -1256,7 +1289,14 @@ export class MockController {
           revision: c.registry?.revision,
           hostsOn: [],
           hostsBehind: [],
+          ...(SOURCES[c.image] ? { source: SOURCES[c.image] } : {}),
         };
+
+        const source = SOURCES[c.image];
+        if (source?.commit) {
+          entry.commits = { ...entry.commits, [target ?? '']: source.commit };
+          if (c.digest && c.digest !== target) entry.commits[c.digest] = OLDER_COMMIT;
+        }
 
         (c.digest === target ? entry.hostsOn : entry.hostsBehind)?.push(host.name);
         byKey.set(key, entry);
@@ -1455,7 +1495,12 @@ export class MockController {
       }
     }
 
-    if (recent.size === 0) return { tags: tags.size, message: `${tags.size} tag(s) are looked up now` };
+    if (recent.size === 0)
+      return {
+        tags: tags.size,
+        sources: Object.keys(SOURCES).length,
+        message: `${tags.size} tag(s) are looked up now`,
+      };
 
     return {
       tags: tags.size,

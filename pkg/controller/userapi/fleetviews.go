@@ -197,7 +197,8 @@ func (s *Handler) handleImages(w http.ResponseWriter, r *http.Request, u *authz.
 }
 
 // handleRefreshImages serves POST /api/v1/images/refresh: every followed tag
-// is looked up at its registry now instead of at its next interval, which
+// is looked up at its registry now instead of at its next interval, and the
+// source branch of every image is read now, which
 // needs the feature manage; a tag looked up within discovery.RefreshFloor is
 // left alone, and the answer says until when.
 func (s *Handler) handleRefreshImages(w http.ResponseWriter, r *http.Request, u *authz.User) {
@@ -213,13 +214,26 @@ func (s *Handler) handleRefreshImages(w http.ResponseWriter, r *http.Request, u 
 		return
 	}
 
-	var done discovery.Refreshed
+	httpjson.Write(s.log, w, http.StatusOK, s.refreshImages())
+}
+
+// refreshImages asks for a registry lookup of every followed tag and a read
+// of every source branch now.
+func (s *Handler) refreshImages() views.ImagesRefresh {
+	var (
+		done    discovery.Refreshed
+		sources int
+	)
+
 	if s.opts.Lookups != nil {
 		done = s.opts.Lookups.Refresh()
 	}
 
-	httpjson.Write(s.log, w, http.StatusOK, views.NewImagesRefresh(done.Tags, done.Recent, done.Next,
-		discovery.RefreshFloor))
+	if s.opts.Upstream != nil {
+		sources = s.opts.Upstream.Refresh()
+	}
+
+	return views.NewImagesRefresh(done.Tags, done.Recent, sources, done.Next, discovery.RefreshFloor)
 }
 
 // handlePackages serves GET /api/v1/packages?q=<part of a name>&limit=&after=:

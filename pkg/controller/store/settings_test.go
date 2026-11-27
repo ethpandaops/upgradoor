@@ -136,7 +136,7 @@ func TestLoadSettingsRefusesBadRows(t *testing.T) {
 	for _, row := range []string{
 		`('notASetting', '"whatever"')`,
 		`('leaseTtl', '"not a duration"')`,
-		`('paused', 'tru')`,
+		`('paused', 'maybe')`,
 	} {
 		t.Run(row, func(t *testing.T) {
 			s := newFileStore(t)

@@ -210,9 +210,16 @@ type imageUse struct {
 	registry *protocol.RegistryCheck
 }
 
+// PublicImages groups the EL and CL containers of all hosts by image
+// reference, each with how it stands against its source.
+func (v *Views) PublicImages(hosts []*fleet.Host) PublicImages {
+	return NewPublicImages(hosts, v.opts.Sources)
+}
+
 // NewPublicImages groups the EL and CL containers of all hosts by image
-// reference.
-func NewPublicImages(hosts []*fleet.Host) PublicImages {
+// reference. sources says how an image stands against the branch it is built
+// from; nil knows of none.
+func NewPublicImages(hosts []*fleet.Host, sources Sources) PublicImages {
 	type key struct {
 		kind  protocol.ContainerKind
 		image string
@@ -253,6 +260,21 @@ func NewPublicImages(hosts []*fleet.Host) PublicImages {
 			Revision:    revision,
 			HostsOn:     make([]string, 0, len(uses)),
 			HostsBehind: make([]string, 0, len(uses)),
+		}
+
+		if sources != nil {
+			digests := []string{digest}
+
+			for _, use := range uses {
+				if !slices.Contains(digests, use.digest) {
+					digests = append(digests, use.digest)
+				}
+			}
+
+			img.Source = sources.Status(k.image)
+			if commits := sources.Commits(k.image, digests); len(commits) > 0 {
+				img.Commits = commits
+			}
 		}
 
 		for _, use := range uses {
