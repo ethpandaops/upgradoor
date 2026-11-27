@@ -16,6 +16,7 @@ import {
   plural,
   queuePlace,
   relativeTime,
+  timestamp,
   secondsBetween,
   shortDigest,
   shortRevision,
@@ -97,6 +98,13 @@ describe('relativeTime', () => {
 describe('absoluteTime and zero times', () => {
   it('carries the UTC ISO form for the tooltip', () => {
     expect(absoluteTime('2026-11-14T11:59:48Z')).toContain('2026-11-14T11:59:48.000Z');
+  });
+
+  it('renders a timestamp that stands still, in local time', () => {
+    const d = new Date(2026, 10, 4, 9, 5, 7);
+    expect(timestamp(d.toISOString())).toBe('2026-11-04 09:05:07');
+    expect(timestamp('0001-01-01T00:00:00Z')).toBe('never');
+    expect(timestamp('nonsense')).toBe('nonsense');
   });
 
   it('treats the Go zero time as unset', () => {

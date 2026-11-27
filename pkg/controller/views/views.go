@@ -10,6 +10,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
+	"github.com/ethpandaops/upgradoor/pkg/controller/upstream"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -28,11 +29,20 @@ type Beacon interface {
 	Health() fleet.NetworkHealth
 }
 
+// Sources is the part of upstream.Tracker the views read.
+type Sources interface {
+	Status(image string) *upstream.Status
+	Commits(image string, digests []string) map[string]string
+}
+
 // Options are the sources of the views.
 type Options struct {
 	Store     Store
 	Scheduler scheduler.Service
 	Beacon    Beacon
+	// Sources says how an image stands against the branch it is built from;
+	// nil knows of none.
+	Sources Sources
 	// Now is the clock.
 	Now func() time.Time
 }

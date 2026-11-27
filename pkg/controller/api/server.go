@@ -26,6 +26,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/controller/stream"
+	"github.com/ethpandaops/upgradoor/pkg/controller/upstream"
 	"github.com/ethpandaops/upgradoor/pkg/controller/userapi"
 	"github.com/ethpandaops/upgradoor/pkg/controller/views"
 	"github.com/ethpandaops/upgradoor/pkg/controller/webui"
@@ -138,6 +139,13 @@ type Options struct {
 	Validators userapi.ValidatorRanges
 	// Lookups says what the tags of the hosts point at.
 	Lookups discovery.Tracker
+	// Upstream compares the images with their source branches; nil without.
+	Upstream upstream.Tracker
+	// HookSecret authenticates the build hook; empty serves none.
+	HookSecret []byte
+	// BuildMinute is the minute of the hour of the image builder's
+	// scheduled run; nil when it has none.
+	BuildMinute *int
 	// DefaultSettings are the settings from flags, shown next to the
 	// effective ones.
 	DefaultSettings fleet.Settings
@@ -225,11 +233,21 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		opts.Registry = prometheus.NewRegistry()
 	}
 
+	var (
+		sources views.Sources
+		refresh userapi.Upstream
+	)
+
+	if opts.Upstream != nil {
+		sources, refresh = opts.Upstream, opts.Upstream
+	}
+
 	s := &Server{
 		log:  log.WithField("package", "api"),
 		opts: opts,
 		views: views.New(views.Options{
 			Store: opts.Store, Scheduler: opts.Scheduler, Beacon: opts.Beacon, Now: opts.Now,
+			Sources: sources,
 		}),
 	}
 
@@ -254,8 +272,9 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 		Notify:  s.Notify, NotifyHost: s.streams.NotifyHost, Now: opts.Now,
 	})
 	s.users = userapi.New(s.log, userapi.Options{
-		Lookups: opts.Lookups,
-		Network: opts.Network, Version: opts.Version,
+		Lookups: opts.Lookups, Upstream: refresh, HookSecret: opts.HookSecret,
+		BuildMinute: opts.BuildMinute,
+		Network:     opts.Network, Version: opts.Version,
 		AuthProviderURL: opts.AuthProviderURL, AuthService: opts.AuthService,
 		UIScript: opts.UIScript, UIScriptIntegrity: opts.UIScriptIntegrity,
 		Store: opts.Store, Scheduler: opts.Scheduler, Beacon: opts.Beacon, Views: s.views,

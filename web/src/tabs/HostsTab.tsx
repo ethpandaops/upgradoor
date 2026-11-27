@@ -1,10 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react';
 
-import { list, type HostListing } from '../api/types';
+import { list, type HostListing, type PublicImageRef } from '../api/types';
 import { useApp, useAuthState, usePrivateAccess } from '../appContext';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
 import { SecurityUpdates } from '../components/HostActions';
 import { usePermissions } from '../components/Permissions';
+import { Digest } from '../components/Digest';
 import { useLive } from '../components/Live';
 import { BulkAction, SelectionBar } from '../components/SelectionBar';
 import { RelTime, useSharedNow } from '../components/RelTime';
@@ -26,9 +27,9 @@ import {
   type SortColumn,
   type SortDirection,
 } from '../components/primitives';
-import { ImageCell, OfflineBadge } from '../components/status';
+import { ClientBadge, OfflineBadge } from '../components/status';
 import { FleetUsage, UsageCell, usageLabel } from '../components/Usage';
-import { absoluteTime, formatDuration, formatPercent, isZeroTime, plural } from '../lib/format';
+import { absoluteTime, displayImage, formatDuration, formatPercent, isZeroTime, plural } from '../lib/format';
 import { hostActionIntent } from '../lib/hostActions';
 import { holdIntent } from '../lib/intents';
 import { HostDrawer } from './HostDetailPanel';
@@ -147,7 +148,7 @@ export function HostsTab() {
     return selection.filter(n => !visible.has(n));
   }, [rows, selection]);
   const allVisibleSelected = visibleNames.length > 0 && visibleNames.every(n => selected.has(n));
-  const columnCount = priv ? (hostDetails ? 12 : 7) : 4;
+  const columnCount = priv ? (hostDetails ? 15 : 10) : 6;
   const rollSelection: ActionIntent = {
     kind: 'roll',
     hosts: selection,
@@ -307,10 +308,13 @@ export function HostsTab() {
               )}
               <SortTh columns={[sortColumn('name', 'Host')]} />
               <SortTh columns={[sortColumn('el', 'Execution')]} />
+              <Th title="The digest of the execution client's image">EL digest</Th>
               <SortTh columns={[sortColumn('cl', 'Consensus')]} />
+              <Th title="The digest of the consensus client's image">CL digest</Th>
               {priv ? (
                 <>
                   <SortTh columns={[sortColumn('slot', 'State', 'What the scheduler does with the host')]} />
+                  <Th title="What the host waits for, or why it is in its state">Reason</Th>
                   <SortTh
                     columns={[sortColumn('attesting', 'Attesting', 'Validators live in the last complete epoch')]}
                   />
@@ -452,21 +456,28 @@ function HostTableRow({
                   {role}
                 </Badge>
               ))}
-          {s && hostOwners(s).length > 0 && (
-            <span
-              className="rounded-sm border border-border px-1.5 text-xs/5 whitespace-nowrap text-muted"
-              title="Owners: the teams that own a container of this host"
-            >
-              {hostOwners(s).join(' · ')}
-            </span>
-          )}
+          {/* The clients are named in their columns; an owner of another container is named here. */}
+          {s &&
+            hostOwners(s)
+              .filter(owner => owner !== row.elClient && owner !== row.clClient)
+              .map(owner => (
+                <span key={owner} title="Owner: a team that owns another container of this host">
+                  <ClientBadge name={owner} />
+                </span>
+              ))}
         </span>
       </Td>
       <Td>
-        <ImageCell image={row.el} compact />
+        <ClientImage client={row.elClient} image={row.el} />
       </Td>
       <Td>
-        <ImageCell image={row.cl} compact />
+        <Digest value={row.el?.digest} />
+      </Td>
+      <Td>
+        <ClientImage client={row.clClient} image={row.cl} />
+      </Td>
+      <Td>
+        <Digest value={row.cl?.digest} />
       </Td>
       {!priv && (
         <Td>
@@ -475,7 +486,7 @@ function HostTableRow({
               pending
             </Badge>
           ) : (
-            <span className="text-faint">up to date</span>
+            <span className="font-medium text-success">✓ up to date</span>
           )}
         </Td>
       )}
@@ -509,7 +520,7 @@ function Uptime({ host }: { host: HostListing }) {
 
 function MissingCells({ details }: { details: boolean }) {
   return (
-    <Td colSpan={details ? 8 : 3} className="text-faint">
+    <Td colSpan={details ? 9 : 4} className="text-faint">
       no details yet
     </Td>
   );
@@ -535,9 +546,8 @@ function PrivateCells({
   return (
     <>
       <Td>
-        {/* A fixed width: the waiting reason changes, the columns do not. */}
         <span
-          className="flex w-60 items-center gap-2 2xl:w-96"
+          className="flex items-center gap-2"
           title={needs.length > 0 ? `Open needs: ${needs.map(n => n.kind).join(', ')}` : undefined}
         >
           {state ? (
@@ -545,7 +555,7 @@ function PrivateCells({
               {state.label}
             </Badge>
           ) : (
-            <span className="text-faint">up to date</span>
+            <span className="font-medium text-success">✓ up to date</span>
           )}
           <OfflineBadge mark={s.offline} />
           {s.plan.notReady && (
@@ -558,12 +568,17 @@ function PrivateCells({
               local hold
             </Badge>
           )}
-          {(state?.detail ?? s.plan.notReady) && (
-            <span className="min-w-0 truncate text-muted" title={state?.detail ?? s.plan.notReady}>
-              {state?.detail ?? s.plan.notReady}
-            </span>
-          )}
         </span>
+      </Td>
+      <Td>
+        {/* A fixed width: the waiting reason changes, the columns do not. */}
+        {(state?.detail ?? s.plan.notReady) ? (
+          <span className="block w-56 truncate text-muted 2xl:w-80" title={state?.detail ?? s.plan.notReady}>
+            {state?.detail ?? s.plan.notReady}
+          </span>
+        ) : (
+          <span className="block w-56 text-faint 2xl:w-80">–</span>
+        )}
       </Td>
       <Td>
         {s.plan.weight === 0 ? (
@@ -657,5 +672,19 @@ function PrivateCells({
         )}
       </Td>
     </>
+  );
+}
+
+/** ClientImage names the client of a container in its colour, with the tag of its image. */
+function ClientImage({ client, image }: { client: string | undefined; image: PublicImageRef | undefined }) {
+  if (!image) return <Dash />;
+
+  return (
+    <span className="inline-flex items-center gap-2">
+      <ClientBadge name={client} />
+      <span className="max-w-40 truncate font-mono text-xs/5 2xl:max-w-64" title={image.image}>
+        {displayImage(image.image)}
+      </span>
+    </span>
   );
 }

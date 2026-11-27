@@ -55,7 +55,14 @@ type Options struct {
 	Scheduler scheduler.Service
 	// Lookups looks the hosts' tags up at the registries; nil without them.
 	Lookups Lookups
-	Beacon  views.Beacon
+	// Upstream compares the images with their source branches; nil without.
+	Upstream Upstream
+	// HookSecret authenticates POST /api/v1/hooks/build; empty serves no hook.
+	HookSecret []byte
+	// BuildMinute is the minute of the hour of the image builder's
+	// scheduled run; nil when it has none.
+	BuildMinute *int
+	Beacon      views.Beacon
 	// Endpoints and Validators are the data sources of the settings page;
 	// nil shows none.
 	Endpoints  BeaconEndpoints
@@ -74,6 +81,11 @@ type Options struct {
 // Lookups is the part of discovery.Tracker the user routes use.
 type Lookups interface {
 	Refresh() discovery.Refreshed
+}
+
+// Upstream is the part of upstream.Tracker the user routes use.
+type Upstream interface {
+	Refresh() int
 }
 
 // Handler serves the user routes and the public REST views.
@@ -125,6 +137,7 @@ func (s *Handler) Routes() []Route {
 		{Method: http.MethodGet, Pattern: "/api/v1/public/images", Public: s.handlePublicImages},
 		{Method: http.MethodGet, Pattern: "/api/v1/public/network", Public: s.handlePublicNetwork},
 		{Method: http.MethodGet, Pattern: "/api/v1/public/slots", Public: s.handlePublicSlots},
+		{Method: http.MethodPost, Pattern: PathBuildHook, Public: s.handleBuildHook},
 
 		{Method: http.MethodGet, Pattern: "/api/v1/hosts", User: s.handleHosts},
 		{Method: http.MethodGet, Pattern: "/api/v1/hosts/{name}", User: s.handleHost},

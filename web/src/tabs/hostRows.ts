@@ -18,6 +18,9 @@ export interface HostRow {
   name: string;
   el?: PublicImageRef;
   cl?: PublicImageRef;
+  /** elClient and clClient name the clients: the team of the container, or the image's name without a login. */
+  elClient?: string;
+  clClient?: string;
   updatePending: boolean;
   /** summary is present for logged-in users only. */
   summary?: HostListing;
@@ -29,6 +32,26 @@ function imageOf(containers: readonly ContainerListing[], kind: ContainerKind): 
   const c = containers.find(x => x.managed && x.kind === kind);
   if (!c) return undefined;
   return { image: c.image, digest: c.digest, revision: c.revision };
+}
+
+/** IMAGE_CLIENTS are the clients whose image is not named like them. */
+const IMAGE_CLIENTS: Record<string, string> = {
+  'client-go': 'geth',
+  'nimbus-eth2': 'nimbus',
+  'prysm-beacon-chain': 'prysm',
+  'beacon-chain': 'prysm',
+};
+
+/** clientOf names the client of a container: its team, or what its image is called. */
+export function clientOf(image: PublicImageRef | undefined, team?: string): string | undefined {
+  if (team) return team;
+  if (!image) return undefined;
+  const name = image.image.replace(/[@:][^/]*$/, '').replace(/^.*\//, '');
+  return IMAGE_CLIENTS[name] ?? name;
+}
+
+function teamOf(containers: readonly ContainerListing[], kind: ContainerKind): string | undefined {
+  return containers.find(x => x.managed && x.kind === kind)?.team;
 }
 
 /**
@@ -43,7 +66,14 @@ export function mergeHostRows(
   const rows = new Map<string, HostRow>();
 
   for (const p of publicHosts) {
-    rows.set(p.name, { name: p.name, el: p.el, cl: p.cl, updatePending: p.updatePending });
+    rows.set(p.name, {
+      name: p.name,
+      el: p.el,
+      cl: p.cl,
+      elClient: clientOf(p.el),
+      clClient: clientOf(p.cl),
+      updatePending: p.updatePending,
+    });
   }
 
   for (const s of summaries) {
@@ -55,6 +85,8 @@ export function mergeHostRows(
       updatePending: list(s.needs).length > 0,
     };
     row.summary = s;
+    row.elClient = clientOf(row.el, teamOf(containers, 'el'));
+    row.clClient = clientOf(row.cl, teamOf(containers, 'cl'));
     rows.set(s.name, row);
   }
 

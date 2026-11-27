@@ -8,6 +8,8 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/controller"
 	"github.com/ethpandaops/upgradoor/pkg/controller/api"
+	"github.com/ethpandaops/upgradoor/pkg/controller/upstream"
+	"github.com/ethpandaops/upgradoor/pkg/controller/userapi"
 	"github.com/ethpandaops/upgradoor/web"
 )
 
@@ -95,6 +97,19 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 	f.BoolVar(&cfg.Registry.AllowPrivate, "registry-allow-private", false,
 		"look tags up at registries on loopback, private and link-local addresses too "+
 			"(hosts name the registries: leave it off unless such a registry is in use)")
+	f.StringArrayVar(&cfg.ImageSources, "image-source", nil,
+		"GitHub repository an image is built from, as <image>=<owner>/<name>[@<ref>], "+
+			"e.g. ethpandaops/grandine=grandinetech/grandine: the branch named like the tag (or <ref>) "+
+			"is compared with the image. Only for images whose labels do not name their source (repeatable)")
+	f.DurationVar(&cfg.SourceInterval, "source-interval", upstream.DefaultInterval,
+		"how often the source branches of the images are read")
+	f.IntVar(&cfg.BuildScheduleMinute, "build-schedule-minute", 45,
+		"minute of the hour at which the image builder's scheduled run starts "+
+			"(eth-client-docker-image-builder: 45); the UI says when a pending build is due. -1 for none")
+	f.StringVar(&cfg.HookSecretFile, "hook-secret-file", "",
+		"file holding the secret of POST "+userapi.PathBuildHook+", which an image builder calls "+
+			"when a build finished: the tags and source branches are then looked up at once. "+
+			"Sent as a bearer token or as the secret of a GitHub webhook (no hook when empty)")
 	f.StringArrayVar(&cfg.DefaultSettings, "default-setting", nil,
 		"default for a setting as key=value, e.g. maxUnavailablePercent=10 (repeatable)")
 	f.StringVar(&pprofListen, "pprof-listen", "",

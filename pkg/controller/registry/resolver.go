@@ -78,6 +78,8 @@ type Resolver interface {
 	// Resolve returns the manifest digest a tag reference points at; the
 	// index digest for a multi-arch tag.
 	Resolve(ctx context.Context, ref string) (string, error)
+	// Labels returns the labels of the image a tag reference has at digest.
+	Labels(ctx context.Context, ref, digest string) (map[string]string, error)
 }
 
 // resolver is the Resolver of real registries. It resolves with a HEAD and

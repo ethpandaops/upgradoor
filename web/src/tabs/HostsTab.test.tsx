@@ -7,8 +7,8 @@ import { LIGHTHOUSE_IMAGE, currentDigest } from '../mock/fixture';
 import { createHarness, renderWithApp, PRIMARY } from '../test/harness';
 import { HostsTab } from './HostsTab';
 
-const PUBLIC_COLUMNS = ['Host', 'Execution', 'Consensus', 'State'];
-const PRIVATE_COLUMNS = ['Attesting', 'CPU', 'Memory', 'Kernel', 'Uptime', 'Updates', 'Seen'];
+const PUBLIC_COLUMNS = ['Host', 'Execution', 'EL digest', 'Consensus', 'CL digest', 'State'];
+const PRIVATE_COLUMNS = ['Reason', 'Attesting', 'CPU', 'Memory', 'Kernel', 'Uptime', 'Updates', 'Seen'];
 
 function columnNames(table: HTMLElement): string[] {
   return within(table)
@@ -62,7 +62,7 @@ describe('HostsTab, logged out (public data only)', () => {
     expect(button).toHaveTextContent(shortDigest(digest));
     expect(shortDigest(digest)).toHaveLength(12);
     expect(button).toHaveAttribute('title', expect.stringContaining(digest));
-    expect(within(current).getByText('up to date')).toBeInTheDocument();
+    expect(within(current).getByText('✓ up to date')).toBeInTheDocument();
 
     expect(within(rowOf(table, 'grandine-erigon-2')).getByText('pending')).toBeInTheDocument();
   });
@@ -116,7 +116,7 @@ describe('HostsTab, logged in', () => {
     expect(within(rowOf(table, 'lodestar-reth-3')).getByText('held')).toBeInTheDocument();
     expect(within(rowOf(table, 'lodestar-reth-3')).getByText('local hold')).toBeInTheDocument();
     expect(rowOf(table, 'lodestar-reth-3')).toHaveTextContent('held by the host');
-    expect(within(rowOf(table, 'prysm-geth-1')).getByText('up to date')).toBeInTheDocument();
+    expect(within(rowOf(table, 'prysm-geth-1')).getByText('✓ up to date')).toBeInTheDocument();
     expect(rowOf(table, 'teku-reth-1')).toHaveTextContent('debian 13');
     expect(rowOf(table, 'lighthouse-geth-3')).toHaveTextContent(
       /validators down: [\d.]+% now, [\d.]+% with this host, limit 10%/

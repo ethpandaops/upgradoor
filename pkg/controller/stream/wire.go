@@ -13,6 +13,7 @@ import (
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
+	"github.com/ethpandaops/upgradoor/pkg/controller/upstream"
 	"github.com/ethpandaops/upgradoor/pkg/controller/views"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -252,6 +253,10 @@ type wireImage struct {
 	Key      string `json:"key"`
 	Digest   string `json:"digest,omitempty"`
 	Revision string `json:"revision,omitempty"`
+	// Source is how the image stands against the branch it is built from.
+	Source *upstream.Status `json:"source,omitempty"`
+	// Commits is the commit of the images hosts run, by digest.
+	Commits map[string]string `json:"commits,omitempty"`
 }
 
 // wirePlan is a scheduler.Plan without the gate (tableNetwork), the queue

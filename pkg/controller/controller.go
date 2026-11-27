@@ -3,6 +3,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -12,6 +13,7 @@ import (
 	"io/fs"
 	"net"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strings"
 	"time"
@@ -26,6 +28,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/registry"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
+	"github.com/ethpandaops/upgradoor/pkg/controller/upstream"
 	"github.com/ethpandaops/upgradoor/pkg/controller/validators"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/registryauth"
@@ -90,6 +93,16 @@ type Config struct {
 	RegistryAuthFile string
 	// Registry is how the registries are reached for the lookups.
 	Registry registry.Config
+	// ImageSources name the GitHub repository an image is built from, as
+	// "<image>=<owner>/<name>[@<ref>]", for images whose labels do not.
+	ImageSources []string
+	// SourceInterval is how often the source branches are read.
+	SourceInterval time.Duration
+	// BuildScheduleMinute is the minute of the hour at which the image
+	// builder's scheduled run starts; negative when it has none.
+	BuildScheduleMinute int
+	// HookSecretFile holds the secret of the build hook; empty serves none.
+	HookSecretFile string
 	// DefaultSettings are "key=value" overrides of the built-in setting
 	// defaults; keys are the JSON names of fleet.Settings.
 	DefaultSettings []string
@@ -114,6 +127,7 @@ type controller struct {
 	validators validators.Service
 	scheduler  scheduler.Service
 	lookups    discovery.Tracker
+	upstream   upstream.Tracker
 	api        *api.Server
 	server     *http.Server
 	served     chan error
@@ -147,6 +161,10 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 
 	if len(cfg.BeaconEndpoints) == 0 {
 		return nil, errors.New("controller: at least one --beacon-endpoint is required")
+	}
+
+	if cfg.BuildScheduleMinute > 59 {
+		return nil, errors.New("controller: --build-schedule-minute is a minute of the hour (0-59), or -1 for none")
 	}
 
 	defaults, err := ParseDefaultSettings(cfg.DefaultSettings)
@@ -196,6 +214,40 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 
 	c.lookups = discovery.NewTracker(log, resolver, defaults.LookupInterval.Std(), time.Now)
 
+	sources := make(map[string]upstream.Source, len(cfg.ImageSources))
+
+	for _, value := range cfg.ImageSources {
+		image, source, serr := upstream.ParseSource(value)
+		if serr != nil {
+			return nil, fmt.Errorf("controller: --image-source: %w", serr)
+		}
+
+		sources[image] = source
+	}
+
+	c.upstream = upstream.New(log, upstream.Options{
+		Lookups:  c.lookups,
+		Registry: resolver,
+		NotFound: registry.IsNotFound,
+		Remote:   upstream.NewGitHub(cfg.Version),
+		Sources:  sources,
+		Interval: cfg.SourceInterval,
+		Changed:  func() { c.api.Notify() },
+		Now:      time.Now,
+	})
+
+	var buildMinute *int
+	if cfg.BuildScheduleMinute >= 0 {
+		buildMinute = &cfg.BuildScheduleMinute
+	}
+
+	var hookSecret []byte
+	if cfg.HookSecretFile != "" {
+		if hookSecret, err = readHookSecret(cfg.HookSecretFile); err != nil {
+			return nil, fmt.Errorf("controller: --hook-secret-file: %w", err)
+		}
+	}
+
 	c.api, err = api.New(log, api.Options{
 		Network:                cfg.Network,
 		Version:                cfg.Version,
@@ -215,6 +267,9 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Endpoints:              c.beacon,
 		Validators:             c.validators,
 		Lookups:                c.lookups,
+		Upstream:               c.upstream,
+		HookSecret:             hookSecret,
+		BuildMinute:            buildMinute,
 		DefaultSettings:        defaults,
 		WebFS:                  cfg.WebFS,
 		Registry:               prometheus.NewRegistry(),
@@ -319,8 +374,13 @@ func (c *controller) Start(ctx context.Context) error {
 			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
 	}
 
+	if err := c.upstream.Start(ctx); err != nil {
+		return errors.Join(fmt.Errorf("upstream: %w", err), c.lookups.Stop(),
+			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
+	}
+
 	if err := c.api.Start(ctx); err != nil {
-		return errors.Join(fmt.Errorf("api: %w", err),
+		return errors.Join(fmt.Errorf("api: %w", err), c.upstream.Stop(),
 			c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
 	}
 
@@ -328,7 +388,7 @@ func (c *controller) Start(ctx context.Context) error {
 
 	listener, err := lc.Listen(ctx, "tcp", c.cfg.Listen)
 	if err != nil {
-		return errors.Join(fmt.Errorf("listen: %w", err), c.api.Stop(), c.lookups.Stop(),
+		return errors.Join(fmt.Errorf("listen: %w", err), c.api.Stop(), c.upstream.Stop(), c.lookups.Stop(),
 			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
 	}
 
@@ -376,10 +436,29 @@ func (c *controller) Stop() error {
 		errs = append(errs, c.server.Shutdown(ctx), <-c.served)
 	}
 
-	errs = append(errs, c.api.Stop(), c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(),
+	errs = append(errs, c.api.Stop(), c.upstream.Stop(), c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(),
 		c.validators.Stop(), c.store.Stop())
 
 	return errors.Join(errs...)
+}
+
+// minHookSecret is the shortest secret the build hook accepts.
+const minHookSecret = 16
+
+// readHookSecret reads the secret of the build hook: the file's content
+// without surrounding white space.
+func readHookSecret(path string) ([]byte, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+
+	secret := bytes.TrimSpace(data)
+	if len(secret) < minHookSecret {
+		return nil, fmt.Errorf("the secret is shorter than %d bytes", minHookSecret)
+	}
+
+	return secret, nil
 }
 
 // health is the beacon service's view with the state of the validator ranges

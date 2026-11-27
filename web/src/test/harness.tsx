@@ -100,6 +100,7 @@ export function renderWithApp(ui: ReactNode, h: Harness): RenderResult {
     version: 'test',
     authProviderUrl: h.auth.getState().enabled ? MOCK_AUTH_URL : '',
     authService: MOCK_AUTH_SERVICE,
+    buildMinute: 45,
   };
   return render(
     <AppContext value={{ api: h.api, auth: h.auth, config }}>

@@ -218,7 +218,7 @@ export function LiveNotice({ status, reload }: { status: LiveStatus; reload: () 
       className="flex flex-wrap items-center gap-x-2 border-b border-warning bg-warning-subtle px-4 py-2 text-sm/6 text-warning"
     >
       <span className="font-medium">
-        Not live since {new Date(lostAt).toLocaleTimeString([], { hour12: false })} — showing the last known state.
+        Not live since {new Date(lostAt).toLocaleTimeString([], { hourCycle: 'h23' })} — showing the last known state.
       </span>
       {status.error !== undefined && <span>{errorText(status.error)}</span>}
     </div>

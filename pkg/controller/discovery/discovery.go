@@ -11,6 +11,7 @@
 package discovery
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"slices"
@@ -64,6 +65,16 @@ type Tracker interface {
 	// Refresh asks for a lookup now of every followed tag whose newest one
 	// is older than RefreshFloor, and says how many that are.
 	Refresh() Refreshed
+	// Tags lists the followed tags with the digest each points at, ordered
+	// by reference.
+	Tags() []Tag
+}
+
+// Tag is a followed tag: the reference as a host wrote it and the digest of
+// its newest good lookup, empty before the first.
+type Tag struct {
+	Ref    string
+	Digest string
 }
 
 // RefreshFloor is the age below which Refresh leaves a lookup alone.
@@ -236,6 +247,21 @@ func (t *tracker) Sync(host string, tags []string, interval time.Duration) []pro
 		default:
 		}
 	}
+
+	return out
+}
+
+// Tags implements Tracker.
+func (t *tracker) Tags() []Tag {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	out := make([]Tag, 0, len(t.tags))
+	for _, tg := range t.tags {
+		out = append(out, Tag{Ref: tg.ref, Digest: tg.digest})
+	}
+
+	slices.SortFunc(out, func(a, b Tag) int { return cmp.Compare(a.Ref, b.Ref) })
 
 	return out
 }

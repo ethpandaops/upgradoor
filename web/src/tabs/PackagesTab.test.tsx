@@ -153,7 +153,9 @@ describe('PackagesTab', () => {
     await user.click(screen.getByRole('button', { name: 'Check registries now' }));
 
     await waitFor(() => {
-      expect(screen.getByRole('status')).toHaveTextContent(/^Looking up \d+ tags/);
+      expect(screen.getByRole('status')).toHaveTextContent(
+        /^Looking up \d+ tags.* Reading the source branches of 3 images\.$/
+      );
     });
     expect(h.calls.filter(c => c.path === '/api/v1/images/refresh')).toHaveLength(1);
 
