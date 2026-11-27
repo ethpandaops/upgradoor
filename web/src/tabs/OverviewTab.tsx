@@ -946,8 +946,9 @@ function ImageStatus({ image, rollNote }: { image: PublicImage; rollNote: RollNo
   const behind = list(image.hostsBehind);
   const build = s?.pending === true;
 
-  // The branch's head is known, but not that the image is built from it: the check has not succeeded (yet).
-  const unverified = s?.head !== undefined && !build && !sameCommit(s.commit, s.head);
+  // The check has not succeeded (yet): the head could not be read, or it is known but not that the image is built from it.
+  const unverified =
+    s !== undefined && !build && (s.head === undefined ? Boolean(s.error) : !sameCommit(s.commit, s.head));
 
   if (unverified && behind.length === 0) {
     return (

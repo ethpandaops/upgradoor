@@ -75,6 +75,10 @@ describe('OverviewTab, logged out (public data only)', () => {
     const lodestar = (await within(images).findByText('chainsafe/lodestar:next')).closest('tr');
     expect(lodestar).toHaveTextContent('? not verified');
     expect(lodestar).not.toHaveTextContent('up to date');
+    // Nor does a branch whose head could not be read count as having none.
+    const teku = (await within(images).findByText('consensys/teku:develop')).closest('tr');
+    expect(teku).toHaveTextContent('? not verified');
+    expect(teku).not.toHaveTextContent('rolled');
     // The images are listed by layer, the execution clients first, under one set of column headers.
     expect(
       within(images)

@@ -154,7 +154,7 @@ describe('PackagesTab', () => {
 
     await waitFor(() => {
       expect(screen.getByRole('status')).toHaveTextContent(
-        /^Looking up \d+ tags.* Reading the source branches of 3 images\.$/
+        /^Looking up \d+ tags.* Reading the source branches of 4 images\.$/
       );
     });
     expect(h.calls.filter(c => c.path === '/api/v1/images/refresh')).toHaveLength(1);

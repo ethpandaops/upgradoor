@@ -306,7 +306,7 @@ const STREAM_ROLLOUT_LIMIT = 50;
 /** OLDER_COMMIT is what the hosts behind an image of SOURCES run. */
 const OLDER_COMMIT = '9f8e7d6c5b4a39281706f5e4d3c2b1a098765432';
 
-/** SOURCES are the images of the fixture whose source branch is known: one built from its head, one behind it, one whose check fails. */
+/** SOURCES are the images of the fixture whose source branch is known: one built from its head, one behind it, one whose check fails, one whose head cannot be read. */
 const SOURCES: Record<string, ImageSource> = {
   'ethpandaops/geth:master': {
     repo: 'ethereum/go-ethereum',
@@ -327,6 +327,11 @@ const SOURCES: Record<string, ImageSource> = {
     head: '83a0cb8fbee7beacfb013b3765f4e16a8050c7c2',
     error:
       'registry: HEAD https://registry-1.docker.io/v2/chainsafe/lodestar/manifests/next-83a0cb8: 429 Too Many Requests',
+  },
+  'consensys/teku:develop': {
+    repo: 'consensys/teku',
+    ref: 'develop',
+    error: 'upstream: github.com/consensys/teku: 401 Unauthorized',
   },
 };
 
