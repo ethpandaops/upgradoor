@@ -958,7 +958,7 @@ func (s *Handler) streamDocs(ctx context.Context, st *eventState, details []deta
 		now:          s.now(),
 		publicGate:   s.views.PublicGate(),
 		publicHosts:  views.NewPublicHosts(hosts),
-		images:       views.NewPublicImages(hosts),
+		images:       s.views.PublicImages(hosts),
 		plan:         s.views.Plan(),
 		hosts:        make([]views.HostSummary, 0, len(hosts)),
 		statusHashes: make([]string, 0, len(hosts)),
@@ -1117,6 +1117,7 @@ func addImages(b *docBuilder, images *views.PublicImages) {
 		img := &images.Images[i]
 		b.add(tableImages, wireImage{
 			Key: string(img.Kind) + " " + img.Image, Digest: img.Digest, Revision: img.Revision,
+			Source: img.Source, Commits: img.Commits,
 		})
 	}
 }

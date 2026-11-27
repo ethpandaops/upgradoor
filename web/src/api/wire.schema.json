@@ -1,5 +1,5 @@
 {
- "version": "a8ca38cc7907",
+ "version": "b09984471799",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -1836,6 +1836,36 @@
     "omit": true
    }
   ],
+  "Status": [
+   {
+    "n": "repo",
+    "t": "s"
+   },
+   {
+    "n": "ref",
+    "t": "s"
+   },
+   {
+    "n": "commit",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "head",
+    "t": "s",
+    "omit": true
+   },
+   {
+    "n": "pending",
+    "t": "b",
+    "omit": true
+   },
+   {
+    "n": "error",
+    "t": "r",
+    "omit": true
+   }
+  ],
   "Step": [
    {
     "n": "needId",
@@ -2144,6 +2174,17 @@
    {
     "n": "revision",
     "t": "r",
+    "omit": true
+   },
+   {
+    "n": "source",
+    "t": "o",
+    "of": "Status",
+    "omit": true
+   },
+   {
+    "n": "commits",
+    "t": "j",
     "omit": true
    }
   ],

@@ -331,7 +331,7 @@ func TestConnectionDroppedAfterToken(t *testing.T) {
 	f.set(func(f *fakeRegistry) { f.bearer = testToken })
 
 	// The retry with the fresh token hits a closed connection.
-	f.handle(kindManifst+"dropped", func(w http.ResponseWriter, _ *http.Request) {
+	f.handle(kindManifest+"dropped", func(w http.ResponseWriter, _ *http.Request) {
 		hijacker, ok := w.(http.Hijacker)
 		if !ok {
 			t.Error("response writer cannot be hijacked")

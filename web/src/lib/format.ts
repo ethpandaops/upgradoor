@@ -73,7 +73,19 @@ export function absoluteTime(iso: string | null | undefined): string {
   if (isZeroTime(iso)) return 'never';
   const d = new Date(iso as string);
   if (Number.isNaN(d.getTime())) return String(iso);
-  return `${d.toLocaleString()} (${d.toISOString()})`;
+  return `${d.toLocaleString([], { hourCycle: 'h23' })} (${d.toISOString()})`;
+}
+
+/** timestamp renders an instant as local "YYYY-MM-DD HH:MM:SS": it reads the same whenever it is looked at. */
+export function timestamp(iso: string | null | undefined): string {
+  if (isZeroTime(iso)) return 'never';
+  const d = new Date(iso as string);
+  if (Number.isNaN(d.getTime())) return String(iso);
+  const two = (n: number) => String(n).padStart(2, '0');
+  return (
+    `${d.getFullYear()}-${two(d.getMonth() + 1)}-${two(d.getDate())} ` +
+    `${two(d.getHours())}:${two(d.getMinutes())}:${two(d.getSeconds())}`
+  );
 }
 
 /** secondsBetween returns b - a in seconds, or null when either is unset. */

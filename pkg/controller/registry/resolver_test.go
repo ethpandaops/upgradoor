@@ -24,13 +24,13 @@ import (
 )
 
 const (
-	repoPath    = "org/app"
-	tagMulti    = "multi"
-	tagSingle   = "single"
-	testToken   = "tok-1"
-	testService = "fake-registry"
-	testBasic   = "user:secret"
-	kindManifst = "/manifests/"
+	repoPath     = "org/app"
+	tagMulti     = "multi"
+	tagSingle    = "single"
+	testToken    = "tok-1"
+	testService  = "fake-registry"
+	testBasic    = "user:secret"
+	kindManifest = "/manifests/"
 )
 
 // fakeRegistry serves org/app with tag "multi" at an index and "single" at
@@ -233,8 +233,8 @@ func (f *fakeRegistry) serveV2(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 	case override != nil:
 		override(w, r)
-	case strings.HasPrefix(suffix, kindManifst):
-		f.serveManifest(w, r, strings.TrimPrefix(suffix, kindManifst))
+	case strings.HasPrefix(suffix, kindManifest):
+		f.serveManifest(w, r, strings.TrimPrefix(suffix, kindManifest))
 	default:
 		http.NotFound(w, r)
 	}
@@ -383,7 +383,7 @@ func TestResolveWithoutDigestHeader(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, f.indexDigest, digest, "computed from the body")
 	require.Equal(t, 1, f.heads())
-	require.Equal(t, 1, f.count(http.MethodGet, kindManifst+tagMulti))
+	require.Equal(t, 1, f.count(http.MethodGet, kindManifest+tagMulti))
 	require.Equal(t, 1, f.gets())
 }
 
@@ -442,7 +442,7 @@ func TestResolveErrors(t *testing.T) {
 
 	// Server errors on the fallback GET.
 	f.set(func(f *fakeRegistry) { f.noHead = true })
-	f.handle(kindManifst+"broken", func(w http.ResponseWriter, r *http.Request) {
+	f.handle(kindManifest+"broken", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			w.WriteHeader(http.StatusNotImplemented)
 
@@ -480,7 +480,7 @@ func TestResolveOversizedOrBrokenTagManifest(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	f.set(func(f *fakeRegistry) { f.noDigestHeader = true })
 
-	f.handle(kindManifst+"huge", func(w http.ResponseWriter, r *http.Request) {
+	f.handle(kindManifest+"huge", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			return
 		}
@@ -492,7 +492,7 @@ func TestResolveOversizedOrBrokenTagManifest(t *testing.T) {
 	})
 
 	// Announces more than it sends, so reading the body fails.
-	f.handle(kindManifst+"short", func(w http.ResponseWriter, r *http.Request) {
+	f.handle(kindManifest+"short", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodHead {
 			return
 		}
@@ -603,7 +603,7 @@ func TestRequestTimeout(t *testing.T) {
 	f := newFakeRegistry(t, false)
 	release := make(chan struct{})
 
-	f.handle(kindManifst+"slow", func(_ http.ResponseWriter, r *http.Request) {
+	f.handle(kindManifest+"slow", func(_ http.ResponseWriter, r *http.Request) {
 		select {
 		case <-release:
 		case <-r.Context().Done():
@@ -703,10 +703,10 @@ func TestCredentialsNeverCrossARedirect(t *testing.T) {
 	}))
 	t.Cleanup(other.Close)
 
-	f.handle(kindManifst+"away", func(w http.ResponseWriter, r *http.Request) {
+	f.handle(kindManifest+"away", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, other.URL+"/v2/org/app/manifests/away", http.StatusTemporaryRedirect)
 	})
-	f.handle(kindManifst+"here", func(w http.ResponseWriter, r *http.Request) {
+	f.handle(kindManifest+"here", func(w http.ResponseWriter, r *http.Request) {
 		http.Redirect(w, r, "/v2/org/app/manifests/"+tagMulti, http.StatusTemporaryRedirect)
 	})
 

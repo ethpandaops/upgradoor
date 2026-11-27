@@ -76,10 +76,10 @@ describe('the host actions', () => {
     expect(button('Hold…')).toBeDisabled();
     expect(button('Forget…')).toBeDisabled();
 
-    // The owners chip of the list.
-    expect(within(table).getAllByTitle('Owners: the teams that own a container of this host')[0]).toHaveTextContent(
-      /\w+ · \w+/
-    );
+    // The clients of the list, each named in its column.
+    const row = within(table).getByRole('button', { name: 'Open lighthouse-geth-1' }).closest('tr') as HTMLElement;
+    expect(within(row).getByText('geth')).toBeInTheDocument();
+    expect(within(row).getByText('lighthouse')).toBeInTheDocument();
     await user.click(screen.getByRole('tab', { name: 'Containers' }));
     expect(screen.getByRole('list', { name: 'Containers' })).toHaveTextContent('lighthouse');
   });

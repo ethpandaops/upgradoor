@@ -43,14 +43,17 @@ type ImagesRefresh struct {
 	// Next is when the first of the recent ones can be looked up on
 	// request again; absent when none is recent.
 	Next *time.Time `json:"next,omitempty"`
+	// Sources is the number of images whose source branch is read now.
+	Sources int `json:"sources,omitempty"`
 	// Message says what happened, for people.
 	Message string `json:"message"`
 }
 
 // NewImagesRefresh is the answer of a refresh that looks tags up now and
 // leaves recent ones alone until next; floor is how recent that is.
-func NewImagesRefresh(tags, recent int, next time.Time, floor time.Duration) ImagesRefresh {
-	out := ImagesRefresh{Tags: tags, Recent: recent}
+// sources is how many images have their source branch read now.
+func NewImagesRefresh(tags, recent, sources int, next time.Time, floor time.Duration) ImagesRefresh {
+	out := ImagesRefresh{Tags: tags, Recent: recent, Sources: sources}
 
 	switch {
 	case tags == 0 && recent == 0:
@@ -70,6 +73,10 @@ func NewImagesRefresh(tags, recent int, next time.Time, floor time.Duration) Ima
 		}
 
 		out.Message += "; the next lookup on request is possible at " + next.Format(time.TimeOnly) + " UTC"
+	}
+
+	if sources > 0 {
+		out.Message += fmt.Sprintf("; the source branches of %d image(s) are read now", sources)
 	}
 
 	return out

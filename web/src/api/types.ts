@@ -1129,6 +1129,24 @@ export interface PublicHosts {
   hosts: List<PublicHost>;
 }
 
+/**
+ * upstream.Status: how the image of a tag stands against the branch it is
+ * built from.
+ */
+export interface ImageSource {
+  /** The GitHub repository (owner/name) and the branch or tag the image is built from. */
+  repo: string;
+  ref: string;
+  /** The commit the image the tag points at was built from; absent when that is not known. */
+  commit?: string;
+  /** The commit the branch is at; absent before the first answer and when the repository has no such ref. */
+  head?: string;
+  /** The branch is ahead of the image: a build is due. */
+  pending?: boolean;
+  /** Why the newest check failed; the rest is of the last good one. */
+  error?: string;
+}
+
 /** api.PublicImage */
 export interface PublicImage {
   image: string;
@@ -1137,6 +1155,10 @@ export interface PublicImage {
   revision?: string;
   hostsOn: List<string>;
   hostsBehind: List<string>;
+  /** Absent for an image whose source is not known. */
+  source?: ImageSource;
+  /** The commit the images at digest and at the digests the hosts run were built from, by digest; unknown ones are left out. */
+  commits?: Dict<string>;
 }
 
 /** api.PublicImages */
@@ -1443,6 +1465,8 @@ export interface ImagesRefresh {
   tags: number;
   recent?: number;
   next?: string;
+  /** How many images have their source branch read now. */
+  sources?: number;
   message: string;
 }
 

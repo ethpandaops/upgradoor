@@ -1,12 +1,12 @@
-import { screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { list, type Gate, type LiveViews } from '../api/types';
+import { list, type Gate, type LiveViews, type PublicImage } from '../api/types';
 import type * as wireModule from '../api/wire';
 import { LIGHTHOUSE_IMAGE } from '../mock/fixture';
 import { createHarness, renderWithApp, PRIMARY } from '../test/harness';
-import { OverviewTab } from './OverviewTab';
+import { ImageSummary, OverviewTab } from './OverviewTab';
 
 const noTab = () => undefined;
 
@@ -44,8 +44,56 @@ describe('OverviewTab, logged out (public data only)', () => {
     ).toBeInTheDocument();
 
     const images = await screen.findByRole('region', { name: 'Client images' });
-    const lighthouse = (await within(images).findByText(LIGHTHOUSE_IMAGE)).closest('li');
-    expect(lighthouse).toHaveTextContent('3/7 · 4 behind');
+    const lighthouse = (await within(images).findByText(LIGHTHOUSE_IMAGE)).closest('tr');
+    expect(lighthouse).toHaveTextContent('3/7');
+    expect(lighthouse).toHaveTextContent('roll pending');
+
+    // The branch is ahead of the image: the head, what the image is built from, and what the hosts run.
+    expect(lighthouse).toHaveTextContent('build pending');
+    expect(lighthouse).toHaveTextContent(/next builder run \d\d:45/);
+    const row = within(lighthouse as HTMLElement);
+    expect(row.getByRole('link', { name: 'sigp/lighthouse@unstable' })).toHaveAttribute(
+      'href',
+      'https://github.com/sigp/lighthouse/tree/unstable'
+    );
+    expect(row.getByRole('link', { name: '7c1f9be' })).toHaveAttribute(
+      'href',
+      'https://github.com/sigp/lighthouse/commit/7c1f9be2a0e4d3b6c5a49788f6e5d4c3b2a19087'
+    );
+    // The image's commit opens what it lacks; the hosts behind run an older one.
+    expect(row.getAllByRole('link', { name: 'd450b29' })[0]).toHaveAttribute(
+      'href',
+      'https://github.com/sigp/lighthouse/compare/d450b29...7c1f9be2a0e4d3b6c5a49788f6e5d4c3b2a19087'
+    );
+    expect(lighthouse).toHaveTextContent('d450b29×39f8e7d6×4');
+    // An image whose branch head is built and rolled everywhere says so.
+    const geth = (await within(images).findByText('ethpandaops/geth:master')).closest('tr');
+    expect(within(geth as HTMLElement).getAllByRole('link', { name: '1df30b1' })).toHaveLength(3);
+    expect(geth).toHaveTextContent('✓ up to date');
+    expect(geth).not.toHaveTextContent('pending');
+    // A check that failed claims nothing.
+    const lodestar = (await within(images).findByText('chainsafe/lodestar:next')).closest('tr');
+    expect(lodestar).toHaveTextContent('? not verified');
+    expect(lodestar).not.toHaveTextContent('up to date');
+    // Nor does a branch whose head could not be read count as having none.
+    const teku = (await within(images).findByText('consensys/teku:develop')).closest('tr');
+    expect(teku).toHaveTextContent('? not verified');
+    expect(teku).not.toHaveTextContent('rolled');
+    // The images are listed by layer, the execution clients first, under one set of column headers.
+    expect(
+      within(images)
+        .getAllByRole('columnheader')
+        .map(h => h.textContent)
+    ).toEqual(
+      expect.arrayContaining(['Image', 'Branch', 'Branch head', 'Image built from', 'Running', 'Status', 'Hosts'])
+    );
+    expect(within(images).getByRole('rowgroup', { name: 'Execution clients' })).toHaveTextContent(
+      'ethpandaops/geth:master'
+    );
+    expect(within(images).getByRole('rowgroup', { name: 'Consensus clients' })).toHaveTextContent(LIGHTHOUSE_IMAGE);
+    expect(images).toHaveTextContent('1 build pending');
+    // The lookup on request needs a login.
+    expect(within(images).queryByRole('button', { name: 'Check registries now' })).not.toBeInTheDocument();
 
     expect(await screen.findByRole('region', { name: 'Updates pending' })).toHaveTextContent(/of 24 hosts/);
 
@@ -279,5 +327,90 @@ describe('OverviewTab, logged in', () => {
       'No host of this fleet has validators'
     );
     expect(await screen.findByText('No validators to watch on this fleet')).toBeInTheDocument();
+  });
+});
+
+describe('OverviewTab, what happened in a span of the graph', () => {
+  it('opens a block: who was off, the lease and what the rollout moves the containers to', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'auth', loggedIn: true });
+    const onOpenTab = vi.fn();
+    renderWithApp(<OverviewTab onOpenTab={onOpenTab} />, h);
+
+    const graph = await screen.findByRole('region', { name: 'Participation and outages' });
+    await user.click(await within(graph).findByRole('button', { name: 'nimbus-nethermind-1: offline' }));
+
+    let panel = screen.getByRole('complementary', { name: 'What happened: Offline · nimbus-nethermind-1' });
+    expect(panel).toHaveTextContent('What was off, and why');
+    expect(panel).toHaveTextContent('upgradoor was not working on it: no lease explains this span');
+
+    // A roll: the panel names the rollout and the images it moves to.
+    const rolls = within(graph).getAllByRole('button', { name: /: image roll/ });
+    await user.click(rolls[rolls.length - 1] as HTMLElement);
+    panel = screen.getByRole('complementary', { name: /^What happened: Image roll · / });
+    expect(panel).toHaveTextContent(/Rollout|Lease/);
+    expect(within(panel).getAllByText('Image roll').length).toBeGreaterThan(0);
+
+    // From the panel to the host and to the rollouts.
+    await user.click(within(panel).getByRole('button', { name: 'Rollouts →' }));
+    expect(onOpenTab).toHaveBeenCalledWith('rollouts');
+    await user.click(
+      within(panel).getAllByRole('button', { name: /^(?!Rollouts)[a-z]+-[a-z]+-\d+$/ })[0] as HTMLElement
+    );
+    expect(onOpenTab).toHaveBeenCalledWith('hosts');
+
+    await user.click(within(panel).getByRole('button', { name: 'Close (Esc)' }));
+    expect(screen.queryByRole('complementary')).not.toBeInTheDocument();
+  });
+
+  it('opens a column without a login with the public numbers only', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: false });
+    renderWithApp(<OverviewTab onOpenTab={noTab} />, h);
+
+    const chart = await screen.findByRole('img', { name: /^Attestations: / });
+    fireEvent.click(chart, { clientX: 400, clientY: 40 });
+
+    const panel = screen.getByRole('complementary', { name: /^What happened: Slots? \d+/ });
+    expect(panel).toHaveTextContent('Participation');
+    expect(panel).toHaveTextContent('Log in to see which hosts missed and what was being rolled on them.');
+    expect(panel).not.toHaveTextContent('What was off, and why');
+    expect(h.userCalls()).toEqual([]);
+  });
+});
+
+describe('ImageSummary', () => {
+  const head = '1df30b18d9ed35ee9d28ffd4648442c2204554ad';
+  const built: PublicImage = {
+    image: 'ethpandaops/geth:master',
+    kind: 'execution',
+    hostsOn: ['a'],
+    hostsBehind: [],
+    source: { repo: 'ethereum/go-ethereum', ref: 'master', commit: head, head },
+  };
+
+  it('says all is rolled when every followed image is on its head', () => {
+    render(<ImageSummary images={[built]} />);
+    expect(screen.getByText(/every image is on its branch head and rolled/)).toBeInTheDocument();
+  });
+
+  it('claims nothing while a branch head could not be read', () => {
+    const unread: PublicImage = {
+      image: 'consensys/teku:develop',
+      kind: 'consensus',
+      hostsOn: ['b'],
+      hostsBehind: [],
+      source: { repo: 'consensys/teku', ref: 'develop', error: '401 Unauthorized' },
+    };
+    render(<ImageSummary images={[built, unread]} />);
+    expect(screen.queryByText(/every image is on its branch head/)).not.toBeInTheDocument();
+  });
+
+  it('claims nothing while the newest check of a head that was read before failed', () => {
+    const stale: PublicImage = {
+      ...built,
+      source: { repo: 'ethereum/go-ethereum', ref: 'master', commit: head, head, error: 'upstream: 503' },
+    };
+    render(<ImageSummary images={[stale]} />);
+    expect(screen.queryByText(/every image is on its branch head/)).not.toBeInTheDocument();
   });
 });

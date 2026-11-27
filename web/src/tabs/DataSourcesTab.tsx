@@ -194,7 +194,7 @@ function ValidatorRanges({
     api
       .refreshValidatorRanges()
       .then(res => {
-        const again = res.next ? ` Again at ${new Date(res.next).toLocaleTimeString()}.` : '';
+        const again = res.next ? ` Again at ${new Date(res.next).toLocaleTimeString([], { hourCycle: 'h23' })}.` : '';
         setNote(`${res.message}.${again}`);
         onRefreshed(res.sources);
       })

@@ -16,7 +16,7 @@ import {
   Th,
   cx,
 } from '../components/primitives';
-import { usePermissions } from '../components/Permissions';
+import { RefreshImages } from '../components/RefreshImages';
 import { RelTime } from '../components/RelTime';
 import { useDebounced } from '../hooks/useDebounced';
 import { useKept } from '../hooks/useKept';
@@ -251,65 +251,6 @@ function ListingView({ kind }: { kind: Kind }) {
       ) : (
         <VersionTable listing={listing} rows={rows} dimmed={waiting} />
       )}
-    </>
-  );
-}
-
-/**
- * RefreshImages asks the controller to look every followed tag up at its
- * registry now, and says what came of it. The hosts report a new digest with
- * their next sync, so the list is fetched again right away and shows it later.
- */
-function RefreshImages({ onDone }: { onDone: () => void }) {
-  const { api } = useApp();
-  const allowed = usePermissions().refreshImages;
-  const [busy, setBusy] = useState(false);
-  const [note, setNote] = useState('');
-
-  const refresh = () => {
-    setBusy(true);
-    setNote('');
-
-    api
-      .refreshImages()
-      .then(res => {
-        const again = res.next
-          ? ` The next lookup on request is possible at ${new Date(res.next).toLocaleTimeString()}.`
-          : '';
-        setNote(
-          res.tags > 0
-            ? `Looking up ${plural(res.tags, 'tag')}; the hosts report the result with their next sync.${again}`
-            : (res.recent ?? 0) > 0
-              ? `Every tag was looked up within the last half minute.${again}`
-              : 'No tag is followed.'
-        );
-        onDone();
-      })
-      .catch((err: unknown) => {
-        setNote(`The lookup could not be asked for: ${err instanceof Error ? err.message : String(err)}`);
-      })
-      .finally(() => {
-        setBusy(false);
-      });
-  };
-
-  return (
-    <>
-      <Button
-        dense
-        disabled={!allowed || busy}
-        title={
-          allowed
-            ? 'Look every followed tag up at its registry now, instead of at its next interval'
-            : 'This login lacks the feature roll'
-        }
-        onClick={refresh}
-      >
-        Check registries now
-      </Button>
-      <span role="status" className="text-xs/5 text-muted">
-        {note}
-      </span>
     </>
   );
 }

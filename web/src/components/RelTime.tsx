@@ -1,7 +1,7 @@
 import { createContext, useContext, type ReactNode } from 'react';
 
 import { useNow } from '../hooks/useNow';
-import { absoluteTime, isZeroTime, relativeTime } from '../lib/format';
+import { absoluteTime, isZeroTime, relativeTime, timestamp } from '../lib/format';
 import { cx } from './primitives';
 
 const NowContext = createContext<number | null>(null);
@@ -52,6 +52,25 @@ export function RelTime({
       className={cx('whitespace-nowrap tabular-nums', fixed && FIXED, className)}
     >
       {relativeTime(value, now)}
+    </time>
+  );
+}
+
+/**
+ * Timestamp shows an instant as a local date and time that stands still, with
+ * the UTC time on hover: for logs, where rows are compared with each other
+ * and with other logs.
+ */
+export function Timestamp({ value, className }: { value: string | null | undefined; className?: string }) {
+  if (isZeroTime(value)) return <span className="text-faint">never</span>;
+
+  return (
+    <time
+      dateTime={value ?? undefined}
+      title={absoluteTime(value)}
+      className={cx('whitespace-nowrap tabular-nums', className)}
+    >
+      {timestamp(value)}
     </time>
   );
 }

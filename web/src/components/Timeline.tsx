@@ -1,4 +1,4 @@
-import { useMemo, useState, type PointerEvent } from 'react';
+import { useMemo, useState, type MouseEvent, type PointerEvent } from 'react';
 
 import { list, type Outage, type SlotHistory } from '../api/types';
 import { useWidth } from '../hooks/useWidth';
@@ -45,11 +45,12 @@ const MAX_NAMES = 8;
 
 const TICK_STEPS_MIN = [1, 2, 5, 10, 15, 30, 60, 120, 180, 360, 720];
 
-function clock(ms: number, seconds = false): string {
+export function clock(ms: number, seconds = false): string {
   return new Date(ms).toLocaleTimeString([], {
     hour: '2-digit',
     minute: '2-digit',
     second: seconds ? '2-digit' : undefined,
+    hourCycle: 'h23',
   });
 }
 
@@ -86,6 +87,50 @@ function slotsLabel(c: SlotColumn): string {
   return c.slots === 1 ? `Slot ${c.slot}` : `Slots ${c.slot}–${c.slot + c.slots - 1}`;
 }
 
+/**
+ * TimelineSelection is a span of the graph somebody asked about: a column, or
+ * a block of the bands with the columns it lies over. The numbers are those
+ * of the columns the span touches.
+ */
+export interface TimelineSelection {
+  fromMs: number;
+  toMs: number;
+  /** The first slot of the span and how many slots it covers. */
+  slot: number;
+  slots: number;
+  slotMs: number;
+  slotsPerEpoch: number;
+  recorded: number;
+  missed: number;
+  assigned: number;
+  included: number;
+  /** The block that was asked about; absent for a column. */
+  block?: OutageBlock;
+}
+
+/** selectionOf sums the columns of the window that the span from fromMs to toMs touches. */
+function selectionOf(win: SlotWindow, fromMs: number, toMs: number, block?: OutageBlock): TimelineSelection {
+  const from = Math.max(fromMs, win.startMs);
+  const to = Math.max(from + 1, Math.min(toMs, win.endMs));
+  const columns = win.columns.filter(c => c.time < to && c.time + c.slots * win.slotMs > from);
+  const first = columns[0];
+  const sum = (pick: (c: SlotColumn) => number) => columns.reduce((n, c) => n + pick(c), 0);
+
+  return {
+    fromMs: first ? first.time : from,
+    toMs: first ? first.time + sum(c => c.slots) * win.slotMs : to,
+    slot: first?.slot ?? 0,
+    slots: sum(c => c.slots),
+    slotMs: win.slotMs,
+    slotsPerEpoch: win.slotsPerEpoch,
+    recorded: sum(c => c.recorded),
+    missed: sum(c => c.missed),
+    assigned: sum(c => c.assigned),
+    included: sum(c => c.included),
+    ...(block ? { block } : {}),
+  };
+}
+
 interface Hover {
   x: number;
   y: number;
@@ -93,7 +138,7 @@ interface Hover {
   block?: OutageBlock;
 }
 
-function workLabel(block: OutageBlock): string {
+export function workLabel(block: Pick<OutageBlock, 'group' | 'work'>): string {
   if (block.group === 'off') return 'Offline';
   const work = block.work;
   return work === 'image' || work === 'packages' || work === 'action' || work === 'reboot'
@@ -162,6 +207,8 @@ export function Timeline({
   rangeMs,
   emptyNote = 'No participation data in this window yet',
   onOpenHost,
+  onSelect,
+  selected,
 }: {
   history: SlotHistory | undefined;
   /** outages are the spans during which hosts were off; undefined without a login, which hides the bands. */
@@ -170,8 +217,12 @@ export function Timeline({
   rangeMs: number;
   /** emptyNote is shown in the participation panel when it has nothing to draw. */
   emptyNote?: string;
-  /** onOpenHost is called for a click on a block of one host. */
+  /** onOpenHost is called for a click on a block of one host, when nothing takes the click with onSelect. */
   onOpenHost?: (host: string) => void;
+  /** onSelect is called for a click on a column or on a block: somebody wants to know what happened there. */
+  onSelect?: (selection: TimelineSelection) => void;
+  /** selected is the span that was asked about; it is framed while its panel is open. */
+  selected?: { fromMs: number; toMs: number };
 }) {
   const [ref, width] = useWidth<HTMLDivElement>(960);
   const [hover, setHover] = useState<Hover | null>(null);
@@ -277,6 +328,34 @@ export function Timeline({
     setHover({ x: px, y: py, column, block: blockAt(px, py) });
   };
 
+  // A block leads to what happened in its span; without onSelect a block of
+  // one host leads to the host.
+  const openBlock = (b: OutageBlock) => {
+    const single = b.hosts === 1 ? b.outages[0]?.names?.[0] : undefined;
+    if (win && onSelect) {
+      const from = Math.min(...b.outages.map(o => Date.parse(o.from)));
+      const to = b.open ? now : Math.max(...b.outages.map(o => Date.parse(o.to)));
+      onSelect(selectionOf(win, from, to, b));
+    } else if (single && onOpenHost) onOpenHost(single);
+  };
+
+  const onClick = (e: MouseEvent<SVGSVGElement>) => {
+    if (!win || !onSelect) return;
+    const box = e.currentTarget.getBoundingClientRect();
+    const px = e.clientX - box.left;
+    const py = e.clientY - box.top;
+    if (px < plotLeft || px >= plotRight || py > axisTop) return;
+
+    const block = blockAt(px, py);
+    if (block) {
+      openBlock(block);
+      return;
+    }
+
+    const column = win.columns[Math.min(count - 1, Math.floor((px - plotLeft) / colWidth))];
+    if (column) onSelect(selectionOf(win, column.time, column.time + column.slots * win.slotMs));
+  };
+
   const latest = win?.latest;
   const summary = latest
     ? `Attestations: ${latest.included} of ${latest.assigned} included in ${slotsLabel(latest).toLowerCase()} (${percentOf(
@@ -297,8 +376,9 @@ export function Timeline({
         aria-label={summary}
         width={width}
         height={height}
-        className="block touch-pan-y select-none"
+        className={cx('block touch-pan-y select-none', onSelect && hover && 'cursor-pointer')}
         onPointerMove={onMove}
+        onClick={onClick}
         onPointerLeave={() => {
           setHover(null);
         }}
@@ -401,7 +481,7 @@ export function Timeline({
               const left = plotLeft + b.x;
               const text = blockText(b, b.width);
               const single = b.hosts === 1 ? b.outages[0]?.names?.[0] : undefined;
-              const open = single !== undefined && onOpenHost !== undefined;
+              const open = onSelect !== undefined || (single !== undefined && onOpenHost !== undefined);
               const fill =
                 b.group === 'off'
                   ? 'fill-foreground/55'
@@ -423,11 +503,12 @@ export function Timeline({
                   onBlur={() => {
                     setHover(null);
                   }}
-                  onClick={() => {
-                    if (single && onOpenHost) onOpenHost(single);
+                  onClick={e => {
+                    e.stopPropagation();
+                    openBlock(b);
                   }}
                   onKeyDown={e => {
-                    if (e.key === 'Enter' && single && onOpenHost) onOpenHost(single);
+                    if (e.key === 'Enter') openBlock(b);
                   }}
                 >
                   <rect
@@ -474,6 +555,19 @@ export function Timeline({
           now
         </text>
 
+        {/* The span that was asked about. */}
+        {selected && selected.toMs > startMs && selected.fromMs < endMs && (
+          <rect
+            pointerEvents="none"
+            x={x(Math.max(selected.fromMs, startMs))}
+            y={CHART_TOP}
+            width={Math.max(x(Math.min(selected.toMs, endMs)) - x(Math.max(selected.fromMs, startMs)), 2)}
+            height={axisTop - CHART_TOP}
+            className="fill-foreground/10 stroke-foreground"
+            strokeWidth={1}
+          />
+        )}
+
         {/* The column under the pointer. */}
         {hover && !hover.block && (
           <rect
@@ -514,9 +608,14 @@ export function Timeline({
           }}
         >
           {hover.block ? (
-            <BlockTip block={hover.block} now={now} canOpen={onOpenHost !== undefined} />
+            <BlockTip
+              block={hover.block}
+              now={now}
+              canOpen={onOpenHost !== undefined}
+              canSelect={onSelect !== undefined}
+            />
           ) : (
-            hoverColumn && <ColumnTip column={hoverColumn} win={win} now={now} />
+            hoverColumn && <ColumnTip column={hoverColumn} win={win} now={now} canSelect={onSelect !== undefined} />
           )}
         </div>
       )}
@@ -525,7 +624,17 @@ export function Timeline({
 }
 
 /** BlockTip says what a block stands for: who, what, from when to when, and what it took out. */
-function BlockTip({ block, now, canOpen }: { block: OutageBlock; now: number; canOpen: boolean }) {
+function BlockTip({
+  block,
+  now,
+  canOpen,
+  canSelect,
+}: {
+  block: OutageBlock;
+  now: number;
+  canOpen: boolean;
+  canSelect: boolean;
+}) {
   const { names, more } = blockNames(block);
   const from = Math.min(...block.outages.map(o => Date.parse(o.from)));
   const to = Math.max(...block.outages.map(o => Date.parse(o.to)));
@@ -589,12 +698,28 @@ function BlockTip({ block, now, canOpen }: { block: OutageBlock; now: number; ca
           {more > 0 && ` and ${more} more`}
         </span>
       )}
-      {block.hosts === 1 && canOpen && <span className="text-faint">Click to find the host in the Hosts tab.</span>}
+      {canSelect ? (
+        <span className="text-faint">
+          Click to see {block.group === 'off' ? 'what happened' : 'what was being rolled'}.
+        </span>
+      ) : (
+        block.hosts === 1 && canOpen && <span className="text-faint">Click to find the host in the Hosts tab.</span>
+      )}
     </>
   );
 }
 
-function ColumnTip({ column, win, now }: { column: SlotColumn; win: SlotWindow; now: number }) {
+function ColumnTip({
+  column,
+  win,
+  now,
+  canSelect,
+}: {
+  column: SlotColumn;
+  win: SlotWindow;
+  now: number;
+  canSelect: boolean;
+}) {
   const epoch = Math.floor(column.slot / Math.max(1, win.slotsPerEpoch));
   const lastEpoch = Math.floor((column.slot + column.slots - 1) / Math.max(1, win.slotsPerEpoch));
   const bucketed = column.slots > 1;
@@ -654,6 +779,7 @@ function ColumnTip({ column, win, now }: { column: SlotColumn; win: SlotWindow; 
           </span>
         </>
       )}
+      {canSelect && <span className="text-faint">Click to see which hosts missed and why.</span>}
     </>
   );
 }

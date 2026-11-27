@@ -1,6 +1,7 @@
 package controllertest
 
 import (
+	"cmp"
 	"context"
 	"slices"
 	"sync"
@@ -58,4 +59,19 @@ func (f *Lookups) Refresh() discovery.Refreshed {
 	f.Refreshed++
 
 	return f.Refreshable
+}
+
+// Tags lists Digests.
+func (f *Lookups) Tags() []discovery.Tag {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	out := make([]discovery.Tag, 0, len(f.Digests))
+	for ref, d := range f.Digests {
+		out = append(out, discovery.Tag{Ref: ref, Digest: d.Digest})
+	}
+
+	slices.SortFunc(out, func(a, b discovery.Tag) int { return cmp.Compare(a.Ref, b.Ref) })
+
+	return out
 }

@@ -26,6 +26,7 @@ import {
   type LiveViews,
   type NetworkHealth,
   type PublicHost,
+  type ImageSource,
   type PublicImage,
   type PublicImageRef,
   type QueueEntry,
@@ -316,7 +317,13 @@ function publicHost(host: HostListing): PublicHost {
 
 /** images lists the image references with the hosts on and behind each digest. */
 function images(
-  rows: readonly { key: string; digest?: string; revision?: string }[],
+  rows: readonly {
+    key: string;
+    digest?: string;
+    revision?: string;
+    source?: ImageSource;
+    commits?: Record<string, string>;
+  }[],
   hosts: readonly PublicHost[]
 ): PublicImage[] {
   const out = rows.map(row => {
@@ -339,6 +346,8 @@ function images(
       ...(row.revision ? { revision: row.revision } : {}),
       hostsOn,
       hostsBehind,
+      ...(row.source ? { source: row.source } : {}),
+      ...(row.commits ? { commits: row.commits } : {}),
     };
   });
 

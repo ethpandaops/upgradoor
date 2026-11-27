@@ -67,6 +67,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/scheduler"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
+	"github.com/ethpandaops/upgradoor/pkg/controller/upstream"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
@@ -120,6 +121,13 @@ type PublicImage struct {
 	// digest.
 	HostsOn     []string `json:"hostsOn"`
 	HostsBehind []string `json:"hostsBehind"`
+	// Source is how the image stands against the branch it is built from;
+	// absent for an image whose source is not known.
+	Source *upstream.Status `json:"source,omitempty"`
+	// Commits is the commit the images at Digest and at the digests the
+	// hosts run were built from, by digest; a digest whose commit is not
+	// known is left out.
+	Commits map[string]string `json:"commits,omitempty"`
 }
 
 // PublicImages is the body of GET /api/v1/public/images.

@@ -229,7 +229,13 @@ function wireHost(h: HostListing, planned: boolean): object {
 function sharedTables(images: PublicImages, slots: readonly SlotRow[]): Tables {
   return {
     im: {
-      rows: list(images.images).map(i => ({ key: `${i.kind} ${i.image}`, digest: i.digest, revision: i.revision })),
+      rows: list(images.images).map(i => ({
+        key: `${i.kind} ${i.image}`,
+        digest: i.digest,
+        revision: i.revision,
+        source: i.source,
+        commits: i.commits ?? undefined,
+      })),
     },
     sl: { rows: slots },
   };

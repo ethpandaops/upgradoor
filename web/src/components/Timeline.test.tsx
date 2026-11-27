@@ -2,7 +2,7 @@ import { fireEvent, render, screen, within } from '@testing-library/react';
 import { describe, expect, it, vi } from 'vitest';
 
 import type { Outage, SlotHistory } from '../api/types';
-import { Timeline, TimelineLegend } from './Timeline';
+import { Timeline, TimelineLegend, type TimelineSelection } from './Timeline';
 
 const FIRST = Date.parse('2026-01-01T00:00:00Z');
 const SLOT = 4000;
@@ -148,6 +148,55 @@ describe('Timeline', () => {
     expect(screen.getByRole('tooltip')).toHaveTextContent(/before .* – now/);
     fireEvent.click(block);
     expect(onOpenHost).toHaveBeenCalledWith('c');
+  });
+
+  it('hands a clicked column, and a clicked block with the columns under it, to onSelect', () => {
+    const onSelect = vi.fn<(selection: TimelineSelection) => void>();
+    const onOpenHost = vi.fn();
+    render(
+      <Timeline
+        history={history}
+        outages={outages}
+        now={NOW}
+        rangeMs={10 * SLOT}
+        onOpenHost={onOpenHost}
+        onSelect={onSelect}
+      />
+    );
+    const chart = screen.getAllByRole('img')[0] as HTMLElement;
+
+    // Slot 323, where three attestations miss.
+    fireEvent.pointerMove(chart, { clientX: columnX(3), clientY: 40 });
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Click to see which hosts missed and why.');
+    fireEvent.click(chart, { clientX: columnX(3), clientY: 40 });
+    expect(onSelect).toHaveBeenLastCalledWith({
+      fromMs: FIRST + 3 * SLOT,
+      toMs: FIRST + 4 * SLOT,
+      slot: 323,
+      slots: 1,
+      slotMs: SLOT,
+      slotsPerEpoch: 32,
+      recorded: 1,
+      missed: 0,
+      assigned: 8,
+      included: 5,
+    });
+
+    // The block of host b lies over slots 322 to 324: the click asks about those, not about the host.
+    const block = screen.getByRole('button', { name: 'b: image roll' });
+    fireEvent.focus(block);
+    expect(screen.getByRole('tooltip')).toHaveTextContent('Click to see what was being rolled.');
+    fireEvent.keyDown(block, { key: 'Enter' });
+    expect(onSelect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ slot: 322, slots: 3, missed: 1, assigned: 24, included: 21 })
+    );
+    expect(onSelect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ block: expect.objectContaining({ outages: [outages[0]] }) as unknown })
+    );
+
+    fireEvent.click(block);
+    expect(onSelect).toHaveBeenCalledTimes(3);
+    expect(onOpenHost).not.toHaveBeenCalled();
   });
 
   it('draws a host action in a colour of its own and keys it in the legend', () => {

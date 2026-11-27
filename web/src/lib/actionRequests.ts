@@ -200,7 +200,7 @@ const OVERRIDE_HOW: readonly string[] = [
 ];
 
 function untilText(until: string | undefined): string {
-  return until ? `, until ${new Date(until).toLocaleString()}` : ', for 24 hours';
+  return until ? `, until ${new Date(until).toLocaleString([], { hourCycle: 'h23' })}` : ', for 24 hours';
 }
 
 /** describeCall states what a simple (non roll / reboot) action will do. */
