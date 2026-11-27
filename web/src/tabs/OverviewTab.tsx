@@ -5,6 +5,7 @@ import {
   type Budget,
   list,
   type Gate,
+  type ImageSource,
   type Lease,
   type NeedKind,
   type Plan,
@@ -721,9 +722,9 @@ function shortCommit(commit: string): string {
 }
 
 /** ImageSummary says, above the list, how many images wait for a build and how many for a roll. */
-function ImageSummary({ images }: { images: readonly PublicImage[] }) {
+export function ImageSummary({ images }: { images: readonly PublicImage[] }) {
   const followed = images.filter(img => img.source?.head);
-  const unverified = followed.filter(img => !img.source?.pending && !sameCommit(img.source?.commit, img.source?.head));
+  const unverified = images.filter(img => sourceUnverified(img.source));
   const build = images.filter(img => img.source?.pending).length;
   const roll = images.filter(img => list(img.hostsBehind).length > 0).length;
 
@@ -758,6 +759,15 @@ function ImageSummary({ images }: { images: readonly PublicImage[] }) {
 }
 
 const COMMIT_LINK = 'font-mono hover:underline';
+
+/**
+ * sourceUnverified reports a check that has not succeeded (yet): the head
+ * could not be read, or it is known but not that the image is built from it.
+ */
+function sourceUnverified(s: ImageSource | undefined): boolean {
+  if (s === undefined || s.pending === true) return false;
+  return s.head === undefined ? Boolean(s.error) : !sameCommit(s.commit, s.head);
+}
 
 /** sameCommit compares two commits of which either may be shortened. */
 function sameCommit(a: string | undefined, b: string | undefined): boolean {
@@ -946,11 +956,7 @@ function ImageStatus({ image, rollNote }: { image: PublicImage; rollNote: RollNo
   const behind = list(image.hostsBehind);
   const build = s?.pending === true;
 
-  // The check has not succeeded (yet): the head could not be read, or it is known but not that the image is built from it.
-  const unverified =
-    s !== undefined && !build && (s.head === undefined ? Boolean(s.error) : !sameCommit(s.commit, s.head));
-
-  if (unverified && behind.length === 0) {
+  if (s !== undefined && sourceUnverified(s) && behind.length === 0) {
     return (
       <span
         className="font-medium text-warning"

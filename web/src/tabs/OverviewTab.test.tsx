@@ -1,12 +1,12 @@
-import { fireEvent, screen, waitFor, within } from '@testing-library/react';
+import { fireEvent, render, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 
-import { list, type Gate, type LiveViews } from '../api/types';
+import { list, type Gate, type LiveViews, type PublicImage } from '../api/types';
 import type * as wireModule from '../api/wire';
 import { LIGHTHOUSE_IMAGE } from '../mock/fixture';
 import { createHarness, renderWithApp, PRIMARY } from '../test/harness';
-import { OverviewTab } from './OverviewTab';
+import { ImageSummary, OverviewTab } from './OverviewTab';
 
 const noTab = () => undefined;
 
@@ -349,5 +349,33 @@ describe('OverviewTab, what happened in a span of the graph', () => {
     expect(panel).toHaveTextContent('Log in to see which hosts missed and what was being rolled on them.');
     expect(panel).not.toHaveTextContent('What was off, and why');
     expect(h.userCalls()).toEqual([]);
+  });
+});
+
+describe('ImageSummary', () => {
+  const head = '1df30b18d9ed35ee9d28ffd4648442c2204554ad';
+  const built: PublicImage = {
+    image: 'ethpandaops/geth:master',
+    kind: 'execution',
+    hostsOn: ['a'],
+    hostsBehind: [],
+    source: { repo: 'ethereum/go-ethereum', ref: 'master', commit: head, head },
+  };
+
+  it('says all is rolled when every followed image is on its head', () => {
+    render(<ImageSummary images={[built]} />);
+    expect(screen.getByText(/every image is on its branch head and rolled/)).toBeInTheDocument();
+  });
+
+  it('claims nothing while a branch head could not be read', () => {
+    const unread: PublicImage = {
+      image: 'consensys/teku:develop',
+      kind: 'consensus',
+      hostsOn: ['b'],
+      hostsBehind: [],
+      source: { repo: 'consensys/teku', ref: 'develop', error: '401 Unauthorized' },
+    };
+    render(<ImageSummary images={[built, unread]} />);
+    expect(screen.queryByText(/every image is on its branch head/)).not.toBeInTheDocument();
   });
 });
