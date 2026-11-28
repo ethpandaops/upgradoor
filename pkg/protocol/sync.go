@@ -8,6 +8,9 @@
 //
 // All bodies are JSON, optionally gzip-encoded (Content-Encoding: gzip). The
 // request proof (pkg/identity) covers the body bytes as sent on the wire.
+// Sync and inventory bodies and their answers may be sealed instead
+// (ContentTypeSealed): gzip JSON encrypted to the controller's current
+// encryption key, which an agent learns from PathHello.
 //
 // The controller serves agents that speak MinVersion to Version; one outside
 // that range is recorded and served nothing. A change in the meaning of a
@@ -576,6 +579,10 @@ type SyncResponse struct {
 	// lookups at the registries. The agent compares them with its local
 	// images and pulls an image as the first phase of the lease that needs it.
 	Digests []TagDigest `json:"digests,omitempty"`
+
+	// Keys are the controller's encryption keys, sent to a sealed sync whose
+	// sender does not hold all of them.
+	Keys []EncryptionKey `json:"keys,omitempty"`
 }
 
 // MaxTags bounds SyncRequest.Tags.

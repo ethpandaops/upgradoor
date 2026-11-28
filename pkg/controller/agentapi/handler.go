@@ -1,6 +1,7 @@
-// Package agentapi is the controller's side of the agent protocol: the sync
-// and inventory endpoints, the verification of the agents' certificates and
-// request proofs, and the pacing of their syncs.
+// Package agentapi is the controller's side of the agent protocol: the sync,
+// inventory and hello endpoints, the verification of the agents'
+// certificates and request proofs, the sealed bodies, and the pacing of
+// their syncs.
 package agentapi
 
 import (
@@ -44,6 +45,9 @@ type Options struct {
 	AllowInsecureAgentHTTP bool
 	// AnswerSigner signs every answer; nil leaves them unsigned.
 	AnswerSigner *identity.AnswerSigner
+	// Keyring holds the encryption keys of sealed requests; nil makes one
+	// on Now.
+	Keyring *identity.Keyring
 	// TrustForwardedHeaders takes the remote address from X-Forwarded-For.
 	TrustForwardedHeaders bool
 
@@ -70,10 +74,12 @@ type Handler struct {
 	publicURLs []string
 	metrics    metrics.Metrics
 
+	keyring              *identity.Keyring
 	syncSlots            chan struct{}
 	pacer                *pacer
 	lookups              discovery.Tracker
 	inventorySlots       chan struct{}
+	helloSlots           chan struct{}
 	syncReadTimeout      time.Duration
 	inventoryReadTimeout time.Duration
 }
@@ -82,16 +88,25 @@ type Handler struct {
 //
 //nolint:gocritic // hugeParam: Options by value, like the other handlers of the controller.
 func New(log logrus.FieldLogger, opts Options) *Handler {
+	keyring := opts.Keyring
+	if keyring == nil && opts.Now != nil {
+		keyring = identity.NewKeyring(identity.WithKeyringClock(opts.Now))
+	} else if keyring == nil {
+		keyring = identity.NewKeyring()
+	}
+
 	return &Handler{
 		log:            log,
 		opts:           opts,
 		now:            opts.Now,
 		publicURLs:     opts.PublicURLs,
 		metrics:        opts.Metrics,
+		keyring:        keyring,
 		syncSlots:      make(chan struct{}, maxConcurrentSyncs),
 		pacer:          newPacer(),
 		lookups:        opts.Lookups,
 		inventorySlots: make(chan struct{}, maxConcurrentInventories),
+		helloSlots:     make(chan struct{}, maxConcurrentHellos),
 
 		syncReadTimeout:      syncReadTimeout,
 		inventoryReadTimeout: inventoryReadTimeout,
@@ -110,6 +125,7 @@ func (s *Handler) Routes() []Route {
 	return []Route{
 		{Method: http.MethodPost, Pattern: protocol.PathSync, Handler: s.handleSync},
 		{Method: http.MethodPost, Pattern: protocol.PathInventory, Handler: s.handleInventory},
+		{Method: http.MethodPost, Pattern: protocol.PathHello, Handler: s.handleHello},
 	}
 }
 

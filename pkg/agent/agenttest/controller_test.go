@@ -16,33 +16,44 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
 
-// post sends body to the controller as an agent does (gzip, certificate,
-// proof) and returns the status and the answer as verified with the
-// controller key (nil unless 200).
+// post sends body to the controller as an agent does (gzip, sealed to the
+// controller's current key, certificate, proof) and returns the status and
+// the answer as opened and verified with the controller key (nil unless 200).
 func post(t *testing.T, c *Controller, path string, body any) (int, []byte) {
 	t.Helper()
 
 	raw, err := json.Marshal(body)
 	require.NoError(t, err)
 
-	var wire bytes.Buffer
+	var plain bytes.Buffer
 
-	zw := gzip.NewWriter(&wire)
+	zw := gzip.NewWriter(&plain)
 	_, err = zw.Write(raw)
 	require.NoError(t, err)
 	require.NoError(t, zw.Close())
 
+	keys, err := c.Keyring.Announced()
+	require.NoError(t, err)
+
 	creds := Credentials(t)
 	url := c.URL() + path
 
-	proof, id, err := creds.Proof(http.MethodPost, url, wire.Bytes(), time.Now())
+	id, err := identity.NewRequestID()
 	require.NoError(t, err)
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, &wire)
+	wire, seal, err := identity.SealRequest(keys[0], identity.KeyID{}, &identity.SealBinding{
+		Network: Network, Subject: HostName, RequestID: id, Path: path,
+	}, plain.Bytes())
+	require.NoError(t, err)
+
+	proof, err := creds.ProofFor(id, http.MethodPost, url, wire, time.Now())
+	require.NoError(t, err)
+
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, url, bytes.NewReader(wire))
 	require.NoError(t, err)
 	req.Header.Set(identity.HeaderCert, creds.Certificate())
 	req.Header.Set(identity.HeaderProof, proof)
-	req.Header.Set("Content-Encoding", "gzip")
+	req.Header.Set("Content-Type", protocol.ContentTypeSealed)
 
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
@@ -55,6 +66,11 @@ func post(t *testing.T, c *Controller, path string, body any) (int, []byte) {
 	if resp.StatusCode != http.StatusOK {
 		return resp.StatusCode, nil
 	}
+
+	require.Equal(t, protocol.ContentTypeSealed, resp.Header.Get("Content-Type"))
+
+	answer, err = seal.Open(answer)
+	require.NoError(t, err)
 
 	key, err := identity.DecodePublicKey(ControllerPublicKey(t))
 	require.NoError(t, err)

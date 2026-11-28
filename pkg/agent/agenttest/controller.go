@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -74,6 +76,11 @@ type Controller struct {
 	Signer *identity.AnswerSigner
 	// Forge rewrites an answer's wire body, to play a party that is not the controller.
 	Forge func(answer []byte, host, proofID string) []byte
+	// Keyring holds the encryption keys; Restart replaces it.
+	Keyring *identity.Keyring
+	// Hellos counts the hello requests, Rekeys the rekey answers.
+	Hellos int
+	Rekeys int
 }
 
 // NewController starts the controller for the test network with
@@ -90,6 +97,7 @@ func NewController(t *testing.T, now func() time.Time) *Controller {
 		verifier:    identity.NewVerifier(identity.PublicKey(signer), Network, identity.WithClock(now)),
 		AutoRelease: true,
 		Signer:      AnswerSigner(t, ControllerSeed),
+		Keyring:     identity.NewKeyring(identity.WithKeyringClock(now)),
 	}
 	c.srv = httptest.NewServer(http.HandlerFunc(c.serve))
 
@@ -150,13 +158,45 @@ func (c *Controller) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if r.Header.Get("Content-Encoding") != "gzip" {
-		c.fail(w, http.StatusBadRequest, "body is not gzip-encoded")
+	if r.URL.Path == protocol.PathHello {
+		c.hello(w, cert.Subject, proofID)
 
 		return
 	}
 
-	zr, err := gzip.NewReader(bytes.NewReader(wire))
+	// As the real controller for an agent: nothing of the host unsealed.
+	if r.Header.Get("Content-Type") != protocol.ContentTypeSealed {
+		c.fail(w, http.StatusBadRequest, "body is not sealed")
+
+		return
+	}
+
+	sealed, err := identity.ParseSealedRequest(wire)
+	if err != nil {
+		c.fail(w, http.StatusBadRequest, err.Error())
+
+		return
+	}
+
+	plain, seal, err := c.Keyring.Open(sealed, &identity.SealBinding{
+		Network: cert.Network, Subject: cert.Subject, RequestID: proofID, Path: r.URL.Path,
+	})
+	if errors.Is(err, identity.ErrUnknownSealKey) {
+		c.Rekeys++
+		c.answer(w, cert.Subject, proofID, nil, &protocol.RekeyResponse{
+			ServerTime: c.now(), Rekey: true, Keys: EncryptionKeys(c.t, c.Keyring),
+		})
+
+		return
+	}
+
+	if err != nil {
+		c.fail(w, http.StatusBadRequest, err.Error())
+
+		return
+	}
+
+	zr, err := gzip.NewReader(bytes.NewReader(plain))
 	if err != nil {
 		c.fail(w, http.StatusBadRequest, "gunzip: "+err.Error())
 
@@ -224,6 +264,34 @@ func (c *Controller) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	forge := c.Forge
+	if r.URL.Path != protocol.PathSync {
+		forge = nil
+	}
+
+	c.answerWith(w, cert.Subject, proofID, seal, answer, forge)
+}
+
+// hello answers the encryption keys; c.mu is held.
+func (c *Controller) hello(w http.ResponseWriter, host, proofID string) {
+	c.Hellos++
+	c.answer(w, host, proofID, nil, &protocol.HelloResponse{
+		ServerTime: c.now(), Keys: EncryptionKeys(c.t, c.Keyring),
+	})
+}
+
+// answer signs answer and seals it with seal unless nil; c.mu is held.
+func (c *Controller) answer(
+	w http.ResponseWriter, host, proofID string, seal *identity.AnswerSeal, answer any,
+) {
+	c.answerWith(w, host, proofID, seal, answer, nil)
+}
+
+// answerWith is answer with forge, when set, in place of the signature.
+func (c *Controller) answerWith(
+	w http.ResponseWriter, host, proofID string, seal *identity.AnswerSeal, answer any,
+	forge func(answer []byte, host, proofID string) []byte,
+) {
 	body, err := json.Marshal(answer)
 	if err != nil {
 		c.fail(w, http.StatusInternalServerError, "encode answer: "+err.Error())
@@ -232,10 +300,10 @@ func (c *Controller) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	switch {
-	case c.Forge != nil && r.URL.Path == protocol.PathSync:
-		body = c.Forge(body, cert.Subject, proofID)
+	case forge != nil:
+		body = forge(body, host, proofID)
 	case c.Signer != nil:
-		if body, err = c.Signer.Sign(cert.Subject, proofID, body); err != nil {
+		if body, err = c.Signer.Sign(host, proofID, body); err != nil {
 			c.fail(w, http.StatusInternalServerError, "sign answer: "+err.Error())
 
 			return
@@ -243,7 +311,39 @@ func (c *Controller) serve(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.Header().Set("Content-Type", "application/json")
-	_, _ = w.Write(body) //nolint:gosec // G705: JSON for the agent under test, not a page
+
+	if seal != nil {
+		w.Header().Set("Content-Type", protocol.ContentTypeSealed)
+
+		body = seal.Seal(body)
+	}
+
+	_, _ = w.Write(body) //nolint:gosec // G705: an answer for the agent under test, not a page
+}
+
+// Restart forgets the encryption keys, as a restarted controller does.
+func (c *Controller) Restart() {
+	c.Set(func(c *Controller) { c.Keyring = identity.NewKeyring(identity.WithKeyringClock(c.now)) })
+}
+
+// EncryptionKeys are the announced keys of keyring in their wire form.
+func EncryptionKeys(t *testing.T, keyring *identity.Keyring) []protocol.EncryptionKey {
+	t.Helper()
+
+	keys, err := keyring.Announced()
+	require.NoError(t, err)
+
+	out := make([]protocol.EncryptionKey, 0, len(keys))
+
+	for _, k := range keys {
+		out = append(out, protocol.EncryptionKey{
+			ID:         k.ID.String(),
+			PublicKey:  base64.RawURLEncoding.EncodeToString(k.Bytes()),
+			ActiveFrom: k.ActiveFrom,
+		})
+	}
+
+	return out
 }
 
 // answerSync records a sync and builds the answer; c.mu is held.
@@ -340,6 +440,29 @@ func (c *Controller) Await(
 			}
 
 			require.FailNow(c.t, "no sync with: "+what, "last sync: %s", last)
+		}
+
+		time.Sleep(awaitPoll)
+	}
+}
+
+// AwaitHellos waits until n hello requests have arrived in all.
+func (c *Controller) AwaitHellos(n int) {
+	c.t.Helper()
+
+	deadline := time.Now().Add(AwaitTimeout)
+
+	for {
+		c.mu.Lock()
+		hellos := c.Hellos
+		c.mu.Unlock()
+
+		if hellos >= n {
+			return
+		}
+
+		if time.Now().After(deadline) {
+			require.FailNow(c.t, fmt.Sprintf("%d hellos, want %d", hellos, n))
 		}
 
 		time.Sleep(awaitPoll)

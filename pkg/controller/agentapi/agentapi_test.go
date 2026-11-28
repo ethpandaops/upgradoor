@@ -1288,3 +1288,298 @@ func TestCleanActions(t *testing.T) {
 		{Name: "zeta", Impact: protocol.ImpactNode, Feature: "admin", Teams: []string{"devops"}},
 	}, got)
 }
+
+// sealing is a harness whose answers are signed and whose keyring runs on
+// its clock, with the verifier of the answers to agent.
+type sealing struct {
+	*harness
+	keyring *identity.Keyring
+	agent   *controllertest.Agent
+	answers *identity.AnswerVerifier
+}
+
+func newSealing(t *testing.T) *sealing {
+	t.Helper()
+
+	key, err := identity.DeriveControllerKey([]byte(
+		"fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210"))
+	require.NoError(t, err)
+
+	signer, err := identity.NewAnswerSigner(key, controllertest.Network)
+	require.NoError(t, err)
+
+	s := &sealing{agent: validatorAgent(t)}
+	s.harness = newHarness(t, func(o *Options) {
+		o.AnswerSigner = signer
+		o.Keyring = identity.NewKeyring(identity.WithKeyringClock(o.Now))
+		s.keyring = o.Keyring
+	})
+
+	s.answers, err = identity.NewAnswerVerifier(identity.PublicKey(key), controllertest.Network,
+		s.agent.Name)
+	require.NoError(t, err)
+
+	return s
+}
+
+// keys are the announced keys.
+func (s *sealing) keys() []*identity.SealKey {
+	s.t.Helper()
+
+	keys, err := s.keyring.Announced()
+	require.NoError(s.t, err)
+
+	return keys
+}
+
+// call serves v sealed as seal says and returns the answer, opened when
+// sealed and verified, and whether it was sealed.
+func (s *sealing) call(path string, v any, seal controllertest.Sealed) (
+	rec *httptest.ResponseRecorder, answer []byte, sealed bool,
+) {
+	s.t.Helper()
+
+	body, err := json.Marshal(v)
+	require.NoError(s.t, err)
+
+	req, answerSeal := s.agent.SealedRequest(s.t, s.clock.Now(), path, body, seal,
+		controllertest.CallOpts{})
+	id := proofID(s.t, req)
+
+	rec = s.serve(req)
+	if rec.Code != http.StatusOK {
+		return rec, nil, false
+	}
+
+	answer = rec.Body.Bytes()
+
+	sealed = rec.Header().Get("Content-Type") == protocol.ContentTypeSealed
+	if sealed {
+		answer, err = answerSeal.Open(answer)
+		require.NoError(s.t, err)
+	}
+
+	answer, err = s.answers.Verify(id, answer)
+	require.NoError(s.t, err)
+
+	return rec, answer, sealed
+}
+
+// proofID is the id of the proof of req.
+func proofID(t *testing.T, req *http.Request) string {
+	t.Helper()
+
+	parts := strings.Split(req.Header.Get(identity.HeaderProof), ".")
+	require.Len(t, parts, 3)
+
+	raw, err := base64.RawURLEncoding.DecodeString(parts[1])
+	require.NoError(t, err)
+
+	var claims identity.ProofClaims
+	require.NoError(t, json.Unmarshal(raw, &claims))
+
+	return claims.ID
+}
+
+func decodeAs[T any](t *testing.T, raw []byte) T {
+	t.Helper()
+
+	var v T
+
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.DisallowUnknownFields()
+	require.NoError(t, dec.Decode(&v), string(raw))
+
+	return v
+}
+
+// A hello answers the keys, signed, and stores nothing.
+func TestHello(t *testing.T) {
+	s := newSealing(t)
+
+	rec, id := signedCall(t, s.harness, s.agent, protocol.PathHello, protocol.HelloRequest{})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	assert.Equal(t, "application/json; charset=utf-8", rec.Header().Get("Content-Type"))
+
+	raw, err := s.answers.Verify(id, rec.Body.Bytes())
+	require.NoError(t, err)
+
+	hello := decodeAs[protocol.HelloResponse](t, raw)
+	require.Len(t, hello.Keys, 1, "no next key before its announcement")
+
+	cur := s.keys()[0]
+	assert.Equal(t, cur.ID.String(), hello.Keys[0].ID)
+	assert.Equal(t, base64.RawURLEncoding.EncodeToString(cur.Bytes()), hello.Keys[0].PublicKey)
+	assert.True(t, hello.Keys[0].ActiveFrom.Equal(controllertest.Epoch))
+
+	s.clock.Advance(50 * time.Minute)
+
+	rec, id = signedCall(t, s.harness, s.agent, protocol.PathHello, protocol.HelloRequest{})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	raw, err = s.answers.Verify(id, rec.Body.Bytes())
+	require.NoError(t, err)
+	assert.Len(t, decodeAs[protocol.HelloResponse](t, raw).Keys, 2, "the next key is announced")
+
+	assert.Nil(t, s.store.Host(s.agent.Name), "a hello stores nothing")
+	assert.Zero(t, s.sched.NudgeCount())
+}
+
+// A sealed sync and inventory are opened and answered sealed; the keys go
+// along only to a sender that lacks one.
+func TestSealedSyncAndInventory(t *testing.T) {
+	s := newSealing(t)
+	inv := controllertest.InventoryFor(t, protocol.Package{Name: "openssl", Version: "3.5.1-1", Arch: "amd64"})
+	req := controllertest.SyncRequest()
+	req.InventoryHash = inv.Hash
+
+	cur := s.keys()[0]
+
+	rec, raw, sealed := s.call(protocol.PathSync, req, controllertest.Sealed{Key: cur})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.True(t, sealed)
+	assert.NotContains(t, rec.Body.String(), "serverTime", "the answer is encrypted")
+
+	resp := decodeAs[protocol.SyncResponse](t, raw)
+	assert.True(t, resp.WantInventory)
+	assert.Empty(t, resp.Keys, "up to date")
+	require.NotNil(t, s.store.Host(s.agent.Name))
+	assert.Equal(t, "agent-1.0.0", s.store.Host(s.agent.Name).Status.AgentVersion)
+
+	rec, raw, sealed = s.call(protocol.PathInventory, inv, controllertest.Sealed{Key: cur})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.True(t, sealed)
+	assert.Equal(t, inv.Hash, decodeAs[protocol.InventoryResponse](t, raw).Hash)
+
+	// The next key is announced: a sender without it gets both.
+	s.clock.Advance(50 * time.Minute)
+
+	_, raw, _ = s.call(protocol.PathSync, req, controllertest.Sealed{Key: cur})
+	keys := decodeAs[protocol.SyncResponse](t, raw).Keys
+	require.Len(t, keys, 2)
+
+	next := s.keys()[1]
+	assert.Equal(t, next.ID.String(), keys[1].ID)
+
+	_, raw, _ = s.call(protocol.PathSync, req, controllertest.Sealed{Key: cur, Known: next.ID})
+	assert.Empty(t, decodeAs[protocol.SyncResponse](t, raw).Keys)
+
+	// Rotated: the previous key still opens, its sender gets the keys.
+	s.clock.Advance(20 * time.Minute)
+
+	_, raw, sealed = s.call(protocol.PathSync, req, controllertest.Sealed{Key: cur, Known: next.ID})
+	require.True(t, sealed)
+	assert.Len(t, decodeAs[protocol.SyncResponse](t, raw).Keys, 1)
+
+	_, raw, _ = s.call(protocol.PathSync, req, controllertest.Sealed{Key: next, Known: cur.ID})
+	assert.Empty(t, decodeAs[protocol.SyncResponse](t, raw).Keys)
+}
+
+// A request sealed to a key the controller does not hold is answered the
+// keys, signed and unsealed, and processed in no part.
+func TestSealedToAnUnknownKeyIsRekeyed(t *testing.T) {
+	restarted := identity.NewKeyring(identity.WithKeyringClock(func() time.Time {
+		return controllertest.Epoch
+	}))
+	before, err := restarted.Announced()
+	require.NoError(t, err)
+
+	tests := []struct {
+		name string
+		key  func(s *sealing) *identity.SealKey
+	}{
+		{name: "after a controller restart", key: func(*sealing) *identity.SealKey { return before[0] }},
+		{name: "expired", key: func(s *sealing) *identity.SealKey {
+			old := s.keys()[0]
+			s.clock.Advance(2 * time.Hour)
+
+			return old
+		}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newSealing(t)
+			key := tt.key(s)
+
+			rec, raw, sealed := s.call(protocol.PathSync, controllertest.SyncRequest(),
+				controllertest.Sealed{Key: key})
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.False(t, sealed)
+
+			rekey := decodeAs[protocol.RekeyResponse](t, raw)
+			assert.True(t, rekey.Rekey)
+			require.Len(t, rekey.Keys, 1)
+			assert.Equal(t, s.keys()[0].ID.String(), rekey.Keys[0].ID)
+
+			assert.Nil(t, s.store.Host(s.agent.Name), "nothing of the request is processed")
+			assert.Zero(t, s.sched.NudgeCount())
+		})
+	}
+}
+
+// A sealed body opens only for the network, host, request and path it was
+// sealed for.
+func TestSealedBodyIsBound(t *testing.T) {
+	body, err := json.Marshal(controllertest.SyncRequest())
+	require.NoError(t, err)
+
+	tests := []struct {
+		name    string
+		binding identity.SealBinding
+	}{
+		{name: "another host", binding: identity.SealBinding{Subject: "prysm-besu-1"}},
+		{name: "another network", binding: identity.SealBinding{Network: "other-devnet-1"}},
+		{name: "another request", binding: identity.SealBinding{RequestID: "another-jti"}},
+		{name: "another path", binding: identity.SealBinding{Path: protocol.PathInventory}},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			s := newSealing(t)
+
+			req, _ := s.agent.SealedRequest(t, s.clock.Now(), protocol.PathSync, body,
+				controllertest.Sealed{Key: s.keys()[0], Binding: tt.binding}, controllertest.CallOpts{})
+
+			requireAgentError(t, s.serve(req), http.StatusBadRequest, "does not decrypt")
+			assert.Nil(t, s.store.Host(s.agent.Name))
+		})
+	}
+
+	t.Run("replayed under a new proof", func(t *testing.T) {
+		s := newSealing(t)
+
+		first, _ := s.agent.SealedRequest(t, s.clock.Now(), protocol.PathSync, body,
+			controllertest.Sealed{Key: s.keys()[0]}, controllertest.CallOpts{})
+		wire, err := io.ReadAll(first.Body)
+		require.NoError(t, err)
+
+		first.Body = io.NopCloser(bytes.NewReader(wire))
+		require.Equal(t, http.StatusOK, s.serve(first).Code)
+
+		replay := s.agentRequest(s.agent, protocol.PathSync, wire, controllertest.CallOpts{
+			Mutate: func(r *http.Request) { r.Header.Set("Content-Type", protocol.ContentTypeSealed) },
+		})
+		requireAgentError(t, s.serve(replay), http.StatusBadRequest, "does not decrypt")
+		assert.Equal(t, 1, s.sched.NudgeCount())
+	})
+
+	t.Run("malformed", func(t *testing.T) {
+		s := newSealing(t)
+
+		req := s.agentRequest(s.agent, protocol.PathSync, []byte("not sealed"), controllertest.CallOpts{
+			Mutate: func(r *http.Request) { r.Header.Set("Content-Type", protocol.ContentTypeSealed) },
+		})
+		requireAgentError(t, s.serve(req), http.StatusBadRequest, "malformed")
+	})
+
+	t.Run("with a content encoding", func(t *testing.T) {
+		s := newSealing(t)
+
+		req, _ := s.agent.SealedRequest(t, s.clock.Now(), protocol.PathSync, body,
+			controllertest.Sealed{Key: s.keys()[0]}, controllertest.CallOpts{
+				Mutate: func(r *http.Request) { r.Header.Set("Content-Encoding", "gzip") },
+			})
+		requireAgentError(t, s.serve(req), http.StatusUnsupportedMediaType, "no content encoding")
+	})
+}

@@ -105,6 +105,74 @@ func (a *Agent) Request(t *testing.T, now time.Time, path string, body []byte, o
 	return req
 }
 
+// Sealed shapes a sealed agent request.
+type Sealed struct {
+	// Key is the encryption key the body is sealed to.
+	Key *identity.SealKey
+	// Known is the other key the agent claims to hold.
+	Known identity.KeyID
+	// Binding overrides the binding of the body; its empty fields are the
+	// request's.
+	Binding identity.SealBinding
+}
+
+// SealedRequest builds a signed agent request whose body is gzipped and
+// sealed as s says; the proof's id is the request id the body is bound to.
+// The seal opens the answer.
+func (a *Agent) SealedRequest(
+	t *testing.T, now time.Time, path string, body []byte, s Sealed, o CallOpts,
+) (*http.Request, *identity.AnswerSeal) {
+	t.Helper()
+
+	claims, err := identity.UnverifiedClaims(a.Creds.Certificate())
+	require.NoError(t, err)
+
+	id, err := identity.NewRequestID()
+	require.NoError(t, err)
+
+	binding := identity.SealBinding{
+		Network: claims.Network, Subject: claims.Subject, RequestID: id, Path: path,
+	}
+
+	if s.Binding.Network != "" {
+		binding.Network = s.Binding.Network
+	}
+
+	if s.Binding.Subject != "" {
+		binding.Subject = s.Binding.Subject
+	}
+
+	if s.Binding.RequestID != "" {
+		binding.RequestID = s.Binding.RequestID
+	}
+
+	if s.Binding.Path != "" {
+		binding.Path = s.Binding.Path
+	}
+
+	wire, seal, err := identity.SealRequest(s.Key, s.Known, &binding, Gzip(t, body))
+	require.NoError(t, err)
+
+	proofURL := o.ProofURL
+	if proofURL == "" {
+		proofURL = BaseURL + path
+	}
+
+	proof, err := a.Creds.ProofFor(id, http.MethodPost, proofURL, wire, now)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodPost, BaseURL+path, bytes.NewReader(wire))
+	req.Header.Set("Content-Type", protocol.ContentTypeSealed)
+	req.Header.Set(identity.HeaderCert, a.Creds.Certificate())
+	req.Header.Set(identity.HeaderProof, proof)
+
+	if o.Mutate != nil {
+		o.Mutate(req)
+	}
+
+	return req, seal
+}
+
 // SyncRequest is a small valid sync request.
 func SyncRequest() *protocol.SyncRequest {
 	return &protocol.SyncRequest{

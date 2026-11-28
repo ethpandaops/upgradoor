@@ -104,14 +104,33 @@ func (c *Credentials) Certificate() string { return c.cert }
 func (c *Credentials) Proof(
 	method, url string, body []byte, now time.Time,
 ) (proof, id string, err error) {
-	var raw [16]byte
-	if _, err = rand.Read(raw[:]); err != nil {
-		return "", "", fmt.Errorf("identity: jti: %w", err)
+	if id, err = NewRequestID(); err != nil {
+		return "", "", err
 	}
 
-	id = base64.RawURLEncoding.EncodeToString(raw[:])
+	if proof, err = c.ProofFor(id, method, url, body, now); err != nil {
+		return "", "", err
+	}
 
-	proof, err = SignProof(c.key, &ProofClaims{
+	return proof, id, nil
+}
+
+// NewRequestID returns a fresh random request id, the jti of a proof.
+func NewRequestID() (string, error) {
+	var raw [16]byte
+	if _, err := rand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("identity: jti: %w", err)
+	}
+
+	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
+}
+
+// ProofFor returns the proof for one request whose id, from NewRequestID,
+// is known before its body: a sealed body is bound to the id.
+func (c *Credentials) ProofFor(
+	id, method, url string, body []byte, now time.Time,
+) (string, error) {
+	return SignProof(c.key, &ProofClaims{
 		IssuedAt:  now.Unix(),
 		ExpiresAt: now.Add(ProofLifetime).Unix(),
 		ID:        id,
@@ -119,11 +138,6 @@ func (c *Credentials) Proof(
 		URL:       url,
 		BodyHash:  BodyHash(body),
 	})
-	if err != nil {
-		return "", "", err
-	}
-
-	return proof, id, nil
 }
 
 // UnverifiedClaims decodes a certificate's claims without checking its

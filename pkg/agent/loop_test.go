@@ -557,6 +557,45 @@ func TestControllerDowntimeIsTolerated(t *testing.T) {
 	assert.Equal(t, "boot", req.BootID)
 }
 
+// A restarted controller holds none of the agent's encryption keys. Its
+// rekey answer is no answer: the terminal operation is not forgotten, the
+// state is sent again sealed to the new keys, without another hello.
+func TestControllerRestartLosesNothing(t *testing.T) {
+	t.Parallel()
+
+	sc := agenttest.BaseScenario()
+	sc.RebootRequired = true
+
+	e := newEnv(t, sc)
+	e.ctrl.Set(func(c *agenttest.Controller) { c.AutoRelease = false })
+	e.start()
+
+	req := e.ctrl.Await("the reboot need", func(req *protocol.SyncRequest) bool {
+		return hasNeed(req, protocol.RebootNeedID)
+	})
+	e.ctrl.Grant(e.lease("lease-1", findNeed(t, &req, protocol.RebootNeedID)))
+
+	op := e.ctrl.AwaitFinished("lease-1")
+	require.Equal(t, protocol.PhaseDone, op.Phase, op.Error)
+
+	// The rekey answer carries no lease: taken as an answer, it would make
+	// the agent forget the terminal operation.
+	e.ctrl.Restart()
+	e.ctrl.AwaitFinished("lease-1")
+	e.ctrl.AwaitFinished("lease-1")
+
+	e.ctrl.Grant(nil)
+	e.ctrl.Await("the operation forgotten", func(req *protocol.SyncRequest) bool {
+		return req.Operation == nil
+	})
+
+	var hellos, rekeys int
+
+	e.ctrl.Set(func(c *agenttest.Controller) { hellos, rekeys = c.Hellos, c.Rekeys })
+	assert.Equal(t, 1, hellos)
+	assert.Equal(t, 1, rekeys)
+}
+
 // With the controller silent for fallback.after, the containers of a kind
 // whose kindPolicies entry rolls follow their tags on the agent's own lease;
 // the others wait.
@@ -1029,7 +1068,8 @@ func TestRefusedAnswersAreNotActedOn(t *testing.T) {
 	}
 }
 
-// Without controller keys a signed answer is acted on in no part.
+// Without controller keys a signed answer is acted on in no part: not even
+// its encryption keys, so no host state is sent.
 func TestSignedAnswersAreRefusedWithoutControllerKeys(t *testing.T) {
 	t.Parallel()
 
@@ -1042,13 +1082,9 @@ func TestSignedAnswersAreRefusedWithoutControllerKeys(t *testing.T) {
 	})
 	e.start()
 
-	e.ctrl.AwaitSyncs(4)
+	e.ctrl.AwaitHellos(4)
 
-	for _, req := range e.ctrl.Syncs() {
-		require.Empty(t, req.DirectiveAcks, "no directive is answered")
-		require.False(t, req.Hold.Of(protocol.HolderStaff) != nil, "no directive is applied")
-	}
-
+	assert.Zero(t, e.ctrl.SyncCount(), "no sync without a key from an accepted answer")
 	assert.NotContains(t, e.readOverridesIfAny(), "controller:")
 }
 

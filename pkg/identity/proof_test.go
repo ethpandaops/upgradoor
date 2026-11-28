@@ -224,3 +224,22 @@ func TestVerifyRejectsForeignIdentities(t *testing.T) {
 		require.ErrorIs(t, err, ErrBadProof)
 	})
 }
+
+// A proof made for an id chosen before the body verifies under that id.
+func TestProofFor(t *testing.T) {
+	f := newFixture(t)
+
+	id, err := NewRequestID()
+	require.NoError(t, err)
+
+	other, err := NewRequestID()
+	require.NoError(t, err)
+	assert.NotEqual(t, id, other)
+
+	proof, err := f.creds.ProofFor(id, "POST", fixtureURL, []byte("{}"), f.now)
+	require.NoError(t, err)
+
+	_, got, err := f.verifier.Verify(f.creds.Certificate(), proof, f.request("{}"))
+	require.NoError(t, err)
+	assert.Equal(t, id, got)
+}

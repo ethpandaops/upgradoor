@@ -4,10 +4,12 @@ import (
 	"bytes"
 	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
+	"mime"
 	"net"
 	"net/http"
 	"os"
@@ -29,6 +31,9 @@ import (
 const (
 	endpointSync      = "sync"
 	endpointInventory = "inventory"
+	endpointHello     = "hello"
+
+	encodingGzip = "gzip"
 
 	// Bodies are held in memory, twice when compressed. These bound how many
 	// are in flight. A slot is only taken by a request whose certificate and
@@ -36,12 +41,14 @@ const (
 	// can hold one.
 	maxConcurrentSyncs       = 64
 	maxConcurrentInventories = 4
+	maxConcurrentHellos      = 16
 
 	// A request holds its slot while its body is read. These bound that
 	// time whatever timeouts the http.Server has, so a host that trickles
 	// its body cannot keep a slot.
 	syncReadTimeout      = 20 * time.Second
 	inventoryReadTimeout = 60 * time.Second
+	helloReadTimeout     = 10 * time.Second
 
 	// auditWriteTimeout bounds the write of identity audit entries, which
 	// does not end with the request.
@@ -72,6 +79,7 @@ func agentErrorf(status int, format string, args ...any) *agentError {
 func (s *Handler) handleSync(w http.ResponseWriter, r *http.Request) {
 	s.serveAgent(w, r, &agentEndpoint{
 		name:        endpointSync,
+		path:        protocol.PathSync,
 		slots:       s.syncSlots,
 		limit:       protocol.MaxSyncBody,
 		readTimeout: s.syncReadTimeout,
@@ -83,6 +91,7 @@ func (s *Handler) handleSync(w http.ResponseWriter, r *http.Request) {
 func (s *Handler) handleInventory(w http.ResponseWriter, r *http.Request) {
 	s.serveAgent(w, r, &agentEndpoint{
 		name:        endpointInventory,
+		path:        protocol.PathInventory,
 		slots:       s.inventorySlots,
 		limit:       protocol.MaxInventoryBody,
 		readTimeout: s.inventoryReadTimeout,
@@ -90,13 +99,43 @@ func (s *Handler) handleInventory(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// agentCall handles one authenticated agent request: cert is the verified
-// certificate, body the decompressed request body.
-type agentCall func(r *http.Request, cert *identity.Certificate, body []byte) (any, error)
+// handleHello serves POST /api/agent/v1/hello.
+func (s *Handler) handleHello(w http.ResponseWriter, r *http.Request) {
+	s.serveAgent(w, r, &agentEndpoint{
+		name:        endpointHello,
+		path:        protocol.PathHello,
+		slots:       s.helloSlots,
+		limit:       protocol.MaxHelloBody,
+		readTimeout: helloReadTimeout,
+		call:        s.hello,
+	})
+}
+
+// agentCall handles one authenticated agent request.
+type agentCall func(r *http.Request, req *agentRequest) (any, error)
+
+// agentRequest is one authenticated agent request.
+type agentRequest struct {
+	cert *identity.Certificate
+	// proofID is the jti of its proof.
+	proofID string
+	// body is the request body, opened and decompressed.
+	body []byte
+	// seal seals the answer of a sealed request; nil for a cleartext one.
+	seal *identity.AnswerSeal
+	// keys are the encryption keys for a sealed request whose sender does
+	// not hold all of them.
+	keys []protocol.EncryptionKey
+	// rekey marks a sealed request to a key the controller does not hold:
+	// it is answered keys and nothing else.
+	rekey bool
+}
 
 // agentEndpoint is one agent route with its limits.
 type agentEndpoint struct {
 	name string
+	// path is the route's path, to which a sealed body is bound.
+	path string
 	// slots bounds the requests in flight.
 	slots chan struct{}
 	// limit bounds the body, on the wire and decompressed.
@@ -106,11 +145,11 @@ type agentEndpoint struct {
 	call        agentCall
 }
 
-// serveAgent is the frame around both agent endpoints. In this order:
+// serveAgent is the frame around the agent endpoints. In this order:
 // checks that need no body (headers, certificate, proof signature and time
 // window), a slot, the bounded read, authentication over the wire bytes,
-// bounded decompression, the call, and the answer with
-// its metric.
+// opening a sealed body, bounded decompression, the call, and the answer,
+// signed and sealed like the request, with its metric.
 //
 // Nothing is read and no slot is taken for a sender that cannot show a
 // certificate of this network and a fresh proof signed by its host key.
@@ -135,34 +174,67 @@ func (s *Handler) serveAgent(w http.ResponseWriter, r *http.Request, ep *agentEn
 		return
 	}
 
-	cert, proofID, body, err := s.authenticateAgent(w, r, pre, ep)
+	req, err := s.authenticateAgent(w, r, pre, ep)
 	if err != nil {
 		s.agentFailure(w, r, ep.name, err)
 
 		return
 	}
 
-	answer, err := ep.call(r, cert, body)
-	if err != nil {
-		s.agentFailure(w, r, ep.name, err)
+	var answer any = &protocol.RekeyResponse{ServerTime: s.now().UTC(), Rekey: true, Keys: req.keys}
 
-		return
-	}
-
-	// Every answer is signed. Without a controller key (the development
-	// opt-out) it goes out as it is.
-	if s.opts.AnswerSigner != nil {
-		answer, err = s.signAnswer(cert.Subject, proofID, answer)
-		if err != nil {
+	if !req.rekey {
+		if answer, err = ep.call(r, req); err != nil {
 			s.agentFailure(w, r, ep.name, err)
 
 			return
 		}
 	}
 
+	wire, err := s.encodeAnswer(req, answer)
+	if err != nil {
+		s.agentFailure(w, r, ep.name, err)
+
+		return
+	}
+
 	s.metrics.AgentRequest(ep.name, http.StatusOK)
-	httpjson.Write(s.log, w, http.StatusOK, answer)
+
+	contentType := httpjson.ContentTypeJSON
+	if req.seal != nil {
+		contentType = protocol.ContentTypeSealed
+	}
+
+	w.Header().Set(httpjson.HeaderContentType, contentType)
+	w.WriteHeader(http.StatusOK)
+
+	if _, err := w.Write(wire); err != nil { //nolint:gosec // G705: an agent answer, not a page
+		s.log.WithError(err).Debug("Cannot write agent answer")
+	}
+
 	s.metrics.AgentAnswered(ep.name, time.Since(start))
+}
+
+// encodeAnswer encodes an answer, signs it and seals it for a sealed
+// request. Without a controller key (the development opt-out) it is not
+// signed.
+func (s *Handler) encodeAnswer(req *agentRequest, answer any) ([]byte, error) {
+	body, err := json.Marshal(answer)
+	if err != nil {
+		return nil, fmt.Errorf("encode answer for %s: %w", req.cert.Subject, err)
+	}
+
+	if s.opts.AnswerSigner != nil {
+		if body, err = s.signAnswer(req.cert.Subject, req.proofID, body); err != nil {
+			return nil, err
+		}
+	}
+
+	if req.seal != nil {
+		return req.seal.Seal(body), nil
+	}
+
+	return append(body, '\n'), nil
 }
 
 // signAnswer wraps an answer into an identity.SignedAnswer for the host and
@@ -174,12 +246,7 @@ func (s *Handler) serveAgent(w http.ResponseWriter, r *http.Request, ep *agentEn
 // Only answers are signed, never errors: an agent acts on nothing of an
 // error whoever sent it, and most errors arise before there is a verified
 // request to bind a signature to.
-func (s *Handler) signAnswer(host, proofID string, answer any) (json.RawMessage, error) {
-	body, err := json.Marshal(answer)
-	if err != nil {
-		return nil, fmt.Errorf("encode answer for %s: %w", host, err)
-	}
-
+func (s *Handler) signAnswer(host, proofID string, body []byte) ([]byte, error) {
 	signed, err := s.opts.AnswerSigner.Sign(host, proofID, body)
 	if err != nil {
 		return nil, fmt.Errorf("sign answer for %s: %w", host, err)
@@ -211,6 +278,8 @@ type agentPreAuth struct {
 	proof    string
 	encoding string
 	urls     []string
+	// sealed is a sealed body; its plaintext is always gzip.
+	sealed bool
 }
 
 // preAuthenticateAgent runs every check that needs no body: the headers, the
@@ -228,9 +297,19 @@ func (s *Handler) preAuthenticateAgent(r *http.Request, limit int64) (*agentPreA
 	}
 
 	pre.encoding = strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding")))
-	if pre.encoding != "" && pre.encoding != "identity" && pre.encoding != "gzip" {
+	if pre.encoding != "" && pre.encoding != "identity" && pre.encoding != encodingGzip {
 		return nil, agentErrorf(http.StatusUnsupportedMediaType,
 			"unsupported content encoding %q", pre.encoding)
+	}
+
+	if mt, _, err := mime.ParseMediaType(r.Header.Get(httpjson.HeaderContentType)); err == nil &&
+		mt == protocol.ContentTypeSealed {
+		if pre.encoding == encodingGzip {
+			return nil, agentErrorf(http.StatusUnsupportedMediaType,
+				"a sealed body has no content encoding")
+		}
+
+		pre.sealed = true
 	}
 
 	urls, err := s.proofURLs(r)
@@ -274,35 +353,115 @@ func (s *Handler) identityFailure(r *http.Request, err error) error {
 
 // authenticateAgent reads the body under the endpoint's size and time limit,
 // verifies the certificate and the proof over the bytes as received, and only
-// then decompresses, again under the limit. Nothing of the body is parsed
-// before the sender is verified. proofID is the id of the verified proof.
+// then opens a sealed body and decompresses, again under the limit. Nothing
+// of the body is parsed before the sender is verified.
 func (s *Handler) authenticateAgent(
 	w http.ResponseWriter, r *http.Request, pre *agentPreAuth, ep *agentEndpoint,
-) (cert *identity.Certificate, proofID string, body []byte, err error) {
+) (*agentRequest, error) {
 	wire, err := s.readAgentBody(w, r, ep)
 	if err != nil {
-		return nil, "", nil, err
+		return nil, err
 	}
 
-	cert, proofID, err = s.opts.Verifier.Verify(pre.cert, pre.proof, identity.Request{
+	cert, proofID, err := s.opts.Verifier.Verify(pre.cert, pre.proof, identity.Request{
 		Method: r.Method,
 		URLs:   pre.urls,
 		Body:   wire,
 	})
 	if err != nil {
-		return nil, "", nil, s.identityFailure(r, err)
+		return nil, s.identityFailure(r, err)
 	}
 
-	if pre.encoding != "gzip" {
-		return cert, proofID, wire, nil
+	req := &agentRequest{cert: cert, proofID: proofID, body: wire}
+
+	if pre.sealed {
+		if err = s.open(req, ep); err != nil || req.rekey {
+			return req, err
+		}
+	} else if pre.encoding != encodingGzip {
+		return req, nil
 	}
 
-	body, err = gunzip(wire, ep.limit)
+	if req.body, err = gunzip(req.body, ep.limit); err != nil {
+		return nil, err
+	}
+
+	return req, nil
+}
+
+// open opens the sealed body of req. A body sealed to a key the keyring
+// does not hold marks req for a rekey answer; the keys of every sealed
+// request whose sender lacks one are set.
+func (s *Handler) open(req *agentRequest, ep *agentEndpoint) error {
+	sealed, err := identity.ParseSealedRequest(req.body)
 	if err != nil {
-		return nil, "", nil, err
+		return agentErrorf(http.StatusBadRequest, "%s", err.Error())
 	}
 
-	return cert, proofID, body, nil
+	body, seal, err := s.keyring.Open(sealed, &identity.SealBinding{
+		Network:   req.cert.Network,
+		Subject:   req.cert.Subject,
+		RequestID: req.proofID,
+		Path:      ep.path,
+	})
+
+	switch {
+	case errors.Is(err, identity.ErrUnknownSealKey):
+		req.rekey = true
+	case errors.Is(err, identity.ErrSealed):
+		return agentErrorf(http.StatusBadRequest, "%s", err.Error())
+	case err != nil:
+		return fmt.Errorf("open sealed body of %s: %w", req.cert.Subject, err)
+	default:
+		req.body, req.seal = body, seal
+	}
+
+	upToDate, err := s.keyring.UpToDate(sealed.KeyID, sealed.Known)
+	if err != nil || (upToDate && !req.rekey) {
+		return err
+	}
+
+	keys, err := s.keyring.Announced()
+	if err != nil {
+		return err
+	}
+
+	req.keys = encryptionKeys(keys)
+
+	return nil
+}
+
+// encryptionKeys is the wire form of keys.
+func encryptionKeys(keys []*identity.SealKey) []protocol.EncryptionKey {
+	out := make([]protocol.EncryptionKey, 0, len(keys))
+
+	for _, k := range keys {
+		out = append(out, protocol.EncryptionKey{
+			ID:         k.ID.String(),
+			PublicKey:  base64.RawURLEncoding.EncodeToString(k.Bytes()),
+			ActiveFrom: k.ActiveFrom,
+		})
+	}
+
+	return out
+}
+
+// hello answers the encryption keys. It stores nothing.
+func (s *Handler) hello(_ *http.Request, req *agentRequest) (any, error) {
+	if len(req.body) == 0 {
+		req.body = []byte("{}")
+	}
+
+	if err := json.Unmarshal(req.body, &protocol.HelloRequest{}); err != nil {
+		return nil, agentErrorf(http.StatusBadRequest, "invalid hello: %s", err.Error())
+	}
+
+	keys, err := s.keyring.Announced()
+	if err != nil {
+		return nil, err
+	}
+
+	return &protocol.HelloResponse{ServerTime: s.now().UTC(), Keys: encryptionKeys(keys)}, nil
 }
 
 // readAgentBody reads the wire bytes under the endpoint's size limit and
@@ -401,11 +560,12 @@ func (s *Handler) proofURLs(r *http.Request) ([]string, error) {
 
 // sync records a host's state and tells it what to do. The host is the
 // certificate subject; nothing in the body can name another one.
-func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte) (any, error) {
+func (s *Handler) sync(r *http.Request, call *agentRequest) (any, error) {
 	ctx := r.Context()
+	cert := call.cert
 
 	var req protocol.SyncRequest
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := json.Unmarshal(call.body, &req); err != nil {
 		return nil, agentErrorf(http.StatusBadRequest, "invalid sync request: %s", err.Error())
 	}
 
@@ -445,7 +605,7 @@ func (s *Handler) sync(r *http.Request, cert *identity.Certificate, body []byte)
 		return nil, fmt.Errorf("assignment of %s: %w", cert.Subject, err)
 	}
 
-	resp := &protocol.SyncResponse{ServerTime: now}
+	resp := &protocol.SyncResponse{ServerTime: now, Keys: call.keys}
 
 	if result != nil && result.Host != nil {
 		resp.WantInventory = req.InventoryHash != result.Host.InventoryHash
@@ -695,11 +855,12 @@ func (s *Handler) auditIdentity(ctx context.Context, entries []fleet.AuditEntry)
 }
 
 // inventory stores a host's inventory after checking its hash.
-func (s *Handler) inventory(r *http.Request, cert *identity.Certificate, body []byte) (any, error) {
+func (s *Handler) inventory(r *http.Request, call *agentRequest) (any, error) {
 	ctx := r.Context()
+	cert := call.cert
 
 	var inv protocol.Inventory
-	if err := json.Unmarshal(body, &inv); err != nil {
+	if err := json.Unmarshal(call.body, &inv); err != nil {
 		return nil, agentErrorf(http.StatusBadRequest, "invalid inventory: %s", err.Error())
 	}
 
