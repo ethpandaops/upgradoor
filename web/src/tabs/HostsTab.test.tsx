@@ -7,7 +7,16 @@ import { LIGHTHOUSE_IMAGE, currentDigest } from '../mock/fixture';
 import { createHarness, renderWithApp, PRIMARY } from '../test/harness';
 import { HostsTab } from './HostsTab';
 
-const PUBLIC_COLUMNS = ['Host', 'Execution', 'EL digest', 'Consensus', 'CL digest', 'State'];
+const PUBLIC_COLUMNS = [
+  'Host',
+  'Execution client',
+  'Execution',
+  'EL digest',
+  'Consensus client',
+  'Consensus',
+  'CL digest',
+  'State',
+];
 const PRIVATE_COLUMNS = ['Reason', 'Attesting', 'CPU', 'Memory', 'Kernel', 'Uptime', 'Updates', 'Seen'];
 
 function columnNames(table: HTMLElement): string[] {
@@ -53,7 +62,14 @@ describe('HostsTab, logged out (public data only)', () => {
 
     const behind = rowOf(table, 'lighthouse-geth-3');
     expect(behind).toHaveTextContent('lighthouse:unstable');
-    expect(within(behind).getByTitle(LIGHTHOUSE_IMAGE)).toBeInTheDocument();
+    expect(within(behind).getByTitle(LIGHTHOUSE_IMAGE)).toHaveTextContent(/^lighthouse:unstable$/);
+    // Each client has a column of its own, right before its image.
+    const [, elClient, execution, , clClient, consensus] = within(behind).getAllByRole('cell');
+    if (!elClient || !execution || !clClient || !consensus) throw new Error('missing cells');
+    expect(within(elClient).getByTitle('Execution client')).toHaveTextContent(/^geth$/);
+    expect(execution).toHaveTextContent(/^geth:master$/);
+    expect(within(clClient).getByTitle('Consensus client')).toHaveTextContent(/^lighthouse$/);
+    expect(consensus).toHaveTextContent(/^lighthouse:unstable$/);
     expect(within(behind).getByText('pending')).toBeInTheDocument();
 
     const current = rowOf(table, 'lighthouse-geth-1');

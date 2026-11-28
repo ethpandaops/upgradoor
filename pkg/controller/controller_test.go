@@ -22,7 +22,7 @@ func TestParseDefaultSettings(t *testing.T) {
 		"maxUnavailablePercent=25", "leaseTtl=10m", "policyReboot=auto",
 		"readyAttestations=3", "readyStableFor=5m", "minPeers=5", "paused=true", `policyImage="manual"`,
 		"readyPeerShare=0.25", "pauseAfterCanaryImage=true",
-		`policyClients={"lighthouse":"auto"}`, `actionPolicies={"security-upgrades":"auto"}`,
+		`policyClients={"cl":{"lighthouse":"auto"}}`, `actionPolicies={"security-upgrades":"auto"}`,
 		`policyKinds={"el":"manual","snooper-el":"auto","other":"manual"}`,
 	})
 	require.NoError(t, err)
@@ -37,7 +37,7 @@ func TestParseDefaultSettings(t *testing.T) {
 	assert.InDelta(t, 0.25, s.ReadyPeerShare, 0)
 	assert.True(t, s.PauseAfterCanaryImage)
 	assert.False(t, s.PauseAfterCanaryReboot)
-	assert.Equal(t, fleet.ClientPolicies{"lighthouse": fleet.PolicyAuto}, s.PolicyClients)
+	assert.Equal(t, fleet.ClientPolicies{"cl": {"lighthouse": fleet.PolicyAuto}}, s.PolicyClients)
 	assert.Equal(t, fleet.ActionPolicies{"security-upgrades": fleet.PolicyAuto}, s.ActionPolicies)
 	assert.Equal(t, fleet.KindPolicies{
 		"el": fleet.PolicyManual, "snooper-el": fleet.PolicyAuto, fleet.KindOther: fleet.PolicyManual,

@@ -194,6 +194,8 @@ func TestPackages(t *testing.T) {
 		},
 		{name: "bad limit", query: "?q=ssl&limit=many", status: http.StatusBadRequest},
 		{name: "zero limit", query: "?q=ssl&limit=0", status: http.StatusBadRequest},
+		{name: "unknown show", query: "?show=newest", status: http.StatusBadRequest},
+		{name: "unknown sort", query: "?sort=size", status: http.StatusBadRequest},
 	}
 
 	for _, tt := range tests {
@@ -324,6 +326,13 @@ func TestPackagesPaging(t *testing.T) {
 	filtered := controllertest.DecodeJSON[views.Packages](t, h.get("/api/v1/packages?q=a&limit=2"))
 	assert.Equal(t, 5, *filtered.Total)
 	assert.Equal(t, "a", filtered.Query)
+	require.NotNil(t, filtered.Counts)
+	assert.Equal(t, 5, filtered.Counts.All)
+
+	controllertest.DecodeJSON[views.Packages](t, h.get("/api/v1/packages?show=outdated&sort=hosts&compact=1"))
+	assert.Equal(t, store.PackageFilter{
+		Limit: store.DefaultPackageSearchLimit, Show: store.PackageShowOutdated, Sort: store.PackageSortHosts, Compact: true,
+	}, h.store.LastPackageFilter)
 }
 
 func TestRollouts(t *testing.T) {

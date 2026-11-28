@@ -68,7 +68,7 @@ func TestArgVotesCommon(t *testing.T) {
 // kinds.
 func TestClientIndexPolicies(t *testing.T) {
 	settings := fleet.DefaultSettings()
-	settings.PolicyClients = fleet.ClientPolicies{"geth": fleet.PolicyManual}
+	settings.PolicyClients = fleet.ClientPolicies{"el": {"geth": fleet.PolicyManual}}
 	settings.PolicyKinds = fleet.KindPolicies{"cl": fleet.PolicyManual}
 
 	sum := HostSummary{Name: "a", Containers: []protocol.Container{
@@ -82,14 +82,12 @@ func TestClientIndexPolicies(t *testing.T) {
 
 	teku, geth := idx.Views[0], idx.Views[1]
 	assert.Equal(t, "teku", teku.Name)
-	assert.False(t, teku.PolicySet)
-	assert.Empty(t, teku.Policy)
+	assert.Empty(t, teku.Policies)
 	assert.Equal(t, map[protocol.ContainerKind]fleet.Policy{
 		protocol.KindCL: fleet.PolicyManual, protocol.KindVC: fleet.PolicyAuto,
 	}, teku.DefaultPolicies)
 
-	assert.True(t, geth.PolicySet)
-	assert.Equal(t, fleet.PolicyManual, geth.Policy)
+	assert.Equal(t, map[protocol.ContainerKind]fleet.Policy{protocol.KindEL: fleet.PolicyManual}, geth.Policies)
 	assert.Equal(t, map[protocol.ContainerKind]fleet.Policy{protocol.KindEL: fleet.PolicyAuto}, geth.DefaultPolicies)
 }
 

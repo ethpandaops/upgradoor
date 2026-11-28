@@ -59,12 +59,13 @@ func (h *harness) restart() {
 	defaults.PolicyReboot = fleet.PolicyAuto
 
 	svc, ok := New(quietLog(), Options{
-		Store:    h.store,
-		Health:   func() fleet.NetworkHealth { return h.health },
-		Liveness: h.store.listLiveness,
-		Attested: h.store.attestedSlots,
-		Defaults: defaults,
-		Now:      func() time.Time { return h.now },
+		Store:        h.store,
+		Health:       func() fleet.NetworkHealth { return h.health },
+		Liveness:     h.store.listLiveness,
+		Attested:     h.store.attestedSlots,
+		Defaults:     defaults,
+		DeployWindow: 24 * time.Hour,
+		Now:          func() time.Time { return h.now },
 		NewID: func() string {
 			h.ids++
 

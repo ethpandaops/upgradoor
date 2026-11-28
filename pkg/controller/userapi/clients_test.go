@@ -91,7 +91,7 @@ func clientFixture(h *harness) {
 		f.CurrentPlan = &scheduler.Plan{Hosts: map[string]scheduler.HostPlan{
 			"n-rolling": {Slot: scheduler.SlotLeased, LeaseID: "lease-2"},
 		}}
-		f.CurrentSettings.PolicyClients = fleet.ClientPolicies{"geth": fleet.PolicyManual}
+		f.CurrentSettings.PolicyClients = fleet.ClientPolicies{"el": {"geth": fleet.PolicyManual}}
 	})
 }
 
@@ -109,8 +109,7 @@ func TestClients(t *testing.T) {
 
 	assert.Equal(t, "lighthouse", lighthouse.Name, "consensus clients come first")
 	assert.Equal(t, views.LayerConsensus, lighthouse.Layer)
-	assert.Empty(t, lighthouse.Policy, "none of its own")
-	assert.False(t, lighthouse.PolicySet)
+	assert.Empty(t, lighthouse.Policies, "none of its own")
 	assert.Equal(t, []views.ClientImage{
 		{
 			Kind: protocol.KindCL, Image: "sigp/lighthouse:latest", Digest: "sha256:l1",
@@ -143,8 +142,7 @@ func TestClients(t *testing.T) {
 	assert.Equal(t, http.StatusBadRequest, h.get("/api/v1/clients/lighthouse/hosts?override=both").Code)
 
 	assert.Equal(t, views.LayerExecution, geth.Layer)
-	assert.Equal(t, fleet.PolicyManual, geth.Policy)
-	assert.True(t, geth.PolicySet)
+	assert.Equal(t, map[protocol.ContainerKind]fleet.Policy{protocol.KindEL: fleet.PolicyManual}, geth.Policies)
 	assert.Equal(t, 1, geth.Failed)
 	assert.Equal(t, 1, geth.Pending, "a container on another image than agent.yaml says is pending")
 	assert.Equal(t, 1, geth.Held)

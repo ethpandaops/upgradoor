@@ -246,17 +246,17 @@ describe('ClientsTab', () => {
     });
   });
 
-  it('sets the image policy of a client through the dialog, and inherits the default again', async () => {
+  it('sets the image policy of a client for a kind through the dialog, and inherits the kind again', async () => {
     const user = userEvent.setup();
     const h = await open('staff', '#clients/geth');
     await screen.findByRole('table', { name: 'Hosts of geth' });
 
-    const policy = screen.getByRole('group', { name: 'Roll policy' });
+    const policy = screen.getByRole('group', { name: 'Roll policy: el' });
     expect(within(policy).getByRole('button', { name: 'Inherit (automatic)' })).toHaveAttribute('aria-pressed', 'true');
     expect(within(policy).getByRole('button', { name: 'Automatic' })).toHaveAttribute('aria-pressed', 'false');
 
     await user.click(within(policy).getByRole('button', { name: 'Manual' }));
-    const dialog = await screen.findByRole('dialog', { name: 'Image policy of geth: manual' });
+    const dialog = await screen.findByRole('dialog', { name: 'Image policy of geth el: manual' });
     await user.type(within(dialog).getByRole('textbox'), 'release week');
     await user.click(within(dialog).getByRole('button', PRIMARY));
 
@@ -265,12 +265,13 @@ describe('ClientsTab', () => {
     });
     expect(h.calls.find(c => c.path === '/api/v1/actions/client-policy')?.body).toEqual({
       client: 'geth',
+      kind: 'el',
       policy: 'manual',
       reason: 'release week',
     });
 
     await user.click(within(policy).getByRole('button', { name: 'Inherit (automatic)' }));
-    const back = await screen.findByRole('dialog', { name: 'Image policy of geth: back to the default' });
+    const back = await screen.findByRole('dialog', { name: 'Image policy of geth el: inherit the kind' });
     await user.click(within(back).getByRole('button', PRIMARY));
     await waitFor(() => {
       expect(within(policy).getByRole('button', { name: 'Inherit (automatic)' })).toHaveAttribute(
@@ -280,33 +281,45 @@ describe('ClientsTab', () => {
     });
     expect(h.calls.filter(c => c.path === '/api/v1/actions/client-policy').at(-1)?.body).toMatchObject({
       client: 'geth',
+      kind: 'el',
       policy: '',
     });
   });
 
-  it('names the default of each kind that inherit follows when they differ', async () => {
+  it('has a policy per kind of the client, each inheriting its kind or with its own', async () => {
+    const user = userEvent.setup();
     window.location.hash = '#clients/lighthouse';
     const h = await createHarness({ mode: 'auth', loggedIn: true, profile: 'staff' });
     await h.api.putSettings({ policyKinds: { cl: 'manual' } });
     renderWithApp(<ClientsTab onOpenTab={vi.fn()} />, h);
     await screen.findByRole('table', { name: 'Hosts of lighthouse' });
 
-    const policy = screen.getByRole('group', { name: 'Roll policy' });
-    expect(within(policy).getByRole('button', { name: 'Inherit (cl manual, vc auto)' })).toHaveAttribute(
-      'aria-pressed',
-      'true'
-    );
-    expect(policy).toHaveTextContent('each kind follows its own default');
+    const cl = screen.getByRole('group', { name: 'Roll policy: cl' });
+    const vc = screen.getByRole('group', { name: 'Roll policy: vc' });
+    expect(within(cl).getByRole('button', { name: 'Inherit (manual)' })).toHaveAttribute('aria-pressed', 'true');
+    expect(within(vc).getByRole('button', { name: 'Inherit (automatic)' })).toHaveAttribute('aria-pressed', 'true');
 
     await h.api.putSettings({ policyKinds: { cl: 'manual', vc: 'manual' } });
-    expect(await within(policy).findByRole('button', { name: 'Inherit (manual)' })).toBeInTheDocument();
+    expect(await within(vc).findByRole('button', { name: 'Inherit (manual)' })).toBeInTheDocument();
+
+    // The vc policy of lighthouse is its own; its cl policy still inherits.
+    await user.click(within(vc).getByRole('button', { name: 'Automatic' }));
+    await user.click(within(await screen.findByRole('dialog')).getByRole('button', PRIMARY));
+    await waitFor(() => {
+      expect(within(vc).getByRole('button', { name: 'Automatic' })).toHaveAttribute('aria-pressed', 'true');
+    });
+    expect(within(cl).getByRole('button', { name: 'Inherit (manual)' })).toHaveAttribute('aria-pressed', 'true');
+    expect((await h.api.settings()).settings.policyClients).toEqual({
+      el: { besu: 'manual' },
+      vc: { lighthouse: 'auto' },
+    });
   });
 
   it('disables the policy switch, with the reason, for a login that may not set it', async () => {
     await open('reader', '#clients/geth');
     await screen.findByRole('table', { name: 'Hosts of geth' });
 
-    const policy = screen.getByRole('group', { name: 'Roll policy' });
+    const policy = screen.getByRole('group', { name: 'Roll policy: el' });
     const reason =
       'Needs upgradoor:manage or upgradoor:team_manage for a team that owns every container of this client';
     for (const name of ['Inherit (automatic)', 'Automatic', 'Manual']) {
@@ -321,12 +334,12 @@ describe('ClientsTab', () => {
     await open('team');
     await screen.findByRole('table', { name: 'Hosts of lighthouse' });
     expect(
-      within(screen.getByRole('group', { name: 'Roll policy' })).getByRole('button', { name: 'Manual' })
+      within(screen.getByRole('group', { name: 'Roll policy: cl' })).getByRole('button', { name: 'Manual' })
     ).toBeEnabled();
 
     await user.click(screen.getByRole('tab', { name: /^geth/ }));
     await screen.findByRole('table', { name: 'Hosts of geth' });
-    const policy = screen.getByRole('group', { name: 'Roll policy' });
+    const policy = screen.getByRole('group', { name: 'Roll policy: el' });
     expect(within(policy).getByRole('button', { name: 'Manual' })).toBeDisabled();
     expect(policy).toHaveTextContent('upgradoor:team_manage does not cover client geth');
   });
@@ -339,7 +352,7 @@ describe('ClientsTab', () => {
     expect(screen.queryByRole('region', { name: /waiting for approval/ })).not.toBeInTheDocument();
 
     await user.click(
-      within(screen.getByRole('group', { name: 'Roll policy' })).getByRole('button', { name: 'Manual' })
+      within(screen.getByRole('group', { name: 'Roll policy: cl' })).getByRole('button', { name: 'Manual' })
     );
     await user.click(within(await screen.findByRole('dialog')).getByRole('button', PRIMARY));
 
@@ -388,7 +401,7 @@ describe("ClientsTab: a client's team", () => {
     await screen.findByRole('table', { name: 'Hosts of lighthouse' });
 
     await user.click(
-      within(screen.getByRole('group', { name: 'Roll policy' })).getByRole('button', { name: 'Manual' })
+      within(screen.getByRole('group', { name: 'Roll policy: cl' })).getByRole('button', { name: 'Manual' })
     );
     await user.click(within(await screen.findByRole('dialog')).getByRole('button', PRIMARY));
 

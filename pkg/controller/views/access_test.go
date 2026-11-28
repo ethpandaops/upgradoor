@@ -177,7 +177,7 @@ func TestAccessAuditAdmin(t *testing.T) {
 	before := fleet.DefaultSettings()
 	after := before
 	after.MaxUnavailablePercent = 25
-	after.PolicyClients = map[string]fleet.Policy{"geth": fleet.PolicyManual}
+	after.PolicyClients = fleet.ClientPolicies{"el": {"geth": fleet.PolicyManual}}
 
 	in := []fleet.AuditEntry{
 		{Action: "settings.update", Target: "settings", Detail: map[string]any{
@@ -198,7 +198,7 @@ func TestAccessAuditAdmin(t *testing.T) {
 		assert.Equal(t, map[string]any{
 			"before": map[string]any{"maxUnavailablePercent": 10.0, "policyClients": map[string]any{}},
 			"after": map[string]any{
-				"maxUnavailablePercent": 25.0, "policyClients": map[string]any{"geth": "manual"},
+				"maxUnavailablePercent": 25.0, "policyClients": map[string]any{"el": map[string]any{"geth": "manual"}},
 			},
 			"reason": "r",
 		}, got[0].Detail)

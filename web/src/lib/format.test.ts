@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 
 import type { Hold } from '../api/types';
 
@@ -105,6 +105,17 @@ describe('absoluteTime and zero times', () => {
     expect(timestamp(d.toISOString())).toBe('2026-11-04 09:05:07');
     expect(timestamp('0001-01-01T00:00:00Z')).toBe('never');
     expect(timestamp('nonsense')).toBe('nonsense');
+  });
+
+  it('renders a timestamp in the time zone of the browser', () => {
+    try {
+      vi.stubEnv('TZ', 'Asia/Kolkata');
+      expect(timestamp('2026-11-27T19:34:25Z')).toBe('2026-11-28 01:04:25');
+      vi.stubEnv('TZ', 'America/New_York');
+      expect(timestamp('2026-11-27T19:34:25Z')).toBe('2026-11-27 14:34:25');
+    } finally {
+      vi.unstubAllEnvs();
+    }
   });
 
   it('treats the Go zero time as unset', () => {

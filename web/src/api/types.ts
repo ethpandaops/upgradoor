@@ -782,12 +782,13 @@ export interface Settings {
   policyPackages: Policy;
   policyReboot: Policy;
   /**
-   * The image policy per client ("geth": "manual"); always an object. The
-   * image rollouts of a client that is listed answer to its entry, the
-   * others to policyKinds, then policyImage. It is changed with the
-   * client-policy action.
+   * The image policy per container kind and client ({"cl": {"lighthouse":
+   * "manual"}}, "other" for unlabelled containers); always an object. The
+   * image rollouts of a client's containers of a kind that is listed answer
+   * to its entry, the others to policyKinds, then policyImage. It is changed
+   * with the client-policy action or with the settings.
    */
-  policyClients: Record<string, Policy>;
+  policyClients: Record<string, Record<string, Policy>>;
   /** The image policy per container kind ("cl": "manual", "other" for unlabelled containers); always an object. A kind that is not listed follows policyImage. */
   policyKinds: Record<string, Policy>;
   /** The policy per host action; always an object. An action that is not listed is manual. */
@@ -801,8 +802,6 @@ export interface Settings {
   /** How often the controller looks a tag up at its registry (Go duration). */
   lookupInterval: string;
   paused: boolean;
-  /** Length of the initial deployment window from the controller's first start (Go duration); "0s" is none. */
-  deployWindow: string;
 }
 
 // --------------------------------------------------------------- scheduler
@@ -866,9 +865,11 @@ export interface EndLeaseRequest {
   reason: string;
 }
 
-/** scheduler.ClientPolicyRequest: the body of client-policy. An empty policy returns the client to policyImage. */
+/** scheduler.ClientPolicyRequest: the body of client-policy. An empty policy returns the client's containers of the kind to the kind's policy. */
 export interface ClientPolicyRequest {
   client: string;
+  /** kind is the container kind, "other" for unlabelled containers. */
+  kind: string;
   policy: Policy | '';
   reason: string;
 }
@@ -1079,8 +1080,23 @@ export interface Plan {
 // ------------------------------------------------------------------- store
 
 /** store.PackageVersion */
-interface PackageVersion {
+export interface PackageVersion {
   version: string;
+  /** The number of hosts; hosts lists them unless the page is compact and this is the most common version. */
+  count: number;
+  hosts: List<string>;
+}
+
+/** store.PackageUpgrade: one candidate apt offers the hosts on one installed version. */
+export interface PackageUpgrade {
+  current: string;
+  candidate: string;
+  /** From a security origin on any of the hosts. */
+  security: boolean;
+  /** In the blocked set of any of the hosts: upgradoor, not unattended-upgrades, upgrades it. */
+  blocked: boolean;
+  /** The number of hosts; hosts lists them unless the page is compact. */
+  count: number;
   hosts: List<string>;
 }
 
@@ -1088,6 +1104,21 @@ interface PackageVersion {
 export interface PackageMatch {
   name: string;
   versions: List<PackageVersion>;
+  upgrades: List<PackageUpgrade>;
+}
+
+/** store.PackageShow */
+export type PackageShow = '' | 'differing' | 'outdated' | 'security';
+
+/** store.PackageSort */
+export type PackageSort = '' | 'versions' | 'hosts' | 'outdated';
+
+/** store.PackageCounts: the number of names a query selects under each show. */
+export interface PackageCounts {
+  all: number;
+  differing: number;
+  outdated: number;
+  security: number;
 }
 
 // --------------------------------------------------------------------- api
@@ -1369,9 +1400,8 @@ export interface ClientImage {
 export interface ClientView {
   name: string;
   layer: ClientLayer;
-  /** The client's own image policy; policySet is false and policy empty when it has none. */
-  policy: Policy | '';
-  policySet: boolean;
+  /** The client's own image policy per kind of its images; a kind without one is not listed. */
+  policies: Record<ContainerKind, Policy>;
   /** What the image rollouts of each kind of the client answer to without a policy of its own: policyKinds, else policyImage. */
   defaultPolicies: Record<ContainerKind, Policy>;
   images: List<ClientImage>;
@@ -1431,6 +1461,8 @@ export interface Packages {
   matches: List<PackageMatch>;
   /** The number of package names the query selects; on the first page only. */
   total?: number;
+  /** The number of names the query selects under each show; on the first page only. */
+  counts?: PackageCounts;
   /** Continues after this page (the `after` parameter); absent on the last page. */
   next?: string;
 }

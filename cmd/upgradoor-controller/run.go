@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
@@ -104,6 +105,9 @@ func newRunCmd(log *logrus.Logger) *cobra.Command {
 		"how often the source branches of the images are read")
 	f.StringArrayVar(&cfg.DefaultSettings, "default-setting", nil,
 		"default for a setting as key=value, e.g. maxUnavailablePercent=10 (repeatable)")
+	f.DurationVar(&cfg.DeployWindow, "deploy-window", 24*time.Hour,
+		"initial deployment window from the first start on a fresh store: only Ansible deploys are leased "+
+			"until it ends or is armed (0 disables, at most 720h)")
 	f.StringVar(&pprofListen, "pprof-listen", "",
 		"serve net/http/pprof on this loopback address, e.g. 127.0.0.1:6060 (off when empty)")
 

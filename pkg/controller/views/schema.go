@@ -285,6 +285,9 @@ type Packages struct {
 	// Total is the number of package names the query selects (all of them
 	// without a query). Only the first page has it.
 	Total *int `json:"total,omitempty"`
+	// Counts is the number of names the query selects under each show; only
+	// the first page has it.
+	Counts *store.PackageCounts `json:"counts,omitempty"`
 	// Next continues after this page (the "after" parameter); absent on the
 	// last page.
 	Next string `json:"next,omitempty"`

@@ -15,6 +15,7 @@ import (
 
 	"github.com/sirupsen/logrus"
 
+	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -48,6 +49,14 @@ type Store interface {
 
 var _ Store = store.Store(nil)
 
+// Lookups is the part of discovery.Tracker the scheduler uses.
+type Lookups interface {
+	RefreshTag(ref string, since time.Time) bool
+	LookedUp(ref string) (discovery.Lookup, bool)
+}
+
+var _ Lookups = discovery.Tracker(nil)
+
 // Options configure the scheduler.
 type Options struct {
 	// Store holds all state. Required.
@@ -65,12 +74,18 @@ type Options struct {
 	Attested func() map[string][]uint64
 	// Defaults are the settings before the stored overrides.
 	Defaults fleet.Settings
+	// DeployWindow is the length of the initial deployment window; 0 is no
+	// window.
+	DeployWindow time.Duration
 	// TickInterval is the reconcile period; 2s when zero.
 	TickInterval time.Duration
 	// Now is the clock; time.Now when nil.
 	Now func() time.Time
 	// NewID returns a new unique ID; random when nil.
 	NewID func() string
+	// Lookups looks up the tags that hosts saw move on (TagMove). Without
+	// it, a need the agent superseded is granted again at once.
+	Lookups Lookups
 	// Changed, when set, is called after a commit, after an audit entry was
 	// appended (every action writes one) and after a reconcile whose plan
 	// differs from the one before it, the time it was computed at aside. It
@@ -87,8 +102,10 @@ type service struct {
 	// is the World's Since: silence is never counted from before it.
 	since time.Time
 
-	// mu serialises reconciles and actions.
-	mu sync.Mutex
+	// mu serialises reconciles and actions; it guards moves, the
+	// Outcome.TagMoves of the last committed reconcile.
+	mu    sync.Mutex
+	moves []TagMove
 
 	planMu sync.RWMutex
 	plan   *Plan
@@ -255,6 +272,12 @@ func (s *service) reconcile(ctx context.Context) error {
 		}).Debug("Committed reconcile")
 	}
 
+	s.moves = out.TagMoves
+
+	for _, ref := range out.Refresh {
+		s.opts.Lookups.RefreshTag(ref, w.Now)
+	}
+
 	s.planMu.Lock()
 	same := samePlan(s.plan, out.Plan)
 	s.plan = out.Plan
@@ -303,11 +326,18 @@ func (s *service) loadWorld(ctx context.Context) (*World, error) {
 		Settings: settings,
 		Health:   s.opts.Health(),
 		NewID:    s.opts.NewID,
+		TagMoves: s.moves,
+	}
+
+	if s.opts.Lookups != nil {
+		w.LookedUp = s.opts.Lookups.LookedUp
 	}
 
 	if w.DeployWindow, err = st.DeployWindow(ctx); err != nil {
 		return nil, fmt.Errorf("scheduler: load deploy window: %w", err)
 	}
+
+	w.DeployWindow.Length = s.opts.DeployWindow
 
 	if w.Hosts, err = st.ListHosts(ctx); err != nil {
 		return nil, fmt.Errorf("scheduler: list hosts: %w", err)
@@ -597,7 +627,7 @@ func (s *service) PatchSettings(
 	}
 
 	next := current
-	next.PolicyClients = maps.Clone(current.PolicyClients)
+	next.PolicyClients = current.PolicyClients.Clone()
 	next.PolicyKinds = maps.Clone(current.PolicyKinds)
 	next.ActionPolicies = maps.Clone(current.ActionPolicies)
 

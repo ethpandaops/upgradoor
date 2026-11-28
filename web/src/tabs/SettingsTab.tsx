@@ -1,4 +1,5 @@
 import { useId, useMemo, useState, type SyntheticEvent } from 'react';
+import { createPortal } from 'react-dom';
 
 import { errorText } from '../api/client';
 import { list, type Policy, type SettingsBody } from '../api/types';
@@ -8,50 +9,31 @@ import { useLive } from '../components/Live';
 import { RelTime } from '../components/RelTime';
 import { IntentAction } from '../components/SelectionBar';
 import { usePermissions } from '../components/Permissions';
-import {
-  Badge,
-  Button,
-  Card,
-  ErrorBanner,
-  INPUT_CLASS,
-  InfoTip,
-  Loading,
-  Segmented,
-  Switch,
-  cx,
-} from '../components/primitives';
+import { Badge, Button, Card, ErrorBanner, INPUT_CLASS, InfoTip, Loading, Switch, cx } from '../components/primitives';
 import { useQuery } from '../hooks/useQuery';
 import { useUnsavedWork } from '../hooks/useUnsavedWork';
 import { absoluteTime } from '../lib/format';
-import { armIntent } from '../lib/intents';
-import { ActionPolicies } from './ActionPolicies';
+import { armIntent, scopeIntent } from '../lib/intents';
 import {
-  GROUPS,
-  POLICIES,
-  POLICY_LABEL,
-  POLICY_MEANING,
   changedSettings,
   dirtyKeys,
   displayValue,
   errorField,
   fieldSpec,
-  kindRows,
-  parsePolicies,
-  policiesText,
-  sameValue,
-  shortValue,
   toForm,
   validateForm,
   valueText,
   type FieldSpec,
-  type GroupSpec,
-  type RolloutKindSpec,
   type SettingKey,
   type SettingsForm,
 } from '../lib/settingsForm';
+import { AREAS, type SectionSpec } from '../lib/settingsLayout';
+import { ActionPolicies } from './ActionPolicies';
+import { ImagePolicyMatrix } from './ImagePolicyMatrix';
+import { FieldLabel, FieldRow, Mark, PolicySwitch, Problem, type FieldState } from './settingsParts';
 
 /**
- * SettingsTab edits the scheduler settings, grouped by what they govern. The
+ * SettingsTab edits the scheduler settings, laid out by settingsLayout. The
  * form is loaded once (it is not refreshed by the stream, so typing is never
  * overwritten). Saving sends the settings that changed, and nothing else.
  */
@@ -64,33 +46,62 @@ export function SettingsTab() {
   const body = saved ?? loaded.data;
 
   return (
-    <div className="mx-auto flex w-full max-w-screen-2xl flex-col gap-4">
-      <DeployWindowCard />
-      {body ? (
-        <SettingsEditor
-          // A new stored state (after a save or a reload) resets the form.
-          key={JSON.stringify(body.settings)}
-          body={body}
-          onSaved={setSaved}
-          onReload={() => {
-            setSaved(null);
-            loaded.refresh();
-          }}
-        />
-      ) : loaded.loading ? (
-        <Loading what="settings" />
-      ) : (
-        <ErrorBanner error={loaded.error} what="the settings" onRetry={loaded.refresh} />
-      )}
+    <div className="mx-auto grid w-full max-w-6xl grid-cols-1 gap-8 lg:grid-cols-[11rem_minmax(0,1fr)]">
+      <SectionNav />
+      <div className="flex min-w-0 flex-col gap-6">
+        <StatusCards />
+        {body ? (
+          <SettingsEditor
+            // A new stored state (after a save or a reload) resets the form.
+            key={JSON.stringify(body.settings)}
+            body={body}
+            onSaved={setSaved}
+            onReload={() => {
+              setSaved(null);
+              loaded.refresh();
+            }}
+          />
+        ) : loaded.loading ? (
+          <Loading what="settings" />
+        ) : (
+          <ErrorBanner error={loaded.error} what="the settings" onRetry={loaded.refresh} />
+        )}
+      </div>
     </div>
   );
 }
 
-/**
- * DeployWindowCard states the initial deployment window as the scheduler
- * last planned it, with the action that ends it early while it is open.
- */
-function DeployWindowCard() {
+const sectionId = (section: SectionSpec) => `settings-${section.id}`;
+
+/** SectionNav lists the sections beside the form on a wide window; a click scrolls to one. */
+function SectionNav() {
+  return (
+    <nav aria-label="Settings sections" className="hidden lg:block">
+      <div className="sticky top-20 flex flex-col gap-4">
+        {AREAS.map(area => (
+          <div key={area.id} className="flex flex-col gap-1">
+            <span className="px-2 text-xs/5 font-semibold tracking-wide text-faint uppercase">{area.title}</span>
+            {area.sections.map(section => (
+              <button
+                key={section.id}
+                type="button"
+                onClick={() => {
+                  document.getElementById(sectionId(section))?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+                }}
+                className="rounded-sm px-2 py-1 text-left text-sm/5 text-muted hover:bg-surface-hover hover:text-foreground"
+              >
+                {section.title}
+              </button>
+            ))}
+          </div>
+        ))}
+      </div>
+    </nav>
+  );
+}
+
+/** StatusCards state what the scheduler does now, apart from what can be edited. */
+function StatusCards() {
   const plan = useLive('plan').data;
   const actions = useActions();
   if (!plan) return null;
@@ -98,7 +109,7 @@ function DeployWindowCard() {
   const w = plan.deployWindow;
 
   return (
-    <>
+    <div className="flex flex-col gap-4">
       {actions.notice}
       <Card
         title="Initial deployment window"
@@ -122,27 +133,17 @@ function DeployWindowCard() {
           )}
         </p>
         <p className="text-xs/5 text-muted">
-          While it is open after the controller first started on a fresh store, nothing is granted but Ansible deploys:
-          rollouts, host actions and manual actions wait. Syncs, probes and readiness go on.
+          After the first start on a fresh store only Ansible deploys are granted until it ends. Its length is the
+          controller&rsquo;s <span className="font-mono">--deploy-window</span> option.
         </p>
       </Card>
       {actions.dialog}
-    </>
+    </div>
   );
 }
 
-/** What every control of the form needs to know about its setting. */
-interface FieldState {
-  value: string;
-  /** stored and fallback are the saved value and the default, as their inputs would show them. */
-  stored: string;
-  fallback: string;
-  /** error is what is wrong with the input, or what the controller said about it. */
-  error: string | undefined;
-  dirty: boolean;
-  disabled: boolean;
-  set: (value: string) => void;
-}
+/** Field is what a section needs to render its settings. */
+type Field = (key: SettingKey) => FieldState;
 
 function SettingsEditor({
   body,
@@ -166,13 +167,14 @@ function SettingsEditor({
   const invalid = Object.keys(errors).length > 0;
   useUnsavedWork(dirty.length > 0);
 
-  const field = (key: SettingKey): FieldState => ({
+  const field: Field = key => ({
     value: form[key],
     stored: displayValue(body.settings, key),
     fallback: displayValue(body.defaults, key),
     error: errors[key] ?? (saveError?.field === key ? errorText(saveError.error) : undefined),
     dirty: dirty.includes(key),
     disabled: saving || !mayWrite.allowed,
+    reason: mayWrite.allowed ? undefined : mayWrite.reason,
     set: value => {
       setForm(prev => ({ ...prev, [key]: value }));
       // What the controller said was about the value that was sent.
@@ -197,17 +199,22 @@ function SettingsEditor({
   };
 
   return (
-    <form id={formId} aria-label="Settings" onSubmit={e => void submit(e)} className="flex flex-col gap-4" noValidate>
-      {/*
-        The scheduler's switches as a strip over the whole width, and below it
-        three groups side by side, stretched to one height; on a narrow window
-        everything is one column.
-      */}
-      <div className="grid grid-cols-1 gap-4 lg:grid-cols-3">
-        {GROUPS.map(group => (
-          <GroupCard key={group.id} group={group} field={field} formId={formId} kinds={list(body.kinds)} />
-        ))}
-      </div>
+    <form id={formId} aria-label="Settings" onSubmit={e => void submit(e)} className="flex flex-col gap-8" noValidate>
+      {AREAS.map(area => (
+        <div key={area.id} className="flex flex-col gap-4">
+          <h2 className="text-xs/5 font-semibold tracking-wide text-faint uppercase">{area.title}</h2>
+          {area.sections.map(section => (
+            <SectionCard
+              key={section.id}
+              section={section}
+              field={field}
+              form={form}
+              formId={formId}
+              kinds={list(body.kinds)}
+            />
+          ))}
+        </div>
+      ))}
 
       <div className="sticky bottom-0 flex flex-col gap-2 rounded-lg border border-border bg-surface p-3 shadow-md">
         {/* What a save will send, before it is sent. */}
@@ -269,383 +276,229 @@ function SettingsEditor({
   );
 }
 
-function GroupCard({
-  group,
+/**
+ * SectionCard is one section: its title, what it governs and its master
+ * control in the header, its settings in the form grid below. A setting
+ * whose parent is another field of the section is drawn inside that field.
+ */
+function SectionCard({
+  section,
   field,
+  form,
   formId,
   kinds,
 }: {
-  group: GroupSpec;
-  field: (key: SettingKey) => FieldState;
+  section: SectionSpec;
+  field: Field;
+  form: SettingsForm;
   formId: string;
   /** kinds are the kinds of the fleet's managed containers. */
   kinds: readonly string[];
 }) {
-  if (group.wide) {
-    return (
-      <Card
-        title={group.title}
-        className="lg:col-span-3"
-        aside={<span className="text-xs/5 text-muted">{group.about}</span>}
-      >
-        <div className="grid grid-cols-1 gap-x-6 gap-y-4 sm:grid-cols-2 xl:grid-cols-5">
-          {group.keys.map(key => (
-            <SettingCell key={key} spec={fieldSpec(key)} state={field(key)} id={`${formId}-${key}`} />
-          ))}
-          {group.kinds?.map(kind => (
-            <KindCell
-              key={kind.id}
-              kind={kind}
-              policy={field(kind.policy)}
-              canary={field(kind.canary)}
-              formId={formId}
-            />
-          ))}
-          {group.actionPolicies && <ActionPolicies state={field('actionPolicies')} />}
-          {group.kindPolicies && (
-            <KindPolicies state={field('policyKinds')} imagePolicy={field('policyImage').value} kinds={kinds} />
-          )}
+  const nested = new Set(section.fields.map(f => f.key));
+  const rows = section.fields.filter(f => f.parent === undefined || !nested.has(f.parent));
+  const master = section.master;
+  const masterState = master && field(master.key);
+
+  if (master?.byAction) return <PauseSection section={section} spec={master} />;
+
+  // A field that inherits the master shows the master above its matrix, not in the header.
+  const matrix = master && section.fields.find(f => f.kind === 'kinds' && f.parent === master.key);
+
+  return (
+    <section
+      id={sectionId(section)}
+      aria-label={section.title}
+      className="scroll-mt-20 rounded-lg border border-border bg-surface"
+    >
+      <header className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3 border-b border-border px-4 py-4 sm:px-5">
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <h3 className="text-sm/6 font-semibold">{section.title}</h3>
+          <p className="text-xs/5 text-muted">{section.about}</p>
         </div>
-        {group.kinds && <ClientPolicies />}
-      </Card>
-    );
-  }
-
-  return (
-    <Card title={group.title} className="h-full">
-      <p className="text-xs/5 text-muted">{group.about}</p>
-      <div className="flex flex-col">
-        {group.keys.map(key => (
-          <SettingRow key={key} spec={fieldSpec(key)} state={field(key)} id={`${formId}-${key}`} />
-        ))}
-      </div>
-    </Card>
-  );
-}
-
-/**
- * ClientPolicies names the clients whose image policy is their own
- * (policyClients). It is read-only here and current: it is read from the
- * event stream, and changed on the Clients tab, client by client.
- */
-function ClientPolicies() {
-  const own = list(useLive('clients').data?.clients).filter(c => c.policySet);
-
-  return (
-    <p aria-label="Image policy per client" className="text-xs/5 text-muted">
-      Image policy per client:{' '}
-      {own.length === 0 ? (
-        'every client follows the policy for images.'
-      ) : (
-        <span className="text-foreground">{own.map(c => `${c.name} ${c.policy}`).join(', ')}.</span>
-      )}{' '}
-      It is set on the{' '}
-      <a href="#clients" className="text-accent underline">
-        Clients tab
-      </a>
-      .
-    </p>
-  );
-}
-
-/** KindChoice is a kind's own image policy, or inherit: it follows policyImage. */
-type KindChoice = Policy | 'inherit';
-
-/**
- * KindPolicies edits the image policy of each container kind (policyKinds):
- * inherit (policyImage, named), automatic or manual per kind.
- */
-function KindPolicies({
-  state,
-  imagePolicy,
-  kinds,
-}: {
-  state: FieldState;
-  imagePolicy: string;
-  kinds: readonly string[];
-}) {
-  const spec = fieldSpec('policyKinds');
-  const policies = parsePolicies(state.value) ?? {};
-  const rows = kindRows(kinds, parsePolicies(state.stored) ?? {}, policies);
-  const inherit = POLICIES.includes(imagePolicy as Policy)
-    ? POLICY_LABEL[imagePolicy as Policy].toLowerCase()
-    : imagePolicy;
-
-  const set = (kind: string, choice: KindChoice) => {
-    const next = { ...policies };
-    if (choice === 'inherit') Reflect.deleteProperty(next, kind);
-    else next[kind] = choice;
-    state.set(policiesText(next));
-  };
-
-  return (
-    <div role="group" aria-label={spec.label} className={cx(CELL, 'sm:col-span-2 xl:col-span-4')}>
-      <div className="flex min-h-6 flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="text-sm/6 font-medium whitespace-nowrap">{spec.label}</span>
-        <InfoTip label={spec.label}>
-          <InfoText spec={spec} fallback={state.fallback} />
-        </InfoTip>
-      </div>
-      <ul className="flex flex-wrap gap-x-6 gap-y-2">
-        {rows.map(kind => (
-          <li key={kind} className="flex min-w-0 flex-wrap items-center gap-x-2 gap-y-1 text-xs/5">
-            <span className="font-mono">{kind === 'other' ? 'other (unlabelled)' : kind}</span>
-            <Segmented<KindChoice>
-              label={`Image policy of the kind ${kind}`}
-              value={policies[kind] ?? 'inherit'}
-              disabled={state.disabled}
+        {master && masterState && !matrix && (
+          <div className="flex flex-col items-start gap-1 sm:items-end">
+            <PolicySwitch
+              label={master.label}
+              value={masterState.value as Policy}
+              disabled={masterState.disabled}
+              reason={masterState.reason}
               onChange={choice => {
-                set(kind, choice);
+                masterState.set(choice);
               }}
-              options={[
-                { value: 'inherit', label: `Inherit (${inherit})`, title: 'Follow Policy: images' },
-                ...POLICIES.map(p => ({ value: p, label: POLICY_LABEL[p], title: POLICY_MEANING[p] })),
-              ]}
             />
-          </li>
-        ))}
-      </ul>
-      <Mark spec={spec} state={state} what={spec.label} />
-      <Problem state={state} />
-    </div>
-  );
-}
-
-/** InfoText is what stands behind a setting's info icon: what it does, its valid range, its default. */
-function InfoText({ spec, fallback }: { spec: FieldSpec; fallback: string }) {
-  return (
-    <>
-      <span className="block">{spec.hint}</span>
-      {spec.range && <span className="mt-1 block text-muted">Valid: {spec.range}.</span>}
-      <span className="mt-1 block text-muted">
-        Default: {valueText(spec, fallback)}. Setting: <span className="font-mono">{spec.key}</span>
-      </span>
-    </>
-  );
-}
-
-/**
- * Mark is a line under a setting, only while there is something to say: that
- * the value is changed and not saved, and that it differs from the default,
- * with the default. The default is a button that puts it back.
- */
-function Mark({ spec, state, what }: { spec: FieldSpec; state: FieldState; what: string }) {
-  const isDefault = sameValue(spec, state.value, state.fallback);
-  if (!state.dirty && isDefault) return null;
-
-  return (
-    <span className="flex flex-wrap items-center justify-end gap-1.5 text-xs/5">
-      {state.dirty && <Badge tone="info">changed</Badge>}
-      {!isDefault && (
-        <button
-          type="button"
-          disabled={state.disabled}
-          aria-label={`Reset ${what} to its default`}
-          title="This is not the default. Click to put the default back."
-          onClick={() => {
-            state.set(state.fallback);
-          }}
-          className="rounded-xs px-1 text-warning hover:bg-surface-hover disabled:cursor-not-allowed"
-        >
-          default {shortValue(spec, state.fallback)}
-        </button>
+            <Mark spec={master} state={masterState} />
+            <Problem state={masterState} />
+          </div>
+        )}
+      </header>
+      <div className="flex flex-col divide-y divide-border px-4 sm:px-5">
+        {rows.map(spec => {
+          const id = `${formId}-${spec.key}`;
+          switch (spec.kind) {
+            case 'kinds': {
+              const child = section.fields.find(f => f.parent === spec.key);
+              if (!master || !masterState) return null;
+              return (
+                <ImagePolicyMatrix
+                  key={spec.key}
+                  root={{ spec: master, state: masterState }}
+                  kinds={{ spec, state: field(spec.key) }}
+                  teams={child && { spec: child, state: field(child.key) }}
+                  form={form}
+                  fleetKinds={kinds}
+                />
+              );
+            }
+            case 'actions':
+              return <ActionPolicies key={spec.key} spec={spec} state={field(spec.key)} />;
+            default:
+              return <SettingRow key={spec.key} spec={spec} state={field(spec.key)} id={id} />;
+          }
+        })}
+      </div>
+      {section.clientPolicyNote && (
+        <p className="border-t border-border px-4 py-3 text-xs/5 text-muted sm:px-5">
+          A team can also set its own policy on the{' '}
+          <a href="#clients" className="text-accent underline">
+            Clients tab
+          </a>
+          .
+        </p>
       )}
-    </span>
-  );
-}
-
-/** Problem is what is wrong with an input, under its line. It is there only while something is wrong. */
-function Problem({ state }: { state: FieldState }) {
-  if (!state.error) return null;
-
-  return (
-    <span role="alert" className="text-right text-xs/5 text-danger">
-      {state.error}
-    </span>
-  );
-}
-
-const ROW = 'flex flex-col gap-0.5 border-b border-border py-2.5 last:border-b-0 last:pb-0';
-
-/** SettingRow is one setting in one line: its label and info, the mark, its control. */
-function SettingRow({ spec, state, id }: { spec: FieldSpec; state: FieldState; id: string }) {
-  const hintId = `${id}-hint`;
-
-  return (
-    <div className={ROW}>
-      <div className="flex min-h-7 flex-wrap items-center gap-x-2 gap-y-1">
-        <label htmlFor={id} className="text-sm/6 font-medium whitespace-nowrap">
-          {spec.label}
-        </label>
-        <InfoTip label={spec.label}>
-          <InfoText spec={spec} fallback={state.fallback} />
-        </InfoTip>
-        <span id={hintId} className="sr-only">
-          {spec.hint} {spec.range ? `Valid: ${spec.range}.` : ''}
-        </span>
-        <span className="ml-auto">
-          <Control id={id} hintId={hintId} spec={spec} state={state} />
-        </span>
-      </div>
-      <Mark spec={spec} state={state} what={spec.label} />
-      <Problem state={state} />
-    </div>
-  );
-}
-
-const CELL = 'flex min-w-0 flex-col gap-2 rounded-sm border border-border bg-background p-3';
-
-/** SettingCell is one setting of a strip: its label and info above, its control below. */
-function SettingCell({ spec, state, id }: { spec: FieldSpec; state: FieldState; id: string }) {
-  const hintId = `${id}-hint`;
-
-  return (
-    <div className={CELL}>
-      <div className="flex min-h-6 flex-wrap items-center gap-x-2 gap-y-1">
-        <label htmlFor={id} className="text-sm/6 font-medium whitespace-nowrap">
-          {spec.label}
-        </label>
-        <InfoTip label={spec.label}>
-          <InfoText spec={spec} fallback={state.fallback} />
-        </InfoTip>
-        <span id={hintId} className="sr-only">
-          {spec.hint}
-        </span>
-      </div>
-      <div className="flex min-h-6 items-center gap-2 text-xs/5 text-muted">
-        <Control id={id} hintId={hintId} spec={spec} state={state} />
-        {spec.kind === 'switch' && (state.value === 'true' ? 'on: nothing new is granted' : 'off: the scheduler runs')}
-      </div>
-      <Mark spec={spec} state={state} what={spec.label} />
-      <Problem state={state} />
-    </div>
+    </section>
   );
 }
 
 /**
- * KindCell is one kind of rollout: its policy as a choice of three, and under
- * it the switch that pauses a rollout of the kind after its canary.
+ * PauseSection is the global pause: the switch above every rollout. It is
+ * the pause and resume action with its confirmation, not a field of the form,
+ * and shows the state the scheduler last planned with.
  */
-function KindCell({
-  kind,
-  policy,
-  canary,
-  formId,
-}: {
-  kind: RolloutKindSpec;
-  policy: FieldState;
-  canary: FieldState;
-  formId: string;
-}) {
-  const policySpec = fieldSpec(kind.policy);
-  const canarySpec = fieldSpec(kind.canary);
-  const canaryHint = `${formId}-${kind.canary}-hint`;
+function PauseSection({ section, spec }: { section: SectionSpec; spec: FieldSpec }) {
+  const plan = useLive('plan').data;
+  const actions = useActions();
+  const paused = plan?.paused ?? false;
 
   return (
-    <div className={CELL}>
-      <div className="flex min-h-6 flex-wrap items-center gap-x-2 gap-y-1">
-        <span className="text-sm/6 font-medium whitespace-nowrap">{kind.label}</span>
-        <InfoTip label={policySpec.label}>
-          <span className="block">
-            What the scheduler does when hosts report {kind.what}:
-            {POLICIES.map(p => (
-              <span key={p} className="block">
-                <span className="font-mono">{p}</span>: {POLICY_MEANING[p]}
+    <section
+      id={sectionId(section)}
+      aria-label={section.title}
+      className={cx(
+        'scroll-mt-20 rounded-lg border',
+        paused ? 'border-warning bg-warning-subtle' : 'border-border-strong bg-surface'
+      )}
+    >
+      {actions.notice}
+      <div className="flex flex-wrap items-center justify-between gap-x-6 gap-y-3 px-4 py-4 sm:px-5">
+        <div className="flex min-w-0 flex-col gap-0.5">
+          <div className="flex items-center gap-1.5">
+            <h3 className="text-sm/6 font-semibold">{section.title}</h3>
+            <InfoTip label={spec.label}>
+              <span className="block">{spec.hint}</span>
+              <span className="mt-1 block text-muted">
+                Setting: <span className="font-mono">{spec.key}</span>
               </span>
+            </InfoTip>
+          </div>
+          <p className="text-xs/5 text-muted">{section.about}</p>
+        </div>
+        <div className="flex items-center gap-3">
+          <span aria-label="Global pause state">
+            {paused ? <Badge tone="warning">Paused</Badge> : <Badge tone="success">Running</Badge>}
+          </span>
+          {plan &&
+            (paused ? (
+              <IntentAction
+                icon="resume"
+                label="Resume all…"
+                onAction={actions.request}
+                intent={scopeIntent('resume', 'Resume everything', '')}
+              />
+            ) : (
+              <IntentAction
+                icon="pause"
+                label="Pause all…"
+                onAction={actions.request}
+                intent={scopeIntent('pause', 'Pause everything', '')}
+              />
             ))}
-          </span>
-          <span className="mt-1 block text-muted">
-            Default: {policy.fallback}. Setting: <span className="font-mono">{kind.policy}</span>
-          </span>
-        </InfoTip>
-        <span className="ml-auto">
-          <Segmented
-            label={policySpec.label}
-            value={policy.value as Policy}
-            disabled={policy.disabled}
-            onChange={policy.set}
-            options={POLICIES.map(p => ({ value: p, label: p, title: POLICY_MEANING[p] }))}
-          />
-        </span>
+        </div>
       </div>
-      <Mark spec={policySpec} state={policy} what={policySpec.label} />
-      <div className="flex min-h-6 flex-wrap items-center gap-x-2 gap-y-1 text-xs/5 text-muted">
-        <span className="whitespace-nowrap">Pause after the canary</span>
-        <InfoTip label={canarySpec.label}>
-          <InfoText spec={canarySpec} fallback={canary.fallback} />
-        </InfoTip>
-        <span id={canaryHint} className="sr-only">
-          {canarySpec.hint}
-        </span>
-        <span className="ml-auto">
-          <Switch
-            label={canarySpec.label}
-            describedBy={canaryHint}
-            checked={canary.value === 'true'}
-            disabled={canary.disabled}
-            onChange={on => {
-              canary.set(on ? 'true' : 'false');
-            }}
-          />
-        </span>
-      </div>
-      <Mark spec={canarySpec} state={canary} what={canarySpec.label} />
-      <Problem state={policy} />
-      <Problem state={canary} />
-    </div>
+      {/* Outside the form: Enter in the dialog must not submit the settings. */}
+      {actions.dialog && createPortal(actions.dialog, document.body)}
+    </section>
   );
 }
 
-/** Control is the input of a setting, with its unit. Its width is fixed: a value that grows moves nothing. */
-function Control({ id, hintId, spec, state }: { id: string; hintId: string; spec: FieldSpec; state: FieldState }) {
+/** SettingRow is one setting in the form grid. */
+function SettingRow({ spec, state, id }: { spec: FieldSpec; state: FieldState; id: string }) {
+  const helpId = `${id}-help`;
+  const labelled = spec.kind !== 'switch' && spec.kind !== 'policy';
+
+  return (
+    <FieldRow label={<FieldLabel spec={spec} state={state} htmlFor={labelled ? id : undefined} helpId={helpId} />}>
+      <div className="flex min-h-7 items-center gap-2">
+        <Control id={id} helpId={helpId} spec={spec} state={state} />
+      </div>
+      <Mark spec={spec} state={state} />
+      <Problem state={state} />
+    </FieldRow>
+  );
+}
+
+/** Control is the input of a setting, with its unit. Inputs have one width, units one column. */
+function Control({ id, helpId, spec, state }: { id: string; helpId: string; spec: FieldSpec; state: FieldState }) {
   const invalid = state.error !== undefined;
 
   switch (spec.kind) {
     case 'actions':
     case 'kinds':
-      // The policies per host action and per kind have editors of their own.
+    case 'teams':
+      // The policies per name have editors of their own.
       return null;
     case 'switch':
       return (
-        <Switch
-          label={spec.label}
-          describedBy={hintId}
-          checked={state.value === 'true'}
-          disabled={state.disabled}
-          onChange={on => {
-            state.set(on ? 'true' : 'false');
-          }}
-        />
+        <>
+          <Switch
+            label={spec.label}
+            describedBy={helpId}
+            checked={state.value === 'true'}
+            disabled={state.disabled}
+            onChange={on => {
+              state.set(on ? 'true' : 'false');
+            }}
+          />
+          <span className="text-xs/5 text-muted">{state.value === 'true' ? 'On' : 'Off'}</span>
+        </>
       );
     case 'policy':
       return (
-        <Segmented
+        <PolicySwitch
           label={spec.label}
           value={state.value as Policy}
           disabled={state.disabled}
-          onChange={state.set}
-          options={POLICIES.map(p => ({ value: p, label: p, title: POLICY_MEANING[p] }))}
+          reason={state.reason}
+          onChange={choice => {
+            state.set(choice);
+          }}
         />
       );
     case 'duration':
       return (
-        <>
-          <input
-            id={id}
-            aria-describedby={hintId}
-            aria-invalid={invalid || undefined}
-            type="text"
-            placeholder="e.g. 30m"
-            value={state.value}
-            disabled={state.disabled}
-            onChange={e => {
-              state.set(e.target.value);
-            }}
-            className={cx(INPUT_CLASS, 'w-24 text-right font-mono', invalid && 'border-danger')}
-          />
-          {/* The place of a unit, so the inputs of a card line up. */}
-          <span className="w-16" />
-        </>
+        <input
+          id={id}
+          aria-describedby={helpId}
+          aria-invalid={invalid || undefined}
+          type="text"
+          placeholder="e.g. 30m"
+          value={state.value}
+          disabled={state.disabled}
+          onChange={e => {
+            state.set(e.target.value);
+          }}
+          className={cx(INPUT_CLASS, 'w-28 text-right font-mono max-sm:h-10', invalid && 'border-danger')}
+        />
       );
     case 'percent':
     case 'share':
@@ -654,7 +507,7 @@ function Control({ id, hintId, spec, state }: { id: string; hintId: string; spec
         <>
           <input
             id={id}
-            aria-describedby={hintId}
+            aria-describedby={helpId}
             aria-invalid={invalid || undefined}
             type="number"
             inputMode="decimal"
@@ -666,9 +519,9 @@ function Control({ id, hintId, spec, state }: { id: string; hintId: string; spec
             onChange={e => {
               state.set(e.target.value);
             }}
-            className={cx(INPUT_CLASS, 'w-24 text-right font-mono', invalid && 'border-danger')}
+            className={cx(INPUT_CLASS, 'w-28 text-right font-mono max-sm:h-10', invalid && 'border-danger')}
           />
-          {spec.unit && <span className="w-16 text-xs/5 text-muted">{spec.unit}</span>}
+          {spec.unit && <span className="text-xs/5 text-muted">{spec.unit}</span>}
         </>
       );
   }

@@ -236,12 +236,15 @@ func (s *Handler) refreshImages() views.ImagesRefresh {
 	return views.NewImagesRefresh(done.Tags, done.Recent, sources, done.Next, discovery.RefreshFloor)
 }
 
-// handlePackages serves GET /api/v1/packages?q=<part of a name>&limit=&after=:
-// one page of the packages installed across the fleet, one entry per name
-// with its versions and the hosts on each. Without q it lists every package
-// in alphabetical order; with q the names that contain it, the best match
-// first. "after" is the "next" of the page before. It needs the plain
-// feature details.
+// handlePackages serves GET /api/v1/packages?q=<part of a name>&limit=&after=
+// &show=&sort=&compact=: one page of the packages installed across the fleet,
+// one entry per name with its versions, the hosts on each and the upgrades
+// apt offers them. Without q it lists every package in alphabetical order;
+// with q the names that contain it, the best match first. show narrows to
+// the names that differ, are outdated or have a security upgrade; sort puts
+// the most versions, hosts or outdated hosts first; compact leaves out the
+// hosts of each name's most common version and of its upgrades. "after" is
+// the "next" of the page before. It needs the plain feature details.
 func (s *Handler) handlePackages(w http.ResponseWriter, r *http.Request, u *authz.User) {
 	if _, ok := s.authz.Allow(w, r, u, &authz.Requirement{Feature: authz.FeatureDetails}); !ok {
 		return
@@ -264,9 +267,23 @@ func (s *Handler) handlePackages(w http.ResponseWriter, r *http.Request, u *auth
 		return
 	}
 
-	page, err := s.opts.Store.ListPackages(r.Context(), store.PackageFilter{
-		Query: query, After: after, Limit: limit,
-	})
+	filter := store.PackageFilter{
+		Query:   query,
+		After:   after,
+		Limit:   limit,
+		Show:    store.PackageShow(r.URL.Query().Get("show")),
+		Sort:    store.PackageSort(r.URL.Query().Get("sort")),
+		Compact: r.URL.Query().Get("compact") == "1",
+	}
+
+	if !validPackageFilter(&filter) {
+		httpjson.Error(s.log, w, http.StatusBadRequest,
+			"show must be differing, outdated or security; sort must be versions, hosts or outdated")
+
+		return
+	}
+
+	page, err := s.opts.Store.ListPackages(r.Context(), &filter)
 
 	switch {
 	case errors.Is(err, store.ErrBadCursor):
@@ -279,12 +296,28 @@ func (s *Handler) handlePackages(w http.ResponseWriter, r *http.Request, u *auth
 		return
 	}
 
-	out := views.Packages{Query: query, Matches: views.NonNil(page.Matches), Next: page.Next}
+	out := views.Packages{Query: query, Matches: views.NonNil(page.Matches), Counts: page.Counts, Next: page.Next}
 	if page.Total >= 0 {
 		out.Total = &page.Total
 	}
 
 	httpjson.Write(s.log, w, http.StatusOK, out)
+}
+
+// validPackageFilter reports whether the show and the sort are known.
+func validPackageFilter(filter *store.PackageFilter) bool {
+	switch filter.Show {
+	case store.PackageShowAll, store.PackageShowDiffering, store.PackageShowOutdated, store.PackageShowSecurity:
+	default:
+		return false
+	}
+
+	switch filter.Sort {
+	case store.PackageSortName, store.PackageSortVersions, store.PackageSortHosts, store.PackageSortOutdated:
+		return true
+	default:
+		return false
+	}
 }
 
 // handleRollouts serves GET /api/v1/rollouts.

@@ -65,6 +65,12 @@ type Tracker interface {
 	// Refresh asks for a lookup now of every followed tag whose newest one
 	// is older than RefreshFloor, and says how many that are.
 	Refresh() Refreshed
+	// RefreshTag asks for a lookup now of one followed tag, unless its newest
+	// lookup began after since. It reports whether the tag is followed.
+	RefreshTag(ref string, since time.Time) bool
+	// LookedUp returns the newest lookup of a followed tag; false when the
+	// tag is not followed.
+	LookedUp(ref string) (Lookup, bool)
 	// Tags lists the followed tags with the digest each points at, ordered
 	// by reference.
 	Tags() []Tag
@@ -75,6 +81,14 @@ type Tracker interface {
 type Tag struct {
 	Ref    string
 	Digest string
+}
+
+// Lookup is the newest lookup of a tag: the digest of the newest good one,
+// and when the newest one began and what failed in it.
+type Lookup struct {
+	Digest  string
+	Started time.Time
+	Error   string
 }
 
 // RefreshFloor is the age below which Refresh leaves a lookup alone.
@@ -95,15 +109,17 @@ type Refreshed struct {
 type tag struct {
 	// ref is the reference as the first host wrote it.
 	ref string
-	// digest is the newest good lookup; checkedAt and err are of the newest
-	// lookup, good or not.
+	// digest is the newest good lookup; startedAt, checkedAt and err are of
+	// the newest lookup, good or not.
 	digest    string
+	startedAt time.Time
 	checkedAt time.Time
 	err       string
 	// hosts are the hosts that follow the tag, with when they last said so.
 	hosts map[string]time.Time
-	// refresh: a lookup was asked for, whatever the interval says.
-	refresh bool
+	// refreshAt is when a lookup was asked for, whatever the interval says;
+	// zero when none is. A lookup that began before it does not answer it.
+	refreshAt time.Time
 }
 
 type tracker struct {
@@ -242,10 +258,7 @@ func (t *tracker) Sync(host string, tags []string, interval time.Duration) []pro
 	}
 
 	if added || changed {
-		select {
-		case t.wake <- struct{}{}:
-		default:
-		}
+		t.signal()
 	}
 
 	return out
@@ -276,8 +289,9 @@ func (t *tracker) Refresh() Refreshed {
 	var out Refreshed
 
 	for _, tg := range t.tags {
-		if tg.refresh || now.Sub(tg.checkedAt) >= refreshFloor {
-			tg.refresh = true
+		if !tg.refreshAt.IsZero() || now.Sub(tg.checkedAt) >= refreshFloor {
+			tg.ask(now)
+
 			out.Tags++
 
 			continue
@@ -291,13 +305,73 @@ func (t *tracker) Refresh() Refreshed {
 	}
 
 	if out.Tags > 0 {
-		select {
-		case t.wake <- struct{}{}:
-		default:
-		}
+		t.signal()
 	}
 
 	return out
+}
+
+// RefreshTag implements Tracker.
+func (t *tracker) RefreshTag(ref string, since time.Time) bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	tg := t.tag(ref)
+	if tg == nil {
+		return false
+	}
+
+	if !tg.startedAt.After(since) {
+		tg.ask(t.now())
+		t.signal()
+	}
+
+	return true
+}
+
+// LookedUp implements Tracker.
+func (t *tracker) LookedUp(ref string) (Lookup, bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	tg := t.tag(ref)
+	if tg == nil {
+		return Lookup{}, false
+	}
+
+	return Lookup{Digest: tg.digest, Started: tg.startedAt, Error: tg.err}, true
+}
+
+// tag returns the followed tag of a reference, or nil. The caller holds t.mu.
+func (t *tracker) tag(ref string) *tag {
+	parsed, err := imageref.Parse(ref)
+	if err != nil {
+		return nil
+	}
+
+	return t.tags[parsed.String()]
+}
+
+// ask asks for a lookup of the tag that begins at now or later. The caller
+// holds t.mu.
+func (tg *tag) ask(now time.Time) {
+	tg.refreshAt = later(tg.refreshAt, now)
+}
+
+func later(a, b time.Time) time.Time {
+	if b.After(a) {
+		return b
+	}
+
+	return a
+}
+
+// signal wakes the goroutine without blocking.
+func (t *tracker) signal() {
+	select {
+	case t.wake <- struct{}{}:
+	default:
+	}
 }
 
 // run looks the due tags up, one at a time, until ctx ends.
@@ -364,7 +438,7 @@ func (t *tracker) nextDue() (string, time.Duration) {
 			left = tg.checkedAt.Add(t.pause(tg)).Sub(now)
 		}
 
-		if tg.refresh {
+		if !tg.refreshAt.IsZero() {
 			left = min(left, 0)
 		}
 
@@ -400,7 +474,7 @@ func (t *tracker) lookup(ctx context.Context, key string) {
 		return
 	}
 
-	ref := tg.ref
+	ref, started := tg.ref, t.now()
 
 	t.mu.Unlock()
 
@@ -425,7 +499,11 @@ func (t *tracker) lookup(ctx context.Context, key string) {
 	}
 
 	log := t.log.WithField("image", ref)
-	tg.checkedAt, tg.refresh = t.now(), false
+	tg.startedAt, tg.checkedAt = started, t.now()
+
+	if !tg.refreshAt.After(started) {
+		tg.refreshAt = time.Time{}
+	}
 
 	if err != nil {
 		msg := err.Error()

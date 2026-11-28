@@ -136,7 +136,8 @@ func needFlagOverride(req *scheduler.FlagOverrideRequest) authz.Requirement {
 }
 
 // needClientPolicy: manage, or team_manage for a client whose reported
-// containers are all owned by a team of the token.
+// containers are all owned by a team of the token; per kind, a team sets
+// only its own entries.
 func needClientPolicy(req *scheduler.ClientPolicyRequest) authz.Requirement {
 	return authz.Requirement{Feature: authz.FeatureManage, Team: &authz.Targets{Client: req.Client}}
 }
@@ -368,6 +369,10 @@ func validateFlagOverride(req *scheduler.FlagOverrideRequest) error {
 func validateClientPolicy(req *scheduler.ClientPolicyRequest) error {
 	if !protocol.ValidClient(req.Client) {
 		return httpjson.BadRequestf("invalid client name %q", req.Client)
+	}
+
+	if !protocol.ValidKind(protocol.ContainerKind(req.Kind)) || req.Kind == string(protocol.KindNone) {
+		return httpjson.BadRequestf("invalid kind %q (other for unlabelled containers)", req.Kind)
 	}
 
 	switch req.Policy {

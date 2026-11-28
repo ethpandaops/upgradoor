@@ -21,6 +21,8 @@ type Lookups struct {
 	// Refreshed counts the calls of Refresh, which answers Refreshable.
 	Refreshed   int
 	Refreshable discovery.Refreshed
+	// RefreshedTags lists the references of the calls of RefreshTag.
+	RefreshedTags []string
 }
 
 // Start does nothing.
@@ -59,6 +61,27 @@ func (f *Lookups) Refresh() discovery.Refreshed {
 	f.Refreshed++
 
 	return f.Refreshable
+}
+
+// RefreshTag records the call; a tag is followed when Digests has it.
+func (f *Lookups) RefreshTag(ref string, _ time.Time) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.RefreshedTags = append(f.RefreshedTags, ref)
+	_, ok := f.Digests[ref]
+
+	return ok
+}
+
+// LookedUp answers from Digests, with CheckedAt as the start of the lookup.
+func (f *Lookups) LookedUp(ref string) (discovery.Lookup, bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	d, ok := f.Digests[ref]
+
+	return discovery.Lookup{Digest: d.Digest, Started: d.CheckedAt, Error: d.Error}, ok
 }
 
 // Tags lists Digests.

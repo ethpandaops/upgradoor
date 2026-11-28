@@ -256,3 +256,27 @@ describe('LeaseTable, a host action', () => {
     expect(within(row('host-restarted')).queryByText(/^exit/)).toBeNull();
   });
 });
+
+describe('LeaseTable, times', () => {
+  it('shows an ended lease with local timestamps, and an open one relative to now', async () => {
+    const granted = new Date(2026, 10, 28, 0, 59, 3).toISOString();
+    const ended = new Date(2026, 10, 28, 1, 4, 25).toISOString();
+    const h = await createHarness({ mode: 'open' });
+    const { unmount } = renderWithApp(
+      <LeaseTable
+        label="Recent leases"
+        closed
+        leases={[lease('host-done', 'released', { grantedAt: granted, endedAt: ended })]}
+      />,
+      h
+    );
+
+    expect(within(row('host-done')).getByText('2026-11-28 00:59:03')).toHaveAttribute('datetime', granted);
+    expect(within(row('host-done')).getByText('2026-11-28 01:04:25')).toHaveAttribute('datetime', ended);
+    expect(row('host-done')).not.toHaveTextContent(/ago/);
+    unmount();
+
+    renderWithApp(<LeaseTable label="Active leases" leases={[lease('host-open', 'running')]} />, h);
+    expect(row('host-open')).toHaveTextContent(/ago/);
+  });
+});

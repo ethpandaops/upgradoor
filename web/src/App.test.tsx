@@ -84,7 +84,7 @@ describe('App in public mode (auth configured, logged out)', () => {
     expect(userCalls().every(c => c.authorization === 'Bearer mock-token')).toBe(true);
 
     await user.click(screen.getByRole('tab', { name: 'Rollouts' }));
-    expect(await screen.findByRole('heading', { name: /Open rollouts \(5\)/ })).toBeInTheDocument();
+    expect(await screen.findByRole('tab', { name: 'Open rollouts 5' })).toHaveAttribute('aria-selected', 'true');
 
     // The login ends while a private tab is shown: the overview, and no error.
     await user.click(screen.getByRole('button', { name: 'Logout' }));
@@ -193,6 +193,20 @@ describe('App in open mode (no auth provider)', () => {
 
     await user.keyboard('{End}');
     expect(window.location.hash).toBe('#audit');
+  });
+
+  it('opens the Rollouts tab at the list a link names', async () => {
+    window.location.hash = '#rollouts/leases/recent';
+    const { user } = boot({ auth: false });
+
+    expect(await screen.findByRole('table', { name: 'Recent leases' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'Rollouts' })).toHaveAttribute('aria-selected', 'true');
+    expect(screen.getByRole('tab', { name: /^Leases \d+$/ })).toHaveAttribute('aria-selected', 'true');
+    expect(window.location.hash).toBe('#rollouts/leases/recent');
+
+    await user.click(screen.getByRole('tab', { name: /^Finished rollouts/ }));
+    expect(window.location.hash).toBe('#rollouts/finished');
+    expect(screen.getByRole('tab', { name: 'Rollouts' })).toHaveAttribute('aria-selected', 'true');
   });
 
   it('switches and persists the theme', async () => {

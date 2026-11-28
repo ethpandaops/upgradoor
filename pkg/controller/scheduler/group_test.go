@@ -90,7 +90,7 @@ func TestKindsRideAlongInOneLease(t *testing.T) {
 // others to policyImage.
 func TestRolloutPerTeamAndKind(t *testing.T) {
 	b := newWorldBuilder(t)
-	b.w.Settings.PolicyClients = fleet.ClientPolicies{"geth": fleet.PolicyManual}
+	b.w.Settings.PolicyClients = fleet.ClientPolicies{"el": {"geth": fleet.PolicyManual}}
 
 	b.host("a", 10)
 	b.host("b", 10)

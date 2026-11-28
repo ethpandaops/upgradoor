@@ -17,48 +17,57 @@ async function openSettings() {
 
 /** rowOf is the line of a setting: its control and the note below it. */
 function rowOf(form: HTMLElement, label: string): HTMLElement {
-  const row = within(form).getByLabelText(label).closest('div.border-b, div.border');
+  const row = within(form).getByLabelText(label).closest('[data-setting]');
   if (!(row instanceof HTMLElement)) throw new Error(`no row for ${label}`);
   return row;
 }
 
-const group = (name: string) => screen.getByRole('region', { name });
+const section = (name: string) => screen.getByRole('region', { name });
 const policy = (form: HTMLElement, label: string) =>
   within(within(form).getByRole('group', { name: label })).getByRole('button', { pressed: true });
 
 describe('SettingsTab', () => {
-  it('shows the stored settings in groups, with the unit at the control', async () => {
+  it('shows the stored settings in sections, with the unit at the control', async () => {
     const { form, h } = await openSettings();
 
-    expect(within(group('Budget and network gate')).getByLabelText('Max unavailable')).toHaveValue(10);
-    expect(group('Budget and network gate')).toHaveTextContent('%');
-    expect(within(group('Budget and network gate')).getByLabelText('Min participation')).toHaveValue(90);
-    expect(within(group('Budget and network gate')).getByLabelText('Max finality lag')).toHaveValue(3);
+    expect(within(section('Budget')).getByLabelText('Max unavailable')).toHaveValue(10);
+    expect(section('Budget')).toHaveTextContent('%');
+    expect(within(section('Network gate')).getByLabelText('Min participation')).toHaveValue(90);
+    expect(within(section('Network gate')).getByLabelText('Max finality lag')).toHaveValue(3);
     expect(rowOf(form, 'Max finality lag')).toHaveTextContent('epochs');
+    expect(rowOf(form, 'Max finality lag')).toHaveTextContent('No new lease while finality lags more than this.');
 
-    const readiness = group('Readiness after an operation');
+    const readiness = section('Readiness after an operation');
     expect(within(readiness).getByLabelText('Ready attestations')).toHaveValue(2);
     expect(rowOf(form, 'Ready attestations')).toHaveTextContent('slots');
     expect(within(readiness).getByLabelText('Ready stable for')).toHaveValue('1m');
     expect(within(readiness).getByLabelText('Min peers')).toHaveValue(3);
-    expect(within(group('Timeouts')).getByLabelText('Readiness timeout')).toHaveValue('30m');
+    expect(within(section('Timeouts')).getByLabelText('Readiness timeout')).toHaveValue('30m');
     // Off by default; the fixture has it on at a quarter, which the line says.
     expect(within(readiness).getByLabelText('Ready peer share')).toHaveValue(0.25);
     expect(rowOf(form, 'Ready peer share')).toHaveTextContent('default 0');
     expect(rowOf(form, 'Ready peer share')).toHaveTextContent('× median');
     expect(rowOf(form, 'Ready attestations')).not.toHaveTextContent('default');
 
-    expect(within(group('Timeouts')).getByLabelText('Lease TTL')).toHaveValue('30m');
-    expect(within(group('Timeouts')).getByLabelText('Host stale after')).toHaveValue('2m');
+    expect(within(section('Timeouts')).getByLabelText('Lease TTL')).toHaveValue('30m');
+    expect(within(section('Timeouts')).getByLabelText('Host stale after')).toHaveValue('2m');
 
-    // A kind of rollout is one line: its policy as a choice, the canary switch next to it.
-    const policies = group('Scheduler');
-    expect(policy(form, 'Policy: images')).toHaveTextContent('auto');
-    expect(policy(form, 'Policy: reboots')).toHaveTextContent('manual');
-    expect(within(policies).getByRole('switch', { name: 'Pause after canary: images' })).toBeChecked();
-    expect(within(policies).getByRole('switch', { name: 'Pause after canary: packages' })).not.toBeChecked();
+    // A kind of rollout is a section: its policy in the header (for images above its matrix), its canary switch inside.
+    const images = section('Image rollouts');
+    expect(within(images).queryByRole('banner')).not.toHaveTextContent('Auto');
+    expect(policy(form, 'Policy: images')).toHaveTextContent('Auto');
+    expect(
+      within(within(section('Reboots')).getByRole('banner')).getByRole('group', { name: 'Policy: reboots' })
+    ).toBeInTheDocument();
+    expect(policy(form, 'Policy: reboots')).toHaveTextContent('Manual');
+    expect(within(images).getByRole('switch', { name: 'Pause after canary: images' })).toBeChecked();
+    expect(
+      within(section('Package upgrades')).getByRole('switch', { name: 'Pause after canary: packages' })
+    ).not.toBeChecked();
+    expect(within(section('Image rollouts')).getByLabelText('Lookup interval')).toHaveValue('5m');
 
-    expect(within(group('Scheduler')).getByRole('switch', { name: 'Global pause' })).not.toBeChecked();
+    expect(within(section('Pause all')).getByLabelText('Global pause state')).toHaveTextContent('Running');
+    expect(within(form).queryByRole('switch', { name: 'Global pause' })).not.toBeInTheDocument();
 
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
     expect(within(form).getByRole('status')).toHaveTextContent('No unsaved changes.');
@@ -66,7 +75,7 @@ describe('SettingsTab', () => {
     expect(h.calls.filter(c => c.method === 'PUT')).toEqual([]);
   });
 
-  it('states the deployment window, edits its length and arms it while it is open', async () => {
+  it('states the deployment window and arms it while it is open; its length is no setting', async () => {
     const h = await createHarness({ mode: 'auth', loggedIn: true, fleet: 'quiet' });
     renderWithApp(<SettingsTab />, h);
     const user = userEvent.setup();
@@ -75,7 +84,7 @@ describe('SettingsTab', () => {
     const state = within(card).getByLabelText('Deployment window state');
     expect(state).toHaveTextContent(/^Open until /);
     const form = await screen.findByRole('form', { name: 'Settings' });
-    expect(within(form).getByLabelText('Deployment window')).toHaveValue('24h');
+    expect(within(form).queryByLabelText('Deployment window')).not.toBeInTheDocument();
 
     await user.click(within(card).getByRole('button', { name: 'Arm now…' }));
     const dialog = screen.getByRole('dialog');
@@ -88,32 +97,38 @@ describe('SettingsTab', () => {
     expect(h.calls.filter(c => c.method === 'POST').map(c => c.path)).toEqual(['/api/v1/actions/arm-deploy-window']);
   });
 
-  it('offers a policy per kind of the fleet and other, and saves the whole map', async () => {
-    const { form, h, user } = await openSettings();
+  it('has a column per kind a team runs, the other kinds below, each inheriting the image policy', async () => {
+    const { h, user } = await openSettings();
 
-    const kinds = within(form).getByRole('group', { name: 'Policy per kind' });
-    const rows = within(kinds)
-      .getAllByRole('listitem')
-      .map(li => li.firstChild?.textContent);
-    expect(rows).toEqual([...list((await h.api.settings()).kinds), 'other (unlabelled)']);
-    expect(rows).toContain('snooper-el');
-    expect(within(group('Images')).getByRole('group', { name: 'Image policy of the kind cl' })).toHaveTextContent(
-      'Inherit (automatic)'
-    );
-    expect(policy(form, 'Image policy of the kind cl')).toHaveTextContent('Inherit (automatic)');
+    const matrix = within(section('Image rollouts')).getByRole('table', { name: 'Image policies per kind and team' });
+    const columns = within(matrix)
+      .getAllByRole('columnheader')
+      .map(th => th.textContent);
+    expect(columns).toEqual(['Team', 'el', 'cl', 'vc']);
+    const alone = within(section('Image rollouts'))
+      .getByRole('list', { name: 'Kinds without teams' })
+      .querySelectorAll('li');
+    expect([...alone].map(li => li.getAttribute('aria-label'))).toEqual(['Kind snooper-el', 'Kind other']);
+    expect(list((await h.api.settings()).kinds)).toContain('snooper-el');
 
-    await user.click(
-      within(within(kinds).getByRole('group', { name: 'Image policy of the kind cl' })).getByRole('button', {
-        name: 'Manual',
-      })
+    // An inheriting cell names the value it follows, and its tooltip the chain.
+    const cl = within(matrix).getByRole('combobox', { name: 'Image policy of the kind cl' });
+    expect(cl).toHaveValue('inherit');
+    expect(cl).toHaveDisplayValue('Inherit · auto');
+    expect(cl).toHaveAttribute('title', 'inherits all images: auto');
+
+    await user.selectOptions(cl, 'manual');
+    await user.selectOptions(
+      within(section('Image rollouts')).getByRole('combobox', { name: 'Image policy of the kind other' }),
+      'auto'
     );
-    await user.click(
-      within(within(kinds).getByRole('group', { name: 'Image policy of the kind other' })).getByRole('button', {
-        name: 'Automatic',
-      })
+    const images = section('Image rollouts');
+    expect(images).toHaveTextContent('Kind policieschangedreset to default');
+    expect(within(images).getByRole('button', { name: 'Reset Kind policies to its default' })).toHaveAttribute(
+      'title',
+      'Default: every kind inherits'
     );
-    expect(kinds).toHaveTextContent('changed');
-    expect(kinds).toHaveTextContent('default every kind inherits');
+    expect(cl).toHaveAttribute('title', 'own policy: manual');
 
     await user.click(screen.getByRole('button', { name: 'Save' }));
     await waitFor(() => {
@@ -128,9 +143,83 @@ describe('SettingsTab', () => {
         'No unsaved changes.'
       );
     });
-    expect(policy(screen.getByRole('form', { name: 'Settings' }), 'Image policy of the kind cl')).toHaveTextContent(
-      'Manual'
+    expect(
+      within(screen.getByRole('form', { name: 'Settings' })).getByRole('combobox', {
+        name: 'Image policy of the kind cl',
+      })
+    ).toHaveValue('manual');
+  });
+
+  it('has a row per team with a cell for each kind it runs, inheriting that kind or with its own', async () => {
+    const { h, user } = await openSettings();
+
+    const matrix = within(section('Image rollouts')).getByRole('table', { name: 'Image policies per kind and team' });
+    const cell = (team: string, kind: string) =>
+      within(matrix).getByRole('combobox', { name: `Image policy of the team ${team} for ${kind}` });
+
+    // lighthouse runs cl and vc: one row, two cells, no el cell.
+    const lighthouse = within(matrix).getByRole('row', { name: 'Team lighthouse' });
+    expect(within(lighthouse).getAllByRole('combobox')).toHaveLength(2);
+    expect(within(lighthouse).getByLabelText('lighthouse runs no el')).toBeInTheDocument();
+    expect(cell('lighthouse', 'cl')).toHaveAttribute('title', 'inherits cl: auto');
+
+    // The kind is manual: its teams that inherit follow it, the image policy stays auto.
+    await user.selectOptions(within(matrix).getByRole('combobox', { name: 'Image policy of the kind cl' }), 'manual');
+    expect(cell('lighthouse', 'cl')).toHaveDisplayValue('Inherit · manual');
+    expect(cell('lighthouse', 'cl')).toHaveAttribute('title', 'inherits cl: manual');
+    expect(cell('lighthouse', 'vc')).toHaveDisplayValue('Inherit · auto');
+
+    // A team's own policy is for one kind.
+    await user.selectOptions(cell('lighthouse', 'cl'), 'auto');
+    expect(cell('lighthouse', 'cl')).toHaveValue('auto');
+    expect(cell('lighthouse', 'vc')).toHaveValue('inherit');
+
+    // besu has its own el policy in the fixture: back to inherit removes it.
+    expect(cell('besu', 'el')).toHaveValue('manual');
+    await user.selectOptions(cell('besu', 'el'), 'inherit');
+
+    await user.click(screen.getByRole('button', { name: 'Save 2 changes' }));
+    await waitFor(() => {
+      expect(h.calls.filter(c => c.method === 'PUT')).toHaveLength(1);
+    });
+    expect(h.calls.find(c => c.method === 'PUT')?.body).toStrictEqual({
+      policyKinds: { cl: 'manual' },
+      policyClients: { cl: { lighthouse: 'auto' } },
+    });
+  });
+
+  it('makes a kind a column once a team has a policy for it', async () => {
+    const h = await createHarness({ mode: 'auth', loggedIn: true });
+    await h.api.putSettings({ policyClients: { 'snooper-el': { tools: 'manual' } } });
+    renderWithApp(<SettingsTab />, h);
+    await screen.findByRole('form', { name: 'Settings' });
+
+    const matrix = within(section('Image rollouts')).getByRole('table', { name: 'Image policies per kind and team' });
+    expect(
+      within(matrix)
+        .getAllByRole('columnheader')
+        .map(th => th.textContent)
+    ).toEqual(['Team', 'el', 'cl', 'vc', 'snooper-el']);
+    expect(within(matrix).getByRole('combobox', { name: 'Image policy of the team tools for snooper-el' })).toHaveValue(
+      'manual'
     );
+    expect(within(section('Image rollouts')).getByRole('listitem', { name: 'Kind other' })).toBeInTheDocument();
+  });
+
+  it('pauses everything with the pause action, apart from the form', async () => {
+    const { form, h, user } = await openSettings();
+
+    const pause = section('Pause all');
+    await user.click(within(pause).getByRole('button', { name: 'Pause all…' }));
+    await user.click(within(screen.getByRole('dialog')).getByRole('button', PRIMARY));
+
+    await waitFor(() => {
+      expect(within(pause).getByLabelText('Global pause state')).toHaveTextContent('Paused');
+    });
+    expect(within(pause).getByRole('button', { name: 'Resume all…' })).toBeInTheDocument();
+    expect(h.calls.filter(c => c.method === 'POST').map(c => c.path)).toEqual(['/api/v1/actions/pause']);
+    expect(within(form).getByText('No unsaved changes.')).toBeInTheDocument();
+    expect(h.calls.filter(c => c.method === 'PUT')).toEqual([]);
   });
 
   it('keeps the long description behind the info icon', async () => {
@@ -167,25 +256,18 @@ describe('SettingsTab', () => {
     await user.clear(ttl);
     await user.type(ttl, '45m');
     await user.click(
-      within(within(form).getByRole('group', { name: 'Policy: packages' })).getByRole('button', { name: 'manual' })
+      within(within(form).getByRole('group', { name: 'Policy: packages' })).getByRole('button', { name: 'Manual' })
     );
-    await user.click(within(form).getByRole('switch', { name: 'Global pause' }));
-
     expect(within(rowOf(form, 'Max unavailable')).getByText('changed')).toBeInTheDocument();
     expect(within(rowOf(form, 'Ready attestations')).queryByText('changed')).not.toBeInTheDocument();
-    expect(within(form).getByRole('status')).toHaveTextContent('4 unsaved changes');
+    expect(within(form).getByRole('status')).toHaveTextContent('3 unsaved changes');
 
     const changes = within(screen.getByRole('list', { name: 'Changes to save' }))
       .getAllByRole('listitem')
       .map(li => li.textContent);
-    expect(changes).toEqual([
-      'Global pause off → on',
-      'Max unavailable 10 % → 12.5 %',
-      'Lease TTL 30m → 45m',
-      'Policy: packages auto → manual',
-    ]);
+    expect(changes).toEqual(['Policy: packages auto → manual', 'Max unavailable 10 % → 12.5 %', 'Lease TTL 30m → 45m']);
 
-    await user.click(screen.getByRole('button', { name: 'Save 4 changes' }));
+    await user.click(screen.getByRole('button', { name: 'Save 3 changes' }));
 
     await waitFor(() => {
       expect(h.calls.filter(c => c.method === 'PUT')).toHaveLength(1);
@@ -194,7 +276,6 @@ describe('SettingsTab', () => {
     expect(put?.path).toBe('/api/v1/settings');
     expect(put?.authorization).toBe('Bearer mock-token');
     expect(put?.body).toStrictEqual({
-      paused: true,
       maxUnavailablePercent: 12.5,
       leaseTtl: '45m',
       policyPackages: 'manual',
@@ -209,14 +290,12 @@ describe('SettingsTab', () => {
     const saved = screen.getByRole('form', { name: 'Settings' });
     expect(within(saved).getByLabelText('Max unavailable')).toHaveValue(12.5);
     expect(within(saved).getByLabelText('Lease TTL')).toHaveValue('45m');
-    expect(within(saved).getByRole('switch', { name: 'Global pause' })).toBeChecked();
     expect(screen.getByRole('button', { name: 'Save' })).toBeDisabled();
 
     // The controller stored it, kept what was not named, and audited the change.
     expect((await h.api.settings()).settings).toMatchObject({
       maxUnavailablePercent: 12.5,
       leaseTtl: '45m',
-      paused: true,
       readyPeerShare: 0.25,
     });
     const audit = await h.api.audit({ action: 'settings.' });

@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { Fragment, useId, useMemo, useRef, type KeyboardEvent, type ReactNode } from 'react';
 
 import {
   list,
@@ -19,20 +19,8 @@ import { ActionIcon } from '../components/icons';
 import { Readiness } from '../components/Readiness';
 import { IntentAction } from '../components/SelectionBar';
 import { PullNote } from '../components/PullNote';
-import { RelTime } from '../components/RelTime';
-import {
-  Badge,
-  Dash,
-  Empty,
-  ErrorBanner,
-  Loading,
-  Section,
-  Segmented,
-  Table,
-  Td,
-  Th,
-  cx,
-} from '../components/primitives';
+import { RelTime, Timestamp } from '../components/RelTime';
+import { Badge, Dash, Empty, ErrorBanner, Loading, Segmented, Table, Td, Th, cx } from '../components/primitives';
 import {
   HostStateBadge,
   memberStateLabel,
@@ -48,6 +36,7 @@ import {
   waitReasons,
   waitsForApproval,
 } from '../lib/approvals';
+import { useHashSub } from '../hooks/useHashTab';
 import { rolloutActionOf } from '../lib/hostActions';
 import {
   approveIntent,
@@ -58,6 +47,17 @@ import {
   ignoreGateIntent,
   scopeIntent,
 } from '../lib/intents';
+import {
+  finishedSummary,
+  leaseSummary,
+  openSummary,
+  placeOf,
+  rolloutsPlace,
+  type FinishedSummary,
+  type LeaseSummary,
+  type OpenSummary,
+  type RolloutsView,
+} from '../lib/rolloutsView';
 
 const collator = new Intl.Collator(undefined, { numeric: true, sensitivity: 'base' });
 
@@ -102,11 +102,15 @@ export function useRolloutData() {
 
 /**
  * RolloutsTab shows the work in detail: every open rollout with the state and
- * waiting reason of each of its hosts, the leases, and what has finished.
+ * waiting reason of each of its hosts, the leases, and what has finished. One
+ * list at a time, chosen by its tab and kept in the URL hash
+ * (#rollouts, #rollouts/leases, #rollouts/leases/recent, #rollouts/finished).
  * The Overview tab has the summary: timeline, in progress, up next.
  */
 export function RolloutsTab() {
-  const [leaseView, setLeaseView] = useState<'active' | 'recent'>('active');
+  const [sub, setSub] = useHashSub('rollouts');
+  const place = rolloutsPlace(sub);
+  const ids = useId();
 
   const { rollouts, plan, queue, leases } = useRolloutData();
   const actions = useActions();
@@ -118,15 +122,14 @@ export function RolloutsTab() {
   const openLeases = list(rollouts.data?.leases);
   const recentLeases = list(rollouts.data?.recentLeases);
 
-  return (
-    <div className="mx-auto flex w-full max-w-screen-2xl flex-col gap-6">
-      {rollouts.error !== undefined && <ErrorBanner error={rollouts.error} what="the rollouts" />}
-      {actions.notice}
+  const tabId = (v: RolloutsView) => `${ids}-tab-${v}`;
+  const panelId = `${ids}-panel`;
 
-      {plan.data && <PlanBar plan={plan.data} onAction={actions.request} />}
-
-      <Section title={`Open rollouts (${open.length})`}>
-        {open.length === 0 ? (
+  let panel: ReactNode;
+  switch (place.view) {
+    case 'open':
+      panel =
+        open.length === 0 ? (
           <Empty>Nothing is rolling out. A rollout opens when a host reports a need.</Empty>
         ) : (
           <div className="flex flex-col gap-3">
@@ -134,71 +137,318 @@ export function RolloutsTab() {
               <RolloutCard key={r.id} rollout={r} queue={queue} leases={leases} onAction={actions.request} />
             ))}
           </div>
-        )}
-      </Section>
-
-      <Section
-        title="Leases"
-        aside={
-          <Segmented
-            label="Leases shown"
-            value={leaseView}
-            onChange={setLeaseView}
-            options={[
-              { value: 'active', label: `Active (${openLeases.length})` },
-              { value: 'recent', label: `Recent (${recentLeases.length})` },
-            ]}
-          />
-        }
-      >
-        {leaseView === 'active' ? (
-          openLeases.length === 0 ? (
-            <Empty>No host holds a lease.</Empty>
-          ) : (
-            <LeaseTable
-              leases={openLeases}
-              label="Active leases"
-              onEnd={l => {
-                actions.request(endLeaseIntent(l));
+        );
+      break;
+    case 'leases':
+      panel = (
+        <div className="flex flex-col gap-2">
+          <div>
+            <Segmented
+              label="Leases shown"
+              value={place.leases}
+              onChange={v => {
+                setSub(placeOf('leases', v));
               }}
+              options={[
+                { value: 'active', label: `Active (${openLeases.length})` },
+                { value: 'recent', label: `Recently ended (${recentLeases.length})` },
+              ]}
             />
-          )
-        ) : recentLeases.length === 0 ? (
-          <Empty>No lease has ended yet.</Empty>
-        ) : (
-          <LeaseTable leases={recentLeases} label="Recent leases" closed />
-        )}
-      </Section>
-
-      <Section title="Finished rollouts">
-        {recent.length === 0 ? (
+          </div>
+          {place.leases === 'active' ? (
+            openLeases.length === 0 ? (
+              <Empty>No host holds a lease.</Empty>
+            ) : (
+              <LeaseTable
+                leases={openLeases}
+                label="Active leases"
+                onEnd={l => {
+                  actions.request(endLeaseIntent(l));
+                }}
+              />
+            )
+          ) : recentLeases.length === 0 ? (
+            <Empty>No lease has ended yet.</Empty>
+          ) : (
+            <LeaseTable leases={recentLeases} label="Recent leases" closed />
+          )}
+        </div>
+      );
+      break;
+    case 'finished':
+      panel =
+        recent.length === 0 ? (
           <Empty>No rollout has finished yet.</Empty>
         ) : (
           <RecentRollouts rollouts={recent} leases={leases} />
-        )}
-      </Section>
+        );
+      break;
+  }
+
+  return (
+    <div className="mx-auto flex w-full max-w-screen-2xl flex-col gap-4">
+      {rollouts.error !== undefined && <ErrorBanner error={rollouts.error} what="the rollouts" />}
+      {actions.notice}
+
+      <div className="flex flex-col gap-3">
+        <div className="flex flex-col rounded-lg border border-border bg-surface lg:flex-row">
+          {plan.data && <PlanStatus plan={plan.data} onAction={actions.request} />}
+          <ViewTabs
+            view={place.view}
+            tabId={tabId}
+            panelId={panelId}
+            open={openSummary(open)}
+            leases={leaseSummary(openLeases, recentLeases)}
+            finished={finishedSummary(recent)}
+            onSelect={v => {
+              setSub(placeOf(v, v === place.view ? place.leases : 'active'));
+            }}
+          />
+        </div>
+        <div role="tabpanel" id={panelId} aria-labelledby={tabId(place.view)}>
+          {panel}
+        </div>
+      </div>
 
       {actions.dialog}
     </div>
   );
 }
 
+const VIEWS: readonly RolloutsView[] = ['open', 'leases', 'finished'];
+
+interface StatItem {
+  n: number;
+  label: string;
+  tone?: 'warning' | 'danger';
+}
+
+/** Stats are counts of a tab's summary as one line of text; a zero count is left out. */
+function Stats({ items }: { items: readonly StatItem[] }) {
+  return items
+    .filter(i => i.n > 0)
+    .map((i, k) => (
+      <Fragment key={i.label}>
+        {k > 0 && ', '}
+        <span className={i.tone === 'danger' ? 'text-danger' : i.tone === 'warning' ? 'text-warning' : undefined}>
+          <span className="font-medium tabular-nums">{i.n}</span> {i.label}
+        </span>
+      </Fragment>
+    ));
+}
+
 /**
- * PlanBar is the scheduler's state and its one control; the Overview has the
- * gate, the budget and the queue in full.
+ * ViewTabs are the tabs of the three lists, each with its summary; they pick
+ * the one shown and move with the arrow keys.
  */
-function PlanBar({ plan, onAction }: { plan: Plan; onAction: (intent: ActionIntent) => void }) {
+function ViewTabs({
+  view,
+  tabId,
+  panelId,
+  open,
+  leases,
+  finished,
+  onSelect,
+}: {
+  view: RolloutsView;
+  tabId: (v: RolloutsView) => string;
+  panelId: string;
+  open: OpenSummary;
+  leases: LeaseSummary;
+  finished: FinishedSummary;
+  onSelect: (v: RolloutsView) => void;
+}) {
+  const refs = useRef(new Map<RolloutsView, HTMLButtonElement>());
+
+  const onKey = (e: KeyboardEvent<HTMLDivElement>) => {
+    const index = VIEWS.indexOf(view);
+    let next: RolloutsView | undefined;
+
+    if (e.key === 'ArrowRight' || e.key === 'ArrowDown') next = VIEWS[(index + 1) % VIEWS.length];
+    else if (e.key === 'ArrowLeft' || e.key === 'ArrowUp') next = VIEWS[(index - 1 + VIEWS.length) % VIEWS.length];
+    else if (e.key === 'Home') next = VIEWS[0];
+    else if (e.key === 'End') next = VIEWS[VIEWS.length - 1];
+
+    if (next) {
+      e.preventDefault();
+      onSelect(next);
+      refs.current.get(next)?.focus();
+    }
+  };
+
+  const tab = (v: RolloutsView, title: string, count: number, summary: readonly ReactNode[]) => (
+    <ViewTab
+      key={v}
+      id={tabId(v)}
+      panelId={panelId}
+      title={title}
+      count={count}
+      selected={view === v}
+      onSelect={() => {
+        onSelect(v);
+      }}
+      tabRef={el => {
+        if (el) refs.current.set(v, el);
+        else refs.current.delete(v);
+      }}
+      lines={summary}
+    />
+  );
+
   return (
-    <div role="group" aria-label="Scheduler" className="flex flex-wrap items-center gap-x-6 gap-y-2 text-xs/5">
-      <span className="inline-flex items-center gap-2">
-        <span className="text-sm/6 font-semibold">Scheduler</span>
-        {plan.paused ? <Badge tone="warning">paused</Badge> : <Badge tone="success">running</Badge>}
+    <div
+      role="tablist"
+      aria-label="Rollout lists"
+      onKeyDown={onKey}
+      className="grid min-w-0 flex-1 grid-cols-1 divide-y divide-border sm:grid-cols-3 sm:divide-x sm:divide-y-0"
+    >
+      {tab('open', 'Open rollouts', open.total, [
+        open.total === 0 ? (
+          'nothing is rolling out'
+        ) : (
+          <Stats
+            items={[
+              { n: open.active, label: 'active' },
+              { n: open.approval, label: 'waiting for approval', tone: 'warning' },
+              { n: open.paused, label: 'paused', tone: 'warning' },
+              { n: open.halted, label: 'halted', tone: 'danger' },
+            ]}
+          />
+        ),
+      ])}
+      {tab('leases', 'Leases', leases.active, [
+        leases.active === 0 ? (
+          'no host holds a lease'
+        ) : (
+          <Stats
+            items={[
+              { n: leases.running, label: 'running' },
+              { n: leases.verifying, label: 'verifying' },
+            ]}
+          />
+        ),
+        leases.recent > 0 && (
+          <>
+            recently ended:{' '}
+            <Stats
+              items={[
+                { n: leases.released, label: 'released' },
+                { n: leases.failed, label: 'failed', tone: 'danger' },
+                { n: leases.expired, label: 'expired', tone: 'warning' },
+                { n: leases.cancelled, label: 'cancelled' },
+              ]}
+            />
+          </>
+        ),
+      ])}
+      {tab('finished', 'Finished rollouts', finished.total, [
+        finished.total === 0 ? (
+          'none has finished yet'
+        ) : (
+          <Stats
+            items={[
+              { n: finished.completed, label: 'completed' },
+              { n: finished.superseded, label: 'superseded' },
+              { n: finished.aborted, label: 'aborted', tone: 'warning' },
+            ]}
+          />
+        ),
+      ])}
+    </div>
+  );
+}
+
+function ViewTab({
+  id,
+  panelId,
+  title,
+  count,
+  selected,
+  onSelect,
+  tabRef,
+  lines,
+}: {
+  id: string;
+  panelId: string;
+  title: string;
+  count: number;
+  selected: boolean;
+  onSelect: () => void;
+  tabRef: (el: HTMLButtonElement | null) => void;
+  /** lines are the summary, one line each; a false line is left out. */
+  lines: readonly ReactNode[];
+}) {
+  return (
+    <button
+      ref={tabRef}
+      type="button"
+      role="tab"
+      id={id}
+      aria-selected={selected}
+      aria-controls={selected ? panelId : undefined}
+      aria-labelledby={`${id}-title ${id}-count`}
+      aria-describedby={`${id}-summary`}
+      tabIndex={selected ? 0 : -1}
+      onClick={onSelect}
+      className={cx(
+        'relative flex min-w-0 flex-col px-3 py-2 text-left focus-visible:-outline-offset-2',
+        !selected && 'hover:bg-surface-hover'
+      )}
+    >
+      <span className="flex items-baseline gap-1.5 text-sm/6">
+        <span id={`${id}-title`} className={selected ? 'font-semibold' : 'font-medium text-muted'}>
+          {title}
+        </span>
+        <span id={`${id}-count`} className="text-faint tabular-nums">
+          {count}
+        </span>
       </span>
-      <span className="inline-flex items-center gap-2" title={list(plan.gate.reasons).join(' · ') || undefined}>
-        <span className="text-muted">Network gate</span>
-        {plan.gate.ok ? <Badge tone="success">open</Badge> : <Badge tone="danger">closed</Badge>}
+      <span id={`${id}-summary`} className="flex flex-col text-xs/5 text-muted">
+        {lines.filter(Boolean).map((line, k) => (
+          <span key={k}>
+            {k > 0 && (
+              <>
+                <span className="sr-only">;</span>{' '}
+              </>
+            )}
+            {line}
+          </span>
+        ))}
       </span>
-      <span className="ml-auto">
+      {/* The selected tab's mark: a bar at its start on a phone, under it from sm. */}
+      {selected && (
+        <span
+          aria-hidden="true"
+          className="absolute inset-y-0 left-0 w-0.5 bg-accent sm:inset-x-0 sm:top-auto sm:bottom-0 sm:h-0.5 sm:w-auto"
+        />
+      )}
+    </button>
+  );
+}
+
+/**
+ * PlanStatus is the scheduler's state and its one control, the first segment
+ * of the header strip; it is not a tab. The Overview has the gate, the budget
+ * and the queue in full.
+ */
+function PlanStatus({ plan, onAction }: { plan: Plan; onAction: (intent: ActionIntent) => void }) {
+  return (
+    <div
+      role="group"
+      aria-label="Scheduler"
+      className="flex flex-wrap items-center gap-x-4 gap-y-1 border-b border-border bg-surface-raised px-3 py-2 text-xs/5 lg:shrink-0 lg:flex-col lg:items-start lg:justify-center lg:rounded-l-lg lg:border-r lg:border-b-0 max-lg:rounded-t-lg"
+    >
+      <span className="flex flex-wrap items-center gap-x-4 gap-y-1">
+        <span className="inline-flex items-center gap-1.5">
+          <span className="font-medium">Scheduler</span>
+          {plan.paused ? <Badge tone="warning">paused</Badge> : <Badge tone="success">running</Badge>}
+        </span>
+        <span className="inline-flex items-center gap-1.5" title={list(plan.gate.reasons).join(' · ') || undefined}>
+          <span className="text-muted">Network gate</span>
+          {plan.gate.ok ? <Badge tone="success">open</Badge> : <Badge tone="danger">closed</Badge>}
+        </span>
+      </span>
+      <span className="ml-auto lg:ml-0">
         {plan.paused ? (
           <IntentAction
             icon="resume"
@@ -421,7 +671,7 @@ export function RolloutCard({
     <article
       aria-label={r.title}
       className={cx(
-        'flex flex-col gap-2 rounded-lg border bg-surface p-4',
+        'flex min-w-0 flex-col gap-2 rounded-lg border bg-surface p-3 sm:p-4',
         r.state === 'halted' ? 'border-danger' : 'border-border'
       )}
     >
@@ -574,7 +824,7 @@ export function RolloutCard({
         </p>
       )}
 
-      <Table label={`Hosts of ${r.title}`}>
+      <Table label={`Hosts of ${r.title}`} stack>
         <thead>
           <tr>
             <Th>Host</Th>
@@ -602,9 +852,9 @@ export function RolloutCard({
                   )}
                 </Td>
                 {/* A host's own request is one host: there is no order to name. */}
-                <Td>{r.kind === 'local' ? <Dash /> : stageLabel(h.stage)}</Td>
+                <Td data-label="Stage">{r.kind === 'local' ? <Dash /> : stageLabel(h.stage)}</Td>
                 {/* State and actions keep their width from one state to the next. */}
-                <Td className="min-w-24">
+                <Td className="min-w-24" data-label="State">
                   {held.has(h.host) ? (
                     <Badge tone="warning" title="The member waits; it is not rolled while the hold lasts">
                       {held.get(h.host)}
@@ -613,12 +863,12 @@ export function RolloutCard({
                     <HostStateBadge state={h.state} noWorse={h.noWorse} />
                   )}
                 </Td>
-                <Td className="min-w-48 whitespace-normal">
+                <Td className="min-w-48 whitespace-normal" data-label="Doing">
                   {/* A done member of an action rollout is its run; any other says what it waits for, then its run. */}
                   {!(run && h.state === 'done') && hostProgress(h, queue, leases, titles)}
                   {run && <ActionRunView run={run} label={`${r.action ?? 'the action'} on ${h.host}`} />}
                 </Td>
-                <Td>
+                <Td data-label="Updated">
                   <RelTime fixed value={h.updatedAt} />
                 </Td>
                 <Td className="min-w-28">
@@ -716,7 +966,7 @@ export function RecentRollouts({
   label?: string;
 }) {
   return (
-    <Table label={label}>
+    <Table label={label} stack>
       <thead>
         <tr>
           <Th>Rollout</Th>
@@ -738,7 +988,7 @@ export function RecentRollouts({
             <tr key={r.id} className="hover:bg-surface-hover">
               {/* Image references have no spaces: they break anywhere, within a width the other columns leave. */}
               <Td className="min-w-48 font-medium whitespace-normal wrap-anywhere xl:min-w-64">{r.title}</Td>
-              <Td>
+              <Td data-label="Kind">
                 {r.kind === 'local'
                   ? 'host request'
                   : r.kind === 'group'
@@ -747,23 +997,25 @@ export function RecentRollouts({
                       ? `action ${r.action ?? ''}`
                       : r.kind}
               </Td>
-              <Td>
+              <Td data-label="State">
                 <RolloutStateBadge state={r.state} />
               </Td>
-              <Td title={hosts.map(h => `${h.host}: ${memberState(h, leases)}`).join('\n')}>
+              <Td data-label="Hosts done" title={hosts.map(h => `${h.host}: ${memberState(h, leases)}`).join('\n')}>
                 <span className="font-mono">
                   {done}/{hosts.length}
                 </span>{' '}
                 <span className="text-muted">({percentOf(done, hosts.length)})</span>
                 {failed > 0 && <span className="text-danger"> {failed} failed</span>}
               </Td>
-              <Td className="min-w-36 whitespace-normal text-muted wrap-anywhere">{r.reason || <Dash />}</Td>
-              <Td>{r.createdBy}</Td>
-              <Td>
-                <RelTime fixed value={r.createdAt} />
+              <Td className="min-w-36 whitespace-normal text-muted wrap-anywhere" data-label="Reason">
+                {r.reason || <Dash />}
               </Td>
-              <Td>
-                <RelTime fixed value={r.endedAt} />
+              <Td data-label="Opened by">{r.createdBy}</Td>
+              <Td data-label="Opened">
+                <Timestamp value={r.createdAt} />
+              </Td>
+              <Td data-label="Ended">
+                <Timestamp value={r.endedAt} />
               </Td>
             </tr>
           );

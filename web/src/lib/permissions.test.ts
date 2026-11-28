@@ -129,7 +129,7 @@ const SAMPLES: Sample[] = [
   },
   {
     name: 'client-policy',
-    call: { action: 'client-policy', body: { client: 'lighthouse', policy: 'manual', reason: '' } },
+    call: { action: 'client-policy', body: { client: 'lighthouse', kind: 'cl', policy: 'manual', reason: '' } },
     feature: FEATURE.manage,
     twin: true,
   },
@@ -766,7 +766,7 @@ describe('can, what the review of the first version found', () => {
 
   it('covers the policy of a client for its team', () => {
     const policy = (client: string) =>
-      ({ action: 'client-policy', body: { client, policy: 'manual', reason: '' } }) satisfies ActionCall;
+      ({ action: 'client-policy', body: { client, kind: 'el', policy: 'manual', reason: '' } }) satisfies ActionCall;
     const clients = [
       { name: 'lighthouse', hosts: 2 },
       { name: 'teku', hosts: 2 },

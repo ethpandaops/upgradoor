@@ -21,8 +21,16 @@ function readHash<T extends string>(tabs: readonly T[], fallback: T): T {
   return (tabs as readonly string[]).includes(raw) ? (raw as T) : fallback;
 }
 
-/** useHashTab keeps the active tab in the URL hash (#hosts, #rollouts, ...). */
-export function useHashTab<T extends string>(tabs: readonly T[], fallback: T): [T, (tab: T) => void] {
+/** hashOf is the hash of a tab and what it selects: ("rollouts", "leases") is "rollouts/leases". */
+function hashOf(tab: string, sub = ''): string {
+  return sub === '' ? tab : `${tab}/${sub.split('/').map(encodeURIComponent).join('/')}`;
+}
+
+/**
+ * useHashTab keeps the active tab in the URL hash (#hosts, #rollouts, ...).
+ * Selecting a tab with a sub opens it at that place (#rollouts/leases).
+ */
+export function useHashTab<T extends string>(tabs: readonly T[], fallback: T): [T, (tab: T, sub?: string) => void] {
   const [tab, setTab] = useState<T>(() => readHash(tabs, fallback));
 
   useEffect(() => {
@@ -35,8 +43,8 @@ export function useHashTab<T extends string>(tabs: readonly T[], fallback: T): [
     };
   }, [tabs, fallback]);
 
-  const select = useCallback((next: T) => {
-    window.location.hash = next;
+  const select = useCallback((next: T, sub?: string) => {
+    window.location.hash = hashOf(next, sub);
     setTab(next);
   }, []);
 
@@ -67,7 +75,7 @@ export function useHashSub(tab: string): [string, (sub: string) => void] {
 
   const select = useCallback(
     (next: string) => {
-      window.location.hash = next === '' ? tab : `${tab}/${next.split('/').map(encodeURIComponent).join('/')}`;
+      window.location.hash = hashOf(tab, next);
       setSub(next);
     },
     [tab]

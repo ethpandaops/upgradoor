@@ -417,7 +417,7 @@ func actionSamples(t *testing.T) []actionSample {
 			feature: authz.FeatureManageFlags, twin: true,
 		},
 		{
-			action: "client-policy", body: `{"client":"lighthouse","policy":"manual"}`,
+			action: "client-policy", body: `{"client":"lighthouse","kind":"cl","policy":"manual"}`,
 			feature: authz.FeatureManage, twin: true,
 		},
 		{action: "pause", body: `{"rollout":"r-lighthouse"}`, feature: authz.FeatureManage, twin: true},

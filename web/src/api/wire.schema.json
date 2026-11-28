@@ -1,5 +1,5 @@
 {
- "version": "b09984471799",
+ "version": "04da3b4c1043",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -300,12 +300,8 @@
     "t": "r"
    },
    {
-    "n": "policy",
-    "t": "r"
-   },
-   {
-    "n": "policySet",
-    "t": "b"
+    "n": "policies",
+    "t": "j"
    },
    {
     "n": "defaultPolicies",

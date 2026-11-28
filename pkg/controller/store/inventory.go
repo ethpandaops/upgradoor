@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"slices"
 	"strconv"
 	"strings"
 
@@ -393,7 +394,7 @@ func (s *sqliteStore) SearchPackages(
 		return []PackageMatch{}, nil
 	}
 
-	page, err := s.ListPackages(ctx, PackageFilter{Query: query, Limit: limit})
+	page, err := s.ListPackages(ctx, &PackageFilter{Query: query, Limit: limit})
 	if err != nil {
 		return nil, err
 	}
@@ -408,16 +409,24 @@ const (
 	rankOther  = 2
 )
 
-// packageCursor is where a page of names ends: the rank and the name of its
-// last entry. As a string it is the rank's digit and the name.
+// packageCursor is where a page of names ends: the rank, the sort key and
+// the name of its last entry. As a string it is the rank's digit, for a
+// non-name sort the key and ":", and the name.
 type packageCursor struct {
 	rank int
+	key  int
 	name string
 }
 
-func (c packageCursor) String() string { return strconv.Itoa(c.rank) + c.name }
+func (c packageCursor) format(sort PackageSort) string {
+	if sort == PackageSortName {
+		return strconv.Itoa(c.rank) + c.name
+	}
 
-func parsePackageCursor(after string) (packageCursor, error) {
+	return strconv.Itoa(c.rank) + strconv.Itoa(c.key) + ":" + c.name
+}
+
+func parsePackageCursor(after string, sort PackageSort) (packageCursor, error) {
 	if after == "" {
 		// Before every name.
 		return packageCursor{rank: -1}, nil
@@ -428,48 +437,125 @@ func parsePackageCursor(after string) (packageCursor, error) {
 		return packageCursor{}, ErrBadCursor
 	}
 
-	return packageCursor{rank: rank, name: after[1:]}, nil
-}
-
-// packageNamesQuery returns the query for the names of one page, each with
-// its rank, and the query that counts all names the filter selects.
-//
-// Without a query the page is a range of the (name, version) index: it
-// starts at the cursor and stops after limit names, whatever the size of the
-// table. With one, a name is matched by a part of it, which no index can
-// look up: the index is walked instead of the table (it holds the name), and
-// only for the names, not once per row and host.
-func packageNamesQuery(query string, after packageCursor, limit int) (names string, args []any, count string, countArgs []any) {
-	if query == "" {
-		return `SELECT DISTINCT name, 0 FROM packages WHERE name > ? ORDER BY name LIMIT ?`,
-			[]any{after.name, limit},
-			`SELECT COUNT(DISTINCT name) FROM packages`, nil
+	if sort == PackageSortName {
+		return packageCursor{rank: rank, name: after[1:]}, nil
 	}
 
-	escaped := escapeLike(query)
-	contains := "%" + escaped + "%"
+	digits, name, ok := strings.Cut(after[1:], ":")
 
-	// LIKE is case-insensitive for ASCII, which is all Debian package names
-	// contain.
-	return `
-		SELECT name, CASE
-			WHEN name = ? COLLATE NOCASE THEN 0
-			WHEN name LIKE ? ESCAPE '\' THEN 1
-			ELSE 2 END AS rank
-		FROM packages
-		WHERE name LIKE ? ESCAPE '\'
-		GROUP BY name
-		HAVING rank > ? OR (rank = ? AND name > ?)
-		ORDER BY rank, name
-		LIMIT ?`,
-		[]any{query, escaped + "%", contains, after.rank, after.rank, after.name, limit},
-		`SELECT COUNT(DISTINCT name) FROM packages WHERE name LIKE ? ESCAPE '\'`, []any{contains}
+	key, err := strconv.Atoi(digits)
+	if !ok || err != nil || key < 0 || name == "" {
+		return packageCursor{}, ErrBadCursor
+	}
+
+	return packageCursor{rank: rank, key: key, name: name}, nil
+}
+
+// packageNames selects the names of one page.
+type packageNames struct {
+	query string
+	show  PackageShow
+	sort  PackageSort
+	after packageCursor
+	limit int
+}
+
+// sql returns the query for the names of one page, each with its rank and
+// sort key.
+//
+// Sorted by name without a query, the page is a range of the (name,
+// version) index: it starts at the cursor and stops after limit names. A
+// query matches a part of the name, which no index can look up, and a count
+// sort needs every name's count: those walk the index, not the table.
+func (n *packageNames) sql() (query string, args []any) {
+	rank, key := "0", "0"
+
+	var where, having []string
+
+	if n.query != "" {
+		escaped := escapeLike(n.query)
+		// LIKE is case-insensitive for ASCII, which is all Debian package
+		// names contain.
+		rank = `CASE WHEN name = ? COLLATE NOCASE THEN 0 WHEN name LIKE ? ESCAPE '\' THEN 1 ELSE 2 END`
+
+		args = append(args, n.query, escaped+"%")
+
+		where = append(where, `name LIKE ? ESCAPE '\'`)
+		args = append(args, "%"+escaped+"%")
+	}
+
+	switch n.sort {
+	case PackageSortVersions:
+		key = "COUNT(DISTINCT version)"
+	case PackageSortHosts:
+		key = "COUNT(DISTINCT host)"
+	case PackageSortOutdated:
+		key = "(SELECT COUNT(DISTINCT u.host) FROM upgradable u WHERE u.name = packages.name)"
+	case PackageSortName:
+	}
+
+	switch n.show {
+	case PackageShowOutdated:
+		where = append(where, "name IN (SELECT name FROM upgradable)")
+	case PackageShowSecurity:
+		where = append(where, "name IN (SELECT name FROM upgradable WHERE security = 1)")
+	case PackageShowDiffering:
+		having = append(having, "COUNT(DISTINCT version) > 1")
+	case PackageShowAll:
+	}
+
+	if n.query == "" && n.sort == PackageSortName {
+		where = append(where, "name > ?")
+		args = append(args, n.after.name)
+	} else {
+		having = append(having, "(rank > ? OR (rank = ? AND (k < ? OR (k = ? AND name > ?))))")
+		args = append(args, n.after.rank, n.after.rank, n.after.key, n.after.key, n.after.name)
+	}
+
+	query = "SELECT name, " + rank + " AS rank, " + key + " AS k FROM packages"
+	if len(where) > 0 {
+		query += " WHERE " + strings.Join(where, " AND ")
+	}
+
+	query += " GROUP BY name"
+	if len(having) > 0 {
+		query += " HAVING " + strings.Join(having, " AND ")
+	}
+
+	switch {
+	case n.sort != PackageSortName:
+		query += " ORDER BY rank, k DESC, name LIMIT ?"
+	case n.query != "":
+		query += " ORDER BY rank, name LIMIT ?"
+	default:
+		query += " ORDER BY name LIMIT ?"
+	}
+
+	return query, append(args, n.limit)
+}
+
+// packageCountsSQL returns the queries that count the names a query
+// selects: all and differing from the packages, outdated and security from
+// the upgradable lists, whose names are all installed.
+func packageCountsSQL(query string) (installed, upgradable string, args []any) {
+	installed = `SELECT COUNT(*), COALESCE(SUM(n > 1), 0)
+		FROM (SELECT COUNT(DISTINCT version) AS n FROM packages%s GROUP BY name)`
+	upgradable = `SELECT COUNT(DISTINCT name), COUNT(DISTINCT CASE WHEN security = 1 THEN name END)
+		FROM upgradable%s`
+
+	where := ""
+	if query != "" {
+		where = ` WHERE name LIKE ? ESCAPE '\'`
+		args = []any{"%" + escapeLike(query) + "%"}
+	}
+
+	return fmt.Sprintf(installed, where), fmt.Sprintf(upgradable, where), args
 }
 
 // ListPackages returns one page of package names with the versions installed
-// across the fleet and the hosts on each. Versions are sorted as strings,
-// hosts by name.
-func (s *sqliteStore) ListPackages(ctx context.Context, filter PackageFilter) (*PackagePage, error) {
+// across the fleet, the hosts on each and the upgrades offered to them.
+// Versions are sorted as strings, hosts by name.
+func (s *sqliteStore) ListPackages(ctx context.Context, filter *PackageFilter) (*PackagePage, error) {
 	query := strings.TrimSpace(filter.Query)
 	limit := filter.Limit
 
@@ -480,7 +566,7 @@ func (s *sqliteStore) ListPackages(ctx context.Context, filter PackageFilter) (*
 		limit = MaxPackageSearchLimit
 	}
 
-	after, err := parsePackageCursor(filter.After)
+	after, err := parsePackageCursor(filter.After, filter.Sort)
 	if err != nil {
 		return nil, fmt.Errorf("store: list packages: %w", err)
 	}
@@ -489,24 +575,25 @@ func (s *sqliteStore) ListPackages(ctx context.Context, filter PackageFilter) (*
 
 	err = s.read(ctx, func(tx *sql.Tx) error {
 		// One more than the page: whether another page follows.
-		namesQuery, args, countQuery, countArgs := packageNamesQuery(query, after, limit+1)
-
-		names := make([]any, 0, limit)
+		names := packageNames{query: query, show: filter.Show, sort: filter.Sort, after: after, limit: limit + 1}
+		namesQuery, args := names.sql()
 		last := after
 
 		scanErr := queryRows(ctx, tx, namesQuery, args, func(row rowScanner) error {
 			var cur packageCursor
-			if rowErr := row.Scan(&cur.name, &cur.rank); rowErr != nil {
+			if rowErr := row.Scan(&cur.name, &cur.rank, &cur.key); rowErr != nil {
 				return rowErr
 			}
 
-			if len(names) == limit {
-				page.Next = last.String()
+			if len(page.Matches) == limit {
+				page.Next = last.format(filter.Sort)
 
 				return nil
 			}
 
-			names = append(names, cur.name)
+			page.Matches = append(page.Matches, PackageMatch{
+				Name: cur.name, Versions: []PackageVersion{}, Upgrades: []PackageUpgrade{},
+			})
 			last = cur
 
 			return nil
@@ -516,61 +603,200 @@ func (s *sqliteStore) ListPackages(ctx context.Context, filter PackageFilter) (*
 		}
 
 		if filter.After == "" {
-			countErr := tx.QueryRowContext(ctx, countQuery, countArgs...).Scan(&page.Total)
+			counts, countErr := countPackages(ctx, tx, query)
 			if countErr != nil {
 				return countErr
 			}
+
+			page.Counts = counts
+
+			switch filter.Show {
+			case PackageShowDiffering:
+				page.Total = counts.Differing
+			case PackageShowOutdated:
+				page.Total = counts.Outdated
+			case PackageShowSecurity:
+				page.Total = counts.Security
+			case PackageShowAll:
+				page.Total = counts.All
+			}
 		}
 
-		if len(names) == 0 {
+		if len(page.Matches) == 0 {
 			return nil
 		}
 
-		matches := page.Matches
-		defer func() { page.Matches = matches }()
-
-		index := make(map[string]int, len(names))
-
-		for i, name := range names {
-			name, ok := name.(string)
-			if !ok {
-				continue
-			}
-
-			index[name] = i
-
-			matches = append(matches, PackageMatch{Name: name, Versions: []PackageVersion{}})
-		}
-
-		// DISTINCT: a host can have one version for two architectures.
-		return queryRows(ctx, tx, `
-			SELECT DISTINCT name, version, host FROM packages
-			WHERE name IN (`+placeholders(len(names))+`)
-			ORDER BY name, version, host`,
-			names,
-			func(row rowScanner) error {
-				var name, version, host string
-				if rowErr := row.Scan(&name, &version, &host); rowErr != nil {
-					return rowErr
-				}
-
-				match := &matches[index[name]]
-
-				last := len(match.Versions) - 1
-				if last < 0 || match.Versions[last].Version != version {
-					match.Versions = append(match.Versions,
-						PackageVersion{Version: version, Hosts: make([]string, 0, 8)})
-					last++
-				}
-
-				match.Versions[last].Hosts = append(match.Versions[last].Hosts, host)
-
-				return nil
-			})
+		return fillPackageMatches(ctx, tx, page.Matches, filter.Compact)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("store: list packages: %w", err)
 	}
 
 	return page, nil
+}
+
+// countPackages counts the names query selects under each show.
+func countPackages(ctx context.Context, tx *sql.Tx, query string) (*PackageCounts, error) {
+	installed, upgradable, args := packageCountsSQL(query)
+	counts := &PackageCounts{}
+
+	if err := tx.QueryRowContext(ctx, installed, args...).Scan(&counts.All, &counts.Differing); err != nil {
+		return nil, err
+	}
+
+	if err := tx.QueryRowContext(ctx, upgradable, args...).Scan(&counts.Outdated, &counts.Security); err != nil {
+		return nil, err
+	}
+
+	return counts, nil
+}
+
+// fillPackageMatches adds the versions, hosts and upgrades of the named
+// matches. Compact leaves out the hosts of each name's most common version
+// and of the upgrades.
+func fillPackageMatches(ctx context.Context, tx *sql.Tx, matches []PackageMatch, compact bool) error {
+	index := make(map[string]int, len(matches))
+	names := make([]any, 0, len(matches))
+
+	for i := range matches {
+		index[matches[i].Name] = i
+		names = append(names, matches[i].Name)
+	}
+
+	in := placeholders(len(names))
+
+	// DISTINCT host: a host can have one version for two architectures.
+	err := queryRows(ctx, tx, `
+		SELECT name, version, COUNT(DISTINCT host) FROM packages
+		WHERE name IN (`+in+`)
+		GROUP BY name, version
+		ORDER BY name, version`,
+		names,
+		func(row rowScanner) error {
+			var v PackageVersion
+
+			var name string
+			if rowErr := row.Scan(&name, &v.Version, &v.Count); rowErr != nil {
+				return rowErr
+			}
+
+			v.Hosts = []string{}
+			match := &matches[index[name]]
+			match.Versions = append(match.Versions, v)
+
+			return nil
+		})
+	if err != nil {
+		return err
+	}
+
+	hostsQuery := `SELECT DISTINCT name, version, host FROM packages WHERE name IN (` + in + `)`
+	hostsArgs := names
+
+	if compact {
+		skip := make([]string, 0, len(matches))
+		hostsArgs = slices.Clone(names)
+
+		for i := range matches {
+			if top := mostCommonVersion(matches[i].Versions); top >= 0 {
+				skip = append(skip, "(?, ?)")
+				hostsArgs = append(hostsArgs, matches[i].Name, matches[i].Versions[top].Version)
+			}
+		}
+
+		if len(skip) > 0 {
+			hostsQuery += ` AND (name, version) NOT IN (VALUES ` + strings.Join(skip, ", ") + `)`
+		}
+	}
+
+	err = queryRows(ctx, tx, hostsQuery+` ORDER BY name, version, host`, hostsArgs,
+		func(row rowScanner) error {
+			var name, version, host string
+			if rowErr := row.Scan(&name, &version, &host); rowErr != nil {
+				return rowErr
+			}
+
+			match := &matches[index[name]]
+			if i := slices.IndexFunc(match.Versions, func(v PackageVersion) bool {
+				return v.Version == version
+			}); i >= 0 {
+				match.Versions[i].Hosts = append(match.Versions[i].Hosts, host)
+			}
+
+			return nil
+		})
+	if err != nil {
+		return err
+	}
+
+	return fillPackageUpgrades(ctx, tx, matches, index, names, compact)
+}
+
+// fillPackageUpgrades adds the upgrades of the matches, with their hosts
+// unless compact.
+func fillPackageUpgrades(
+	ctx context.Context, tx *sql.Tx, matches []PackageMatch, index map[string]int, names []any, compact bool,
+) error {
+	in := placeholders(len(names))
+
+	err := queryRows(ctx, tx, `
+		SELECT name, current, candidate, MAX(security), MAX(blocked), COUNT(DISTINCT host)
+		FROM upgradable WHERE name IN (`+in+`)
+		GROUP BY name, current, candidate
+		ORDER BY name, current, candidate`,
+		names,
+		func(row rowScanner) error {
+			var (
+				name string
+				u    PackageUpgrade
+			)
+
+			if rowErr := row.Scan(&name, &u.Current, &u.Candidate, &u.Security, &u.Blocked, &u.Count); rowErr != nil {
+				return rowErr
+			}
+
+			u.Hosts = []string{}
+			match := &matches[index[name]]
+			match.Upgrades = append(match.Upgrades, u)
+
+			return nil
+		})
+	if err != nil || compact {
+		return err
+	}
+
+	return queryRows(ctx, tx, `
+		SELECT DISTINCT name, current, candidate, host FROM upgradable
+		WHERE name IN (`+in+`)
+		ORDER BY name, current, candidate, host`,
+		names,
+		func(row rowScanner) error {
+			var name, current, candidate, host string
+			if rowErr := row.Scan(&name, &current, &candidate, &host); rowErr != nil {
+				return rowErr
+			}
+
+			match := &matches[index[name]]
+			if i := slices.IndexFunc(match.Upgrades, func(u PackageUpgrade) bool {
+				return u.Current == current && u.Candidate == candidate
+			}); i >= 0 {
+				match.Upgrades[i].Hosts = append(match.Upgrades[i].Hosts, host)
+			}
+
+			return nil
+		})
+}
+
+// mostCommonVersion returns the index of the version on the most hosts, the
+// first of a tie; -1 for none.
+func mostCommonVersion(versions []PackageVersion) int {
+	top := -1
+
+	for i := range versions {
+		if top < 0 || versions[i].Count > versions[top].Count {
+			top = i
+		}
+	}
+
+	return top
 }

@@ -414,3 +414,107 @@ func TestMigrateDeployWindow(t *testing.T) {
 		})
 	}
 }
+
+// Step 6 drops the stored deployWindow setting: its length is a flag.
+func TestMigrateDeployWindowSetting(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	steps, err := loadMigrations()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(steps), 6)
+
+	path := filepath.Join(t.TempDir(), "upgradoor.db")
+	s, ok := New(quietLog(), path).(*sqliteStore)
+	require.True(t, ok)
+
+	db := fileDB(t, path)
+	require.NoError(t, s.migrate(ctx, db, steps[:5]))
+
+	_, err = db.Exec(`INSERT INTO settings (key, value) VALUES ('deployWindow', '"0s"'), ('minPeers', '5')`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.migrate(ctx, db, steps))
+	require.NoError(t, s.Start(ctx))
+	t.Cleanup(func() { _ = s.Stop() })
+
+	settings, err := s.LoadSettings(ctx, fleet.DefaultSettings())
+	require.NoError(t, err, "the removed setting is gone")
+	assert.Equal(t, 5, settings.MinPeers)
+}
+
+// Step 7 turns a team's image policy into one per kind of its containers;
+// a team that runs none gets one under el, cl, vc, other and the fleet's kinds.
+func TestMigrateClientPoliciesPerKind(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	steps, err := loadMigrations()
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, len(steps), 6)
+
+	path := filepath.Join(t.TempDir(), "upgradoor.db")
+	s, ok := New(quietLog(), path).(*sqliteStore)
+	require.True(t, ok)
+
+	db := fileDB(t, path)
+	require.NoError(t, s.migrate(ctx, db, steps[:5]))
+
+	_, err = db.Exec(`
+		INSERT INTO hosts (name, cert_hash, first_seen, last_seen, status) VALUES
+			('a', 'h', 1, 1, '{"containers":[
+				{"name":"lh","managed":true,"kind":"cl","team":"lighthouse"},
+				{"name":"lh-vc","managed":true,"kind":"vc","team":"lighthouse"},
+				{"name":"geth","managed":true,"kind":"el","team":"geth"},
+				{"name":"tools","managed":true,"team":"tools"},
+				{"name":"snooper","managed":true,"kind":"snooper-el","team":"snooper"},
+				{"name":"x","managed":false,"kind":"cl","team":"geth"}]}'),
+			('b', 'h', 1, 1, NULL);
+		INSERT INTO settings (key, value) VALUES
+			('policyClients', '{"lighthouse":"manual","tools":"auto","gone":"manual"}');`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.migrate(ctx, db, steps))
+	require.NoError(t, s.Start(ctx))
+	t.Cleanup(func() { _ = s.Stop() })
+
+	settings, err := s.LoadSettings(ctx, fleet.DefaultSettings())
+	require.NoError(t, err)
+	assert.Equal(t, fleet.ClientPolicies{
+		"cl":         {"lighthouse": fleet.PolicyManual, "gone": fleet.PolicyManual},
+		"vc":         {"lighthouse": fleet.PolicyManual, "gone": fleet.PolicyManual},
+		"el":         {"gone": fleet.PolicyManual},
+		"snooper-el": {"gone": fleet.PolicyManual},
+		"other":      {"tools": fleet.PolicyAuto, "gone": fleet.PolicyManual},
+	}, settings.PolicyClients)
+}
+
+// Step 7 leaves a store without team policies without them.
+func TestMigrateClientPoliciesNone(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	steps, err := loadMigrations()
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "upgradoor.db")
+	s, ok := New(quietLog(), path).(*sqliteStore)
+	require.True(t, ok)
+
+	db := fileDB(t, path)
+	require.NoError(t, s.migrate(ctx, db, steps[:5]))
+
+	_, err = db.Exec(`INSERT INTO settings (key, value) VALUES ('policyClients', '{}')`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.migrate(ctx, db, steps))
+	require.NoError(t, s.Start(ctx))
+	t.Cleanup(func() { _ = s.Stop() })
+
+	settings, err := s.LoadSettings(ctx, fleet.DefaultSettings())
+	require.NoError(t, err)
+	assert.Nil(t, settings.PolicyClients)
+}

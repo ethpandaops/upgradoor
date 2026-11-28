@@ -34,6 +34,7 @@ import {
   type ImagesRefresh,
   type PackageMatch,
   type Packages,
+  type PackageUpgrade,
   type Plan,
   type SlotHistory,
   type SlotRow,
@@ -199,6 +200,9 @@ function mix(a: number, b: number): number {
  * canary, or because a person aborted a rollout of an observed cause.
  */
 const RESUME = '; resume to continue';
+
+/** DEPLOY_WINDOW_MS is the length of the initial deployment window, the controller's --deploy-window. */
+const DEPLOY_WINDOW_MS = 24 * 3600_000;
 
 /** DEPLOY_WINDOW_REASON starts the reason of a host that waits for the initial deployment window; its end follows. */
 const DEPLOY_WINDOW_REASON = 'initial deployment window until ';
@@ -378,11 +382,10 @@ export class MockController {
   /** deployWindow is the window as the plan states it (scheduler.DeployWindow). */
   private deployWindow(): DeployWindow {
     const w = this.data.deployWindow;
-    const length = parseGoDuration(this.data.settings.deployWindow) ?? 0;
-    const until = length > 0 ? w.startedAt + length : undefined;
+    const until = w.startedAt + DEPLOY_WINDOW_MS;
     return {
-      open: w.armedAt === undefined && until !== undefined && this.now() < until,
-      ...(until !== undefined ? { until: this.iso(until) } : {}),
+      open: w.armedAt === undefined && this.now() < until,
+      until: this.iso(until),
       ...(w.armedAt !== undefined ? { armedAt: this.iso(w.armedAt) } : {}),
     };
   }
@@ -576,7 +579,11 @@ export class MockController {
         return { ...page, hosts: list(page.hosts).map(h => without(h, 'usage')) };
       }
       if (route === 'packages')
-        return this.packages(q.get('q') ?? '', Number(q.get('limit')) || 50, q.get('after') ?? '');
+        return this.packages(q.get('q') ?? '', Number(q.get('limit')) || 50, q.get('after') ?? '', {
+          show: q.get('show') ?? '',
+          sort: q.get('sort') ?? '',
+          compact: q.get('compact') === '1',
+        });
       if (route === 'images') return this.images(q.get('q') ?? '', Number(q.get('limit')) || 50, q.get('after') ?? '');
       if (route === 'settings') {
         this.authorizeAdmin(login);
@@ -1413,41 +1420,125 @@ export class MockController {
   /**
    * packages is one page of the fleet's packages, as the controller pages
    * them: every name in alphabetical order, or the names that contain the
-   * query (the exact match, then those that start with it, then the rest).
-   * A page continues after the name the cursor holds.
+   * query (the exact match, then those that start with it, then the rest),
+   * narrowed by show, ordered by sort and compacted like the controller does.
+   * A page continues after the cursor.
    */
-  private packages(query: string, limit: number, after: string): Packages {
+  private packages(
+    query: string,
+    limit: number,
+    after: string,
+    opts: { show: string; sort: string; compact: boolean }
+  ): Packages {
+    if (
+      !['', 'differing', 'outdated', 'security'].includes(opts.show) ||
+      !['', 'versions', 'hosts', 'outdated'].includes(opts.sort)
+    )
+      throw new HttpError(
+        400,
+        'show must be differing, outdated or security; sort must be versions, hosts or outdated'
+      );
+
     const needle = query.trim().toLowerCase();
-    const byName = new Map<string, Map<string, string[]>>();
+    const byName = new Map<string, Map<string, Set<string>>>();
+    const upgrades = new Map<string, Map<string, PackageUpgrade>>();
 
     for (const host of this.data.hosts.values()) {
       for (const p of list(host.inventory?.packages)) {
         if (!p.name.toLowerCase().includes(needle)) continue;
-        const versions = byName.get(p.name) ?? new Map<string, string[]>();
-        versions.set(p.version, [...(versions.get(p.version) ?? []), host.name]);
+        const versions = byName.get(p.name) ?? new Map<string, Set<string>>();
+        versions.set(p.version, (versions.get(p.version) ?? new Set<string>()).add(host.name));
         byName.set(p.name, versions);
+      }
+      for (const u of list(host.inventory?.upgradable)) {
+        if (!u.name.toLowerCase().includes(needle)) continue;
+        const byPair = upgrades.get(u.name) ?? new Map<string, PackageUpgrade>();
+        const key = `${u.current}\n${u.candidate}`;
+        const known = byPair.get(key) ?? {
+          current: u.current,
+          candidate: u.candidate,
+          security: false,
+          blocked: false,
+          count: 0,
+          hosts: [],
+        };
+        byPair.set(key, {
+          ...known,
+          security: known.security || u.security,
+          blocked: known.blocked || u.blocked,
+          count: known.count + 1,
+          hosts: [...list(known.hosts), host.name],
+        });
+        upgrades.set(u.name, byPair);
       }
     }
 
-    const rank = (name: string) => (needle === '' ? 0 : name === needle ? 0 : name.startsWith(needle) ? 1 : 2);
-    const cursor = (name: string) => `${rank(name)}${name}`;
-    if (after !== '' && !/^[012]./.test(after)) throw new HttpError(400, 'after is not the next of a page');
+    const outdatedHosts = (name: string) => [...(upgrades.get(name)?.values() ?? [])].reduce((n, u) => n + u.count, 0);
+    const differing = (name: string) => (byName.get(name)?.size ?? 0) > 1;
+    const outdated = (name: string) => upgrades.has(name);
+    const security = (name: string) => [...(upgrades.get(name)?.values() ?? [])].some(u => u.security);
+    const show = (name: string) =>
+      opts.show === 'differing'
+        ? differing(name)
+        : opts.show === 'outdated'
+          ? outdated(name)
+          : opts.show === 'security'
+            ? security(name)
+            : true;
+    const key = (name: string) =>
+      opts.sort === 'versions'
+        ? (byName.get(name)?.size ?? 0)
+        : opts.sort === 'hosts'
+          ? new Set([...(byName.get(name)?.values() ?? [])].flatMap(h => [...h])).size
+          : opts.sort === 'outdated'
+            ? outdatedHosts(name)
+            : 0;
 
-    const names = [...byName.keys()].sort((a, b) => rank(a) - rank(b) || (a < b ? -1 : 1));
-    const rest = names.filter(name => after === '' || cursor(name) > after);
+    const rank = (name: string) => (needle === '' ? 0 : name === needle ? 0 : name.startsWith(needle) ? 1 : 2);
+    const cursor = (name: string) => (opts.sort === '' ? `${rank(name)}${name}` : `${rank(name)}${key(name)}:${name}`);
+    if (after !== '' && !(opts.sort === '' ? /^[012]./ : /^[012]\d+:./).test(after))
+      throw new HttpError(400, 'after is not the next of a page');
+
+    const all = [...byName.keys()];
+    const order = (a: string, b: string) => rank(a) - rank(b) || key(b) - key(a) || (a < b ? -1 : 1);
+    const names = all.filter(show).sort(order);
+    let rest = names;
+    if (after !== '') {
+      const [, r, k, n] = (opts.sort === '' ? /^(\d)()(.*)$/ : /^(\d)(\d+):(.*)$/).exec(after) ?? [];
+      const at = { rank: Number(r), key: Number(k || 0), name: n ?? '' };
+      rest = names.filter(
+        name =>
+          rank(name) > at.rank ||
+          (rank(name) === at.rank && (key(name) < at.key || (key(name) === at.key && name > at.name)))
+      );
+    }
     const page = rest.slice(0, limit);
 
-    const matches: PackageMatch[] = page.map(name => ({
-      name,
-      versions: [...(byName.get(name) ?? new Map<string, string[]>()).entries()]
-        .sort(([a], [b]) => b.localeCompare(a, undefined, { numeric: true }))
-        .map(([version, hosts]) => ({ version, hosts: hosts.sort() })),
-    }));
+    const matches: PackageMatch[] = page.map(name => {
+      const versions = [...(byName.get(name) ?? new Map<string, Set<string>>()).entries()]
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([version, hosts]) => ({ version, count: hosts.size, hosts: [...hosts].sort() }));
+      const top = versions.reduce((best, v, i) => (best < 0 || v.count > (versions[best]?.count ?? 0) ? i : best), -1);
+      return {
+        name,
+        versions: opts.compact ? versions.map((v, i) => (i === top ? { ...v, hosts: [] } : v)) : versions,
+        upgrades: [...(upgrades.get(name)?.values() ?? [])]
+          .sort((a, b) => (a.current + a.candidate < b.current + b.candidate ? -1 : 1))
+          .map(u => ({ ...u, hosts: opts.compact ? [] : [...list(u.hosts)].sort() })),
+      };
+    });
+
+    const counts = {
+      all: all.length,
+      differing: all.filter(differing).length,
+      outdated: all.filter(outdated).length,
+      security: all.filter(security).length,
+    };
 
     return {
       query: query.trim(),
       matches,
-      ...(after === '' ? { total: names.length } : {}),
+      ...(after === '' ? { total: names.length, counts } : {}),
       ...(rest.length > limit ? { next: cursor(page[page.length - 1] ?? '') } : {}),
     };
   }
@@ -1607,14 +1698,24 @@ export class MockController {
     const specs = new Map<string, (typeof FIELDS)[number]>(FIELDS.map(f => [f.key, f]));
 
     for (const [key, value] of Object.entries(body as Record<string, unknown>)) {
-      // The image policies per client are an object of client to policy, replaced as a whole.
+      // The image policies per kind and client are an object of kind to client to policy, replaced as a whole.
       if (key === 'policyClients') {
         const ok =
           typeof value === 'object' &&
           value !== null &&
           !Array.isArray(value) &&
-          Object.entries(value).every(([client, p]) => CLIENT_NAME.test(client) && (p === 'auto' || p === 'manual'));
-        if (!ok) throw new HttpError(400, 'policyClients must be an object of client to policy');
+          Object.entries(value as Record<string, unknown>).every(
+            ([kind, clients]) =>
+              CLIENT_NAME.test(kind) &&
+              kind !== 'none' &&
+              typeof clients === 'object' &&
+              clients !== null &&
+              !Array.isArray(clients) &&
+              Object.entries(clients).every(
+                ([client, p]) => CLIENT_NAME.test(client) && (p === 'auto' || p === 'manual')
+              )
+          );
+        if (!ok) throw new HttpError(400, 'policyClients must be an object of kind to an object of client to policy');
         continue;
       }
       // The image policies per container kind, replaced as a whole.
@@ -1758,12 +1859,17 @@ export class MockController {
   }
 
   /**
-   * clientPolicy sets or clears the image policy of one client. Open image
-   * rollouts of the client answer to it from then on; one that was approved
-   * stays approved.
+   * clientPolicy sets or clears the image policy of one client's containers
+   * of a kind. Open image rollouts of them answer to it from then on; one
+   * that was approved stays approved.
    */
   private clientPolicy(req: ClientPolicyRequest): ActionResult {
     if (!CLIENT_NAME.test(req.client)) throw new HttpError(400, `invalid client name "${req.client}"`);
+    // The body is whatever was sent.
+    const kind = (req.kind as string | undefined) ?? '';
+    if (!CLIENT_NAME.test(kind) || kind === 'none') {
+      throw new HttpError(400, `invalid kind "${kind}" (other for unlabelled containers)`);
+    }
     // The body is whatever was sent.
     const policy: string = req.policy;
     if (!['', 'auto', 'manual'].includes(policy)) {
@@ -1771,15 +1877,17 @@ export class MockController {
     }
 
     const before = this.data.settings;
-    const policyClients = { ...before.policyClients };
-    if (req.policy === '') Reflect.deleteProperty(policyClients, req.client);
-    else policyClients[req.client] = req.policy;
+    const clients = { ...before.policyClients[kind] };
+    if (req.policy === '') Reflect.deleteProperty(clients, req.client);
+    else clients[req.client] = req.policy;
+    const policyClients = { ...before.policyClients, [kind]: clients };
+    if (Object.keys(clients).length === 0) Reflect.deleteProperty(policyClients, kind);
 
     const next = { ...before, policyClients };
     const message =
       req.policy === ''
-        ? `image policy of ${req.client}: the default of each kind`
-        : `image policy of ${req.client}: ${req.policy}`;
+        ? `image policy of ${req.client} ${kind}: the policy of the kind`
+        : `image policy of ${req.client} ${kind}: ${req.policy}`;
 
     // A request that changes nothing is no change and no entry in the audit log.
     if (JSON.stringify(before.policyClients) === JSON.stringify(policyClients)) return { message };

@@ -196,9 +196,9 @@ func (w *world) start(ctx context.Context) error {
 		"--network", network, "--signer-public-key", identity.EncodePublicKey(identity.PublicKey(signer)),
 		"--controller-seed-file", seedFile, "--allow-insecure-agent-http", "--allow-open-api",
 		"--beacon-endpoint", "http://" + beaconAddr,
-		"--registry-plain-http", regAddr, "--registry-allow-private"}
+		"--registry-plain-http", regAddr, "--registry-allow-private", "--deploy-window=0"}
 
-	for _, setting := range []string{"lookupInterval=30s", "pauseAfterCanaryImage=false", "deployWindow=0"} {
+	for _, setting := range []string{"lookupInterval=30s", "pauseAfterCanaryImage=false"} {
 		args = append(args, "--default-setting", setting)
 	}
 

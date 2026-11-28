@@ -1683,26 +1683,35 @@ func TestHoldOfSeveralHostsReportsThePartialResult(t *testing.T) {
 func TestClientPolicyAction(t *testing.T) {
 	h := newHarness(t)
 
-	for _, tt := range []struct{ host, image, client string }{
-		{"a", "ethpandaops/geth:master", "geth"},
-		{"b", "sigp/lighthouse:latest", "lighthouse"},
+	for _, tt := range []struct {
+		host, image, client string
+		kind                protocol.ContainerKind
+	}{
+		{"a", "ethpandaops/geth:master", "geth", protocol.KindEL},
+		{"b", "sigp/lighthouse:latest", "lighthouse", protocol.KindCL},
 	} {
 		h.addHost(tt.host, 0)
 		h.sync(tt.host, func(st *protocol.SyncRequest) {
 			c := container("c", tt.image, digestOld, digestA, h.now)
-			c.Team = tt.client
+			c.Team, c.Kind = tt.client, tt.kind
 			st.Containers = []protocol.Container{c}
 			n := imageNeed("c", tt.image, digestA)
-			n.Image.Team = tt.client
+			n.Image.Team, n.Image.Kind = tt.client, tt.kind
 			st.Needs = []protocol.Need{n}
 		})
 	}
 
-	res, err := h.svc.SetClientPolicy(h.ctx, "alice", ClientPolicyRequest{
-		Client: "geth", Policy: fleet.PolicyManual, Reason: "release week",
+	// A policy of geth's consensus containers is no policy of its execution ones.
+	_, err := h.svc.SetClientPolicy(h.ctx, "alice", ClientPolicyRequest{
+		Client: "geth", Kind: "cl", Policy: fleet.PolicyManual,
 	})
 	require.NoError(t, err)
-	assert.Equal(t, "image policy of geth: manual", res.Message)
+
+	res, err := h.svc.SetClientPolicy(h.ctx, "alice", ClientPolicyRequest{
+		Client: "geth", Kind: "el", Policy: fleet.PolicyManual, Reason: "release week",
+	})
+	require.NoError(t, err)
+	assert.Equal(t, "image policy of geth el: manual", res.Message)
 
 	entry := h.store.lastAudit()
 	assert.Equal(t, "action.client-policy", entry.Action)
@@ -1710,27 +1719,28 @@ func TestClientPolicyAction(t *testing.T) {
 
 	audits := len(h.store.auditActions())
 	_, err = h.svc.SetClientPolicy(h.ctx, "alice", ClientPolicyRequest{
-		Client: "geth", Policy: fleet.PolicyManual,
+		Client: "geth", Kind: "el", Policy: fleet.PolicyManual,
 	})
 	require.NoError(t, err)
 	assert.Len(t, h.store.auditActions(), audits, "setting what is set changes and audits nothing")
 
 	h.tick()
 
-	geth := h.openRollout(imageKey("geth", "ethpandaops/geth:master", digestA))
+	geth := h.openRollout(groupKey(protocol.KindEL, "geth",
+		[]fleet.RolloutTarget{{Image: "ethpandaops/geth:master", Digest: digestA}}))
 	assert.Equal(t, "geth", geth.Team)
 	assert.Equal(t, "waiting for approval (policy manual)", h.assignment("a").Queue.Reason)
 	assert.NotNil(t, h.assignment("b").Lease, "lighthouse follows policyImage, which is auto")
 
-	res, err = h.svc.SetClientPolicy(h.ctx, "alice", ClientPolicyRequest{Client: "geth"})
+	res, err = h.svc.SetClientPolicy(h.ctx, "alice", ClientPolicyRequest{Client: "geth", Kind: "el"})
 	require.NoError(t, err)
-	assert.Equal(t, "image policy of geth: the default of each kind", res.Message)
+	assert.Equal(t, "image policy of geth el: the policy of the kind", res.Message)
 
 	got, err := h.svc.Settings(h.ctx)
 	require.NoError(t, err)
-	assert.Empty(t, got.PolicyClients)
+	assert.Equal(t, fleet.ClientPolicies{"cl": {"geth": fleet.PolicyManual}}, got.PolicyClients)
 
-	_, err = h.svc.SetClientPolicy(h.ctx, "alice", ClientPolicyRequest{Client: "Geth", Policy: "auto"})
+	_, err = h.svc.SetClientPolicy(h.ctx, "alice", ClientPolicyRequest{Client: "Geth", Kind: "el", Policy: "auto"})
 	require.ErrorIs(t, err, ErrInvalidAction)
 }
 

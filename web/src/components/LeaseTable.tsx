@@ -5,7 +5,7 @@ import { RunExit, RunOutput } from './ActionRun';
 import { ShortId } from './Digest';
 import { ActionIcon } from './icons';
 import { Readiness } from './Readiness';
-import { RelTime } from './RelTime';
+import { RelTime, Timestamp } from './RelTime';
 import { Badge, Dash, Table, Td, Th } from './primitives';
 import { PullNote } from './PullNote';
 import { LeaseOutcomeBadge, LeaseStateBadge, StepBadge, needSummary } from './status';
@@ -100,7 +100,7 @@ export function BeforeLease({ lease }: { lease: Pick<Lease, 'baseline'> }) {
 /**
  * LeaseTable lists leases with the agent's phase, the per-need steps and the
  * controller's readiness note. `closed` switches the time columns to the
- * history form (ended, duration). With `onEnd` every open lease gets a
+ * history form: when it was granted and ended as local timestamps, and how long it took. With `onEnd` every open lease gets a
  * button to end it. An open lease that a person has ended already says so
  * ("ending (cancelled by <actor>)") and its button is disabled: it stays open
  * until the agent reports or the lease expires.
@@ -119,7 +119,7 @@ export function LeaseTable({
   onEnd?: (lease: Lease) => void;
 }) {
   return (
-    <Table label={label}>
+    <Table label={label} stack>
       <thead>
         <tr>
           <Th>Lease</Th>
@@ -147,12 +147,16 @@ export function LeaseTable({
 
           return (
             <tr key={l.id} className="hover:bg-surface-hover">
-              <Td>
+              <Td data-label="Lease">
                 <ShortId value={l.id} label="lease" />
               </Td>
-              {showHost && <Td className="font-medium">{l.host}</Td>}
-              <Td className="min-w-28">
-                <span className="inline-flex items-center gap-1">
+              {showHost && (
+                <Td className="font-medium" data-label="Host">
+                  {l.host}
+                </Td>
+              )}
+              <Td className="min-w-28" data-label="State">
+                <span className="inline-flex flex-wrap items-center gap-1">
                   <LeaseStateBadge state={l.state} />
                   <LeaseOutcomeBadge outcome={l.outcome} />
                   {l.force && <Badge tone="warning">force</Badge>}
@@ -160,10 +164,10 @@ export function LeaseTable({
                 </span>
               </Td>
               {/* The phase, the note and the times change while a lease runs: their columns keep their width. */}
-              <Td className="min-w-24">
+              <Td className="min-w-24" data-label="Phase">
                 {l.operation ? <span className="font-mono">{l.operation.phase}</span> : <Dash />}
               </Td>
-              <Td className="min-w-48">
+              <Td className="min-w-48" data-label="Steps">
                 <span className="inline-flex flex-wrap gap-1">
                   {steps.length > 0
                     ? steps.map(s => {
@@ -193,7 +197,7 @@ export function LeaseTable({
                 )}
               </Td>
               {/* The one column that takes the room that is left: the others stay as wide as their content. */}
-              <Td className="w-full min-w-72 whitespace-normal">
+              <Td className="w-full min-w-72 whitespace-normal" data-label={closed ? 'Outcome' : 'Readiness'}>
                 {l.error ? (
                   <span className="text-danger">{l.error}</span>
                 ) : l.operation?.error ? (
@@ -208,17 +212,30 @@ export function LeaseTable({
                 <PeerChecks checks={l.peerChecks} />
                 <BeforeLease lease={l} />
               </Td>
-              <Td className="font-mono" title={`weight ${l.weight}, charged ${l.charged}`}>
+              <Td className="font-mono" data-label="Weight" title={`weight ${l.weight}, charged ${l.charged}`}>
                 {l.charged}/{l.weight}
               </Td>
-              <Td>{l.grantedBy}</Td>
-              <Td>
-                <RelTime fixed value={l.grantedAt} />
-              </Td>
-              <Td>
-                <RelTime fixed value={closed ? l.endedAt : l.expiresAt} />
-              </Td>
-              {closed && <Td>{took === null ? <Dash /> : formatDuration(took)}</Td>}
+              <Td data-label="Granted by">{l.grantedBy}</Td>
+              {closed ? (
+                <>
+                  <Td data-label="Granted">
+                    <Timestamp value={l.grantedAt} />
+                  </Td>
+                  <Td data-label="Ended">
+                    <Timestamp value={l.endedAt} />
+                  </Td>
+                </>
+              ) : (
+                <>
+                  <Td data-label="Granted">
+                    <RelTime fixed value={l.grantedAt} />
+                  </Td>
+                  <Td data-label="Expires">
+                    <RelTime fixed value={l.expiresAt} />
+                  </Td>
+                </>
+              )}
+              {closed && <Td data-label="Took">{took === null ? <Dash /> : formatDuration(took)}</Td>}
               {onEnd && (
                 <Td>
                   <ActionIcon

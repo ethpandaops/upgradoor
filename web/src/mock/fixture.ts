@@ -365,7 +365,6 @@ export function defaultSettings(): Settings {
     readyPeerShare: 0,
     lookupInterval: '5m0s',
     paused: false,
-    deployWindow: '24h0m0s',
   };
 }
 
@@ -1488,7 +1487,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
       ...(fleet === 'large' || fleet === 'huge' ? { maxLeasedPercent: 15 } : {}),
       pauseAfterCanaryImage: true,
       readyPeerShare: 0.25,
-      policyClients: { besu: 'manual' },
+      policyClients: { el: { besu: 'manual' } },
     },
     defaults,
     gateFailing: false,

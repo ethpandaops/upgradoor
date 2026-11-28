@@ -47,6 +47,7 @@ import { attentionItems, type AttentionItem } from '../lib/activity';
 import { gateApprovalNotes } from '../lib/approvals';
 import { formatPercent, percentOf, plural } from '../lib/format';
 import { rolloutActionOf } from '../lib/hostActions';
+import { ROLLOUTS_PLACE } from '../lib/rolloutsView';
 import { approveIntent, armIntent, holdIntent, hostsIntent, scopeIntent } from '../lib/intents';
 import { clearsByItself, splitQueue, workKind, type StageOf } from '../lib/timeline';
 import { clientOf } from './hostRows';
@@ -72,7 +73,11 @@ const IN_PROGRESS_SHOWN = 8;
  * progress, what comes next and what is stuck. Logged out it shows the
  * public part: the gate, the fleet's participation per slot and the images.
  */
-export function OverviewTab({ onOpenTab }: { onOpenTab: (tab: 'hosts' | 'rollouts' | 'settings') => void }) {
+export function OverviewTab({
+  onOpenTab,
+}: {
+  onOpenTab: (tab: 'hosts' | 'rollouts' | 'settings', sub?: string) => void;
+}) {
   const { auth } = useApp();
   const priv = usePrivateAccess();
   const authEnabled = useAuthState(auth).enabled;
@@ -212,7 +217,7 @@ export function OverviewTab({ onOpenTab }: { onOpenTab: (tab: 'hosts' | 'rollout
                       type="button"
                       className="font-medium text-accent hover:underline"
                       onClick={() => {
-                        onOpenTab('rollouts');
+                        onOpenTab('rollouts', ROLLOUTS_PLACE.leases);
                       }}
                     >
                       see the rollouts
@@ -306,8 +311,8 @@ export function OverviewTab({ onOpenTab }: { onOpenTab: (tab: 'hosts' | 'rollout
           onOpenHost={priv ? openHost : undefined}
           onOpenRollouts={
             priv
-              ? () => {
-                  onOpenTab('rollouts');
+              ? place => {
+                  onOpenTab('rollouts', place);
                 }
               : undefined
           }

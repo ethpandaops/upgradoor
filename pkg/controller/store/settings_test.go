@@ -166,7 +166,7 @@ func TestSettingsFieldsCoverEveryField(t *testing.T) {
 		"leaseTtl", "hostStaleAfter", "readinessTimeout", "baselineGrace", "maxConcurrentPulls",
 		"policyImage", "policyPackages", "policyReboot", "paused",
 		"pauseAfterCanaryImage", "pauseAfterCanaryPackages", "pauseAfterCanaryReboot", "readyPeerShare",
-		"lookupInterval", "deployWindow",
+		"lookupInterval",
 		"policyClients", "policyKinds", "actionPolicies",
 	}, keysOf(fields))
 }

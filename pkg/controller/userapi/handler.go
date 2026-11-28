@@ -28,7 +28,7 @@ type Store interface {
 	views.Store
 	authz.Store
 
-	ListPackages(ctx context.Context, filter store.PackageFilter) (*store.PackagePage, error)
+	ListPackages(ctx context.Context, filter *store.PackageFilter) (*store.PackagePage, error)
 	ListSlotParticipation(ctx context.Context, fromSlot uint64) ([]fleet.SlotParticipation, error)
 	SumHostSlotRuns(
 		ctx context.Context, fromSlot, toSlot, gap, minSlots uint64, perSlot []string,

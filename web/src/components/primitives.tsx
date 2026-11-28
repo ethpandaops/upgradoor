@@ -78,24 +78,28 @@ export function Button({ variant = 'default', dense = false, className, type, ..
 /**
  * Table is the table shell; it scrolls horizontally on narrow screens. roomy
  * is the main table of a view: taller rows, cells centred on the row. fixed
- * gives the columns the widths of the header cells.
+ * gives the columns the widths of the header cells. stack turns each row into
+ * a block of labelled lines on a phone; a cell's data-label is its label.
  */
 export function Table({
   children,
   label,
   roomy = false,
   fixed = false,
+  stack = false,
 }: {
   children: ReactNode;
   label: string;
   roomy?: boolean;
   /** fixed: the header's widths lay out the columns, whatever the rows hold. */
   fixed?: boolean;
+  stack?: boolean;
 }) {
   return (
     <div className="overflow-x-auto rounded-lg border border-border bg-surface">
       <table
         aria-label={label}
+        data-stack={stack || undefined}
         className={cx(
           'w-full border-collapse text-left',
           fixed && 'min-w-5xl table-fixed',
@@ -242,7 +246,11 @@ export function Section({ title, aside, children }: { title: ReactNode; aside?: 
 
 /** Dash is the placeholder of an empty cell. */
 export function Dash() {
-  return <span className="text-faint">–</span>;
+  return (
+    <span data-dash className="text-faint">
+      –
+    </span>
+  );
 }
 
 /** TextInput is the one text field style. */
@@ -311,7 +319,7 @@ export function Segmented<T extends string>({
             onChange(o.value);
           }}
           className={cx(
-            'h-6 px-2 text-xs/5 font-medium first:rounded-l-xs last:rounded-r-xs disabled:cursor-not-allowed',
+            'h-6 px-2 text-xs/5 font-medium first:rounded-l-xs last:rounded-r-xs disabled:cursor-not-allowed max-sm:h-10',
             o.value === value ? 'bg-surface-selected text-foreground' : 'text-muted hover:bg-surface-hover',
             disabled && o.value !== value && 'opacity-50'
           )}

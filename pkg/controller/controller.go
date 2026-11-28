@@ -99,6 +99,9 @@ type Config struct {
 	// DefaultSettings are "key=value" overrides of the built-in setting
 	// defaults; keys are the JSON names of fleet.Settings.
 	DefaultSettings []string
+	// DeployWindow is the length of the initial deployment window from the
+	// first start on a fresh store; 0 is no window.
+	DeployWindow time.Duration
 	// Version is the build version.
 	Version string
 	// WebFS is the built web UI.
@@ -161,6 +164,10 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		return nil, fmt.Errorf("controller: --default-setting: %w", err)
 	}
 
+	if cfg.DeployWindow < 0 || cfg.DeployWindow > fleet.MaxDeployWindow {
+		return nil, errors.New("controller: --deploy-window must be between 0 and 720h")
+	}
+
 	c := &controller{
 		log:    log.WithField("package", "controller"),
 		cfg:    *cfg,
@@ -178,16 +185,6 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		UserAgent: "upgradoor-controller/" + cfg.Version,
 		Changed:   func() { c.api.Notify() },
 	})
-	c.scheduler = scheduler.New(log, scheduler.Options{
-		Store:    c.store,
-		Health:   c.health,
-		Liveness: c.beacon.Liveness,
-		Attested: c.beacon.AttestedSlots,
-		Defaults: defaults,
-		NewID:    newID,
-		// The API is built after the scheduler, which is not running yet.
-		Changed: func() { c.api.Notify() },
-	})
 
 	logins := registryauth.Logins{}
 	if cfg.RegistryAuthFile != "" {
@@ -202,6 +199,19 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 	}
 
 	c.lookups = discovery.NewTracker(log, resolver, defaults.LookupInterval.Std(), time.Now)
+
+	c.scheduler = scheduler.New(log, scheduler.Options{
+		Store:        c.store,
+		Health:       c.health,
+		Liveness:     c.beacon.Liveness,
+		Attested:     c.beacon.AttestedSlots,
+		Defaults:     defaults,
+		DeployWindow: cfg.DeployWindow,
+		NewID:        newID,
+		Lookups:      c.lookups,
+		// The API is built after the scheduler, which is not running yet.
+		Changed: func() { c.api.Notify() },
+	})
 
 	sources := make(map[string]upstream.Source, len(cfg.ImageSources))
 
@@ -291,7 +301,7 @@ func (c *controller) startDeployWindow(ctx context.Context) error {
 	}
 
 	log.Info("Initial deployment window not armed: only Ansible deploys are leased " +
-		"until it ends (setting deployWindow) or is armed")
+		"until it ends (--deploy-window) or is armed")
 
 	return nil
 }

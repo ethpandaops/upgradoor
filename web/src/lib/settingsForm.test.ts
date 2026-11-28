@@ -4,16 +4,14 @@ import { defaultSettings } from '../mock/fixture';
 import type { SettingsBody } from '../api/types';
 import golden from '../api/wire.golden.json';
 import {
-  ELSEWHERE,
   FIELDS,
-  GROUPS,
-  ROLLOUT_KINDS,
   changedSettings,
   errorField,
   fieldSpec,
   fromForm,
-  groupKeys,
+  kindPolicy,
   kindRows,
+  teamRows,
   sameValue,
   toForm,
   validateField,
@@ -91,41 +89,12 @@ describe('the baseline grace and the pull limit', () => {
     expect(fromForm({ ...toForm(defaultSettings()), maxConcurrentPulls: '0' }).maxConcurrentPulls).toBe(0);
   });
 
-  it('sit next to the readiness timeout and the host limit', () => {
-    const keys = (id: string) => GROUPS.find(g => g.id === id)?.keys ?? [];
-    expect(keys('timeouts').slice(-2)).toEqual(['readinessTimeout', 'baselineGrace']);
-    expect(keys('limits')).toContain('maxConcurrentPulls');
-  });
-
   it('find the setting a message names first', () => {
     expect(errorField('baselineGrace must be between readyStableFor and readinessTimeout')).toBe('baselineGrace');
   });
 });
 
-describe('the groups of the settings page', () => {
-  // The settings as the controller answers them (written by TestWireFiles in
-  // pkg/controller/userapi): a setting the controller gains and the page does not
-  // place fails here.
-  const served = Object.keys((golden.rest.settings as { settings: object }).settings).sort();
-
-  it('place every setting the controller has exactly once', () => {
-    const placed: string[] = GROUPS.flatMap(groupKeys);
-
-    // A setting is a field of the form, or it is named as edited elsewhere
-    // (the image policy per client, on the Clients tab); never both, never neither.
-    expect([...placed, ...ELSEWHERE].sort()).toEqual(served);
-    expect(new Set(placed).size).toBe(placed.length);
-    expect([...FIELDS.map(f => f.key), ...ELSEWHERE].sort()).toEqual(served);
-  });
-
-  it('put the canary switch of a kind next to its policy', () => {
-    for (const kind of ROLLOUT_KINDS) {
-      expect(fieldSpec(kind.policy).kind).toBe('policy');
-      expect(fieldSpec(kind.canary).kind).toBe('switch');
-    }
-    expect(GROUPS.filter(g => g.kinds)).toHaveLength(1);
-  });
-
+describe('the settings form', () => {
   it('find the setting a message of the controller is about', () => {
     expect(errorField('minPeers must be at least 1')).toBe('minPeers');
     expect(errorField('leaseTTL must be at least 1m')).toBe('leaseTtl');
@@ -169,5 +138,45 @@ describe('the policy per kind', () => {
     expect(validateField(kinds, '{"none":"manual"}')).toBe('none is not a kind');
     expect(validateField(kinds, '{"cl":"sometimes"}')).toBe('must be an object of kind to auto or manual');
     expect(validateField(kinds, '{"cl":"manual"}')).toBeNull();
+  });
+});
+
+describe('the policy per team', () => {
+  const teams = fieldSpec('policyClients');
+
+  it('lists the teams of each kind, and those with a policy under it', () => {
+    const rows = teamRows(
+      [
+        { name: 'lighthouse', kinds: ['cl', 'vc', 'cl'] },
+        { name: 'geth', kinds: ['el'] },
+        { name: 'exporter', kinds: [''] },
+      ],
+      { cl: { gone: 'manual' }, el: { geth: 'auto' } }
+    );
+    expect(Object.fromEntries(rows)).toEqual({
+      cl: ['gone', 'lighthouse'],
+      vc: ['lighthouse'],
+      el: ['geth'],
+      other: ['exporter'],
+    });
+  });
+
+  it('inherits the kind, which inherits the image policy', () => {
+    const form = { ...toForm(defaultSettings()), policyImage: 'manual', policyKinds: '{"cl":"auto"}' };
+    expect(kindPolicy(form, 'cl')).toBe('auto');
+    expect(kindPolicy(form, 'el')).toBe('manual');
+  });
+
+  it('is sent as a whole map and says what is set', () => {
+    const stored = defaultSettings();
+    const form = { ...toForm(stored), policyClients: '{"vc":{},"cl":{"teku":"auto","lighthouse":"manual"}}' };
+    expect(changedSettings(form, stored)).toEqual({ policyClients: { cl: { lighthouse: 'manual', teku: 'auto' } } });
+    expect(sameValue(teams, '{"el":{}}', '{}')).toBe(true);
+    expect(valueText(teams, '{}')).toBe('every team inherits');
+    expect(valueText(teams, form.policyClients)).toBe('lighthouse cl manual, teku cl auto');
+    expect(validateField(teams, '{"el":{"geth":"later"}}')).toBe(
+      'must be an object of kind to an object of team to auto or manual'
+    );
+    expect(validateField(teams, '{"geth":"manual"}')).not.toBeNull();
   });
 });

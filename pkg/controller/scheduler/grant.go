@@ -477,6 +477,10 @@ func (g *granter) evaluate(r *fleet.Rollout, hv *hostView) (v verdict, granted [
 		return verdict{rank: rankPull, reason: reasonPull}, nil, false
 	}
 
+	if v = g.p.tagMoveVerdict(hv.h.Name, needs); v.rank != rankGrantable {
+		return v, nil, false
+	}
+
 	// Independent containers touch neither the node nor the network: the
 	// gate does not hold them back. Nor does it hold back a rollout a person
 	// let pass it. A rollout a person approved passes it with one host at a
@@ -814,9 +818,9 @@ func (p *pass) pulling() int {
 // deployWindow is the state of the initial deployment window at the pass.
 func (p *pass) deployWindow() DeployWindow {
 	w := &p.w.DeployWindow
-	d := DeployWindow{Open: w.Open(p.now, p.set.DeployWindow.Std()), ArmedAt: w.ArmedAt}
+	d := DeployWindow{Open: w.Open(p.now), ArmedAt: w.ArmedAt}
 
-	if end := w.End(p.set.DeployWindow.Std()); !end.IsZero() {
+	if end := w.End(); !end.IsZero() {
 		d.Until = &end
 	}
 

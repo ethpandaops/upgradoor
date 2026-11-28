@@ -11,7 +11,7 @@ describe('ActionPolicies', () => {
     const h = await createHarness({ mode: 'auth', loggedIn: true });
     renderWithApp(<SettingsTab />, h);
 
-    const group = await screen.findByRole('group', { name: 'Policy: host actions' });
+    const group = await screen.findByRole('group', { name: 'Action policies' });
     const pressed = (action: string) =>
       within(within(group).getByRole('group', { name: `Policy of the action ${action}` })).getByRole('button', {
         pressed: true,
@@ -21,19 +21,19 @@ describe('ActionPolicies', () => {
         within(group)
           .getAllByRole('listitem')
           .map(li => li.textContent)
-      ).toEqual(['docker-pruneautomanual', 'prune-beacon-dbautomanual', 'security-upgradesautomanual']);
+      ).toEqual(['docker-pruneAutoManual', 'prune-beacon-dbAutoManual', 'security-upgradesAutoManual']);
     });
-    expect(pressed('security-upgrades')).toHaveTextContent('manual');
-    expect(group).toHaveTextContent('every action manual');
+    expect(pressed('security-upgrades')).toHaveTextContent('Manual');
 
     await user.click(
       within(within(group).getByRole('group', { name: 'Policy of the action docker-prune' })).getByRole('button', {
-        name: 'auto',
+        name: 'Auto',
       })
     );
-    expect(pressed('docker-prune')).toHaveTextContent('auto');
+    expect(pressed('docker-prune')).toHaveTextContent('Auto');
+    expect(group).toHaveTextContent('changed');
     expect(screen.getByRole('list', { name: 'Changes to save' })).toHaveTextContent(
-      'Policy: host actions every action manual → docker-prune auto'
+      'Action policies every action manual → docker-prune auto'
     );
 
     await user.click(screen.getByRole('button', { name: 'Save' }));

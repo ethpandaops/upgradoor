@@ -94,12 +94,11 @@ type ClientImage struct {
 type ClientView struct {
 	Name  string      `json:"name"`
 	Layer ClientLayer `json:"layer"`
-	// Policy is the client's own image policy (policyClients); PolicySet is
-	// false and Policy empty when it has none. DefaultPolicies is what the
-	// image rollouts of each kind of the client answer to without one
-	// (fleet.Settings.KindPolicy).
-	Policy          fleet.Policy                            `json:"policy"`
-	PolicySet       bool                                    `json:"policySet"`
+	// Policies are the client's own image policies per kind of its images
+	// (policyClients); a kind without one is not listed. DefaultPolicies is
+	// what the image rollouts of each kind of the client answer to without
+	// one (fleet.Settings.KindPolicy).
+	Policies        map[protocol.ContainerKind]fleet.Policy `json:"policies"`
 	DefaultPolicies map[protocol.ContainerKind]fleet.Policy `json:"defaultPolicies"`
 	// Images are the configured image references of the client's
 	// containers, by kind and reference.
@@ -204,15 +203,18 @@ func NewClientIndex(hosts []HostSummary, settings *fleet.Settings) *ClientIndex 
 			Layer: cmp.Or(layers[name], LayerExecution),
 			Hosts: len(rows),
 		}
-		view.Policy, view.PolicySet = settings.PolicyClients[name]
-
 		view.count(rows)
 		view.Images = clientImages(rows)
+		view.Policies = make(map[protocol.ContainerKind]fleet.Policy, len(view.Images))
 		view.DefaultPolicies = make(map[protocol.ContainerKind]fleet.Policy, len(view.Images))
 
 		for i := range view.Images {
 			kind := view.Images[i].Kind
 			view.DefaultPolicies[kind], _ = settings.KindPolicy(kind)
+
+			if p, ok := settings.PolicyClients.Get(kind, name); ok {
+				view.Policies[kind] = p
+			}
 		}
 
 		view.Version = clientVersion(rows)

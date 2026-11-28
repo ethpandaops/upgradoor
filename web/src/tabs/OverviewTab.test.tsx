@@ -353,7 +353,8 @@ describe('OverviewTab, what happened in a span of the graph', () => {
 
     // From the panel to the host and to the rollouts.
     await user.click(within(panel).getByRole('button', { name: 'Rollouts →' }));
-    expect(onOpenTab).toHaveBeenCalledWith('rollouts');
+    // It opens the list that holds the lease of the span.
+    expect(onOpenTab).toHaveBeenCalledWith('rollouts', expect.stringMatching(/^leases(\/recent)?$/));
     await user.click(
       within(panel).getAllByRole('button', { name: /^(?!Rollouts)[a-z]+-[a-z]+-\d+$/ })[0] as HTMLElement
     );

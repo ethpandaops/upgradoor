@@ -1640,10 +1640,8 @@ func TestImageRolloutPerClient(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxUnavailablePercent = 50 // room for a canary per client
 	b.w.Settings.MaxLeasedPercent = 50
-	b.w.Settings.PolicyClients = make(fleet.ClientPolicies, len(clients))
-
 	for _, tt := range clients {
-		b.w.Settings.PolicyClients[tt.client] = tt.policy
+		b.w.Settings.PolicyClients = b.w.Settings.PolicyClients.With(testKind(image), tt.client, tt.policy)
 
 		for _, name := range []string{tt.client + "-1", tt.client + "-2"} {
 			c := container("cl", image, digestOld, digestA, b.w.Now)

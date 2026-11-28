@@ -651,6 +651,8 @@ func (p *pass) endLease(l *fleet.Lease, state fleet.LeaseState) {
 	if hv := p.hosts[l.Host]; hv != nil && hv.lease == l {
 		hv.lease = nil
 	}
+
+	p.noteTagMoves(l)
 }
 
 // chargeHost charges the host of a node lease that failed after it may have

@@ -1,6 +1,7 @@
 import { list, type Lease, type Outage, type Rollout, type Rollouts, type SlotRow } from '../api/types';
 import { usePrivateAccess } from '../appContext';
 import { formatDuration, percentOf, plural, shortRevision } from '../lib/format';
+import { leasePlace } from '../lib/rolloutsView';
 import { Digest, ShortId } from './Digest';
 import { Drawer } from './Drawer';
 import { useLive } from './Live';
@@ -103,7 +104,8 @@ export function OutagePanel({
   now: number;
   onClose: () => void;
   onOpenHost?: (host: string) => void;
-  onOpenRollouts?: () => void;
+  /** onOpenRollouts opens the Rollouts tab at a place: the list that holds the leases of the span. */
+  onOpenRollouts?: (place: string) => void;
 }) {
   const priv = usePrivateAccess();
   const rollouts = useLive('rollouts', priv).data;
@@ -227,7 +229,17 @@ export function OutagePanel({
             </Section>
 
             {onOpenRollouts && (
-              <Button className="self-start" onClick={onOpenRollouts}>
+              <Button
+                className="self-start"
+                onClick={() => {
+                  onOpenRollouts(
+                    leasePlace(
+                      list(causes).flatMap(o => (o.lease ? [o.lease] : [])),
+                      rollouts
+                    )
+                  );
+                }}
+              >
                 Rollouts →
               </Button>
             )}

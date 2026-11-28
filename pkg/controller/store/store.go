@@ -56,7 +56,7 @@ type Store interface {
 	// ListPackages returns one page of the installed packages, one entry
 	// per name: all of them, or those whose name contains the filter's
 	// query. See PackageFilter for the order and the paging.
-	ListPackages(ctx context.Context, filter PackageFilter) (*PackagePage, error)
+	ListPackages(ctx context.Context, filter *PackageFilter) (*PackagePage, error)
 
 	// SaveSlotParticipation upserts slot rows and replaces their per-host
 	// rows.
@@ -151,6 +151,62 @@ type SyncResult struct {
 type PackageMatch struct {
 	Name     string           `json:"name"`
 	Versions []PackageVersion `json:"versions"`
+	// Upgrades are the candidates apt offers the hosts, from the upgradable
+	// lists of their inventories; empty when every host is up to date.
+	Upgrades []PackageUpgrade `json:"upgrades"`
+}
+
+// PackageUpgrade is one candidate offered to the hosts on one installed
+// version.
+type PackageUpgrade struct {
+	Current   string `json:"current"`
+	Candidate string `json:"candidate"`
+	// Security is set when the candidate comes from a security origin on
+	// any of the hosts.
+	Security bool `json:"security"`
+	// Blocked is set when the package is in the blocked set of any of the
+	// hosts: upgradoor, not unattended-upgrades, upgrades it.
+	Blocked bool `json:"blocked"`
+	// Count is the number of hosts; Hosts lists them, unless the page is
+	// compact.
+	Count int      `json:"count"`
+	Hosts []string `json:"hosts"`
+}
+
+// PackageShow narrows a package list.
+type PackageShow string
+
+const (
+	// PackageShowAll lists every name.
+	PackageShowAll PackageShow = ""
+	// PackageShowDiffering lists names installed in more than one version.
+	PackageShowDiffering PackageShow = "differing"
+	// PackageShowOutdated lists names with an upgrade candidate on a host.
+	PackageShowOutdated PackageShow = "outdated"
+	// PackageShowSecurity lists names with a security upgrade on a host.
+	PackageShowSecurity PackageShow = "security"
+)
+
+// PackageSort orders a package list.
+type PackageSort string
+
+const (
+	// PackageSortName orders by name; with a query, by rank, then name.
+	PackageSortName PackageSort = ""
+	// PackageSortVersions puts the names with the most versions first.
+	PackageSortVersions PackageSort = "versions"
+	// PackageSortHosts puts the names on the most hosts first.
+	PackageSortHosts PackageSort = "hosts"
+	// PackageSortOutdated puts the names with the most outdated hosts first.
+	PackageSortOutdated PackageSort = "outdated"
+)
+
+// PackageCounts is the number of names a query selects under each show.
+type PackageCounts struct {
+	All       int `json:"all"`
+	Differing int `json:"differing"`
+	Outdated  int `json:"outdated"`
+	Security  int `json:"security"`
 }
 
 // PackageFilter selects a page of package names.
@@ -169,6 +225,13 @@ type PackageFilter struct {
 	// Limit bounds the names of the page (0 means
 	// DefaultPackageSearchLimit, at most MaxPackageSearchLimit).
 	Limit int
+	// Show narrows the names; Sort orders them. A non-name sort keeps the
+	// query's rank first, then the count descending, then the name.
+	Show PackageShow
+	Sort PackageSort
+	// Compact leaves out the hosts of each name's most common version and
+	// of its upgrades; their counts stay.
+	Compact bool
 }
 
 // PackagePage is one page of package names.
@@ -177,6 +240,9 @@ type PackagePage struct {
 	// Total is the number of names the filter selects. It is counted for
 	// the first page only (After empty) and -1 otherwise.
 	Total int
+	// Counts is the number of names the query selects under each show;
+	// first page only.
+	Counts *PackageCounts
 	// Next continues after this page; empty when it is the last one.
 	Next string
 }
@@ -186,8 +252,11 @@ var ErrBadCursor = errors.New("store: not a page cursor")
 
 // PackageVersion is one installed version and the hosts on it.
 type PackageVersion struct {
-	Version string   `json:"version"`
-	Hosts   []string `json:"hosts"`
+	Version string `json:"version"`
+	// Count is the number of hosts; Hosts lists them, unless the page is
+	// compact and this is the name's most common version.
+	Count int      `json:"count"`
+	Hosts []string `json:"hosts"`
 }
 
 // RolloutFilter selects rollouts.

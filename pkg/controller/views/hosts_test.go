@@ -66,7 +66,7 @@ func TestNewHostUsage(t *testing.T) {
 // none.
 func TestRolloutsPolicySource(t *testing.T) {
 	st, sched := controllertest.NewStore(), controllertest.NewScheduler()
-	sched.CurrentSettings.PolicyClients = fleet.ClientPolicies{"geth": fleet.PolicyManual}
+	sched.CurrentSettings.PolicyClients = fleet.ClientPolicies{"el": {"geth": fleet.PolicyManual}}
 	sched.CurrentSettings.PolicyKinds = fleet.KindPolicies{"cl": fleet.PolicyManual}
 
 	st.Rollouts = []*fleet.Rollout{

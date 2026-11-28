@@ -19,6 +19,8 @@ import type {
   Images,
   ImagesRefresh,
   Packages,
+  PackageShow,
+  PackageSort,
   SlotHistory,
   RebootRequest,
   RollRequest,
@@ -261,10 +263,19 @@ export class ApiClient {
 
   /**
    * packages asks for one page of the fleet's packages: all of them, or those
-   * whose name contains q. after is the `next` of the page before.
+   * whose name contains q, narrowed by show and ordered by sort. after is
+   * the `next` of the page before; compact leaves out the hosts of each
+   * name's most common version and of its upgrades.
    */
-  packages(page: { q?: string; limit?: number; after?: string }, signal?: AbortSignal): Promise<Packages> {
-    return this.request(`/api/v1/packages${query({ ...page })}`, { user: true, signal });
+  packages(
+    page: { q?: string; limit?: number; after?: string; show?: PackageShow; sort?: PackageSort; compact?: boolean },
+    signal?: AbortSignal
+  ): Promise<Packages> {
+    const { compact, ...rest } = page;
+    return this.request(`/api/v1/packages${query({ ...rest, compact: compact ? '1' : undefined })}`, {
+      user: true,
+      signal,
+    });
   }
 
   /**

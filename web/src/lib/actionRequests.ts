@@ -89,13 +89,14 @@ export function buildEndLeaseRequest(lease: string, reason: string): EndLeaseReq
   return { lease, reason: reason.trim() };
 }
 
-/** buildClientPolicyRequest builds the body of client-policy; an empty policy returns the client to the default. */
+/** buildClientPolicyRequest builds the body of client-policy; an empty policy returns the client's containers of the kind to the kind's policy. */
 export function buildClientPolicyRequest(
   client: string,
+  kind: string,
   policy: ClientPolicyRequest['policy'],
   reason: string
 ): ClientPolicyRequest {
-  return { client, policy, reason: reason.trim() };
+  return { client, kind: kind || 'other', policy, reason: reason.trim() };
 }
 
 /** buildScopeRequest builds the body of pause, resume and abort; an empty rollout is the global scope. */
@@ -245,22 +246,22 @@ export function describeCall(call: ActionCall): string[] {
           'until somebody retries it. No hold is set: hold the host if it is to be left alone.',
       ];
     case 'client-policy': {
-      const { client, policy } = call.body;
+      const { client, kind, policy } = call.body;
       if (policy === '') {
         return [
-          `Remove the image policy of ${client}: its image rollouts answer to the policy of their kind, else the policy for images, again.`,
+          `Remove the image policy of ${client} for ${kind}: its image rollouts of that kind answer to the policy of the kind, else the policy for images, again.`,
           'An open rollout that was approved stays approved.',
         ];
       }
       return [
-        `Set the image policy of ${client} to ${policy}: ` +
+        `Set the image policy of ${client} for ${kind} to ${policy}: ` +
           (policy === 'manual'
-            ? 'a new image of the client is queued and waits for a person to approve the rollout.'
-            : 'a new image of the client rolls out by itself.'),
+            ? `a new image of its ${kind} containers is queued and waits for a person to approve the rollout.`
+            : `a new image of its ${kind} containers rolls out by itself.`),
         policy === 'manual'
-          ? 'An open image rollout of the client that nobody approved waits for approval from now on; one that was approved stays approved.'
-          : 'An open image rollout of the client that waits for approval starts.',
-        'The other clients, packages and reboots keep their policies.',
+          ? 'An open image rollout of them that nobody approved waits for approval from now on; one that was approved stays approved.'
+          : 'An open image rollout of them that waits for approval starts.',
+        'Its other kinds, the other clients, packages and reboots keep their policies.',
       ];
     }
     case 'image-override': {

@@ -82,7 +82,8 @@ type Service interface {
 	ImageOverride(ctx context.Context, actor string, req ImageOverrideRequest) (*ActionResult, error)
 	FlagOverride(ctx context.Context, actor string, req FlagOverrideRequest) (*ActionResult, error)
 	ClientOverride(ctx context.Context, actor string, req ClientOverrideRequest) (*ActionResult, error)
-	// SetClientPolicy sets the image policy of one client, or returns the
+	// SetClientPolicy sets the image policy of one client's containers of a
+	// kind, or returns the
 	// client to the global default (policyImage).
 	SetClientPolicy(ctx context.Context, actor string, req ClientPolicyRequest) (*ActionResult, error)
 	// Pause pauses everything (no Rollout) or one rollout; Resume lifts the
@@ -271,8 +272,11 @@ const (
 type ClientPolicyRequest struct {
 	// Client is the client name, as the agents report it.
 	Client string `json:"client"`
-	// Policy is "auto" or "manual"; empty returns the client to the global
-	// default (policyImage).
+	// Kind is the container kind the policy is for (fleet.KindOther for
+	// unlabelled containers).
+	Kind string `json:"kind"`
+	// Policy is "auto" or "manual"; empty returns the client's containers of
+	// the kind to the kind's policy.
 	Policy fleet.Policy `json:"policy"`
 	Reason string       `json:"reason"`
 }
@@ -345,7 +349,7 @@ type Plan struct {
 // (fleet.Rollout.Deployed).
 type DeployWindow struct {
 	Open bool `json:"open"`
-	// Until is when the window closes by time; nil when the setting is 0 or
+	// Until is when the window closes by time; nil when its length is 0 or
 	// the store holds no window.
 	Until *time.Time `json:"until,omitempty"`
 	// ArmedAt is when the window was armed; nil while not armed.
@@ -426,7 +430,7 @@ type WaitKind string
 
 // Wait kinds. Budget, host limit, pulls and order clear by themselves as the
 // rollout proceeds; pull clears when the agent lets a failed pull be tried
-// again; working clears when the operation the host works on without a lease
+// again, or when the tag the host saw move on was looked up again; working clears when the operation the host works on without a lease
 // is over; gate clears when the network recovers; deploy-window clears when
 // the window ends; the others need somebody to act.
 const (

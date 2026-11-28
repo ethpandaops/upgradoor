@@ -878,12 +878,16 @@ function ClientConfig({
             {client.layer} client · {plural(client.hosts, 'host')}
           </span>
         </div>
-        <PolicySetting client={client} onAction={onAction} />
       </div>
 
       <div className="grid gap-3 lg:grid-cols-2">
         {kinds.map(kind => (
-          <KindConfig key={kind} kind={kind} images={list(client.images).filter(i => i.kind === kind)} />
+          <KindConfig
+            key={kind}
+            kind={kind}
+            images={list(client.images).filter(i => i.kind === kind)}
+            policy={<PolicySetting client={client} kind={kind} onAction={onAction} />}
+          />
         ))}
       </div>
 
@@ -943,8 +947,16 @@ function withCommands(client: ClientView, rest: readonly ClientView[] | undefine
   };
 }
 
-/** KindConfig is the configuration of one kind of container of the client: image and tag target. */
-function KindConfig({ kind, images }: { kind: ContainerKind; images: readonly ClientImage[] }) {
+/** KindConfig is the configuration of one kind of container of the client: image and tag target, and its roll policy. */
+function KindConfig({
+  kind,
+  images,
+  policy,
+}: {
+  kind: ContainerKind;
+  images: readonly ClientImage[];
+  policy: ReactNode;
+}) {
   // The reference most hosts follow first; other references (a host configured apart) are listed under it.
   const main = mainImage(images);
   if (!main) return null;
@@ -982,6 +994,7 @@ function KindConfig({ kind, images }: { kind: ContainerKind; images: readonly Cl
           </span>
         ))}
       </div>
+      {policy}
     </div>
   );
 }
@@ -1026,27 +1039,35 @@ function DeviationChip({
   );
 }
 
-/** PolicyChoice is the client's own image policy, or inherit: it follows the default. */
+/** PolicyChoice is the client's own image policy for a kind, or inherit: it follows the kind's. */
 type PolicyChoice = Policy | 'inherit';
 
 /**
- * PolicySetting is the image policy of the client, a setting of its header:
- * inherit (the default, named), automatic or manual. It is disabled, and says
- * why, for a login that may not set it.
+ * PolicySetting is the image policy of the client's containers of one kind:
+ * inherit (the kind's policy, named), automatic or manual. It is disabled,
+ * and says why, for a login that may not set it.
  */
-function PolicySetting({ client, onAction }: { client: ClientView; onAction: (intent: ActionIntent) => void }) {
+function PolicySetting({
+  client,
+  kind,
+  onAction,
+}: {
+  client: ClientView;
+  kind: ContainerKind;
+  onAction: (intent: ActionIntent) => void;
+}) {
   const permissions = usePermissions();
-  const defaults = inheritedPolicies(client);
-  const value: PolicyChoice = client.policy === '' ? 'inherit' : client.policy;
+  const own = (client.policies as Partial<Record<ContainerKind, Policy>>)[kind];
+  const inherited = (client.defaultPolicies as Partial<Record<ContainerKind, Policy>>)[kind] ?? 'auto';
+  const value: PolicyChoice = own ?? 'inherit';
+  const label = KIND_LABEL[kind] ?? (kind || 'other');
 
-  const verdict = permissions.canIntent(clientPolicyIntent(client.name, client.policy));
+  const verdict = permissions.canIntent(clientPolicyIntent(client.name, kind, own ?? ''));
   const options: { value: PolicyChoice; label: string; title: string }[] = [
     {
       value: 'inherit',
-      label: `Inherit (${inheritText(defaults)})`,
-      title: verdict.allowed
-        ? `Follow the default of each kind for images, now ${inheritText(defaults)}`
-        : verdict.reason,
+      label: `Inherit (${POLICY_LABEL[inherited].toLowerCase()})`,
+      title: verdict.allowed ? `Follow the image policy of the kind ${kind || 'other'}` : verdict.reason,
     },
     ...POLICIES.map(p => ({
       value: p,
@@ -1056,43 +1077,27 @@ function PolicySetting({ client, onAction }: { client: ClientView; onAction: (in
   ];
 
   return (
-    <div role="group" aria-label="Roll policy" className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs/5">
-      <span className="text-sm/6 font-medium" title={POLICIES.map(p => `${p}: ${POLICY_MEANING[p]}`).join('\n')}>
+    <div
+      role="group"
+      aria-label={`Roll policy: ${kind || 'other'}`}
+      className="flex flex-wrap items-center gap-x-3 gap-y-1 border-t border-border pt-2 text-xs/5"
+    >
+      <span className="font-medium" title={POLICIES.map(p => `${p}: ${POLICY_MEANING[p]}`).join('\n')}>
         Roll policy
       </span>
       <Segmented<PolicyChoice>
-        label={`Roll policy of ${client.name}`}
+        label={`Roll policy of ${client.name} ${label}`}
         value={value}
         disabled={!verdict.allowed}
         options={options}
         onChange={choice => {
-          if (choice !== value) onAction(clientPolicyIntent(client.name, choice === 'inherit' ? '' : choice));
+          if (choice !== value) onAction(clientPolicyIntent(client.name, kind, choice === 'inherit' ? '' : choice));
         }}
       />
-      <span className="text-muted">{policyMeaning(value, defaults)}</span>
+      <span className="text-muted">{POLICY_MEANING[own ?? inherited]}</span>
       {!verdict.allowed && <span className="text-muted">Read only: {verdict.reason}.</span>}
     </div>
   );
-}
-
-/** inheritedPolicies are the image policies the client's kinds follow without one of its own, in the page's order of kinds. */
-function inheritedPolicies(client: ClientView): [string, Policy][] {
-  const defaults = client.defaultPolicies;
-  return clientKinds(client).flatMap(kind => (defaults[kind] ? [[kind, defaults[kind]] as [string, Policy]] : []));
-}
-
-/** inheritText names what inherit means: one policy when the kinds agree, else the policy of each kind. */
-function inheritText(defaults: readonly [string, Policy][]): string {
-  const policies = new Set(defaults.map(([, p]) => p));
-  if (policies.size <= 1) return POLICY_LABEL[[...policies][0] ?? 'auto'].toLowerCase();
-  return defaults.map(([kind, p]) => `${kind} ${p}`).join(', ');
-}
-
-/** policyMeaning says what the chosen policy does. */
-function policyMeaning(value: PolicyChoice, defaults: readonly [string, Policy][]): string {
-  if (value !== 'inherit') return POLICY_MEANING[value];
-  const policies = new Set(defaults.map(([, p]) => p));
-  return policies.size === 1 ? POLICY_MEANING[[...policies][0] as Policy] : 'each kind follows its own default';
 }
 
 // -------------------------------------------------------------------- rows

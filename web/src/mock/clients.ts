@@ -61,7 +61,7 @@ export function imagePolicy(
   team: string | undefined,
   kind: string | undefined
 ): [Policy, PolicySource] {
-  const own = team ? settings.policyClients[team] : undefined;
+  const own = team ? settings.policyClients[kind || 'other']?.[team] : undefined;
   return own ? [own, 'client'] : kindPolicy(settings, kind);
 }
 
@@ -284,8 +284,12 @@ export function clientIndex(hosts: readonly HostSummary[], settings: Settings): 
     views.push({
       name,
       layer: consensus ? 'consensus' : 'execution',
-      policy: settings.policyClients[name] ?? '',
-      policySet: name in settings.policyClients,
+      policies: Object.fromEntries(
+        clientImages.flatMap(i => {
+          const p = settings.policyClients[i.kind || 'other']?.[name];
+          return p ? [[i.kind, p]] : [];
+        })
+      ),
       defaultPolicies: Object.fromEntries(clientImages.map(i => [i.kind, kindPolicy(settings, i.kind)[0]])),
       images: clientImages,
       hosts: rows.length,

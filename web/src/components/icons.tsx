@@ -87,7 +87,7 @@ export function IconButton({
         disabled={disabled}
         onClick={onClick}
         className={cx(
-          'inline-flex size-7 items-center justify-center rounded-sm border border-transparent',
+          'inline-flex size-7 items-center justify-center rounded-sm border border-transparent max-sm:size-10',
           'disabled:cursor-not-allowed disabled:opacity-35',
           tone === 'danger'
             ? 'text-danger hover:enabled:border-danger hover:enabled:bg-danger-subtle'

@@ -3,7 +3,6 @@ import { useCallback, useEffect, useMemo, useState } from 'react';
 import { list, type HostListing, type PublicImageRef } from '../api/types';
 import { useApp, useAuthState, usePrivateAccess } from '../appContext';
 import { useActions, type ActionIntent } from '../components/ActionDialog';
-import { SecurityUpdates } from '../components/HostActions';
 import { usePermissions } from '../components/Permissions';
 import { Digest } from '../components/Digest';
 import { useLive } from '../components/Live';
@@ -148,7 +147,7 @@ export function HostsTab() {
     return selection.filter(n => !visible.has(n));
   }, [rows, selection]);
   const allVisibleSelected = visibleNames.length > 0 && visibleNames.every(n => selected.has(n));
-  const columnCount = priv ? (hostDetails ? 15 : 10) : 6;
+  const columnCount = priv ? (hostDetails ? 17 : 12) : 8;
   const rollSelection: ActionIntent = {
     kind: 'roll',
     hosts: selection,
@@ -307,8 +306,14 @@ export function HostsTab() {
                 </Th>
               )}
               <SortTh columns={[sortColumn('name', 'Host')]} />
+              <Th tight title="Execution client">
+                <span className="sr-only">Execution client</span>
+              </Th>
               <SortTh columns={[sortColumn('el', 'Execution')]} />
               <Th title="The digest of the execution client's image">EL digest</Th>
+              <Th tight title="Consensus client">
+                <span className="sr-only">Consensus client</span>
+              </Th>
               <SortTh columns={[sortColumn('cl', 'Consensus')]} />
               <Th title="The digest of the consensus client's image">CL digest</Th>
               {priv ? (
@@ -359,7 +364,6 @@ export function HostsTab() {
                 onOpen={() => {
                   setOpenHost(openHost === row.name ? '' : row.name);
                 }}
-                onAction={actions.request}
               />
             ))}
           </tbody>
@@ -390,7 +394,6 @@ function HostTableRow({
   open,
   onSelect,
   onOpen,
-  onAction,
 }: {
   row: HostRow;
   priv: boolean;
@@ -399,7 +402,6 @@ function HostTableRow({
   open: boolean;
   onSelect: () => void;
   onOpen: () => void;
-  onAction: (intent: ActionIntent) => void;
 }) {
   const s = row.summary;
 
@@ -467,14 +469,32 @@ function HostTableRow({
               ))}
         </span>
       </Td>
+      <Td tight>
+        {row.elClient ? (
+          <span title="Execution client">
+            <ClientBadge name={row.elClient} />
+          </span>
+        ) : (
+          <Dash />
+        )}
+      </Td>
       <Td>
-        <ClientImage client={row.elClient} image={row.el} />
+        <Image image={row.el} />
       </Td>
       <Td>
         <Digest value={row.el?.digest} />
       </Td>
+      <Td tight>
+        {row.clClient ? (
+          <span title="Consensus client">
+            <ClientBadge name={row.clClient} />
+          </span>
+        ) : (
+          <Dash />
+        )}
+      </Td>
       <Td>
-        <ClientImage client={row.clClient} image={row.cl} />
+        <Image image={row.cl} />
       </Td>
       <Td>
         <Digest value={row.cl?.digest} />
@@ -490,12 +510,7 @@ function HostTableRow({
           )}
         </Td>
       )}
-      {priv &&
-        (s ? (
-          <PrivateCells row={row} summary={s} details={details} onAction={onAction} />
-        ) : (
-          <MissingCells details={details} />
-        ))}
+      {priv && (s ? <PrivateCells row={row} summary={s} details={details} /> : <MissingCells details={details} />)}
     </tr>
   );
 }
@@ -530,13 +545,11 @@ function PrivateCells({
   row,
   summary: s,
   details,
-  onAction,
 }: {
   row: HostRow;
   summary: HostListing;
   /** details: the login reads the system of the hosts (details). */
   details: boolean;
-  onAction: (intent: ActionIntent) => void;
 }) {
   const share = attestingShare(s);
   const state = hostState(row);
@@ -654,7 +667,6 @@ function PrivateCells({
                   reboot
                 </Badge>
               )}
-              <SecurityUpdates host={s} onAction={onAction} />
             </span>
           </Td>
         </>
@@ -675,16 +687,13 @@ function PrivateCells({
   );
 }
 
-/** ClientImage names the client of a container in its colour, with the tag of its image. */
-function ClientImage({ client, image }: { client: string | undefined; image: PublicImageRef | undefined }) {
+/** Image is the tag of a container's image; the full reference is its title. */
+function Image({ image }: { image: PublicImageRef | undefined }) {
   if (!image) return <Dash />;
 
   return (
-    <span className="inline-flex items-center gap-2">
-      <ClientBadge name={client} />
-      <span className="max-w-40 truncate font-mono text-xs/5 2xl:max-w-64" title={image.image}>
-        {displayImage(image.image)}
-      </span>
+    <span className="block max-w-40 truncate font-mono text-xs/5 2xl:max-w-64" title={image.image}>
+      {displayImage(image.image)}
     </span>
   );
 }

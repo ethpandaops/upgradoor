@@ -100,7 +100,7 @@ export function BulkAction({
         disabled={reason !== ''}
         onClick={run}
         className={cx(
-          'inline-flex h-7 items-center gap-1.5 rounded-sm border px-2 text-xs/5 font-medium whitespace-nowrap',
+          'inline-flex h-7 items-center gap-1.5 rounded-sm border px-2 text-xs/5 font-medium whitespace-nowrap max-sm:h-10',
           'disabled:cursor-not-allowed disabled:opacity-40',
           tone === 'danger'
             ? 'border-transparent text-danger enabled:hover:border-danger enabled:hover:bg-danger-subtle'

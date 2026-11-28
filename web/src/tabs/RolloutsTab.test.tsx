@@ -4,6 +4,7 @@ import { describe, expect, it } from 'vitest';
 
 import { list, type Rollout } from '../api/types';
 import { createHarness, PRIMARY, renderWithApp } from '../test/harness';
+import { timestamp } from '../lib/format';
 import { RecentRollouts, RolloutTargets, RolloutsTab, policyText } from './RolloutsTab';
 
 const digest = (c: string) => `sha256:${c.repeat(64)}`;
@@ -147,10 +148,12 @@ describe('RolloutsTab, decisions of a person', () => {
     const h = await createHarness({ mode: 'open' });
     renderWithApp(<RolloutsTab />, h);
 
+    await user.click(await screen.findByRole('tab', { name: /^Leases/ }));
     const leases = await screen.findByRole('table', { name: 'Active leases' });
     await user.click(within(leases).getByRole('button', { name: 'End the lease of lighthouse-geth-2' }));
     await user.click(within(screen.getByRole('dialog')).getByRole('button', { name: 'End the lease' }));
 
+    await user.click(screen.getByRole('tab', { name: /^Open rollouts/ }));
     const card = await screen.findByRole('article', { name: /^lighthouse cl: / });
     await waitFor(() => {
       expect(card).toHaveTextContent('paused (lighthouse-geth-2 cancelled by anonymous)');
@@ -277,6 +280,104 @@ describe('RolloutsTab, a host action', () => {
   });
 });
 
+describe('RolloutsTab, one list at a time', () => {
+  const selected = () => screen.getAllByRole('tab').find(t => t.getAttribute('aria-selected') === 'true');
+
+  it('shows the open rollouts first, with a summary panel for each list', async () => {
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<RolloutsTab />, h);
+
+    await screen.findByRole('article', { name: /^lighthouse cl: / });
+    const list = screen.getByRole('tablist', { name: 'Rollout lists' });
+    const tabs = within(list).getAllByRole('tab');
+    expect(tabs).toHaveLength(3);
+    const scheduler = screen.getByRole('group', { name: 'Scheduler' });
+    expect(list).not.toContainElement(scheduler);
+    expect(within(scheduler).getByRole('button', { name: /Pause all/ })).toBeInTheDocument();
+    const [open, leases, finished] = tabs as [HTMLElement, HTMLElement, HTMLElement];
+    expect(open).toHaveAccessibleName(/^Open rollouts \d+$/);
+    expect(leases).toHaveAccessibleName(/^Leases \d+$/);
+    expect(finished).toHaveAccessibleName(/^Finished rollouts \d+$/);
+    expect(tabs.filter(t => t.getAttribute('aria-selected') === 'true')).toEqual([open]);
+    expect(open).toHaveAccessibleDescription(/\d+ active/);
+    expect(leases).toHaveAccessibleDescription(/\d+ verifying; recently ended: \d+ released/);
+
+    const panel = screen.getByRole('tabpanel');
+    expect(panel).toHaveAttribute('aria-labelledby', open.id);
+    expect(within(panel).queryByRole('table', { name: 'Active leases' })).not.toBeInTheDocument();
+    expect(within(panel).queryByRole('table', { name: 'Recent rollouts' })).not.toBeInTheDocument();
+  });
+
+  it('shows only the list of the chosen panel and keeps it in the URL hash', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<RolloutsTab />, h);
+
+    await user.click(await screen.findByRole('tab', { name: /^Leases/ }));
+    expect(window.location.hash).toBe('#rollouts/leases');
+    expect(selected()).toHaveAccessibleName(/^Leases/);
+    const panel = screen.getByRole('tabpanel');
+    expect(within(panel).getByRole('table', { name: 'Active leases' })).toBeInTheDocument();
+    expect(screen.queryByRole('article')).not.toBeInTheDocument();
+
+    await user.click(within(panel).getByRole('button', { name: /^Recently ended/ }));
+    expect(window.location.hash).toBe('#rollouts/leases/recent');
+    expect(screen.getByRole('table', { name: 'Recent leases' })).toBeInTheDocument();
+
+    await user.click(screen.getByRole('tab', { name: /^Finished rollouts/ }));
+    expect(window.location.hash).toBe('#rollouts/finished');
+    expect(screen.getByRole('table', { name: 'Recent rollouts' })).toBeInTheDocument();
+    expect(screen.queryByRole('table', { name: 'Recent leases' })).not.toBeInTheDocument();
+  });
+
+  it('moves between the panels with the arrow keys, Home and End', async () => {
+    const user = userEvent.setup();
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<RolloutsTab />, h);
+
+    const open = await screen.findByRole('tab', { name: /^Open rollouts/ });
+    expect(open).toHaveAttribute('tabindex', '0');
+    expect(screen.getByRole('tab', { name: /^Leases/ })).toHaveAttribute('tabindex', '-1');
+
+    open.focus();
+    await user.keyboard('{ArrowRight}');
+    expect(screen.getByRole('tab', { name: /^Leases/ })).toHaveFocus();
+    expect(window.location.hash).toBe('#rollouts/leases');
+    await user.keyboard('{End}');
+    expect(screen.getByRole('tab', { name: /^Finished rollouts/ })).toHaveFocus();
+    expect(window.location.hash).toBe('#rollouts/finished');
+    await user.keyboard('{ArrowRight}');
+    expect(screen.getByRole('tab', { name: /^Open rollouts/ })).toHaveFocus();
+    expect(window.location.hash).toBe('#rollouts');
+    await user.keyboard('{ArrowLeft}');
+    expect(selected()).toHaveAccessibleName(/^Finished rollouts/);
+    await user.keyboard('{Home}');
+    expect(selected()).toHaveAccessibleName(/^Open rollouts/);
+  });
+
+  it.each([
+    ['#rollouts/leases', 'Leases', 'Active leases'],
+    ['#rollouts/leases/recent', 'Leases', 'Recent leases'],
+    ['#rollouts/finished', 'Finished rollouts', 'Recent rollouts'],
+  ])('opens at the list a link names: %s', async (hash, tab, table) => {
+    window.location.hash = hash;
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<RolloutsTab />, h);
+
+    expect(await screen.findByRole('table', { name: table })).toBeInTheDocument();
+    expect(selected()).toHaveAccessibleName(new RegExp(`^${tab} \\d+$`));
+  });
+
+  it('opens an unknown place at the open rollouts', async () => {
+    window.location.hash = '#rollouts/nonsense';
+    const h = await createHarness({ mode: 'open' });
+    renderWithApp(<RolloutsTab />, h);
+
+    expect(await screen.findByRole('article', { name: /^lighthouse cl: / })).toBeInTheDocument();
+    expect(selected()).toHaveAccessibleName(/^Open rollouts/);
+  });
+});
+
 describe('RolloutTargets', () => {
   it('names a tag at its digest, and a soft deploy with its container and a changed command line', () => {
     render(
@@ -336,6 +437,25 @@ describe('RecentRollouts', () => {
     const cell = screen.getByRole('cell', { name: title });
     expect(cell).toHaveClass('whitespace-normal', 'wrap-anywhere');
     expect(cell).not.toHaveClass('whitespace-nowrap');
+  });
+});
+
+describe('RecentRollouts, times', () => {
+  it('shows when a rollout opened and ended as local timestamps, not relative to now', () => {
+    const opened = new Date(2026, 10, 27, 23, 58, 2).toISOString();
+    const ended = new Date(2026, 10, 28, 1, 4, 25).toISOString();
+    render(
+      <RecentRollouts
+        rollouts={[rollout({ state: 'completed', createdAt: opened, endedAt: ended })]}
+        leases={new Map()}
+      />
+    );
+
+    const row = screen.getByText('prysm cl').closest('tr') as HTMLElement;
+    expect(within(row).getByText('2026-11-27 23:58:02')).toHaveAttribute('datetime', opened);
+    expect(within(row).getByText('2026-11-28 01:04:25')).toHaveAttribute('datetime', ended);
+    expect(row).not.toHaveTextContent(/ago|just now/);
+    expect(timestamp(ended)).toBe('2026-11-28 01:04:25');
   });
 });
 

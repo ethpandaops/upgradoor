@@ -226,3 +226,70 @@ func TestStartLooksUpAndStopEnds(t *testing.T) {
 	require.NoError(t, f.t.Stop())
 	require.NoError(t, f.t.Stop())
 }
+
+func TestRefreshTagLooksOneTagUpOnceAfterSince(t *testing.T) {
+	f := newFixture(t)
+
+	other := "ethpandaops/lighthouse:unstable"
+	f.reg.set(other, "sha256:lh", nil)
+
+	f.t.Sync("a", []string{image, other}, interval)
+	f.step()
+
+	assert.False(t, f.t.RefreshTag("ethpandaops/reth:main", f.now), "not followed")
+
+	got, ok := f.t.LookedUp("docker.io/" + image)
+	require.True(t, ok)
+	assert.Equal(t, Lookup{Digest: "sha256:one", Started: f.now}, got)
+
+	// A lookup that began after since answers the ask already.
+	assert.True(t, f.t.RefreshTag(image, f.now.Add(-time.Second)))
+	assert.Zero(t, f.step())
+
+	f.reg.set(image, "sha256:two", nil)
+
+	// Within the floor of Refresh, many hosts asking: one lookup, of that tag.
+	f.now = f.now.Add(time.Second)
+	ended := f.now
+
+	for range 3 {
+		assert.True(t, f.t.RefreshTag(image, ended))
+	}
+
+	f.reg.asked = nil
+	f.now = f.now.Add(time.Second)
+	assert.Equal(t, 1, f.step())
+	assert.Equal(t, []string{image}, f.reg.asked)
+
+	got, _ = f.t.LookedUp(image)
+	assert.Equal(t, Lookup{Digest: "sha256:two", Started: f.now}, got)
+
+	assert.True(t, f.t.RefreshTag(image, ended))
+	assert.Zero(t, f.step(), "looked up after since")
+}
+
+func TestARefreshAskedDuringALookupIsNotAnsweredByIt(t *testing.T) {
+	f := newFixture(t)
+
+	f.t.Sync("a", []string{image}, interval)
+	f.step()
+
+	f.now = f.now.Add(time.Minute)
+	f.t.RefreshTag(image, f.now)
+
+	// The next ask comes while the lookup that answers the first is in flight.
+	reg := f.t.resolver
+	f.t.resolver = resolverFunc(func(ctx context.Context, ref string) (string, error) {
+		f.t.resolver = reg
+		f.now = f.now.Add(time.Second)
+		f.t.RefreshTag(image, f.now)
+
+		return reg.Resolve(ctx, ref)
+	})
+
+	assert.Equal(t, 2, f.step(), "looked up again for the later ask")
+}
+
+type resolverFunc func(ctx context.Context, ref string) (string, error)
+
+func (r resolverFunc) Resolve(ctx context.Context, ref string) (string, error) { return r(ctx, ref) }

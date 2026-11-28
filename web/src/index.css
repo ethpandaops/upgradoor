@@ -155,3 +155,63 @@
     background-color: var(--surface-selected-value);
   }
 }
+
+/*
+ * A stacking table (Table stack) below sm: the header is left to assistive
+ * tech and each row is a block, one line per cell with its data-label in
+ * front; a cell that holds only a Dash is left out. Outside a layer, so it
+ * wins over the cells' width and wrap utilities.
+ */
+table[data-stack] {
+  @variant max-sm {
+    & thead {
+      position: absolute;
+      width: 1px;
+      height: 1px;
+      overflow: hidden;
+      clip-path: inset(50%);
+      white-space: nowrap;
+    }
+
+    & tbody,
+    & tr {
+      display: block;
+    }
+
+    & tr {
+      border-bottom: 1px solid var(--border-value);
+      padding-block: --spacing(1.5);
+
+      &:last-child {
+        border-bottom: 0;
+      }
+    }
+
+    & td {
+      display: block;
+      position: relative;
+      width: auto;
+      min-width: 0;
+      border: 0;
+      padding-block: --spacing(0.5);
+      white-space: normal;
+      overflow-wrap: anywhere;
+    }
+
+    & td[data-label]:has(> [data-dash]:only-child) {
+      display: none;
+    }
+
+    & td[data-label] {
+      padding-left: --spacing(24);
+
+      &::before {
+        content: attr(data-label);
+        position: absolute;
+        left: --spacing(2.5);
+        width: --spacing(20);
+        color: var(--muted-value);
+      }
+    }
+  }
+}

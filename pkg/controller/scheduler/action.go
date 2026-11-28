@@ -1030,9 +1030,9 @@ func overrideRefusal(
 	}
 }
 
-// SetClientPolicy sets or clears the image policy of one client. Open image
-// rollouts of the client answer to it from the next reconcile on: one that
-// was approved stays approved.
+// SetClientPolicy sets or clears the image policy of one client's containers
+// of a kind. Open image rollouts of them answer to it from the next reconcile
+// on: one that was approved stays approved.
 func (s *service) SetClientPolicy(
 	ctx context.Context, actor string, req ClientPolicyRequest,
 ) (*ActionResult, error) {
@@ -1045,29 +1045,15 @@ func (s *service) SetClientPolicy(
 	}
 
 	next := settings
-	next.PolicyClients = maps.Clone(settings.PolicyClients)
-
-	if req.Policy == "" {
-		delete(next.PolicyClients, req.Client)
-	} else {
-		if next.PolicyClients == nil {
-			next.PolicyClients = make(fleet.ClientPolicies, 1)
-		}
-
-		next.PolicyClients[req.Client] = req.Policy
-	}
-
-	if len(next.PolicyClients) == 0 {
-		next.PolicyClients = nil
-	}
+	next.PolicyClients = settings.PolicyClients.With(protocol.ContainerKind(req.Kind), req.Client, req.Policy)
 
 	if err := next.Validate(); err != nil {
 		return nil, fmt.Errorf("%w: %w", ErrInvalidAction, err)
 	}
 
-	res := &ActionResult{Message: fmt.Sprintf("image policy of %s: %s", req.Client, req.Policy)}
+	res := &ActionResult{Message: fmt.Sprintf("image policy of %s %s: %s", req.Client, req.Kind, req.Policy)}
 	if req.Policy == "" {
-		res.Message = fmt.Sprintf("image policy of %s: the default of each kind", req.Client)
+		res.Message = fmt.Sprintf("image policy of %s %s: the policy of the kind", req.Client, req.Kind)
 	}
 
 	if next.Equal(&settings) {
@@ -1118,20 +1104,16 @@ func (s *service) ArmDeployWindow(ctx context.Context, actor string, req ArmRequ
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	settings, err := s.Settings(ctx)
-	if err != nil {
-		return nil, err
-	}
-
 	w, err := s.opts.Store.DeployWindow(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("scheduler: load deploy window: %w", err)
 	}
 
+	w.Length = s.opts.DeployWindow
 	now := s.opts.Now()
 	res := &ActionResult{Message: "the deployment window is not open"}
 
-	if !w.Open(now, settings.DeployWindow.Std()) {
+	if !w.Open(now) {
 		return res, nil
 	}
 

@@ -418,6 +418,16 @@ func searchFixture(t *testing.T, s Store, hosts, perHost int) int {
 	return rows
 }
 
+// onHosts is a version on the named hosts, listed in full.
+func onHosts(version string, hosts ...string) PackageVersion {
+	return PackageVersion{Version: version, Count: len(hosts), Hosts: hosts}
+}
+
+// installed is a package without upgrades.
+func installed(name string, versions ...PackageVersion) PackageMatch {
+	return PackageMatch{Name: name, Versions: versions, Upgrades: []PackageUpgrade{}}
+}
+
 func hostRange(from, to int) []string {
 	hosts := make([]string, 0, to-from)
 	for h := from; h < to; h++ {
@@ -446,19 +456,19 @@ func TestSearchPackages(t *testing.T) {
 			rows := searchFixture(t, s, hosts, perHost)
 			require.Equal(t, rows, countRows(t, s, "packages"))
 
-			firstThree := []PackageVersion{{Version: "1", Hosts: hostRange(0, 3)}}
-			libc6 := PackageMatch{Name: "libc6", Versions: []PackageVersion{
-				{Version: "2.41-12", Hosts: hostRange(0, 20)},
-				{Version: "2.41-13", Hosts: hostRange(20, 30)},
-			}}
-			libc6dev := PackageMatch{Name: "libc6-dev", Versions: []PackageVersion{
-				{Version: "2.41-12", Hosts: []string{
+			firstThree := []PackageVersion{onHosts("1", hostRange(0, 3)...)}
+			libc6 := installed("libc6",
+				onHosts("2.41-12", hostRange(0, 20)...),
+				onHosts("2.41-13", hostRange(20, 30)...),
+			)
+			libc6dev := installed("libc6-dev",
+				onHosts("2.41-12",
 					"node-00", "node-02", "node-04", "node-06", "node-08",
 					"node-10", "node-12", "node-14", "node-16", "node-18",
-				}},
-				{Version: "2.41-13", Hosts: []string{"node-20", "node-22", "node-24", "node-26", "node-28"}},
-			}}
-			compat := PackageMatch{Name: "glibc6-compat", Versions: firstThree}
+				),
+				onHosts("2.41-13", "node-20", "node-22", "node-24", "node-26", "node-28"),
+			)
+			compat := installed("glibc6-compat", firstThree...)
 
 			tests := []struct {
 				name  string
@@ -501,17 +511,17 @@ func TestSearchPackages(t *testing.T) {
 				{
 					name:  "underscore is literal",
 					query: "lib_x",
-					want:  []PackageMatch{{Name: "lib_x", Versions: firstThree}},
+					want:  []PackageMatch{installed("lib_x", firstThree...)},
 				},
 				{
 					name:  "percent is literal",
 					query: "%",
-					want:  []PackageMatch{{Name: "odd%name", Versions: firstThree}},
+					want:  []PackageMatch{installed("odd%name", firstThree...)},
 				},
 				{
 					name:  "backslash is literal",
 					query: `\`,
-					want:  []PackageMatch{{Name: `back\slash`, Versions: firstThree}},
+					want:  []PackageMatch{installed(`back\slash`, firstThree...)},
 				},
 				{name: "no match", query: "does-not-exist", want: []PackageMatch{}},
 				{name: "blank query", query: "   ", want: []PackageMatch{}},
@@ -533,7 +543,7 @@ func TestSearchPackages(t *testing.T) {
 				require.Len(t, got, DefaultPackageSearchLimit)
 				assert.Equal(t, "pkg-0000", got[0].Name)
 				assert.Equal(t, fmt.Sprintf("pkg-%04d", DefaultPackageSearchLimit-1), got[len(got)-1].Name)
-				assert.Equal(t, []PackageVersion{{Version: "1.0-1", Hosts: hostRange(0, hosts)}}, got[0].Versions)
+				assert.Equal(t, []PackageVersion{onHosts("1.0-1", hostRange(0, hosts)...)}, got[0].Versions)
 
 				got, err = s.SearchPackages(ctx, "pkg-", -5)
 				require.NoError(t, err)
@@ -553,9 +563,7 @@ func TestSearchPackages(t *testing.T) {
 
 				got, err := s.SearchPackages(ctx, "lib_x", 0)
 				require.NoError(t, err)
-				assert.Equal(t, []PackageMatch{{Name: "lib_x", Versions: []PackageVersion{
-					{Version: "1", Hosts: []string{"node-00", "node-02"}},
-				}}}, got)
+				assert.Equal(t, []PackageMatch{installed("lib_x", onHosts("1", "node-00", "node-02"))}, got)
 			})
 		})
 	}
@@ -644,7 +652,7 @@ func TestListPackages(t *testing.T) {
 
 			all := func(filter PackageFilter) (names []string, total, pages int) {
 				for {
-					page, err := s.ListPackages(ctx, filter)
+					page, err := s.ListPackages(ctx, &filter)
 					require.NoError(t, err)
 
 					if filter.After == "" {
@@ -689,7 +697,7 @@ func TestListPackages(t *testing.T) {
 
 			// A page continues after a name, not at an offset: a package
 			// that appears before the cursor moves nothing.
-			first, err := s.ListPackages(ctx, PackageFilter{Limit: 5})
+			first, err := s.ListPackages(ctx, &PackageFilter{Limit: 5})
 			require.NoError(t, err)
 
 			inv := newInventory(0)
@@ -698,12 +706,148 @@ func TestListPackages(t *testing.T) {
 			addHost(t, s, "node-new", nil)
 			require.NoError(t, s.SaveInventory(ctx, "node-new", inv))
 
-			second, err := s.ListPackages(ctx, PackageFilter{Limit: 5, After: first.Next})
+			second, err := s.ListPackages(ctx, &PackageFilter{Limit: 5, After: first.Next})
 			require.NoError(t, err)
 			assert.Equal(t, whole[5], second.Matches[0].Name)
 
-			_, err = s.ListPackages(ctx, PackageFilter{After: "x"})
+			_, err = s.ListPackages(ctx, &PackageFilter{After: "x"})
 			require.ErrorIs(t, err, ErrBadCursor)
+		})
+	}
+}
+
+// A list can be narrowed to the names that differ or have upgrades, sorted
+// by a count, and compacted; the counts of every narrowing come with the
+// first page.
+func TestListPackagesShowSortCompact(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := backend.open(t)
+
+			fixture := map[string]struct {
+				packages   map[string]string
+				upgradable []protocol.Upgradable
+			}{
+				"node-a": {
+					packages: map[string]string{"openssl": "3.0.1", "curl": "8.0", "zlib": "1.0", "docker-ce": "1"},
+					upgradable: []protocol.Upgradable{
+						{Name: "openssl", Arch: "amd64", Current: "3.0.1", Candidate: "3.0.2", Security: true},
+					},
+				},
+				"node-b": {
+					packages: map[string]string{"openssl": "3.0.1", "curl": "8.0", "zlib": "1.0", "docker-ce": "2"},
+					upgradable: []protocol.Upgradable{
+						{Name: "openssl", Arch: "amd64", Current: "3.0.1", Candidate: "3.0.2", Security: true},
+					},
+				},
+				"node-c": {
+					packages: map[string]string{"openssl": "3.0.2", "curl": "8.0", "zlib": "1.0", "docker-ce": "3"},
+					upgradable: []protocol.Upgradable{
+						{Name: "curl", Arch: "amd64", Current: "8.0", Candidate: "8.1", Blocked: true},
+					},
+				},
+			}
+
+			for host, f := range fixture {
+				addHost(t, s, host, nil)
+
+				inv := newInventory(0)
+				for name, version := range f.packages {
+					inv.Packages = append(inv.Packages, protocol.Package{Name: name, Version: version, Arch: "amd64"})
+				}
+
+				inv.Upgradable = f.upgradable
+				sealInventory(t, inv)
+				require.NoError(t, s.SaveInventory(ctx, host, inv))
+			}
+
+			names := func(filter PackageFilter) []string {
+				var out []string
+
+				for {
+					page, err := s.ListPackages(ctx, &filter)
+					require.NoError(t, err)
+
+					for _, m := range page.Matches {
+						out = append(out, m.Name)
+					}
+
+					if page.Next == "" {
+						return out
+					}
+
+					filter.After = page.Next
+				}
+			}
+
+			first, err := s.ListPackages(ctx, &PackageFilter{Show: PackageShowDiffering})
+			require.NoError(t, err)
+			assert.Equal(t, &PackageCounts{All: 4, Differing: 2, Outdated: 2, Security: 1}, first.Counts)
+			assert.Equal(t, 2, first.Total)
+
+			search, err := s.ListPackages(ctx, &PackageFilter{Query: "ssl", Show: PackageShowSecurity})
+			require.NoError(t, err)
+			assert.Equal(t, &PackageCounts{All: 1, Differing: 1, Outdated: 1, Security: 1}, search.Counts)
+
+			later, err := s.ListPackages(ctx, &PackageFilter{Limit: 1, After: "0curl"})
+			require.NoError(t, err)
+			assert.Nil(t, later.Counts, "counted for the first page only")
+
+			for _, tt := range []struct {
+				filter PackageFilter
+				want   []string
+			}{
+				{PackageFilter{Show: PackageShowDiffering}, []string{"docker-ce", "openssl"}},
+				{PackageFilter{Show: PackageShowOutdated}, []string{"curl", "openssl"}},
+				{PackageFilter{Show: PackageShowSecurity}, []string{"openssl"}},
+				{PackageFilter{Sort: PackageSortVersions}, []string{"docker-ce", "openssl", "curl", "zlib"}},
+				{PackageFilter{Sort: PackageSortHosts}, []string{"curl", "docker-ce", "openssl", "zlib"}},
+				{PackageFilter{Sort: PackageSortOutdated}, []string{"openssl", "curl", "docker-ce", "zlib"}},
+				{PackageFilter{Sort: PackageSortOutdated, Show: PackageShowDiffering}, []string{"openssl", "docker-ce"}},
+				{PackageFilter{Query: "l", Sort: PackageSortVersions}, []string{"openssl", "curl", "zlib"}},
+			} {
+				for _, limit := range []int{1, 2, 10} {
+					tt.filter.Limit = limit
+					assert.Equal(t, tt.want, names(tt.filter), "%+v", tt.filter)
+				}
+			}
+
+			full, err := s.ListPackages(ctx, &PackageFilter{Query: "openssl"})
+			require.NoError(t, err)
+			assert.Equal(t, []PackageMatch{{
+				Name:     "openssl",
+				Versions: []PackageVersion{onHosts("3.0.1", "node-a", "node-b"), onHosts("3.0.2", "node-c")},
+				Upgrades: []PackageUpgrade{{
+					Current: "3.0.1", Candidate: "3.0.2", Security: true, Count: 2, Hosts: []string{"node-a", "node-b"},
+				}},
+			}}, full.Matches)
+
+			compact, err := s.ListPackages(ctx, &PackageFilter{Query: "openssl", Compact: true})
+			require.NoError(t, err)
+			assert.Equal(t, []PackageMatch{{
+				Name: "openssl",
+				Versions: []PackageVersion{
+					{Version: "3.0.1", Count: 2, Hosts: []string{}},
+					onHosts("3.0.2", "node-c"),
+				},
+				Upgrades: []PackageUpgrade{{Current: "3.0.1", Candidate: "3.0.2", Security: true, Count: 2, Hosts: []string{}}},
+			}}, compact.Matches)
+
+			curl, err := s.ListPackages(ctx, &PackageFilter{Query: "curl"})
+			require.NoError(t, err)
+			require.Len(t, curl.Matches, 1)
+			assert.True(t, curl.Matches[0].Upgrades[0].Blocked)
+
+			for _, bad := range []string{"1curl", "1x:curl", "1-1:curl", "11:"} {
+				_, err = s.ListPackages(ctx, &PackageFilter{Sort: PackageSortVersions, After: bad})
+				require.ErrorIs(t, err, ErrBadCursor, bad)
+			}
 		})
 	}
 }
@@ -720,12 +864,25 @@ func TestListPackagesUsesTheNameIndex(t *testing.T) {
 			s := backend.open(t)
 			searchFixture(t, s, 3, 20)
 
-			page, args, count, countArgs := packageNamesQuery("", packageCursor{rank: 0, name: "lib"}, 51)
-			search, searchArgs, searchCount, searchCountArgs := packageNamesQuery("ssl", packageCursor{rank: -1}, 51)
+			queries := map[string][]any{}
 
-			for query, queryArgs := range map[string][]any{
-				page: args, count: countArgs, search: searchArgs, searchCount: searchCountArgs,
+			for _, names := range []packageNames{
+				{after: packageCursor{rank: 0, name: "lib"}, limit: 51},
+				{query: "ssl", after: packageCursor{rank: -1}, limit: 51},
+				{show: PackageShowDiffering, after: packageCursor{rank: -1}, limit: 51},
+				{show: PackageShowOutdated, sort: PackageSortOutdated, after: packageCursor{rank: -1}, limit: 51},
+				{query: "lib", sort: PackageSortHosts, after: packageCursor{rank: -1}, limit: 51},
 			} {
+				query, args := names.sql()
+				queries[query] = args
+			}
+
+			for _, q := range []string{"", "ssl"} {
+				installed, upgradable, args := packageCountsSQL(q)
+				queries[installed], queries[upgradable] = args, args
+			}
+
+			for query, queryArgs := range queries {
 				for _, line := range queryPlan(t, s, query, queryArgs) {
 					reads := strings.HasPrefix(line, "SCAN packages") && !strings.Contains(line, "USING COVERING INDEX")
 					assert.False(t, reads, "reads the whole table: %s\n%s", line, query)

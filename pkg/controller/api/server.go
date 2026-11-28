@@ -42,7 +42,7 @@ type Store interface {
 
 	SaveInventory(ctx context.Context, host string, inv *protocol.Inventory) error
 	GetInventory(ctx context.Context, host string) (*protocol.Inventory, error)
-	ListPackages(ctx context.Context, filter store.PackageFilter) (*store.PackagePage, error)
+	ListPackages(ctx context.Context, filter *store.PackageFilter) (*store.PackagePage, error)
 
 	// ListSlotParticipation returns the slot rows from fromSlot on, oldest
 	// first; SumHostSlotParticipation their per-host part summed over

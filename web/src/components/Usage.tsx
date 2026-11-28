@@ -27,7 +27,7 @@ export function UsageBar({ value, label, detail }: { value: number; label: strin
   const level = usageLevel(value);
 
   return (
-    <span className="flex min-w-0 items-center gap-2">
+    <span className="flex min-w-0 items-center gap-1.5">
       <span
         role="meter"
         aria-label={label}
@@ -41,9 +41,7 @@ export function UsageBar({ value, label, detail }: { value: number; label: strin
           style={{ width: `${Math.min(100, Math.max(0, value))}%` }}
         />
       </span>
-      <span className={cx('min-w-9 text-right tabular-nums', LEVEL_TEXT[level])}>
-        {formatPercent(Math.round(value))}
-      </span>
+      <span className={cx('min-w-9 tabular-nums', LEVEL_TEXT[level])}>{formatPercent(Math.round(value))}</span>
       {detail && <span className="min-w-0 truncate text-muted">{detail}</span>}
     </span>
   );

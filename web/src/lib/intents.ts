@@ -212,12 +212,13 @@ export function endLeaseIntent(lease: Pick<Lease, 'id' | 'host' | 'needs'>): Act
   };
 }
 
-/** clientPolicyIntent sets the image policy of one client; an empty policy returns it to the global default. */
-export function clientPolicyIntent(client: string, policy: Policy | ''): ActionIntent {
+/** clientPolicyIntent sets the image policy of one client's containers of a kind; an empty policy returns them to the kind's policy. */
+export function clientPolicyIntent(client: string, kind: string, policy: Policy | ''): ActionIntent {
+  const what = `${client} ${kind || 'other'}`;
   return {
     kind: 'call',
-    title: policy === '' ? `Image policy of ${client}: back to the default` : `Image policy of ${client}: ${policy}`,
+    title: policy === '' ? `Image policy of ${what}: inherit the kind` : `Image policy of ${what}: ${policy}`,
     verb: 'Set the policy',
-    make: reason => ({ action: 'client-policy', body: buildClientPolicyRequest(client, policy, reason) }),
+    make: reason => ({ action: 'client-policy', body: buildClientPolicyRequest(client, kind, policy, reason) }),
   };
 }

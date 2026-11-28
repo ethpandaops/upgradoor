@@ -7,6 +7,7 @@ import (
 	"slices"
 	"time"
 
+	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -84,6 +85,11 @@ type World struct {
 	Directives []*fleet.Directive
 	// NewID returns a new unique ID.
 	NewID func() string
+	// TagMoves are Outcome.TagMoves of the pass before.
+	TagMoves []TagMove
+	// LookedUp returns the newest lookup of a tag
+	// (discovery.Tracker.LookedUp). Without it no tag move is noted.
+	LookedUp func(ref string) (discovery.Lookup, bool)
 }
 
 // Outcome is the result of one reconcile: the rows to write and the plan.
@@ -102,6 +108,10 @@ type Outcome struct {
 	Unproven []store.HostUnproven
 	Audit    []fleet.AuditEntry
 	Plan     *Plan
+	// TagMoves are the tag moves that hold after the pass; Refresh the tags
+	// to look up now for the moves it noted.
+	TagMoves []TagMove
+	Refresh  []string
 }
 
 // Changes returns the outcome as one store transaction.
@@ -284,6 +294,11 @@ type pass struct {
 	// per client, -1 where too few of them probe it (fleetMedian).
 	refs    []*hostView
 	medians map[string]int
+	// moves are the tag moves by host, lookups the lookups the pass asked
+	// for, refresh the tags to look up now.
+	moves   map[string][]TagMove
+	lookups map[string]lookupAnswer
+	refresh []string
 }
 
 // budgetBefore is the budget as the leases and the liveness stand before
@@ -317,6 +332,8 @@ func newPass(w *World) *pass {
 		needs:          make(map[string]map[string][]protocol.Need, len(w.Rollouts)+2),
 		marked:         make(map[string]bool, 2),
 		first:          make(map[string]*fleet.Lease, 1),
+		moves:          make(map[string][]TagMove, len(w.TagMoves)+1),
+		lookups:        make(map[string]lookupAnswer, len(w.TagMoves)+1),
 	}
 
 	p.indexLiveness()
@@ -383,6 +400,8 @@ func newPass(w *World) *pass {
 			hv.held, hv.holdRequested = true, true
 		}
 	}
+
+	p.initTagMoves()
 
 	return p
 }
@@ -512,7 +531,9 @@ func (p *pass) setMember(m *fleet.RolloutHost, state fleet.HostState) {
 
 // outcome collects what changed against the world.
 func (p *pass) outcome(plan *Plan) *Outcome {
-	out := &Outcome{Audit: p.audit, Plan: plan, Dropped: p.dropped}
+	out := &Outcome{
+		Audit: p.audit, Plan: plan, Dropped: p.dropped, TagMoves: p.tagMoves(), Refresh: p.refresh,
+	}
 
 	for _, name := range p.names {
 		if p.marked[name] && !maps.Equal(p.hosts[name].broken, p.hosts[name].h.Broken) {

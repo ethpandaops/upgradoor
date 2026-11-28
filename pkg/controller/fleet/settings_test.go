@@ -96,16 +96,6 @@ func TestSettingsDefaultsAndValidation(t *testing.T) {
 
 	s.MaxLeasedPercent = 100
 	require.NoError(t, s.Validate())
-
-	assert.Equal(t, 24*time.Hour, s.DeployWindow.Std())
-
-	for _, v := range []time.Duration{-time.Second, MaxDeployWindow + time.Second} {
-		s.DeployWindow = Duration(v)
-		require.EqualError(t, s.Validate(), "deployWindow must be between 0 and 720h", "%s", v)
-	}
-
-	s.DeployWindow = 0
-	require.NoError(t, s.Validate(), "0: no window")
 }
 
 func TestDeployWindowState(t *testing.T) {
@@ -119,23 +109,25 @@ func TestDeployWindowState(t *testing.T) {
 		now    time.Time
 		open   bool
 	}{
-		{name: "no window stored", length: 24 * time.Hour, now: start},
-		{name: "open", w: DeployWindowState{StartedAt: start}, length: 24 * time.Hour,
+		{name: "no window stored", w: DeployWindowState{Length: 24 * time.Hour}, now: start},
+		{name: "open", w: DeployWindowState{StartedAt: start, Length: 24 * time.Hour},
 			now: start.Add(23 * time.Hour), open: true},
-		{name: "ended by time", w: DeployWindowState{StartedAt: start}, length: 24 * time.Hour,
+		{name: "ended by time", w: DeployWindowState{StartedAt: start, Length: 24 * time.Hour},
 			now: start.Add(24 * time.Hour)},
-		{name: "longer setting moves the end", w: DeployWindowState{StartedAt: start}, length: 48 * time.Hour,
+		{name: "longer window moves the end", w: DeployWindowState{StartedAt: start, Length: 48 * time.Hour},
 			now: start.Add(24 * time.Hour), open: true},
 		{name: "disabled", w: DeployWindowState{StartedAt: start}, now: start},
-		{name: "armed", w: DeployWindowState{StartedAt: start, ArmedAt: &armed}, length: 24 * time.Hour,
+		{name: "armed", w: DeployWindowState{StartedAt: start, Length: 24 * time.Hour, ArmedAt: &armed},
 			now: start.Add(2 * time.Hour)},
 	} {
-		assert.Equal(t, tt.open, tt.w.Open(tt.now, tt.length), tt.name)
+		assert.Equal(t, tt.open, tt.w.Open(tt.now), tt.name)
 	}
 
-	w := DeployWindowState{StartedAt: start}
-	assert.Equal(t, start.Add(time.Hour), w.End(time.Hour))
-	assert.True(t, w.End(0).IsZero())
+	w := DeployWindowState{StartedAt: start, Length: time.Hour}
+	assert.Equal(t, start.Add(time.Hour), w.End())
+
+	w.Length = 0
+	assert.True(t, w.End().IsZero())
 }
 
 func TestSettingsCanaryPauseAndPeerShare(t *testing.T) {
@@ -170,12 +162,20 @@ func TestSettingsClientPolicies(t *testing.T) {
 	assert.Equal(t, PolicySourceDefault, src)
 
 	s.PolicyImage = PolicyManual
-	s.PolicyClients = ClientPolicies{"geth": PolicyAuto}
+	s.PolicyClients = ClientPolicies{"el": {"geth": PolicyAuto}, "cl": {"lighthouse": PolicyAuto}}
 	require.NoError(t, s.Validate())
 
 	p, src = s.ImagePolicy("geth", protocol.KindEL)
 	assert.Equal(t, PolicyAuto, p)
 	assert.Equal(t, PolicySourceClient, src)
+
+	p, src = s.ImagePolicy("lighthouse", protocol.KindVC)
+	assert.Equal(t, PolicyManual, p, "a team's policy is per kind")
+	assert.Equal(t, PolicySourceDefault, src)
+
+	p, _ = s.ImagePolicy("lighthouse", protocol.KindCL)
+	assert.Equal(t, PolicyAuto, p)
+	s.PolicyClients = s.PolicyClients.With(protocol.KindCL, "lighthouse", "")
 
 	p, _ = s.ImagePolicy("lighthouse", protocol.KindCL)
 	assert.Equal(t, PolicyManual, p)
@@ -192,14 +192,20 @@ func TestSettingsClientPolicies(t *testing.T) {
 	assert.Nil(t, back.PolicyClients)
 
 	empty, same := DefaultSettings(), DefaultSettings()
-	empty.PolicyClients = ClientPolicies{}
+	empty.PolicyClients = ClientPolicies{"el": {}}
 	assert.True(t, empty.Equal(&same))
 	assert.False(t, s.Equal(&same))
 
-	s.PolicyClients = ClientPolicies{"Geth": PolicyAuto}
+	require.NoError(t, json.Unmarshal([]byte(`{"policyClients":{"el":{},"cl":{"teku":"manual"}}}`), &back))
+	assert.Equal(t, ClientPolicies{"cl": {"teku": PolicyManual}}, back.PolicyClients, "a kind without entries is none")
+
+	s.PolicyClients = ClientPolicies{"el": {"Geth": PolicyAuto}}
 	require.ErrorContains(t, s.Validate(), "is not a client name")
 
-	s.PolicyClients = ClientPolicies{"geth": "sometimes"}
+	s.PolicyClients = ClientPolicies{"EL": {"geth": PolicyAuto}}
+	require.ErrorContains(t, s.Validate(), "is not a kind name")
+
+	s.PolicyClients = ClientPolicies{"el": {"geth": "sometimes"}}
 	require.ErrorContains(t, s.Validate(), "invalid policy")
 }
 
@@ -207,7 +213,7 @@ func TestSettingsClientPolicies(t *testing.T) {
 // policies say; one with a tag that moved answers to them.
 func TestSettingsGroupPolicy(t *testing.T) {
 	s := DefaultSettings()
-	s.PolicyClients = ClientPolicies{"geth": PolicyManual}
+	s.PolicyClients = ClientPolicies{"el": {"geth": PolicyManual}}
 
 	deploy := RolloutTarget{Image: "geth:v1", Digest: "sha256:a", Spec: "k1"}
 	moved := RolloutTarget{Image: "geth:v1", Digest: "sha256:b"}
@@ -237,7 +243,7 @@ func TestSettingsKindPolicies(t *testing.T) {
 	s := DefaultSettings()
 	assert.Nil(t, s.PolicyKinds, "none by default")
 
-	s.PolicyClients = ClientPolicies{"geth": PolicyAuto}
+	s.PolicyClients = ClientPolicies{"el": {"geth": PolicyAuto}}
 	s.PolicyKinds = KindPolicies{"el": PolicyManual, "cl": PolicyManual, "snooper-el": PolicyManual, KindOther: PolicyManual}
 	require.NoError(t, s.Validate())
 
@@ -315,4 +321,25 @@ func TestSettingsActionPolicies(t *testing.T) {
 
 	s.ActionPolicies = ActionPolicies{"a": "sometimes"}
 	require.ErrorContains(t, s.Validate(), `invalid policy "sometimes" for a`)
+}
+
+func TestClientPoliciesWith(t *testing.T) {
+	var c ClientPolicies
+
+	c = c.With(protocol.KindCL, "lighthouse", PolicyManual)
+	d := c.With("", "tools", PolicyAuto)
+	assert.Equal(t, ClientPolicies{"cl": {"lighthouse": PolicyManual}}, c, "With copies")
+	assert.Equal(t, ClientPolicies{"cl": {"lighthouse": PolicyManual}, KindOther: {"tools": PolicyAuto}}, d)
+	assert.Equal(t, 2, d.Len())
+
+	p, ok := d.Get("", "tools")
+	assert.True(t, ok)
+	assert.Equal(t, PolicyAuto, p)
+
+	_, ok = d.Get(protocol.KindVC, "lighthouse")
+	assert.False(t, ok)
+
+	assert.Nil(t, c.With(protocol.KindCL, "lighthouse", ""), "the last entry cleared is none")
+	assert.True(t, d.Equal(d.Clone()))
+	assert.False(t, d.Equal(c))
 }

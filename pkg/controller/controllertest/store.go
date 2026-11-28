@@ -40,6 +40,8 @@ type Store struct {
 	// arguments.
 	LastSearchQuery string
 	LastSearchLimit int
+	// LastPackageFilter is the last ListPackages filter in full.
+	LastPackageFilter store.PackageFilter
 }
 
 // NewStore returns an empty store.
@@ -208,7 +210,7 @@ func (f *Store) GetInventory(_ context.Context, host string) (*protocol.Inventor
 
 // ListPackages pages through the fake's packages in their order; the cursor
 // is "2" and the name of the last entry of the page before.
-func (f *Store) ListPackages(_ context.Context, filter store.PackageFilter) (
+func (f *Store) ListPackages(_ context.Context, filter *store.PackageFilter) (
 	*store.PackagePage, error,
 ) {
 	f.Lock()
@@ -219,6 +221,7 @@ func (f *Store) ListPackages(_ context.Context, filter store.PackageFilter) (
 	}
 
 	f.LastSearchQuery, f.LastSearchLimit = filter.Query, filter.Limit
+	f.LastPackageFilter = *filter
 
 	if filter.After != "" && !strings.HasPrefix(filter.After, "2") {
 		return nil, store.ErrBadCursor
@@ -241,12 +244,17 @@ func (f *Store) ListPackages(_ context.Context, filter store.PackageFilter) (
 		case len(page.Matches) == filter.Limit:
 			page.Next = "2" + page.Matches[len(page.Matches)-1].Name
 		default:
+			if m.Upgrades == nil {
+				m.Upgrades = []store.PackageUpgrade{}
+			}
+
 			page.Matches = append(page.Matches, m)
 		}
 	}
 
 	if filter.After == "" {
 		page.Total = total
+		page.Counts = &store.PackageCounts{All: total}
 	}
 
 	return page, nil

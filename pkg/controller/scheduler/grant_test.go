@@ -1359,7 +1359,7 @@ func TestDeployIsAutoButWaitsAtAClosedGate(t *testing.T) {
 	b.w.Settings.MaxUnavailablePercent = 100
 	b.w.Settings.MaxLeasedPercent = 100
 	b.w.Settings.PolicyImage = fleet.PolicyManual
-	b.w.Settings.PolicyClients = fleet.ClientPolicies{"geth": fleet.PolicyManual, "besu": fleet.PolicyManual}
+	b.w.Settings.PolicyClients = fleet.ClientPolicies{"el": {"geth": fleet.PolicyManual, "besu": fleet.PolicyManual}}
 	b.host("a", 10)
 	b.host("b", 10)
 	b.deploysInGroup("a", "geth", protocol.KindEL, "geth", imgGeth, digestA)
@@ -1389,7 +1389,7 @@ func TestApprovalByKindPolicy(t *testing.T) {
 	b.w.Settings.MaxUnavailablePercent = 100
 	b.w.Settings.MaxLeasedPercent = 100
 	b.w.Settings.MaxIndependentPercent = 100
-	b.w.Settings.PolicyClients = fleet.ClientPolicies{"geth": fleet.PolicyAuto}
+	b.w.Settings.PolicyClients = fleet.ClientPolicies{"el": {"geth": fleet.PolicyAuto}}
 	b.w.Settings.PolicyKinds = fleet.KindPolicies{
 		"el": fleet.PolicyManual, "snooper-el": fleet.PolicyManual, fleet.KindOther: fleet.PolicyManual,
 	}
@@ -1422,7 +1422,7 @@ func TestApprovalByKindPolicy(t *testing.T) {
 func TestDeployWindowHoldsAllButDeploys(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.MaxLeasedPercent = 100
-	b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now.Add(-time.Hour)}
+	b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now.Add(-time.Hour), Length: 24 * time.Hour}
 	end := b.w.DeployWindow.StartedAt.Add(24 * time.Hour)
 
 	b.host("h", 10)
@@ -1455,7 +1455,7 @@ func TestDeployWindowHoldsAllButDeploys(t *testing.T) {
 func TestDeployWindowUnderPause(t *testing.T) {
 	b := newWorldBuilder(t)
 	b.w.Settings.Paused = true
-	b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now}
+	b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now, Length: 24 * time.Hour}
 
 	b.host("h", 10)
 	b.wants("h", packagesNeed("2.0"))
@@ -1473,11 +1473,10 @@ func TestDeployWindowClosed(t *testing.T) {
 	for name, mod := range map[string]func(b *worldBuilder){
 		"armed": func(b *worldBuilder) {
 			at := b.w.Now
-			b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now, ArmedAt: &at}
+			b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now, Length: 24 * time.Hour, ArmedAt: &at}
 		},
 		"disabled": func(b *worldBuilder) {
 			b.w.DeployWindow = fleet.DeployWindowState{StartedAt: b.w.Now}
-			b.w.Settings.DeployWindow = 0
 		},
 		"no window stored": func(*worldBuilder) {},
 	} {

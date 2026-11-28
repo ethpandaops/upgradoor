@@ -106,9 +106,11 @@ type Settings struct {
 	PolicyImage    Policy `json:"policyImage"`
 	PolicyPackages Policy `json:"policyPackages"`
 	PolicyReboot   Policy `json:"policyReboot"`
-	// PolicyClients is the image policy per client, which is the team of
-	// the containers ("geth": "manual"). The image rollouts of a team that is
-	// listed answer to its entry; the others to PolicyKinds, then PolicyImage.
+	// PolicyClients is the image policy per container kind and client, which
+	// is the team of the containers ({"cl": {"lighthouse": "manual"}},
+	// KindOther for unlabelled containers). The image rollouts of a team's
+	// containers of a kind answer to its entry under that kind; the others
+	// to PolicyKinds, then PolicyImage.
 	PolicyClients ClientPolicies `json:"policyClients"`
 	// PolicyKinds is the image policy per container kind ("cl": "manual"),
 	// KindOther for unlabelled containers. It applies to the image rollouts
@@ -140,11 +142,6 @@ type Settings struct {
 
 	// Paused is the global pause: nothing new is granted.
 	Paused bool `json:"paused"`
-
-	// DeployWindow is the length of the initial deployment window from the
-	// controller's first start on a fresh store (DeployWindowState). 0 is no
-	// window.
-	DeployWindow Duration `json:"deployWindow"`
 }
 
 // DefaultSettings returns the built-in defaults.
@@ -167,16 +164,18 @@ func DefaultSettings() Settings {
 		PolicyPackages:          PolicyAuto,
 		PolicyReboot:            PolicyManual,
 		LookupInterval:          Duration(5 * time.Minute),
-		DeployWindow:            Duration(24 * time.Hour),
 	}
 }
 
-// MaxDeployWindow bounds Settings.DeployWindow.
+// MaxDeployWindow bounds the length of the initial deployment window.
 const MaxDeployWindow = 30 * 24 * time.Hour
 
-// DeployWindowState is the stored state of the initial deployment window.
-// While it is open only leases of Ansible deploys are granted.
+// DeployWindowState is the state of the initial deployment window. While it
+// is open only leases of Ansible deploys are granted.
 type DeployWindowState struct {
+	// Length is the configured length of the window (--deploy-window); 0 is
+	// no window. It is not stored.
+	Length time.Duration `json:"-"`
 	// StartedAt is the controller's first start on a fresh store; zero when
 	// the store has no window.
 	StartedAt time.Time `json:"startedAt"`
@@ -186,17 +185,17 @@ type DeployWindowState struct {
 }
 
 // End is when the window closes by time; zero when there is no window.
-func (w *DeployWindowState) End(length time.Duration) time.Time {
-	if w.StartedAt.IsZero() || length <= 0 {
+func (w *DeployWindowState) End() time.Time {
+	if w.StartedAt.IsZero() || w.Length <= 0 {
 		return time.Time{}
 	}
 
-	return w.StartedAt.Add(length)
+	return w.StartedAt.Add(w.Length)
 }
 
 // Open reports whether the window is open at now.
-func (w *DeployWindowState) Open(now time.Time, length time.Duration) bool {
-	end := w.End(length)
+func (w *DeployWindowState) Open(now time.Time) bool {
+	end := w.End()
 
 	return w.ArmedAt == nil && !end.IsZero() && now.Before(end)
 }
@@ -207,26 +206,34 @@ const (
 	MaxLookupInterval = 24 * time.Hour
 )
 
-// ClientPolicies is an image policy per client. In JSON it is always an
-// object: none is {}, never null.
-type ClientPolicies map[string]Policy
+// ClientPolicies is an image policy per container kind (KindOther for
+// unlabelled containers) and client. In JSON it is always an object: none is
+// {}, never null; a kind without entries is left out.
+type ClientPolicies map[string]map[string]Policy
 
 // MarshalJSON implements json.Marshaler.
 func (c ClientPolicies) MarshalJSON() ([]byte, error) {
-	if c == nil {
-		return []byte("{}"), nil
+	out := make(map[string]map[string]Policy, len(c))
+
+	for kind, clients := range c {
+		if len(clients) > 0 {
+			out[kind] = clients
+		}
 	}
 
-	return json.Marshal(map[string]Policy(c))
+	return json.Marshal(out)
 }
 
 // UnmarshalJSON implements json.Unmarshaler: the object replaces what was
-// there, and an empty one is no policies at all (nil).
+// there, a kind without entries is dropped, and an empty one is no policies
+// at all (nil).
 func (c *ClientPolicies) UnmarshalJSON(b []byte) error {
-	var m map[string]Policy
+	var m map[string]map[string]Policy
 	if err := json.Unmarshal(b, &m); err != nil {
-		return fmt.Errorf("policyClients must be an object of client to policy: %w", err)
+		return fmt.Errorf("policyClients must be an object of kind to an object of client to policy: %w", err)
 	}
+
+	maps.DeleteFunc(m, func(_ string, clients map[string]Policy) bool { return len(clients) == 0 })
 
 	if len(m) == 0 {
 		m = nil
@@ -237,8 +244,89 @@ func (c *ClientPolicies) UnmarshalJSON(b []byte) error {
 	return nil
 }
 
-// MaxPolicyClients bounds PolicyClients.
-const MaxPolicyClients = 64
+// Get returns the policy of a client's containers of a kind (KindOther for
+// the empty kind) and whether it has one.
+func (c ClientPolicies) Get(kind protocol.ContainerKind, client string) (Policy, bool) {
+	p, ok := c[cmp.Or(string(kind), KindOther)][client]
+
+	return p, ok
+}
+
+// With returns a copy with the policy of a client's containers of a kind
+// set, or cleared when p is empty. The copy is nil when it holds nothing.
+func (c ClientPolicies) With(kind protocol.ContainerKind, client string, p Policy) ClientPolicies {
+	key := cmp.Or(string(kind), KindOther)
+	out := c.Clone()
+
+	if p == "" {
+		delete(out[key], client)
+
+		if len(out[key]) == 0 {
+			delete(out, key)
+		}
+	} else {
+		if out == nil {
+			out = make(ClientPolicies, 1)
+		}
+
+		if out[key] == nil {
+			out[key] = make(map[string]Policy, 1)
+		}
+
+		out[key][client] = p
+	}
+
+	if len(out) == 0 {
+		return nil
+	}
+
+	return out
+}
+
+// Clone returns a deep copy.
+func (c ClientPolicies) Clone() ClientPolicies {
+	if c == nil {
+		return nil
+	}
+
+	out := make(ClientPolicies, len(c))
+	for kind, clients := range c {
+		out[kind] = maps.Clone(clients)
+	}
+
+	return out
+}
+
+// Len is the number of entries over all kinds.
+func (c ClientPolicies) Len() int {
+	n := 0
+	for _, clients := range c {
+		n += len(clients)
+	}
+
+	return n
+}
+
+// Equal reports whether both hold the same entries; a kind without entries
+// is no entry.
+func (c ClientPolicies) Equal(o ClientPolicies) bool {
+	if c.Len() != o.Len() {
+		return false
+	}
+
+	for kind, clients := range c {
+		for client, p := range clients {
+			if q, ok := o[kind][client]; !ok || q != p {
+				return false
+			}
+		}
+	}
+
+	return true
+}
+
+// MaxPolicyClients bounds the entries of PolicyClients.
+const MaxPolicyClients = 256
 
 // KindPolicies is an image policy per container kind. In JSON it is always
 // an object: none is {}, never null.
@@ -281,7 +369,7 @@ type PolicySource string
 
 // Policy sources.
 const (
-	// PolicySourceClient: the team's entry in PolicyClients.
+	// PolicySourceClient: the team's entry under the kind in PolicyClients.
 	PolicySourceClient PolicySource = "client"
 	// PolicySourceKind: the kind's entry in PolicyKinds.
 	PolicySourceKind PolicySource = "kind"
@@ -336,10 +424,10 @@ func (s *Settings) ActionPolicy(name string) Policy {
 
 // ImagePolicy is the policy the image rollouts of a team's containers of a
 // kind answer to (empty kind: unlabelled containers), and the setting it
-// comes from: the team's entry in PolicyClients, else the kind's in
-// PolicyKinds, else PolicyImage.
+// comes from: the team's entry under the kind in PolicyClients, else the
+// kind's in PolicyKinds, else PolicyImage.
 func (s *Settings) ImagePolicy(team string, kind protocol.ContainerKind) (Policy, PolicySource) {
-	if p, ok := s.PolicyClients[team]; ok && team != "" {
+	if p, ok := s.PolicyClients.Get(kind, team); ok && team != "" {
 		return p, PolicySourceClient
 	}
 
@@ -401,7 +489,7 @@ func (s *Settings) Equal(o *Settings) bool {
 	a.PolicyKinds, b.PolicyKinds = nil, nil
 	a.ActionPolicies, b.ActionPolicies = nil, nil
 
-	return reflect.DeepEqual(a, b) && maps.Equal(s.PolicyClients, o.PolicyClients) &&
+	return reflect.DeepEqual(a, b) && s.PolicyClients.Equal(o.PolicyClients) &&
 		maps.Equal(s.PolicyKinds, o.PolicyKinds) && maps.Equal(s.ActionPolicies, o.ActionPolicies)
 }
 
@@ -503,10 +591,6 @@ func (s *Settings) Validate() error {
 		return errors.New("lookupInterval must be between 30s and 24h")
 	}
 
-	if s.DeployWindow < 0 || s.DeployWindow.Std() > MaxDeployWindow {
-		return errors.New("deployWindow must be between 0 and 720h")
-	}
-
 	return s.validatePolicies()
 }
 
@@ -519,17 +603,23 @@ func (s *Settings) validatePolicies() error {
 		}
 	}
 
-	if len(s.PolicyClients) > MaxPolicyClients {
-		return fmt.Errorf("policyClients lists more than %d clients", MaxPolicyClients)
+	if s.PolicyClients.Len() > MaxPolicyClients {
+		return fmt.Errorf("policyClients lists more than %d entries", MaxPolicyClients)
 	}
 
-	for client, p := range s.PolicyClients {
-		if !protocol.ValidClient(client) {
-			return fmt.Errorf("policyClients: %q is not a client name", client)
+	for kind, clients := range s.PolicyClients {
+		if !protocol.ValidKind(protocol.ContainerKind(kind)) || kind == string(protocol.KindNone) {
+			return fmt.Errorf("policyClients: %q is not a kind name", kind)
 		}
 
-		if p != PolicyAuto && p != PolicyManual {
-			return fmt.Errorf("policyClients: invalid policy %q for %s", p, client)
+		for client, p := range clients {
+			if !protocol.ValidClient(client) {
+				return fmt.Errorf("policyClients: %q is not a client name", client)
+			}
+
+			if p != PolicyAuto && p != PolicyManual {
+				return fmt.Errorf("policyClients: invalid policy %q for %s of %s", p, client, kind)
+			}
 		}
 	}
 
