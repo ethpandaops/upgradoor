@@ -48,12 +48,12 @@
 //	GET  /healthz
 //
 // "user" routes need a bearer token from the authenticatoor when
-// --auth-provider-url is set and are open otherwise. Every such token may
+// auth.providerUrl is set and are open otherwise. Every such token may
 // read but the "admin" routes; PUT and POST need a feature of this service
 // in the token, or its team twin for targets a team of the token owns
 // (authz.go, actions.go), and are answered 403 without it. What a login
-// reads of the hosts depends on authz.FeatureDetails, of the audit log on
-// authz.FeatureAdmin too (Access). No user view carries the error texts of
+// reads of the hosts depends on authz.FeatureDetails; the audit log needs
+// authz.FeatureAudit, in full authz.FeatureAdmin too (Access). No user view carries the error texts of
 // the beacon service or the validator ranges inventory (PublicGate); the
 // data sources do. The public routes are
 // the only unauthenticated view of host data and must never carry package

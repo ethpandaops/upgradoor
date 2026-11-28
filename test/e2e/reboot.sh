@@ -106,17 +106,30 @@ controller_pub=$("$work/upgradoor-controller" keygen controller-pubkey \
     --controller-seed-file "$work/controller.seed")
 
 # Open API (no auth provider): this is a closed test network.
+cat >"$work/controller.yaml" <<EOF
+network:
+  name: $network
+  beaconEndpoints: [http://$id-beacon:5052]
+agents:
+  signerPublicKey: $signer
+  controllerSeedFile: /controller.seed
+  allowInsecureHttp: true
+auth:
+  allowOpenApi: true
+deployWindow: 0s
+settingDefaults:
+  policyReboot: auto
+  policyPackages: auto
+  hostStaleAfter: 45s
+  leaseTtl: 5m
+  paused: true
+EOF
 docker run -d --name "$id-controller" --network "$net" --label upgradoor.test=reboot \
     -p "127.0.0.1:$ctl_port:8080" --tmpfs /data \
     -v "$work/upgradoor-controller:/upgradoor-controller:ro" \
     -v "$work/controller.seed:/controller.seed:ro" \
-    debian:13-slim /upgradoor-controller run \
-    --listen :8080 --data-dir /data --network "$network" --signer-public-key "$signer" \
-    --controller-seed-file /controller.seed \
-    --allow-insecure-agent-http --allow-open-api --beacon-endpoint "http://$id-beacon:5052" \
-    --default-setting policyReboot=auto --default-setting policyPackages=auto \
-    --default-setting hostStaleAfter=45s --default-setting leaseTtl=5m \
-    --default-setting paused=true --deploy-window=0 >/dev/null
+    -v "$work/controller.yaml:/controller.yaml:ro" \
+    debian:13-slim /upgradoor-controller run --config /controller.yaml >/dev/null
 wait_until "controller up" 30 curl -fsS "$ctl/healthz"
 
 # --- hosts ---------------------------------------------------------------------

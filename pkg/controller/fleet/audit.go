@@ -119,6 +119,7 @@ var AuditActions = []AuditAction{
 	{Action: "action.forget", Group: AuditGroupHosts, Target: AuditTargetHost},
 	{Action: "action.forget.failed", Group: AuditGroupHosts, Target: AuditTargetHost},
 	{Action: "auth.refused", Group: AuditGroupAccess, Target: AuditTargetRequest},
+	{Action: "debug.pprof", Group: AuditGroupAccess, Target: AuditTargetRequest},
 }
 
 // AuditActionOf returns the description of an action.

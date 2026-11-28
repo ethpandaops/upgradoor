@@ -190,10 +190,9 @@ pass "devnet started"
 # A real controller has the in-cluster node, which upgradoor never touches;
 # here every beacon node is also a managed host and one of them is broken on
 # purpose, so all four are given and the controller fails over.
-beacon_args=()
-for i in $(seq 1 $nodes); do
-    beacon_args+=(--beacon-endpoint "http://$(ip_of "$(container "cl-$i-lighthouse-geth")"):4000")
-done
+beacon_endpoints=$(for i in $(seq 1 $nodes); do
+    printf 'http://%s:4000\n' "$(ip_of "$(container "cl-$i-lighthouse-geth")")"
+done | paste -sd, -)
 
 # --- identities, controller, agents ----------------------------------------
 
@@ -225,23 +224,35 @@ wait_until "validator ranges served" 20 \
     curl -fsS "http://127.0.0.1:$ranges_port/validator-ranges.json"
 
 mkdir -p "$work/data"
-"$work/upgradoor-controller" run \
-    --listen "127.0.0.1:$port" --data-dir "$work/data" \
-    --network "$network" --signer-public-key "$signer" \
-    --controller-seed-file "$work/controller.seed" \
-    --allow-insecure-agent-http \
-    --auth-provider-url "$auth" \
-    --registry-plain-http "$registry" --registry-allow-private \
-    "${beacon_args[@]}" \
-    --validator-ranges-url "http://127.0.0.1:$ranges_port/validator-ranges.json" \
-    --default-setting maxUnavailablePercent=25 \
-    --default-setting readyAttestations=2 \
-    --default-setting leaseTtl=5m \
-    --default-setting readinessTimeout=6m \
-    --default-setting baselineGrace=3m \
-    --default-setting hostStaleAfter=1m \
-    --default-setting lookupInterval=30s \
-    --deploy-window=0 \
+cat >"$work/controller.yaml" <<EOF
+server:
+  listen: 127.0.0.1:$port
+network:
+  name: $network
+  beaconEndpoints: [$beacon_endpoints]
+  validatorRangesUrl: http://127.0.0.1:$ranges_port/validator-ranges.json
+agents:
+  signerPublicKey: $signer
+  controllerSeedFile: $work/controller.seed
+  allowInsecureHttp: true
+auth:
+  providerUrl: $auth
+images:
+  registryPlainHttp: [$registry]
+  registryAllowPrivate: true
+store:
+  dataDir: $work/data
+deployWindow: 0s
+settingDefaults:
+  maxUnavailablePercent: 25
+  readyAttestations: 2
+  leaseTtl: 5m
+  readinessTimeout: 6m
+  baselineGrace: 3m
+  hostStaleAfter: 1m
+  lookupInterval: 30s
+EOF
+"$work/upgradoor-controller" run --config "$work/controller.yaml" \
     >"$work/controller.log" 2>&1 &
 echo $! >"$work/controller.pid"
 wait_until "controller up" 30 curl -fsS "$ctl/healthz"

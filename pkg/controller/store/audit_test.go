@@ -350,3 +350,55 @@ func TestAuditQueriesUseTheirIndex(t *testing.T) {
 		}
 	}
 }
+
+// DeleteAuditBefore takes the oldest entries first, a batch at a time; the
+// rest keep their IDs, pages and target index, and new IDs are not reused.
+func TestDeleteAuditBefore(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	for _, backend := range backends {
+		t.Run(backend.name, func(t *testing.T) {
+			t.Parallel()
+
+			s := backend.open(t)
+
+			for i := range 6 {
+				require.NoError(t, s.AppendAudit(ctx, fleet.AuditEntry{
+					Time: at(i * 10), Actor: "scheduler", Action: "lease.granted", Target: "node-1",
+				}))
+			}
+
+			n, err := s.DeleteAuditBefore(ctx, at(35), 0)
+			require.NoError(t, err)
+			assert.Zero(t, n, "limit 0 deletes nothing")
+
+			n, err = s.DeleteAuditBefore(ctx, at(35), 3)
+			require.NoError(t, err)
+			assert.Equal(t, int64(3), n)
+
+			n, err = s.DeleteAuditBefore(ctx, at(35), 3)
+			require.NoError(t, err)
+			assert.Equal(t, int64(1), n)
+
+			n, err = s.DeleteAuditBefore(ctx, at(35), 3)
+			require.NoError(t, err)
+			assert.Zero(t, n)
+
+			left, err := s.ListAudit(ctx, AuditFilter{Target: "node-1"})
+			require.NoError(t, err)
+			assert.Equal(t, []int64{6, 5}, auditIDs(left))
+
+			page, err := s.ListAudit(ctx, AuditFilter{BeforeID: 6})
+			require.NoError(t, err)
+			assert.Equal(t, []int64{5}, auditIDs(page))
+
+			require.NoError(t, s.AppendAudit(ctx, fleet.AuditEntry{Actor: "scheduler", Action: "lease.granted"}))
+
+			newest, err := s.ListAudit(ctx, AuditFilter{Limit: 1})
+			require.NoError(t, err)
+			assert.Equal(t, []int64{7}, auditIDs(newest))
+		})
+	}
+}

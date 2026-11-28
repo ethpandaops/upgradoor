@@ -413,3 +413,31 @@ func (s *sqliteStore) AuditActors(ctx context.Context) (people []AuditActor, age
 
 	return people, agents, nil
 }
+
+// DeleteAuditBefore implements Store. IDs are never reused (AUTOINCREMENT),
+// so the pages and links of the remaining entries stay valid.
+func (s *sqliteStore) DeleteAuditBefore(ctx context.Context, before time.Time, limit int) (int64, error) {
+	if limit <= 0 {
+		return 0, nil
+	}
+
+	var deleted int64
+
+	err := s.write(ctx, func(tx *sql.Tx) error {
+		res, err := tx.ExecContext(ctx, `DELETE FROM audit WHERE id IN (
+			SELECT id FROM audit INDEXED BY audit_time WHERE time < ? ORDER BY time LIMIT ?)`,
+			millis(before), limit)
+		if err != nil {
+			return err
+		}
+
+		deleted, err = res.RowsAffected()
+
+		return err
+	})
+	if err != nil {
+		return 0, fmt.Errorf("store: delete audit: %w", err)
+	}
+
+	return deleted, nil
+}

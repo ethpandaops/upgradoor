@@ -112,6 +112,21 @@ func (a *userAuth) start(ctx, refreshCtx context.Context, log logrus.FieldLogger
 // the "services" claim for it), which is all a read needs. What else it may
 // do is decided per request by authorize.
 func (a *userAuth) authenticate(r *http.Request) (*authz.User, error) {
+	return a.authenticateToken(r, bearerToken(r))
+}
+
+// bearerToken is the token of the Authorization header; empty without one.
+func bearerToken(r *http.Request) string {
+	scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
+	}
+
+	return strings.TrimSpace(token)
+}
+
+// authenticateToken is authenticate with the token given.
+func (a *userAuth) authenticateToken(r *http.Request, token string) (*authz.User, error) {
 	if a.open() {
 		return &authz.User{Actor: actorAnonymous, Open: true}, nil
 	}
@@ -124,10 +139,7 @@ func (a *userAuth) authenticate(r *http.Request) (*authz.User, error) {
 		return nil, errAuthNotReady
 	}
 
-	scheme, token, ok := strings.Cut(r.Header.Get("Authorization"), " ")
-	token = strings.TrimSpace(token)
-
-	if !ok || !strings.EqualFold(scheme, "Bearer") || token == "" {
+	if token == "" {
 		return nil, errUnauthenticated
 	}
 

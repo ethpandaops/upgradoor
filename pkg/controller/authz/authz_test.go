@@ -36,6 +36,11 @@ func TestFeatureNames(t *testing.T) {
 	assert.True(t, protocol.ValidActionFeature(protocol.DefaultActionFeature))
 	assert.Equal(t, FeatureManage, protocol.DefaultActionFeature)
 
+	// audit gates reading, never a host action.
+	assert.False(t, protocol.ValidActionFeature(FeatureAudit))
+	assert.True(t, auth.FeatureAllowed("+upgradoor:audit", "upgradoor", FeatureAudit, auth.FeatureDefaultDeny))
+	assert.False(t, auth.FeatureAllowed("+upgradoor:admin", "upgradoor", FeatureAudit, auth.FeatureDefaultDeny))
+
 	// A prefix grant covers every feature that starts with it: "manage*" is
 	// the three manage features, any other spelled name with "*" that feature
 	// only, and no twin is reached by a prefix of a plain feature.
@@ -115,6 +120,12 @@ func TestImplied(t *testing.T) {
 	grants := func(features ...string) func(string) bool {
 		return func(f string) bool { return slices.Contains(features, f) }
 	}
+
+	assert.True(t, Implied(FeatureAudit, grants(FeatureAdmin)))
+	assert.True(t, Implied(FeatureAudit, grants(FeatureAudit)))
+	assert.False(t, Implied(FeatureAudit,
+		grants(FeatureDetails, FeatureManage, FeatureManageImage, FeatureManageFlags)))
+	assert.False(t, Implied(FeatureAdmin, grants(FeatureAudit)))
 
 	for _, f := range []string{FeatureDetails, FeatureManage, FeatureManageImage, FeatureManageFlags} {
 		assert.True(t, Implied(f, grants(FeatureAdmin)), f)

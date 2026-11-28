@@ -66,7 +66,7 @@ type Source struct {
 	Commit string
 }
 
-// ParseSource reads the value of --image-source, "<image>=<owner>/<name>[@<ref>]":
+// ParseSource reads an entry of images.sources, "<image>=<owner>/<name>[@<ref>]":
 // the image repository (without a tag) and the GitHub repository its tags
 // are built from, each tag from the ref of its name unless one is given.
 func ParseSource(value string) (image string, source Source, err error) {

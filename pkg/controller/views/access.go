@@ -23,7 +23,8 @@ import (
 // The audit log is reduced the same way, and without the feature admin it
 // leaves out what only the admin pages show: the settings in a settings
 // change but what it changed, the error of a fetch of the validator ranges.
-// The zero Access reduces every host and owns nothing.
+// Without the feature audit a host's details carry no audit entries.
+// The zero Access reduces every host, owns nothing and reads no audit log.
 type Access struct {
 	// Full shows every host in full: the plain feature, or the API runs
 	// open.
@@ -31,6 +32,8 @@ type Access struct {
 	// Admin shows the audit log in full: the feature admin, or the API runs
 	// open.
 	Admin bool
+	// AuditLog reads the audit log: the feature audit, or the API runs open.
+	AuditLog bool
 	// Teams are the login's teams: their containers are shown in full on
 	// every host.
 	Teams []string
@@ -65,6 +68,10 @@ func (a *Access) Key() string {
 	admin := ""
 	if a.Admin {
 		admin = "+admin"
+	}
+
+	if a.AuditLog {
+		admin += "+audit"
 	}
 
 	if a.Full {
@@ -132,9 +139,19 @@ func (a *Access) Summary(sum *HostSummary) HostSummary {
 }
 
 // Detail is a host's details as the login sees them; d itself when it sees
-// the host in full, nil for nil.
+// the host in full and reads the audit log, nil for nil.
 func (a *Access) Detail(d *HostDetail) *HostDetail {
-	if d == nil || a.HostFull(d.Containers) {
+	if d == nil {
+		return nil
+	}
+
+	if !a.AuditLog {
+		out := *d
+		out.History = []fleet.AuditEntry{}
+		d = &out
+	}
+
+	if a.HostFull(d.Containers) {
 		return d
 	}
 

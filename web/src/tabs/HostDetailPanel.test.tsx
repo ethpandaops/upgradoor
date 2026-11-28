@@ -277,6 +277,18 @@ describe('HostDrawer history', () => {
       '#audit/?who=all&target=lighthouse-geth-2'
     );
   });
+
+  it('shows only the leases to a login without audit', async () => {
+    const { drawer, tab } = await openDrawer('lighthouse-geth-2', { mode: 'auth', loggedIn: true, profile: 'team' });
+    await tab('History');
+
+    expect(await within(drawer).findByRole('table', { name: 'Leases of lighthouse-geth-2' })).toHaveTextContent(
+      'verifying'
+    );
+    expect(within(drawer).queryByRole('region', { name: 'Events' })).not.toBeInTheDocument();
+    expect(within(drawer).queryByRole('list', { name: 'History of lighthouse-geth-2' })).not.toBeInTheDocument();
+    expect(within(drawer).queryByRole('link', { name: /in the audit log/ })).not.toBeInTheDocument();
+  });
 });
 
 describe('HostDrawer keys', () => {

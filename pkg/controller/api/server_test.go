@@ -372,9 +372,11 @@ func TestEveryUserRouteIsGuarded(t *testing.T) {
 	}
 	staff := provider.Grant(t, controllertest.StaffServices)
 
-	// adminReads are the reading routes that need a feature: admin, or
-	// details for the packages of the fleet.
-	adminReads := []string{"GET /api/v1/settings", "GET /api/v1/settings/sources", "GET /api/v1/packages"}
+	// adminReads are the reading routes that need a feature: admin, details
+	// for the packages of the fleet, audit for the audit log.
+	adminReads := []string{
+		"GET /api/v1/settings", "GET /api/v1/settings/sources", "GET /api/v1/packages", "GET /api/v1/audit",
+	}
 	mutating := 0
 
 	for _, route := range routes {
@@ -547,4 +549,49 @@ func TestUnknownRoutes(t *testing.T) {
 	// Wrong method on a known action: no such route.
 	rec = h.get("/api/v1/actions/roll")
 	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+// The profiles are mounted only when enabled, never without an auth
+// provider, and a browser without a login gets the web UI as the gate.
+func TestPprofRoutes(t *testing.T) {
+	off, _ := authHarness(t, true)
+	assert.NotEqual(t, http.StatusUnauthorized, off.get("/debug/pprof/heap").Code, "off: the web UI answers")
+
+	c := controllertest.NewClock(controllertest.Epoch)
+	provider := controllertest.NewAuthProvider(t, c, true)
+	h := newHarness(t, func(o *Options) {
+		o.AuthProviderURL = provider.Server.URL + "/"
+		o.Now = c.Now
+		o.Pprof = true
+	})
+	h.clock = c
+	h.start()
+
+	rec := h.get("/debug/pprof")
+	assert.Equal(t, http.StatusMovedPermanently, rec.Code)
+	assert.Equal(t, "/debug/pprof/", rec.Header().Get("Location"))
+
+	assert.Equal(t, http.StatusUnauthorized, h.get("/debug/pprof/heap").Code)
+
+	req := httptest.NewRequest(http.MethodGet, controllertest.BaseURL+"/debug/pprof/heap", http.NoBody)
+	req.Header.Set("Accept", "text/html")
+	rec = h.serve(req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Contains(t, rec.Header().Get("Content-Type"), "text/html")
+	assert.Contains(t, rec.Body.String(), `<head><base href="/">`, "the assets load from the root")
+
+	req = httptest.NewRequest(http.MethodGet, controllertest.BaseURL+"/debug/pprof/heap", http.NoBody)
+	req.Header.Set("Authorization", provider.Grant(t, "+upgradoor:admin"))
+	rec = h.serve(req)
+	assert.Equal(t, http.StatusOK, rec.Code)
+	assert.Equal(t, "application/octet-stream", rec.Header().Get("Content-Type"))
+
+	log := logrus.New()
+	log.SetOutput(io.Discard)
+
+	_, err := New(log, Options{
+		Network: controllertest.Network, Verifier: h.srv.opts.Verifier, Store: h.store, Scheduler: h.sched,
+		Beacon: h.beacon, DefaultSettings: fleet.DefaultSettings(), Pprof: true,
+	})
+	require.ErrorContains(t, err, "pprof needs an auth provider")
 }

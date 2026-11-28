@@ -428,6 +428,7 @@ func TestWebFeaturesAreTheServers(t *testing.T) {
 
 	server := []string{
 		authz.FeatureDetails, authz.FeatureManage, authz.FeatureManageImage, authz.FeatureManageFlags, authz.FeatureAdmin,
+		authz.FeatureAudit,
 	}
 
 	slices.Sort(web)

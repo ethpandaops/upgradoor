@@ -10,7 +10,8 @@ upgradoor only recreates them on a newer digest of their tag (or an override).
 - The **agent** (`upgradoor agent`, systemd) reports the host's containers,
   blocked packages and reboot flag to the controller over outbound HTTPS. It
   opens no port and changes nothing without a lease.
-- The **controller** (`upgradoor-controller run`) looks up the image tags at
+- The **controller** (`upgradoor-controller run --config controller.yaml`,
+  see `run --help`) looks up the image tags at
   their registries, groups the needs into rollouts and grants leases a few
   hosts at a time:
   - budget: validator weight (`maxUnavailablePercent`) and a host limit
@@ -22,7 +23,7 @@ upgradoor only recreates them on a newer digest of their tag (or an override).
   `policyReboot`), per client (`policyClients`) and per container kind
   (`policyKinds`, `other` for unlabelled containers); an image rollout answers
   to its client's, then its kind's, then `policyImage`. Settings are edited in
-  the UI; `--default-setting key=value` sets their defaults.
+  the UI; `settingDefaults` in the controller config sets their defaults.
 - Web UI and API with logins from the devnet's authenticatoor. Every login
   reads a reduced view; more needs a feature of the service `upgradoor`:
 
@@ -32,7 +33,8 @@ upgradoor only recreates them on a newer digest of their tag (or an override).
   | `manage` | roll, reboot, hold, mark-offline, skip, retry, end-lease, client policy, image refresh, pause/resume/approve/abort of a rollout, `force`, `ignoreBudget`, all hosts; host actions without a `feature:` |
   | `manage_image` | image overrides |
   | `manage_flags` | flag overrides |
-  | `admin` | all of the above, forget, global pause, settings, data sources |
+  | `audit` | the audit log and the events in a host's history |
+  | `admin` | all of the above, forget, global pause, settings, data sources, `/debug/pprof/` (with `ui.pprof`) |
 
   Each except `admin` has a `team_` twin limited to what the token's teams
   own (`team_manage`: no reboot, mark-offline or image refresh). A plain feature includes its twin; a
@@ -102,7 +104,7 @@ upgradoor verify-cert           print what a host certificate certifies
 ## Source branches
 
 The controller finds the GitHub repository and branch each followed image is
-built from and reads the branch's head every minute (`--source-interval`).
+built from and reads the branch's head every minute (`images.sourceInterval`).
 The overview shows per image whether it is built from that head, or that a
 build is pending (the branch is ahead of the image), next to the hosts that
 still have to roll.
@@ -114,13 +116,13 @@ still have to roll.
 - An `ethpandaops/<client>` image without labels is matched to its upstream
   repository by name, and compared through the builder's `<tag>-<commit>`
   tag. Anything else is named with
-  `--image-source <image>=<owner>/<name>[@<ref>]`.
+  `images.sources: ["<image>=<owner>/<name>[@<ref>]"]`.
 - "Check registries now" in the UI looks every tag and branch up at once.
 
 ## Validators
 
 The controller reads the devnet's validator name inventory from
-`--validator-ranges-url` (e.g.
+`network.validatorRangesUrl` (e.g.
 `https://config.<network_subdomain>/api/v1/nodes/validator-ranges`). Only
 validators with an attestation duty count toward the budget and readiness.
 Without the URL no host has validators and the budget is only the host limit.
@@ -131,7 +133,7 @@ Without the URL no host has validators and the budget is only the host limit.
   issued with the devnet seed: `upgradoor-controller keygen host-cert
   --network <n> --hostname <h> --public-key <key>`.
 - The controller signs its answers with a key derived from the controller
-  seed (`--controller-seed-file`); agents pin its public key
+  seed (`agents.controllerSeedFile`); agents pin its public key
   (`controller.publicKey`) and act on nothing else.
 - Neither public key depends on the network: the controller refuses
   certificates and agents refuse answers of another network.
@@ -191,6 +193,15 @@ managedFile: managed.yaml
 socket: {path: agent.sock}
 verbs: [roll, packages, reboot]
 EOF
+cat > controller.yaml <<EOF
+server: {listen: 127.0.0.1:8080}
+network: {name: dev, beaconEndpoints: [http://127.0.0.1:5052]}
+agents: {signerPublicKey: $(cat signer.pub), controllerSeedFile: controller.seed, allowInsecureHttp: true}
+auth: {allowOpenApi: true}
+images: {registryPlainHttp: [127.0.0.1:5050], registryAllowPrivate: true}
+store: {dataDir: data}
+settingDefaults: {lookupInterval: 30s}
+EOF
 cat > host.yaml <<EOF
 os: {id: debian, versionId: "13", arch: amd64}
 containers:
@@ -203,10 +214,7 @@ Then, each in its own terminal from `.tmp/dev`:
 ```sh
 go run ../../test/e2e/fakebeacon --listen 127.0.0.1:5052
 go run ../../test/fakeregistry --scenario host.yaml
-../../bin/upgradoor-controller run --listen 127.0.0.1:8080 --data-dir data --network dev \
-  --signer-public-key "$(cat signer.pub)" --controller-seed-file controller.seed \
-  --allow-insecure-agent-http --allow-open-api --beacon-endpoint http://127.0.0.1:5052 \
-  --registry-plain-http 127.0.0.1:5050 --registry-allow-private --default-setting lookupInterval=30s
+../../bin/upgradoor-controller run --config controller.yaml
 go run ../../test/fakeagent --config agent.yaml --scenario host.yaml --registry 127.0.0.1:5050
 ```
 

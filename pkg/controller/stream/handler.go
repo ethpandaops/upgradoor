@@ -74,7 +74,7 @@ func (s *Handler) access(u *authz.User) views.Access {
 	case s.opts.Access != nil:
 		return s.opts.Access(u)
 	case u.Open:
-		return views.Access{Full: true}
+		return views.Access{Full: true, Admin: true, AuditLog: true}
 	default:
 		return views.Access{}
 	}

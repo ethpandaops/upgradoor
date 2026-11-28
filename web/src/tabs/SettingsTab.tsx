@@ -135,7 +135,7 @@ function StatusCards() {
         </p>
         <p className="text-xs/5 text-muted">
           After the first start on a fresh store only Ansible deploys are granted until it ends. Its length is the
-          controller&rsquo;s <span className="font-mono">--deploy-window</span> option.
+          controller&rsquo;s <span className="font-mono">deployWindow</span> config key.
         </p>
       </Card>
       {actions.dialog}
@@ -157,7 +157,8 @@ function SettingsEditor({
 }) {
   const { api } = useApp();
   const formId = useId();
-  const mayWrite = usePermissions().can({ action: 'settings' });
+  const { can, audit } = usePermissions();
+  const mayWrite = can({ action: 'settings' });
 
   const [form, setForm] = useState<SettingsForm>(() => toForm(body.settings));
   const [saving, setSaving] = useState(false);
@@ -271,9 +272,11 @@ function SettingsEditor({
                   ? 'Fix the marked fields to save.'
                   : `${dirty.length} unsaved ${dirty.length === 1 ? 'change' : 'changes'}. Every change is recorded in the audit log.`}
           </span>
-          <a href={auditHash({ group: 'settings' })} className="ml-auto text-xs/5 text-accent hover:underline">
-            Change history
-          </a>
+          {audit && (
+            <a href={auditHash({ group: 'settings' })} className="ml-auto text-xs/5 text-accent hover:underline">
+              Change history
+            </a>
+          )}
         </div>
       </div>
     </form>

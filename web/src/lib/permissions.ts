@@ -28,6 +28,8 @@ export const FEATURE = {
   manage_image: 'manage_image',
   /** manage_flags: flag-override, client-override of the flags. Twin team_manage_flags: a container a team of the login owns. */
   manage_flags: 'manage_flags',
+  /** audit: the audit log (Audit tab) and the events in a host's history; admin-only details still need admin. No twin. */
+  audit: 'audit',
   /** admin: forget, the global pause, arming the deployment window, the settings, the data sources. Includes every other feature. No twin. */
   admin: 'admin',
 } as const;

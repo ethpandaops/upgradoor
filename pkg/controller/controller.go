@@ -6,14 +6,11 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
-	"io/fs"
 	"net"
 	"net/http"
 	"path/filepath"
-	"strings"
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
@@ -35,79 +32,6 @@ import (
 // DatabaseFile is the SQLite file name inside the data directory.
 const DatabaseFile = "upgradoor.db"
 
-// Config is the controller configuration. The controller holds one secret,
-// the controller seed, from which it derives the key it signs its answers to
-// agents with. Agents are verified against the signer public key, users
-// against the authenticatoor's public keys.
-type Config struct {
-	// Listen is the HTTP listen address.
-	Listen string
-	// DataDir holds the SQLite database.
-	DataDir string
-	// Network is the network name certificates must be issued for.
-	Network string
-	// SignerPublicKey is the unpadded base64url ML-DSA-44 signer public key.
-	SignerPublicKey string
-	// ControllerSeedFile is the file holding the controller seed, from which
-	// the controller derives the controller key at start. It is not the
-	// devnet seed.
-	// The seed is only ever read from a file: a flag or an environment
-	// variable would show it in the process listing or the pod
-	// specification.
-	ControllerSeedFile string
-	// AllowUnsignedAgentAnswers runs the controller without a controller
-	// seed: its answers are not signed, and agents that pin a controller key
-	// refuse them (development only).
-	AllowUnsignedAgentAnswers bool
-	// PublicURLs are the base URLs agents reach the controller under.
-	PublicURLs []string
-	// AllowInsecureAgentHTTP accepts agent requests over plain http when no
-	// public URL is configured (development only).
-	AllowInsecureAgentHTTP bool
-	// TrustForwardedHeaders takes the client address from X-Forwarded-For.
-	TrustForwardedHeaders bool
-	// AuthProviderURL is the authenticatoor base URL; empty runs the API
-	// open, which needs AllowOpenAPI.
-	AuthProviderURL string
-	// AllowOpenAPI runs the user API without an auth provider: every action
-	// is anonymous and allowed (closed test networks only).
-	AllowOpenAPI bool
-	// AuthService is the name of this service in the token's "services"
-	// claim; empty means api.DefaultAuthService.
-	AuthService string
-	// UIOrigins are extra origins the web UI may connect to.
-	UIOrigins []string
-	// UIScript is a script added to the web UI, e.g. a site menu, and
-	// UIScriptIntegrity its subresource integrity hash.
-	UIScript          string
-	UIScriptIntegrity string
-	// BeaconEndpoints are beacon API base URLs, tried in order.
-	BeaconEndpoints []string
-	// ValidatorRangesURL is the devnet's validator ranges inventory, from
-	// which hosts get their validators; empty gives no host validators.
-	ValidatorRangesURL string
-	// RegistryAuthFile is a Docker config.json with the credentials for the
-	// registry lookups; empty or missing means anonymous.
-	RegistryAuthFile string
-	// Registry is how the registries are reached for the lookups.
-	Registry registry.Config
-	// ImageSources name the GitHub repository an image is built from, as
-	// "<image>=<owner>/<name>[@<ref>]", for images whose labels do not.
-	ImageSources []string
-	// SourceInterval is how often the source branches are read.
-	SourceInterval time.Duration
-	// DefaultSettings are "key=value" overrides of the built-in setting
-	// defaults; keys are the JSON names of fleet.Settings.
-	DefaultSettings []string
-	// DeployWindow is the length of the initial deployment window from the
-	// first start on a fresh store; 0 is no window.
-	DeployWindow time.Duration
-	// Version is the build version.
-	Version string
-	// WebFS is the built web UI.
-	WebFS fs.FS
-}
-
 // Service is the running controller.
 type Service interface {
 	Start(ctx context.Context) error
@@ -124,6 +48,7 @@ type controller struct {
 	scheduler  scheduler.Service
 	lookups    discovery.Tracker
 	upstream   upstream.Tracker
+	retention  *auditRetention
 	api        *api.Server
 	server     *http.Server
 	served     chan error
@@ -133,17 +58,13 @@ var _ Service = (*controller)(nil)
 
 // New validates the configuration and builds the controller.
 func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
-	if cfg.Network == "" {
-		return nil, errors.New("controller: --network is required")
+	if err := cfg.Validate(); err != nil {
+		return nil, fmt.Errorf("controller config: %w", err)
 	}
 
-	if err := identity.ValidateName(cfg.Network); err != nil {
-		return nil, fmt.Errorf("controller: --network: %w", err)
-	}
-
-	signer, err := identity.DecodePublicKey(cfg.SignerPublicKey)
+	signer, err := identity.DecodePublicKey(cfg.Agents.SignerPublicKey)
 	if err != nil {
-		return nil, fmt.Errorf("controller: --signer-public-key: %w", err)
+		return nil, fmt.Errorf("controller: agents.signerPublicKey: %w", err)
 	}
 
 	answers, err := loadAnswerSigner(cfg)
@@ -151,21 +72,9 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		return nil, err
 	}
 
-	if authErr := checkAuth(cfg); authErr != nil {
-		return nil, authErr
-	}
-
-	if len(cfg.BeaconEndpoints) == 0 {
-		return nil, errors.New("controller: at least one --beacon-endpoint is required")
-	}
-
-	defaults, err := ParseDefaultSettings(cfg.DefaultSettings)
+	defaults, err := cfg.Settings()
 	if err != nil {
-		return nil, fmt.Errorf("controller: --default-setting: %w", err)
-	}
-
-	if cfg.DeployWindow < 0 || cfg.DeployWindow > fleet.MaxDeployWindow {
-		return nil, errors.New("controller: --deploy-window must be between 0 and 720h")
+		return nil, fmt.Errorf("controller: settingDefaults: %w", err)
 	}
 
 	c := &controller{
@@ -174,26 +83,30 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		served: make(chan error, 1),
 	}
 
-	c.store = store.New(log, filepath.Join(cfg.DataDir, DatabaseFile))
+	c.store = store.New(log, filepath.Join(cfg.Store.DataDir, DatabaseFile))
+	c.retention = newAuditRetention(log, c.store, cfg.Store.AuditRetention.Std())
 	c.beacon = beacon.New(log, beacon.Options{
-		Endpoints: cfg.BeaconEndpoints,
+		Endpoints: cfg.Network.BeaconEndpoints,
 		Store:     c.store,
 	})
 	c.validators = validators.New(log, validators.Options{
-		URL:       cfg.ValidatorRangesURL,
+		URL:       cfg.Network.ValidatorRangesURL,
 		Store:     c.store,
 		UserAgent: "upgradoor-controller/" + cfg.Version,
 		Changed:   func() { c.api.Notify() },
 	})
 
 	logins := registryauth.Logins{}
-	if cfg.RegistryAuthFile != "" {
-		if logins, err = registryauth.LoadLogins(log, cfg.RegistryAuthFile); err != nil {
-			return nil, fmt.Errorf("controller: --registry-auth-file: %w", err)
+	if cfg.Images.RegistryAuthFile != "" {
+		if logins, err = registryauth.LoadLogins(log, cfg.Images.RegistryAuthFile); err != nil {
+			return nil, fmt.Errorf("controller: images.registryAuthFile: %w", err)
 		}
 	}
 
-	resolver, err := registry.NewResolver(log, &cfg.Registry, logins)
+	resolver, err := registry.NewResolver(log, &registry.Config{
+		PlainHTTP: cfg.Images.RegistryPlainHTTP, CAFile: cfg.Images.RegistryCAFile,
+		AllowPrivate: cfg.Images.RegistryAllowPrivate,
+	}, logins)
 	if err != nil {
 		return nil, fmt.Errorf("controller: %w", err)
 	}
@@ -206,19 +119,19 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		Liveness:     c.beacon.Liveness,
 		Attested:     c.beacon.AttestedSlots,
 		Defaults:     defaults,
-		DeployWindow: cfg.DeployWindow,
+		DeployWindow: cfg.DeployWindow.Std(),
 		NewID:        newID,
 		Lookups:      c.lookups,
 		// The API is built after the scheduler, which is not running yet.
 		Changed: func() { c.api.Notify() },
 	})
 
-	sources := make(map[string]upstream.Source, len(cfg.ImageSources))
+	sources := make(map[string]upstream.Source, len(cfg.Images.Sources))
 
-	for _, value := range cfg.ImageSources {
+	for _, value := range cfg.Images.Sources {
 		image, source, serr := upstream.ParseSource(value)
 		if serr != nil {
-			return nil, fmt.Errorf("controller: --image-source: %w", serr)
+			return nil, fmt.Errorf("controller: images.sources: %w", serr)
 		}
 
 		sources[image] = source
@@ -230,24 +143,25 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 		NotFound: registry.IsNotFound,
 		Remote:   upstream.NewGitHub(cfg.Version),
 		Sources:  sources,
-		Interval: cfg.SourceInterval,
+		Interval: cfg.Images.SourceInterval.Std(),
 		Changed:  func() { c.api.Notify() },
 		Now:      time.Now,
 	})
 
 	c.api, err = api.New(log, api.Options{
-		Network:                cfg.Network,
+		Network:                cfg.Network.Name,
 		Version:                cfg.Version,
-		Verifier:               identity.NewVerifier(signer, cfg.Network),
+		Verifier:               identity.NewVerifier(signer, cfg.Network.Name),
 		AnswerSigner:           answers,
-		PublicURLs:             cfg.PublicURLs,
-		AllowInsecureAgentHTTP: cfg.AllowInsecureAgentHTTP,
-		TrustForwardedHeaders:  cfg.TrustForwardedHeaders,
-		AuthProviderURL:        cfg.AuthProviderURL,
-		AuthService:            cfg.AuthService,
-		UIOrigins:              cfg.UIOrigins,
-		UIScript:               cfg.UIScript,
-		UIScriptIntegrity:      cfg.UIScriptIntegrity,
+		PublicURLs:             cfg.Server.PublicURLs,
+		AllowInsecureAgentHTTP: cfg.Agents.AllowInsecureHTTP,
+		TrustForwardedHeaders:  cfg.Server.TrustForwardedHeaders,
+		AuthProviderURL:        cfg.Auth.ProviderURL,
+		AuthService:            cfg.Auth.Service,
+		UIOrigins:              cfg.UI.Origins,
+		UIScript:               cfg.UI.Script,
+		UIScriptIntegrity:      cfg.UI.ScriptIntegrity,
+		Pprof:                  cfg.UI.Pprof,
 		Store:                  c.store,
 		Scheduler:              c.scheduler,
 		Beacon:                 c.beacon,
@@ -264,7 +178,7 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 	}
 
 	if answers == nil {
-		c.log.Warn("INSECURE: --allow-unsigned-agent-answers is set and there is no " +
+		c.log.Warn("INSECURE: agents.allowUnsignedAnswers is set and there is no " +
 			"controller seed. Answers to agents are NOT signed: agents that pin a " +
 			"controller key refuse them, and the others trust whoever answers under " +
 			"the controller's name. Development only.")
@@ -276,8 +190,8 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 				"from the controller seed")
 	}
 
-	if cfg.AllowOpenAPI {
-		c.log.Warn("INSECURE: --allow-open-api is set and there is no --auth-provider-url. " +
+	if cfg.Auth.AllowOpenAPI {
+		c.log.Warn("INSECURE: auth.allowOpenApi is set and there is no auth.providerUrl. " +
 			"The API is open to everyone who can reach it: every action is anonymous " +
 			"and allowed. Closed test networks only.")
 	}
@@ -301,46 +215,23 @@ func (c *controller) startDeployWindow(ctx context.Context) error {
 	}
 
 	log.Info("Initial deployment window not armed: only Ansible deploys are leased " +
-		"until it ends (--deploy-window) or is armed")
-
-	return nil
-}
-
-// checkAuth accepts a configuration with an auth provider, or without one
-// with the explicit opt-out, not both.
-func checkAuth(cfg *Config) error {
-	switch {
-	case cfg.AuthProviderURL == "" && !cfg.AllowOpenAPI:
-		return errors.New("controller: --auth-provider-url is required: without it every " +
-			"action is anonymous and allowed (--allow-open-api runs without, " +
-			"for closed test networks)")
-	case cfg.AuthProviderURL != "" && cfg.AllowOpenAPI:
-		return errors.New("controller: --auth-provider-url and --allow-open-api exclude each other")
-	}
+		"until it ends (deployWindow) or is armed")
 
 	return nil
 }
 
 // loadAnswerSigner reads the controller seed and derives the controller key
-// of this network from it. Without a seed it returns nil,
-// which is only accepted with the explicit opt-out.
+// of this network from it; nil without a seed (agents.allowUnsignedAnswers,
+// checked by Validate).
 func loadAnswerSigner(cfg *Config) (*identity.AnswerSigner, error) {
-	switch {
-	case cfg.ControllerSeedFile == "" && cfg.AllowUnsignedAgentAnswers:
+	if cfg.Agents.ControllerSeedFile == "" {
 		return nil, nil //nolint:nilnil // no key and no error is the opt-out
-	case cfg.ControllerSeedFile == "":
-		return nil, errors.New("controller: --controller-seed-file is required: agents act " +
-			"only on signed answers (--allow-unsigned-agent-answers runs without, " +
-			"for development)")
-	case cfg.AllowUnsignedAgentAnswers:
-		return nil, errors.New("controller: --controller-seed-file and " +
-			"--allow-unsigned-agent-answers exclude each other")
 	}
 
 	// Neither error carries anything of the file's content.
-	seed, err := identity.ReadSeedFile(cfg.ControllerSeedFile)
+	seed, err := identity.ReadSeedFile(cfg.Agents.ControllerSeedFile)
 	if err != nil {
-		return nil, fmt.Errorf("controller: --controller-seed-file: %w", err)
+		return nil, fmt.Errorf("controller: agents.controllerSeedFile: %w", err)
 	}
 
 	key, err := identity.DeriveControllerKey(seed)
@@ -348,7 +239,7 @@ func loadAnswerSigner(cfg *Config) (*identity.AnswerSigner, error) {
 		return nil, fmt.Errorf("controller: derive the controller key: %w", err)
 	}
 
-	signer, err := identity.NewAnswerSigner(key, cfg.Network)
+	signer, err := identity.NewAnswerSigner(key, cfg.Network.Name)
 	if err != nil {
 		return nil, fmt.Errorf("controller: controller key: %w", err)
 	}
@@ -366,40 +257,44 @@ func (c *controller) Start(ctx context.Context) error {
 		return errors.Join(err, c.store.Stop())
 	}
 
+	if err := c.retention.Start(ctx); err != nil {
+		return errors.Join(fmt.Errorf("audit retention: %w", err), c.store.Stop())
+	}
+
 	if err := c.validators.Start(ctx); err != nil {
-		return errors.Join(fmt.Errorf("validator ranges: %w", err), c.store.Stop())
+		return errors.Join(fmt.Errorf("validator ranges: %w", err), c.retention.Stop(), c.store.Stop())
 	}
 
 	if err := c.beacon.Start(ctx); err != nil {
-		return errors.Join(fmt.Errorf("beacon: %w", err), c.validators.Stop(), c.store.Stop())
+		return errors.Join(fmt.Errorf("beacon: %w", err), c.validators.Stop(), c.retention.Stop(), c.store.Stop())
 	}
 
 	if err := c.scheduler.Start(ctx); err != nil {
 		return errors.Join(fmt.Errorf("scheduler: %w", err),
-			c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
+			c.beacon.Stop(), c.validators.Stop(), c.retention.Stop(), c.store.Stop())
 	}
 
 	if err := c.lookups.Start(ctx); err != nil {
 		return errors.Join(fmt.Errorf("lookups: %w", err),
-			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
+			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.retention.Stop(), c.store.Stop())
 	}
 
 	if err := c.upstream.Start(ctx); err != nil {
 		return errors.Join(fmt.Errorf("upstream: %w", err), c.lookups.Stop(),
-			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
+			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.retention.Stop(), c.store.Stop())
 	}
 
 	if err := c.api.Start(ctx); err != nil {
 		return errors.Join(fmt.Errorf("api: %w", err), c.upstream.Stop(),
-			c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
+			c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.retention.Stop(), c.store.Stop())
 	}
 
 	var lc net.ListenConfig
 
-	listener, err := lc.Listen(ctx, "tcp", c.cfg.Listen)
+	listener, err := lc.Listen(ctx, "tcp", c.cfg.Server.Listen)
 	if err != nil {
 		return errors.Join(fmt.Errorf("listen: %w", err), c.api.Stop(), c.upstream.Stop(), c.lookups.Stop(),
-			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.store.Stop())
+			c.scheduler.Stop(), c.beacon.Stop(), c.validators.Stop(), c.retention.Stop(), c.store.Stop())
 	}
 
 	// WriteTimeout is that of a request. An event stream sets its own
@@ -424,8 +319,8 @@ func (c *controller) Start(ctx context.Context) error {
 
 	c.log.WithFields(logrus.Fields{
 		"listen":  listener.Addr().String(),
-		"network": c.cfg.Network,
-		"auth":    c.cfg.AuthProviderURL != "",
+		"network": c.cfg.Network.Name,
+		"auth":    c.cfg.Auth.ProviderURL != "",
 	}).Info("controller started")
 
 	return nil
@@ -447,7 +342,7 @@ func (c *controller) Stop() error {
 	}
 
 	errs = append(errs, c.api.Stop(), c.upstream.Stop(), c.lookups.Stop(), c.scheduler.Stop(), c.beacon.Stop(),
-		c.validators.Stop(), c.store.Stop())
+		c.validators.Stop(), c.retention.Stop(), c.store.Stop())
 
 	return errors.Join(errs...)
 }
@@ -459,66 +354,6 @@ func (c *controller) health() fleet.NetworkHealth {
 	h.ValidatorRangesError = c.validators.Error()
 
 	return h
-}
-
-// ParseDefaultSettings applies "key=value" overrides to the built-in
-// defaults. A value is read as JSON when it parses (numbers, booleans,
-// quoted strings) and as a plain string otherwise ("30m", "manual").
-func ParseDefaultSettings(overrides []string) (fleet.Settings, error) {
-	settings := fleet.DefaultSettings()
-
-	raw, err := json.Marshal(settings)
-	if err != nil {
-		return settings, err
-	}
-
-	fields := make(map[string]json.RawMessage, 16)
-
-	err = json.Unmarshal(raw, &fields)
-	if err != nil {
-		return settings, err
-	}
-
-	for _, kv := range overrides {
-		key, value, ok := strings.Cut(kv, "=")
-		if !ok || key == "" {
-			return settings, fmt.Errorf("%q is not key=value", kv)
-		}
-
-		if _, known := fields[key]; !known {
-			return settings, fmt.Errorf("unknown setting %q", key)
-		}
-
-		if json.Valid([]byte(value)) {
-			fields[key] = json.RawMessage(value)
-
-			continue
-		}
-
-		quoted, qerr := json.Marshal(value)
-		if qerr != nil {
-			return settings, qerr
-		}
-
-		fields[key] = quoted
-	}
-
-	merged, err := json.Marshal(fields)
-	if err != nil {
-		return settings, err
-	}
-
-	// A bare number for a duration ("leaseTtl=30") must not be accepted
-	// silently, so decode strictly into the typed struct.
-	if err := json.Unmarshal(merged, &settings); err != nil {
-		return settings, err
-	}
-
-	if err := settings.Validate(); err != nil {
-		return settings, err
-	}
-
-	return settings, nil
 }
 
 func newID() string {

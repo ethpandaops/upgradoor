@@ -860,7 +860,7 @@ func TestHostDetailsFeature(t *testing.T) {
 	}
 
 	t.Run("reduced", func(t *testing.T) {
-		basic := provider.Grant(t, "+upgradoor")
+		basic := provider.Grant(t, "+upgradoor:audit")
 
 		for _, path := range paths {
 			raw := read(path, basic)
@@ -919,7 +919,7 @@ func TestHostDetailsFeature(t *testing.T) {
 	})
 
 	t.Run("full", func(t *testing.T) {
-		full := provider.Grant(t, "+upgradoor:details")
+		full := provider.Grant(t, "+upgradoor:details:audit")
 
 		raw := read("/api/v1/hosts/lighthouse-geth-1", full)
 		for _, secret := range controllertest.HostDetailSecrets {
@@ -950,7 +950,9 @@ func TestAdminFeature(t *testing.T) {
 		return h.serve(userRoute{method: http.MethodGet, path: path}.request(authorization))
 	}
 
-	for _, services := range []string{"+upgradoor", "+upgradoor:details", "+upgradoor:details,manage*"} {
+	for _, services := range []string{
+		"+upgradoor:audit", "+upgradoor:details:audit", "+upgradoor:details:manage*:audit",
+	} {
 		login := provider.Grant(t, services, controllertest.SecretOwnerEL)
 
 		for _, path := range paths {
@@ -1006,5 +1008,50 @@ func TestAdminFeature(t *testing.T) {
 
 	for kind, p := range clients.Clients[0].DefaultPolicies {
 		assert.Equal(t, fleet.DefaultSettings().PolicyImage, p, kind)
+	}
+}
+
+// The audit log needs the feature audit (or admin): without it GET
+// /api/v1/audit is refused and a host's history carries no entries, its
+// leases stay.
+func TestAuditFeature(t *testing.T) {
+	h, provider := authHarness(t, true)
+	controllertest.LeakFixture(t, h.store, h.sched, h.beacon)
+	h.store.Audit = append(h.store.Audit, fleet.AuditEntry{
+		ID: 2, Time: controllertest.Epoch, Actor: "agent:lighthouse-geth-1", Action: "host.registered",
+		Target: "lighthouse-geth-1",
+	})
+
+	get := func(path, authorization string) *httptest.ResponseRecorder {
+		return h.serve(userRoute{method: http.MethodGet, path: path}.request(authorization))
+	}
+
+	for _, tc := range []struct {
+		services string
+		audit    bool
+	}{
+		{"+upgradoor", false},
+		{"+upgradoor:details:manage*", false},
+		{"+upgradoor:audit", true},
+		{"+upgradoor:admin", true},
+	} {
+		t.Run(tc.services, func(t *testing.T) {
+			login := provider.Grant(t, tc.services, controllertest.SecretOwnerEL)
+
+			rec := get("/api/v1/audit?actors=1", login)
+			if tc.audit {
+				assert.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			} else {
+				assert.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+			}
+
+			rec = get("/api/v1/hosts/lighthouse-geth-1", login)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+			detail := controllertest.DecodeJSON[views.HostDetail](t, rec)
+			assert.NotEmpty(t, detail.Leases, "the lease history stays")
+			assert.Equal(t, tc.audit, len(detail.History) > 0)
+			assert.NotNil(t, detail.History)
+		})
 	}
 }

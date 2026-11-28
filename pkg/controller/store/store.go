@@ -120,6 +120,10 @@ type Store interface {
 	// AuditActors counts the audit entries of each person, by actor, and
 	// those of all agents.
 	AuditActors(ctx context.Context) (people []AuditActor, agents int, err error)
+	// DeleteAuditBefore deletes at most limit of the oldest entries stamped
+	// before before, in one short transaction, and returns how many it
+	// deleted.
+	DeleteAuditBefore(ctx context.Context, before time.Time, limit int) (int64, error)
 }
 
 // HostSync is the input of RecordSync.

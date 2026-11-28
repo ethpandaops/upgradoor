@@ -130,6 +130,9 @@ type Options struct {
 	// UIScriptIntegrity its subresource integrity hash.
 	UIScript          string
 	UIScriptIntegrity string
+	// Pprof serves the profiles under /debug/pprof/ to logins with the
+	// feature admin; it needs an auth provider.
+	Pprof bool
 
 	Store     Store
 	Scheduler scheduler.Service
@@ -206,6 +209,10 @@ func New(log logrus.FieldLogger, opts Options) (*Server, error) {
 	}
 
 	opts.AuthProviderURL = strings.TrimRight(opts.AuthProviderURL, "/")
+
+	if opts.Pprof && opts.AuthProviderURL == "" {
+		return nil, errors.New("api: pprof needs an auth provider: profiles are for admin logins only")
+	}
 
 	if opts.AuthService == "" {
 		opts.AuthService = DefaultAuthService
@@ -394,6 +401,11 @@ func (s *Server) routes(ui http.Handler) http.Handler {
 		MaxRequestsInFlight: 4,
 		Timeout:             20 * time.Second,
 	}))
+
+	if s.opts.Pprof {
+		mux.Handle(userapi.PprofPath, http.RedirectHandler(userapi.PprofPath+"/", http.StatusMovedPermanently))
+		mux.Handle(userapi.PprofPath+"/", s.users.Pprof(pprofGate(ui)))
+	}
 
 	mux.Handle("/", ui)
 

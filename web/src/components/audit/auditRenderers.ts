@@ -349,6 +349,21 @@ export function auditRenderers(settingsLabels: ReadonlyMap<string, string> = new
       summary: e => str(d(e, 'error')),
       fields: [ERROR],
     },
+    'debug.pprof': {
+      title: e => {
+        const profile = str(d(e, 'profile'));
+        return profile ? `Downloaded profile ${profile}` : 'Downloaded a profile';
+      },
+      tone: e => {
+        const status = d(e, 'status');
+        return typeof status === 'number' && status >= 400 ? 'danger' : undefined;
+      },
+      summary: e => {
+        const status = d(e, 'status');
+        return typeof status === 'number' && status >= 400 ? `status ${status}` : str(d(e, 'query'));
+      },
+      fields: [F('profile', 'Profile', 'mono'), F('query', 'Query', 'mono'), F('status', 'Status', 'number')],
+    },
   };
 }
 
@@ -360,7 +375,7 @@ export const FALLBACK_ACTIONS: ReadonlySet<string> = new Set(['auth.refused']);
 
 /** humanize turns an action or key into words: "action.mark-offline" → "Mark offline". */
 export function humanize(name: string): string {
-  const last = name.replace(/^(action|settings|rollout|lease|host|directive|auth|sources)\./, '');
+  const last = name.replace(/^(action|settings|rollout|lease|host|directive|auth|sources|debug)\./, '');
   const words = last
     .replace(/[.-]/g, ' ')
     .replace(/([a-z])([A-Z])/g, '$1 $2')

@@ -17,6 +17,7 @@ import { BeforeLease, LeaseTable, PeerChecks } from '../components/LeaseTable';
 import { useLive } from '../components/Live';
 import { ActionIcon } from '../components/icons';
 import { Readiness } from '../components/Readiness';
+import { usePermissions } from '../components/Permissions';
 import { IntentAction } from '../components/SelectionBar';
 import { PullNote } from '../components/PullNote';
 import { RelTime, Timestamp } from '../components/RelTime';
@@ -667,6 +668,7 @@ export function RolloutCard({
   const budgetReasons = r.ignoreBudget || atGate ? [] : waitReasons(r, queue, 'budget');
   const gateApproval = approvableAtGate(r, queue);
   const hostAction = rolloutActionOf(r);
+  const { audit } = usePermissions();
 
   return (
     <article
@@ -779,9 +781,11 @@ export function RolloutCard({
         <span>
           id <ShortId value={r.id} label="rollout" />
         </span>
-        <a href={auditHash({ target: r.id })} className="text-accent hover:underline">
-          history
-        </a>
+        {audit && (
+          <a href={auditHash({ target: r.id })} className="text-accent hover:underline">
+            history
+          </a>
+        )}
         {r.kind === 'group' && (
           <span>
             kind <span className="font-medium text-foreground">{r.containerKind || 'unlabelled'}</span>

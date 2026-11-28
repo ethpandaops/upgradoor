@@ -50,7 +50,27 @@ describe('auditRenderers', () => {
     expect(FALLBACK.summary?.(refused)).toBe('lacks admin');
   });
 
+  it('reads a profile download', () => {
+    const r = renderers['debug.pprof'];
+    if (!r) throw new Error('no renderer for debug.pprof');
+
+    const ok = entry('debug.pprof', { profile: 'heap', query: 'gc=1', status: 200 }, '/debug/pprof/heap');
+    expect(r.title(ok)).toBe('Downloaded profile heap');
+    expect(r.tone?.(ok)).toBeUndefined();
+    expect(r.summary?.(ok)).toBe('gc=1');
+    expect(r.fields?.map(f => [f.key, f.kind])).toEqual([
+      ['profile', 'mono'],
+      ['query', 'mono'],
+      ['status', 'number'],
+    ]);
+
+    const failed = entry('debug.pprof', { profile: 'nope', query: '', status: 404 }, '/debug/pprof/nope');
+    expect(r.tone?.(failed)).toBe('danger');
+    expect(r.summary?.(failed)).toBe('status 404');
+  });
+
   it('humanizes names', () => {
+    expect(humanize('debug.pprof')).toBe('Pprof');
     expect(humanize('action.mark-offline')).toBe('Mark offline');
     expect(humanize('ignoredGate')).toBe('Ignored gate');
   });

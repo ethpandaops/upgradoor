@@ -66,7 +66,7 @@ import { hostUsage } from '../lib/usage';
 import { validateImageRef } from '../lib/imageRef';
 import { parseGoDuration } from '../lib/goDuration';
 import { rolloutActionOf } from '../lib/hostActions';
-import { FEATURE, TEAM_PREFIX, TWINNED, can, type Login, type PermissionCall } from '../lib/permissions';
+import { FEATURE, TEAM_PREFIX, TWINNED, can, hasFeature, type Login, type PermissionCall } from '../lib/permissions';
 import { FIELDS, toForm, validateForm } from '../lib/settingsForm';
 import {
   EPOCH_MS,
@@ -202,7 +202,7 @@ function mix(a: number, b: number): number {
  */
 const RESUME = '; resume to continue';
 
-/** DEPLOY_WINDOW_MS is the length of the initial deployment window, the controller's --deploy-window. */
+/** DEPLOY_WINDOW_MS is the length of the initial deployment window, the controller's deployWindow config key. */
 const DEPLOY_WINDOW_MS = 24 * 3600_000;
 
 /** DEPLOY_WINDOW_REASON starts the reason of a host that waits for the initial deployment window; its end follows. */
@@ -294,6 +294,8 @@ interface MockStream {
   user: boolean;
   /** full: the login reads the hosts in full (details); the others get no command lines of the clients. */
   full: boolean;
+  /** audit: the login reads the events in a host's history (the feature audit). */
+  audit: boolean;
   hosts: string[];
   controller: ReadableStreamDefaultController<Uint8Array>;
   /** What the stream was sent last: its tables, its string table, their version, and the details of its hosts. */
@@ -453,6 +455,7 @@ export class MockController {
     const url = new URL(input, 'http://mock.invalid');
     const user = url.pathname === USER_EVENTS_PATH;
     const full = user && this.login(init).hasFeature(FEATURE.details);
+    const audit = user && hasFeature(this.login(init), FEATURE.audit);
 
     let stream: MockStream | undefined;
     const close = () => {
@@ -469,6 +472,7 @@ export class MockController {
         stream = {
           user,
           full,
+          audit,
           hosts: user ? url.searchParams.getAll('host') : [],
           controller,
           doc: new Map(),
@@ -518,7 +522,7 @@ export class MockController {
     const details: Record<string, unknown> = {};
     for (const name of stream.hosts) {
       const before = stream.details.get(name);
-      const now = this.data.hosts.has(name) ? encodeDoc('d', detailTables(this.host(name))) : null;
+      const now = this.data.hosts.has(name) ? encodeDoc('d', detailTables(this.host(name, stream.audit))) : null;
       stream.details.set(name, now);
 
       if (now === null) {
@@ -597,6 +601,9 @@ export class MockController {
       if (route === 'plan') return this.plan();
       if (route === 'slots') return this.slots(q.get('window'), true);
       if (route === 'audit') {
+        if (!login.open && !hasFeature(login, FEATURE.audit)) {
+          throw new HttpError(403, `forbidden: this login lacks the feature ${login.service}:${FEATURE.audit}`);
+        }
         return this.auditPage(q, Number(q.get('before')) || 0, Number(q.get('limit')) || 100);
       }
     }
@@ -1401,7 +1408,8 @@ export class MockController {
     return { clients: this.clientIndex().views };
   }
 
-  private host(name: string): HostDetail {
+  /** host is a host in full; its history (the audit events) only with audit. */
+  private host(name: string, audit: boolean): HostDetail {
     const host = this.data.hosts.get(name);
     if (!host) throw new HttpError(404, `unknown host ${name}`);
 
@@ -1409,7 +1417,7 @@ export class MockController {
       ...host,
       ...this.summary(host, this.plan(), true),
       leases: this.data.leases.filter(l => l.host === name).sort((a, b) => b.grantedAt.localeCompare(a.grantedAt)),
-      history: this.data.audit.filter(e => e.target === name).sort((a, b) => b.id - a.id),
+      history: audit ? this.data.audit.filter(e => e.target === name).sort((a, b) => b.id - a.id) : [],
     };
   }
 

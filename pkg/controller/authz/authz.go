@@ -46,8 +46,8 @@ import (
 //   - a host: T owns a managed container on it; only for T's own hold and
 //     team_details.
 //
-// Implications (Implied): admin includes details, manage, manage_image and
-// manage_flags; a plain feature includes its twin. Nothing else.
+// Implications (Implied): admin includes details, manage, manage_image,
+// manage_flags and audit; a plain feature includes its twin. Nothing else.
 //
 // A prefix grant covers every feature whose name starts with it: "manage*"
 // is manage, manage_image and manage_flags (TestFeatureNames).
@@ -80,6 +80,10 @@ const (
 	// FeatureManageFlags covers flag-override and the flags part of
 	// client-override. Twin: team_manage_flags.
 	FeatureManageFlags = "manage_flags"
+	// FeatureAudit covers GET /api/v1/audit and the audit entries in a
+	// host's history (views.Access). What only the admin reads of an entry
+	// still needs admin. No twin.
+	FeatureAudit = "audit"
 	// FeatureAdmin covers forget, pause and resume without a rollout (the
 	// global switch), arm-deploy-window, GET and PUT /api/v1/settings, the data sources and
 	// their refresh, and the audit log in full (views.Access). It includes

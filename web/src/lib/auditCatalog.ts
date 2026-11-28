@@ -88,6 +88,7 @@ export const AUDIT_ACTIONS: readonly AuditActionInfo[] = [
   H('action.forget', 'hosts'),
   H('action.forget.failed', 'hosts'),
   { action: 'auth.refused', group: 'access', target: 'request' },
+  { action: 'debug.pprof', group: 'access', target: 'request' },
 ];
 
 const BY_ACTION = new Map(AUDIT_ACTIONS.map(a => [a.action, a]));
@@ -117,7 +118,7 @@ export const GROUP_LABEL: Record<AuditGroup, string> = {
   settings: 'Settings',
   sources: 'Data sources',
   hosts: 'Host registry',
-  access: 'Refused requests',
+  access: 'Refused requests and profiles',
 };
 
 export const TARGET_KIND_LABEL: Record<AuditTargetKind, string> = {
@@ -125,7 +126,7 @@ export const TARGET_KIND_LABEL: Record<AuditTargetKind, string> = {
   rollout: 'Rollout',
   settings: 'Settings',
   sources: 'Data source',
-  request: 'API request',
+  request: 'Request',
 };
 
 export const AUDIT_GROUPS = Object.keys(GROUP_LABEL) as AuditGroup[];

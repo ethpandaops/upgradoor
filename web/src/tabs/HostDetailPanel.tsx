@@ -850,6 +850,7 @@ function ActionRow({
 // ------------------------------------------------------------------- history
 
 function HistoryPane({ host: h }: { host: HostDetail }) {
+  const { audit } = usePermissions();
   const leases = list(h.leases);
   const history = list(h.history);
 
@@ -862,18 +863,20 @@ function HistoryPane({ host: h }: { host: HostDetail }) {
           <LeaseTable leases={leases} label={`Leases of ${h.name}`} showHost={false} closed />
         )}
       </Group>
-      <Group title="Events">
-        {history.length === 0 ? (
-          <Empty>No history yet.</Empty>
-        ) : (
-          <>
-            <AuditList entries={history} label={`History of ${h.name}`} showTarget={false} />
-            <a href={auditHash({ target: h.name })} className="self-start text-xs/5 text-accent hover:underline">
-              All of {h.name} in the audit log
-            </a>
-          </>
-        )}
-      </Group>
+      {audit && (
+        <Group title="Events">
+          {history.length === 0 ? (
+            <Empty>No history yet.</Empty>
+          ) : (
+            <>
+              <AuditList entries={history} label={`History of ${h.name}`} showTarget={false} />
+              <a href={auditHash({ target: h.name })} className="self-start text-xs/5 text-accent hover:underline">
+                All of {h.name} in the audit log
+              </a>
+            </>
+          )}
+        </Group>
+      )}
     </>
   );
 }

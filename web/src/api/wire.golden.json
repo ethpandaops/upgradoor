@@ -2927,6 +2927,11 @@
    "action": "auth.refused",
    "group": "access",
    "target": "request"
+  },
+  {
+   "action": "debug.pprof",
+   "group": "access",
+   "target": "request"
   }
  ]
 }

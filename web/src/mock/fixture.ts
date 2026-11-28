@@ -1923,6 +1923,11 @@ function buildAudit(input: AuditInput): AuditEntry[] {
     reason: 'the login lacks the feature admin',
     teams: ['teku'],
   });
+  log(20 * 60, 'alice@example.org', 'debug.pprof', '/debug/pprof/heap', {
+    profile: 'heap',
+    query: 'gc=1',
+    status: 200,
+  });
 
   // The open rollouts of the fixture.
   log(3 * D + 5 * H, 'scheduler', 'rollout.created', r.dockerRollout, {

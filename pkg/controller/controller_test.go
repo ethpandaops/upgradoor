@@ -4,55 +4,12 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 )
-
-func TestParseDefaultSettings(t *testing.T) {
-	s, err := ParseDefaultSettings(nil)
-	require.NoError(t, err)
-	assert.Equal(t, fleet.DefaultSettings(), s)
-
-	s, err = ParseDefaultSettings([]string{
-		"maxUnavailablePercent=25", "leaseTtl=10m", "policyReboot=auto",
-		"readyAttestations=3", "readyStableFor=5m", "minPeers=5", "paused=true", `policyImage="manual"`,
-		"readyPeerShare=0.25", "pauseAfterCanaryImage=true",
-		`policyClients={"cl":{"lighthouse":"auto"}}`, `actionPolicies={"security-upgrades":"auto"}`,
-		`policyKinds={"el":"manual","snooper-el":"auto","other":"manual"}`,
-	})
-	require.NoError(t, err)
-	assert.InDelta(t, 25.0, s.MaxUnavailablePercent, 0)
-	assert.Equal(t, 10*time.Minute, s.LeaseTTL.Std())
-	assert.Equal(t, fleet.PolicyAuto, s.PolicyReboot)
-	assert.Equal(t, fleet.PolicyManual, s.PolicyImage)
-	assert.Equal(t, uint64(3), s.ReadyAttestations)
-	assert.Equal(t, 5*time.Minute, s.ReadyStableFor.Std())
-	assert.Equal(t, 5, s.MinPeers)
-	assert.True(t, s.Paused)
-	assert.InDelta(t, 0.25, s.ReadyPeerShare, 0)
-	assert.True(t, s.PauseAfterCanaryImage)
-	assert.False(t, s.PauseAfterCanaryReboot)
-	assert.Equal(t, fleet.ClientPolicies{"cl": {"lighthouse": fleet.PolicyAuto}}, s.PolicyClients)
-	assert.Equal(t, fleet.ActionPolicies{"security-upgrades": fleet.PolicyAuto}, s.ActionPolicies)
-	assert.Equal(t, fleet.KindPolicies{
-		"el": fleet.PolicyManual, "snooper-el": fleet.PolicyAuto, fleet.KindOther: fleet.PolicyManual,
-	}, s.PolicyKinds)
-
-	for _, bad := range []string{
-		"nokey", "=1", "unknown=1", "leaseTtl=30", "maxUnavailablePercent=200",
-		"policyImage=sometimes", "readyAttestations=many", "readyAttestations=0", "readyStableFor=1h", "minPeers=0",
-		"readyPeerShare=2", "readyPeerShare=half", "pauseAfterCanaryImage=sometimes",
-		`policyKinds={"none":"manual"}`, `policyKinds={"cl":"sometimes"}`, `policyKinds=["cl"]`,
-	} {
-		_, err := ParseDefaultSettings([]string{bad})
-		require.Error(t, err, bad)
-	}
-}
 
 func TestLoadAnswerSigner(t *testing.T) {
 	const (
@@ -90,28 +47,18 @@ func TestLoadAnswerSigner(t *testing.T) {
 	good := write("controller.seed", controllerSeed+"\n")
 
 	assert.Equal(t, publicKey(controllerSeed),
-		signerKey(t, &Config{Network: network, ControllerSeedFile: good}))
+		signerKey(t, seedConfig(network, good)))
 
 	// The key does not depend on the network.
-	other := signerKey(t, &Config{Network: "testnet-devnet-1", ControllerSeedFile: good})
+	other := signerKey(t, seedConfig("testnet-devnet-1", good))
 	assert.Equal(t, publicKey(controllerSeed), other)
 
-	// The opt-out is the only way to run without a seed.
-	signer, err := loadAnswerSigner(&Config{Network: network, AllowUnsignedAgentAnswers: true})
+	// Without a seed (the opt-out, which Validate checks) there is no key.
+	signer, err := loadAnswerSigner(&Config{Network: NetworkConfig{Name: network}})
 	require.NoError(t, err)
 	assert.Nil(t, signer)
 
-	_, err = loadAnswerSigner(&Config{Network: network})
-	require.ErrorContains(t, err, "--controller-seed-file is required")
-
-	_, err = loadAnswerSigner(&Config{
-		Network: network, ControllerSeedFile: good, AllowUnsignedAgentAnswers: true,
-	})
-	require.ErrorContains(t, err, "exclude each other")
-
-	_, err = loadAnswerSigner(&Config{
-		Network: network, ControllerSeedFile: filepath.Join(dir, "missing"),
-	})
+	_, err = loadAnswerSigner(seedConfig(network, filepath.Join(dir, "missing")))
 	require.ErrorIs(t, err, identity.ErrNoSeed)
 
 	// A seed that is too short is refused, and nothing of the file is in
@@ -119,21 +66,12 @@ func TestLoadAnswerSigner(t *testing.T) {
 	const short = "too-short-to-be-a-seed"
 
 	for _, content := range []string{short, short + "\n", ""} {
-		_, err = loadAnswerSigner(&Config{
-			Network: network, ControllerSeedFile: write("short.seed", content),
-		})
+		_, err = loadAnswerSigner(seedConfig(network, write("short.seed", content)))
 		require.ErrorIs(t, err, identity.ErrSeedTooShort)
 		assert.NotContains(t, err.Error(), short)
 	}
 }
 
-// An open API is an explicit choice, and one or the other, not both.
-func TestCheckAuth(t *testing.T) {
-	require.NoError(t, checkAuth(&Config{AuthProviderURL: "https://auth.example"}))
-	require.NoError(t, checkAuth(&Config{AllowOpenAPI: true}))
-
-	require.ErrorContains(t, checkAuth(&Config{}), "--auth-provider-url is required")
-	require.ErrorContains(t, checkAuth(&Config{
-		AuthProviderURL: "https://auth.example", AllowOpenAPI: true,
-	}), "exclude each other")
+func seedConfig(network, seedFile string) *Config {
+	return &Config{Network: NetworkConfig{Name: network}, Agents: AgentsConfig{ControllerSeedFile: seedFile}}
 }

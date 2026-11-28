@@ -33,6 +33,8 @@ export interface Permissions {
   refreshImages: boolean;
   /** hostDetails: the login reads every host in full (the feature details); the stream is reduced otherwise. */
   hostDetails: boolean;
+  /** audit: the login reads the audit log and the events in a host's history (the feature audit). */
+  audit: boolean;
   /** can decides one call; context says what the page knows of the lease or rollout it is about. */
   can: (call: PermissionCall, context?: CallContext) => Verdict;
   /** offers reports whether the page shows an intent at all: a login without reboot is not offered one. */
@@ -181,6 +183,7 @@ function build(
     login,
     refreshImages: login.open || hasFeature(login, FEATURE.manage),
     hostDetails: login.open || hasFeature(login, FEATURE.details),
+    audit: login.open || hasFeature(login, FEATURE.audit),
     can: decide,
     offers: intent => intent.kind !== 'reboot' || login.open || hasFeature(login, FEATURE.manage),
     canIntent,

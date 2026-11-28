@@ -80,7 +80,7 @@ func TestAccessDetail(t *testing.T) {
 		}}},
 	}
 
-	got := (&Access{}).Detail(d)
+	got := (&Access{AuditLog: true}).Detail(d)
 
 	assert.True(t, got.Reduced)
 	assert.Empty(t, got.CertHash)
@@ -91,8 +91,19 @@ func TestAccessDetail(t *testing.T) {
 	assert.Equal(t, map[string]any{"roles": []string{"x"}}, got.History[0].Detail)
 	assert.Equal(t, "out", d.Leases[0].Operation.Steps[0].Action.Output, "the detail is not changed")
 
-	assert.Same(t, d, (&Access{Full: true}).Detail(d))
+	assert.Same(t, d, (&Access{Full: true, AuditLog: true}).Detail(d))
 	assert.Nil(t, (&Access{}).Detail(nil))
+
+	// Without the audit log: no entries, the leases stay, d is not changed.
+	for _, a := range []Access{{}, {Full: true}} {
+		got = a.Detail(d)
+		assert.Empty(t, got.History)
+		assert.NotNil(t, got.History)
+		assert.Len(t, got.Leases, 1)
+		assert.Len(t, d.History, 1)
+	}
+
+	assert.NotEqual(t, (&Access{Full: true}).Key(), (&Access{Full: true, AuditLog: true}).Key())
 }
 
 func TestAccessClientHost(t *testing.T) {

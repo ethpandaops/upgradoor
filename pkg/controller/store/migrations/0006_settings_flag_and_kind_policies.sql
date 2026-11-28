@@ -1,6 +1,6 @@
 -- upgradoor controller schema, step 6: settings changes.
 -- The length of the initial deployment window is the controller's
--- --deploy-window flag, no longer a setting.
+-- deployWindow config key, no longer a setting.
 -- The image policy of a team is per container kind (policyClients: kind ->
 -- team -> policy). A stored policy of a team becomes one entry under every
 -- kind of the team's managed containers ('other' for unlabelled ones); a team

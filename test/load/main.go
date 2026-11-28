@@ -63,7 +63,6 @@ type options struct {
 	rolloutAfter time.Duration
 	rampUp       time.Duration
 	dir          string
-	pprof        bool
 }
 
 func main() {
@@ -74,7 +73,6 @@ func main() {
 	flag.DurationVar(&o.rolloutAfter, "rollout-after", 90*time.Second, "when the new geth image appears")
 	flag.DurationVar(&o.rampUp, "ramp-up", 20*time.Second, "time over which the agents start")
 	flag.StringVar(&o.dir, "dir", ".tmp/load", "work directory (emptied first)")
-	flag.BoolVar(&o.pprof, "pprof", false, "serve the controller's pprof on a free loopback port")
 	flag.Parse()
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -151,12 +149,12 @@ func (w *world) start(ctx context.Context) error {
 		}
 	}
 
-	ports, err := freePorts(4)
+	ports, err := freePorts(3)
 	if err != nil {
 		return err
 	}
 
-	beaconAddr, ctlAddr, regAddr := "127.0.0.1:"+ports[0], "127.0.0.1:"+ports[1], "127.0.0.1:"+ports[3]
+	beaconAddr, ctlAddr, regAddr := "127.0.0.1:"+ports[0], "127.0.0.1:"+ports[1], "127.0.0.1:"+ports[2]
 	w.ctlURL = "http://" + ctlAddr
 
 	w.registry = agenttest.NewRegistry()
@@ -192,19 +190,25 @@ func (w *world) start(ctx context.Context) error {
 
 	w.controller = identity.EncodePublicKey(identity.PublicKey(ctlKey))
 
-	args := []string{"run", "--listen", ctlAddr, "--data-dir", filepath.Join(w.o.dir, "data"),
-		"--network", network, "--signer-public-key", identity.EncodePublicKey(identity.PublicKey(signer)),
-		"--controller-seed-file", seedFile, "--allow-insecure-agent-http", "--allow-open-api",
-		"--beacon-endpoint", "http://" + beaconAddr,
-		"--registry-plain-http", regAddr, "--registry-allow-private", "--deploy-window=0"}
+	args := make([]string, 0, 32)
+	args = append(args, "run")
 
-	for _, setting := range []string{"lookupInterval=30s", "pauseAfterCanaryImage=false"} {
-		args = append(args, "--default-setting", setting)
-	}
-
-	if w.o.pprof {
-		args = append(args, "--pprof-listen", "127.0.0.1:"+ports[2])
-		fmt.Printf("pprof at http://127.0.0.1:%s/debug/pprof/\n", ports[2])
+	for _, set := range []string{
+		"server.listen=" + ctlAddr,
+		"store.dataDir=" + filepath.Join(w.o.dir, "data"),
+		"network.name=" + network,
+		"network.beaconEndpoints=http://" + beaconAddr,
+		"agents.signerPublicKey=" + identity.EncodePublicKey(identity.PublicKey(signer)),
+		"agents.controllerSeedFile=" + seedFile,
+		"agents.allowInsecureHttp=true",
+		"auth.allowOpenApi=true",
+		"images.registryPlainHttp=" + regAddr,
+		"images.registryAllowPrivate=true",
+		"deployWindow=0s",
+		"settingDefaults.lookupInterval=30s",
+		"settingDefaults.pauseAfterCanaryImage=false",
+	} {
+		args = append(args, "--set", set)
 	}
 
 	w.ctl, err = startProcess(filepath.Join(w.o.dir, "controller.log"),

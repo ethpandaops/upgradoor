@@ -173,7 +173,7 @@ const MaxDeployWindow = 30 * 24 * time.Hour
 // DeployWindowState is the state of the initial deployment window. While it
 // is open only leases of Ansible deploys are granted.
 type DeployWindowState struct {
-	// Length is the configured length of the window (--deploy-window); 0 is
+	// Length is the configured length of the window (deployWindow); 0 is
 	// no window. It is not stored.
 	Length time.Duration `json:"-"`
 	// StartedAt is the controller's first start on a fresh store; zero when

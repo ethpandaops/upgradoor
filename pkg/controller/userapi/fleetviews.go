@@ -94,16 +94,18 @@ func (s *Handler) writeBodyError(w http.ResponseWriter, err error) {
 // Access is how much of the hosts u reads: everything with the feature
 // details or when the API runs open; otherwise the reduced view, with
 // the hosts a team of u owns a container on in full under the twin. The
-// audit log in full needs admin too.
+// audit log needs the feature audit, in full admin too.
 func (s *Handler) Access(u *authz.User) views.Access {
 	admin := u.Open || s.authz.HasFeature(u, authz.FeatureAdmin)
+	audit := u.Open || s.authz.HasFeature(u, authz.FeatureAudit)
 
 	if u.Open || s.authz.HasFeature(u, authz.FeatureDetails) {
-		return views.Access{Full: true, Admin: admin}
+		return views.Access{Full: true, Admin: admin, AuditLog: audit}
 	}
 
 	return views.Access{
 		Admin:      admin,
+		AuditLog:   audit,
 		Teams:      u.Teams,
 		OwnedHosts: s.authz.HasFeature(u, authz.TeamFeaturePrefix+authz.FeatureDetails),
 	}
@@ -386,8 +388,13 @@ func (s *Handler) settingsBody(ctx context.Context, settings *fleet.Settings) (*
 	}, nil
 }
 
-// handleAudit serves GET /api/v1/audit, newest first, paged by "before".
+// handleAudit serves GET /api/v1/audit, newest first, paged by "before". It
+// needs the feature audit.
 func (s *Handler) handleAudit(w http.ResponseWriter, r *http.Request, u *authz.User) {
+	if _, ok := s.authz.Allow(w, r, u, &authz.Requirement{Feature: authz.FeatureAudit}); !ok {
+		return
+	}
+
 	limit, err := queryLimit(r, store.DefaultAuditLimit, store.MaxAuditLimit)
 	if err != nil {
 		httpjson.BadRequest(s.log, w, err)

@@ -868,6 +868,18 @@ describe('hasFeature, the implications of the controller', () => {
       expect(hasFeature(login([FEATURE.manage]), f), f).toBe(false);
       expect(hasFeature(login([FEATURE.manage, 'team_manage']), TEAM_PREFIX + f), f).toBe(false);
     }
-    expect(hasFeature(login(['details', 'manage', 'manage_image', 'manage_flags']), FEATURE.admin)).toBe(false);
+    expect(hasFeature(login(['details', 'manage', 'manage_image', 'manage_flags', 'audit']), FEATURE.admin)).toBe(
+      false
+    );
+  });
+
+  it('gives audit through admin only, and audit has no twin', () => {
+    expect(hasFeature(login([FEATURE.audit]), FEATURE.audit)).toBe(true);
+    expect(hasFeature(login([FEATURE.admin]), FEATURE.audit)).toBe(true);
+    for (const f of [FEATURE.details, FEATURE.manage, FEATURE.manage_image, FEATURE.manage_flags]) {
+      expect(hasFeature(login([f, TEAM_PREFIX + f]), FEATURE.audit), f).toBe(false);
+    }
+    expect(hasFeature(login([TEAM_PREFIX + FEATURE.audit]), FEATURE.audit)).toBe(false);
+    expect(TWINNED).not.toContain(FEATURE.audit);
   });
 });

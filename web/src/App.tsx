@@ -7,6 +7,7 @@ import { canViewPrivate, type AuthStore } from './auth/authStore';
 import { Header } from './components/Header';
 import { LiveBanner, LiveIndicator, LiveProvider } from './components/Live';
 import { DEFAULT_SERVICE, PermissionsProvider } from './components/Permissions';
+import { PprofGate, isPprofPath } from './components/PprofGate';
 import { NowProvider } from './components/RelTime';
 import { Button, Loading, cx } from './components/primitives';
 import { useHashTab } from './hooks/useHashTab';
@@ -42,6 +43,9 @@ const ADMIN_TABS: ReadonlySet<TabId> = new Set(['settings', 'sources']);
 /** Packages needs the feature details. */
 const DETAIL_TABS: ReadonlySet<TabId> = new Set(['packages']);
 
+/** Audit needs the feature audit. */
+const AUDIT_TABS: ReadonlySet<TabId> = new Set(['audit']);
+
 /** Overview and Hosts have a public view; the rest needs a login. */
 const PRIVATE_TABS: ReadonlySet<TabId> = new Set(['clients', 'rollouts', 'packages', 'settings', 'sources', 'audit']);
 
@@ -50,18 +54,17 @@ const PRIVATE_TABS: ReadonlySet<TabId> = new Set(['clients', 'rollouts', 'packag
  * The rules are the controller's: without a login only the public views
  * exist, and the settings can only be changed with the feature admin, so for
  * every other login the Settings tab would be a page of controls it cannot
- * use; the data sources are served to admin only. Without an auth provider
+ * use; the data sources are served to admin only, the audit log to audit only. Without an auth provider
  * (open mode) everything is shown. This only decides what is offered: the
  * controller decides what each request may do.
  */
-export function visibleTabs(access: { priv: boolean; admin: boolean; hostDetails: boolean }): TabId[] {
-  return TABS.filter(id =>
-    ADMIN_TABS.has(id)
-      ? access.admin
-      : DETAIL_TABS.has(id)
-        ? access.priv && access.hostDetails
-        : !PRIVATE_TABS.has(id) || access.priv
-  );
+export function visibleTabs(access: { priv: boolean; admin: boolean; hostDetails: boolean; audit: boolean }): TabId[] {
+  return TABS.filter(id => {
+    if (ADMIN_TABS.has(id)) return access.admin;
+    if (DETAIL_TABS.has(id)) return access.priv && access.hostDetails;
+    if (AUDIT_TABS.has(id)) return access.priv && access.audit;
+    return !PRIVATE_TABS.has(id) || access.priv;
+  });
 }
 
 /** MockControls lets the mock mode flip the network gate and, with a fake auth client, the login from the UI. */
@@ -133,6 +136,9 @@ export function App({ api, auth, mock }: { api: ApiClient; auth: AuthStore; mock
     );
   }
 
+  // The controller serves this page at the profiling URLs to a browser without a valid token.
+  if (isPprofPath(window.location.pathname)) return <PprofGate auth={auth} config={boot.config} />;
+
   return <Shell api={api} auth={auth} config={boot.config} mock={mock} />;
 }
 
@@ -156,7 +162,8 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
   // Open mode has no login and no features: everything may be done.
   const admin = !authState.enabled || (priv && auth.hasFeature(service, FEATURE.admin));
   const hostDetails = !authState.enabled || (priv && auth.hasFeature(service, FEATURE.details));
-  const tabs = useMemo(() => visibleTabs({ priv, admin, hostDetails }), [priv, admin, hostDetails]);
+  const audit = !authState.enabled || (priv && (admin || auth.hasFeature(service, FEATURE.audit)));
+  const tabs = useMemo(() => visibleTabs({ priv, admin, hostDetails, audit }), [priv, admin, hostDetails, audit]);
 
   // A tab that is not in the menu is not shown either: its URL, and the tab a
   // login was on when it ended, lead to the overview. The panel is the
