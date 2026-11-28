@@ -57,6 +57,11 @@ type Host interface {
 	// Rescan collects the package inventory now and returns the system state
 	// from it.
 	Rescan(ctx context.Context) (System, error)
+	// SSHJournal reads the sshd entries of the journal (journalctl JSON
+	// lines) after cursor, or from since when cursor is empty, up to until.
+	SSHJournal(ctx context.Context, cursor string, since, until time.Time) ([]byte, error)
+	// SSHAlive reports whether pid is a running sshd process.
+	SSHAlive(pid int) bool
 
 	// Probe checks the local EL and CL.
 	Probe(ctx context.Context) protocol.NodeHealth
@@ -145,4 +150,14 @@ func (m *machine) RunAction(ctx context.Context, argv []string, timeout time.Dur
 // Rescan implements Host.
 func (m *machine) Rescan(ctx context.Context) (System, error) {
 	return m.system.Rescan(ctx)
+}
+
+// SSHJournal implements Host.
+func (m *machine) SSHJournal(ctx context.Context, cursor string, since, until time.Time) ([]byte, error) {
+	return m.system.SSHJournal(ctx, cursor, since, until)
+}
+
+// SSHAlive implements Host.
+func (m *machine) SSHAlive(pid int) bool {
+	return m.system.SSHAlive(pid)
 }

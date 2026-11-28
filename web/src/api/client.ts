@@ -1,6 +1,7 @@
 import type {
   ActionResult,
   Audit,
+  SSHLogins,
   ClientHostState,
   ClientHosts,
   ApproveLeaseRequest,
@@ -186,6 +187,22 @@ export interface ClientHostsQuery {
   limit?: number;
 }
 
+/** SSHLoginQuery is the query of GET /api/v1/ssh-logins. */
+export interface SSHLoginQuery {
+  view?: 'fleet' | 'groups';
+  host?: string;
+  identity?: string;
+  fingerprint?: string;
+  user?: string;
+  /** from and to are RFC 3339 instants: groups whose first login is in [from, to). */
+  from?: string;
+  to?: string;
+  unknown?: boolean;
+  open?: boolean;
+  cursor?: string;
+  limit?: number;
+}
+
 interface AuditQuery {
   who?: string;
   actor?: string;
@@ -326,6 +343,15 @@ export class ApiClient {
       user: true,
       signal,
     });
+  }
+
+  /** sshLogins asks for a page of the SSH login groups or of their fleet clusters (feature audit). */
+  sshLogins(q: SSHLoginQuery = {}, signal?: AbortSignal): Promise<SSHLogins> {
+    const { unknown, open, ...rest } = q;
+    return this.request(
+      `/api/v1/ssh-logins${query({ ...rest, unknown: unknown ? '1' : undefined, open: open ? '1' : undefined })}`,
+      { user: true, signal }
+    );
   }
 
   action(call: ActionCall): Promise<ActionResult> {

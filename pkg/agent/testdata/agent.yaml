@@ -44,3 +44,7 @@ commands:
 verify:
   window: 30s
   timeout: 5m
+sshLogins:
+  enabled: true
+  backlog: 48h
+  keyMap: /etc/upgradoor/test-ssh-keys.json

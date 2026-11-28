@@ -982,6 +982,10 @@ func (s *Handler) streamDocs(ctx context.Context, st *eventState, details []deta
 		v.audit.LatestID = newest[0].ID
 	}
 
+	if v.audit.SSHLogins, err = s.opts.Store.SSHLoginsSeen(ctx); err != nil {
+		return nil, fmt.Errorf("ssh logins: %w", err)
+	}
+
 	now := v.now
 	staleAfter := settings.HostStaleAfter.Std()
 

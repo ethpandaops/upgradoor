@@ -270,6 +270,8 @@ export function privateTables(v: {
   slots: readonly SlotRow[];
   rollouts: Rollouts;
   latestAuditId: number;
+  /** sshLogins: a host has reported SSH logins. */
+  sshLogins?: boolean;
 }): Tables {
   const all = [...list(v.rollouts.open), ...list(v.rollouts.recent)];
   const planned = v.plan.hosts ?? {};
@@ -294,7 +296,7 @@ export function privateTables(v: {
       rows: [...list(v.rollouts.leases), ...list(v.rollouts.recentLeases)],
       order: [list(v.rollouts.leases).map(l => l.id), list(v.rollouts.recentLeases).map(l => l.id)],
     },
-    a: { one: { latestId: v.latestAuditId } },
+    a: { one: { latestId: v.latestAuditId, ...(v.sshLogins ? { sshLogins: true } : {}) } },
   };
 }
 

@@ -9,6 +9,9 @@ const (
 	// AuditAgentPrefix starts the actor of what an agent's sync records:
 	// "agent:<host>".
 	AuditAgentPrefix = "agent:"
+	// AuditSSHPrefix starts the actor of an SSH login group a host reported:
+	// "ssh:<identity or key fingerprint>".
+	AuditSSHPrefix = "ssh:"
 	// AuditTargetSettings is the target of every change of the settings.
 	AuditTargetSettings = "settings"
 )
@@ -16,12 +19,13 @@ const (
 // AuditActorKind sorts the actors of the audit trail.
 type AuditActorKind string
 
-// Actor kinds. People are everyone but the scheduler and the agents: logins,
-// tokens, "anonymous" of an open API.
+// Actor kinds. People are everyone but the scheduler, the agents and the SSH
+// logins: logins, tokens, "anonymous" of an open API.
 const (
 	AuditPeople    AuditActorKind = "people"
 	AuditScheduler AuditActorKind = "scheduler"
 	AuditAgents    AuditActorKind = "agents"
+	AuditSSH       AuditActorKind = "ssh"
 )
 
 // AuditActorKindOf returns the kind of an actor.
@@ -31,6 +35,8 @@ func AuditActorKindOf(actor string) AuditActorKind {
 		return AuditScheduler
 	case strings.HasPrefix(actor, AuditAgentPrefix):
 		return AuditAgents
+	case strings.HasPrefix(actor, AuditSSHPrefix):
+		return AuditSSH
 	default:
 		return AuditPeople
 	}
@@ -51,6 +57,7 @@ const (
 	AuditGroupSources      AuditGroup = "sources"
 	AuditGroupHosts        AuditGroup = "hosts"
 	AuditGroupAccess       AuditGroup = "access"
+	AuditGroupSSH          AuditGroup = "ssh"
 )
 
 // AuditTargetKind is what the target of an audit entry names.
@@ -120,7 +127,11 @@ var AuditActions = []AuditAction{
 	{Action: "action.forget.failed", Group: AuditGroupHosts, Target: AuditTargetHost},
 	{Action: "auth.refused", Group: AuditGroupAccess, Target: AuditTargetRequest},
 	{Action: "debug.pprof", Group: AuditGroupAccess, Target: AuditTargetRequest},
+	{Action: AuditActionSSHSession, Group: AuditGroupSSH, Target: AuditTargetHost},
 }
+
+// AuditActionSSHSession records one closed SSH login group of a host.
+const AuditActionSSHSession = "ssh.session"
 
 // AuditActionOf returns the description of an action.
 func AuditActionOf(action string) (AuditAction, bool) {

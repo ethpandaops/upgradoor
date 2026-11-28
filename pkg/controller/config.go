@@ -139,6 +139,23 @@ type StoreConfig struct {
 	DataDir string `yaml:"dataDir"`
 	// AuditRetention is how long audit entries stay; 0 keeps them.
 	AuditRetention Duration `yaml:"auditRetention"`
+	// SSHLoginRetention is how long SSH login groups stay after their last
+	// logout; 0 keeps them.
+	SSHLoginRetention Duration `yaml:"sshLoginRetention"`
+}
+
+// validateRetention checks the retentions: 0 (keep) or at least an hour.
+func (c *StoreConfig) validateRetention(bad func(key, format string, args ...any)) {
+	for _, r := range []struct {
+		key  string
+		keep Duration
+	}{{"store.auditRetention", c.AuditRetention}, {"store.sshLoginRetention", c.SSHLoginRetention}} {
+		if r.keep < 0 {
+			bad(r.key, "must not be negative")
+		} else if d := r.keep.Std(); d > 0 && d < time.Hour {
+			bad(r.key, "must be 0 (keep) or at least 1h")
+		}
+	}
 }
 
 // Duration is a time.Duration written as a Go duration string ("90s",
@@ -429,11 +446,7 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	if c.Store.AuditRetention < 0 {
-		bad("store.auditRetention", "must not be negative")
-	} else if r := c.Store.AuditRetention.Std(); r > 0 && r < time.Hour {
-		bad("store.auditRetention", "must be 0 (keep) or at least 1h")
-	}
+	c.Store.validateRetention(bad)
 
 	if c.DeployWindow < 0 || c.DeployWindow.Std() > fleet.MaxDeployWindow {
 		bad("deployWindow", "must be between 0 and 720h")

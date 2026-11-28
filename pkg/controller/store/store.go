@@ -124,6 +124,20 @@ type Store interface {
 	// before before, in one short transaction, and returns how many it
 	// deleted.
 	DeleteAuditBefore(ctx context.Context, before time.Time, limit int) (int64, error)
+
+	// RecordSSHLogins stores a host's SSH login report: its open groups
+	// replace the host's open ones, its closed groups are stored once each,
+	// with an audit entry, and the host is marked as reporting them.
+	RecordSSHLogins(
+		ctx context.Context, host string, at time.Time, report *protocol.SSHReport,
+	) (*SSHLoginsRecorded, error)
+	// ListSSHLogins returns a page of SSH login groups or clusters.
+	ListSSHLogins(ctx context.Context, filter *SSHLoginFilter) (*SSHLoginPage, error)
+	// SSHLoginsSeen reports whether a host has ever reported SSH logins.
+	SSHLoginsSeen(ctx context.Context) (bool, error)
+	// DeleteSSHLoginsBefore deletes at most limit of the oldest closed
+	// groups whose last logout is before before, and returns how many.
+	DeleteSSHLoginsBefore(ctx context.Context, before time.Time, limit int) (int64, error)
 }
 
 // HostSync is the input of RecordSync.
@@ -254,7 +268,8 @@ type PackagePage struct {
 	Next string
 }
 
-// ErrBadCursor is returned by ListPackages for an After that no page gave.
+// ErrBadCursor is returned by ListPackages and ListSSHLogins for a cursor
+// that no page gave.
 var ErrBadCursor = errors.New("store: not a page cursor")
 
 // PackageVersion is one installed version and the hosts on it.

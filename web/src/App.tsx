@@ -5,7 +5,7 @@ import type { Config } from './api/types';
 import { AppContext, useAuthState, type AppServices } from './appContext';
 import { canViewPrivate, type AuthStore } from './auth/authStore';
 import { Header } from './components/Header';
-import { LiveBanner, LiveIndicator, LiveProvider } from './components/Live';
+import { LiveBanner, LiveIndicator, LiveProvider, useLive } from './components/Live';
 import { DEFAULT_SERVICE, PermissionsProvider } from './components/Permissions';
 import { PprofGate, isPprofPath } from './components/PprofGate';
 import { NowProvider } from './components/RelTime';
@@ -22,8 +22,19 @@ import { PackagesTab } from './tabs/PackagesTab';
 import { RolloutsTab } from './tabs/RolloutsTab';
 import { DataSourcesTab } from './tabs/DataSourcesTab';
 import { SettingsTab } from './tabs/SettingsTab';
+import { SSHLoginsTab } from './tabs/SSHLoginsTab';
 
-export const TABS = ['overview', 'hosts', 'clients', 'rollouts', 'packages', 'settings', 'sources', 'audit'] as const;
+export const TABS = [
+  'overview',
+  'hosts',
+  'clients',
+  'rollouts',
+  'packages',
+  'settings',
+  'sources',
+  'audit',
+  'ssh',
+] as const;
 type TabId = (typeof TABS)[number];
 
 const TAB_LABEL: Record<TabId, string> = {
@@ -35,6 +46,7 @@ const TAB_LABEL: Record<TabId, string> = {
   settings: 'Settings',
   sources: 'Data sources',
   audit: 'Audit',
+  ssh: 'SSH logins',
 };
 
 /** Settings and data sources need the feature admin. */
@@ -43,23 +55,39 @@ const ADMIN_TABS: ReadonlySet<TabId> = new Set(['settings', 'sources']);
 /** Packages needs the feature details. */
 const DETAIL_TABS: ReadonlySet<TabId> = new Set(['packages']);
 
-/** Audit needs the feature audit. */
-const AUDIT_TABS: ReadonlySet<TabId> = new Set(['audit']);
+/** Audit and the SSH logins need the feature audit. */
+const AUDIT_TABS: ReadonlySet<TabId> = new Set(['audit', 'ssh']);
 
 /** Overview and Hosts have a public view; the rest needs a login. */
-const PRIVATE_TABS: ReadonlySet<TabId> = new Set(['clients', 'rollouts', 'packages', 'settings', 'sources', 'audit']);
+const PRIVATE_TABS: ReadonlySet<TabId> = new Set([
+  'clients',
+  'rollouts',
+  'packages',
+  'settings',
+  'sources',
+  'audit',
+  'ssh',
+]);
 
 /**
  * visibleTabs are the tabs the login can use; the others are not in the menu.
  * The rules are the controller's: without a login only the public views
  * exist, and the settings can only be changed with the feature admin, so for
  * every other login the Settings tab would be a page of controls it cannot
- * use; the data sources are served to admin only, the audit log to audit only. Without an auth provider
+ * use; the data sources are served to admin only, the audit log to audit only. The SSH logins need
+ * audit too, and show once a host has reported one (ssh). Without an auth provider
  * (open mode) everything is shown. This only decides what is offered: the
  * controller decides what each request may do.
  */
-export function visibleTabs(access: { priv: boolean; admin: boolean; hostDetails: boolean; audit: boolean }): TabId[] {
+export function visibleTabs(access: {
+  priv: boolean;
+  admin: boolean;
+  hostDetails: boolean;
+  audit: boolean;
+  ssh: boolean;
+}): TabId[] {
   return TABS.filter(id => {
+    if (id === 'ssh') return access.priv && access.audit && access.ssh;
     if (ADMIN_TABS.has(id)) return access.admin;
     if (DETAIL_TABS.has(id)) return access.priv && access.hostDetails;
     if (AUDIT_TABS.has(id)) return access.priv && access.audit;
@@ -144,6 +172,19 @@ export function App({ api, auth, mock }: { api: ApiClient; auth: AuthStore; mock
 
 function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; config: Config; mock?: MockControls }) {
   const services = useMemo<AppServices>(() => ({ api, auth, config }), [api, auth, config]);
+
+  return (
+    <AppContext value={services}>
+      <LiveProvider>
+        <NowProvider>
+          <ShellBody auth={auth} config={config} mock={mock} />
+        </NowProvider>
+      </LiveProvider>
+    </AppContext>
+  );
+}
+
+function ShellBody({ auth, config, mock }: { auth: AuthStore; config: Config; mock?: MockControls }) {
   const authState = useAuthState(auth);
   const { preference, setPreference } = useTheme();
   // A link to a host (?host=<name>) without a tab opens the Hosts tab.
@@ -163,12 +204,21 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
   const admin = !authState.enabled || (priv && auth.hasFeature(service, FEATURE.admin));
   const hostDetails = !authState.enabled || (priv && auth.hasFeature(service, FEATURE.details));
   const audit = !authState.enabled || (priv && (admin || auth.hasFeature(service, FEATURE.audit)));
-  const tabs = useMemo(() => visibleTabs({ priv, admin, hostDetails, audit }), [priv, admin, hostDetails, audit]);
+  // The SSH logins show once a host has reported one; until the stream says,
+  // a link to them waits instead of leading away.
+  const auditHead = useLive('audit');
+  const ssh = auditHead.data?.sshLogins === true;
+  const sshPending = priv && audit && auditHead.data === undefined && auditHead.error === undefined;
+  const tabs = useMemo(
+    () => visibleTabs({ priv, admin, hostDetails, audit, ssh }),
+    [priv, admin, hostDetails, audit, ssh]
+  );
 
   // A tab that is not in the menu is not shown either: its URL, and the tab a
   // login was on when it ended, lead to the overview. The panel is the
   // overview's from the first render, so nothing of the hidden tab flashes.
-  const tab: TabId = tabs.includes(wanted) ? wanted : 'overview';
+  const waiting = wanted === 'ssh' && sshPending;
+  const tab: TabId = tabs.includes(wanted) || waiting ? wanted : 'overview';
   useEffect(() => {
     if (wanted !== tab) setTab(tab);
   }, [wanted, tab, setTab]);
@@ -215,106 +265,98 @@ function Shell({ api, auth, config, mock }: { api: ApiClient; auth: AuthStore; c
     case 'audit':
       panel = <AuditTab />;
       break;
+    case 'ssh':
+      panel = waiting ? <Loading what="the SSH logins" /> : <SSHLoginsTab />;
+      break;
   }
 
   return (
-    <AppContext value={services}>
-      <LiveProvider>
-        <NowProvider>
-          <div className="flex min-h-dvh flex-col bg-background text-foreground">
-            <Header
-              config={config}
-              auth={auth}
-              authState={authState}
-              theme={preference}
-              onTheme={setPreference}
-              mockLabel={mock?.label}
-              extra={
-                <>
-                  <LiveIndicator />
-                  {mock && (
-                    <>
-                      <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
-                        <input
-                          type="checkbox"
-                          checked={gateFailing}
-                          onChange={e => {
-                            mock.setGateFailing(e.target.checked);
-                            setGateFailing(e.target.checked);
-                          }}
-                          className="accent-accent"
-                        />
-                        failing gate
-                      </label>
-                      {mock.login && (
-                        <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
-                          login as
-                          <select
-                            value={mockLogin}
-                            onChange={e => {
-                              mock.login?.set(e.target.value);
-                              setMockLogin(e.target.value);
-                            }}
-                            className="rounded-sm border border-border-strong bg-surface px-1 text-foreground"
-                          >
-                            {mock.login.options.map(option => (
-                              <option key={option} value={option}>
-                                {option}
-                              </option>
-                            ))}
-                          </select>
-                        </label>
-                      )}
-                    </>
+    <div className="flex min-h-dvh flex-col bg-background text-foreground">
+      <Header
+        config={config}
+        auth={auth}
+        authState={authState}
+        theme={preference}
+        onTheme={setPreference}
+        mockLabel={mock?.label}
+        extra={
+          <>
+            <LiveIndicator />
+            {mock && (
+              <>
+                <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
+                  <input
+                    type="checkbox"
+                    checked={gateFailing}
+                    onChange={e => {
+                      mock.setGateFailing(e.target.checked);
+                      setGateFailing(e.target.checked);
+                    }}
+                    className="accent-accent"
+                  />
+                  failing gate
+                </label>
+                {mock.login && (
+                  <label className="hidden items-center gap-1.5 text-xs/5 text-muted md:flex">
+                    login as
+                    <select
+                      value={mockLogin}
+                      onChange={e => {
+                        mock.login?.set(e.target.value);
+                        setMockLogin(e.target.value);
+                      }}
+                      className="rounded-sm border border-border-strong bg-surface px-1 text-foreground"
+                    >
+                      {mock.login.options.map(option => (
+                        <option key={option} value={option}>
+                          {option}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                )}
+              </>
+            )}
+          </>
+        }
+        nav={
+          <div role="tablist" aria-label="Views" onKeyDown={onTabKey} className="flex h-full min-h-10 items-stretch">
+            {tabs.map(id => {
+              return (
+                <button
+                  key={id}
+                  ref={el => {
+                    if (el) tabRefs.current.set(id, el);
+                    else tabRefs.current.delete(id);
+                  }}
+                  type="button"
+                  role="tab"
+                  id={`tab-${id}`}
+                  aria-selected={tab === id}
+                  aria-controls="tab-panel"
+                  tabIndex={tab === id ? 0 : -1}
+                  onClick={() => {
+                    setTab(id);
+                  }}
+                  className={cx(
+                    'border-y-2 border-t-transparent px-3 text-sm/6 font-medium whitespace-nowrap',
+                    tab === id
+                      ? 'border-b-accent text-foreground'
+                      : 'border-b-transparent text-muted hover:text-foreground'
                   )}
-                </>
-              }
-              nav={
-                <div
-                  role="tablist"
-                  aria-label="Views"
-                  onKeyDown={onTabKey}
-                  className="flex h-full min-h-10 items-stretch"
                 >
-                  {tabs.map(id => {
-                    return (
-                      <button
-                        key={id}
-                        ref={el => {
-                          if (el) tabRefs.current.set(id, el);
-                          else tabRefs.current.delete(id);
-                        }}
-                        type="button"
-                        role="tab"
-                        id={`tab-${id}`}
-                        aria-selected={tab === id}
-                        aria-controls="tab-panel"
-                        tabIndex={tab === id ? 0 : -1}
-                        onClick={() => {
-                          setTab(id);
-                        }}
-                        className={cx(
-                          'border-y-2 border-t-transparent px-3 text-sm/6 font-medium whitespace-nowrap',
-                          tab === id
-                            ? 'border-b-accent text-foreground'
-                            : 'border-b-transparent text-muted hover:text-foreground'
-                        )}
-                      >
-                        {TAB_LABEL[id]}
-                      </button>
-                    );
-                  })}
-                </div>
-              }
-            />
-            <LiveBanner />
-
-            <main id="tab-panel" role="tabpanel" aria-labelledby={`tab-${tab}`} className="grow p-4">
-              <PermissionsProvider>{panel}</PermissionsProvider>
-            </main>
+                  {TAB_LABEL[id]}
+                </button>
+              );
+            })}
           </div>
-        </NowProvider>
-      </LiveProvider>
-    </AppContext>
+        }
+      />
+      <LiveBanner />
+
+      <main id="tab-panel" role="tabpanel" aria-labelledby={`tab-${tab}`} className="grow p-4">
+        <PermissionsProvider>{panel}</PermissionsProvider>
+      </main>
+    </div>
   );
 }

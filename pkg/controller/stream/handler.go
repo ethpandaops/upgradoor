@@ -20,6 +20,7 @@ import (
 type Store interface {
 	ListHosts(ctx context.Context) ([]*fleet.Host, error)
 	ListAudit(ctx context.Context, filter store.AuditFilter) ([]fleet.AuditEntry, error)
+	SSHLoginsSeen(ctx context.Context) (bool, error)
 	ListSlotParticipation(ctx context.Context, fromSlot uint64) ([]fleet.SlotParticipation, error)
 	SumHostSlotParticipation(
 		ctx context.Context, fromSlot, bucketSlots uint64,

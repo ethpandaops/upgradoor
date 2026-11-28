@@ -39,6 +39,7 @@ func userRoutes() []userRoute {
 		{method: http.MethodGet, path: "/api/v1/settings"},
 		{method: http.MethodPut, path: "/api/v1/settings", body: string(settings)},
 		{method: http.MethodGet, path: "/api/v1/audit"},
+		{method: http.MethodGet, path: "/api/v1/ssh-logins"},
 		{method: http.MethodGet, path: "/api/v1/slots"},
 		{method: http.MethodPost, path: "/api/v1/actions/roll", body: `{"all":true}`},
 		{method: http.MethodPost, path: "/api/v1/actions/reboot", body: `{"hosts":["a"]}`},

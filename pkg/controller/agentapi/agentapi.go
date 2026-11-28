@@ -605,7 +605,8 @@ func (s *Handler) sync(r *http.Request, call *agentRequest) (any, error) {
 		return nil, fmt.Errorf("assignment of %s: %w", cert.Subject, err)
 	}
 
-	resp := &protocol.SyncResponse{ServerTime: now, Keys: call.keys}
+	resp := &protocol.SyncResponse{ServerTime: now, Keys: call.keys, Accepts: accepts}
+	resp.SSHAck = s.recordSSH(ctx, cert.Subject, now, &req)
 
 	if result != nil && result.Host != nil {
 		resp.WantInventory = req.InventoryHash != result.Host.InventoryHash
@@ -645,6 +646,112 @@ func (s *Handler) sync(r *http.Request, call *agentRequest) (any, error) {
 	s.pacer.observe(time.Since(started))
 
 	return resp, nil
+}
+
+// accepts are the optional features the controller stores.
+var accepts = []string{protocol.FeatureSSHLogins}
+
+// recordSSH stores the SSH login report of a host that has the feature on
+// and returns the acknowledgement; nil when there is none or it cannot be
+// stored, which the host sends again.
+func (s *Handler) recordSSH(ctx context.Context, host string, now time.Time, req *protocol.SyncRequest) *int64 {
+	if req.SSH == nil || !slices.Contains(req.Features, protocol.FeatureSSHLogins) {
+		return nil
+	}
+
+	rec, err := s.opts.Store.RecordSSHLogins(ctx, host, now, cleanSSH(req.SSH))
+	if err != nil {
+		s.log.WithError(err).WithField("host", host).Warn("Cannot store SSH logins")
+
+		return nil
+	}
+
+	if rec.Closed > 0 || rec.FirstSeen {
+		s.opts.Notify()
+	}
+
+	return &rec.Ack
+}
+
+// Bounds of the strings of an SSH login group.
+const (
+	maxSSHIdentity = 128
+	maxSSHField    = 64
+	maxSSHError    = 256
+)
+
+// cleanSSH bounds what a host reports of its SSH logins: at most
+// protocol.MaxSSHOpen open and protocol.MaxSSHClosed closed groups, each
+// Seq once (a closed one wins), strings clipped, an unknown source as
+// unknown, counts not negative.
+func cleanSSH(in *protocol.SSHReport) *protocol.SSHReport {
+	out := &protocol.SSHReport{Dropped: max(0, in.Dropped), Error: clipText(in.Error, maxSSHError)}
+	closed := make(map[int64]struct{}, len(in.Closed))
+
+	for i := range in.Closed[:min(len(in.Closed), protocol.MaxSSHClosed)] {
+		if g, ok := cleanSSHGroup(&in.Closed[i]); ok {
+			if _, dup := closed[g.Seq]; !dup {
+				closed[g.Seq] = struct{}{}
+				out.Closed = append(out.Closed, g)
+			}
+		}
+	}
+
+	open := make(map[int64]struct{}, len(in.Open))
+
+	for i := range in.Open[:min(len(in.Open), protocol.MaxSSHOpen)] {
+		if g, ok := cleanSSHGroup(&in.Open[i]); ok {
+			_, isClosed := closed[g.Seq]
+			if _, dup := open[g.Seq]; !dup && !isClosed {
+				open[g.Seq] = struct{}{}
+				out.Open = append(out.Open, g)
+			}
+		}
+	}
+
+	return out
+}
+
+// cleanSSHGroup bounds one group; one without a Seq, user, address or start
+// is dropped.
+func cleanSSHGroup(in *protocol.SSHLoginGroup) (protocol.SSHLoginGroup, bool) {
+	g := *in
+
+	if g.Seq <= 0 || g.User == "" || g.From == "" || g.FirstLogin.IsZero() {
+		return g, false
+	}
+
+	g.Identity = clipText(g.Identity, maxSSHIdentity)
+	g.Fingerprint = clipText(g.Fingerprint, maxSSHField)
+	g.KeyType = clipText(g.KeyType, maxSSHField)
+	g.User = clipText(g.User, maxSSHField)
+	g.From = clipText(g.From, maxSSHField)
+
+	switch g.Source {
+	case fleet.SSHSourceGitHub, fleet.SSHSourceComment:
+	default:
+		g.Source = fleet.SSHSourceUnknown
+	}
+
+	if g.Identity == "" {
+		g.Source = fleet.SSHSourceUnknown
+	}
+
+	g.Sessions = max(0, g.Sessions)
+	g.Open = max(0, g.Open)
+	g.LongestMillis = max(0, g.LongestMillis)
+	g.TotalMillis = max(0, g.TotalMillis)
+
+	return g, true
+}
+
+// clipText cuts s to at most n bytes of valid UTF-8.
+func clipText(s string, n int) string {
+	if len(s) > n {
+		s = s[:n]
+	}
+
+	return strings.ToValidUTF8(s, "")
 }
 
 // recorded tells the scheduler and the views about a recorded sync. A sync

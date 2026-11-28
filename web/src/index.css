@@ -159,7 +159,7 @@
 /*
  * A stacking table (Table stack) below sm: the header is left to assistive
  * tech and each row is a block, one line per cell with its data-label in
- * front; a cell that holds only a Dash is left out. Outside a layer, so it
+ * front; a cell that holds only a Dash, or is marked data-stack-hidden, is left out. Outside a layer, so it
  * wins over the cells' width and wrap utilities.
  */
 table[data-stack] {
@@ -199,6 +199,10 @@ table[data-stack] {
     }
 
     & td[data-label]:has(> [data-dash]:only-child) {
+      display: none;
+    }
+
+    & td[data-stack-hidden] {
       display: none;
     }
 

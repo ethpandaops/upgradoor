@@ -14,6 +14,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/agent/lease"
 	"github.com/ethpandaops/upgradoor/pkg/agent/link"
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
+	"github.com/ethpandaops/upgradoor/pkg/agent/logins"
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
 )
@@ -76,6 +77,9 @@ func TestLoadConfigReadsEveryKey(t *testing.T) {
 			Fallback: plan.Fallback{After: 2 * time.Hour, Interval: 20 * time.Minute},
 		},
 		Verify: lease.Config{Window: 30 * time.Second, Timeout: 5 * time.Minute},
+		SSHLogins: logins.Config{
+			Enabled: true, Backlog: 48 * time.Hour, KeyMap: "/etc/upgradoor/test-ssh-keys.json",
+		},
 	}, cfg)
 }
 
@@ -97,6 +101,9 @@ func TestLoadConfigAppliesTheDefaults(t *testing.T) {
 	assert.Equal(t, "/root/.docker/config.json", cfg.Host.Docker.AuthFile)
 	assert.Equal(t, plan.DefaultIgnore, cfg.Policy.DefaultPolicy)
 	assert.Equal(t, 45*time.Second, cfg.Verify.Window)
+	assert.False(t, cfg.SSHLogins.Enabled, "the SSH login history is off by default")
+	assert.Equal(t, 168*time.Hour, cfg.SSHLogins.Backlog)
+	assert.Equal(t, "/etc/upgradoor/ssh-keys.json", cfg.SSHLogins.KeyMap)
 }
 
 func TestLoadConfigRefusesWhatItDoesNotKnow(t *testing.T) {
@@ -126,6 +133,8 @@ func TestLoadConfigRefusesWhatItDoesNotKnow(t *testing.T) {
 		"an unknown verb":             {head + "verbs: [exec]\n", `unknown verb "exec"`},
 		"not yaml":                    {"controller: [\n", "parse config"},
 		"a role that is no name":      {head + "roles: [a/b]\n", "roles"},
+		"a relative key map":          {head + "sshLogins:\n  keyMap: keys.json\n", "sshLogins.keyMap"},
+		"an unknown sshLogins key":    {head + "sshLogins:\n  users: [devops]\n", "not found"},
 	} {
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()

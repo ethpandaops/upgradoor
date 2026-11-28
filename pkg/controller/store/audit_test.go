@@ -310,6 +310,8 @@ func TestAuditQueriesUseTheirIndex(t *testing.T) {
 		{"one person", AuditFilter{Actor: "alice@example.org"}, "audit_people", false},
 		{"people's leases", AuditFilter{ActorKind: fleet.AuditPeople, Group: fleet.AuditGroupLeases}, "audit_people", true},
 		{"agents", AuditFilter{ActorKind: fleet.AuditAgents}, "audit_agents", true},
+		{"ssh", AuditFilter{ActorKind: fleet.AuditSSH}, "audit_ssh", true},
+		{"one key", AuditFilter{Actor: "ssh:github:pk910"}, "audit_ssh", false},
 		{"target", AuditFilter{Target: "node-1", ActorKind: fleet.AuditPeople}, "audit_target", false},
 		{"settings", AuditFilter{Group: fleet.AuditGroupSettings}, "audit_target", false},
 		{"holds", AuditFilter{Group: fleet.AuditGroupHolds}, "audit_action", true},

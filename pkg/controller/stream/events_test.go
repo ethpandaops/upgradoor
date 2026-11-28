@@ -669,3 +669,28 @@ func TestEventStreamSlotOfALargeFleet(t *testing.T) {
 	assert.NotContains(t, ev.data, "node-0004")
 	t.Logf("a slot in which 3 of 1000 hosts missed: %d bytes: %s", len(ev.data), ev.data)
 }
+
+// The audit head says whether a host reported SSH logins.
+func TestAuditHeadSSHLogins(t *testing.T) {
+	for _, seen := range []bool{false, true} {
+		h := newHarness(t, nil)
+		fastStreams(h)
+		controllertest.LeakFixture(t, h.store, h.sched, h.beacon)
+
+		if seen {
+			h.store.SSHHosts = map[string]bool{"lighthouse-geth-1": true}
+		}
+
+		h.start()
+
+		st := h.stream(PathEvents, "")
+		require.Equal(t, http.StatusOK, st.status)
+
+		want := `{"r":[[3]]}`
+		if seen {
+			want = `{"r":[[3,1]]}`
+		}
+
+		assert.JSONEq(t, want, string(st.event(eventSnapshot)[tableAudit]), "sshLogins is the second cell")
+	}
+}

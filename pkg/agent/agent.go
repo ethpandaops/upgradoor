@@ -59,6 +59,7 @@ type agent struct {
 	audit   local.Audit
 	rolls   local.Rolls
 	server  local.Server
+	ssh     *sshLogins
 	// state and runner are set by Start.
 	state  lease.State
 	runner lease.Runner
@@ -166,6 +167,7 @@ func New(log logrus.FieldLogger, cfg *Config, creds *identity.Credentials, deps 
 		lastAnswer:       now(),
 	}
 	a.server = local.NewServer(log, &cfg.Local, localAPI{a})
+	a.ssh = newSSHLogins(log, &cfg.SSHLogins, deps.Host, cfg.StateDir, now)
 
 	return a, nil
 }

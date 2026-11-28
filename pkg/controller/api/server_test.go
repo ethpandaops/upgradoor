@@ -373,9 +373,10 @@ func TestEveryUserRouteIsGuarded(t *testing.T) {
 	staff := provider.Grant(t, controllertest.StaffServices)
 
 	// adminReads are the reading routes that need a feature: admin, details
-	// for the packages of the fleet, audit for the audit log.
+	// for the packages of the fleet, audit for the audit log and the SSH logins.
 	adminReads := []string{
 		"GET /api/v1/settings", "GET /api/v1/settings/sources", "GET /api/v1/packages", "GET /api/v1/audit",
+		"GET /api/v1/ssh-logins",
 	}
 	mutating := 0
 

@@ -3,8 +3,10 @@
 // packages and reboots. It decides nothing and never runs "apt-get update"
 // outside UpgradePackages.
 //
+// It reads the sshd entries of the journal for the SSH login history.
+//
 // Only the closed set of programs runs (dpkg-query, dpkg, apt-get,
-// systemctl), by absolute path, with a fixed environment, no shell and
+// systemctl, journalctl), by absolute path, with a fixed environment, no shell and
 // bounded output; only packages of the configured blocked set are upgraded.
 // An agent that is not root is given a command for the upgrade and one for
 // the reboot (Commands), which run in their place.
@@ -40,6 +42,11 @@ type System interface {
 	RunAction(ctx context.Context, argv []string, timeout time.Duration) protocol.ActionResult
 	// Rescan collects the inventory now and returns the status from it.
 	Rescan(ctx context.Context) (Status, error)
+	// SSHJournal reads the sshd entries of the journal as journalctl's JSON
+	// lines: after cursor, or from since when cursor is empty, up to until.
+	SSHJournal(ctx context.Context, cursor string, since, until time.Time) ([]byte, error)
+	// SSHAlive reports whether pid is a running sshd process.
+	SSHAlive(pid int) bool
 }
 
 // Status is the cheap, frequently read part of the OS state.

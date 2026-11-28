@@ -1139,7 +1139,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "04da3b4c1043"
+  "v": "90a84cac7989"
  },
  "user": {
   "a": {
@@ -2358,7 +2358,7 @@
    ]
   },
   "t": 1794657600,
-  "v": "04da3b4c1043"
+  "v": "90a84cac7989"
  },
  "patch": {
   "c": {
@@ -2932,6 +2932,11 @@
    "action": "debug.pprof",
    "group": "access",
    "target": "request"
+  },
+  {
+   "action": "ssh.session",
+   "group": "ssh",
+   "target": "host"
   }
  ]
 }

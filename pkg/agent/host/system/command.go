@@ -91,13 +91,16 @@ func (e *commandError) Unwrap() error {
 }
 
 // commandAllowed reports whether name with args is inside the closed set.
-// systemctl is limited to the single invocation "systemctl reboot".
+// systemctl is limited to the single invocation "systemctl reboot",
+// journalctl to the reads of journalArgs.
 func commandAllowed(name string, args []string) bool {
 	switch name {
 	case cmdDpkgQuery, cmdDpkg, cmdAptGet:
 		return true
 	case cmdSystemctl:
 		return slices.Equal(args, []string{"reboot"})
+	case cmdJournalctl:
+		return journalAllowed(args)
 	default:
 		return false
 	}

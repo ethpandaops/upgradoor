@@ -47,7 +47,7 @@ func (f *fakePruner) DeleteAuditBefore(_ context.Context, before time.Time, limi
 	return int64(deleted), nil
 }
 
-func TestAuditRetention(t *testing.T) {
+func TestRetention(t *testing.T) {
 	now := time.Date(2026, 11, 28, 12, 0, 0, 0, time.UTC)
 
 	entries := make([]time.Time, 0, 2*retentionBatch+10)
@@ -59,10 +59,17 @@ func TestAuditRetention(t *testing.T) {
 		entries = append(entries, now.Add(-time.Duration(i)*time.Hour))
 	}
 
-	f := &fakePruner{entries: entries, done: make(chan struct{})}
-	done := f.done
+	f := &fakePruner{entries: entries}
+	// The SSH logins are pruned after the audit log.
+	ssh := &fakePruner{
+		entries: []time.Time{now.Add(-40 * 24 * time.Hour), now.Add(-time.Hour)}, done: make(chan struct{}),
+	}
+	done := ssh.done
 
-	r := newAuditRetention(logrus.New(), f, 24*time.Hour)
+	r := newRetention(logrus.New(),
+		pruned{what: "audit", keep: 24 * time.Hour, delete: f.DeleteAuditBefore},
+		pruned{what: "ssh-logins", keep: 30 * 24 * time.Hour, delete: ssh.DeleteAuditBefore},
+	)
 	r.now = func() time.Time { return now }
 	r.pause = time.Millisecond
 
@@ -81,11 +88,19 @@ func TestAuditRetention(t *testing.T) {
 
 	assert.Equal(t, []int{retentionBatch, retentionBatch, 5}, f.calls, "batch by batch")
 	assert.Len(t, f.entries, 5, "the entries within the retention stay")
+
+	ssh.mu.Lock()
+	defer ssh.mu.Unlock()
+
+	assert.Equal(t, []time.Time{now.Add(-time.Hour)}, ssh.entries, "each target by its own retention")
 }
 
-func TestAuditRetentionOff(t *testing.T) {
+func TestRetentionOff(t *testing.T) {
 	f := &fakePruner{}
-	r := newAuditRetention(logrus.New(), f, 0)
+	r := newRetention(logrus.New(),
+		pruned{what: "audit", delete: f.DeleteAuditBefore},
+		pruned{what: "ssh-logins", delete: f.DeleteAuditBefore},
+	)
 
 	require.NoError(t, r.Start(context.Background()))
 	require.NoError(t, r.Stop())

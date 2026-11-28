@@ -96,10 +96,10 @@ func TestImportRules(t *testing.T) {
 			}
 		}
 
-		if f.pkg == pkgPlan && !f.test {
+		if slices.Contains(purePackages, f.pkg) && !f.test {
 			for _, call := range planClock {
 				assert.False(t, strings.Contains(f.text, call+"("),
-					"%s: plan never reads the clock or waits (%s)", f.path, call)
+					"%s: %s never reads the clock or waits (%s)", f.path, f.pkg, call)
 			}
 		}
 	}
@@ -205,10 +205,10 @@ func checkImport(t *testing.T, f *sourceFile, imp string, allowed []string) {
 	case strings.HasPrefix(imp, module):
 		own := strings.TrimPrefix(imp, module)
 		assert.Contains(t, allowed, own, "%s may not import %s", f.path, own)
-	case f.pkg == pkgPlan && slices.ContainsFunc(planForbids, func(p string) bool {
+	case slices.Contains(purePackages, f.pkg) && slices.ContainsFunc(planForbids, func(p string) bool {
 		return imp == p || strings.HasPrefix(imp, p+"/")
 	}):
-		assert.Fail(t, "plan does no I/O", "%s imports %s", f.path, imp)
+		assert.Fail(t, f.pkg+" does no I/O", "%s imports %s", f.path, imp)
 	case owner != "":
 		assert.Equal(t, owner, f.pkg, "%s: only %s imports %s", f.path, owner, imp)
 	case imp == "net/http" || strings.HasPrefix(imp, "net/http/"):
@@ -216,7 +216,8 @@ func checkImport(t *testing.T, f *sourceFile, imp string, allowed []string) {
 	case strings.Contains(strings.Split(imp, "/")[0], "."):
 		// Third-party: the agent's dependencies are logrus and yaml (none in
 		// plan); testify only in test support.
-		ok := (f.pkg != pkgPlan && (imp == "github.com/sirupsen/logrus" || imp == "gopkg.in/yaml.v3")) ||
+		ok := (!slices.Contains(purePackages, f.pkg) &&
+			(imp == "github.com/sirupsen/logrus" || imp == "gopkg.in/yaml.v3")) ||
 			(f.pkg == pkgAgenttest && strings.HasPrefix(imp, "github.com/stretchr/testify/"))
 		assert.True(t, ok, "%s imports the third-party %s", f.path, imp)
 	}

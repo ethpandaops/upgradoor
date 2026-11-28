@@ -144,7 +144,7 @@ describe('MockController audit log', () => {
 
     const unknown = entries.filter(e => !auditActionOf(e.action)).map(e => e.action);
     expect(unknown).toEqual([]);
-    expect(new Set(entries.map(e => actorKindOf(e.actor)))).toEqual(new Set(['people', 'scheduler', 'agents']));
+    expect(new Set(entries.map(e => actorKindOf(e.actor)))).toEqual(new Set(['people', 'scheduler', 'agents', 'ssh']));
     // Mostly the scheduler, a person of every group.
     const scheduler = entries.filter(e => e.actor === 'scheduler').length;
     expect(scheduler).toBeGreaterThan(entries.length / 2);

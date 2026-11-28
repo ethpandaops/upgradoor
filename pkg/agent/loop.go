@@ -92,6 +92,7 @@ func (a *agent) cycle(ctx context.Context) bool {
 		}
 
 		// link logs the episode; nothing of the answer is acted on.
+		a.ssh.failed()
 		a.syncFailing = true
 		soon := a.fallback(&view, req.Needs)
 		a.publish(&facts, &view, req, nil)
@@ -101,6 +102,7 @@ func (a *agent) cycle(ctx context.Context) bool {
 
 	a.syncFailing = false
 	a.endFallback()
+	a.ssh.answered(resp)
 
 	a.tracker.SetDigests(resp.Digests)
 	a.logQueue(resp.Queue)
@@ -298,6 +300,9 @@ func (a *agent) report(ctx context.Context, view *plan.View) *protocol.SyncReque
 		req.Pending = sys.Pending
 		req.InventoryHash = sys.InventoryHash
 	}
+
+	a.ssh.collect(ctx, req.BootID)
+	req.Features, req.SSH = a.ssh.report()
 
 	return req
 }

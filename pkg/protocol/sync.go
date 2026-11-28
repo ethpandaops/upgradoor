@@ -100,6 +100,12 @@ type SyncRequest struct {
 	// Actions are the host's configured actions, sorted by name, at most
 	// MaxActions.
 	Actions []ActionInfo `json:"actions,omitempty"`
+
+	// Features are the optional features enabled on the host that the
+	// controller accepts (FeatureSSHLogins).
+	Features []string `json:"features,omitempty"`
+	// SSH is the SSH login history, with FeatureSSHLogins.
+	SSH *SSHReport `json:"ssh,omitempty"`
 }
 
 // Hold is the agent's hold state. The agent owns its holds: the controller
@@ -583,6 +589,13 @@ type SyncResponse struct {
 	// Keys are the controller's encryption keys, sent to a sealed sync whose
 	// sender does not hold all of them.
 	Keys []EncryptionKey `json:"keys,omitempty"`
+
+	// Accepts are the optional features the controller stores
+	// (FeatureSSHLogins).
+	Accepts []string `json:"accepts,omitempty"`
+	// SSHAck is the highest Seq of the request's closed SSH login groups,
+	// all of which are stored; set when the request's SSH report is stored.
+	SSHAck *int64 `json:"sshAck,omitempty"`
 }
 
 // MaxTags bounds SyncRequest.Tags.

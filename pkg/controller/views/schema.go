@@ -25,6 +25,7 @@
 //	POST /api/v1/settings/sources/validator-ranges/refresh  admin  {} -> ValidatorRangesRefresh
 //	GET  /api/v1/audit?who=&actor=&target=&kind=&group=&action=&from=&to=&q=&before=&limit=&actors=   user -> Audit
 //	GET  /api/v1/slots?window=         user     -> SlotHistory
+//	GET  /api/v1/ssh-logins?view=&host=&identity=&fingerprint=&user=&from=&to=&unknown=&open=&cursor=&limit=   audit -> SSHLogins
 //	POST /api/v1/actions/roll          user     scheduler.RollRequest         -> scheduler.ActionResult
 //	POST /api/v1/actions/reboot        user     scheduler.RebootRequest       -> scheduler.ActionResult
 //	POST /api/v1/actions/host-action   user     scheduler.HostActionRequest   -> scheduler.ActionResult
@@ -345,4 +346,16 @@ type AuditActors struct {
 type AuditHead struct {
 	// LatestID is the ID of the newest audit entry, 0 for an empty log.
 	LatestID int64 `json:"latestId"`
+	// SSHLogins: a host has reported SSH logins.
+	SSHLogins bool `json:"sshLogins,omitempty"`
+}
+
+// SSHLogins is the body of GET /api/v1/ssh-logins: one page of login
+// groups (view=groups) or of fleet clusters (view=fleet, the default); the
+// other list is empty.
+type SSHLogins struct {
+	Groups   []fleet.SSHLoginGroup   `json:"groups"`
+	Clusters []fleet.SSHLoginCluster `json:"clusters"`
+	// Next is the cursor of the next page; empty on the last one.
+	Next string `json:"next"`
 }

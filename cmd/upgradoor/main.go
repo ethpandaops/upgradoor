@@ -77,6 +77,7 @@ func newRootCmd(log *logrus.Logger) *cobra.Command {
 	onHost := []*cobra.Command{
 		newListCmd(), newStatusCmd(), newRollCmd(), newOverrideCmd(),
 		newHoldCmd(), newReleaseCmd(), newInitOverridesCmd(), newDeployCmd(), newKeyCmd(), newVerifyCertCmd(),
+		newSSHKeyMapCmd(),
 	}
 	for _, cmd := range onHost {
 		cmd.GroupID = groupHost

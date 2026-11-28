@@ -84,6 +84,7 @@ import { ClientQueryError, clientHostsPage, clientIndex, groupPolicy, type Clien
 import { MockHostActionError, seedHostActions, startHostAction } from './hostActions';
 import { OFF_SLOTS, capOutages, outageSpans, type Deviation } from './outages';
 import { MockSources } from './sources';
+import { sshLoginsPage } from './sshLogins';
 import {
   StringTable,
   detailTables,
@@ -510,6 +511,7 @@ export class MockController {
           slots,
           rollouts: this.rollouts(STREAM_ROLLOUT_LIMIT),
           latestAuditId: this.data.audit.reduce((max, e) => Math.max(max, e.id), 0),
+          sshLogins: this.data.sshLogins.length > 0,
         })
       : publicTables({ now: this.now(), gate: this.gate(), hosts: this.publicHosts(), images, slots });
 
@@ -605,6 +607,12 @@ export class MockController {
           throw new HttpError(403, `forbidden: this login lacks the feature ${login.service}:${FEATURE.audit}`);
         }
         return this.auditPage(q, Number(q.get('before')) || 0, Number(q.get('limit')) || 100);
+      }
+      if (route === 'ssh-logins') {
+        if (!login.open && !hasFeature(login, FEATURE.audit)) {
+          throw new HttpError(403, `forbidden: this login lacks the feature ${login.service}:${FEATURE.audit}`);
+        }
+        return sshLoginsPage(this.data.sshLogins, q, this.now());
       }
     }
 

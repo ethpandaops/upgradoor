@@ -64,7 +64,7 @@ const QUICK_RANGES = [
 ];
 
 /** TextFilter is a text field that commits its value once typing pauses, and follows the filter when it changes elsewhere. */
-function TextFilter({
+export function TextFilter({
   value,
   onCommit,
   ...rest
@@ -111,7 +111,7 @@ function TextFilter({
   );
 }
 
-function Field({ label, children, className }: { label: string; children: ReactNode; className?: string }) {
+export function Field({ label, children, className }: { label: string; children: ReactNode; className?: string }) {
   return (
     <label className={cx('flex min-w-0 flex-col gap-1 text-xs/5 text-muted', className)}>
       {label}

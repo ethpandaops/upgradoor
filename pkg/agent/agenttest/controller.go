@@ -81,6 +81,9 @@ type Controller struct {
 	// Hellos counts the hello requests, Rekeys the rekey answers.
 	Hellos int
 	Rekeys int
+	// Accepts are restated in every answer; with FeatureSSHLogins a sync's
+	// SSH report is acknowledged up to its highest closed Seq.
+	Accepts []string
 }
 
 // NewController starts the controller for the test network with
@@ -385,6 +388,17 @@ func (c *Controller) answerSync(req *protocol.SyncRequest) *protocol.SyncRespons
 	} else {
 		resp.Ended = c.Ended
 		resp.Queue = c.Queue
+	}
+
+	resp.Accepts = slices.Clone(c.Accepts)
+
+	if req.SSH != nil && slices.Contains(c.Accepts, protocol.FeatureSSHLogins) {
+		var ack int64
+		for i := range req.SSH.Closed {
+			ack = max(ack, req.SSH.Closed[i].Seq)
+		}
+
+		resp.SSHAck = &ack
 	}
 
 	return resp

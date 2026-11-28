@@ -35,6 +35,7 @@ describe('auditCatalog', () => {
     expect(actorKindOf('user:scheduler')).toBe('people');
     expect(actorKindOf('agent:node-1')).toBe('agents');
     expect(actorKindOf('anonymous')).toBe('people');
+    expect(actorKindOf('ssh:github:pk910')).toBe('ssh');
   });
 
   it('keeps the filter in the URL without the defaults', () => {

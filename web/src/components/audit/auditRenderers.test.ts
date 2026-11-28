@@ -69,6 +69,27 @@ describe('auditRenderers', () => {
     expect(r.summary?.(failed)).toBe('status 404');
   });
 
+  it('reads an SSH login group', () => {
+    const r = renderers['ssh.session'];
+    if (!r) throw new Error('no renderer for ssh.session');
+
+    const known = entry('ssh.session', {
+      identity: 'github:pk910',
+      user: 'devops',
+      from: '10.0.0.1',
+      sessions: 31,
+      totalMs: 125_000,
+    });
+    expect(r.title(known)).toBe('31 SSH sessions of github:pk910');
+    expect(r.tone?.(known)).toBeUndefined();
+    expect(r.summary?.(known)).toBe('as devops · from 10.0.0.1 · 2m 5s');
+
+    const unknown = entry('ssh.session', { fingerprint: 'SHA256:abc', sessions: 1, endUnknown: true });
+    expect(r.title(unknown)).toBe('1 SSH session of an unknown key');
+    expect(r.tone?.(unknown)).toBe('warning');
+    expect(r.summary?.(unknown)).toBe('end unknown');
+  });
+
   it('humanizes names', () => {
     expect(humanize('debug.pprof')).toBe('Pprof');
     expect(humanize('action.mark-offline')).toBe('Mark offline');

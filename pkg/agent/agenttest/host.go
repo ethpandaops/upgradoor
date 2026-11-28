@@ -3,6 +3,7 @@ package agenttest
 import (
 	"cmp"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"slices"
@@ -71,6 +72,10 @@ type Host struct {
 	calls  []string
 	notes  []string
 	onCall func(call string)
+	// journal are the journal lines SSHJournal reads; sshAlive the running
+	// sshd processes.
+	journal  [][]byte
+	sshAlive map[int]bool
 }
 
 var _ host.Host = (*Host)(nil)
@@ -935,4 +940,72 @@ func (h *Host) PullNotes() []string {
 	defer h.mu.Unlock()
 
 	return slices.Clone(h.notes)
+}
+
+// SSHJournal implements host.Host (op "journal", no call recorded): the
+// lines of SetSSHJournal after cursor, or from since without one, up to
+// until.
+func (h *Host) SSHJournal(ctx context.Context, cursor string, since, until time.Time) ([]byte, error) {
+	if err := h.begin(ctx, "journal", ""); err != nil {
+		return nil, fmt.Errorf("agenttest: journal: %w", err)
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	var out []byte
+
+	after := cursor == ""
+
+	for _, line := range h.journal {
+		var head struct {
+			Cursor   string `json:"__CURSOR"`                    //nolint:tagliatelle // the journal's names
+			Realtime int64  `json:"__REALTIME_TIMESTAMP,string"` //nolint:tagliatelle // the journal's names
+		}
+
+		if json.Unmarshal(line, &head) != nil {
+			continue
+		}
+
+		at := time.UnixMicro(head.Realtime)
+
+		switch {
+		case !after:
+			after = head.Cursor == cursor
+		case at.After(until):
+			return out, nil
+		case cursor != "" || !at.Before(since):
+			out = append(append(out, line...), '\n')
+		}
+	}
+
+	return out, nil
+}
+
+// SSHAlive implements host.Host: the PIDs of SetSSHAlive.
+func (h *Host) SSHAlive(pid int) bool {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	return h.sshAlive[pid]
+}
+
+// SetSSHJournal appends journal lines (journalctl JSON objects, in order).
+func (h *Host) SetSSHJournal(lines ...[]byte) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	h.journal = append(h.journal, lines...)
+}
+
+// SetSSHAlive marks an sshd process running or gone.
+func (h *Host) SetSSHAlive(pid int, alive bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.sshAlive == nil {
+		h.sshAlive = make(map[int]bool, 4)
+	}
+
+	h.sshAlive[pid] = alive
 }

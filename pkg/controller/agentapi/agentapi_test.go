@@ -1583,3 +1583,100 @@ func TestSealedBodyIsBound(t *testing.T) {
 		requireAgentError(t, s.serve(req), http.StatusUnsupportedMediaType, "no content encoding")
 	})
 }
+
+// A sync answers that SSH logins are accepted; a report of a host with the
+// feature on is stored and acknowledged, the notify fired for what closed.
+func TestSyncStoresSSHLogins(t *testing.T) {
+	h := newHarness(t, nil)
+	agent := validatorAgent(t)
+
+	start := controllertest.Epoch.Add(-time.Hour)
+	end := start.Add(time.Minute)
+	closed := protocol.SSHLoginGroup{
+		Seq: 7, Identity: "github:pk910", Source: "github", Fingerprint: "SHA256:x", KeyType: "ED25519",
+		User: "devops", From: "10.0.0.5", FirstLogin: start, LastLogout: &end, Sessions: 2,
+	}
+	open := protocol.SSHLoginGroup{Seq: 8, User: "devops", From: "10.0.0.5", FirstLogin: end, Sessions: 1, Open: 1}
+
+	req := controllertest.SyncRequest()
+	req.SSH = &protocol.SSHReport{Open: []protocol.SSHLoginGroup{open}, Closed: []protocol.SSHLoginGroup{closed}}
+
+	// Without the feature named, a report is not taken.
+	rec := h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	resp := controllertest.DecodeJSON[protocol.SyncResponse](t, rec)
+	assert.Equal(t, []string{protocol.FeatureSSHLogins}, resp.Accepts)
+	assert.Nil(t, resp.SSHAck)
+	assert.Empty(t, h.store.SSH)
+
+	req.Features = []string{protocol.FeatureSSHLogins}
+	notified := h.notified.Load()
+
+	rec = h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	resp = controllertest.DecodeJSON[protocol.SyncResponse](t, rec)
+	require.NotNil(t, resp.SSHAck)
+	assert.Equal(t, int64(7), *resp.SSHAck)
+	assert.Len(t, h.store.SSH, 2)
+	assert.Greater(t, h.notified.Load(), notified)
+
+	audit := h.store.AuditEntries()
+	require.NotEmpty(t, audit)
+	assert.Equal(t, "ssh:github:pk910", audit[len(audit)-1].Actor)
+
+	// A report that cannot be stored is not acknowledged; the sync is
+	// answered all the same.
+	h.store.Set(func(f *controllertest.Store) { f.SSHErr = errors.New("disk full") })
+
+	rec = h.agentPost(agent, protocol.PathSync, req, controllertest.CallOpts{})
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+
+	resp = controllertest.DecodeJSON[protocol.SyncResponse](t, rec)
+	assert.Nil(t, resp.SSHAck)
+	assert.Equal(t, []string{protocol.FeatureSSHLogins}, resp.Accepts)
+}
+
+func TestCleanSSH(t *testing.T) {
+	t.Parallel()
+
+	start := controllertest.Epoch
+
+	group := func(seq int64) protocol.SSHLoginGroup {
+		return protocol.SSHLoginGroup{Seq: seq, User: "devops", From: "10.0.0.5", FirstLogin: start, Sessions: 1}
+	}
+
+	long := strings.Repeat("x", 300)
+	odd := group(3)
+	odd.Identity, odd.Source, odd.User, odd.Sessions, odd.TotalMillis = long, "made-up", "dev\xffops", -1, -5
+
+	in := &protocol.SSHReport{
+		Open:    []protocol.SSHLoginGroup{group(1), group(1), group(2), {Seq: 9}},
+		Closed:  []protocol.SSHLoginGroup{group(2), odd, {Seq: 4, User: "x", From: "y"}},
+		Dropped: -3,
+		Error:   long,
+	}
+
+	out := cleanSSH(in)
+	require.Len(t, out.Closed, 2)
+	require.Len(t, out.Open, 1, "each Seq once, a closed one wins, an empty one dropped")
+	assert.Equal(t, int64(1), out.Open[0].Seq)
+	assert.Equal(t, fleet.SSHSourceUnknown, out.Open[0].Source)
+	assert.Zero(t, out.Dropped)
+	assert.Len(t, out.Error, maxSSHError)
+
+	got := out.Closed[1]
+	assert.Len(t, got.Identity, maxSSHIdentity)
+	assert.Equal(t, fleet.SSHSourceUnknown, got.Source)
+	assert.Equal(t, "devops", got.User)
+	assert.Zero(t, got.Sessions)
+	assert.Zero(t, got.TotalMillis)
+
+	many := &protocol.SSHReport{}
+	for i := range protocol.MaxSSHClosed + 10 {
+		many.Closed = append(many.Closed, group(int64(i+1)))
+	}
+
+	assert.Len(t, cleanSSH(many).Closed, protocol.MaxSSHClosed)
+}

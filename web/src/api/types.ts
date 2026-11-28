@@ -1624,11 +1624,71 @@ export interface AuditActors {
   agents: number;
 }
 
+/** fleet.SSHLoginGroup source: where the identity of the key comes from. */
+export type SSHKeySource = 'github' | 'comment' | 'unknown';
+
+/** fleet.SSHLoginGroup: the sessions of one key, login user and address of a host that followed each other. */
+export interface SSHLoginGroup {
+  id: number;
+  host: string;
+  /** identity is "github:<name>" or the key's comment; absent for an unknown key. */
+  identity?: string;
+  source: SSHKeySource;
+  fingerprint?: string;
+  /** keyType is the key's type, or the method of a login without a key. */
+  keyType?: string;
+  user: string;
+  from: string;
+  firstLogin: string;
+  /** lastLogout is the newest end so far; firstLogin while none ended. */
+  lastLogout: string;
+  sessions: number;
+  /** open counts the sessions logged in now. */
+  open: number;
+  closed: boolean;
+  longestMs: number;
+  totalMs: number;
+  /** endUnknown: a session ended without a logout in the journal. */
+  endUnknown?: boolean;
+}
+
+/** fleet.SSHLoginCluster: the overlapping groups of one identity and login user across the fleet. */
+export interface SSHLoginCluster {
+  identity?: string;
+  source: SSHKeySource;
+  fingerprint?: string;
+  keyType?: string;
+  user: string;
+  from: List<string>;
+  firstLogin: string;
+  lastStart: string;
+  lastLogout: string;
+  hosts: number;
+  hostNames: List<string>;
+  groups: number;
+  sessions: number;
+  open: number;
+  longestMs: number;
+  totalMs: number;
+  endUnknown?: boolean;
+}
+
+/** views.SSHLogins: one page of login groups (view=groups) or fleet clusters (view=fleet). */
+export interface SSHLogins {
+  /** groups are the rows of view=groups, clusters those of view=fleet; the other list is empty. */
+  groups: List<SSHLoginGroup>;
+  clusters: List<SSHLoginCluster>;
+  /** next is the cursor of the next page; empty on the last one. */
+  next: string;
+}
+
 // ------------------------------------------------------------ event stream
 
 /** api.AuditHead: the newest entry of the audit log, as the stream reports it. */
 export interface AuditHead {
   latestId: number;
+  /** sshLogins: a host has reported SSH logins. */
+  sshLogins?: boolean;
 }
 
 /**

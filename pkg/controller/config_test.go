@@ -264,6 +264,12 @@ func TestConfigValidate(t *testing.T) {
 		"bad image source":   {func(c *Config) { c.Images.Sources = []string{"x"} }, "images.sources[0]: "},
 		"negative retention": {func(c *Config) { c.Store.AuditRetention = -1 }, "store.auditRetention: "},
 		"short retention":    {func(c *Config) { c.Store.AuditRetention = Duration(time.Minute) }, "store.auditRetention: "},
+		"negative ssh retention": {
+			func(c *Config) { c.Store.SSHLoginRetention = -1 }, "store.sshLoginRetention: ",
+		},
+		"short ssh retention": {
+			func(c *Config) { c.Store.SSHLoginRetention = Duration(time.Minute) }, "store.sshLoginRetention: ",
+		},
 		"pprof open": {func(c *Config) {
 			c.Auth = AuthConfig{AllowOpenAPI: true}
 			c.UI.Pprof = true

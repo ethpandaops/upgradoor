@@ -15,6 +15,8 @@ func TestAuditActorKindOf(t *testing.T) {
 		"user:scheduler":    AuditPeople,
 		"agent:node-1":      AuditAgents,
 		"agent":             AuditPeople,
+		"ssh:github:pk910":  AuditSSH,
+		"ssh:SHA256:abc":    AuditSSH,
 		"alice@example.org": AuditPeople,
 		"anonymous":         AuditPeople,
 		"":                  AuditPeople,

@@ -4,7 +4,7 @@
 import type { AuditEntry } from '../api/types';
 
 /** fleet.AuditActorKind; "all" is no actor filter. */
-export type AuditWho = 'people' | 'scheduler' | 'agents' | 'all';
+export type AuditWho = 'people' | 'scheduler' | 'agents' | 'ssh' | 'all';
 
 /** fleet.AuditGroup */
 export type AuditGroup =
@@ -17,7 +17,8 @@ export type AuditGroup =
   | 'settings'
   | 'sources'
   | 'hosts'
-  | 'access';
+  | 'access'
+  | 'ssh';
 
 /** fleet.AuditTargetKind */
 export type AuditTargetKind = 'host' | 'rollout' | 'settings' | 'sources' | 'request';
@@ -89,6 +90,7 @@ export const AUDIT_ACTIONS: readonly AuditActionInfo[] = [
   H('action.forget.failed', 'hosts'),
   { action: 'auth.refused', group: 'access', target: 'request' },
   { action: 'debug.pprof', group: 'access', target: 'request' },
+  H('ssh.session', 'ssh'),
 ];
 
 const BY_ACTION = new Map(AUDIT_ACTIONS.map(a => [a.action, a]));
@@ -105,6 +107,7 @@ export const WHO_OPTIONS: readonly { value: AuditWho; label: string; title: stri
     title: 'What the scheduler decided on its own: rollouts, leases, instructions',
   },
   { value: 'agents', label: 'Agents', title: 'What the agents reported when they synced: registrations, certificates' },
+  { value: 'ssh', label: 'SSH', title: 'The SSH logins the hosts reported, one entry per login group' },
   { value: 'all', label: 'All', title: 'Everything' },
 ];
 
@@ -119,6 +122,7 @@ export const GROUP_LABEL: Record<AuditGroup, string> = {
   sources: 'Data sources',
   hosts: 'Host registry',
   access: 'Refused requests and profiles',
+  ssh: 'SSH logins',
 };
 
 export const TARGET_KIND_LABEL: Record<AuditTargetKind, string> = {
@@ -136,6 +140,7 @@ export const TARGET_KINDS = Object.keys(TARGET_KIND_LABEL) as AuditTargetKind[];
 export function actorKindOf(actor: string): Exclude<AuditWho, 'all'> {
   if (actor === 'scheduler') return 'scheduler';
   if (actor.startsWith('agent:')) return 'agents';
+  if (actor.startsWith('ssh:')) return 'ssh';
   return 'people';
 }
 

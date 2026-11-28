@@ -518,3 +518,46 @@ func TestMigrateClientPoliciesNone(t *testing.T) {
 	require.NoError(t, err)
 	assert.Nil(t, settings.PolicyClients)
 }
+
+// Step 6 adds the SSH login tables, and the audit entries of SSH logins
+// leave the index of people's entries for one of their own.
+func TestMigrateSSHLogins(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	steps, err := loadMigrations()
+	require.NoError(t, err)
+
+	path := filepath.Join(t.TempDir(), "upgradoor.db")
+	s, ok := New(quietLog(), path).(*sqliteStore)
+	require.True(t, ok)
+
+	db := fileDB(t, path)
+	require.NoError(t, s.migrate(ctx, db, steps[:5]))
+
+	_, err = db.Exec(`INSERT INTO audit (time, actor, action, target) VALUES
+		(1, 'alice@example.org', 'action.hold', 'node-1'), (2, 'ssh:github:pk910', 'ssh.session', 'node-1')`)
+	require.NoError(t, err)
+
+	require.NoError(t, s.migrate(ctx, db, steps))
+	require.NoError(t, s.Start(ctx))
+	t.Cleanup(func() { _ = s.Stop() })
+
+	seen, err := s.SSHLoginsSeen(ctx)
+	require.NoError(t, err)
+	assert.False(t, seen)
+
+	people, err := s.ListAudit(ctx, AuditFilter{ActorKind: fleet.AuditPeople})
+	require.NoError(t, err)
+	require.Len(t, people, 1)
+	assert.Equal(t, "alice@example.org", people[0].Actor)
+
+	ssh, err := s.ListAudit(ctx, AuditFilter{ActorKind: fleet.AuditSSH})
+	require.NoError(t, err)
+	require.Len(t, ssh, 1)
+
+	actors, _, err := s.AuditActors(ctx)
+	require.NoError(t, err)
+	assert.Equal(t, []AuditActor{{Actor: "alice@example.org", Entries: 1}}, actors)
+}

@@ -9,7 +9,17 @@ import { fakeAuthenticatoor } from './mock/install';
 import { MockController, type MockProfile } from './mock/mockController';
 import { PUBLIC_PATHS, recordingFetch, type RecordedCall } from './test/harness';
 
-const TABS = ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Settings', 'Data sources', 'Audit'];
+const TABS = [
+  'Overview',
+  'Hosts',
+  'Clients',
+  'Rollouts',
+  'Packages',
+  'Settings',
+  'Data sources',
+  'Audit',
+  'SSH logins',
+];
 
 function boot(opts: { auth: boolean; loggedIn?: boolean; unreachable?: boolean; profile?: MockProfile }) {
   const controller = new MockController({ auth: opts.auth });
@@ -76,7 +86,9 @@ describe('App in public mode (auth configured, logged out)', () => {
     expect(await screen.findByText('mock-user@example.org')).toBeInTheDocument();
     await screen.findByRole('region', { name: 'In progress' });
     // The mock logs in staff: every tab, the settings included.
-    expect(tabNames()).toEqual(TABS);
+    await waitFor(() => {
+      expect(tabNames()).toEqual(TABS);
+    });
 
     await user.click(screen.getByRole('tab', { name: 'Hosts' }));
     await screen.findByRole('columnheader', { name: /Kernel/ });
@@ -116,7 +128,7 @@ describe('the menu of a login', () => {
   // feature, a team member the team features, a reader none. Packages
   // needs details, Audit needs audit.
   const cases: [MockProfile, string[]][] = [
-    ['staff', ['Overview', 'Hosts', 'Clients', 'Rollouts', 'Packages', 'Settings', 'Data sources', 'Audit']],
+    ['staff', TABS],
     ['team', ['Overview', 'Hosts', 'Clients', 'Rollouts']],
     ['reader', ['Overview', 'Hosts', 'Clients', 'Rollouts']],
   ];
@@ -141,18 +153,37 @@ describe('the menu of a login', () => {
   });
 
   it('decides by what the login may do', () => {
-    expect(visibleTabs({ priv: false, admin: false, hostDetails: true, audit: true })).toEqual(['overview', 'hosts']);
-    expect(visibleTabs({ priv: true, admin: false, hostDetails: true, audit: true })).toEqual([
+    const all = { priv: true, admin: true, hostDetails: true, audit: true, ssh: true };
+    expect(visibleTabs({ ...all, priv: false, admin: false })).toEqual(['overview', 'hosts']);
+    expect(visibleTabs({ ...all, admin: false })).toEqual([
       'overview',
       'hosts',
       'clients',
       'rollouts',
       'packages',
       'audit',
+      'ssh',
     ]);
-    expect(visibleTabs({ priv: true, admin: false, hostDetails: false, audit: true })).not.toContain('packages');
-    expect(visibleTabs({ priv: true, admin: false, hostDetails: true, audit: false })).not.toContain('audit');
-    expect(visibleTabs({ priv: true, admin: true, hostDetails: true, audit: true })).toHaveLength(8);
+    expect(visibleTabs({ ...all, hostDetails: false })).not.toContain('packages');
+    expect(visibleTabs({ ...all, audit: false })).not.toContain('audit');
+    expect(visibleTabs(all)).toHaveLength(9);
+  });
+
+  it('offers the SSH logins with the feature audit once a host reported one', () => {
+    const all = { priv: true, admin: true, hostDetails: true, audit: true, ssh: true };
+    expect(visibleTabs(all)).toContain('ssh');
+    expect(visibleTabs({ ...all, ssh: false })).not.toContain('ssh');
+    expect(visibleTabs({ ...all, audit: false, admin: false })).not.toContain('ssh');
+    expect(visibleTabs({ ...all, priv: false })).not.toContain('ssh');
+  });
+
+  it('opens the SSH logins at their link once the stream says there are some', async () => {
+    window.location.hash = '#ssh/?view=groups&unknown=1';
+    boot({ auth: false });
+
+    expect(await screen.findByRole('table', { name: 'SSH login groups' })).toBeInTheDocument();
+    expect(screen.getByRole('tab', { name: 'SSH logins' })).toHaveAttribute('aria-selected', 'true');
+    expect(window.location.hash).toBe('#ssh/?view=groups&unknown=1');
   });
 });
 
@@ -192,8 +223,9 @@ describe('App in open mode (no auth provider)', () => {
     expect(rollouts).toHaveFocus();
     expect(window.location.hash).toBe('#rollouts');
 
+    await screen.findByRole('tab', { name: 'SSH logins' });
     await user.keyboard('{End}');
-    expect(window.location.hash).toBe('#audit');
+    expect(window.location.hash).toBe('#ssh');
   });
 
   it('opens the Rollouts tab at the list a link names', async () => {

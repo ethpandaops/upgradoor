@@ -18,16 +18,19 @@ import { Drawer } from '../components/Drawer';
 import { HostActionsMenu, SecurityUpdates } from '../components/HostActions';
 import { Disclosure } from '../components/icons';
 import { BaselineState, LeaseTable } from '../components/LeaseTable';
-import { useLiveHost } from '../components/Live';
+import { useLive, useLiveHost } from '../components/Live';
 import { OverrideButtons, OverrideSummary, overrideState } from '../components/Overrides';
 import { usePermissions } from '../components/Permissions';
 import { PullNote } from '../components/PullNote';
 import { Readiness } from '../components/Readiness';
 import { RelTime } from '../components/RelTime';
+import { GroupsList } from '../components/SSHLogins';
 import { IntentAction } from '../components/SelectionBar';
 import { Badge, Dash, Empty, ErrorBanner, Loading, Table, Td, Th, cx } from '../components/primitives';
 import { ImpactBadge, LeaseStateBadge, NeedLine, OfflineBadge } from '../components/status';
 import { ContainerUsage, HostResources } from '../components/Usage';
+import { useApp } from '../appContext';
+import { useQuery } from '../hooks/useQuery';
 import { auditHash } from '../lib/auditCatalog';
 import { displayImage, heldBy, isHeld, percentOf, shortRevision } from '../lib/format';
 import { hostActionIntent, runnableActions, verbBlocked } from '../lib/hostActions';
@@ -849,8 +852,41 @@ function ActionRow({
 
 // ------------------------------------------------------------------- history
 
+/** HOST_SSH_LIMIT is how many of a host's newest SSH login groups its history shows. */
+const HOST_SSH_LIMIT = 20;
+
+/** HostSSHLogins lists a host's newest SSH login groups. */
+function HostSSHLogins({ name }: { name: string }) {
+  const { api } = useApp();
+  const latestId = useLive('audit').data?.latestId ?? 0;
+  const logins = useQuery(s => api.sshLogins({ view: 'groups', host: name, limit: HOST_SSH_LIMIT }, s), {
+    key: `ssh-logins?host=${name}&at=${latestId}`,
+    keepPrevious: true,
+  });
+  const groups = list(logins.data?.groups);
+
+  if (logins.error !== undefined && !logins.data)
+    return <ErrorBanner error={logins.error} what="the SSH logins" onRetry={logins.refresh} />;
+  if (!logins.data) return <Loading what="the SSH logins" />;
+
+  return groups.length === 0 ? (
+    <Empty>No SSH login reported.</Empty>
+  ) : (
+    <>
+      <GroupsList groups={groups} label={`SSH logins of ${name}`} />
+      <a
+        href={`#ssh/?view=groups&host=${encodeURIComponent(name)}`}
+        className="self-start text-xs/5 text-accent hover:underline"
+      >
+        All SSH logins of {name}
+      </a>
+    </>
+  );
+}
+
 function HistoryPane({ host: h }: { host: HostDetail }) {
   const { audit } = usePermissions();
+  const sshSeen = useLive('audit').data?.sshLogins === true;
   const leases = list(h.leases);
   const history = list(h.history);
 
@@ -875,6 +911,11 @@ function HistoryPane({ host: h }: { host: HostDetail }) {
               </a>
             </>
           )}
+        </Group>
+      )}
+      {audit && sshSeen && (
+        <Group title="SSH logins">
+          <HostSSHLogins name={h.name} />
         </Group>
       )}
     </>

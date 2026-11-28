@@ -16,6 +16,7 @@ const (
 	pkgLink      = "pkg/agent/link"
 	pkgLease     = "pkg/agent/lease"
 	pkgLocal     = "pkg/agent/local"
+	pkgLogins    = "pkg/agent/logins"
 	pkgAgenttest = "pkg/agent/agenttest"
 	pkgProtocol  = "pkg/protocol"
 	pkgIdentity  = "pkg/identity"
@@ -28,9 +29,10 @@ var mayImport = map[string][]string{
 	// The root wires everything but test support.
 	pkgRoot: {
 		pkgPlan, pkgHost, pkgRegistry, pkgLink,
-		pkgLease, pkgLocal, pkgProtocol, pkgIdentity, pkgImageref,
+		pkgLease, pkgLocal, pkgLogins, pkgProtocol, pkgIdentity, pkgImageref,
 	},
-	pkgPlan: {pkgProtocol, pkgImageref},
+	pkgPlan:   {pkgProtocol, pkgImageref},
+	pkgLogins: {pkgProtocol},
 	// Only host imports its sub-packages; they import no package of
 	// pkg/agent.
 	pkgHost:      {pkgDocker, pkgSystem, pkgProbe, pkgResources, pkgProtocol},
@@ -49,10 +51,13 @@ var mayImport = map[string][]string{
 
 // Standard-library and third-party imports that only some packages may use.
 var (
-	// planForbids are the standard packages that do I/O; plan uses none.
+	// purePackages do no I/O, read no clock and use no third-party package.
+	purePackages = []string{pkgPlan, pkgLogins}
+	// planForbids are the standard packages that do I/O; the pure packages
+	// use none.
 	planForbids = []string{"os", "net", "syscall", "io/ioutil", "io/fs", "path/filepath"}
 	// planClock are the calls of package time that read the clock or wait;
-	// plan gets the time as an argument.
+	// the pure packages get the time as an argument.
 	planClock = []string{
 		"time.Now", "time.Since", "time.Until", "time.Sleep", "time.After", "time.NewTimer",
 		"time.Tick", "time.NewTicker", "time.AfterFunc",

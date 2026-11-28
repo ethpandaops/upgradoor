@@ -1,5 +1,5 @@
 {
- "version": "04da3b4c1043",
+ "version": "90a84cac7989",
  "tables": {
   "a": "AuditHead",
   "c": "ClientView",
@@ -129,6 +129,11 @@
    {
     "n": "latestId",
     "t": "n"
+   },
+   {
+    "n": "sshLogins",
+    "t": "b",
+    "omit": true
    }
   ],
   "BaselineContainer": [

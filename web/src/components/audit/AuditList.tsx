@@ -42,14 +42,14 @@ const TONE_TEXT: Record<Tone, string> = {
 // -------------------------------------------------------------- navigation
 
 /** openHost opens a host's drawer on the Hosts tab: ?host= and #hosts, as the tab keeps them. */
-function openHost(name: string) {
+export function openHost(name: string) {
   const url = new URL(window.location.href);
   url.searchParams.set('host', name);
   window.history.replaceState(window.history.state, '', url);
   window.location.hash = 'hosts';
 }
 
-function hostHref(name: string): string {
+export function hostHref(name: string): string {
   const url = new URL(window.location.href);
   url.searchParams.set('host', name);
   url.hash = 'hosts';
@@ -109,11 +109,11 @@ function FilterLink({
 /** ActorBadge says who acted: a person, the scheduler or an agent. */
 export function ActorBadge({ actor, ctx }: { actor: string; ctx: AuditContext }) {
   const kind = actorKindOf(actor);
-  const label = kind === 'agents' ? actor.slice('agent:'.length) : actor;
+  const label = kind === 'agents' ? actor.slice('agent:'.length) : kind === 'ssh' ? actor.slice('ssh:'.length) : actor;
   const style =
     kind === 'people'
       ? 'border-transparent bg-surface-selected text-accent'
-      : kind === 'agents'
+      : kind === 'agents' || kind === 'ssh'
         ? 'border-transparent bg-info-subtle text-info'
         : 'border-border bg-surface-raised text-muted';
 
@@ -128,6 +128,7 @@ export function ActorBadge({ actor, ctx }: { actor: string; ctx: AuditContext })
       )}
     >
       {kind === 'agents' && <span className="font-normal opacity-75">agent</span>}
+      {kind === 'ssh' && <span className="font-normal opacity-75">ssh</span>}
       <span className="truncate">{label}</span>
     </FilterLink>
   );
@@ -355,11 +356,11 @@ export function AuditDetail({ entry: e, ctx }: { entry: AuditEntry; ctx: AuditCo
   return (
     <div className="flex flex-col gap-3 rounded-md border border-border bg-background p-3 text-xs/5">
       {rows.length > 0 && (
-        <dl className="grid grid-cols-1 gap-x-4 gap-y-1 sm:grid-cols-[minmax(0,10rem)_minmax(0,1fr)]">
+        <dl className="grid grid-cols-1 gap-x-4 gap-y-1 @2xl:grid-cols-[minmax(0,10rem)_minmax(0,1fr)]">
           {rows.map(s => (
             <div key={s.key} className="contents">
               <dt className="text-muted">{s.label}</dt>
-              <dd className="mb-1 min-w-0 sm:mb-0">
+              <dd className="mb-1 min-w-0 @2xl:mb-0">
                 <Value kind={s.kind} value={detail[s.key]} ctx={ctx} />
               </dd>
             </div>
@@ -403,9 +404,9 @@ function AuditRow({ entry: e, ctx, showTarget }: { entry: AuditEntry; ctx: Audit
   const hasDetail = e.detail !== undefined && Object.keys(e.detail).length > 0;
 
   return (
-    <li className="flex flex-col gap-1 px-3 py-2 sm:grid sm:grid-cols-[9.5rem_minmax(0,12rem)_minmax(0,1fr)] sm:items-start sm:gap-x-3">
-      <div className="flex min-w-0 items-center gap-2 sm:contents">
-        <Timestamp value={e.time} className="text-muted sm:pt-px" />
+    <li className="flex flex-col gap-1 px-3 py-2 @2xl:grid @2xl:grid-cols-[9.5rem_minmax(0,12rem)_minmax(0,1fr)] @2xl:items-start @2xl:gap-x-3">
+      <div className="flex min-w-0 items-center gap-2 @2xl:contents">
+        <Timestamp value={e.time} className="text-muted @2xl:pt-px" />
         <ActorBadge actor={e.actor} ctx={ctx} />
       </div>
       <div className="flex min-w-0 flex-col gap-2">
@@ -425,9 +426,9 @@ function AuditRow({ entry: e, ctx, showTarget }: { entry: AuditEntry; ctx: Audit
               onClick={() => {
                 setOpen(v => !v);
               }}
-              className="-my-0.5 inline-flex shrink-0 items-center gap-0.5 rounded-xs px-1 py-0.5 text-muted hover:bg-surface-hover hover:text-foreground max-sm:py-2"
+              className="-my-0.5 inline-flex shrink-0 items-center gap-0.5 rounded-xs px-1 py-0.5 text-muted hover:bg-surface-hover hover:text-foreground @max-2xl:py-2"
             >
-              <span className="max-sm:sr-only">Detail</span>
+              <span className="@max-2xl:sr-only">Detail</span>
               <Icon name="chevron" className={cx('size-3.5 transition-transform', open && 'rotate-180')} />
             </button>
           )}
@@ -462,7 +463,10 @@ export function AuditList({
   const ctx = useMemo<AuditContext>(() => ({ rolloutTitle: id => titles.get(id), onFilter }), [titles, onFilter]);
 
   return (
-    <ol aria-label={label} className="divide-y divide-border rounded-lg border border-border bg-surface text-xs/5">
+    <ol
+      aria-label={label}
+      className="@container divide-y divide-border rounded-lg border border-border bg-surface text-xs/5"
+    >
       {entries.map(e => (
         <AuditRow key={e.id} entry={e} ctx={ctx} showTarget={showTarget} />
       ))}

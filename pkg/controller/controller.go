@@ -48,7 +48,7 @@ type controller struct {
 	scheduler  scheduler.Service
 	lookups    discovery.Tracker
 	upstream   upstream.Tracker
-	retention  *auditRetention
+	retention  *retention
 	api        *api.Server
 	server     *http.Server
 	served     chan error
@@ -84,7 +84,10 @@ func New(log logrus.FieldLogger, cfg *Config) (Service, error) {
 	}
 
 	c.store = store.New(log, filepath.Join(cfg.Store.DataDir, DatabaseFile))
-	c.retention = newAuditRetention(log, c.store, cfg.Store.AuditRetention.Std())
+	c.retention = newRetention(log,
+		pruned{what: "audit", keep: cfg.Store.AuditRetention.Std(), delete: c.store.DeleteAuditBefore},
+		pruned{what: "ssh-logins", keep: cfg.Store.SSHLoginRetention.Std(), delete: c.store.DeleteSSHLoginsBefore},
+	)
 	c.beacon = beacon.New(log, beacon.Options{
 		Endpoints: cfg.Network.BeaconEndpoints,
 		Store:     c.store,
@@ -258,7 +261,7 @@ func (c *controller) Start(ctx context.Context) error {
 	}
 
 	if err := c.retention.Start(ctx); err != nil {
-		return errors.Join(fmt.Errorf("audit retention: %w", err), c.store.Stop())
+		return errors.Join(fmt.Errorf("retention: %w", err), c.store.Stop())
 	}
 
 	if err := c.validators.Start(ctx); err != nil {

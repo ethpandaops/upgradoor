@@ -15,6 +15,7 @@ import (
 	"github.com/ethpandaops/upgradoor/pkg/agent/lease"
 	"github.com/ethpandaops/upgradoor/pkg/agent/link"
 	"github.com/ethpandaops/upgradoor/pkg/agent/local"
+	"github.com/ethpandaops/upgradoor/pkg/agent/logins"
 	"github.com/ethpandaops/upgradoor/pkg/agent/plan"
 	"github.com/ethpandaops/upgradoor/pkg/identity"
 	"github.com/ethpandaops/upgradoor/pkg/protocol"
@@ -45,6 +46,8 @@ type Config struct {
 	Host   host.Config  `yaml:",inline"`
 
 	Verify lease.Config `yaml:"verify"`
+	// SSHLogins reports the SSH login history; off by default.
+	SSHLogins logins.Config `yaml:"sshLogins"`
 }
 
 // removedKeys are keys of earlier agent.yaml files, with what took their
@@ -134,10 +137,11 @@ func (c *Config) ApplyDefaults() {
 	c.Policy.ApplyDefaults()
 	c.Host.ApplyDefaults()
 	c.Verify.ApplyDefaults()
+	c.SSHLogins.ApplyDefaults()
 }
 
-// Validate checks the controller section, the roles, the host section and
-// the policy, in that order.
+// Validate checks the controller section, the roles, the host section, the
+// sshLogins section and the policy, in that order.
 func (c *Config) Validate() error {
 	if err := c.Controller.Validate(); err != nil {
 		return err
@@ -154,6 +158,10 @@ func (c *Config) Validate() error {
 	}
 
 	if err := c.Host.Validate(); err != nil {
+		return err
+	}
+
+	if err := c.SSHLogins.Validate(); err != nil {
 		return err
 	}
 

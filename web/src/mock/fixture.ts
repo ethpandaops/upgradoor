@@ -27,8 +27,10 @@ import type {
   RolloutHost,
   RolloutTarget,
   Settings,
+  SSHLoginGroup,
   Upgradable,
 } from '../api/types';
+import { buildSSHLogins, sshActor, sshAuditDetail } from './sshLogins';
 
 /** hex returns `len` deterministic hex characters for a seed. */
 
@@ -326,6 +328,8 @@ export interface MockData {
   rollouts: MockRollout[];
   leases: Lease[];
   audit: AuditEntry[];
+  /** sshLogins are the SSH login groups the hosts reported. */
+  sshLogins: SSHLoginGroup[];
   settings: Settings;
   defaults: Settings;
   gateFailing: boolean;
@@ -1365,7 +1369,10 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
   ];
 
   const defaults = defaultSettings();
+  const sshLogins = buildSSHLogins([...hosts.keys()], now);
   const audit = buildAudit({
+    sshLogins,
+    now,
     at,
     hosts,
     defaults,
@@ -1391,6 +1398,7 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
     leases: fleet === 'quiet' ? [] : leases,
     quiet: fleet === 'quiet',
     audit,
+    sshLogins,
     // One client has an image policy of its own; no rollout of it is open.
     settings: {
       ...defaults,
@@ -1514,6 +1522,8 @@ function largeFleet(
 /** What buildAudit writes about: the fixture's hosts, rollouts and leases. */
 interface AuditInput {
   at: (secondsAgo: number) => string;
+  now: number;
+  sshLogins: readonly SSHLoginGroup[];
   hosts: ReadonlyMap<string, HostDetail>;
   defaults: Settings;
   rollouts: Record<
@@ -2028,6 +2038,12 @@ function buildAudit(input: AuditInput): AuditEntry[] {
     impact: 'node',
     force: false,
   });
+
+  // A closed SSH login group is recorded when the host delivers it, after its ten idle minutes.
+  for (const g of input.sshLogins) {
+    if (!g.closed) continue;
+    log((input.now - Date.parse(g.lastLogout)) / 1000 - 600, sshActor(g), 'ssh.session', g.host, sshAuditDetail(g));
+  }
 
   // Oldest first, so IDs grow with time; a stable sort keeps the order of one moment.
   return pending

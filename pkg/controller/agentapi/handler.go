@@ -30,6 +30,9 @@ type Store interface {
 	GetHost(ctx context.Context, name string) (*fleet.Host, error)
 	SaveInventory(ctx context.Context, host string, inv *protocol.Inventory) error
 	AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error
+	RecordSSHLogins(
+		ctx context.Context, host string, at time.Time, report *protocol.SSHReport,
+	) (*store.SSHLoginsRecorded, error)
 }
 
 // Options configures the agent API.

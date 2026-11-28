@@ -99,11 +99,13 @@ func insertAudit(
 // time it started.
 const auditClockSkew = time.Minute
 
-// Conditions on the actor that match the partial indexes audit_people and
-// audit_agents word for word, which the planner needs to use them.
+// Conditions on the actor that match the partial indexes audit_people,
+// audit_agents and audit_ssh word for word, which the planner needs to use
+// them.
 const (
-	auditPeopleTerm = `actor != 'scheduler' AND substr(actor, 1, 6) != 'agent:'`
+	auditPeopleTerm = `actor != 'scheduler' AND substr(actor, 1, 6) != 'agent:' AND substr(actor, 1, 4) != 'ssh:'`
 	auditAgentsTerm = `substr(actor, 1, 6) = 'agent:'`
+	auditSSHTerm    = `substr(actor, 1, 4) = 'ssh:'`
 )
 
 // auditDriver is the index a filtered audit query walks.
@@ -116,6 +118,7 @@ const (
 	auditByTarget
 	auditByPeople
 	auditByAgents
+	auditBySSH
 	auditByAction
 )
 
@@ -282,6 +285,8 @@ func auditDriverOf(f *AuditFilter, actions []auditActions) auditDriver {
 		return auditByPeople
 	case kind == fleet.AuditAgents:
 		return auditByAgents
+	case kind == fleet.AuditSSH:
+		return auditBySSH
 	case slices.ContainsFunc(actions, func(a auditActions) bool { return !a.dense }):
 		return auditByAction
 	default:
@@ -295,6 +300,7 @@ var auditIndexes = map[auditDriver]string{
 	auditByTarget: "INDEXED BY audit_target",
 	auditByPeople: "INDEXED BY audit_people",
 	auditByAgents: "INDEXED BY audit_agents",
+	auditBySSH:    "INDEXED BY audit_ssh",
 	auditByAction: "INDEXED BY audit_action",
 }
 
@@ -302,6 +308,7 @@ var auditIndexes = map[auditDriver]string{
 var auditKindTerms = map[fleet.AuditActorKind]string{
 	fleet.AuditPeople:    auditPeopleTerm,
 	fleet.AuditAgents:    auditAgentsTerm,
+	fleet.AuditSSH:       auditSSHTerm,
 	fleet.AuditScheduler: `actor = 'scheduler'`,
 }
 

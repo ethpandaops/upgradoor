@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/fleet"
 	"github.com/ethpandaops/upgradoor/pkg/controller/store"
@@ -43,6 +44,13 @@ type Store struct {
 	LastSearchLimit int
 	// LastPackageFilter is the last ListPackages filter in full.
 	LastPackageFilter store.PackageFilter
+	// SSH are the SSH login groups, SSHHosts the hosts that reported them;
+	// LastSSHFilter is the last ListSSHLogins filter.
+	SSH           []fleet.SSHLoginGroup
+	SSHHosts      map[string]bool
+	LastSSHFilter store.SSHLoginFilter
+	// SSHErr fails RecordSSHLogins only.
+	SSHErr error
 }
 
 // NewStore returns an empty store.
@@ -622,7 +630,7 @@ func (f *Store) AuditActors(context.Context) (people []store.AuditActor, agents 
 			counts[actor]++
 		case fleet.AuditAgents:
 			agents++
-		case fleet.AuditScheduler:
+		case fleet.AuditScheduler, fleet.AuditSSH:
 		}
 	}
 
@@ -653,4 +661,120 @@ func (f *Store) SetErr(err error) {
 	defer f.Unlock()
 
 	f.Err = err
+}
+
+// RecordSSHLogins replaces the host's open groups and adds the closed ones
+// once, each with an audit entry, like the real store.
+func (f *Store) RecordSSHLogins(
+	_ context.Context, host string, at time.Time, report *protocol.SSHReport,
+) (*store.SSHLoginsRecorded, error) {
+	f.Lock()
+	defer f.Unlock()
+
+	if err := cmp.Or(f.Err, f.SSHErr); err != nil {
+		return nil, err
+	}
+
+	out := &store.SSHLoginsRecorded{FirstSeen: !f.SSHHosts[host]}
+
+	if f.SSHHosts == nil {
+		f.SSHHosts = make(map[string]bool, 4)
+	}
+
+	f.SSHHosts[host] = true
+
+	f.SSH = slices.DeleteFunc(f.SSH, func(g fleet.SSHLoginGroup) bool { return g.Host == host && !g.Closed })
+
+	add := func(g *protocol.SSHLoginGroup, closed bool) bool {
+		for i := range f.SSH {
+			if f.SSH[i].Host == host && f.SSH[i].ID == g.Seq {
+				return false
+			}
+		}
+
+		end := g.FirstLogin
+		if g.LastLogout != nil {
+			end = *g.LastLogout
+		}
+
+		f.SSH = append(f.SSH, fleet.SSHLoginGroup{
+			ID: g.Seq, Host: host, Identity: g.Identity, Source: g.Source, Fingerprint: g.Fingerprint,
+			KeyType: g.KeyType, User: g.User, From: g.From, FirstLogin: g.FirstLogin, LastLogout: end,
+			Sessions: g.Sessions, Open: g.Open, Closed: closed, LongestMs: g.LongestMillis,
+			TotalMs: g.TotalMillis, EndUnknown: g.EndUnknown,
+		})
+
+		return true
+	}
+
+	for i := range report.Open {
+		add(&report.Open[i], false)
+	}
+
+	for i := range report.Closed {
+		g := &report.Closed[i]
+		out.Ack = max(out.Ack, g.Seq)
+
+		if add(g, true) {
+			out.Closed++
+			view := fleet.SSHLoginGroup{Identity: g.Identity, Fingerprint: g.Fingerprint, KeyType: g.KeyType}
+			f.Audit = append(f.Audit, fleet.AuditEntry{
+				ID: int64(len(f.Audit) + 1), Time: at, Actor: view.Actor(),
+				Action: fleet.AuditActionSSHSession, Target: host,
+			})
+		}
+	}
+
+	return out, nil
+}
+
+// ListSSHLogins returns every matching group or cluster on one page.
+func (f *Store) ListSSHLogins(_ context.Context, filter *store.SSHLoginFilter) (*store.SSHLoginPage, error) {
+	f.Lock()
+	defer f.Unlock()
+
+	if f.Err != nil {
+		return nil, f.Err
+	}
+
+	f.LastSSHFilter = *filter
+
+	groups := make([]fleet.SSHLoginGroup, 0, len(f.SSH))
+
+	for _, g := range f.SSH {
+		if (filter.Host == "" || g.Host == filter.Host) && (filter.Identity == "" || g.Identity == filter.Identity) &&
+			(filter.User == "" || g.User == filter.User) && (!filter.Unknown || g.Identity == "") &&
+			(!filter.Open || g.Open > 0) {
+			groups = append(groups, g)
+		}
+	}
+
+	slices.SortFunc(groups, func(a, b fleet.SSHLoginGroup) int { return b.FirstLogin.Compare(a.FirstLogin) })
+
+	if filter.View == store.SSHViewGroups {
+		return &store.SSHLoginPage{Groups: groups}, nil
+	}
+
+	clusters := fleet.NewSSHClusters(time.Now())
+	for i := range groups {
+		clusters.Add(&groups[i])
+	}
+
+	return &store.SSHLoginPage{Clusters: clusters.Clusters()}, nil
+}
+
+// SSHLoginsSeen reports whether a host recorded SSH logins.
+func (f *Store) SSHLoginsSeen(context.Context) (bool, error) {
+	f.Lock()
+	defer f.Unlock()
+
+	return len(f.SSHHosts) > 0, f.Err
+}
+
+// Set changes the store's fields under its lock.
+func (f *Store) Set(fn func(f *Store)) {
+	f.Lock()
+	defer f.Unlock()
+
+	fn(f)
 }

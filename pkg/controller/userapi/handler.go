@@ -30,6 +30,7 @@ type Store interface {
 
 	ListPackages(ctx context.Context, filter *store.PackageFilter) (*store.PackagePage, error)
 	AuditActors(ctx context.Context) (people []store.AuditActor, agents int, err error)
+	ListSSHLogins(ctx context.Context, filter *store.SSHLoginFilter) (*store.SSHLoginPage, error)
 	ListSlotParticipation(ctx context.Context, fromSlot uint64) ([]fleet.SlotParticipation, error)
 	SumHostSlotRuns(
 		ctx context.Context, fromSlot, toSlot, gap, minSlots uint64, perSlot []string,
@@ -151,6 +152,7 @@ func (s *Handler) Routes() []Route {
 			User: s.handleRefreshValidatorRanges,
 		},
 		{Method: http.MethodGet, Pattern: "/api/v1/audit", User: s.handleAudit},
+		{Method: http.MethodGet, Pattern: "/api/v1/ssh-logins", User: s.handleSSHLogins},
 		{Method: http.MethodGet, Pattern: "/api/v1/slots", User: s.handleSlots},
 	}
 

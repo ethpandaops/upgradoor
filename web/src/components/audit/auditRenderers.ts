@@ -5,7 +5,7 @@
 import type { AuditEntry } from '../../api/types';
 import type { AuditFilter } from '../../lib/auditCatalog';
 import { changeOf, diffValues } from '../../lib/auditDiff';
-import { hostList, plural } from '../../lib/format';
+import { formatDuration, hostList, plural } from '../../lib/format';
 import type { Tone } from '../primitives';
 
 /** What a renderer may ask of the page it is shown on. */
@@ -349,6 +349,40 @@ export function auditRenderers(settingsLabels: ReadonlyMap<string, string> = new
       summary: e => str(d(e, 'error')),
       fields: [ERROR],
     },
+    'ssh.session': {
+      title: e => {
+        const n = d(e, 'sessions');
+        const who = str(d(e, 'identity')) ?? (str(d(e, 'fingerprint')) ? 'an unknown key' : str(d(e, 'keyType')));
+        const sessions = typeof n === 'number' ? plural(n, 'SSH session') : 'SSH sessions';
+        return who ? `${sessions} of ${who}` : sessions;
+      },
+      tone: e => (str(d(e, 'identity')) ? undefined : 'warning'),
+      summary: e => {
+        const total = d(e, 'totalMs');
+        return [
+          str(d(e, 'user')) && `as ${str(d(e, 'user')) as string}`,
+          str(d(e, 'from')) && `from ${str(d(e, 'from')) as string}`,
+          typeof total === 'number' ? formatDuration(total / 1000) : undefined,
+          d(e, 'endUnknown') ? 'end unknown' : undefined,
+        ]
+          .filter(Boolean)
+          .join(' · ');
+      },
+      fields: [
+        F('identity', 'Identity'),
+        F('source', 'Key source'),
+        F('fingerprint', 'Fingerprint', 'mono'),
+        F('keyType', 'Key type'),
+        F('user', 'Login user', 'mono'),
+        F('from', 'From', 'mono'),
+        F('firstLogin', 'First login', 'time'),
+        F('lastLogout', 'Last logout', 'time'),
+        F('sessions', 'Sessions', 'number'),
+        F('longestMs', 'Longest (ms)', 'number'),
+        F('totalMs', 'Total (ms)', 'number'),
+        F('endUnknown', 'A session ended without a logout', 'yes'),
+      ],
+    },
     'debug.pprof': {
       title: e => {
         const profile = str(d(e, 'profile'));
@@ -375,7 +409,7 @@ export const FALLBACK_ACTIONS: ReadonlySet<string> = new Set(['auth.refused']);
 
 /** humanize turns an action or key into words: "action.mark-offline" → "Mark offline". */
 export function humanize(name: string): string {
-  const last = name.replace(/^(action|settings|rollout|lease|host|directive|auth|sources|debug)\./, '');
+  const last = name.replace(/^(action|settings|rollout|lease|host|directive|auth|sources|debug|ssh)\./, '');
   const words = last
     .replace(/[.-]/g, ' ')
     .replace(/([a-z])([A-Z])/g, '$1 $2')
