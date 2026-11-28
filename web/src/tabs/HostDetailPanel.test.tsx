@@ -269,8 +269,12 @@ describe('HostDrawer history', () => {
     await tab('History');
 
     expect(within(drawer).getByRole('table', { name: 'Leases of lighthouse-geth-2' })).toHaveTextContent('verifying');
-    expect(within(drawer).getByRole('table', { name: 'History of lighthouse-geth-2' })).toHaveTextContent(
-      'lease.granted'
+    expect(within(drawer).getByRole('list', { name: 'History of lighthouse-geth-2' })).toHaveTextContent(
+      'Lease granted'
+    );
+    expect(within(drawer).getByRole('link', { name: 'All of lighthouse-geth-2 in the audit log' })).toHaveAttribute(
+      'href',
+      '#audit/?who=all&target=lighthouse-geth-2'
     );
   });
 });

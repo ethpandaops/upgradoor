@@ -4,6 +4,7 @@ import (
 	"cmp"
 	"context"
 	"errors"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -560,7 +561,8 @@ func (f *Store) ListAudit(_ context.Context, filter store.AuditFilter) (
 
 		if (filter.Target != "" && e.Target != filter.Target) ||
 			!strings.HasPrefix(e.Action, filter.ActionPrefix) ||
-			(filter.BeforeID > 0 && e.ID >= filter.BeforeID) {
+			(filter.BeforeID > 0 && e.ID >= filter.BeforeID) ||
+			!auditMatches(&filter, &e) {
 			continue
 		}
 
@@ -568,6 +570,68 @@ func (f *Store) ListAudit(_ context.Context, filter store.AuditFilter) (
 	}
 
 	return out, nil
+}
+
+// auditMatches applies the filters of the store that are not about the
+// target, the action prefix or the page.
+func auditMatches(f *store.AuditFilter, e *fleet.AuditEntry) bool {
+	kind := fleet.AuditActorKindOf(e.Actor)
+	info, _ := fleet.AuditActionOf(e.Action)
+	settings := e.Target == fleet.AuditTargetSettings
+
+	inKind := func(k fleet.AuditTargetKind) bool {
+		if k == fleet.AuditTargetSetting {
+			return settings
+		}
+
+		return !settings && info.Target == k
+	}
+
+	inGroup := func(g fleet.AuditGroup) bool {
+		if g == fleet.AuditGroupSettings {
+			return settings
+		}
+
+		return !settings && info.Group == g
+	}
+
+	text := strings.ToLower(e.Actor + " " + e.Action + " " + e.Target)
+
+	return (f.Actor == "" || e.Actor == f.Actor) &&
+		(f.ActorKind == "" || kind == f.ActorKind) &&
+		(f.TargetKind == "" || inKind(f.TargetKind)) &&
+		(f.Group == "" || inGroup(f.Group)) &&
+		(f.From.IsZero() || !e.Time.Before(f.From)) &&
+		(f.To.IsZero() || e.Time.Before(f.To)) &&
+		(f.Search == "" || strings.Contains(text, strings.ToLower(f.Search)))
+}
+
+func (f *Store) AuditActors(context.Context) (people []store.AuditActor, agents int, err error) {
+	f.Lock()
+	defer f.Unlock()
+
+	if f.Err != nil {
+		return nil, 0, f.Err
+	}
+
+	counts := make(map[string]int, 8)
+
+	for i := range f.Audit {
+		switch actor := f.Audit[i].Actor; fleet.AuditActorKindOf(actor) {
+		case fleet.AuditPeople:
+			counts[actor]++
+		case fleet.AuditAgents:
+			agents++
+		case fleet.AuditScheduler:
+		}
+	}
+
+	people = make([]store.AuditActor, 0, len(counts))
+	for _, actor := range slices.Sorted(maps.Keys(counts)) {
+		people = append(people, store.AuditActor{Actor: actor, Entries: counts[actor]})
+	}
+
+	return people, agents, nil
 }
 
 func (f *Store) AuditEntries() []fleet.AuditEntry {

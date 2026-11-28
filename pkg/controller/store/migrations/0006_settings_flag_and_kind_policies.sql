@@ -6,6 +6,8 @@
 -- kind of the team's managed containers ('other' for unlabelled ones); a team
 -- that runs no container gets one under el, cl, vc, other and every kind of
 -- the fleet.
+-- The audit log is filtered by actor and time: the entries of people and of
+-- agents are few among the scheduler's and get partial indexes.
 
 DELETE FROM settings WHERE key = 'deployWindow';
 
@@ -43,3 +45,8 @@ HAVING count(*) > 0;
 DROP TABLE client_policy_pairs;
 DROP TABLE team_kinds;
 DROP TABLE old_client_policies;
+
+CREATE INDEX audit_people ON audit(actor, id)
+    WHERE actor != 'scheduler' AND substr(actor, 1, 6) != 'agent:';
+CREATE INDEX audit_agents ON audit(actor, id) WHERE substr(actor, 1, 6) = 'agent:';
+CREATE INDEX audit_time ON audit(time);

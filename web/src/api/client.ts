@@ -187,10 +187,20 @@ export interface ClientHostsQuery {
 }
 
 interface AuditQuery {
+  who?: string;
+  actor?: string;
   target?: string;
+  kind?: string;
+  group?: string;
   action?: string;
+  /** from and to are RFC 3339 instants; to is exclusive. */
+  from?: string;
+  to?: string;
+  q?: string;
   before?: number;
   limit?: number;
+  /** actors asks for the people of the log and their counts. */
+  actors?: boolean;
 }
 
 function query(params: Record<string, string | number | undefined>): string {
@@ -311,7 +321,11 @@ export class ApiClient {
   }
 
   audit(q: AuditQuery = {}, signal?: AbortSignal): Promise<Audit> {
-    return this.request(`/api/v1/audit${query({ ...q })}`, { user: true, signal });
+    const { actors, ...rest } = q;
+    return this.request(`/api/v1/audit${query({ ...rest, actors: actors ? '1' : undefined })}`, {
+      user: true,
+      signal,
+    });
   }
 
   action(call: ActionCall): Promise<ActionResult> {

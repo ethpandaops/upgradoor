@@ -795,6 +795,18 @@ func TestAuditPaging(t *testing.T) {
 	assert.JSONEq(t, `{"entries":[],"nextBefore":0}`,
 		h.get("/api/v1/audit?target=nobody").Body.String())
 
+	people := page("?who=people&group=holds&limit=3&actors=1")
+	assert.Equal(t, []int64{25, 20, 15}, ids(people))
+	assert.Equal(t, &views.AuditActors{
+		People: []store.AuditActor{{Actor: controllertest.UserEmail, Entries: 5}},
+	}, people.Actors)
+
+	assert.Equal(t, []int64{24, 23}, ids(page("?who=scheduler&kind=host&before=25&limit=2")))
+	assert.Equal(t, []int64{5}, ids(page("?actor="+url.QueryEscape(controllertest.UserEmail)+"&q=HOST-B&to="+
+		url.QueryEscape(controllertest.Epoch.Add(10*time.Second).Format(time.RFC3339)))))
+	assert.Equal(t, []int64{25, 24}, ids(page("?limit=2&from="+
+		url.QueryEscape(controllertest.Epoch.Add(24*time.Second).Format(time.RFC3339)))))
+
 	// The limit is capped.
 	for i := 26; i <= store.MaxAuditLimit+50; i++ {
 		h.store.Audit = append(h.store.Audit, fleet.AuditEntry{ID: int64(i), Action: "x"})
@@ -806,7 +818,8 @@ func TestAuditPaging(t *testing.T) {
 
 	for _, bad := range []string{
 		"?limit=0", "?limit=x", "?before=x", "?before=-4",
-		"?target=" + strings.Repeat("a", maxAuditFilter+1),
+		"?target=" + strings.Repeat("a", maxAuditFilter+1), "?q=" + strings.Repeat("a", maxAuditFilter+1),
+		"?who=robots", "?group=nope", "?kind=nope", "?from=yesterday", "?to=1700000000",
 	} {
 		rec := h.get("/api/v1/audit" + bad)
 		assert.Equal(t, http.StatusBadRequest, rec.Code, bad)

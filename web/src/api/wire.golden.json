@@ -2707,5 +2707,226 @@
     ]
    }
   ]
- }
+ },
+ "auditActions": [
+  {
+   "action": "rollout.created",
+   "group": "rollouts",
+   "target": "rollout",
+   "scheduler": true
+  },
+  {
+   "action": "rollout.paused",
+   "group": "rollouts",
+   "target": "rollout",
+   "scheduler": true
+  },
+  {
+   "action": "rollout.halted",
+   "group": "rollouts",
+   "target": "rollout",
+   "scheduler": true
+  },
+  {
+   "action": "rollout.completed",
+   "group": "rollouts",
+   "target": "rollout",
+   "scheduler": true
+  },
+  {
+   "action": "rollout.superseded",
+   "group": "rollouts",
+   "target": "rollout",
+   "scheduler": true
+  },
+  {
+   "action": "rollout.dropped",
+   "group": "rollouts",
+   "target": "rollout",
+   "scheduler": true
+  },
+  {
+   "action": "action.roll",
+   "group": "rollouts",
+   "target": "rollout"
+  },
+  {
+   "action": "action.reboot",
+   "group": "rollouts",
+   "target": "rollout"
+  },
+  {
+   "action": "action.pause",
+   "group": "rollouts",
+   "target": "rollout"
+  },
+  {
+   "action": "action.resume",
+   "group": "rollouts",
+   "target": "rollout"
+  },
+  {
+   "action": "action.ignore-gate",
+   "group": "rollouts",
+   "target": "rollout"
+  },
+  {
+   "action": "action.ignore-budget",
+   "group": "rollouts",
+   "target": "rollout"
+  },
+  {
+   "action": "action.skip",
+   "group": "rollouts",
+   "target": "rollout"
+  },
+  {
+   "action": "action.retry",
+   "group": "rollouts",
+   "target": "rollout"
+  },
+  {
+   "action": "action.abort",
+   "group": "rollouts",
+   "target": "rollout"
+  },
+  {
+   "action": "action.host-action",
+   "group": "host-actions",
+   "target": "rollout"
+  },
+  {
+   "action": "lease.granted",
+   "group": "leases",
+   "target": "host",
+   "scheduler": true
+  },
+  {
+   "action": "lease.released",
+   "group": "leases",
+   "target": "host",
+   "scheduler": true
+  },
+  {
+   "action": "lease.failed",
+   "group": "leases",
+   "target": "host",
+   "scheduler": true
+  },
+  {
+   "action": "lease.expired",
+   "group": "leases",
+   "target": "host",
+   "scheduler": true
+  },
+  {
+   "action": "lease.cancelled",
+   "group": "leases",
+   "target": "host",
+   "scheduler": true
+  },
+  {
+   "action": "action.approve-lease",
+   "group": "leases",
+   "target": "host"
+  },
+  {
+   "action": "action.end-lease",
+   "group": "leases",
+   "target": "host"
+  },
+  {
+   "action": "action.hold",
+   "group": "holds",
+   "target": "host"
+  },
+  {
+   "action": "action.unhold",
+   "group": "holds",
+   "target": "host"
+  },
+  {
+   "action": "action.mark-offline",
+   "group": "holds",
+   "target": "host"
+  },
+  {
+   "action": "action.unmark-offline",
+   "group": "holds",
+   "target": "host"
+  },
+  {
+   "action": "action.image-override",
+   "group": "overrides",
+   "target": "host"
+  },
+  {
+   "action": "action.flag-override",
+   "group": "overrides",
+   "target": "host"
+  },
+  {
+   "action": "directive.accepted",
+   "group": "instructions",
+   "target": "host",
+   "scheduler": true
+  },
+  {
+   "action": "directive.rejected",
+   "group": "instructions",
+   "target": "host",
+   "scheduler": true
+  },
+  {
+   "action": "directive.cancelled",
+   "group": "instructions",
+   "target": "host",
+   "scheduler": true
+  },
+  {
+   "action": "settings.update",
+   "group": "settings",
+   "target": "settings"
+  },
+  {
+   "action": "action.client-policy",
+   "group": "settings",
+   "target": "settings"
+  },
+  {
+   "action": "action.arm-deploy-window",
+   "group": "settings",
+   "target": "settings"
+  },
+  {
+   "action": "sources.validator-ranges.refresh",
+   "group": "sources",
+   "target": "sources"
+  },
+  {
+   "action": "host.registered",
+   "group": "hosts",
+   "target": "host"
+  },
+  {
+   "action": "host.certificate-changed",
+   "group": "hosts",
+   "target": "host"
+  },
+  {
+   "action": "action.forget",
+   "group": "hosts",
+   "target": "host"
+  },
+  {
+   "action": "action.forget.failed",
+   "group": "hosts",
+   "target": "host"
+  },
+  {
+   "action": "auth.refused",
+   "group": "access",
+   "target": "request"
+  }
+ ]
 }

@@ -23,7 +23,7 @@
 //	PUT  /api/v1/settings              user     fleet.Settings -> SettingsBody
 //	GET  /api/v1/settings/sources      admin    -> DataSources
 //	POST /api/v1/settings/sources/validator-ranges/refresh  admin  {} -> ValidatorRangesRefresh
-//	GET  /api/v1/audit?target=&action=&before=&limit=   user -> Audit
+//	GET  /api/v1/audit?who=&actor=&target=&kind=&group=&action=&from=&to=&q=&before=&limit=&actors=   user -> Audit
 //	GET  /api/v1/slots?window=         user     -> SlotHistory
 //	POST /api/v1/actions/roll          user     scheduler.RollRequest         -> scheduler.ActionResult
 //	POST /api/v1/actions/reboot        user     scheduler.RebootRequest       -> scheduler.ActionResult
@@ -328,6 +328,15 @@ type Audit struct {
 	Entries []fleet.AuditEntry `json:"entries"`
 	// NextBefore is the "before" value for the next page; 0 at the end.
 	NextBefore int64 `json:"nextBefore"`
+	// Actors are there when asked for (actors=1).
+	Actors *AuditActors `json:"actors,omitempty"`
+}
+
+// AuditActors are the people of the audit log with their number of entries,
+// and the number of entries of the agents.
+type AuditActors struct {
+	People []store.AuditActor `json:"people"`
+	Agents int                `json:"agents"`
 }
 
 // AuditHead is what an event stream says about the audit log. The log itself

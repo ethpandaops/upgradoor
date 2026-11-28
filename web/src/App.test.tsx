@@ -167,7 +167,7 @@ describe('App in open mode (no auth provider)', () => {
     expect(document.title).toBe('upgradoor · mock-devnet-0');
 
     await user.click(screen.getByRole('tab', { name: 'Audit' }));
-    expect(await screen.findByRole('table', { name: 'Audit log' })).toBeInTheDocument();
+    expect(await screen.findByRole('list', { name: 'Audit log' })).toBeInTheDocument();
     expect(calls.every(c => c.authorization === null)).toBe(true);
   });
 

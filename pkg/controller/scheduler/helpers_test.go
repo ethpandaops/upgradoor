@@ -554,8 +554,14 @@ func (s *fakeStore) Commit(_ context.Context, ch *store.Changes) error {
 	return nil
 }
 
+// appendAudit stores entries. An action fleet.AuditActions does not name
+// panics: the audit page filters and renders by that list.
 func (s *fakeStore) appendAudit(entries []fleet.AuditEntry) {
 	for _, e := range entries {
+		if _, ok := fleet.AuditActionOf(e.Action); !ok {
+			panic("audit action missing from fleet.AuditActions: " + e.Action)
+		}
+
 		e.ID = int64(len(s.audit) + 1)
 		s.audit = append(s.audit, e)
 	}

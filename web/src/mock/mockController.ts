@@ -59,6 +59,7 @@ import {
   type WaitKind,
 } from '../api/types';
 import { WIRE_VERSION, without } from '../api/wire';
+import { actorKindOf, matchesFilter } from '../lib/auditCatalog';
 import { applyFlags, validateFlags } from '../lib/flags';
 import { formatPercent, heldBy, isHeld } from '../lib/format';
 import { hostUsage } from '../lib/usage';
@@ -596,12 +597,7 @@ export class MockController {
       if (route === 'plan') return this.plan();
       if (route === 'slots') return this.slots(q.get('window'), true);
       if (route === 'audit') {
-        return this.auditPage(
-          q.get('target') ?? '',
-          q.get('action') ?? '',
-          Number(q.get('before')) || 0,
-          Number(q.get('limit')) || 100
-        );
+        return this.auditPage(q, Number(q.get('before')) || 0, Number(q.get('limit')) || 100);
       }
     }
 
@@ -1769,16 +1765,34 @@ export class MockController {
     return this.settingsBody();
   }
 
-  private auditPage(target: string, actionPrefix: string, before: number, limit: number): Audit {
+  private auditPage(q: URLSearchParams, before: number, limit: number): Audit {
+    const filter = Object.fromEntries(
+      ['who', 'actor', 'target', 'kind', 'group', 'action', 'from', 'to', 'q'].map(k => [k, q.get(k) ?? ''])
+    );
     const matching = this.data.audit
-      .filter(e => (target === '' || e.target === target) && (actionPrefix === '' || e.action.startsWith(actionPrefix)))
+      .filter(e => matchesFilter(e, filter))
       .filter(e => before === 0 || e.id < before)
       .sort((a, b) => b.id - a.id);
 
     const entries = matching.slice(0, limit);
     const last = entries[entries.length - 1];
+    const page: Audit = { entries, nextBefore: matching.length > limit && last ? last.id : 0 };
 
-    return { entries, nextBefore: matching.length > limit && last ? last.id : 0 };
+    if (q.get('actors') === '1') {
+      const people = new Map<string, number>();
+      let agents = 0;
+      for (const e of this.data.audit) {
+        const kind = actorKindOf(e.actor);
+        if (kind === 'people') people.set(e.actor, (people.get(e.actor) ?? 0) + 1);
+        if (kind === 'agents') agents += 1;
+      }
+      page.actors = {
+        people: [...people].sort(([a], [b]) => a.localeCompare(b)).map(([actor, n]) => ({ actor, entries: n })),
+        agents,
+      };
+    }
+
+    return page;
   }
 
   // ------------------------------------------------------------ actions

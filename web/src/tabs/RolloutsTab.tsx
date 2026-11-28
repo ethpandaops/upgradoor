@@ -28,6 +28,7 @@ import {
   RolloutStateBadge,
   stageLabel,
 } from '../components/status';
+import { auditHash } from '../lib/auditCatalog';
 import { pauseLabel, percentOf, plural, QUEUE_PLACE_TITLE, queuePlace, shortRevision } from '../lib/format';
 import {
   GATE_APPROVAL_HINT,
@@ -778,6 +779,9 @@ export function RolloutCard({
         <span>
           id <ShortId value={r.id} label="rollout" />
         </span>
+        <a href={auditHash({ target: r.id })} className="text-accent hover:underline">
+          history
+        </a>
         {r.kind === 'group' && (
           <span>
             kind <span className="font-medium text-foreground">{r.containerKind || 'unlabelled'}</span>

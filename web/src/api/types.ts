@@ -1608,6 +1608,20 @@ export interface SettingsBody {
 export interface Audit {
   entries: List<AuditEntry>;
   nextBefore: number;
+  /** actors are there when asked for. */
+  actors?: AuditActors;
+}
+
+/** store.AuditActor */
+export interface AuditActor {
+  actor: string;
+  entries: number;
+}
+
+/** api.AuditActors: the people of the log with their entries, and the entries of the agents. */
+export interface AuditActors {
+  people: List<AuditActor>;
+  agents: number;
 }
 
 // ------------------------------------------------------------ event stream

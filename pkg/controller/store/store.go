@@ -117,6 +117,9 @@ type Store interface {
 	AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error
 	// ListAudit returns entries, newest first.
 	ListAudit(ctx context.Context, filter AuditFilter) ([]fleet.AuditEntry, error)
+	// AuditActors counts the audit entries of each person, by actor, and
+	// those of all agents.
+	AuditActors(ctx context.Context) (people []AuditActor, agents int, err error)
 }
 
 // HostSync is the input of RecordSync.
@@ -285,16 +288,35 @@ type DirectiveFilter struct {
 	Rollouts []string
 }
 
-// AuditFilter selects audit entries.
+// AuditFilter selects audit entries; every field that is set must match.
 type AuditFilter struct {
 	// Target selects entries about one host, rollout or setting.
 	Target string
+	// TargetKind selects entries whose target is of a kind.
+	TargetKind fleet.AuditTargetKind
+	// Actor selects the entries of one actor, ActorKind those of a kind.
+	Actor     string
+	ActorKind fleet.AuditActorKind
+	// Group selects the entries of the actions of a group.
+	Group fleet.AuditGroup
 	// ActionPrefix selects entries whose action starts with it.
 	ActionPrefix string
+	// From and To select entries of a time range; To is exclusive.
+	From, To time.Time
+	// Search selects entries whose actor, action or target contain it,
+	// ignoring ASCII case; with SearchDetail their detail as well.
+	Search       string
+	SearchDetail bool
 	// BeforeID pages backwards: only entries with a smaller ID.
 	BeforeID int64
 	// Limit bounds the result; 0 means 100.
 	Limit int
+}
+
+// AuditActor is one actor of the audit trail and its number of entries.
+type AuditActor struct {
+	Actor   string `json:"actor"`
+	Entries int    `json:"entries"`
 }
 
 // Changes is one atomic set of scheduler writes. Rollouts, leases and

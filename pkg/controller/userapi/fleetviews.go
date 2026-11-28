@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/ethpandaops/upgradoor/pkg/controller/authz"
 	"github.com/ethpandaops/upgradoor/pkg/controller/discovery"
@@ -387,8 +388,6 @@ func (s *Handler) settingsBody(ctx context.Context, settings *fleet.Settings) (*
 
 // handleAudit serves GET /api/v1/audit, newest first, paged by "before".
 func (s *Handler) handleAudit(w http.ResponseWriter, r *http.Request, u *authz.User) {
-	q := r.URL.Query()
-
 	limit, err := queryLimit(r, store.DefaultAuditLimit, store.MaxAuditLimit)
 	if err != nil {
 		httpjson.BadRequest(s.log, w, err)
@@ -396,27 +395,17 @@ func (s *Handler) handleAudit(w http.ResponseWriter, r *http.Request, u *authz.U
 		return
 	}
 
-	filter := store.AuditFilter{
-		Target:       q.Get("target"),
-		ActionPrefix: q.Get("action"),
-		// One more than asked tells whether another page exists.
-		Limit: limit + 1,
-	}
+	access := s.Access(u)
 
-	if len(filter.Target) > maxAuditFilter || len(filter.ActionPrefix) > maxAuditFilter {
-		httpjson.Error(s.log, w, http.StatusBadRequest, "target or action filter too long")
+	filter, err := auditFilter(r, &access)
+	if err != nil {
+		httpjson.BadRequest(s.log, w, err)
 
 		return
 	}
 
-	if raw := q.Get("before"); raw != "" {
-		filter.BeforeID, err = strconv.ParseInt(raw, 10, 64)
-		if err != nil || filter.BeforeID < 0 {
-			httpjson.Error(s.log, w, http.StatusBadRequest, "before must be a non-negative integer")
-
-			return
-		}
-	}
+	// One more than asked tells whether another page exists.
+	filter.Limit = limit + 1
 
 	entries, err := s.opts.Store.ListAudit(r.Context(), filter)
 	if err != nil {
@@ -425,7 +414,6 @@ func (s *Handler) handleAudit(w http.ResponseWriter, r *http.Request, u *authz.U
 		return
 	}
 
-	access := s.Access(u)
 	out := views.Audit{Entries: views.NonNil(access.Audit(entries))}
 
 	if len(out.Entries) > limit {
@@ -433,5 +421,90 @@ func (s *Handler) handleAudit(w http.ResponseWriter, r *http.Request, u *authz.U
 		out.NextBefore = out.Entries[limit-1].ID
 	}
 
+	if r.URL.Query().Get("actors") == "1" {
+		people, agents, err := s.opts.Store.AuditActors(r.Context())
+		if err != nil {
+			httpjson.InternalError(s.log, w, r, err)
+
+			return
+		}
+
+		out.Actors = &views.AuditActors{People: views.NonNil(people), Agents: agents}
+	}
+
 	httpjson.Write(s.log, w, http.StatusOK, out)
+}
+
+// auditFilter reads the filter of GET /api/v1/audit. The detail is searched
+// only for a login that reads every detail in full.
+func auditFilter(r *http.Request, access *views.Access) (store.AuditFilter, error) {
+	q := r.URL.Query()
+
+	filter := store.AuditFilter{
+		Target:       q.Get("target"),
+		TargetKind:   fleet.AuditTargetKind(q.Get("kind")),
+		Actor:        q.Get("actor"),
+		ActorKind:    fleet.AuditActorKind(q.Get("who")),
+		Group:        fleet.AuditGroup(q.Get("group")),
+		ActionPrefix: q.Get("action"),
+		Search:       strings.TrimSpace(q.Get("q")),
+		SearchDetail: access.Full && access.Admin,
+	}
+
+	for _, v := range []string{filter.Target, filter.Actor, filter.ActionPrefix, filter.Search} {
+		if len(v) > maxAuditFilter {
+			return filter, errors.New("a filter is too long")
+		}
+	}
+
+	if !validAuditFilter(&filter) {
+		return filter, errors.New("unknown actor kind, target kind or group")
+	}
+
+	var err error
+
+	if raw := q.Get("before"); raw != "" {
+		filter.BeforeID, err = strconv.ParseInt(raw, 10, 64)
+		if err != nil || filter.BeforeID < 0 {
+			return filter, errors.New("before must be a non-negative integer")
+		}
+	}
+
+	for _, t := range []struct {
+		name string
+		into *time.Time
+	}{{"from", &filter.From}, {"to", &filter.To}} {
+		raw := q.Get(t.name)
+		if raw == "" {
+			continue
+		}
+
+		if *t.into, err = time.Parse(time.RFC3339, raw); err != nil {
+			return filter, fmt.Errorf("%s must be an RFC 3339 time", t.name)
+		}
+	}
+
+	return filter, nil
+}
+
+// validAuditFilter says whether the kinds and the group a filter names exist.
+func validAuditFilter(f *store.AuditFilter) bool {
+	switch f.ActorKind {
+	case "", fleet.AuditPeople, fleet.AuditScheduler, fleet.AuditAgents:
+	default:
+		return false
+	}
+
+	known := func(match func(a *fleet.AuditAction) bool) bool {
+		for i := range fleet.AuditActions {
+			if match(&fleet.AuditActions[i]) {
+				return true
+			}
+		}
+
+		return false
+	}
+
+	return (f.TargetKind == "" || known(func(a *fleet.AuditAction) bool { return a.Target == f.TargetKind })) &&
+		(f.Group == "" || known(func(a *fleet.AuditAction) bool { return a.Group == f.Group }))
 }

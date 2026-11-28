@@ -29,6 +29,7 @@ type Store interface {
 	authz.Store
 
 	ListPackages(ctx context.Context, filter *store.PackageFilter) (*store.PackagePage, error)
+	AuditActors(ctx context.Context) (people []store.AuditActor, agents int, err error)
 	ListSlotParticipation(ctx context.Context, fromSlot uint64) ([]fleet.SlotParticipation, error)
 	SumHostSlotRuns(
 		ctx context.Context, fromSlot, toSlot, gap, minSlots uint64, perSlot []string,

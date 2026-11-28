@@ -403,6 +403,8 @@ type wireGolden struct {
 	SlotPatch json.RawMessage `json:"slotPatch"`
 	// views.Hosts is GET /api/v1/hosts after the patch.
 	Hosts json.RawMessage `json:"hosts"`
+	// AuditActions are the actions the audit log can hold.
+	AuditActions []fleet.AuditAction `json:"auditActions"`
 }
 
 // The page interprets the schema from a file and tests its decoder against
@@ -472,6 +474,7 @@ func TestWireFiles(t *testing.T) {
 
 	golden.SlotPatch = raw(user.event(eventPatch))
 	golden.Hosts = json.RawMessage(h.get("/api/v1/hosts").Body.Bytes())
+	golden.AuditActions = fleet.AuditActions
 
 	body, err := json.MarshalIndent(golden, "", " ")
 	require.NoError(t, err)

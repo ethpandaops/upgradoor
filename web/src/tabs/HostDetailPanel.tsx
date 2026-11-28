@@ -12,7 +12,7 @@ import {
 } from '../api/types';
 import type { ActionIntent } from '../components/ActionDialog';
 import { RunExit, RunOutput } from '../components/ActionRun';
-import { AuditTable } from '../components/AuditTable';
+import { AuditList } from '../components/audit/AuditList';
 import { Digest, ShortId } from '../components/Digest';
 import { Drawer } from '../components/Drawer';
 import { HostActionsMenu, SecurityUpdates } from '../components/HostActions';
@@ -28,6 +28,7 @@ import { IntentAction } from '../components/SelectionBar';
 import { Badge, Dash, Empty, ErrorBanner, Loading, Table, Td, Th, cx } from '../components/primitives';
 import { ImpactBadge, LeaseStateBadge, NeedLine, OfflineBadge } from '../components/status';
 import { ContainerUsage, HostResources } from '../components/Usage';
+import { auditHash } from '../lib/auditCatalog';
 import { displayImage, heldBy, isHeld, percentOf, shortRevision } from '../lib/format';
 import { hostActionIntent, runnableActions, verbBlocked } from '../lib/hostActions';
 import { holdIntent, offlineIntent } from '../lib/intents';
@@ -865,7 +866,12 @@ function HistoryPane({ host: h }: { host: HostDetail }) {
         {history.length === 0 ? (
           <Empty>No history yet.</Empty>
         ) : (
-          <AuditTable entries={history} label={`History of ${h.name}`} showTarget={false} />
+          <>
+            <AuditList entries={history} label={`History of ${h.name}`} showTarget={false} />
+            <a href={auditHash({ target: h.name })} className="self-start text-xs/5 text-accent hover:underline">
+              All of {h.name} in the audit log
+            </a>
+          </>
         )}
       </Group>
     </>

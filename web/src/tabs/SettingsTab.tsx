@@ -12,6 +12,7 @@ import { usePermissions } from '../components/Permissions';
 import { Badge, Button, Card, ErrorBanner, INPUT_CLASS, InfoTip, Loading, Switch, cx } from '../components/primitives';
 import { useQuery } from '../hooks/useQuery';
 import { useUnsavedWork } from '../hooks/useUnsavedWork';
+import { auditHash } from '../lib/auditCatalog';
 import { absoluteTime } from '../lib/format';
 import { armIntent, scopeIntent } from '../lib/intents';
 import {
@@ -270,6 +271,9 @@ function SettingsEditor({
                   ? 'Fix the marked fields to save.'
                   : `${dirty.length} unsaved ${dirty.length === 1 ? 'change' : 'changes'}. Every change is recorded in the audit log.`}
           </span>
+          <a href={auditHash({ group: 'settings' })} className="ml-auto text-xs/5 text-accent hover:underline">
+            Change history
+          </a>
         </div>
       </div>
     </form>

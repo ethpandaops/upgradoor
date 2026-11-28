@@ -70,6 +70,7 @@ type Store interface {
 
 	AppendAudit(ctx context.Context, entries ...fleet.AuditEntry) error
 	ListAudit(ctx context.Context, filter store.AuditFilter) ([]fleet.AuditEntry, error)
+	AuditActors(ctx context.Context) (people []store.AuditActor, agents int, err error)
 }
 
 // Beacon is the part of beacon.Service the API needs.

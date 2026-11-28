@@ -1365,108 +1365,19 @@ export function buildMockData(now: number = Date.now(), fleet: MockFleet = 'smal
   ];
 
   const defaults = defaultSettings();
-  const audit: AuditEntry[] = [];
-  let auditId = 0;
-  const log = (secondsAgo: number, actor: string, action: string, target: string, detail?: Record<string, unknown>) => {
-    auditId += 1;
-    audit.push({ id: auditId, time: at(secondsAgo), actor, action, target, detail });
-  };
-
-  // Oldest first, so IDs grow with time.
-  for (const [i, name] of [...hosts.keys()].entries()) {
-    log(19 * 86400 - i * 40, `agent:${name}`, 'host.registered', name, {
-      certHash: hosts.get(name)?.certHash,
-      roles: hosts.get(name)?.roles,
-    });
-  }
-  log(11 * 86400, 'agent:prysm-geth-2', 'host.certificate-changed', 'prysm-geth-2', {
-    before: { certHash: hex('cert/prysm-geth-2/old') },
-    after: { certHash: hex('cert/prysm-geth-2') },
+  const audit = buildAudit({
+    at,
+    hosts,
+    defaults,
+    rollouts: { abortedRollout, dockerRollout, rebootRollout, nethermindRollout, grandineRollout, lighthouseRollout },
+    leases: { leaseFailed, leaseGrandine, leaseCanary, leaseRpc, leaseVerifying },
+    attested,
+    targets: {
+      nethermind: imageTarget(NETHERMIND_IMAGE, nmDigest),
+      grandine: imageTarget(GRANDINE_IMAGE, grDigest),
+      lighthouse: imageTarget(LIGHTHOUSE_IMAGE, lhDigest),
+    },
   });
-  log(6 * 86400, 'bob@example.org', 'settings.update', 'settings', {
-    before: { ...defaults, maxUnavailablePercent: 5, readyAttestations: 4 },
-    after: { ...defaults },
-  });
-  log(5 * 86400, 'alice@example.org', 'action.reboot', abortedRollout, {
-    hosts: ['prysm-erigon-1', 'prysm-geth-1', 'prysm-geth-2'],
-    staggered: true,
-    force: false,
-    ignoreBudget: false,
-    ignoreGate: false,
-    reason: 'kernel test',
-  });
-  log(5 * 86400 - 240, 'alice@example.org', 'action.abort', abortedRollout, { reason: 'wrong selection' });
-  log(3 * 86400 + 5 * 3600, 'scheduler', 'rollout.created', dockerRollout, {
-    title: 'Packages: docker-ce, docker-ce-cli → 5:29.0.0',
-  });
-  log(2 * 86400 + 2 * 3600, 'scheduler', 'rollout.completed', dockerRollout);
-  log(26 * 3600, 'scheduler', 'rollout.created', rebootRollout, { title: 'Reboot', policy: 'manual' });
-  log(8 * 3600, 'alice@example.org', 'action.hold', 'grandine-erigon-2', { reason: 'testing a debug build' });
-  log(7 * 3600, 'alice@example.org', 'action.unhold', 'grandine-erigon-2', { reason: 'custom image is enough' });
-  log(3 * 3600 + 12 * 60, 'scheduler', 'rollout.created', nethermindRollout, {
-    containerKind: 'el',
-    team: 'nethermind',
-    targets: [imageTarget(NETHERMIND_IMAGE, nmDigest)],
-  });
-  log(3 * 3600 + 10 * 60, 'scheduler', 'lease.granted', 'nimbus-nethermind-1', {
-    lease: leaseFailed,
-    rollout: nethermindRollout,
-  });
-  log(2 * 3600 + 50 * 60, 'scheduler', 'lease.failed', 'nimbus-nethermind-1', {
-    lease: leaseFailed,
-    error: 'container nethermind restarted 14 times while verifying',
-  });
-  log(2 * 3600 + 50 * 60 - 1, 'scheduler', 'rollout.halted', nethermindRollout, {
-    reason: 'nimbus-nethermind-1: container nethermind restarted 14 times while verifying',
-  });
-  log(96 * 60, 'bob@example.org', 'settings.update', 'settings', {
-    before: { ...defaults },
-    after: { ...defaults, pauseAfterCanaryImage: true, readyPeerShare: 0.25 },
-  });
-  log(95 * 60, 'scheduler', 'rollout.created', grandineRollout, {
-    containerKind: 'cl',
-    team: 'grandine',
-    targets: [imageTarget(GRANDINE_IMAGE, grDigest)],
-  });
-  log(93 * 60, 'scheduler', 'lease.granted', 'grandine-erigon-1', {
-    lease: leaseGrandine,
-    rollout: grandineRollout,
-    canary: true,
-  });
-  log(78 * 60, 'scheduler', 'lease.released', 'grandine-erigon-1', {
-    lease: leaseGrandine,
-    readiness: attested(92 * 60),
-  });
-  log(78 * 60 - 1, 'scheduler', 'rollout.paused', grandineRollout, {
-    reason: 'paused after the canary; resume to continue',
-    lease: leaseGrandine,
-  });
-  log(47 * 60, 'scheduler', 'rollout.created', lighthouseRollout, {
-    containerKind: 'cl',
-    team: 'lighthouse',
-    targets: [imageTarget(LIGHTHOUSE_IMAGE, lhDigest)],
-  });
-  log(46 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-1', {
-    lease: leaseCanary,
-    rollout: lighthouseRollout,
-    canary: true,
-  });
-  log(38 * 60, 'scheduler', 'lease.released', 'lighthouse-geth-1', {
-    lease: leaseCanary,
-    readiness: attested(45 * 60),
-  });
-  // The lighthouse rollout paused after its canary too, and was resumed.
-  log(38 * 60 - 1, 'scheduler', 'rollout.paused', lighthouseRollout, {
-    reason: 'paused after the canary; resume to continue',
-    lease: leaseCanary,
-  });
-  log(37 * 60, 'alice@example.org', 'action.resume', lighthouseRollout, { reason: 'the canary looks good' });
-  log(36 * 60, 'scheduler', 'lease.granted', 'rpc-1', { lease: leaseRpc, rollout: lighthouseRollout });
-  log(21 * 60, 'scheduler', 'lease.released', 'rpc-1', {
-    lease: leaseRpc,
-    readiness: 'not ready before the lease: node is syncing; no worse after',
-  });
-  log(9 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-2', { lease: leaseVerifying, rollout: lighthouseRollout });
 
   return {
     network: NETWORK,
@@ -1598,4 +1509,531 @@ function largeFleet(
     .forEach((host, i) => offline.set(host, [[now - (95 - i * 12) * 60_000, now - (55 - i * 12) * 60_000]]));
 
   return offline;
+}
+
+/** What buildAudit writes about: the fixture's hosts, rollouts and leases. */
+interface AuditInput {
+  at: (secondsAgo: number) => string;
+  hosts: ReadonlyMap<string, HostDetail>;
+  defaults: Settings;
+  rollouts: Record<
+    | 'abortedRollout'
+    | 'dockerRollout'
+    | 'rebootRollout'
+    | 'nethermindRollout'
+    | 'grandineRollout'
+    | 'lighthouseRollout',
+    string
+  >;
+  leases: Record<'leaseFailed' | 'leaseGrandine' | 'leaseCanary' | 'leaseRpc' | 'leaseVerifying', string>;
+  attested: (doneSecondsAgo: number) => string;
+  targets: Record<'nethermind' | 'grandine' | 'lighthouse', RolloutTarget>;
+}
+
+/** The scheduler's readiness line of a lease that was released. */
+const READY = 'ready: node at head with peers, validators attesting';
+
+/**
+ * buildAudit writes the audit log of the fixture as the controller does,
+ * with the details its actions record: mostly the scheduler's rollouts and
+ * leases over three weeks, the agents' registrations, and what a handful of
+ * people did of every kind.
+ */
+function buildAudit(input: AuditInput): AuditEntry[] {
+  const { at, hosts, defaults, rollouts: r, leases: l } = input;
+  const pending: [number, string, string, string, Record<string, unknown> | undefined][] = [];
+  const log = (secondsAgo: number, actor: string, action: string, target: string, detail?: Record<string, unknown>) => {
+    pending.push([secondsAgo, actor, action, target, detail]);
+  };
+  // What allowed a person's request, as the controller stamps it.
+  const staff = { authorizedBy: 'manage', teams: [] };
+  const team = (t: string) => ({ authorizedBy: 'team_manage', teams: [t] });
+  const admin = { authorizedBy: 'admin', teams: [] };
+  const names = [...hosts.keys()];
+  const H = 3600;
+  const D = 86400;
+
+  for (const [i, name] of names.entries()) {
+    const h = hosts.get(name);
+    log(19 * D - i * 40, `agent:${name}`, 'host.registered', name, {
+      certHash: h?.certHash,
+      roles: h?.roles,
+      validators: h?.validators ?? 0,
+      remoteAddr: `10.0.${Math.floor(i / 200)}.${(i % 200) + 10}`,
+    });
+  }
+  log(11 * D, 'agent:prysm-geth-2', 'host.certificate-changed', 'prysm-geth-2', {
+    before: { certHash: hex('cert/prysm-geth-2/old') },
+    after: { certHash: hex('cert/prysm-geth-2') },
+    remoteAddr: '10.0.0.24',
+  });
+
+  // Rollouts the scheduler ran on its own: a lease per host, granted and released.
+  let leaseSeq = 0;
+  const rolloutRun = (
+    id: string,
+    key: string,
+    title: string,
+    startAgo: number,
+    members: readonly string[],
+    end: 'completed' | 'superseded'
+  ) => {
+    log(startAgo, 'scheduler', 'rollout.created', id, { key, title });
+    let t = startAgo - 60;
+    for (const [i, host] of members.entries()) {
+      leaseSeq += 1;
+      const lease = `ls-${hex(`audit/lease/${leaseSeq}`, 16)}`;
+      log(t, 'scheduler', 'lease.granted', host, {
+        lease,
+        rollouts: [id],
+        cost: 1,
+        impact: 'node',
+        unavailable: i % 3,
+        allowed: 3,
+        force: false,
+        ignoreBudget: false,
+        ignoredGate: false,
+        closedGate: false,
+      });
+      log(t - 540, 'scheduler', 'lease.released', host, {
+        lease,
+        force: false,
+        readiness: `${READY}: ${3 + (i % 4)} of 4 attestations`,
+      });
+      if (i === 0 && end === 'completed') {
+        log(t - 541, 'scheduler', 'rollout.paused', id, {
+          key,
+          reason: 'paused after the canary; resume to continue',
+          lease,
+        });
+        log(t - 900, 'alice@example.org', 'action.resume', id, {
+          before: { paused: true },
+          after: { paused: false, approved: false },
+          reason: 'canary is attesting',
+          ...staff,
+        });
+        t -= 900;
+      }
+      t -= 120;
+    }
+    log(t, 'scheduler', `rollout.${end}`, id, {
+      key,
+      reason: end === 'superseded' ? 'newer package versions appeared' : '',
+    });
+  };
+
+  const fleetHosts = names.filter(n => n !== 'tooling-1' && n !== 'bootnode-1');
+  rolloutRun(
+    `ro-${hex('audit/rollout/libssl', 16)}`,
+    `packages:${hex('packages/libssl', 16)}`,
+    'packages: libssl3 3.0.13-0ubuntu3.5, openssl 3.0.13-0ubuntu3.5',
+    17 * D,
+    fleetHosts,
+    'completed'
+  );
+  rolloutRun(
+    `ro-${hex('audit/rollout/geth-old', 16)}`,
+    `unit:el/geth:${hex('geth/old', 12)}`,
+    'geth el: ethpandaops/geth:master to sha256:5f0c2e9a1b7d',
+    14 * D,
+    fleetHosts.filter(n => n.includes('geth')),
+    'completed'
+  );
+  rolloutRun(
+    `ro-${hex('audit/rollout/curl', 16)}`,
+    `packages:${hex('packages/curl', 16)}`,
+    'packages: curl 8.5.0-2ubuntu10.5',
+    12 * D,
+    fleetHosts.slice(0, 6),
+    'superseded'
+  );
+  rolloutRun(
+    `ro-${hex('audit/rollout/deploy', 16)}`,
+    `unit:cl/lighthouse:${hex('deploy/lighthouse', 12)}`,
+    'lighthouse cl: lighthouse to sigp/lighthouse:v8.0.0 to sha256:8a1d0c7e44f2, command line changed',
+    10 * D,
+    fleetHosts.filter(n => n.startsWith('lighthouse')),
+    'completed'
+  );
+  rolloutRun(
+    `ro-${hex('audit/rollout/curl2', 16)}`,
+    `packages:${hex('packages/curl2', 16)}`,
+    'packages: curl 8.5.0-2ubuntu10.6',
+    12 * D - 4 * H,
+    fleetHosts,
+    'completed'
+  );
+  const dropped = `ro-${hex('audit/rollout/dropped', 16)}`;
+  log(9 * D, 'scheduler', 'rollout.created', dropped, {
+    key: 'local:teku-besu-2',
+    title: 'teku-besu-2: overrides file',
+  });
+  log(9 * D - 300, 'scheduler', 'rollout.dropped', dropped, {
+    key: 'local:teku-besu-2',
+    title: 'teku-besu-2: overrides file',
+    reason: 'every host resolved on its own',
+  });
+  log(8 * D, 'scheduler', 'lease.granted', 'teku-besu-1', {
+    lease: `ls-${hex('audit/expired', 16)}`,
+    rollouts: [`ro-${hex('audit/rollout/curl2', 16)}`],
+    cost: 1,
+    impact: 'node',
+    force: false,
+  });
+  log(8 * D - 1800, 'scheduler', 'lease.expired', 'teku-besu-1', {
+    lease: `ls-${hex('audit/expired', 16)}`,
+    reason: 'the agent did not report the lease done in time',
+  });
+
+  // People: the settings.
+  log(18 * D, 'bob@example.org', 'action.arm-deploy-window', 'settings', {
+    before: { armedAt: null },
+    after: { armedAt: at(18 * D) },
+    reason: 'fleet is deployed',
+    ...admin,
+  });
+  log(6 * D, 'bob@example.org', 'settings.update', 'settings', {
+    before: { ...defaults, maxUnavailablePercent: 5, readyAttestations: 4 },
+    after: { ...defaults },
+    ...admin,
+  });
+  log(4 * D, 'bob@example.org', 'action.client-policy', 'settings', {
+    before: { policyClients: {} },
+    after: { policyClients: { el: { besu: 'manual' } } },
+    reason: 'besu releases need a look first',
+    ...admin,
+  });
+  log(96 * 60, 'bob@example.org', 'settings.update', 'settings', {
+    before: { ...defaults },
+    after: { ...defaults, pauseAfterCanaryImage: true, readyPeerShare: 0.25 },
+    ...admin,
+  });
+  log(15 * D, 'carol@example.org', 'action.pause', 'settings', {
+    before: { paused: false },
+    after: { paused: true },
+    reason: 'devnet maintenance',
+    ...staff,
+  });
+  log(15 * D - 2 * H, 'carol@example.org', 'action.resume', 'settings', {
+    before: { paused: true },
+    after: { paused: false },
+    reason: 'maintenance done',
+    ...staff,
+  });
+  log(2 * D, 'bob@example.org', 'sources.validator-ranges.refresh', 'validator-ranges', { changed: true, ...admin });
+
+  // People: rollouts.
+  log(5 * D, 'alice@example.org', 'action.reboot', r.abortedRollout, {
+    hosts: ['prysm-erigon-1', 'prysm-geth-1', 'prysm-geth-2'],
+    rejected: {},
+    containers: [],
+    staggered: true,
+    force: false,
+    ignoreBudget: false,
+    ignoreGate: false,
+    reason: 'kernel test',
+    ...staff,
+  });
+  log(5 * D - 240, 'alice@example.org', 'action.abort', r.abortedRollout, {
+    before: { state: 'active' },
+    after: { state: 'aborted' },
+    reason: 'wrong selection',
+    ...staff,
+  });
+  const manualRoll = `ro-${hex('audit/rollout/manual-roll', 16)}`;
+  log(13 * D, 'dave@example.org', 'action.roll', manualRoll, {
+    hosts: ['teku-besu-1', 'teku-besu-2', 'teku-besu-3'],
+    rejected: { 'teku-reth-1': 'the host runs no container of the team' },
+    containers: ['teku'],
+    staggered: true,
+    force: false,
+    ignoreBudget: false,
+    ignoreGate: false,
+    reason: 'pick up the new jwt secret',
+    ...team('teku'),
+  });
+  log(13 * D - 1800, 'dave@example.org', 'action.skip', manualRoll, {
+    hosts: ['teku-besu-3'],
+    reason: 'that one is being debugged',
+    ...team('teku'),
+  });
+  const hostAction = `ro-${hex('audit/rollout/host-action', 16)}`;
+  log(7 * D, 'carol@example.org', 'action.host-action', hostAction, {
+    action: 'prune-docker',
+    hosts: ['rpc-1', 'tooling-1', 'bootnode-1'],
+    rejected: {},
+    basis: { 'rpc-1': 'disk 91% full' },
+    pauseAfterCanary: true,
+    ignoreGate: false,
+    reason: 'disks are filling up',
+    ...staff,
+  });
+  log(16 * D, 'alice@example.org', 'action.ignore-gate', `ro-${hex('audit/rollout/libssl', 16)}`, {
+    before: { ignoreGate: false },
+    after: { ignoreGate: true },
+    reason: 'the gate is closed by a known lodestar bug',
+    ...staff,
+  });
+  log(16 * D - 600, 'alice@example.org', 'action.ignore-budget', `ro-${hex('audit/rollout/libssl', 16)}`, {
+    before: { ignoreBudget: false },
+    after: { ignoreBudget: true },
+    reason: 'security fix, roll it now',
+    ...staff,
+  });
+  log(2 * H + 20 * 60, 'alice@example.org', 'action.pause', r.nethermindRollout, {
+    before: { paused: false },
+    after: { paused: true },
+    reason: 'looking at the crash loop',
+    ...staff,
+  });
+  log(2 * H + 10 * 60, 'alice@example.org', 'action.resume', r.nethermindRollout, {
+    before: { paused: true },
+    after: { paused: false, approved: false },
+    reason: 'still halted; leave it to nethermind',
+    ...staff,
+  });
+  log(3 * D, 'erin@example.org', 'action.retry', `ro-${hex('audit/rollout/geth-old', 16)}`, {
+    hosts: ['lighthouse-geth-3'],
+    before: { state: 'halted' },
+    after: { state: 'active' },
+    reason: 'the disk was full, fixed',
+    ...team('geth'),
+  });
+
+  // People: hosts.
+  log(8 * H, 'alice@example.org', 'action.hold', 'grandine-erigon-2', {
+    holder: 'staff',
+    directive: `dv-${hex('audit/hold', 12)}`,
+    before: { held: false },
+    after: { held: true, by: 'alice@example.org', reason: 'testing a debug build' },
+    reason: 'testing a debug build',
+    ...staff,
+  });
+  log(8 * H - 20, 'scheduler', 'directive.accepted', 'grandine-erigon-2', {
+    directive: `dv-${hex('audit/hold', 12)}`,
+    kind: 'hold',
+    holder: 'staff',
+  });
+  log(7 * H, 'alice@example.org', 'action.unhold', 'grandine-erigon-2', {
+    holder: 'staff',
+    directive: `dv-${hex('audit/unhold', 12)}`,
+    before: { held: true, by: 'alice@example.org', reason: 'testing a debug build' },
+    after: { held: false, by: 'alice@example.org', reason: 'custom image is enough' },
+    reason: 'custom image is enough',
+    ...staff,
+  });
+  log(7 * H - 20, 'scheduler', 'directive.accepted', 'grandine-erigon-2', {
+    directive: `dv-${hex('audit/unhold', 12)}`,
+    kind: 'release-hold',
+    holder: 'staff',
+  });
+  log(9 * D, 'carol@example.org', 'action.mark-offline', 'prysm-erigon-1', {
+    before: { offline: false },
+    after: { offline: true, reason: 'hardware swap', until: at(8 * D) },
+    reason: 'hardware swap',
+    ...staff,
+  });
+  log(8 * D, 'carol@example.org', 'action.unmark-offline', 'prysm-erigon-1', {
+    before: { offline: true, reason: 'hardware swap' },
+    after: { offline: false },
+    reason: 'back',
+    ...staff,
+  });
+  log(30 * H, 'frank@example.org', 'action.image-override', 'nimbus-nethermind-2', {
+    container: 'nethermind',
+    directive: `dv-${hex('audit/override', 12)}`,
+    reason: 'debug build for the sync issue',
+    part: 'image',
+    image: 'nethermindeth/nethermind:debug-sync',
+    until: at(-2 * D),
+    ...team('nethermind'),
+  });
+  log(30 * H - 30, 'scheduler', 'directive.accepted', 'nimbus-nethermind-2', {
+    directive: `dv-${hex('audit/override', 12)}`,
+    kind: 'override',
+    container: 'nethermind',
+  });
+  log(29 * H, 'frank@example.org', 'action.flag-override', 'nimbus-nethermind-3', {
+    container: 'nethermind',
+    directive: `dv-${hex('audit/flags', 12)}`,
+    reason: 'more logs',
+    part: 'flags',
+    addFlags: ['--log=debug', '--Sync.VerboseLogging=true'],
+    removeFlags: ['--log=info'],
+    until: at(-D),
+    ...team('nethermind'),
+  });
+  log(29 * H - 30, 'scheduler', 'directive.rejected', 'nimbus-nethermind-3', {
+    directive: `dv-${hex('audit/flags', 12)}`,
+    kind: 'override',
+    container: 'nethermind',
+    error: 'the agent configuration allows no flag overrides',
+  });
+  log(20 * H, 'frank@example.org', 'action.image-override', 'nimbus-nethermind-2', {
+    container: 'nethermind',
+    directive: `dv-${hex('audit/override-clear', 12)}`,
+    reason: 'fixed upstream',
+    part: 'image',
+    clear: true,
+    ...team('nethermind'),
+  });
+  log(20 * H - 600, 'scheduler', 'directive.cancelled', 'nimbus-nethermind-2', {
+    directive: `dv-${hex('audit/override-clear', 12)}`,
+    kind: 'override',
+    container: 'nethermind',
+    error: 'the agent did not answer in time',
+  });
+  log(6 * D, 'alice@example.org', 'action.approve-lease', 'lodestar-reth-2', {
+    lease: `ls-${hex('audit/approve', 16)}`,
+    rollouts: [`ro-${hex('audit/rollout/curl2', 16)}`],
+    readiness: 'not ready: node is syncing',
+    reason: 'it was syncing before, roll it anyway',
+    ...staff,
+  });
+  log(6 * D - 400, 'scheduler', 'lease.released', 'lodestar-reth-2', {
+    lease: `ls-${hex('audit/approve', 16)}`,
+    force: false,
+    readiness: 'not ready before the lease: node is syncing; no worse after',
+    outcome: 'no-worse',
+    approvedBy: 'alice@example.org',
+  });
+  log(4 * D, 'erin@example.org', 'action.end-lease', 'lodestar-reth-3', {
+    lease: `ls-${hex('audit/end', 16)}`,
+    state: 'verifying',
+    reason: 'stuck verifying for an hour',
+    ...staff,
+  });
+  log(4 * D - 60, 'scheduler', 'lease.cancelled', 'lodestar-reth-3', {
+    lease: `ls-${hex('audit/end', 16)}`,
+    by: 'erin@example.org',
+    rollouts: [],
+  });
+  log(11 * D, 'carol@example.org', 'action.forget', 'old-bootnode-2', { reason: 'decommissioned', ...staff });
+  log(11 * D - 120, 'carol@example.org', 'action.forget', 'old-bootnode-3', { reason: 'decommissioned', ...staff });
+  log(11 * D - 121, 'carol@example.org', 'action.forget.failed', 'old-bootnode-3', {
+    error: 'scheduler: delete host old-bootnode-3: database is locked',
+  });
+  log(2 * D + 3 * H, 'ci-deployer', 'auth.refused', '/api/v1/actions/roll', {
+    method: 'POST',
+    reason: 'the login lacks the feature manage',
+    teams: ['lighthouse'],
+  });
+  log(30 * 60, 'dave@example.org', 'auth.refused', '/api/v1/settings', {
+    method: 'PUT',
+    reason: 'the login lacks the feature admin',
+    teams: ['teku'],
+  });
+
+  // The open rollouts of the fixture.
+  log(3 * D + 5 * H, 'scheduler', 'rollout.created', r.dockerRollout, {
+    key: `packages:${hex('packages/docker', 16)}`,
+    title: 'Packages: docker-ce, docker-ce-cli → 5:29.0.0',
+  });
+  log(2 * D + 2 * H, 'scheduler', 'rollout.completed', r.dockerRollout, {
+    key: `packages:${hex('packages/docker', 16)}`,
+    reason: '',
+  });
+  log(26 * H, 'scheduler', 'rollout.created', r.rebootRollout, { key: 'reboot', title: 'reboot' });
+  const created = (t: RolloutTarget, unit: string) => ({
+    key: `unit:${unit}:${hex(t.digest, 12)}`,
+    title: `${unit.replace('/', ' ')}: ${t.image} to ${t.digest.slice(0, 19)}`,
+  });
+  log(
+    3 * H + 12 * 60,
+    'scheduler',
+    'rollout.created',
+    r.nethermindRollout,
+    created(input.targets.nethermind, 'nethermind/el')
+  );
+  log(3 * H + 10 * 60, 'scheduler', 'lease.granted', 'nimbus-nethermind-1', {
+    lease: l.leaseFailed,
+    rollouts: [r.nethermindRollout],
+    cost: 1,
+    impact: 'node',
+    force: false,
+  });
+  log(2 * H + 50 * 60, 'scheduler', 'lease.failed', 'nimbus-nethermind-1', {
+    lease: l.leaseFailed,
+    reason: 'container nethermind restarted 14 times while verifying',
+    rollouts: [r.nethermindRollout],
+  });
+  log(2 * H + 50 * 60 - 1, 'scheduler', 'rollout.halted', r.nethermindRollout, {
+    host: 'nimbus-nethermind-1',
+    lease: l.leaseFailed,
+    reason: 'container nethermind restarted 14 times while verifying',
+  });
+  log(95 * 60, 'scheduler', 'rollout.created', r.grandineRollout, created(input.targets.grandine, 'grandine/cl'));
+  log(93 * 60, 'scheduler', 'lease.granted', 'grandine-erigon-1', {
+    lease: l.leaseGrandine,
+    rollouts: [r.grandineRollout],
+    cost: 1,
+    impact: 'node',
+    force: false,
+  });
+  log(78 * 60, 'scheduler', 'lease.released', 'grandine-erigon-1', {
+    lease: l.leaseGrandine,
+    force: false,
+    readiness: input.attested(92 * 60),
+  });
+  log(78 * 60 - 1, 'scheduler', 'rollout.paused', r.grandineRollout, {
+    reason: 'paused after the canary; resume to continue',
+    lease: l.leaseGrandine,
+  });
+  log(47 * 60, 'scheduler', 'rollout.created', r.lighthouseRollout, created(input.targets.lighthouse, 'lighthouse/cl'));
+  log(46 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-1', {
+    lease: l.leaseCanary,
+    rollouts: [r.lighthouseRollout],
+    cost: 1,
+    impact: 'node',
+    force: false,
+  });
+  log(38 * 60, 'scheduler', 'lease.released', 'lighthouse-geth-1', {
+    lease: l.leaseCanary,
+    force: false,
+    readiness: input.attested(45 * 60),
+  });
+  // The lighthouse rollout paused after its canary too, and was resumed.
+  log(38 * 60 - 1, 'scheduler', 'rollout.paused', r.lighthouseRollout, {
+    reason: 'paused after the canary; resume to continue',
+    lease: l.leaseCanary,
+  });
+  log(37 * 60, 'alice@example.org', 'action.resume', r.lighthouseRollout, {
+    before: { paused: true },
+    after: { paused: false, approved: false },
+    reason: 'the canary looks good',
+    ...staff,
+  });
+  log(36 * 60, 'scheduler', 'lease.granted', 'rpc-1', {
+    lease: l.leaseRpc,
+    rollouts: [r.lighthouseRollout],
+    cost: 0,
+    impact: 'node',
+    force: false,
+  });
+  log(21 * 60, 'scheduler', 'lease.released', 'rpc-1', {
+    lease: l.leaseRpc,
+    force: false,
+    readiness: 'not ready before the lease: node is syncing; no worse after',
+    outcome: 'no-worse',
+  });
+  log(9 * 60, 'scheduler', 'lease.granted', 'lighthouse-geth-2', {
+    lease: l.leaseVerifying,
+    rollouts: [r.lighthouseRollout],
+    cost: 1,
+    impact: 'node',
+    force: false,
+  });
+
+  // Oldest first, so IDs grow with time; a stable sort keeps the order of one moment.
+  return pending
+    .map((p, i) => ({ p, i }))
+    .sort((a, b) => b.p[0] - a.p[0] || a.i - b.i)
+    .map(({ p: [secondsAgo, actor, action, target, detail] }, i) => ({
+      id: i + 1,
+      time: at(secondsAgo),
+      actor,
+      action,
+      target,
+      detail,
+    }));
 }
